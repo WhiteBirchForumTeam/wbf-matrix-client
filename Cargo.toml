@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/wbf-wire"]
+exclude = ["vendor/matrix-rust-sdk"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.95"
