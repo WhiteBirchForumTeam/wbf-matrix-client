@@ -63,7 +63,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 |---|---|
 | `info <mxc> [--manifest <m.json>]` | 印 `Info` 的 Ack（server 知道的欄位）。有 manifest 就順便解描述印出來，並做約定 §3.1 第 2 條的核對 |
 | `download --manifest <m.json> [-o <out>]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照約定 §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin` |
-| `play --manifest <m.json> --at <pos> [--len <n>]` | seek：只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
+| `seek --manifest <m.json> --at <pos> [--len <n>]` | 只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。
 
@@ -116,7 +116,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 規則：
 
-- **印是即時的，不是結束才印。** 三種模式都是事件一到就寫一行 JSON 進 stdout 並 flush，所以 `wait 5` 接管線不會等到第 5 秒才一次吐出來。這是 §4「一個 JSON 物件」的第二個例外（第一個是 `play`）：`watch` 印 **JSON Lines**。
+- **印是即時的，不是結束才印。** 三種模式都是事件一到就寫一行 JSON 進 stdout 並 flush，所以 `wait 5` 接管線不會等到第 5 秒才一次吐出來。這是 §4「一個 JSON 物件」的第二個例外（第一個是 `seek`）：`watch` 印 **JSON Lines**。
 - **結束時 stderr 印一行 `since`**，下次用 `--since` 接著等，中間進來的不漏。這也是 `wait` 連續呼叫的接法；`since` 自己不落地，理由同 §3.4.1 的 `next`。
 - **只印這個房間的。** `/sync` 回來的是全部房間，其他房間的丟掉；要看全部就開幾個 `watch`。
 - **自己送的也印**（`sender` 是自己），腳本自己濾。`once` 不把自己的算進「第一則」，不然 `send` 完接著 `once` 永遠等到的是自己。
@@ -124,7 +124,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 ## 4. 輸出與 exit code
 
-- stdout：**一個 JSON 物件**，命令成功才印。兩個例外：`play` 印明文 bytes；`watch` 印 JSON Lines，一事件一行、即時 flush（§3.4.2）。
+- stdout：**一個 JSON 物件**，命令成功才印。兩個例外：`seek` 印明文 bytes；`watch` 印 JSON Lines，一事件一行、即時 flush（§3.4.2）。
 - stderr：進度（`chunk 17/2031 …`）、警告、錯誤訊息。
 - exit code：
 
@@ -179,7 +179,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 1. `login`，`ping` 看 features 有 `upload`、`download`。
 2. 產生 200 MiB 隨機檔 → `upload` → 標準 `GET /_matrix/client/v1/media/download/…` 拿整份 → 與本地逐塊密文串接後 `cmp`。
 3. `download` → 與原檔 `cmp`。
-4. `play --at 150000000 --len 4096` → 與 `dd` 從原檔切的同一段 `cmp`；stderr 要顯示只讀了一塊。
+4. `seek --at 150000000 --len 4096` → 與 `dd` 從原檔切的同一段 `cmp`；stderr 要顯示只讀了一塊。
 5. 上傳到一半 `kill` → 再跑同一條 `upload` → 看到 `resume from chunk N` → 結果同第 2、3 條。
 6. `cat 原檔 | upload --stream` → 同第 3 條。
 7. 三種 `--cipher` 各跑一次第 2、3 條。

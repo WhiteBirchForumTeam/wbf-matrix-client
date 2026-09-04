@@ -28,7 +28,7 @@ wbf-matrix-client/
     wbf-sdk/                 用得上的東西：WebSocket 通道、pack 收發管線、分塊上傳／下載、每塊 AEAD、續傳、
                              與 matrix-sdk 的接縫（登入、房間、事件、金鑰）
   apps/
-    wbf-cli/                 命令列：login、rooms、send、watch、upload、download、play（seek 驗證）
+    wbf-cli/                 命令列：login、rooms、send、watch、upload、download、seek
     desktop/                 之後
 ```
 
@@ -55,7 +55,7 @@ wbf-matrix-client/
 | 收發文字（含 E2EE 房） | matrix-sdk | 兩個帳號互發，收到且解得開 |
 | 分塊上傳 | wbf-sdk | `wbf-cli upload <file>`：Create（`EncryptedFileInfo` 加加密描述）→ 逐塊加密送 → Seal → 把 `wbf.chunked` 事件送進房間；server 的標準下載拿到的密文與本地密文逐 byte 相同 |
 | 分塊下載 | wbf-sdk | `wbf-cli download <mxc>`：Info 拿描述解出金鑰 → 逐塊 Read 解密 → 與原檔逐 byte 相同 |
-| seek | wbf-sdk | `wbf-cli play <mxc> --at <明文位置>`：只讀含該位置的那一塊就能解出對的 bytes（核心設計的驗收：大於 1 GB 的檔中途 seek 不必下載前面） |
+| seek | wbf-sdk | `wbf-cli seek <mxc> --at <明文位置>`：只讀含該位置的那一塊就能解出對的 bytes（核心設計的驗收：大於 1 GB 的檔中途 seek 不必下載前面） |
 | 續傳 | wbf-sdk | 上傳中殺掉 CLI，重跑同一命令從 `Status` 接著送，結果逐 byte 相同 |
 | 串流上傳 | wbf-sdk | `wbf-cli upload --stream` 從 stdin 讀、`0/0` 哨兵、`IS_LAST` 收尾、Seal 帶最終描述 |
 | 協議不漂移 | wbf-wire | `cargo test -p wbf-wire` 對著複製來的 `wbf-vectors.json` 全過 |
@@ -71,7 +71,7 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 0. repo 只有設計文件與 `vendor/matrix-rust-sdk` submodule，等維護者同意規劃。（2026-09-04 同意）
 1. `wbf-wire` 加向量測試。（2026-09-04 做完）向量檔是 `docs/design/wbf-vectors.json`，從 server repo 的同名檔**整份複製**，不手改；
    server 規格改了就重新複製一次，`cargo test -p wbf-wire` 紅了就是漂移。工具鏈釘在 `rust-toolchain.toml`（1.95.0，與 submodule 的 `rust-version` 一致）。
-2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`play`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。
+2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`seek`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。
 3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`watch`。
 4. UI 框架決定與 `apps/desktop`。
 
