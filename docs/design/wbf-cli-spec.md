@@ -74,12 +74,12 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `rooms` | 列出加入的房間：`[{ "room_id", "name", "encrypted": bool }]` |
 | `send <room_id> --text <msg>` | 送文字 |
 | `send <room_id> --file <file> [upload 的參數]` | upload 後把約定 §5 的事件送進房間。房間沒 E2EE 就走明文模式，**送之前印警告並要求確認**（約定 §5.1）；`--yes` 跳過確認給腳本用 |
-| `recv <room_id> [--since <token>] [--follow]` | 從 `/sync` 印**新**事件（現在起）；`--follow` 不結束、來一個印一個（一行一個 JSON）。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印 |
+| `watch <room_id> tail \| wait <秒> \| once [--since <token>]` | 從 `/sync` 等**新**事件（現在起），來一個立刻印一個，一行一個 JSON。三種模式見 §3.4.2。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印 |
 | `ping` | `Hello` 加 `Ping`，印 server 回的 features 與上限。除錯用，第 2 步就有 |
 
 #### 3.4.1 讀房間（規劃，第 3 步之後）
 
-`recv` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令：
+`watch` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令：
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
@@ -87,7 +87,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `read <room_id> [--limit <n>] [--before <token>] [--type <event_type>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響 | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
 | `files <room_id> [--limit <n>] [--before <token>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
 
-事件的統一形狀（`read`、`recv`、`files` 都用）：
+事件的統一形狀（`read`、`watch`、`files` 都用）：
 
 | 欄位 | 說明 |
 |---|---|
@@ -104,9 +104,27 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 - **`files` 不驗完整性**：它只解區塊、印 manifest，不碰 `Info`。核對是 `info`／`download` 的事（約定 §3.1）。
 - 不加 `search`：server 端全文搜尋對加密房間無效，要做也是 client 端掃 `read` 的輸出，那是腳本一行 `jq` 的事。
 
+#### 3.4.2 `watch`：等新事件，有就立刻印
+
+同一個命令，差別只在**什麼時候結束**：
+
+| 模式 | 什麼時候結束 | 給誰用 |
+|---|---|---|
+| `tail` | 不結束，到 Ctrl-C 或斷線用完續傳次數（exit 4） | 人看、或管線接到另一個程式後面 |
+| `wait <秒>` | 時間到就結束，這段時間內進來的都印過了；一則都沒有也是 exit 0 | 腳本：「送完之後等 5 秒看對方回什麼」 |
+| `once` | 印到**第一則**就結束；`--timeout <秒>` 到了還沒有 exit 5 | 腳本：「阻塞到有回應為止」 |
+
+規則：
+
+- **印是即時的，不是結束才印。** 三種模式都是事件一到就寫一行 JSON 進 stdout 並 flush，所以 `wait 5` 接管線不會等到第 5 秒才一次吐出來。這是 §4「一個 JSON 物件」的第二個例外（第一個是 `play`）：`watch` 印 **JSON Lines**。
+- **結束時 stderr 印一行 `since`**，下次用 `--since` 接著等，中間進來的不漏。這也是 `wait` 連續呼叫的接法；`since` 自己不落地，理由同 §3.4.1 的 `next`。
+- **只印這個房間的。** `/sync` 回來的是全部房間，其他房間的丟掉；要看全部就開幾個 `watch`。
+- **自己送的也印**（`sender` 是自己），腳本自己濾。`once` 不把自己的算進「第一則」，不然 `send` 完接著 `once` 永遠等到的是自己。
+- **第 2 步的 session 在加密房間照樣能用**，只是每則都 `decrypted: false`；`once` 還是算有回應。
+
 ## 4. 輸出與 exit code
 
-- stdout：**一個 JSON 物件**，命令成功才印（`play` 例外：印明文 bytes）。
+- stdout：**一個 JSON 物件**，命令成功才印。兩個例外：`play` 印明文 bytes；`watch` 印 JSON Lines，一事件一行、即時 flush（§3.4.2）。
 - stderr：進度（`chunk 17/2031 …`）、警告、錯誤訊息。
 - exit code：
 
@@ -117,6 +135,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | 2 | server 回 `Error` pack 或 HTTP 非 2xx；stderr 印 `code` 與 `message` |
 | 3 | **完整性失敗**：CRC、AEAD 標籤、長度、sha256、事件與 `Info` 對不上。半成品已刪 |
 | 4 | 網路：連不上、斷線且續傳次數用完 |
+| 5 | 等逾時：`watch once --timeout` 到了還沒有事件 |
 
 ## 5. Manifest：`upload` 印的、`download` 吃的
 
