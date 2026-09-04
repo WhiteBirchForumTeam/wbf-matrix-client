@@ -38,7 +38,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `login --user <mxid> [--password <pw>] [--device-name <name>]` | 登入、寫 session 檔。沒給 `--password` 就從終端讀（不回顯）；🚫 不接受環境變數給密碼 | `{ "user_id", "device_id", "server" }` |
+| `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、寫 session 檔。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
 | `logout` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪 session 檔 | `{ "ok": true }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 
@@ -74,8 +74,35 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `rooms` | 列出加入的房間：`[{ "room_id", "name", "encrypted": bool }]` |
 | `send <room_id> --text <msg>` | 送文字 |
 | `send <room_id> --file <file> [upload 的參數]` | upload 後把約定 §5 的事件送進房間。房間沒 E2EE 就走明文模式，**送之前印警告並要求確認**（約定 §5.1）；`--yes` 跳過確認給腳本用 |
-| `recv <room_id> [--since <token>]` | 印事件；認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印 |
+| `recv <room_id> [--since <token>] [--follow]` | 從 `/sync` 印**新**事件（現在起）；`--follow` 不結束、來一個印一個（一行一個 JSON）。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印 |
 | `ping` | `Hello` 加 `Ping`，印 server 回的 features 與上限。除錯用，第 2 步就有 |
+
+#### 3.4.1 讀房間（規劃，第 3 步之後）
+
+`recv` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令：
+
+| 命令 | 做什麼 | stdout |
+|---|---|---|
+| `room <room_id>` | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
+| `read <room_id> [--limit <n>] [--before <token>] [--type <event_type>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響 | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
+| `files <room_id> [--limit <n>] [--before <token>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
+
+事件的統一形狀（`read`、`recv`、`files` 都用）：
+
+| 欄位 | 說明 |
+|---|---|
+| `event_id`、`sender`、`ts`、`type` | 照 Matrix 原樣 |
+| `content` | 解密後的內容。明文房間就是原樣 |
+| `decrypted` | `true`／`false`／`null`。`null` 表示本來就不是加密事件 |
+| `undecryptable_reason` | `decrypted` 是 `false` 才有，example: `no_session_key`、`no_e2ee_store`（第 2 步的 session 沒有裝置金鑰，見 §1） |
+
+規則：
+
+- **解不開不是錯誤。** 加密房間裡拿不到 key 的事件照印，`decrypted: false` 帶原因，exit 仍是 0。用 exit 3 只會讓一整頁因為一則舊訊息全掛。
+- **翻頁 token 不落地。** `next` 只印在 stdout，不寫狀態檔；要接著翻是呼叫者的事。session 檔的 SDK store 另有它自己的 sync 位置，跟這個無關。
+- **`--type`、`--sender` 在 client 端濾**：Matrix 的 `filter` 參數各 server 支援程度不一，而且只是省流量，結果一樣。過濾後一頁可能是空的但 `next` 不是 null，呼叫者要照 `next` 判斷有沒有到頭，不是照 `events` 長度。
+- **`files` 不驗完整性**：它只解區塊、印 manifest，不碰 `Info`。核對是 `info`／`download` 的事（約定 §3.1）。
+- 不加 `search`：server 端全文搜尋對加密房間無效，要做也是 client 端掃 `read` 的輸出，那是腳本一行 `jq` 的事。
 
 ## 4. 輸出與 exit code
 
