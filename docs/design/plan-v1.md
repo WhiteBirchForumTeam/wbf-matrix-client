@@ -71,7 +71,7 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 0. repo 只有設計文件與 `vendor/matrix-rust-sdk` submodule，等維護者同意規劃。（2026-09-04 同意）
 1. `wbf-wire` 加向量測試。（2026-09-04 做完）向量檔是 `docs/design/wbf-vectors.json`，從 server repo 的同名檔**整份複製**，不手改；
    server 規格改了就重新複製一次，`cargo test -p wbf-wire` 紅了就是漂移。工具鏈釘在 `rust-toolchain.toml`（1.95.0，與 submodule 的 `rust-version` 一致）。
-2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk，先用 access token 直接打本機 server），CLI 的 `upload`／`download`／`play`／續傳。
+2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`play`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。
 3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`recv`。
 4. UI 框架決定與 `apps/desktop`。
 
