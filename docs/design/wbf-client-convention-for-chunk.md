@@ -198,7 +198,7 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 此時 §3.1 第 2 條用區塊的 `file_size` 與 `Info` 的 `chunk_count`、`chunk_size` 核對。
 `Info` 還回的描述如果缺 `file_size`，代表上傳者沒照第 3 步做；區塊有 `file_size` 就照區塊，描述只是副本。
 
-## 7. Seek（`play --at pos`）
+## 7. Seek（`seek --at pos`）
 
 ```
 i   = pos / chunk_size            （整數除法）
