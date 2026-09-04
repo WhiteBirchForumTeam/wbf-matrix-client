@@ -1,7 +1,7 @@
 # wbf-matrix-client v1 規劃：SDK crate 加 CLI，UI 之後
 
 > 狀態：**維護者 2026-09-04 同意**，開始實作。程式碼一律開分支送 PR 審查，不直接合到 `main`（維護者 2026-09-04 定）。
-> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
+> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。第 2 步拆三個 PR，第 1 個（密碼層與 client 向量）2026-09-05 送審。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
 > 一個 repo（`crates/` 加 `apps/`）；v1 範圍是最小可用（登入、房間列表、收發文字、分塊上傳／下載媒體）；
 > matrix-rust-sdk 先用上游，需要改再 fork。
 >
@@ -71,7 +71,10 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 0. repo 只有設計文件與 `vendor/matrix-rust-sdk` submodule，等維護者同意規劃。（2026-09-04 同意）
 1. `wbf-wire` 加向量測試。（2026-09-04 做完）向量檔是 `docs/design/wbf-vectors.json`，從 server repo 的同名檔**整份複製**，不手改；
    server 規格改了就重新複製一次，`cargo test -p wbf-wire` 紅了就是漂移。工具鏈釘在 `rust-toolchain.toml`（1.95.0，與 submodule 的 `rust-version` 一致）。
-2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`seek`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。
+2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`seek`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。拆三個 PR：
+   1. 密碼層與 client 向量：`cipher`、每塊與描述的 AEAD、事件區塊、seek 算法、`chunk_size` 選法；`docs/design/wbf-client-vectors.json`（約定 §9）。無 async、無網路。（2026-09-05 送審）
+   2. WebSocket 通道與 pack 收發管線、`login`、上傳（固定大小與串流）、下載、seek、續傳。
+   3. `apps/wbf-cli` 與驗收腳本（CLI 規格 §8）。
 3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`watch`。
 4. UI 框架決定與 `apps/desktop`。
 
