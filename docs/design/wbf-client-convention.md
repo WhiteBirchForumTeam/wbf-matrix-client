@@ -22,10 +22,10 @@
 | 明文塊 `pt_i` | 原檔第 `i` 塊，`i` 從 0 起；長度 = `chunk_size`，最後一塊 = `file_size − i × chunk_size` |
 | 密文塊 `ct_i` | `pt_i` 加密後，長度 = `len(pt_i) + 16`；就是線上規格 `Chunk` 的 data |
 | 描述 | 檔名、MIME、大小等；明文是 §4 的 JSON，加密後是線上規格 `Create`／`Seal` 的 data，`Info` 原樣還回 |
-| 區塊 | 房間事件 `content` 裡 `cc.zooy.wbf.chunked` 那個物件（§5） |
+| 區塊 | 房間事件 `content` 裡 `org.wbftw.chunked` 那個物件（§5） |
 
-命名空間 `cc.zooy.wbf` 是照 Matrix 規格的反向網域慣例取的（維護者的網域是 `zooy.cc`）。
-**待維護者確認**；改了就是全文取代。
+命名空間 `org.wbftw` 照 Matrix 規格的反向網域慣例，對應組織 wbftw（維護者 2026-09-04 定：這個 repo 是組織的，
+`zooy.cc` 只是私人 server，不拿來當名義）。
 
 ## 2. 每檔的參數
 
@@ -69,6 +69,9 @@
 ```
 
 - 欄位與 §5 的區塊一模一樣，**只少 `key`**。兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕（§3.1 第 2 條同一精神）。
+- `file_size` 與 `sha256` **可缺**，缺 = 還不知道（串流上傳在 `Create` 時就是這樣，§6）。**不要寫 0 當佔位**：0 會被讀成「空檔」。
+  `Seal` 帶的描述才是最終版，會整份覆蓋 `Create` 那份（線上規格 §3.4）；上傳者在 `Seal` 時知道多少就寫多少。
+- `chunk_size` 一定有：它是 `Create` 就定死的參數，串流也一樣。塊數不寫在描述裡，它從 `file_size` 算得出來，server 的 `Info` 也會回。
 - `name`、`mimetype` 可缺；缺的顯示成 `unknown`，不要用空字串當佔位。
 - `sha256` 選用；有就是整檔明文的十六進位小寫。
 - base64 一律 RFC 4648 標準字母表、**帶** `=` padding。
@@ -88,10 +91,10 @@
 {
   "type": "m.room.message",
   "content": {
-    "msgtype": "cc.zooy.wbf.file",
+    "msgtype": "org.wbftw.file",
     "body": "video.mkv（WBF 分塊檔，需要 WBF client 才能開）",
     "url": "mxc://example.org/1122334455667788",
-    "cc.zooy.wbf.chunked": {
+    "org.wbftw.chunked": {
       "v": 1,
       "cipher": "chacha20-poly1305",
       "key": "<base64, 32 bytes>",
@@ -109,19 +112,22 @@
 - `url` 是 `Create` Ack 回的 `mxc`（media id = 上傳 id 的 16 位小寫 hex）。
 - `body` 給舊 client 看；內容不當權威（檔名以區塊的 `name` 為準）。
 - **只在 E2EE 房間送**。`key` 靠 Megolm 保護，這正是 Matrix 把附件金鑰放事件裡的做法；非加密房間裡送這個事件等於把金鑰公開，client 必須拒送。
-- 認得 `msgtype` 但 `cc.zooy.wbf.chunked` 缺、`v` 不認得、`cipher` 不是 `chacha20-poly1305` → 當成解不開的檔，顯示 `body`，不下載。
+- 認得 `msgtype` 但 `org.wbftw.chunked` 缺、`v` 不認得、`cipher` 不是 `chacha20-poly1305` → 當成解不開的檔，顯示 `body`，不下載。
 - 縮圖：沒有（密文做不出來），事件不帶 `info.thumbnail_*`。
 - `m.video`／`m.audio` 的 `info.duration` 這類明文元資料，v1 不放；要放就放進區塊，之後升 `v`。
 
 ## 6. 串流上傳（大小未知）
 
-1. `Create`：`EncryptedFileInfo { file_size: 0, chunk_size: N, chunk_count: 0 }`，data = §4 的描述加密，其中 `file_size` 先填 0、`sha256` 不放。
+1. `Create`：`EncryptedFileInfo { file_size: 0, chunk_size: N, chunk_count: 0 }`（線上規格的串流哨兵），
+   data = §4 的描述加密，**不含 `file_size`、不含 `sha256`**（不知道就不寫，§4）。此時描述只有 `v`、`chunk_size`、`nonce_base` 與知道的 `name`／`mimetype`。
 2. 每讀滿 `chunk_size` 明文就送一塊，索引遞增；最後一塊（可以不滿）帶 `IS_LAST`。加密方式與 §3 完全相同，沒有特例。
-3. `Seal` 的 data = 重新加密的描述，這次 `file_size` 是真值、`sha256` 有算就放。
+3. **`Seal` 必須帶 data**：重新加密的完整描述，`file_size` 是真值、`sha256` 有算就放。server 拿它整份覆蓋 `Create` 那份。
+   串流上傳 `Seal` 不帶 data 是 client 的 bug：server 上會留一份沒有大小的描述。固定大小上傳的 `Seal` 帶不帶都可以。
 4. 房間事件在 `Seal` 之後才送，區塊寫最終的 `file_size`。
 
 下載端看不出一個檔是不是串流傳的，也不需要：`Info` 的 `file_size` 在串流上傳會是 `null`（server 不知道），
 此時 §3.1 第 2 條用區塊的 `file_size` 與 `Info` 的 `chunk_count`、`chunk_size` 核對。
+`Info` 還回的描述如果缺 `file_size`，代表上傳者沒照第 3 步做；區塊有 `file_size` 就照區塊，描述只是副本。
 
 ## 7. Seek（`play --at pos`）
 
@@ -153,6 +159,6 @@ Read(mxc, chunk=i) → ct_i → 解密 → pt_i[off..]
 
 ## 11. 要維護者決定的
 
-1. 命名空間 `cc.zooy.wbf` 可以嗎（§1）。
+1. ~~命名空間~~ 定了：`org.wbftw`（維護者 2026-09-04）。
 2. 「只在 E2EE 房間送」硬擋（§5）可以嗎。
 3. `chunk_size` 的預設值：一般檔 64 KiB、影片 1 MiB（§2），還是全部一種。
