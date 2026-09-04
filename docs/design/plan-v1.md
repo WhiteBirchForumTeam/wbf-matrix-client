@@ -1,4 +1,4 @@
-# wbf-client v1 規劃：SDK crate 加 CLI，UI 之後
+# wbf-matrix-client v1 規劃：SDK crate 加 CLI，UI 之後
 
 > 狀態：**維護者 2026-09-04 同意**，開始實作。程式碼一律開分支送 PR 審查，不直接合到 `main`（維護者 2026-09-04 定）。
 > 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
@@ -18,7 +18,7 @@ UI 框架的選擇延後到 SDK 能用之後。
 ## 2. 佈局
 
 ```
-wbf-client/
+wbf-matrix-client/
   Cargo.toml                 workspace（之後）
   docs/design/               規劃與決定（本檔起）
   vendor/matrix-rust-sdk/    上游 submodule（維護者選 submodule：要改就在這裡改、這裡 fork）
@@ -85,5 +85,5 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 ## 8. 要維護者決定的
 
 1. 這份規劃可以嗎？
-2. Forgejo 上建 `wbf-client` repo（我的 token 只有 wbfuwunel），並給 `claude` 帳號 write 權限；GitHub 的 `wbftw` 那邊要不要也建一份。
+2. ~~Forgejo 上建 repo~~ 定了：Forgejo `amaid/wbf-matrix-client` 開發、GitHub `WhiteBirchForumTeam/wbf-matrix-client` 鏡像（2026-09-04）。
 3. 事件格式：見 `wbf-client-convention-for-chunk.md` §11。
