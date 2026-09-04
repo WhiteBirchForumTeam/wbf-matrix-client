@@ -68,15 +68,27 @@
   "file_size": 132056, "chunk_size": 65536, "nonce_base": "AAECAwQFBgc=", "sha256": "<hex, 選用>" }
 ```
 
-- 欄位與 §5 的區塊一模一樣，**只少 `key`**。兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕（§3.1 第 2 條同一精神）。
-- `file_size` 與 `sha256` **可缺**，缺 = 還不知道（串流上傳在 `Create` 時就是這樣，§6）。**不要寫 0 當佔位**：0 會被讀成「空檔」。
-  `Seal` 帶的描述才是最終版，會整份覆蓋 `Create` 那份（線上規格 §3.4）；上傳者在 `Seal` 時知道多少就寫多少。
-- `chunk_size` 一定有：它是 `Create` 就定死的參數，串流也一樣。塊數不寫在描述裡，它從 `file_size` 算得出來，server 的 `Info` 也會回。
-- `name`、`mimetype` 可缺；缺的顯示成 `unknown`，不要用空字串當佔位。
-- `sha256` 選用；有就是整檔明文的十六進位小寫。
-- base64 一律 RFC 4648 標準字母表、**帶** `=` padding。
+| key | 必要？ | example | 備註 |
+|---|---|---|---|
+| `v` | 必要 | `1` | 本文版本（§8）。不認得就拒絕 |
+| `chunk_size` | 必要 | `65536` | 明文塊大小，byte。`Create` 就定死，串流也知道。必須等於 `Create` Ack 回的 `chunk_size` |
+| `nonce_base` | 必要 | `"AAECAwQFBgc="` | 8 byte，base64（RFC 4648 標準字母表、帶 `=`）。每檔一個 |
+| `file_size` | 選用 | `132056` | 明文總長，byte。**缺 = 還不知道**（串流上傳 `Create` 時），`Seal` 那份必須有。🚫 不要寫 0 當佔位，0 會被讀成空檔 |
+| `name` | 選用 | `"video.mkv"` | 缺 = 不知道，顯示成 `unknown`；不要用空字串當佔位 |
+| `mimetype` | 選用 | `"video/x-matroska"` | 同上 |
+| `sha256` | 選用 | `"9f86d0…"` | 整檔明文 SHA-256，十六進位小寫。缺 = 沒算或還不知道。有就要驗（§3.1 第 5 條） |
 
-加密：同一把 `key`，`nonce_desc = nonce_base ‖ 0xFF_FF_FF_FF`，`aad = "wbf-desc-v1"`。密文放 `Create` 的 data；`Seal` 再帶一次就用同一個 nonce 與 AAD 重新加密（內容不同、nonce 相同，對 AEAD 是 nonce 重用）—— 所以**`Seal` 那份改用 `0xFF_FF_FF_FE`**：`Create` 用 `…FF_FF_FF_FF`，`Seal` 用 `…FF_FF_FF_FE`，塊索引上限因此是 `0xFFFF_FFFD`。
+- 欄位與 §5 房間事件的區塊一模一樣，**只少 `key`**。兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕。
+- 塊數不寫：從 `file_size` 與 `chunk_size` 算得出來，server 的 `Info` 也會回。
+- `Seal` 帶的描述是最終版，整份覆蓋 `Create` 那份（線上規格 §3.4）；上傳者在 `Seal` 時知道多少就寫多少。
+- 不認得的 key 忽略（與 Matrix 事件同一規則），本文新增選用欄位不用升 `v`。
+
+加密：同一把 `key`、`aad = "wbf-desc-v1"`，nonce 用保留的塊索引，`Create` 與 `Seal` 各一個，因為兩份內容不同，不能共用 nonce：
+
+| 哪一份 | nonce |
+|---|---|
+| `Create` 的 data | `nonce_base ‖ 0xFF_FF_FF_FF` |
+| `Seal` 的 data | `nonce_base ‖ 0xFF_FF_FF_FE` |
 
 為什麼描述還要存一份在 server：串流上傳（§6）在 `Create` 時不知道 `file_size` 與 `sha256`，`Seal` 才補得齊；
 而且拿到金鑰的人即使房間事件被撤回，仍能從 `Info` 重建參數。**它是副本，不是權威。**
@@ -109,8 +121,22 @@
 }
 ```
 
-- `url` 是 `Create` Ack 回的 `mxc`（media id = 上傳 id 的 16 位小寫 hex）。
-- `body` 給舊 client 看；內容不當權威（檔名以區塊的 `name` 為準）。
+`content` 的欄位：
+
+| key | 必要？ | example | 備註 |
+|---|---|---|---|
+| `msgtype` | 必要 | `"org.wbftw.file"` | 舊 client 不認得就顯示 `body` |
+| `body` | 必要 | `"video.mkv（WBF 分塊檔，需要 WBF client 才能開）"` | 給舊 client 看的一行字。不當權威，檔名以區塊的 `name` 為準 |
+| `url` | 必要 | `"mxc://example.org/1122334455667788"` | `Create` Ack 回的 `mxc`（media id = 上傳 id 的 16 位小寫 hex） |
+| `org.wbftw.chunked` | 必要 | 見下表 | 區塊。缺就當解不開的檔 |
+
+區塊 `org.wbftw.chunked` 的欄位：§4 描述的每一個 key（同樣的必要／選用規則，但 `file_size` 在事件裡**必要**，事件在 `Seal` 之後才送，一定知道），再加：
+
+| key | 必要？ | example | 備註 |
+|---|---|---|---|
+| `cipher` | 必要 | `"chacha20-poly1305"` | 目前只有這一個值；不是它就拒絕 |
+| `key` | 必要 | `"<base64, 32 bytes>"` | 每檔一把。**只在這裡**，不進描述、不進 server 看得到的地方 |
+
 - **只在 E2EE 房間送**。`key` 靠 Megolm 保護，這正是 Matrix 把附件金鑰放事件裡的做法；非加密房間裡送這個事件等於把金鑰公開，client 必須拒送。
 - 認得 `msgtype` 但 `org.wbftw.chunked` 缺、`v` 不認得、`cipher` 不是 `chacha20-poly1305` → 當成解不開的檔，顯示 `body`，不下載。
 - 縮圖：沒有（密文做不出來），事件不帶 `info.thumbnail_*`。
