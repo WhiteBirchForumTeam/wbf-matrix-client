@@ -538,3 +538,37 @@ async fn hello_ping_status_abort() {
     let after = client.upload_status(state.upload_id).await;
     assert_eq!(after.unwrap_err().server_code(), Some("NotFound"));
 }
+
+/// wbfuwunel 對 `Create` 的回應標頭 id 是新上傳 id（plan-v1 §6 記的順帶發現）：兩種都要收；
+/// 標頭 id 是別的值、或非 `Create` 的回應不抄回 id，都要拒。
+#[tokio::test]
+async fn create_ack_header_id_variants() {
+    let file_cipher = FileCipher::with_fixed(Cipher::None, [0; 32], [0; 8], 16);
+
+    let mut server = FakeServer::new();
+    server.create_ack_header_is_upload_id = true;
+    let mut client = WbfClient::new(&mut server);
+    let state = client
+        .create_upload(SERVER, USER, &file_cipher, &block_for("x", Some(40)))
+        .await
+        .expect("header id == new upload id is accepted");
+    assert_ne!(state.upload_id, 0);
+
+    let mut server = FakeServer::new();
+    server.wrong_response_id_once = Some(0xDEAD);
+    let mut client = WbfClient::new(&mut server);
+    let error = client
+        .create_upload(SERVER, USER, &file_cipher, &block_for("x", Some(40)))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Protocol(_)), "{error}");
+
+    let mut server = FakeServer::new();
+    server.wrong_response_id_once = Some(1);
+    let mut client = WbfClient::new(&mut server);
+    let error = client.hello("test").await.unwrap_err();
+    assert!(
+        matches!(error, SdkError::Protocol(_)),
+        "non-Create must echo id 0: {error}"
+    );
+}

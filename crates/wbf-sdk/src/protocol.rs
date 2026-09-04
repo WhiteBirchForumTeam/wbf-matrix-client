@@ -137,9 +137,11 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
             response.kind, response.flags
         )));
     }
-    // seq 一定要抄回。id 也是（線上規格 §2），但 wbfuwunel 對 `Create`（請求 id 0）的回應把新發的上傳 id
-    // 放在標頭；請求 id 是 0 的就只驗 seq，`Create` 的呼叫者再拿標頭 id 對 Ack meta 的 id（`upload.rs`）。
-    let id_echoed = request.id == 0 || response.id == request.id;
+    // id 與 seq 都要抄回（線上規格 §2）。唯一的放寬：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭，
+    // 所以只有 `Create` 允許標頭 id 不是 0，而 `create_upload` 會再拿它對 Ack meta 的 `id`。其他 id 0 的請求
+    // （Hello、Ping、Info、Read）回應 id 必須是 0。
+    let is_create = request.kind == Kind::Upload && request.subtype == upload::CREATE;
+    let id_echoed = response.id == request.id || is_create;
     if !id_echoed || response.seq != request.seq {
         return Err(SdkError::Protocol(format!(
             "response id/seq {}/{} does not echo request {}/{}",

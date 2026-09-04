@@ -12,6 +12,10 @@ use wbf_wire::Pack;
 
 use crate::error::SdkError;
 
+/// 一個請求從送出到收到回應的上限。與 server 的 `wbf_ws_idle_timeout` 預設相同：對方黑洞了就回 `Network`，
+/// 不讓 client 永遠掛著。
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 通道的契約。實作只管 bytes 來回；回應是不是 Ack、id／seq 對不對，是 `protocol::expect_ack` 的事。
 #[allow(async_fn_in_trait)]
 pub trait PackChannel {
@@ -117,15 +121,17 @@ impl WsChannel {
 impl PackChannel for WsChannel {
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
         let bytes = pack.encode()?;
-        self.socket
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|error| SdkError::Network(format!("websocket send: {error}")))?;
+        tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.socket.send(Message::Binary(bytes.into())),
+        )
+        .await
+        .map_err(|_| SdkError::Network("websocket send timed out".into()))?
+        .map_err(|error| SdkError::Network(format!("websocket send: {error}")))?;
         loop {
-            let message = self
-                .socket
-                .next()
+            let message = tokio::time::timeout(REQUEST_TIMEOUT, self.socket.next())
                 .await
+                .map_err(|_| SdkError::Network("websocket response timed out".into()))?
                 .ok_or_else(|| {
                     SdkError::Network("websocket closed before a response arrived".into())
                 })?
@@ -155,8 +161,12 @@ pub struct HttpChannel {
 
 impl HttpChannel {
     pub fn new(server: &str, access_token: &str) -> Result<HttpChannel, SdkError> {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| SdkError::Network(format!("http client: {error}")))?;
         Ok(HttpChannel {
-            client: reqwest::Client::new(),
+            client,
             url: format!("{}/_wbf/v1/pack", server.trim_end_matches('/')),
             bearer: format!("Bearer {access_token}"),
         })
@@ -181,10 +191,16 @@ impl PackChannel for HttpChannel {
             .await
             .map_err(|error| SdkError::Network(format!("http pack body: {error}")))?;
         // 線上規格 §1：HTTP 一律 200，沒 token 401 但 body 仍是 pack。其他狀態碼是 server 之外的東西（proxy）在講話。
-        if status.as_u16() != 200 && status.as_u16() != 401 {
-            return Err(SdkError::Network(format!("http pack: status {status}")));
+        match status.as_u16() {
+            200 => Ok(Pack::decode(&body)?),
+            // body 是 pack 就照 pack 的 Error 走；不是（proxy 的 401 頁）也要是 Unauthorized，跟 WebSocket 升級被拒同一個分類。
+            401 => Pack::decode(&body).map_err(|_| SdkError::Server {
+                code: "Unauthorized".into(),
+                message: "http pack refused: token invalid".into(),
+                meta: serde_json::Value::Null,
+            }),
+            _ => Err(SdkError::Network(format!("http pack: status {status}"))),
         }
-        Ok(Pack::decode(&body)?)
     }
 }
 

@@ -35,6 +35,10 @@ pub struct FakeServer {
     pub drop_ack_once_at: Option<(u64, u32)>,
     /// 請求紀錄：(kind, subtype, seq)。
     pub requests: Vec<(Kind, u8, u32)>,
+    /// 學 wbfuwunel：`Create` 的回應標頭 `id` 填新發的上傳 id，不是抄請求的 0。
+    pub create_ack_header_is_upload_id: bool,
+    /// 故障：下一個回應的標頭 id 填這個值（模擬不抄回的 server），只觸發一次。
+    pub wrong_response_id_once: Option<u64>,
 }
 
 impl FakeServer {
@@ -81,12 +85,19 @@ impl FakeServer {
                 serde_json::json!({}),
             )),
         };
+        let is_create = request.kind == Kind::Upload && request.subtype == upload::CREATE;
+        let mut response_id = request.id;
+        if let Some(wrong) = self.wrong_response_id_once.take() {
+            response_id = wrong;
+        } else if is_create && self.create_ack_header_is_upload_id {
+            response_id = self.next_id;
+        }
         match result {
             Ok((meta, data)) => Pack {
                 kind: Kind::Control,
                 subtype: control::ACK,
                 flags: flags::IS_RESPONSE,
-                id: request.id,
+                id: response_id,
                 seq: request.seq,
                 meta: meta.to_string().into_bytes(),
                 data,
