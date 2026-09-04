@@ -3,7 +3,7 @@
 //! 規格書 §11 寫了 client 該驗什麼；每個段落一個測試。
 
 use serde::Deserialize;
-use wbf_wire::{crc32c, DecodeError, EncryptedFileInfo, Kind, Pack};
+use wbf_wire::{crc32c, DecodeError, EncodeError, EncryptedFileInfo, Kind, Pack};
 
 const VECTORS_JSON: &str = include_str!("../../../docs/design/wbf-vectors.json");
 
@@ -154,4 +154,19 @@ fn rejected_packs_fail_with_the_named_error() {
 fn encrypted_file_info_rejects_wrong_length() {
     assert_eq!(EncryptedFileInfo::from_bytes(&[0u8; 15]), None);
     assert_eq!(EncryptedFileInfo::from_bytes(&[0u8; 17]), None);
+}
+
+#[test]
+fn encode_rejects_reserved_flags() {
+    // 與 rejected[reserved_flag] 對稱：decode 會拒的 flags，encode 也不該做出來。
+    let pack = Pack {
+        kind: Kind::Upload,
+        subtype: wbf_wire::pack::upload::CHUNK,
+        flags: 0x80,
+        id: 0x1122_3344_5566_7788,
+        seq: 0,
+        meta: Vec::new(),
+        data: vec![0xde, 0xad, 0xbe, 0xef, 0x01],
+    };
+    assert_eq!(pack.encode(), Err(EncodeError::ReservedFlags(0x80)));
 }

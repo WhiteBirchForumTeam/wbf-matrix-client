@@ -161,6 +161,8 @@ impl std::error::Error for DecodeError {}
 pub enum EncodeError {
     MetaTooLong(usize),
     DataTooLong(usize),
+    /// `flags` 帶了沒定義的位元；對方 decode 會拒（`DecodeError::ReservedFlags`），所以這邊先擋。
+    ReservedFlags(u8),
 }
 
 impl std::fmt::Display for EncodeError {
@@ -168,6 +170,9 @@ impl std::fmt::Display for EncodeError {
         match self {
             EncodeError::MetaTooLong(len) => write!(out, "meta is {len} bytes, more than u32"),
             EncodeError::DataTooLong(len) => write!(out, "data is {len} bytes, more than u32"),
+            EncodeError::ReservedFlags(flags) => {
+                write!(out, "reserved flag bits set: {flags:#04x}")
+            }
         }
     }
 }
@@ -175,10 +180,15 @@ impl std::fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 impl Pack {
+    /// 驗的與 `decode` 一樣多：flags 的保留位元擋，subtype 對不對 kind 不擋（兩邊都不擋，那是組包層的事）。
+    ///
     /// Return:
     ///     Ok(Vec<u8>)        線上 bytes，長度 = 32 + meta.len() + data.len()
-    ///     Err(EncodeError)   meta 或 data 超過 u32
+    ///     Err(EncodeError)   meta 或 data 超過 u32，或 flags 帶了保留位元
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
+        if self.flags & !flags::KNOWN != 0 {
+            return Err(EncodeError::ReservedFlags(self.flags));
+        }
         let meta_len = u32::try_from(self.meta.len())
             .map_err(|_| EncodeError::MetaTooLong(self.meta.len()))?;
         let data_len = u32::try_from(self.data.len())
@@ -275,6 +285,10 @@ impl Pack {
 
 /// 呼叫者要先確認 `bytes.len() >= at + 4`。
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
+    debug_assert!(
+        bytes.len() >= at + 4,
+        "caller must bounds-check before read_u32"
+    );
     u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
 }
 
