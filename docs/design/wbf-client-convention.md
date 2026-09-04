@@ -61,6 +61,9 @@
 
 ## 4. 描述：`Create`／`Seal` 的 data
 
+**兩個都必帶、都不空**（維護者 2026-09-04 定）。它讓「有 `key` 但沒有房間事件」的人也能從 `Info` 重建參數，
+這是分享連結（mxc 加 `key`，不進房間就能看）的基礎；data 送空就沒有分享。正常的房間下載路徑只用 §5 的區塊，不讀它。
+
 明文是 JSON（UTF-8，不限鍵序）：
 
 ```json
@@ -80,7 +83,8 @@
 
 - 欄位與 §5 房間事件的區塊一模一樣，**只少 `key`**。兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕。
 - 塊數不寫：從 `file_size` 與 `chunk_size` 算得出來，server 的 `Info` 也會回。
-- `Seal` 帶的描述是最終版，整份覆蓋 `Create` 那份（線上規格 §3.4）；上傳者在 `Seal` 時知道多少就寫多少。
+- `Seal` 帶的描述是最終版，整份覆蓋 `Create` 那份（線上規格 §3.4）。`Seal` 是約定：固定大小與串流都一樣要帶，一條規則。
+  沒 `Seal` 的上傳不會留下半成品：server 在 `media_upload_ttl` 內沒收到新塊就整個清掉（線上規格 §3.5），所以描述不會因為少一次 `Seal` 而漂移。
 - 不認得的 key 忽略（與 Matrix 事件同一規則），本文新增選用欄位不用升 `v`。
 
 加密：同一把 `key`、`aad = "wbf-desc-v1"`，nonce 用保留的塊索引，`Create` 與 `Seal` 各一個，因為兩份內容不同，不能共用 nonce：
@@ -89,9 +93,6 @@
 |---|---|
 | `Create` 的 data | `nonce_base ‖ 0xFF_FF_FF_FF` |
 | `Seal` 的 data | `nonce_base ‖ 0xFF_FF_FF_FE` |
-
-為什麼描述還要存一份在 server：串流上傳（§6）在 `Create` 時不知道 `file_size` 與 `sha256`，`Seal` 才補得齊；
-而且拿到金鑰的人即使房間事件被撤回，仍能從 `Info` 重建參數。**它是副本，不是權威。**
 
 ## 5. 房間事件
 
@@ -147,8 +148,7 @@
 1. `Create`：`EncryptedFileInfo { file_size: 0, chunk_size: N, chunk_count: 0 }`（線上規格的串流哨兵），
    data = §4 的描述加密，**不含 `file_size`、不含 `sha256`**（不知道就不寫，§4）。此時描述只有 `v`、`chunk_size`、`nonce_base` 與知道的 `name`／`mimetype`。
 2. 每讀滿 `chunk_size` 明文就送一塊，索引遞增；最後一塊（可以不滿）帶 `IS_LAST`。加密方式與 §3 完全相同，沒有特例。
-3. **`Seal` 必須帶 data**：重新加密的完整描述，`file_size` 是真值、`sha256` 有算就放。server 拿它整份覆蓋 `Create` 那份。
-   串流上傳 `Seal` 不帶 data 是 client 的 bug：server 上會留一份沒有大小的描述。固定大小上傳的 `Seal` 帶不帶都可以。
+3. `Seal` 帶重新加密的完整描述（§4，一律必帶），`file_size` 是真值、`sha256` 有算就放。server 拿它整份覆蓋 `Create` 那份。
 4. 房間事件在 `Seal` 之後才送，區塊寫最終的 `file_size`。
 
 下載端看不出一個檔是不是串流傳的，也不需要：`Info` 的 `file_size` 在串流上傳會是 `null`（server 不知道），
