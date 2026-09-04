@@ -1,7 +1,7 @@
 # wbf-client v1 規劃：SDK crate 加 CLI，UI 之後
 
 > 狀態：**維護者 2026-09-04 同意**，開始實作。程式碼一律開分支送 PR 審查，不直接合到 `main`（維護者 2026-09-04 定）。
-> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。client 約定規格書草案在 `wbf-client-convention.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
+> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
 > 一個 repo（`crates/` 加 `apps/`）；v1 範圍是最小可用（登入、房間列表、收發文字、分塊上傳／下載媒體）；
 > matrix-rust-sdk 先用上游，需要改再 fork。
 >
@@ -62,7 +62,7 @@ wbf-client/
 
 ## 5. 事件格式與 client 之間的約定
 
-由 [wbf-client-convention.md](wbf-client-convention.md) 定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。
+由 [wbf-client-convention-for-chunk.md](wbf-client-convention-for-chunk.md) 定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。
 server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢：`wbf.` 違反 Matrix 的反向網域命名慣例，
 而規格的 `file` 欄位語意是 AES-CTR，放 ChaCha20 的參數進去是說謊。
 
@@ -86,4 +86,4 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 
 1. 這份規劃可以嗎？
 2. Forgejo 上建 `wbf-client` repo（我的 token 只有 wbfuwunel），並給 `claude` 帳號 write 權限；GitHub 的 `wbftw` 那邊要不要也建一份。
-3. 事件格式：見 `wbf-client-convention.md` §11。
+3. 事件格式：見 `wbf-client-convention-for-chunk.md` §11。
