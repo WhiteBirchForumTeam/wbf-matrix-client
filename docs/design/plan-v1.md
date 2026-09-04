@@ -1,6 +1,7 @@
 # wbf-client v1 規劃：SDK crate 加 CLI，UI 之後
 
-> 狀態：草案，2026-09-04，等維護者同意。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
+> 狀態：**維護者 2026-09-04 同意**，開始實作。程式碼一律開分支送 PR 審查，不直接合到 `main`（維護者 2026-09-04 定）。
+> 進度：§6 第 1 步 `wbf-wire` 做完（PR `feat/wbf-wire`）。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
 > 一個 repo（`crates/` 加 `apps/`）；v1 範圍是最小可用（登入、房間列表、收發文字、分塊上傳／下載媒體）；
 > matrix-rust-sdk 先用上游，需要改再 fork。
 >
@@ -67,8 +68,9 @@ wbf-client/
 
 ## 6. 順序
 
-0. （現在）repo 只有設計文件與 `vendor/matrix-rust-sdk` submodule，等維護者同意規劃。
-1. `wbf-wire` 加向量測試（一天）。
+0. repo 只有設計文件與 `vendor/matrix-rust-sdk` submodule，等維護者同意規劃。（2026-09-04 同意）
+1. `wbf-wire` 加向量測試。（2026-09-04 做完）向量檔是 `docs/design/wbf-vectors.json`，從 server repo 的同名檔**整份複製**，不手改；
+   server 規格改了就重新複製一次，`cargo test -p wbf-wire` 紅了就是漂移。工具鏈釘在 `rust-toolchain.toml`（1.95.0，與 submodule 的 `rust-version` 一致）。
 2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk，先用 access token 直接打本機 server），CLI 的 `upload`／`download`／`play`／續傳。
 3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`recv`。
 4. UI 框架決定與 `apps/desktop`。
