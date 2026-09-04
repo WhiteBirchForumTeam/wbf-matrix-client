@@ -1,0 +1,187 @@
+{
+  "format_version": 1,
+  "convention_v": 1,
+  "files": [
+    {
+      "name": "chacha20-poly1305 40 bytes in 16-byte chunks",
+      "cipher": "chacha20-poly1305",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "nonce_base_hex": "a0a1a2a3a4a5a6a7",
+      "chunk_size": 16,
+      "plaintext_hex": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d14",
+      "chunks": [
+        {
+          "index": 0,
+          "nonce_hex": "a0a1a2a3a4a5a6a700000000",
+          "plain_len": 16,
+          "data_hex": "1931f791255470552de721132b894528cc3b00555d9cc6248b3f51d526559f0c"
+        },
+        {
+          "index": 1,
+          "nonce_hex": "a0a1a2a3a4a5a6a700000001",
+          "plain_len": 16,
+          "data_hex": "95bcf2e0b69787f35f5a8bb7603a9f2109b2c64f7b85821d74ac7008eb4f63ca"
+        },
+        {
+          "index": 2,
+          "nonce_hex": "a0a1a2a3a4a5a6a700000002",
+          "plain_len": 8,
+          "data_hex": "01d277149d6c23d87f4112506b88ee6b000dd420968e3a74"
+        }
+      ],
+      "create_description_json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"nonce_base\":\"oKGio6Slpqc=\",\"chunk_size\":16,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\"}",
+      "create_description_data_hex": "0366286586de91a0add08089926a8858827f03bc26eede9bc50b13dfb8371b5ec90adbd7b19da2eb2c1dd2dba0b7ee69a3bbfd576931f690b529f7ea4b23b6d7bef67e50ba67bc4885c29fd79d0cd43e52f2d8f5c41de33e7e9d37ba1a1b58d3862c9e1794793e69f3f39d44e62501c088f4722089a0677562a36ee599c1105083d278aa15cc59ed192c2bb39bab9532ab1b799ab7f9b84ff212",
+      "seal_description_json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"nonce_base\":\"oKGio6Slpqc=\",\"chunk_size\":16,\"file_size\":40,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\",\"sha256\":\"0873681bd0f82f74733bd4b4639467130c6ff71a09281210ed60c3dc95d6aa90\"}",
+      "seal_description_data_hex": "dadcfa4852f00076097e0cda72b7be0635f17cb2627243da4937d08d22abf974d6f65446b5d189f67fe95d17b8c40e0601907fc3967eb65b6bdbbe71e6b2a20209368f13157afed1ea553876680d3eab1cc550ca12e2ad30080c475b6d6c323d48747537679ffb20a2d3415919eb01b8aa1943f9cea5913f4da864fbcfdd9707c512e675a8fc082c4c1b1e0f18309f1d5258afcf5ae9232e1819a1ffb028f8f43d840f326d83e1a1e6cc0ed12cac93048088d950c08b6a006c58ae0c3188dba82aabd62489a7f2f5f8776766f5652762eb62111d8ca8dd1798dd35c2b5e39975b8ec6e1d2e02bc16f403317569ed568ea915ba047a",
+      "event_block_json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"nonce_base\":\"oKGio6Slpqc=\",\"chunk_size\":16,\"file_size\":40,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\",\"sha256\":\"0873681bd0f82f74733bd4b4639467130c6ff71a09281210ed60c3dc95d6aa90\"}"
+    },
+    {
+      "name": "aes-256-gcm 40 bytes in 16-byte chunks",
+      "cipher": "aes-256-gcm",
+      "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "nonce_base_hex": "a0a1a2a3a4a5a6a7",
+      "chunk_size": 16,
+      "plaintext_hex": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d14",
+      "chunks": [
+        {
+          "index": 0,
+          "nonce_hex": "a0a1a2a3a4a5a6a700000000",
+          "plain_len": 16,
+          "data_hex": "fd53ffb04e145f11ec3d93c9db2850c6a14d323a7751400459acb442934cf37e"
+        },
+        {
+          "index": 1,
+          "nonce_hex": "a0a1a2a3a4a5a6a700000001",
+          "plain_len": 16,
+          "data_hex": "40f9d6acfbc6f575680208f9ad43db7e4ca94af81e021301a0c79dc0987fb45a"
+        },
+        {
+          "index": 2,
+          "nonce_hex": "a0a1a2a3a4a5a6a700000002",
+          "plain_len": 8,
+          "data_hex": "357a547959620c96558563f7938dac59ca2ec5348d55f780"
+        }
+      ],
+      "create_description_json": "{\"v\":1,\"cipher\":\"aes-256-gcm\",\"nonce_base\":\"oKGio6Slpqc=\",\"chunk_size\":16,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\"}",
+      "create_description_data_hex": "58382397a8f69c8f79106a05f8eb6e5045c8dae2ca496d79f4eaaf86b44aa3eb7539056731a1ead49e69ae9257fd5c12c5f54407de4a4ec50c5c5bb13819631c7e8e4252851eae758fa22f04c321c2eff4e89dbcb1aebca845a12ddb59ec03c2e2ed45f2da66e42cd2725b456e497b037037cc982f56e98417e53631e06df2fbb19f1b781210f2b2d1370475e2238877ad5540cb",
+      "seal_description_json": "{\"v\":1,\"cipher\":\"aes-256-gcm\",\"nonce_base\":\"oKGio6Slpqc=\",\"chunk_size\":16,\"file_size\":40,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\",\"sha256\":\"0873681bd0f82f74733bd4b4639467130c6ff71a09281210ed60c3dc95d6aa90\"}",
+      "seal_description_data_hex": "c7d9b2564d742aae7cb5d5efc220c2c805e2f8e6f76672d951b9cbddd993754239f41e45eb1a144e7faec2289a28374261313ee2af468c119162d27cf4190b73db40c1787c4e1d562d2547dd1452333ac6c311b95acd44896ee057b41fffc0ac38c00b9257a2a86e02309be55a92663f1d28b7ac88424b5afecf55a6e2a4306bf47a71a0f8f88ac9bec767b366c87bf246b7b189afc15169dfb62c1610b1dcc20ed49c4b5c7a545494e0ea506006e94162b9bf11b999e8a7982725621b58f26908c3915d3140c2082fcce5ddc0d530831009e11cc2cdc8d3e27a9e4d0ed57ddc99ab099a1b686dea9218e65619784e",
+      "event_block_json": "{\"v\":1,\"cipher\":\"aes-256-gcm\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"nonce_base\":\"oKGio6Slpqc=\",\"chunk_size\":16,\"file_size\":40,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\",\"sha256\":\"0873681bd0f82f74733bd4b4639467130c6ff71a09281210ed60c3dc95d6aa90\"}"
+    },
+    {
+      "name": "none 40 bytes in 16-byte chunks",
+      "cipher": "none",
+      "key_hex": "",
+      "nonce_base_hex": "",
+      "chunk_size": 16,
+      "plaintext_hex": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d14",
+      "chunks": [
+        {
+          "index": 0,
+          "nonce_hex": "",
+          "plain_len": 16,
+          "data_hex": "030a11181f262d343b424950575e656c"
+        },
+        {
+          "index": 1,
+          "nonce_hex": "",
+          "plain_len": 16,
+          "data_hex": "737a81888f969da4abb2b9c0c7ced5dc"
+        },
+        {
+          "index": 2,
+          "nonce_hex": "",
+          "plain_len": 8,
+          "data_hex": "e3eaf1f8ff060d14"
+        }
+      ],
+      "create_description_json": "{\"v\":1,\"cipher\":\"none\",\"chunk_size\":16,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\"}",
+      "create_description_data_hex": "7b2276223a312c22636970686572223a226e6f6e65222c226368756e6b5f73697a65223a31362c226e616d65223a2273616d706c652e62696e222c226d696d6574797065223a226170706c69636174696f6e2f6f637465742d73747265616d227d",
+      "seal_description_json": "{\"v\":1,\"cipher\":\"none\",\"chunk_size\":16,\"file_size\":40,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\",\"sha256\":\"0873681bd0f82f74733bd4b4639467130c6ff71a09281210ed60c3dc95d6aa90\"}",
+      "seal_description_data_hex": "7b2276223a312c22636970686572223a226e6f6e65222c226368756e6b5f73697a65223a31362c2266696c655f73697a65223a34302c226e616d65223a2273616d706c652e62696e222c226d696d6574797065223a226170706c69636174696f6e2f6f637465742d73747265616d222c22736861323536223a2230383733363831626430663832663734373333626434623436333934363731333063366666373161303932383132313065643630633364633935643661613930227d",
+      "event_block_json": "{\"v\":1,\"cipher\":\"none\",\"chunk_size\":16,\"file_size\":40,\"name\":\"sample.bin\",\"mimetype\":\"application/octet-stream\",\"sha256\":\"0873681bd0f82f74733bd4b4639467130c6ff71a09281210ed60c3dc95d6aa90\"}"
+    }
+  ],
+  "seek": [
+    {
+      "chunk_size": 65536,
+      "pos": 0,
+      "index": 0,
+      "offset": 0
+    },
+    {
+      "chunk_size": 65536,
+      "pos": 65535,
+      "index": 0,
+      "offset": 65535
+    },
+    {
+      "chunk_size": 65536,
+      "pos": 65536,
+      "index": 1,
+      "offset": 0
+    },
+    {
+      "chunk_size": 65536,
+      "pos": 71680,
+      "index": 1,
+      "offset": 6144
+    },
+    {
+      "chunk_size": 1048576,
+      "pos": 150000000,
+      "index": 143,
+      "offset": 53632
+    }
+  ],
+  "rejected_blocks": [
+    {
+      "name": "v 2",
+      "checked_as": "event_block",
+      "json": "{\"v\":2,\"cipher\":\"chacha20-poly1305\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"nonce_base\":\"oKGio6SlpqE=\",\"chunk_size\":16,\"file_size\":40}",
+      "error": "UnknownVersion"
+    },
+    {
+      "name": "encrypted without key",
+      "checked_as": "event_block",
+      "json": "{\"v\":1,\"cipher\":\"aes-256-gcm\",\"nonce_base\":\"oKGio6SlpqE=\",\"chunk_size\":16,\"file_size\":40}",
+      "error": "MissingKey"
+    },
+    {
+      "name": "plaintext with key",
+      "checked_as": "event_block",
+      "json": "{\"v\":1,\"cipher\":\"none\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"chunk_size\":16,\"file_size\":40}",
+      "error": "UnexpectedKey"
+    },
+    {
+      "name": "encrypted without nonce_base",
+      "checked_as": "event_block",
+      "json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"chunk_size\":16,\"file_size\":40}",
+      "error": "MissingNonceBase"
+    },
+    {
+      "name": "event block without file_size",
+      "checked_as": "event_block",
+      "json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"nonce_base\":\"oKGio6SlpqE=\",\"chunk_size\":16}",
+      "error": "MissingFileSize"
+    },
+    {
+      "name": "chunk_size 0",
+      "checked_as": "event_block",
+      "json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"nonce_base\":\"oKGio6SlpqE=\",\"chunk_size\":0,\"file_size\":40}",
+      "error": "ChunkSizeZero"
+    },
+    {
+      "name": "description carrying key",
+      "checked_as": "description",
+      "json": "{\"v\":1,\"cipher\":\"chacha20-poly1305\",\"key\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"nonce_base\":\"oKGio6SlpqE=\",\"chunk_size\":16}",
+      "error": "UnexpectedKey"
+    },
+    {
+      "name": "unknown cipher",
+      "checked_as": "event_block",
+      "json": "{\"v\":1,\"cipher\":\"aes-128-gcm\",\"chunk_size\":16,\"file_size\":40}",
+      "error": "ParseError"
+    }
+  ]
+}

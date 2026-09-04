@@ -216,9 +216,14 @@ Read(mxc, chunk=i) → ct_i → 解密 → pt_i[off..]
 
 ## 9. 測試向量（第 2 步產生）
 
-本文的可執行版本：`docs/design/wbf-client-vectors.json`，由 `wbf-sdk` 的實作產生，內容：固定 `key`、`nonce_base`、一個小檔的
-每塊 `ct_i`、描述密文、對應的房間事件區塊。`wbf-sdk` 每次測試對著它跑，任何其他語言的 client 也能拿去驗。
-現在還沒有；做 wbf-sdk 時一起產生，並在本節填入路徑。
+本文的可執行版本：[`wbf-client-vectors.json`](wbf-client-vectors.json)，由 `crates/wbf-sdk/tests/client_vectors.rs` 產生
+（`WBF_WRITE_CLIENT_VECTORS=1 cargo test -p wbf-sdk --test client_vectors`）。內容：三個 `cipher` 各一個檔，固定 `key`、
+`nonce_base`、40 byte 明文切 16 byte 一塊（三塊，最後一塊 8 byte）、每塊的 nonce 與密文、`Create` 與 `Seal` 兩份描述的
+JSON 與密文、對應的事件區塊；§7 的 seek 算例（含 CLI 規格 §3.3.1 的 70K 那個）；一組必須被拒絕的區塊樣本，`error` 是拒絕的原因。
+
+它證明的是「實作沒有變」，不是「實作是對的」：後者靠 `tests/unit.rs` 裡對 RFC 8439 §2.8.2 與 NIST GCM Test Case 16 的兩條，
+確認底下的 AEAD 就是標準的那個；nonce、AAD、索引的構造則要讀本文的人對著 `chunk_crypto.rs` 看。
+改本文時：先改程式、重新產生、看 diff 是不是預期的、再 commit。任何其他語言的 client 拿這份對得上，就能跟 wbf-sdk 互解。
 
 ## 10. 明確不做的
 
