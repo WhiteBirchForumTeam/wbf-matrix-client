@@ -34,7 +34,10 @@ fn chacha20_poly1305_matches_rfc_8439() {
     );
 }
 
-/// NIST GCM 規格附錄 Test Case 16（AES-256、帶 AAD）。
+/// McGrew & Viega《The Galois/Counter Mode of Operation (GCM)》（NIST 收錄的 GCM 提案）附錄 B 的 Test Case 16。
+/// 附錄 B 的編號：1–6 是 AES-128、7–12 是 AES-192、**13–18 是 AES-256**；TC16 是 TC4 的輸入配 256-bit 金鑰
+/// `feffe992…8308` 重複兩次，密文 `522dc1f0…`、標籤 `76fc6ece…`。同輸入配 128-bit 金鑰是 TC4（密文 `42831ec2…`），
+/// 不是這一條。
 #[test]
 fn aes_256_gcm_matches_nist_test_case_16() {
     let key: [u8; 32] = unhex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")

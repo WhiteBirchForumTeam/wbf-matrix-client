@@ -437,7 +437,7 @@ fn descriptions_seal_and_open() {
             FileCipher::from_event_block(&event_block).expect("valid"),
             file_cipher
         );
-        if file_cipher.cipher.is_encrypting() {
+        if file_cipher.cipher().is_encrypting() {
             assert!(file.event_block_json.contains("\"key\""));
             assert!(!file.seal_description_json.contains("\"key\""));
         } else {

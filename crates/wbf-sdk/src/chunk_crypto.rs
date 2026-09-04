@@ -82,14 +82,25 @@ impl std::fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
-/// 一個檔的加密參數：`cipher`、`key`、`nonce_base`、`chunk_size`。明文模式沒有 key 與 nonce_base。
-/// 從事件區塊來（下載）或隨機產生（上傳）。
+/// 一個檔的加密參數。從事件區塊來（下載）或隨機產生（上傳）。
+///
+/// 「加密模式一定有 key 與 nonce_base、明文模式一定沒有」寫成型別（`Mode`），不是靠建構函數記得：
+/// 加密模式缺 key 的狀態表示不出來，所以塊不可能被靜默當明文送出。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileCipher {
-    pub cipher: Cipher,
-    key: Option<[u8; KEY_LEN]>,
-    nonce_base: Option<[u8; NONCE_BASE_LEN]>,
     pub chunk_size: u32,
+    mode: Mode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Mode {
+    /// `Cipher::None`：塊就是明文、描述就是 JSON。
+    Plain,
+    Encrypted {
+        cipher: Cipher,
+        key: [u8; KEY_LEN],
+        nonce_base: [u8; NONCE_BASE_LEN],
+    },
 }
 
 impl FileCipher {
@@ -99,19 +110,29 @@ impl FileCipher {
     ///     block: 事件區塊
     /// Return:
     ///     Ok(FileCipher)
-    ///     Err(BlockError)   `check_as_event_block` 不過
+    ///     Err(BlockError)   `check_as_event_block` 不過（含加密模式缺 `key`／`nonce_base`）
     pub fn from_event_block(block: &ChunkedBlock) -> Result<FileCipher, BlockError> {
         block.check_as_event_block()?;
+        // check_as_event_block 已經擋掉壞組合；這裡的拒絕分支是再擋一次，不靠它。
+        let mode = match (block.cipher, block.key, block.nonce_base) {
+            (Cipher::None, None, None) => Mode::Plain,
+            (Cipher::None, Some(_), _) => return Err(BlockError::UnexpectedKey),
+            (Cipher::None, None, Some(_)) => return Err(BlockError::UnexpectedNonceBase),
+            (cipher, Some(key), Some(nonce_base)) => Mode::Encrypted {
+                cipher,
+                key,
+                nonce_base,
+            },
+            (_, None, _) => return Err(BlockError::MissingKey),
+            (_, Some(_), None) => return Err(BlockError::MissingNonceBase),
+        };
         Ok(FileCipher {
-            cipher: block.cipher,
-            key: block.key,
-            nonce_base: block.nonce_base,
             chunk_size: block.chunk_size,
+            mode,
         })
     }
 
     /// 上傳端：新的一檔，`key` 與 `nonce_base` 由 CSPRNG 產生。同一個檔重傳要再叫一次（約定 §2）。
-    /// 明文模式（`Cipher::None`）兩者都是 None。
     ///
     /// Args:
     ///     cipher: example: Cipher::default_for_this_machine()
@@ -121,10 +142,8 @@ impl FileCipher {
     pub fn generate(cipher: Cipher, chunk_size: u32) -> FileCipher {
         if !cipher.is_encrypting() {
             return FileCipher {
-                cipher,
-                key: None,
-                nonce_base: None,
                 chunk_size,
+                mode: Mode::Plain,
             };
         }
         let mut key = [0u8; KEY_LEN];
@@ -132,35 +151,32 @@ impl FileCipher {
         getrandom::getrandom(&mut key).expect("OS CSPRNG available");
         getrandom::getrandom(&mut nonce_base).expect("OS CSPRNG available");
         FileCipher {
-            cipher,
-            key: Some(key),
-            nonce_base: Some(nonce_base),
             chunk_size,
+            mode: Mode::Encrypted {
+                cipher,
+                key,
+                nonce_base,
+            },
         }
     }
 
-    /// 測試與向量用：固定的參數。
+    /// 測試與向量用：固定的參數。`Cipher::None` 時 `key`／`nonce_base` 被忽略。
     pub fn with_fixed(
         cipher: Cipher,
         key: [u8; KEY_LEN],
         nonce_base: [u8; NONCE_BASE_LEN],
         chunk_size: u32,
     ) -> FileCipher {
-        if cipher.is_encrypting() {
-            FileCipher {
+        let mode = if cipher.is_encrypting() {
+            Mode::Encrypted {
                 cipher,
-                key: Some(key),
-                nonce_base: Some(nonce_base),
-                chunk_size,
+                key,
+                nonce_base,
             }
         } else {
-            FileCipher {
-                cipher,
-                key: None,
-                nonce_base: None,
-                chunk_size,
-            }
-        }
+            Mode::Plain
+        };
+        FileCipher { chunk_size, mode }
     }
 
     /// 上傳端：把參數寫成事件區塊（約定 §5），其餘欄位呼叫者填。
@@ -170,11 +186,19 @@ impl FileCipher {
     /// Return:
     ///     ChunkedBlock  `name`／`mimetype`／`sha256` 都是 None
     pub fn to_event_block(&self, file_size: u64) -> ChunkedBlock {
+        let (cipher, key, nonce_base) = match &self.mode {
+            Mode::Plain => (Cipher::None, None, None),
+            Mode::Encrypted {
+                cipher,
+                key,
+                nonce_base,
+            } => (*cipher, Some(*key), Some(*nonce_base)),
+        };
         ChunkedBlock {
             v: crate::chunk_block::CONVENTION_V,
-            cipher: self.cipher,
-            key: self.key,
-            nonce_base: self.nonce_base,
+            cipher,
+            key,
+            nonce_base,
             chunk_size: self.chunk_size,
             file_size: Some(file_size),
             name: None,
@@ -184,9 +208,21 @@ impl FileCipher {
     }
 
     /// Return:
+    ///     Cipher  明文模式回 `Cipher::None`
+    pub fn cipher(&self) -> Cipher {
+        match &self.mode {
+            Mode::Plain => Cipher::None,
+            Mode::Encrypted { cipher, .. } => *cipher,
+        }
+    }
+
+    /// Return:
     ///     Option<[u8; 8]>  加密模式有，明文模式 None
     pub fn nonce_base(&self) -> Option<[u8; NONCE_BASE_LEN]> {
-        self.nonce_base
+        match &self.mode {
+            Mode::Plain => None,
+            Mode::Encrypted { nonce_base, .. } => Some(*nonce_base),
+        }
     }
 
     /// 約定 §3：`ct_i = AEAD(key, nonce_base ‖ u32_be(i), "wbf-chunk-v1", pt_i)`。明文模式回 `plain` 的複本。
@@ -279,27 +315,32 @@ impl FileCipher {
     /// Return:
     ///     usize  加密模式 `plain_len + 16`，明文模式 `plain_len`
     pub fn sealed_len(&self, plain_len: usize) -> usize {
-        if self.cipher.is_encrypting() {
-            plain_len + TAG_LEN
-        } else {
-            plain_len
+        match self.mode {
+            Mode::Plain => plain_len,
+            Mode::Encrypted { .. } => plain_len + TAG_LEN,
         }
     }
 
     fn seal_with_index(&self, index: u32, aad: &[u8], plain: &[u8]) -> Vec<u8> {
-        let (Some(key), Some(nonce_base)) = (self.key, self.nonce_base) else {
-            return plain.to_vec();
-        };
-        self.cipher
-            .seal(&key, &build_nonce(nonce_base, index), aad, plain)
+        match &self.mode {
+            Mode::Plain => plain.to_vec(),
+            Mode::Encrypted {
+                cipher,
+                key,
+                nonce_base,
+            } => cipher.seal(key, &build_nonce(*nonce_base, index), aad, plain),
+        }
     }
 
     fn open_with_index(&self, index: u32, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
-        let (Some(key), Some(nonce_base)) = (self.key, self.nonce_base) else {
-            return Some(sealed.to_vec());
-        };
-        self.cipher
-            .open(&key, &build_nonce(nonce_base, index), aad, sealed)
+        match &self.mode {
+            Mode::Plain => Some(sealed.to_vec()),
+            Mode::Encrypted {
+                cipher,
+                key,
+                nonce_base,
+            } => cipher.open(key, &build_nonce(*nonce_base, index), aad, sealed),
+        }
     }
 }
 

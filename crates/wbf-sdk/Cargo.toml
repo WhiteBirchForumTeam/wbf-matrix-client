@@ -7,7 +7,6 @@ rust-version.workspace = true
 description = "wbfuwunel 的 client SDK。第 2 步第 1 個 PR：每塊 AEAD、描述加密、事件區塊（約定規格書 §2–§4、§7）。"
 
 [dependencies]
-wbf-wire = { path = "../wbf-wire" }
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 cpufeatures = "0.2"
