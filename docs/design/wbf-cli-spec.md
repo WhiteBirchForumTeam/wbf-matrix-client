@@ -179,11 +179,16 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 `<file>.wbf-upload.json`，放在被上傳的檔旁邊；串流模式沒有（stdin 沒得重來）。
 
 ```json
-{ "server": "…", "user_id": "@a:localhost", "upload_id": 1234605616436508552, "mxc": "…",
-  "cipher": "…", "key": "…", "nonce_base": "…", "chunk_size": 65536, "file_size": 132056, "chunk_count": 3 }
+{ "server": "…", "user_id": "@a:localhost", "upload_id": 1234605616436508552, "mxc": "…", "chunk_max_bytes": 69632,
+  "block": { "v": 1, "cipher": "…", "key": "…", "nonce_base": "…", "chunk_size": 65536, "file_size": 132056,
+             "name": "video.mkv", "mimetype": "video/x-matroska" } }
 ```
 
-含 `key`，同 manifest 的保護。Seal 成功或 `abort` 後刪。
+- `block` 與 manifest 的 `block` 同一個形狀（SDK 的 `ChunkedBlock`），只是還沒有 `sha256`；Seal 時填上就變成 manifest 的 `block`。
+  塊數不存：從 `file_size` 與 `chunk_size` 算得出來。這是 SDK 的 `UploadState`，`Create` 一回來就寫檔。
+- 含 `key`，同 manifest 的保護。Seal 成功或 `abort` 後刪。
+- 續傳時 SDK 對 server 的 `Status` 有兩種修正：狀態檔比 server 舊（重送已收的塊）server 回冪等 Ack、跳到 `received`；
+  比 server 新（從沒收到的塊開始）server 回 `OutOfOrder`、跳回 `expected_seq`。所以 CLI 只要「從 `Status.received` 送」，不必自己算。
 
 ## 7. Session 檔
 
