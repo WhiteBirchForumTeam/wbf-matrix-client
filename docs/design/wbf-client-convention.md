@@ -22,10 +22,10 @@
 | 明文塊 `pt_i` | 原檔第 `i` 塊，`i` 從 0 起；長度 = `chunk_size`，最後一塊 = `file_size − i × chunk_size` |
 | 密文塊 `ct_i` | `pt_i` 加密後，長度 = `len(pt_i) + 16`；就是線上規格 `Chunk` 的 data |
 | 描述 | 檔名、MIME、大小等；明文是 §4 的 JSON，加密後是線上規格 `Create`／`Seal` 的 data，`Info` 原樣還回 |
-| 區塊 | 房間事件 `content` 裡 `org.wbftw.chunked` 那個物件（§5） |
+| 區塊 | 房間事件 `content` 裡 `org.wbftw.wbfuwunel.chunked` 那個物件（§5） |
 
-命名空間 `org.wbftw` 照 Matrix 規格的反向網域慣例，對應組織 wbftw（維護者 2026-09-04 定：這個 repo 是組織的，
-`zooy.cc` 只是私人 server，不拿來當名義）。
+命名是 `org.wbftw.wbfuwunel.<名字>`：`org.wbftw` 是組織（Matrix 的反向網域慣例，維護者 2026-09-04 定；`zooy.cc` 只是私人 server，
+不拿來當名義），`wbfuwunel` 是專案，最後一段才是名字，與 `org.matrix.msc1767.text` 同款。
 
 ## 2. 每檔的參數
 
@@ -103,10 +103,10 @@
 {
   "type": "m.room.message",
   "content": {
-    "msgtype": "org.wbftw.file",
+    "msgtype": "org.wbftw.wbfuwunel.file",
     "body": "video.mkv（WBF 分塊檔，需要 WBF client 才能開）",
     "url": "mxc://example.org/1122334455667788",
-    "org.wbftw.chunked": {
+    "org.wbftw.wbfuwunel.chunked": {
       "v": 1,
       "cipher": "chacha20-poly1305",
       "key": "<base64, 32 bytes>",
@@ -125,12 +125,12 @@
 
 | key | 必要？ | example | 備註 |
 |---|---|---|---|
-| `msgtype` | 必要 | `"org.wbftw.file"` | 舊 client 不認得就顯示 `body` |
+| `msgtype` | 必要 | `"org.wbftw.wbfuwunel.file"` | 舊 client 不認得就顯示 `body` |
 | `body` | 必要 | `"video.mkv（WBF 分塊檔，需要 WBF client 才能開）"` | 給舊 client 看的一行字。不當權威，檔名以區塊的 `name` 為準 |
 | `url` | 必要 | `"mxc://example.org/1122334455667788"` | `Create` Ack 回的 `mxc`（media id = 上傳 id 的 16 位小寫 hex） |
-| `org.wbftw.chunked` | 必要 | 見下表 | 區塊。缺就當解不開的檔 |
+| `org.wbftw.wbfuwunel.chunked` | 必要 | 見下表 | 區塊。缺就當解不開的檔 |
 
-區塊 `org.wbftw.chunked` 的欄位：§4 描述的每一個 key（同樣的必要／選用規則，但 `file_size` 在事件裡**必要**，事件在 `Seal` 之後才送，一定知道），再加：
+區塊 `org.wbftw.wbfuwunel.chunked` 的欄位：§4 描述的每一個 key（同樣的必要／選用規則，但 `file_size` 在事件裡**必要**，事件在 `Seal` 之後才送，一定知道），再加：
 
 | key | 必要？ | example | 備註 |
 |---|---|---|---|
@@ -138,7 +138,7 @@
 | `key` | 必要 | `"<base64, 32 bytes>"` | 每檔一把。**只在這裡**，不進描述、不進 server 看得到的地方 |
 
 - **只在 E2EE 房間送**。`key` 靠 Megolm 保護，這正是 Matrix 把附件金鑰放事件裡的做法；非加密房間裡送這個事件等於把金鑰公開，client 必須拒送。
-- 認得 `msgtype` 但 `org.wbftw.chunked` 缺、`v` 不認得、`cipher` 不是 `chacha20-poly1305` → 當成解不開的檔，顯示 `body`，不下載。
+- 認得 `msgtype` 但 `org.wbftw.wbfuwunel.chunked` 缺、`v` 不認得、`cipher` 不是 `chacha20-poly1305` → 當成解不開的檔，顯示 `body`，不下載。
 - 縮圖：沒有（密文做不出來），事件不帶 `info.thumbnail_*`。
 - `m.video`／`m.audio` 的 `info.duration` 這類明文元資料，v1 不放；要放就放進區塊，之後升 `v`。
 
