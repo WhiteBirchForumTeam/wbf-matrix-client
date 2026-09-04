@@ -34,7 +34,7 @@
 | `key` | 每檔一把，32 byte，CSPRNG | **只放房間事件的區塊**。不進描述、不進任何 server 看得到的地方 |
 | `nonce_base` | 每檔一個，8 byte，CSPRNG | 區塊與描述都有 |
 | `chunk_size` | 上傳者定，必須在線上規格允許的範圍（預設 4 KiB 到 16 MiB）；建議 64 KiB（一般）或 1 MiB（影片） | 區塊與描述都有；**必須等於** `Create` 的 `EncryptedFileInfo.chunk_size`（`Create` 送 0 讓 server 挑預設時，Ack 回的 `chunk_size` 才是真值，事件與描述要寫那個） |
-| `file_size` | 明文總長 | 區塊與描述都有；固定大小上傳時**必須等於** `EncryptedFileInfo.file_size` |
+| `file_size` | 明文總長 | 區塊一定有；描述在知道之後才有（串流上傳要到 `Seal`，§4、§6）。固定大小上傳時**必須等於** `EncryptedFileInfo.file_size` |
 
 同一把 `key` 加同一個 `nonce_base` 只能用在**一個**上傳。重傳同一個檔要重新產生兩者。
 理由：AEAD 的 nonce 重用是致命的，而「同一個檔傳兩次」是最容易踩到的路。
@@ -46,7 +46,7 @@
 - `aad_i = "wbf-chunk-v1"`（ASCII，12 byte，不含結尾 0）。用途是把塊密文與描述密文（§4）的網域分開；塊索引已經在 nonce 裡，不重複放。
 - `ct_i = ChaCha20Poly1305(key, nonce_i, aad_i, pt_i)`，標籤附在密文後（crate `chacha20poly1305` 的預設）。
 
-塊索引 `i` 的上限是 `0xFFFF_FFFE`：`0xFFFF_FFFF` 保留給描述（§4）。線上規格的 `chunk_count` 是 u32，
+塊索引 `i` 的上限是 `0xFFFF_FFFD`：`0xFFFF_FFFF` 與 `0xFFFF_FFFE` 保留給描述（`Create` 與 `Seal` 各一個，§4）。線上規格的 `chunk_count` 是 u32，
 實際上單檔上限（預設 10 GiB）遠早於此。
 
 ### 3.1 解密端必須做的檢查（全部 fail closed，任一不過就整個檔視為壞的，不顯示部分內容）
@@ -76,7 +76,7 @@
 - `sha256` 選用；有就是整檔明文的十六進位小寫。
 - base64 一律 RFC 4648 標準字母表、**帶** `=` padding。
 
-加密：同一把 `key`，`nonce_desc = nonce_base ‖ 0xFF_FF_FF_FF`，`aad = "wbf-desc-v1"`。密文放 `Create` 的 data。
+加密：同一把 `key`，`nonce_desc = nonce_base ‖ 0xFF_FF_FF_FF`，`aad = "wbf-desc-v1"`。密文放 `Create` 的 data；`Seal` 再帶一次就用同一個 nonce 與 AAD 重新加密（內容不同、nonce 相同，對 AEAD 是 nonce 重用）—— 所以**`Seal` 那份改用 `0xFF_FF_FF_FE`**：`Create` 用 `…FF_FF_FF_FF`，`Seal` 用 `…FF_FF_FF_FE`，塊索引上限因此是 `0xFFFF_FFFD`。
 
 為什麼描述還要存一份在 server：串流上傳（§6）在 `Create` 時不知道 `file_size` 與 `sha256`，`Seal` 才補得齊；
 而且拿到金鑰的人即使房間事件被撤回，仍能從 `Info` 重建參數。**它是副本，不是權威。**
