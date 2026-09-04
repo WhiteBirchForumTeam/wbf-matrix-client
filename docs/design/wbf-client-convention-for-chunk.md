@@ -33,8 +33,20 @@
 |---|---|---|
 | `key` | 每檔一把，32 byte，CSPRNG | **只放房間事件的區塊**。不進描述、不進任何 server 看得到的地方 |
 | `nonce_base` | 每檔一個，8 byte，CSPRNG | 區塊與描述都有 |
-| `chunk_size` | 上傳者定，必須在線上規格允許的範圍（預設 4 KiB 到 16 MiB）；建議 64 KiB（一般）或 1 MiB（影片） | 區塊與描述都有；**必須等於** `Create` 的 `EncryptedFileInfo.chunk_size`（`Create` 送 0 讓 server 挑預設時，Ack 回的 `chunk_size` 才是真值，事件與描述要寫那個） |
+| `chunk_size` | 依**明文大小**選，見下表；必須在線上規格允許的範圍（預設 4 KiB 到 16 MiB） | 區塊與描述都有；**必須等於** `Create` 的 `EncryptedFileInfo.chunk_size`（`Create` 送 0 讓 server 挑預設時，Ack 回的 `chunk_size` 才是真值，事件與描述要寫那個） |
 | `file_size` | 明文總長 | 區塊一定有；描述在知道之後才有（串流上傳要到 `Seal`，§4、§6）。固定大小上傳時**必須等於** `EncryptedFileInfo.file_size` |
+
+`chunk_size` 的選法（維護者 2026-09-04 定）：
+
+| 明文大小 | `chunk_size` |
+|---|---|
+| < 50 MiB | 64 KiB |
+| ≥ 50 MiB | 1 MiB |
+| 串流（大小未知） | 1 MiB |
+
+只看大小、不看類型：`chunk_size` 與 `file_size` 都是 server 看得到的明文，依類型選就等於把類型寫在明文欄位上；
+依大小選則沒有多洩任何東西，`file_size` 本來就在那裡。下載端不假設這張表：塊大小一律以區塊的 `chunk_size` 為準，
+舊版或別的 client 用了不同的值也解得開。
 
 同一把 `key` 加同一個 `nonce_base` 只能用在**一個**上傳。重傳同一個檔要重新產生兩者。
 理由：AEAD 的 nonce 重用是致命的，而「同一個檔傳兩次」是最容易踩到的路。
@@ -187,4 +199,4 @@ Read(mxc, chunk=i) → ct_i → 解密 → pt_i[off..]
 
 1. ~~命名空間~~ 定了：`org.wbftw`（維護者 2026-09-04）。
 2. 「只在 E2EE 房間送」硬擋（§5）可以嗎。
-3. `chunk_size` 的預設值：一般檔 64 KiB、影片 1 MiB（§2），還是全部一種。
+3. ~~`chunk_size`~~ 定了：依大小，50 MiB 以下 64 KiB、以上與串流 1 MiB（§2，維護者 2026-09-04）。
