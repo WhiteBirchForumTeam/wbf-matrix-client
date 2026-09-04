@@ -1,7 +1,7 @@
 # wbf-client v1 規劃：SDK crate 加 CLI，UI 之後
 
 > 狀態：**維護者 2026-09-04 同意**，開始實作。程式碼一律開分支送 PR 審查，不直接合到 `main`（維護者 2026-09-04 定）。
-> 進度：§6 第 1 步 `wbf-wire` 做完（PR `feat/wbf-wire`）。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
+> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
 > 一個 repo（`crates/` 加 `apps/`）；v1 範圍是最小可用（登入、房間列表、收發文字、分塊上傳／下載媒體）；
 > matrix-rust-sdk 先用上游，需要改再 fork。
 >
@@ -43,7 +43,7 @@ wbf-client/
 | async | `tokio` | |
 | WebSocket | `tokio-tungstenite` | `GET /_wbf/v1/ws`，一個 binary message 一個 pack |
 | CRC | `crc32c` | 與 server 同一個 crate、同一組向量 |
-| 每塊加密 | `chacha20poly1305` | 規格書 §7 的建議；`nonce_i = nonce_base ‖ i` |
+| 每塊加密 | `chacha20poly1305`、`aes-gcm` | 二選一，見 wbf-client-convention-for-chunk.md §3；`nonce_i = nonce_base ‖ i` |
 | JSON meta | `serde_json` | Ack／Error／Info 的 meta |
 | HTTP 備援 | `reqwest`（matrix-sdk 已帶） | `POST /_wbf/v1/pack`，測試與腳本用 |
 
@@ -60,11 +60,11 @@ wbf-client/
 | 串流上傳 | wbf-sdk | `wbf-cli upload --stream` 從 stdin 讀、`0/0` 哨兵、`IS_LAST` 收尾、Seal 帶最終描述 |
 | 協議不漂移 | wbf-wire | `cargo test -p wbf-wire` 對著複製來的 `wbf-vectors.json` 全過 |
 
-## 5. 事件格式（client 之間的約定，server 不讀）
+## 5. 事件格式與 client 之間的約定
 
-依 server 設計文件 §7：`m.file`（或 `m.video`／`m.audio`）事件，`url` 是 mxc，`file` 是 Matrix 標準的金鑰欄，
-另加 `wbf.chunked = { chunk_size, file_size, cipher, nonce_base }`。加密描述（`Create` 的 data）的內容照規格書 §7 的建議，
-用同一把 key、獨立 nonce 加密。不認識 `wbf.chunked` 的 client 看到一個下載得到但解不開的檔案，這是接受的。
+由 [wbf-client-convention-for-chunk.md](wbf-client-convention-for-chunk.md) 定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。
+server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢：`wbf.` 違反 Matrix 的反向網域命名慣例，
+而規格的 `file` 欄位語意是 AES-CTR，放 ChaCha20 的參數進去是說謊。
 
 ## 6. 順序
 
@@ -86,4 +86,4 @@ wbf-client/
 
 1. 這份規劃可以嗎？
 2. Forgejo 上建 `wbf-client` repo（我的 token 只有 wbfuwunel），並給 `claude` 帳號 write 權限；GitHub 的 `wbftw` 那邊要不要也建一份。
-3. 事件格式 §5 就照 server 設計文件 §7 走，還是你要另訂。
+3. 事件格式：見 `wbf-client-convention-for-chunk.md` §11。
