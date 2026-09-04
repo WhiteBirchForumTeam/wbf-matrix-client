@@ -43,7 +43,7 @@ wbf-client/
 | async | `tokio` | |
 | WebSocket | `tokio-tungstenite` | `GET /_wbf/v1/ws`，一個 binary message 一個 pack |
 | CRC | `crc32c` | 與 server 同一個 crate、同一組向量 |
-| 每塊加密 | `chacha20poly1305` | 規格書 §7 的建議；`nonce_i = nonce_base ‖ i` |
+| 每塊加密 | `chacha20poly1305`、`aes-gcm` | 二選一，見 wbf-client-convention-for-chunk.md §3；`nonce_i = nonce_base ‖ i` |
 | JSON meta | `serde_json` | Ack／Error／Info 的 meta |
 | HTTP 備援 | `reqwest`（matrix-sdk 已帶） | `POST /_wbf/v1/pack`，測試與腳本用 |
 

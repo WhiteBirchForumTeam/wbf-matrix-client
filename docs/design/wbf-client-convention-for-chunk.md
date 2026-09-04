@@ -16,7 +16,7 @@
 
 | 房間 | 模式 | 塊的 data | `cipher` |
 |---|---|---|---|
-| 有 E2EE | 加密 | 每塊用 ChaCha20-Poly1305 各自加密，每檔一把隨機金鑰，金鑰放事件區塊、由房間的 E2EE 保護 | `chacha20-poly1305` |
+| 有 E2EE | 加密 | 每塊各自 AEAD 加密，每檔一把隨機金鑰，金鑰放事件區塊、由房間的 E2EE 保護 | `chacha20-poly1305` 或 `aes-256-gcm`，發送端每檔選一個（§3） |
 | 沒 E2EE | 明文 | 就是明文塊，什麼都不加。client 發送前要警告並取得確認（§5.1） | `none` |
 
 兩種模式的線上流程、塊切法、seek、串流完全一樣，差別只在塊的 data 有沒有加密、事件區塊有沒有 `key`。
@@ -66,17 +66,25 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 
 明文模式（`cipher: none`）：`data_i = pt_i`，沒有標籤、沒有 nonce，`Read` 回來的 `len` 必須剛好等於預期明文長度。以下是加密模式。
 
-- 演算法：**ChaCha20-Poly1305**（IETF 版，RFC 8439：12 byte nonce、16 byte 標籤）。線上規格 §7 的建議，這裡定死。
+- 演算法二選一，發送端每檔決定，寫在 `cipher`（維護者 2026-09-04 定：讓 SDK 與 UI 能選）。兩個的金鑰、nonce、標籤長度一樣，nonce 與 AAD 的構造共用，下載端兩個都要支援：
+
+| `cipher` | 演算法 | 什麼時候選 |
+|---|---|---|
+| `chacha20-poly1305` | ChaCha20-Poly1305，IETF 版（RFC 8439） | 沒有硬體 AES 的平台（多數手機的純軟體路徑）。線上規格 §7 的建議值 |
+| `aes-256-gcm` | AES-256-GCM（NIST SP 800-38D） | 有硬體 AES（x86 AES-NI、ARMv8 Crypto Extensions）時比 ChaCha 快，且常見於硬體安全晶片 |
+
+  SDK 的預設：偵測到硬體 AES 就 `aes-256-gcm`，否則 `chacha20-poly1305`；UI 可以覆蓋成固定一種。
+  兩者都是 12 byte nonce、16 byte 標籤、32 byte 金鑰。
 - `nonce_i = nonce_base ‖ u32_be(i)`，12 byte。
 - `aad_i = "wbf-chunk-v1"`（ASCII，12 byte，不含結尾 0）。用途是把塊密文與描述密文（§4）的網域分開；塊索引已經在 nonce 裡，不重複放。
-- `ct_i = ChaCha20Poly1305(key, nonce_i, aad_i, pt_i)`，標籤附在密文後（crate `chacha20poly1305` 的預設）。
+- `ct_i = AEAD(key, nonce_i, aad_i, pt_i)`，`AEAD` 是 `cipher` 指定的那個；標籤附在密文後（crate `chacha20poly1305` 與 `aes-gcm` 的預設）。
 
 塊索引 `i` 的上限是 `0xFFFF_FFFD`：`0xFFFF_FFFF` 與 `0xFFFF_FFFE` 保留給描述（`Create` 與 `Seal` 各一個，§4）。線上規格的 `chunk_count` 是 u32，
 實際上單檔上限（預設 10 GiB）遠早於此。
 
 ### 3.1 下載端必須做的檢查（全部 fail closed，任一不過就整個檔視為壞的，不顯示部分內容）
 
-1. 區塊的 `v` 認得（§8），`cipher` 是 `chacha20-poly1305` 或 `none`。加密模式必須有 `key` 與 `nonce_base`，明文模式必須沒有 `key`。
+1. 區塊的 `v` 認得（§8），`cipher` 是 `chacha20-poly1305`、`aes-256-gcm` 或 `none`。加密模式必須有 `key` 與 `nonce_base`，明文模式必須沒有 `key`。
 2. `chunk_size`、`file_size` 與 `Info` 回的 `chunk_size`、`chunk_count` 一致：`chunk_count == ceil(file_size / chunk_size)`。
    不一致代表事件與 server 上的東西對不上，拒絕。
 3. 每塊 `Read` 回來的 `len` 必須等於預期長度：加密模式 `預期明文長度 + 16`，明文模式 `預期明文長度`（預期明文長度：非最後一塊 = `chunk_size`；最後一塊 = `file_size − i × chunk_size`）。
@@ -100,7 +108,7 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 |---|---|---|---|
 | `v` | 必要 | `1` | 本文版本（§8）。不認得就拒絕 |
 | `chunk_size` | 必要 | `65536` | 明文塊大小，byte。`Create` 就定死，串流也知道。必須等於 `Create` Ack 回的 `chunk_size` |
-| `cipher` | 必要 | `"chacha20-poly1305"` | 或 `"none"`（明文模式）。與事件區塊一致 |
+| `cipher` | 必要 | `"chacha20-poly1305"` | `"chacha20-poly1305"`、`"aes-256-gcm"`、`"none"` 三選一。與事件區塊一致 |
 | `nonce_base` | 加密模式必要，明文模式不放 | `"AAECAwQFBgc="` | 8 byte，base64（RFC 4648 標準字母表、帶 `=`）。每檔一個 |
 | `file_size` | 選用 | `132056` | 明文總長，byte。**缺 = 還不知道**（串流上傳 `Create` 時），`Seal` 那份必須有。🚫 不要寫 0 當佔位，0 會被讀成空檔 |
 | `name` | 選用 | `"video.mkv"` | 缺 = 不知道，顯示成 `unknown`；不要用空字串當佔位 |
@@ -161,7 +169,7 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 
 | key | 必要？ | example | 備註 |
 |---|---|---|---|
-| `cipher` | 必要 | `"chacha20-poly1305"` | 或 `"none"`（明文模式）。其他值拒絕 |
+| `cipher` | 必要 | `"chacha20-poly1305"` | `"chacha20-poly1305"`、`"aes-256-gcm"`、`"none"` 三選一。其他值拒絕 |
 | `key` | 加密模式必要，明文模式**必須沒有** | `"<base64, 32 bytes>"` | 每檔一把。**只在這裡**，不進描述、不進 server 看得到的地方 |
 
 - 認得 `msgtype` 但 `org.wbftw.wbfuwunel.chunked` 缺、`v` 不認得、`cipher` 不認得、或 §3.1 第 1 條不過 → 當成解不開的檔，顯示 `body`，不下載。
@@ -170,7 +178,7 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 
 | 房間 | 發送端 | 接收端 |
 |---|---|---|
-| 有 E2EE | 用加密模式。`key` 靠 Megolm 保護，這正是 Matrix 把附件金鑰放事件裡的做法 | 照 §3 解 |
+| 有 E2EE | 用加密模式，`cipher` 依 §3 的表選。`key` 靠 Megolm 保護，這正是 Matrix 把附件金鑰放事件裡的做法 | 照 §3 解 |
 | 沒 E2EE | **先警告、取得確認**才送，用明文模式。警告要講清楚：這個房間沒有加密，檔案會以明文存在 server 上、房間裡每個人與 server 都看得到 | 照明文模式讀 |
 
 - 🚫 發送端**永遠不**在沒 E2EE 的房間送 `cipher: chacha20-poly1305`：事件是明文，`key` 就公開了，加密白做。這是 client 的 bug，不是使用者的選擇。
@@ -223,3 +231,4 @@ Read(mxc, chunk=i) → ct_i → 解密 → pt_i[off..]
 1. ~~命名空間~~ 定了：`org.wbftw`（維護者 2026-09-04）。
 2. ~~E2EE 硬擋~~ 定了：不擋，沒 E2EE 的房間用明文模式，發送前警告並確認（§5.1，維護者 2026-09-04）。
 3. ~~`chunk_size`~~ 定了：依大小，50 MiB 以下 64 KiB、以上 1 MiB；串流依線路，行動網路 64 KiB、Wi-Fi 1 MiB（§2，維護者 2026-09-04）。
+4. ~~`cipher`~~ 定了：`chacha20-poly1305` 與 `aes-256-gcm` 二選一，SDK 依硬體預設、UI 可覆蓋（§3，維護者 2026-09-04）。
