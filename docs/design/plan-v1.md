@@ -114,6 +114,8 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 - **與聯邦對接能兼容就盡量兼容**；我們自幹的 feature 是 extension，可以不兼容。
 - 🚨 **任何會 breaking Matrix 兼容的地方，都要提出來審查**，由維護者定案要不要兼容。這條沒有例外。
 
+聊天模型（Conversation／Peer／Message／Role、怎麼接 Matrix、哪裡要審）在 [chat-model.md](chat-model.md)。
+
 落到程式上的規則（第 3 步起適用）：
 
 | 規則 | 意思 |
