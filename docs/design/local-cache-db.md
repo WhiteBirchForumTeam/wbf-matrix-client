@@ -155,8 +155,16 @@ CREATE TABLE events (
 CREATE INDEX events_by_time ON events (room_id, origin_server_ts);
 CREATE INDEX events_files ON events (room_id, msgtype) WHERE chunked_block_json IS NOT NULL;
 
+-- 本地 offset：自己讀到哪，只在這台裝置（chat-model §3.5，維護者定）；給遠端看的 read 在 server，不在這裡。
 CREATE TABLE read_positions (room_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, ts INTEGER NOT NULL);
+
+-- Delete for me（chat-model §5，維護者定）：本地清掉並記下來，之後從 server 拿到同一則也忽略。
+-- 不動 server；重新安裝（DB 不在了）就恢復。這張表不受配額清理。
+CREATE TABLE hidden_messages (room_id TEXT NOT NULL, event_id TEXT NOT NULL, hidden_at INTEGER NOT NULL,
+  PRIMARY KEY (room_id, event_id));
 ```
+
+- 寫入 `events` 前先查 `hidden_messages`，有就不寫；讀出來給 UI 前也再濾一次（消費端自己問，不靠寫入端記得）。
 
 - 解不開的加密事件也存（`decrypted = 0` 帶原因），之後拿到金鑰重解時覆蓋；不存等於每次都要重拉。
 - 配額（§1）以 `origin_server_ts` 為序刪最舊；`rooms` 不受配額。

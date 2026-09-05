@@ -1,6 +1,6 @@
 # 聊天模型與房間設計：站在 Matrix 的高度，用 Telegram 的形狀
 
-> 狀態：草案，2026-09-05，等維護者訂正。
+> 狀態：2026-09-05 維護者訂正過一輪（標「維護者定」的是定案，標「再議」的還開著）。
 > 前提：[plan-v1.md](plan-v1.md) §7.2 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
 > 「現在怎麼接到 Matrix」只是第一個 backend 的接法，之後換成自己的協定時，模型不動、只換接法。
 > Telegram 的部分是憑印象寫的（維護者明說接受）；Matrix 的部分照規格與 `vendor/matrix-rust-sdk` 的實作。
@@ -9,8 +9,9 @@
 ## 0. 一句話
 
 使用者看到的是 Telegram 的形狀：**對話**（私訊、群組、頻道）、**訊息**（文字、檔案、系統）、回覆、編輯、刪除、已讀、置頂。
-底下是 Matrix 的骨架：對話是 room、訊息是 event、身份是 mxid 加裝置、加密是 Megolm。
-**模型只講我們的名詞**；Matrix 的名詞只出現在 §3 的對照表與 adapter 裡。
+底下是 Matrix 的骨架，**而且底層統一就是 ROOM**（維護者 2026-09-05 定）：DM 是兩個人的 room、group 是多人的 room、channel 是只有 owner 能講話的 room。
+這是 Matrix 的標準模型，打掉它會讓兼容難辦；「這是什麼類型」在**高層**（UI）區分，底層不加任何東西。
+**模型只講我們的名詞**（Conversation／Peer／Message，維護者同意）；Matrix 的名詞只出現在 §3 的對照表與 adapter 裡。
 
 ## 1. 兩邊的世界觀，先對齊名詞
 
@@ -22,12 +23,12 @@
 | 訊息內容 | `m.room.message` 加 `msgtype`（text／file／image…），其他 type 是 state 或系統 | 訊息帶 media 欄位 | **MessageKind**（§2.3） |
 | 回覆 | `m.relates_to.m.in_reply_to` | reply_to_message_id | `reply_to: Option<MessageId>` |
 | 編輯 | 新事件帶 `m.relates_to.rel_type = m.replace`，原事件不變 | 原訊息被改、標 edited | `edited: Option<Edit>`，adapter 把 replace 折進原訊息 |
-| 刪除 | redaction：事件內容被清空，留骨架 | delete for me／for everyone | `Deleted`；for-me 是 **[審]**（§5） |
+| 刪除 | redaction：事件內容被清空，留骨架 | delete for me／for everyone | `Deleted`（for everyone）；for-me 是本地標記，不動 server（§5，維護者定） |
 | 反應 | `m.annotation` 加 emoji key | reactions | `reactions: Vec<Reaction>` |
-| 已讀 | 讀取收據 `m.read`（別人看得到）加 `m.fully_read`（只有自己） | 雙勾勾，per-chat 已讀到哪 | **ReadMarker**（自己）＋ **ReadReceipt**（別人） |
+| 已讀 | 讀取收據 `m.read`（別人看得到）加 `m.fully_read`（只有自己） | 雙勾勾，per-chat 已讀到哪 | **維持 Matrix 做法**，兩種 read：本地 offset（自己看的，進本地庫）與給遠端看的 read（要不要送是 UI 設定）（§3.5，維護者定） |
 | 正在輸入 | `m.typing`（EDU，不進歷史） | typing 狀態 | `Typing`，只在 watch 流裡出現，不落地 |
-| 誰能做什麼 | power levels：每個 event type 一個門檻 | admin／member／restricted | **Role** 三級（§2.4），adapter 對到 power level |
-| 頻道 | 沒有原生概念；用 power levels 讓只有管理員能發 | channel：單向廣播、訂閱者看不到彼此 | `ConversationKind::Channel`，兼容的做法見 §3.2 |
+| 誰能做什麼 | power levels：每個 event type 一個門檻 | admin／member／restricted | **維持 power level 模式**，不自己搞一套（§2.4，維護者定） |
+| 頻道 | 沒有原生概念；用 power levels 讓只有管理員能發 | channel：單向廣播 | 底層 **do nothing**：UI 建「channel」時把 room 包裝成大家都沒權限發言、只有 owner 能發（§3.2，維護者定） |
 | 置頂 | `m.room.pinned_events` state | pinned messages | `pinned: Vec<MessageId>` |
 | 資料夾／封存 | `m.tag`（`m.favourite`、`m.lowpriority`）加 client 自己的 | folders、archive | **Tag**，第一版只做 favourite／archived |
 | 歷史 | `/messages` 分頁，token 往回翻 | 一路往上捲 | `history(before)`（CLI 規格 §3.4.1 的 `read`） |
@@ -37,7 +38,7 @@
 | 聯邦 | 有：room 可以跨 server | 沒有：單一平台 | 保留，能兼容盡量兼容（plan-v1 §7.2） |
 
 Telegram 沒有而 Matrix 有、我們**要留**的：多裝置各自金鑰、裝置驗證、聯邦、房間 state（可查歷史誰改了名字）。
-Matrix 沒有而 Telegram 有的，全部在 §5 列成 **[審]**。
+Matrix 沒有而 Telegram 有的，全部在 §5，維護者逐列定過。
 
 ## 2. 我們的模型（`wbf-sdk` 的 pub 型別）
 
@@ -48,10 +49,12 @@ Matrix 沒有而 Telegram 有的，全部在 §5 列成 **[審]**。
 ```rust
 pub struct ConversationId(String);        // 現在 = room_id，之後可以是任何東西；對外是不透明字串
 
+/// 高層的分類，**從 room 的事實推出來**（成員數、`m.direct`、power levels），不是 room 上多存的欄位；
+/// 底層永遠是一致的 ROOM（維護者 2026-09-05 定）。
 pub enum ConversationKind {
-    Direct,       // 兩個人；一個對象只有一個 Direct（§3.1 怎麼保證）
-    Group,        // 多人，大家都能發
-    Channel,      // 單向：只有 Role::Admin 以上能發，其他人只能看
+    Direct,       // 兩個人的 room（§3.1 怎麼判）
+    Group,        // 多人的 room，大家都能發
+    Channel,      // 只有 owner 能發言的 room（§3.2）
 }
 
 pub struct Conversation {
@@ -62,7 +65,8 @@ pub struct Conversation {
     pub avatar: Option<Attachment>,       // 之後
     pub encrypted: bool,                  // false 是例外，UI 要標
     pub member_count: u32,
-    pub my_role: Role,
+    pub my_power_level: i64,              // Matrix 的數字照給（§2.4）
+    pub can_send_message: bool,           // 從 power levels 算好的結論，UI 直接用
     pub last_message: Option<MessageSummary>,
     pub unread: Unread,                   // §2.5
     pub pinned: Vec<MessageId>,
@@ -76,7 +80,7 @@ pub struct Conversation {
 ```rust
 pub struct PeerId(String);                // 現在 = mxid
 pub struct Peer { pub id: PeerId, pub display_name: Option<String>, pub avatar: Option<Attachment> }
-pub struct Member { pub peer: Peer, pub role: Role, pub joined_at: Option<Timestamp> }
+pub struct Member { pub peer: Peer, pub power_level: i64, pub joined_at: Option<Timestamp> }
 
 pub struct DeviceId(String);
 pub enum DeviceTrust { Verified, Unverified, Blocked }   // E2EE 的事，UI 顯示鎖頭用
@@ -119,25 +123,22 @@ pub struct Edit { pub at: Timestamp, pub by: PeerId }
 pub struct Reaction { pub key: String, pub by: Vec<PeerId> }
 pub struct Formatted { pub html: String }          // 第一版只收不產：我們送純文字，收到別人的 HTML 就帶著
 pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: PeerId }, Kicked{..}, Banned{..},
-                       NameChanged{..}, TopicChanged{..}, RoleChanged{..}, EncryptionEnabled, Pinned{..}, Other(String) }
+                       NameChanged{..}, TopicChanged{..}, PowerLevelChanged{..}, EncryptionEnabled, Pinned{..}, Other(String) }
 ```
 
-### 2.4 角色：三級，不是 power level 的數字
+### 2.4 權限：維持 Matrix 的 power level，不自己搞一套（維護者定）
 
-```rust
-pub enum Role { Owner, Admin, Member }   // Channel 的訂閱者也是 Member，只是不能發
-```
-
-Matrix 的 power level 是 0–100 的數字加每個事件類型一個門檻，太細。我們對外只有三級，adapter 負責對應（§3.3）。
-要更細的（例如「可以邀請但不能踢」）**[審]**：是做進 Role 還是不做。
+`Conversation.my_power_level`、`Member.power_level` 就是 Matrix 的數字；「能不能做 X」由 adapter 拿 power levels 的門檻算好，
+以 `can_send_message` 這種 bool 給出來，UI 不自己比數字。沒有 Role enum：Owner／Admin／Member 只是 UI 顯示用的詞（100／≥ 50／其他），不進模型。
 
 ### 2.5 未讀
 
 ```rust
-pub struct Unread { pub count: u32, pub mentions: u32, pub marker: Option<MessageId> }
+pub struct Unread { pub count: u32, pub mentions: u32, pub local_offset: Option<MessageId> }
 ```
 
-`count` 是 marker 之後、不是自己發的、非 System 的訊息數；我們自己算，不信 server 的通知計數（各 server 算法不一）。
+`local_offset` 是自己看到哪，只在本地（之後進 [local-cache-db.md](local-cache-db.md) 的 `read_positions`；現在沒有本地庫，只活在記憶體）。
+`count` 是 `local_offset` 之後、不是自己發的、非 System 的訊息數；我們自己算，不信 server 的通知計數（各 server 算法不一）。
 
 ### 2.6 動作（`Backend` trait 的一半）
 
@@ -152,10 +153,10 @@ pub trait Backend {
     async fn edit(&self, msg: &MessageId, body: &str) -> Result<MessageId>;
     async fn delete(&self, msg: &MessageId, reason: Option<&str>) -> Result<()>;
     async fn react(&self, msg: &MessageId, key: &str) -> Result<()>;
-    async fn mark_read(&self, id: &ConversationId, upto: &MessageId) -> Result<()>;
+    async fn send_read_receipt(&self, id: &ConversationId, upto: &MessageId, visible_to_others: bool) -> Result<()>;  // §3.5
     async fn pin(&self, msg: &MessageId, pinned: bool) -> Result<()>;
-    async fn create(&self, kind: ConversationKind, name: Option<&str>, invite: &[PeerId]) -> Result<ConversationId>;
-    async fn invite / leave / kick / ban / set_role ...
+    async fn create(&self, options: CreateOptions) -> Result<ConversationId>;   // name、invite、encrypted（§3.6）、channel 包裝（§3.2）
+    async fn invite / leave / kick / ban / set_power_level ...
     fn watch(&self) -> impl Stream<Item = Update>;      // §4.2
 }
 ```
@@ -175,23 +176,18 @@ Matrix 沒有「DM」型別，只有慣例：建房時 `is_direct: true`，雙�
   **不**自動退出多的那些（那是使用者的資料）。
 - `create(Direct, invite=[p])`：先找既有的，有就回它，沒有才建（`is_direct: true`，加寫 `m.direct`）。這是 Telegram 的「一個人一個聊天」。
 
-### 3.2 Channel：兼容的做法
+### 3.2 Channel：底層 do nothing，用原生邏輯達到功能（維護者定）
 
-Matrix 的做法是 power levels：`events_default: 50`（發訊息要 50）、預設成員 0。這樣其他 Matrix client 進來也是「看得到、發不出」，兼容。
-我們再加一個 state 事件 `org.wbftw.wbfuwunel.conversation_kind` 內容 `{ "kind": "channel" }`，讓我們自己的 client 不用從 power level 反推。
-沒有這個 state 的房，adapter 用 power level 猜：`events_default ≥ 50` 且我不是 admin → Channel；猜的結果標 `kind_inferred: true`。
+不自己蓋 channel、不加任何 state 事件。UI 建「channel」時只是把 room 包裝成：`events_default` 設到只有 owner 達得到（100）、其他成員預設 0。
+這樣其他 Matrix client 進來也是「看得到、發不出」，完全兼容。
+`ConversationKind::Channel` 是 adapter 從 power levels **推**出來的：發訊息的門檻高到只有 owner 達得到 → Channel。標準就是這樣，沒有「猜」。
 
-Telegram 頻道「訂閱者看不到彼此」：Matrix 成員列表對所有成員可見，**做不到** → **[審]**：接受不同，還是 server 端 extension。
+Telegram 頻道「訂閱者看不到彼此」：Matrix 做不到，**先不考慮**（維護者定）。頻道的其他功能（訂閱、簽名、統計…）是草案，與 fork server 連動，這裡不規劃。
 
-### 3.3 Role 對 power level
+### 3.3 power level：照抄（維護者定）
 
-| Role | power level |
-|---|---|
-| Owner | 100（建房者） |
-| Admin | 50–99 |
-| Member | < 50 |
-
-`set_role` 只寫 100／50／0 三個值。收到別的 client 設的 73，對外仍是 Admin。
+數字直接給（`my_power_level`、`Member.power_level`），`set_power_level` 寫什麼就是什麼。adapter 只多做一件事：把「門檻 vs 我的數字」算成 `can_send_message` 這種 bool。
+UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不進模型。
 
 ### 3.4 訊息事件的對應
 
@@ -208,14 +204,20 @@ Telegram 頻道「訂閱者看不到彼此」：Matrix 成員列表對所有成�
 
 ### 3.5 已讀
 
-- `mark_read(upto)`：同時送 `m.read` 收據（別人看到雙勾勾）與 `m.fully_read`（自己的 marker）。
-  Telegram 的已讀是給對方看的，Matrix 兩者分開；我們合成一個動作。要不要有「只更新自己、不讓對方知道」的模式 **[審]**（Matrix 有 `m.read.private`）。
-- `Unread` 自己算：從 `marker` 之後數。
+維持 Matrix 做法，兩種 read 分開（維護者定）：
+
+| | 放哪 | 誰看得到 | 怎麼送 |
+|---|---|---|---|
+| **本地 offset** | 本地（之後進 local-cache-db 的 `read_positions`；現在只在記憶體） | 只有自己這台裝置 | 不送。UI 捲到哪就寫哪 |
+| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `send_read_receipt(visible_to_others)`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策 |
+
+`m.fully_read`：不用，本地 offset 取代它（它本來就只是「自己讀到哪」的 server 端副本）。`Unread` 從本地 offset 算。
 
 ### 3.6 加密
 
-- 建 Group／Direct 時預設 `m.room.encryption`（Megolm）。Channel 也加密：Telegram 的頻道是公開的不加密，我們的頻道是「E2EE 的單向群組」，這是本質差異，保留。
-  公開頻道（任何人可加入、歷史公開）要不要不加密 **[審]**。
+- **開 room 時自由選擇要不要加密**，由 UI（也就是 owner）決定；底層不帶立場（`CreateOptions.encrypted`）（維護者定）。
+  不論是不是 E2EE，都照 Matrix 實作：加密就 `m.room.encryption`（Megolm）；公開可搜就 `history_visibility: world_readable` 加 `join_rule: public`，這兩件事互不影響。
+  UI 的預設值（例如 Direct／Group 預設加密）是 UI 的事；非加密 room 送檔案前的警告照約定 §5.1。
 - 裝置驗證、cross-signing、金鑰備份：第一版只做「解得開就解、解不開標 `decrypted: false`」，驗證流程是第 4 步以後的事。
 - 這一層是 `RoomCrypto` trait 的實作包 `OlmMachine`（plan-v1 §7.2）；adapter 呼叫的是 trait。
 
@@ -254,24 +256,28 @@ pub enum Update {
 ### 4.3 順序：為什麼不能用時間戳排序
 
 `sent_at` 是**發送者的 server**蓋的時間，聯邦下兩台 server 時鐘不同，排序會亂。Matrix 的真順序是 DAG 的拓樸序，`/sync` 與 `/messages` 回來的順序就是它。
-我們定：**訊息的順序 = backend 交出來的順序**，`Message` 不帶序號；UI 與快取（之後）用「backend 給的順序」加 `sent_at` 當顯示用的時間。
-Telegram 的遞增 message id 我們沒有 → 「跳到第 N 則」做不到，只有「跳到某個 id」與「翻到某個時間」。**[審]** 要不要在自己的協定裡加 per-conversation 序號。
+第 3 步先照這個：**訊息的順序 = backend 交出來的順序**，`Message` 不帶序號；`sent_at` 只當顯示用的時間。
+**時序怎麼定：再議**（維護者 2026-09-05）。
+Telegram 的遞增 message id 我們現在沒有 → 「跳到第 N 則」做不到。**維護者建議要有 per-conversation 序號，再議**：它得由 server 發（client 算不出全局一致的序號），所以是自己的協定／fork server 的事。
 
 ## 5. Telegram 有、Matrix 沒有：全部要審
 
-| 功能 | Matrix 能不能 | 建議 | |
+維護者 2026-09-05 逐列定過：
+
+| 功能 | Matrix 能不能 | 定案 | |
 |---|---|---|---|
-| Delete for me（只在自己這邊消失） | 不能：redaction 是全體。本地不存（plan-v1 §7.1）所以現在連藏都藏不住 | 等本地快取有了再做成「本地隱藏」，不動 server | **[審]** |
-| 自毀訊息（timer） | 沒有（MSC 有草案沒定案）。client 端計時刪除擋不住不配合的 client | 做成 extension：事件帶 `org.wbftw.wbfuwunel.expires_at`，我們的 client 到時本地隱藏並發 redaction；其他 client 看到永久訊息 | **[審]**：接受「只對我們的 client 有效」嗎 |
-| 轉發（帶原作者） | 沒有轉發語意；只能複製內容 | 事件加 `org.wbftw.wbfuwunel.forwarded_from { peer, message }`，其他 client 看到普通訊息 | **[審]** |
-| 頻道訂閱者互不可見 | 不能 | 接受不同，或 server extension 限制 `/members` | **[審]** |
-| 公開頻道不加密、歷史公開可搜 | 可以：`history_visibility: world_readable` 加不開加密 | 頻道分「私密（加密）」「公開（不加密、world_readable）」兩種 | **[審]** |
-| @username 搜人 | 有 user directory（`/user_directory/search`），但只搜同 server 與共同房間 | 用它，接受範圍限制 | 兼容 |
-| 訊息序號、跳到第 N 則 | 沒有 | 之後自己的協定再加 | **[審]** |
-| 已讀不通知對方 | 有 `m.read.private` | 提供開關 | 兼容 |
-| 排程訊息、草稿同步 | 沒有 | 草稿只放記憶體（§7.1）；排程不做 | 不做 |
-| 語音訊息、貼圖、投票 | 有 MSC（voice `m.audio` 加 `org.matrix.msc3245.voice`；投票 MSC3381） | 都是 `File` 或之後的 `MessageKind`；第 3 步不做 | 之後 |
-| 超大群（十萬人） | Matrix 房間可以，但成員同步要 lazy load | adapter 一律 lazy load members | 兼容 |
+| Delete for me（只在自己這邊消失） | 不能：redaction 是全體 | **本地標記**：清本地快取並記「這則已清」，之後從 server 拿到也忽略；重新安裝 app 會恢復。不動 server。進 local-cache-db 的 `hidden_messages` | 維護者定 |
+| 自毀訊息（timer） | 沒有 | **草案**，未來與 fork server 連動，這裡不規劃 | 維護者定 |
+| 轉發（帶原作者） | 沒有轉發語意 | 事件加 `org.wbftw.wbfuwunel.forwarded_from { peer, message }`，其他 client 看到普通訊息 | 維護者定（同意） |
+| 頻道訂閱者互不可見 | 不能 | 先不考慮 | 維護者定 |
+| 頻道功能（訂閱、簽名、統計…） | 部分 | 草案，與 fork server 連動 | 維護者定 |
+| 公開頻道不加密、歷史公開可搜 | 可以 | 由 owner 在開 room 時決定；加密與公開可搜是兩個獨立選項，都照 Matrix 實作（§3.6） | 維護者定 |
+| @username 搜人 | user directory，只搜同 server 與共同房間 | 用它 | 兼容 |
+| 訊息序號、跳到第 N 則 | 沒有 | **維護者建議要有，再議**（§4.3） | 再議 |
+| 已讀不通知對方 | 有 `m.read.private` | UI 設定（§3.5） | 兼容 |
+| 排程訊息、草稿同步 | 沒有 | 不做；草稿只做本地版 | 維護者定 |
+| 語音訊息、貼圖、投票 | 有 MSC | 維持 Matrix 模式，優化再議 | 維護者定 |
+| 超大群（十萬人） | 可以 | 不做 | 維護者定 |
 
 ## 6. 第 3 步的範圍（不是全部一次做）
 
@@ -281,12 +287,10 @@ Telegram 的遞增 message id 我們沒有 → 「跳到第 N 則」做不到，
 4. 加密：解得開就解，解不開標原因；`RoomCrypto` trait 立起來，實作包 `OlmMachine`。
 5. **不做**：建房、邀請、角色、置頂、已讀送出、裝置驗證、標準附件下載。這些是第 3 步之後一個一個加。
 
-## 7. 要維護者訂正的
+## 7. 還開著的（再議）
 
-1. §1 的名詞：Conversation／Peer／Message／Role 這幾個叫法可以嗎？
-2. §2.4 Role 三級夠不夠。
-3. §3.2 Channel 的兼容做法，與「訂閱者互不可見」做不到。
-4. §3.6 頻道要不要分私密（加密）與公開（不加密）。
-5. §4.3 沒有遞增序號，接不接受。
-6. §5 每一列的 **[審]**。
-7. §6 的範圍。
+1. §4.3 時序怎麼定。
+2. §4.3 per-conversation 訊息序號（維護者建議要有）：由誰發、怎麼與 Matrix 的 event_id 共存。
+3. §6 的範圍（維護者還沒對這一項表態）。
+
+已定案的都寫在各節，標「維護者定」。
