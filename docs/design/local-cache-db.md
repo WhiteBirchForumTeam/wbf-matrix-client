@@ -65,6 +65,16 @@ local.key（0600）
   讀檔時 `mode` 不認得就拒絕。「沒設密碼」是 `Plain`，不是「密碼等於空字串」——後者會讓空密碼靜默通過。
 - **一個入口**：`Vault::open(dir, Unlock::NoPassword | Unlock::Password(secret))`。`Plain` 配 `NoPassword`、
   `PasswordWrapped` 配 `Password`，配錯就 `Err`，UI 與 CLI 都只能走這裡。CLI 的密碼來源同 `login`：`--password-file` 或終端不回顯。
+- **解鎖後金鑰放哪**（維護者 2026-09-05：作法由我定，照一般開發工具的做法）：
+
+  | | 做法 |
+  |---|---|
+  | UI | 解鎖一次，主金鑰只在記憶體；UI runtime 與 wbf-sdk 是同一個程序，關掉就沒了 |
+  | CLI（只在開發與 debug 用） | 仿 `sudo`：解鎖成功後寫一張 **unlock ticket**（`<data dir>/unlock.ticket`，0600，內容是主金鑰加 `expires_at`），有效期預設 15 分鐘、`--unlock-ttl <秒>` 可調；期內的命令不再問密碼。`lock` 命令刪掉它。過期的 ticket 讀到就刪，Unix 上模式不是 0600 就拒用 |
+
+  CLI 密碼的來源與 `login` 同一套：`--local-password-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
+  ticket 是明文主金鑰落地，安全性等於 `Plain` 模式那 15 分鐘；維護者明說接受（CLI 不是產品面）。這一項不進 UI。
+
 - **威脅模型**（老實寫）：
 
 | 防 | 不防 |
@@ -250,7 +260,6 @@ CREATE INDEX media_files_lru ON media_files (last_used_at);
 
 ## 9. 還開著的
 
-1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，另外用第三把子金鑰鎖成 `session.sealed`（§4，維護者 2026-09-05）。
-   仍開著的是體感：`PasswordWrapped` 模式下 CLI 每個命令都要輸密碼，除非有 agent 之類的東西；加 local password 那一版再看。
+1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，`session.sealed`（§4）。~~CLI 每個命令輸密碼的體感~~ 定了：仿 sudo 的 unlock ticket（§4）。
 2. ~~媒體內容快取另議~~ 定了方向：§8。
 3. ~~媒體配額的數字~~ 定了：2 GiB best effort、保護期 7 天（§8.4）。事件快取不設上限；同步視窗 500 則／房、初開全域 10000 則是預設值，可調。
