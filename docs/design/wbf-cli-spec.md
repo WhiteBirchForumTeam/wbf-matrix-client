@@ -95,34 +95,39 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 `chunks_read` 就是驗收「不必下載前面」的證據：`--at 150000000` 時它必須只有一個元素。
 
-### 3.4 房間（第 3 步）
+### 3.4 房間（第 3 步，2026-09-06 做了第一版）
+
+從第 3 步起 `login` 走 matrix-sdk（拿到有裝置金鑰的 session，E2EE 房間才解得開），store 放 session 檔旁邊的 `matrix/`（§7）。
+這些命令都先做一次增量 sync（timeout 0）再動作，所以看到的是現況。
 
 | 命令 | 做什麼 |
 |---|---|
-| `rooms` | 列出加入的房間：`[{ "room_id", "name", "encrypted": bool }]` |
-| `send <room_id> --text <msg>` | 送文字 |
-| `send <room_id> --file <file> [upload 的參數]` | upload 後把約定 §5 的事件送進房間。房間沒 E2EE 就走明文模式，**送之前印警告並要求確認**（約定 §5.1）；`--yes` 跳過確認給腳本用 |
+| `rooms` | 列出加入的房間：chat-model §2.1 的 `Conversation` 陣列（`id`、`kind`、`name`、`topic`、`encrypted`、`member_count`、`my_power_level`、`can_send_message`、`direct_peer`） |
+| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }` |
+| `send <room_id> --file <file> [--caption <c>] [--cipher …] [--chunk-size …] [--sha256] [--manifest <out>] [--yes]` | upload（含續傳）後把約定 §5 的事件送進房間；印 `{ "event_id", "mxc" }`。房間沒 E2EE：**送之前印警告並要求確認**（約定 §5.1）、強制 `cipher: none`（給別的 `--cipher` 就 exit 1：加密區塊的 key 會公開）；`--yes` 跳過確認給腳本用。⚠️ 附件宣告（約定 §5.2）這一版帶不出去，stderr 會印警告 |
 | `watch <room_id> tail \| wait <秒> \| once [--since <token>]` | 從 `/sync` 等**新**事件（現在起），來一個立刻印一個，一行一個 JSON。三種模式見 §3.4.2。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印 |
 | `ping` | `Hello` 加 `Ping`，印 server 回的 features 與上限。除錯用，第 2 步就有 |
 
-#### 3.4.1 讀房間（規劃，第 3 步之後）
+#### 3.4.1 讀房間
 
-`watch` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令：
+`watch` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令（`read`、`files` 第 3 步做了；`room` 還沒，`rooms` 的輸出已經有它大部分的欄位）：
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `room <room_id>` | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
-| `read <room_id> [--limit <n>] [--before <token>] [--type <event_type>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響 | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
+| `room <room_id>`（還沒） | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
+| `read <room_id> [--limit <n>] [--before <token>] [--type <名>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
 | `files <room_id> [--limit <n>] [--before <token>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
 
-事件的統一形狀（`read`、`watch`、`files` 都用）：
+事件的統一形狀（`read`、`watch`、`files` 都用）就是 chat-model §2.3 的 `Message` 序列化：
 
 | 欄位 | 說明 |
 |---|---|
-| `event_id`、`sender`、`ts`、`type` | 照 Matrix 原樣 |
-| `content` | 解密後的內容。明文房間就是原樣 |
+| `id`、`conversation`、`sender`、`sent_at` | event_id、room_id、mxid、`origin_server_ts`（毫秒，只當顯示用） |
+| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`deleted`（`reason`）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
+| `reply_to`、`edited_by`、`reactions` | 同一頁內的關係事件折進目標（chat-model §3.4） |
 | `decrypted` | `true`／`false`／`null`。`null` 表示本來就不是加密事件 |
-| `undecryptable_reason` | `decrypted` 是 `false` 才有，example: `no_session_key`、`no_e2ee_store`（第 2 步的 session 沒有裝置金鑰，見 §1） |
+| `undecryptable_reason` | `decrypted` 是 `false` 才有，matrix-sdk 給的原因（example: `MissingMegolmSession`） |
+| `r_seq`、`g_seq` | server 發的序號（chat-model §4.3）；非 fork server 的房間沒有 |
 
 規則：
 
@@ -202,7 +207,8 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | Linux | `$XDG_CONFIG_HOME/wbf-cli/session.json`（沒設就 `~/.config/wbf-cli/`） |
 | macOS | `~/Library/Application Support/wbf-cli/session.json` |
 
-內容 `{ "server", "user_id", "device_id", "access_token" }`，第 3 步加 SDK store 的路徑。權限只給自己。
+內容 `{ "server", "user_id", "device_id", "access_token", "store_dir" }`；`store_dir` 是第 3 步加的 matrix-sdk store 目錄（session 檔旁邊的 `matrix/`，裝 crypto 與 state 兩個 sqlite，絕對不當快取，plan-v1 §7.1）。
+⚠️ 這一版 store 沒有 passphrase；主金鑰的 vault 是 local-cache-db.md 那一版的事。權限只給自己。
 🚫 任何命令的輸出、log、錯誤訊息都不印 `access_token`。
 
 ## 8. 驗收腳本（第 2 步交付的一部分）
@@ -226,4 +232,4 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 - 沒有互動模式、沒有進度條以外的 UI。
 - 不存密碼，只存 token。
-- 第 2 步不碰房間；`send`／`watch`／`rooms` 第 3 步才有。
+- 第 3 步還沒做的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載（chat-model §6）。

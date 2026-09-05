@@ -21,6 +21,8 @@ pub enum SdkError {
     /// 對方講的不是這個協議：pack 解不開（CRC 除外）、回應的 id／seq 對不上、Ack meta 不是預期的 JSON。
     Protocol(String),
     Io(std::io::Error),
+    /// 等逾時：`watch once --timeout` 到了還沒有事件（CLI exit 5）。
+    Timeout(String),
 }
 
 impl std::fmt::Display for SdkError {
@@ -32,6 +34,7 @@ impl std::fmt::Display for SdkError {
             SdkError::Network(message) => write!(formatter, "network: {message}"),
             SdkError::Protocol(message) => write!(formatter, "protocol: {message}"),
             SdkError::Io(error) => write!(formatter, "io: {error}"),
+            SdkError::Timeout(message) => write!(formatter, "timeout: {message}"),
         }
     }
 }

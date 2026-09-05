@@ -4,8 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
+use wbf_sdk::backend::matrix_sdk::MatrixBackend;
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
-use wbf_sdk::login::{login_with_password, logout, whoami};
+use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{
     Channel, ChunkedBlock, Cipher, FileCipher, Manifest, SdkError, Session, Transport, UploadState,
     WbfClient,
@@ -72,16 +73,45 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         Command::Info { mxc, manifest } => info_command(&context, &mxc, manifest.as_deref()).await,
         Command::Download { manifest, out } => download_command(&context, &manifest, out).await,
         Command::Seek { manifest, at, len } => seek_command(&context, &manifest, at, len).await,
+        Command::Rooms => crate::rooms::rooms_command(&context).await,
+        Command::Send(args) => crate::rooms::send_command(&context, &args).await,
+        Command::Watch(args) => crate::rooms::watch_command(&context, &args).await,
+        Command::Read {
+            room,
+            limit,
+            before,
+            types,
+            sender,
+        } => {
+            crate::rooms::read_command(
+                &context,
+                &room,
+                limit,
+                before.as_deref(),
+                &types,
+                sender.as_deref(),
+            )
+            .await
+        }
+        Command::Files {
+            room,
+            limit,
+            before,
+            save,
+        } => {
+            crate::rooms::files_command(&context, &room, limit, before.as_deref(), save.as_deref())
+                .await
+        }
     }
 }
 
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
-struct Context {
-    session_path: PathBuf,
-    server_override: Option<String>,
-    token_override: Option<String>,
-    quiet: bool,
-    transport: Transport,
+pub struct Context {
+    pub session_path: PathBuf,
+    pub server_override: Option<String>,
+    pub token_override: Option<String>,
+    pub quiet: bool,
+    pub transport: Transport,
 }
 
 impl Context {
@@ -102,7 +132,7 @@ impl Context {
     /// `--token` 加 `--server` 就不碰 session 檔；否則讀 session 檔，`--server` 可覆蓋。
     /// `--token` 模式打一次 `whoami` 填真的 user_id：續傳狀態檔的 `is_for` 要靠它分辨「不是你的上傳」，
     /// 填佔位值會讓兩把不同的 token 比成相等（PR #6 審查 rumia 🟡2）。
-    async fn session(&self) -> Result<Session, SdkError> {
+    pub async fn session(&self) -> Result<Session, SdkError> {
         if let Some(token) = &self.token_override {
             let server = self.server_override.clone().ok_or_else(|| {
                 SdkError::Usage("--token needs --server (or WBF_SERVER) too".into())
@@ -112,6 +142,7 @@ impl Context {
                 user_id: String::new(),
                 device_id: String::new(),
                 access_token: token.clone(),
+                store_dir: None,
             };
             let who = whoami(&probe).await?;
             return Ok(Session {
@@ -127,14 +158,14 @@ impl Context {
         Ok(session)
     }
 
-    async fn client(&self) -> Result<WbfClient<Channel>, SdkError> {
+    pub async fn client(&self) -> Result<WbfClient<Channel>, SdkError> {
         let session = self.session().await?;
         let channel =
             Channel::connect(&session.server, &session.access_token, self.transport).await?;
         Ok(WbfClient::new(channel))
     }
 
-    fn progress(&self, line: String) {
+    pub fn progress(&self, line: String) {
         if !self.quiet {
             eprintln!("{line}");
         }
@@ -161,10 +192,12 @@ async fn login_command(
         }
         None => rpassword::prompt_password("password: ")?,
     };
+    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放 session 檔旁邊的 matrix/。
+    let store_dir = crate::rooms::store_dir_for(&context.session_path);
     let mut password = password;
-    let session = login_with_password(&server, user, &password, device_name).await;
+    let login = MatrixBackend::login(&server, user, &password, device_name, &store_dir).await;
     password.zeroize();
-    let session = session?;
+    let (_backend, session) = login?;
     write_session(&context.session_path, &session)?;
     print_json(
         &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server }),
@@ -191,6 +224,15 @@ fn parse_cipher(name: Option<&str>) -> Result<Cipher, SdkError> {
 }
 
 async fn upload_file(context: &Context, args: &UploadArgs) -> Result<(), SdkError> {
+    let manifest = upload_file_to_manifest(context, args).await?;
+    emit_manifest(&manifest, args.manifest.as_deref())
+}
+
+/// 固定大小上傳的整條路（狀態檔、續傳、Seal），回 manifest；`upload` 與 `send --file` 共用。
+pub async fn upload_file_to_manifest(
+    context: &Context,
+    args: &UploadArgs,
+) -> Result<Manifest, SdkError> {
     let path = args
         .file
         .as_deref()
@@ -269,7 +311,7 @@ async fn upload_file(context: &Context, args: &UploadArgs) -> Result<(), SdkErro
     if summary.truncated {
         eprintln!("warning: server truncated this upload at its size limit");
     }
-    emit_manifest(&manifest, args.manifest.as_deref())
+    Ok(manifest)
 }
 
 async fn upload_stream(context: &Context, args: &UploadArgs) -> Result<(), SdkError> {

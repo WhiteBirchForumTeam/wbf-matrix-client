@@ -307,6 +307,15 @@ pub enum Update {
 
 ## 6. 第 3 步的範圍（不是全部一次做）
 
+> 2026-09-06 第一版做了（`wbf-sdk/src/chat.rs`、`backend/matrix_sdk.rs`、CLI `rooms`／`send`／`watch`／`read`／`files`）。與本文的差異，程式碼檔頭也寫了：
+> - id 用 `String`，不包 newtype；`SystemEvent` 先是 `event_type` 加一行文字；`Unread`、`Tag`、`DeviceTrust` 還沒。
+> - `watch` 是 callback（`FnMut(Update) -> Continue|Stop` 加 deadline）不是 `Stream`：sync 迴圈在 backend 手上。
+> - **`RoomCrypto` trait 這一版沒有**：加密完全在 matrix-sdk 的 `Room::send`／`TimelineEvent` 裡，我們沒碰 `OlmMachine`，沒東西可包；
+>   接管送訊息（附件宣告需要）那一版才會出現。空的 trait 是儀式，不先立。
+> - **附件宣告（約定 §5.2）帶不出去**：matrix-sdk 的 `Room::send` 不能加 header、server 的 `Event/Send` 還是提案；CLI 送檔案時印警告。
+>   要帶就得自己 Megolm 加密再走 `Event/Send`，那需要 submodule 露出 `Room::encrypt` 這類的入口（小 patch，但是 fork）或直接拿 `OlmMachine`。等 server 定案再定。
+> - 聚合（edit／reaction／redaction 折進目標）只在同一頁內；目標不在頁裡的關係事件照原樣留著。
+
 1. `Backend` trait 與 `matrix_sdk` adapter；`conversations`、`conversation`、`history`、`send_text`、`send_file`、`watch`。
 2. CLI：`rooms`（印 `Conversation`）、`send --text`、`send --file`（非加密對話警告並確認，約定 §5.1）、`watch`、`read`、`files`（CLI 規格 §3.4）。
 3. `Message` 的聚合：edit 折進去、reaction 聚合、redaction 變 `Deleted`；`Unsupported` 不丟。

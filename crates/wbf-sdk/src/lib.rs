@@ -10,9 +10,11 @@
 //! - `login`：純 HTTP 拿 token。
 //! - `manifest`：CLI 印的 manifest 與上傳狀態檔。
 //!
-//! 房間、事件、matrix-sdk 在第 3 步。
+//! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
 
+pub mod backend;
 pub mod channel;
+pub mod chat;
 pub mod chunk_block;
 pub mod chunk_crypto;
 pub mod cipher;
@@ -25,6 +27,10 @@ pub mod protocol;
 pub mod upload;
 
 pub use channel::{Channel, PackChannel, Transport};
+pub use chat::{
+    Attachment, ChatBackend, Conversation, ConversationKind, Message, MessageKind, Page, Update,
+    WatchControl, WatchEnd,
+};
 pub use chunk_block::{BlockError, ChunkedBlock};
 pub use chunk_crypto::{CryptoError, DescriptionSlot, FileCipher, Link, SeekTarget};
 pub use cipher::Cipher;

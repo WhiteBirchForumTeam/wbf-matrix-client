@@ -12,6 +12,9 @@ pub struct Session {
     pub user_id: String,
     pub device_id: String,
     pub access_token: String,
+    /// matrix-sdk 的 store 目錄（crypto 與 state 兩個 sqlite）；純 HTTP 登入的 session 沒有（CLI 規格 §7）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +68,7 @@ pub async fn login_with_password(
         user_id: login.user_id,
         device_id: login.device_id,
         access_token: login.access_token,
+        store_dir: None,
     })
 }
 
