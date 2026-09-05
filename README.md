@@ -8,7 +8,7 @@ UI 框架的選擇延後到 SDK 能用之後。規劃與進度看 [`docs/design/
 | | 狀態 |
 |---|---|
 | `crates/wbf-wire` | 做完。線上協議的 codec（pack、`EncryptedFileInfo`、CRC-32C），純函數；`cargo test -p wbf-wire` 對著 server 產生的黃金向量跑 |
-| `crates/wbf-sdk` | 做中。密碼層做完（`cipher`、每塊與描述的 AEAD、事件區塊、seek；`cargo test -p wbf-sdk` 對著 [`wbf-client-vectors.json`](docs/design/wbf-client-vectors.json) 跟 RFC／NIST 向量跑）；通道、上傳／下載、續傳、串流還沒；之後接 matrix-sdk |
+| `crates/wbf-sdk` | 做中。密碼層、WebSocket／HTTP 通道、登入、分塊上傳／下載／seek／續傳／串流都有了；`cargo test -p wbf-sdk` 對著 [`wbf-client-vectors.json`](docs/design/wbf-client-vectors.json)、RFC／NIST 向量、記憶體版 server 跑，`tests/e2e_local_server.rs` 對著真的 wbfuwunel 跑（`--ignored`，見檔頭）。房間與 matrix-sdk 是第 3 步 |
 | `apps/wbf-cli` | 還沒。介面已定在 [`docs/design/wbf-cli-spec.md`](docs/design/wbf-cli-spec.md) |
 | `apps/desktop` | 之後 |
 

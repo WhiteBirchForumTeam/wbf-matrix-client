@@ -318,7 +318,11 @@ fn vectors_match_current_implementation() {
     }
     let on_disk = std::fs::read_to_string(VECTORS_PATH).expect("vectors exist");
     let regenerated = serde_json::to_string_pretty(&build_vectors()).expect("serializes") + "\n";
-    assert!(on_disk == regenerated, "implementation output differs from wbf-client-vectors.json; if intended, regenerate and review the diff");
+    // git 的 autocrlf 可能把檔案換成 CRLF；比內容不比換行。
+    assert!(
+        on_disk.replace("\r\n", "\n") == regenerated,
+        "implementation output differs from wbf-client-vectors.json; if intended, regenerate and review the diff"
+    );
 }
 
 #[test]

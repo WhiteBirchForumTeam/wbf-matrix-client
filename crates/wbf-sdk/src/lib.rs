@@ -1,13 +1,36 @@
-//! wbfuwunel 的 client SDK。權威是 `docs/design/wbf-client-convention-for-chunk.md`（約定規格書）；
-//! `tests/client_vectors.rs` 對著 `docs/design/wbf-client-vectors.json` 跑。
+//! wbfuwunel 的 client SDK。權威是 `docs/design/wbf-client-convention-for-chunk.md`（約定規格書）
+//! 與 server repo 的 `chunked-upload-spec.md`（線上規格）；`tests/client_vectors.rs` 對著
+//! `docs/design/wbf-client-vectors.json` 跑。
 //!
-//! 目前只有不需要網路的部分：每塊怎麼加密、描述怎麼加密、事件區塊長什麼樣、seek 怎麼算。
-//! 通道與上傳／下載在下一個 PR。
+//! 分層：
+//! - `cipher`／`chunk_block`／`chunk_crypto`：不需要網路的部分，每塊怎麼加密、事件區塊長什麼樣、seek 怎麼算。
+//! - `protocol`：pack 怎麼組、Ack 怎麼讀。
+//! - `channel`：一個 pack 進一個 pack 出（WebSocket／HTTP）。
+//! - `client` + `upload` + `download`：`WbfClient`，一條通道上的命令。
+//! - `login`：純 HTTP 拿 token。
+//! - `manifest`：CLI 印的 manifest 與上傳狀態檔。
+//!
+//! 房間、事件、matrix-sdk 在第 3 步。
 
+pub mod channel;
 pub mod chunk_block;
 pub mod chunk_crypto;
 pub mod cipher;
+pub mod client;
+pub mod download;
+pub mod error;
+pub mod login;
+pub mod manifest;
+pub mod protocol;
+pub mod upload;
 
+pub use channel::{Channel, PackChannel, Transport};
 pub use chunk_block::{BlockError, ChunkedBlock};
 pub use chunk_crypto::{CryptoError, DescriptionSlot, FileCipher, Link, SeekTarget};
 pub use cipher::Cipher;
+pub use client::WbfClient;
+pub use download::{DownloadReport, SeekResult};
+pub use error::SdkError;
+pub use login::Session;
+pub use manifest::{Manifest, UploadState};
+pub use upload::SentSummary;
