@@ -22,5 +22,13 @@ tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 http = "1"
+matrix-sdk = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk", default-features = false, features = ["e2e-encryption", "bundled-sqlite"], optional = true }
+futures-core = { version = "0.3", optional = true }
+
+[features]
+default = []
+# 第 3 步的房間 backend：唯一 use matrix_sdk 的地方是 src/backend/matrix_sdk.rs（plan-v1 §7.2）。
+# 預設關：wbf-sdk 本體不拖 matrix-sdk，apps/wbf-cli 才開。
+matrix = ["dep:matrix-sdk", "dep:futures-core"]
 
 [dev-dependencies]

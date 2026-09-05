@@ -2,6 +2,7 @@
 //! 每個命令在 `commands.rs`，session 檔在 `session.rs`。
 
 mod commands;
+mod rooms;
 mod session;
 
 use std::path::PathBuf;
@@ -88,6 +89,77 @@ pub enum Command {
         #[arg(long)]
         len: Option<u64>,
     },
+    /// 列出加入的房間（CLI 規格 §3.4）
+    Rooms,
+    /// 送文字或檔案進房間；檔案先上傳再送約定 §5 的事件
+    Send(SendArgs),
+    /// 等新事件，來一則立刻印一則，JSON Lines（CLI 規格 §3.4.2）
+    Watch(WatchArgs),
+    /// 歷史，從最新往回（CLI 規格 §3.4.1）
+    Read {
+        room: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// 接上一頁印的 next
+        #[arg(long)]
+        before: Option<String>,
+        /// client 端過濾：事件 type，可多個
+        #[arg(long = "type")]
+        types: Vec<String>,
+        #[arg(long)]
+        sender: Option<String>,
+    },
+    /// 只留分塊檔事件，印 manifest；--save 一個事件存一個 <event_id>.json
+    Files {
+        room: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        save: Option<PathBuf>,
+    },
+}
+
+#[derive(Args)]
+pub struct SendArgs {
+    pub room: String,
+    #[arg(long, conflicts_with = "file")]
+    pub text: Option<String>,
+    /// 先 upload 再送事件；upload 的參數照用
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// 檔案訊息的說明文字
+    #[arg(long)]
+    pub caption: Option<String>,
+    /// 非加密房間送檔案要確認；給了就跳過（腳本用）
+    #[arg(long)]
+    pub yes: bool,
+    #[arg(long)]
+    pub cipher: Option<String>,
+    #[arg(long)]
+    pub chunk_size: Option<u32>,
+    #[arg(long)]
+    pub sha256: bool,
+    /// 上傳的 manifest 也寫一份到這裡（含 key，機密）
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct WatchArgs {
+    pub room: String,
+    /// tail（不結束）、wait（等幾秒）、once（印到第一則就停）
+    #[arg(value_parser = ["tail", "wait", "once"])]
+    pub mode: String,
+    /// wait 的秒數
+    pub seconds: Option<u64>,
+    /// 接上次結束時 stderr 印的 since
+    #[arg(long)]
+    pub since: Option<String>,
+    /// once 的上限秒數；到了還沒有 exit 5。不帶就等到有別人的訊息為止
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args)]
@@ -143,5 +215,6 @@ fn exit_code(error: &SdkError) -> u8 {
         SdkError::Server { .. } | SdkError::Protocol(_) => 2,
         SdkError::Integrity(_) => 3,
         SdkError::Network(_) => 4,
+        SdkError::Timeout(_) => 5,
     }
 }
