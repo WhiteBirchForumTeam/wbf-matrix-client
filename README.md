@@ -12,6 +12,10 @@ UI 框架的選擇延後到 SDK 能用之後。規劃與進度看 [`docs/design/
 | `apps/wbf-cli` | 第 2 步的命令都有了：`login`、`logout`、`whoami`、`ping`、`upload`（含續傳與 `--stream`）、`status`、`abort`、`info`、`download`、`seek`。介面在 [`docs/design/wbf-cli-spec.md`](docs/design/wbf-cli-spec.md)；`scripts/acceptance.sh` 對本機 wbfuwunel 跑 §8 的驗收。第 3 步的 `rooms`、`send --text|--file`、`watch tail|wait|once`、`read`、`files` 第一版做了，`login` 改走 matrix-sdk（有裝置金鑰，E2EE 房間解得開） |
 | `apps/desktop` | 之後 |
 
+## 接手先讀
+
+[`docs/handover.md`](docs/handover.md)：現在在哪、怎麼跑、坑、已知的洞、下一步。每次交接更新。
+
 ## 設計文件
 
 | 檔 | 內容 |
