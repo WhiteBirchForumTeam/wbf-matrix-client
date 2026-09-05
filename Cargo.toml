@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wbf-wire", "crates/wbf-sdk"]
+members = ["crates/wbf-wire", "crates/wbf-sdk", "apps/wbf-cli"]
 exclude = ["vendor/matrix-rust-sdk"]
 
 [workspace.package]
