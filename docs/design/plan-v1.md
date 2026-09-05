@@ -100,6 +100,30 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 - 未來加上 local password 時，啟動要輸入密碼才解得開，**UI 與 CLI 一致**，沒有哪一邊繞過。
 - 因此現在寫的東西不能假設本地有快取可查：每個命令的答案都從 server 來，這也是第 3 步 `watch`／`read`／`files` 的前提（CLI 規格 §3.4）。
 
+## 7.2 耦合方向（維護者 2026-09-05 定）：上游 SDK 是可以拆掉的零件，不是地基
+
+維護者的原話，照錄：「不要依賴太重，能切乾淨就切乾淨，蓋下去之後，要拆開來就難了。現在剛起步，這是重點的重點。」
+
+方向：
+
+- **我們自己的東西越多，對上游的依賴越低。** 上游 `matrix-sdk` 不是要一次淘汰，是隨著我們的 work 長大自然變薄，最後變成 fallback。
+- **WS 層之後會有我們自己的協定**（現在的 pack 是起點）。到那時上游那套 E2EE 可能用不到，變成純 fallback。
+- **crypto 先留**（`matrix-sdk-crypto`／vodozemac），但只當「加密解密的引用」，引擎是我們的：接法要讓「換成自己的引擎」是換一個實作，不是改呼叫者。
+- **`matrix-sdk-base` 未必需要**：它與網路無關，但改 WS 可能動到加密、動到房間狀態；很高機會自己蓋一套。不要讓它的型別滲進我們的介面。
+- **整體架構往 Telegram 對齊**（房間、對話、媒體的使用方式），但**不丟掉 E2EE 的本質**。
+- **與聯邦對接能兼容就盡量兼容**；我們自幹的 feature 是 extension，可以不兼容。
+- 🚨 **任何會 breaking Matrix 兼容的地方，都要提出來審查**，由維護者定案要不要兼容。這條沒有例外。
+
+落到程式上的規則（第 3 步起適用）：
+
+| 規則 | 意思 |
+|---|---|
+| CLI 與 UI 只看 `wbf-sdk` 的型別 | `Room`、`Event`、`Manifest`… 都是我們定義的；`matrix_sdk::Room`、`ruma::events::…` 不出現在 `wbf-sdk` 的 pub 介面 |
+| 上游放在一個 adapter 模組裡 | 例如 `wbf-sdk/src/backend/matrix_sdk.rs`：它是唯一 `use matrix_sdk` 的地方。之後的 `backend/wbf_ws.rs` 是同一個 trait 的另一個實作 |
+| 加密引擎是一個 trait | `RoomCrypto { encrypt_event, decrypt_event, … }`，第一個實作包 `OlmMachine`；換引擎是加一個實作 |
+| 跨邊界只傳資料，不傳規則 | adapter 不知道 CLI 的政策（要不要警告、要不要落地）；CLI 不知道 adapter 底下是 HTTP 還是 pack |
+| 每個 PR 要寫「這次新增了對上游的哪些依賴」 | 讓依賴的增長是看得見的，不是蓋下去才發現 |
+
 ## 8. 要維護者決定的
 
 1. 這份規劃可以嗎？
