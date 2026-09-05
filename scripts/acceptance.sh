@@ -6,6 +6,8 @@
 # 環境變數：WBF_SERVER（預設 http://127.0.0.1:6167）、WBF_USER（預設 alice）、WBF_PASSWORD_FILE（必要）、
 # WBF_ACCEPT_SIZE_MIB（預設 200；想快一點就給小的）。
 # 任一步失敗就 exit 非 0 並印出是哪一步。
+# 執行順序與規格 §8 的編號不同（三種 cipher 先跑，因為 seek／續傳／串流都要它的 manifest）；
+# 每一步的標題括號裡是規格的步驟號。
 set -euo pipefail
 
 SERVER=${WBF_SERVER:-http://127.0.0.1:6167}
@@ -28,7 +30,7 @@ wbf() { "$cli" --server "$SERVER" --session "$session" "$@"; }
 step() { echo; echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-step "1. login, ping"
+step "A (spec 1). login, ping"
 wbf login --user "$USER_ID" --password-file "$PASSWORD_FILE" >/dev/null
 ping_out=$(wbf ping)
 echo "$ping_out"
@@ -47,7 +49,7 @@ token=$(grep -o '"access_token": *"[^"]*"' "$session" | cut -d'"' -f4)
 upload_download_roundtrip() {
     local cipher=$1
     local manifest="$work/m-$cipher.json" out="$work/out-$cipher.bin"
-    step "2. upload ($cipher) and compare the standard download with the expected ciphertext length"
+    step "B (spec 2, $cipher). upload, then compare the standard download with the expected ciphertext length"
     wbf --quiet upload "$big" --cipher "$cipher" --sha256 --manifest "$manifest" >/dev/null
     local mxc chunk_size file_size chunks overhead expected_len actual_len
     mxc=$(grep -o '"mxc": *"[^"]*"' "$manifest" | cut -d'"' -f4)
@@ -63,20 +65,20 @@ upload_download_roundtrip() {
     [ "$actual_len" = "$expected_len" ] || fail "standard download is $actual_len bytes, expected $expected_len"
     echo "standard download: $actual_len bytes = $chunks chunks x $overhead tag + $file_size"
 
-    step "3. download ($cipher) and cmp"
+    step "C (spec 3, $cipher). download and cmp"
     wbf --quiet download --manifest "$manifest" -o "$out"
     cmp "$big" "$out" || fail "download ($cipher) differs from the original"
     echo "download ($cipher): identical"
     echo "$manifest"
 }
 
-step "7. three ciphers (each runs steps 2 and 3)"
+step "D (spec 7). three ciphers, each running spec 2 and 3"
 manifest_chacha=$(upload_download_roundtrip chacha20-poly1305 | tail -1)
 upload_download_roundtrip aes-256-gcm >/dev/null
 upload_download_roundtrip none >/dev/null
 echo "all three ciphers: ok"
 
-step "4. seek --at $SEEK_AT --len $SEEK_LEN reads exactly one chunk"
+step "E (spec 4). seek --at $SEEK_AT --len $SEEK_LEN reads exactly one chunk"
 seek_out="$work/seek.bin"
 seek_summary=$(wbf --quiet seek --manifest "$manifest_chacha" --at "$SEEK_AT" --len "$SEEK_LEN" 2>&1 >"$seek_out")
 echo "$seek_summary"
@@ -85,7 +87,7 @@ cmp "$seek_out" "$work/dd.bin" || fail "seek bytes differ from dd"
 grep -qE '"chunks_read":\[[0-9]+\]' <<<"$seek_summary" || fail "seek read more than one chunk: $seek_summary"
 echo "seek: identical, one chunk"
 
-step "5. kill an upload half-way, run the same command again, expect resume"
+step "F (spec 5). kill an upload half-way, run the same command again, expect resume"
 resume_src="$work/resume.bin"
 cp "$big" "$resume_src"
 log="$work/resume.log"
@@ -113,7 +115,7 @@ wbf --quiet download --manifest "$work/resume.json" -o "$work/resume-out.bin"
 cmp "$big" "$work/resume-out.bin" || fail "resumed upload differs from the original"
 echo "resume: identical"
 
-step "6. stream upload from stdin"
+step "G (spec 6). stream upload from stdin"
 cat "$big" | wbf --quiet upload --stream --cipher aes-256-gcm --link wifi --name stream.bin --manifest "$work/stream.json" >/dev/null
 wbf --quiet download --manifest "$work/stream.json" -o "$work/stream-out.bin"
 cmp "$big" "$work/stream-out.bin" || fail "stream upload differs from the original"

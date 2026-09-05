@@ -10,6 +10,7 @@ use wbf_sdk::{
     Channel, ChunkedBlock, Cipher, FileCipher, Manifest, SdkError, Session, Transport, UploadState,
     WbfClient,
 };
+use zeroize::Zeroize;
 
 use crate::session::{
     default_session_path, delete_session, read_session, write_private, write_session,
@@ -27,13 +28,13 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             device_name,
         } => login_command(&context, &user, password_file.as_deref(), &device_name).await,
         Command::Logout => {
-            let session = context.session()?;
+            let session = context.session().await?;
             logout(&session).await?;
             delete_session(&context.session_path)?;
             print_json(&json!({ "ok": true }))
         }
         Command::Whoami => {
-            let who = whoami(&context.session()?).await?;
+            let who = whoami(&context.session().await?).await?;
             print_json(&json!({ "user_id": who.user_id, "device_id": who.device_id }))
         }
         Command::Ping => {
@@ -99,16 +100,24 @@ impl Context {
     }
 
     /// `--token` 加 `--server` 就不碰 session 檔；否則讀 session 檔，`--server` 可覆蓋。
-    fn session(&self) -> Result<Session, SdkError> {
+    /// `--token` 模式打一次 `whoami` 填真的 user_id：續傳狀態檔的 `is_for` 要靠它分辨「不是你的上傳」，
+    /// 填佔位值會讓兩把不同的 token 比成相等（PR #6 審查 rumia 🟡2）。
+    async fn session(&self) -> Result<Session, SdkError> {
         if let Some(token) = &self.token_override {
             let server = self.server_override.clone().ok_or_else(|| {
                 SdkError::Usage("--token needs --server (or WBF_SERVER) too".into())
             })?;
-            return Ok(Session {
+            let probe = Session {
                 server,
-                user_id: "unknown".into(),
-                device_id: "unknown".into(),
+                user_id: String::new(),
+                device_id: String::new(),
                 access_token: token.clone(),
+            };
+            let who = whoami(&probe).await?;
+            return Ok(Session {
+                user_id: who.user_id,
+                device_id: who.device_id,
+                ..probe
             });
         }
         let mut session = read_session(&self.session_path)?;
@@ -119,7 +128,7 @@ impl Context {
     }
 
     async fn client(&self) -> Result<WbfClient<Channel>, SdkError> {
-        let session = self.session()?;
+        let session = self.session().await?;
         let channel =
             Channel::connect(&session.server, &session.access_token, self.transport).await?;
         Ok(WbfClient::new(channel))
@@ -152,8 +161,10 @@ async fn login_command(
         }
         None => rpassword::prompt_password("password: ")?,
     };
-    let session = login_with_password(&server, user, &password, device_name).await?;
-    drop(password);
+    let mut password = password;
+    let session = login_with_password(&server, user, &password, device_name).await;
+    password.zeroize();
+    let session = session?;
     write_session(&context.session_path, &session)?;
     print_json(
         &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server }),
@@ -186,7 +197,7 @@ async fn upload_file(context: &Context, args: &UploadArgs) -> Result<(), SdkErro
         .ok_or_else(|| SdkError::Usage("upload needs a file, or --stream".into()))?;
     let mut source = std::fs::File::open(path)?;
     let file_size = source.metadata()?.len();
-    let session = context.session()?;
+    let session = context.session().await?;
     let mut client = context.client().await?;
     let state_path = state_path_for(path);
 
@@ -206,7 +217,12 @@ async fn upload_file(context: &Context, args: &UploadArgs) -> Result<(), SdkErro
                 )));
             }
             let status = client.upload_status(state.upload_id).await?;
-            context.progress(format!("resume from chunk {}", status.received));
+            if status.finished {
+                // 上次在 Seal 前被殺：server 已經收齊，下面的 send_chunks 一塊也不會送（只在 --sha256 時重算雜湊），直接 Seal。
+                context.progress("all chunks already on the server; sealing".to_string());
+            } else {
+                context.progress(format!("resume from chunk {}", status.received));
+            }
             (state, status.received)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -240,8 +256,9 @@ async fn upload_file(context: &Context, args: &UploadArgs) -> Result<(), SdkErro
             &mut source,
             from_chunk,
             args.sha256,
-            &mut |done, total| {
-                context.progress(format!("chunk {done}/{}", total.unwrap_or(0)));
+            &mut |done, total| match total {
+                Some(total) => context.progress(format!("chunk {done}/{total}")),
+                None => context.progress(format!("chunk {done}")),
             },
         )
         .await?;
@@ -261,7 +278,7 @@ async fn upload_stream(context: &Context, args: &UploadArgs) -> Result<(), SdkEr
             "--stream reads stdin; do not pass a file".into(),
         ));
     }
-    let session = context.session()?;
+    let session = context.session().await?;
     let mut client = context.client().await?;
     let cipher = parse_cipher(args.cipher.as_deref())?;
     let link = if args.link == "wifi" {
@@ -317,8 +334,33 @@ fn emit_manifest(manifest: &Manifest, path: Option<&Path>) -> Result<(), SdkErro
 
 // ---- 下載 ----
 
-fn read_manifest(path: &Path) -> Result<Manifest, SdkError> {
-    Manifest::from_json(&std::fs::read(path)?)
+/// 讀 manifest 並核對它是這個 session 的 server 的：顯式拒絕「拿 A server 的 manifest 去打 B server」，
+/// 不讓使用者看到 NotFound 還要自己猜（與上傳狀態檔的 `is_for` 同一個規則）。
+async fn read_manifest(context: &Context, path: &Path) -> Result<Manifest, SdkError> {
+    let manifest = Manifest::from_json(&std::fs::read(path)?)?;
+    let session = context.session().await?;
+    if manifest.server.trim_end_matches('/') != session.server.trim_end_matches('/') {
+        return Err(SdkError::Usage(format!(
+            "manifest is for {}, but the session is on {}",
+            manifest.server, session.server
+        )));
+    }
+    Ok(manifest)
+}
+
+/// 沒給 `-o` 時用描述的 `name`：它是對方寫的，帶路徑分隔符或是 `..` 就不能當檔名，要求明給 `-o`。
+fn output_path_from_name(name: Option<&str>) -> Result<PathBuf, SdkError> {
+    let name = name
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download.bin");
+    let is_plain_file_name =
+        !name.contains(['/', '\\']) && name != "." && name != ".." && !name.contains('\0');
+    if !is_plain_file_name {
+        return Err(SdkError::Usage(format!(
+            "the file's name {name:?} is not a plain file name; pass -o"
+        )));
+    }
+    Ok(PathBuf::from(name))
 }
 
 async fn info_command(
@@ -333,7 +375,7 @@ async fn info_command(
         "chunk_count": info.chunk_count, "truncated": info.truncated, "content_type": info.content_type,
     });
     if let Some(path) = manifest {
-        let manifest = read_manifest(path)?;
+        let manifest = read_manifest(context, path).await?;
         if manifest.mxc != mxc {
             return Err(SdkError::Usage(format!(
                 "manifest is for {}, not {mxc}",
@@ -363,17 +405,11 @@ async fn download_command(
     manifest_path: &Path,
     out: Option<PathBuf>,
 ) -> Result<(), SdkError> {
-    let manifest = read_manifest(manifest_path)?;
-    let out = out.unwrap_or_else(|| {
-        PathBuf::from(
-            manifest
-                .block
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "download.bin".into()),
-        )
-    });
+    let manifest = read_manifest(context, manifest_path).await?;
+    let out = match out {
+        Some(out) => out,
+        None => output_path_from_name(manifest.block.name.as_deref())?,
+    };
     let mut client = context.client().await?;
     let mut file = std::fs::File::create(&out)?;
     let result = client
@@ -403,7 +439,7 @@ async fn seek_command(
     at: u64,
     len: Option<u64>,
 ) -> Result<(), SdkError> {
-    let manifest = read_manifest(manifest_path)?;
+    let manifest = read_manifest(context, manifest_path).await?;
     let mut client = context.client().await?;
     let result = client.seek_read(&manifest, at, len).await?;
     let mut stdout = std::io::stdout().lock();

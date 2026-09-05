@@ -23,7 +23,7 @@ pub struct Cli {
     /// session 檔位置
     #[arg(long, global = true, env = "WBF_SESSION")]
     pub session: Option<PathBuf>,
-    /// stdout 只印 JSON（預設就是）
+    /// stdout 只印 JSON（預設就是；現在是刻意的 no-op，留著是為了之後加人類可讀模式時介面不變，CLI 規格 §2）
     #[arg(long, global = true)]
     pub json: bool,
     /// stderr 不印進度

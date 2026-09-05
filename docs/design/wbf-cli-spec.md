@@ -67,6 +67,10 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。
 
+- manifest 的 `server` 與 session 的不同 → exit 1，不拿 A server 的 manifest 去打 B server（與上傳狀態檔的規則一致）。
+- `download` 沒給 `-o` 時用描述的 `name`；它是對方寫的，帶路徑分隔符或是 `.`／`..` 就要求明給 `-o`（exit 1），不寫到意料外的位置。
+- `--token` 模式會先打一次 `whoami` 填真的 user_id，狀態檔的 server／user 核對才有意義。
+
 #### 3.3.1 `seek` 的語意：位置是明文位置，讀的單位是塊
 
 `--at` 與 `--len` 都是**明文**的 byte 位置與長度，跟 chunk 邊界無關；對齊到塊是 `seek` 自己的事。以 `chunk_size` 64 KiB 為例：

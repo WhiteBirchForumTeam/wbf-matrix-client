@@ -69,6 +69,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
+    // mode() 只在建立新檔時生效；覆寫既有檔（舊版留下的 0644）權限不會變，這裡無條件再設一次。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(bytes)?;
     Ok(())
 }

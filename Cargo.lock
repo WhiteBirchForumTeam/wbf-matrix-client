@@ -1536,6 +1536,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "wbf-sdk",
+ "zeroize",
 ]
 
 [[package]]
