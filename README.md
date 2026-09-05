@@ -19,6 +19,7 @@ UI 框架的選擇延後到 SDK 能用之後。規劃與進度看 [`docs/design/
 | [`plan-v1.md`](docs/design/plan-v1.md) | v1 範圍、佈局、依賴、驗收、順序、進度 |
 | [`wbf-client-convention-for-chunk.md`](docs/design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。server 不讀這些 |
 | [`wbf-cli-spec.md`](docs/design/wbf-cli-spec.md) | CLI 的命令、參數、輸出、exit code、manifest、狀態檔、驗收腳本 |
+| [`local-cache-db.md`](docs/design/local-cache-db.md) | 之後的本地資料庫：加密的暫存快取、主金鑰與 local password、與 matrix-sdk store 的分工（現在還不做，見 plan-v1 §7.1） |
 | [`wbf-vectors.json`](docs/design/wbf-vectors.json) | 線上協議的黃金向量，從 wbfuwunel **整份複製**、不手改；server 規格改了就重新複製，測試紅了就是漂移 |
 
 ## 關聯專案
