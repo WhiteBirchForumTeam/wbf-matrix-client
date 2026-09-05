@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::SessionTokens;
-use matrix_sdk::config::SyncSettings;
+use matrix_sdk::config::{RequestConfig, SyncSettings};
 use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
@@ -191,6 +191,9 @@ impl ChatBackend for MatrixBackend {
     }
 
     async fn history(&self, id: &str, before: Option<&str>, limit: u32) -> Result<Page, SdkError> {
+        if limit == 0 {
+            return Err(SdkError::Usage("history limit must be at least 1".into()));
+        }
         let room = self.room(id)?;
         let mut options = MessagesOptions::backward();
         options.limit = UInt::from(limit);
@@ -331,26 +334,31 @@ impl ChatBackend for MatrixBackend {
 
 async fn build_client(server: &str, store_dir: &Path) -> Result<Client, SdkError> {
     std::fs::create_dir_all(store_dir)?;
+    // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
     Client::builder()
         .homeserver_url(server)
+        .request_config(RequestConfig::new().timeout(crate::channel::REQUEST_TIMEOUT))
         .sqlite_store(store_dir, None)
         .build()
         .await
         .map_err(|error| SdkError::Network(format!("matrix client: {error}")))
 }
 
-/// matrix-sdk 的錯誤分類到我們的：HTTP 層的 Matrix 錯誤 → `Server`（code 是 errcode），其他 → `Network`。
-fn matrix_error(error: impl std::fmt::Display) -> SdkError {
-    let text = error.to_string();
-    // matrix_sdk::Error 的 Display 會帶 errcode（例如 "M_FORBIDDEN: Invalid password"）；抓得到就當 Server。
-    if let Some(code) = text.split(':').next().filter(|head| head.starts_with("M_")) {
+/// matrix-sdk 的錯誤分類到我們的：server 回了 Matrix 的 `errcode`（M_FORBIDDEN…）→ `Server`（code 就是 errcode），其他 → `Network`。
+/// 用型別化的入口，不 parse Display 字串（PR #9 審查 rumia 🟡1：Display 是 `[403 / M_FORBIDDEN] …`，字串抓不到）。
+fn matrix_error(error: matrix_sdk::Error) -> SdkError {
+    if let Some(kind) = error.client_api_error_kind() {
+        let status = error
+            .as_client_api_error()
+            .map(|api| api.status_code.as_u16())
+            .unwrap_or(0);
         return SdkError::Server {
-            code: code.trim().to_string(),
-            message: text,
-            meta: serde_json::Value::Null,
+            code: kind.errcode().to_string(),
+            message: error.to_string(),
+            meta: serde_json::json!({ "status": status }),
         };
     }
-    SdkError::Network(format!("matrix: {text}"))
+    SdkError::Network(format!("matrix: {error}"))
 }
 
 // ---- 事件 → Message ----
@@ -379,6 +387,23 @@ fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
     message.decrypted = decrypted;
     message.undecryptable_reason = reason;
     (message, relation)
+}
+
+/// 一頁事件 JSON → `Message` 陣列，關係事件折進目標（`aggregate`）。給沒有 `TimelineEvent` 的呼叫者與測試用；
+/// `decrypted` 一律 None（解密狀態只有 matrix-sdk 的 `TimelineEvent` 知道）。
+///
+/// Args:
+///     conversation: room_id，sync 的事件沒帶時補上
+///     raws: 事件 JSON，照 server 給的順序
+/// Return:
+///     Vec<Message>  已折進去的 reaction／edit／redaction 事件不在裡面；目標不在這一頁的照原樣留著
+pub fn messages_from_json(conversation: &str, raws: &[serde_json::Value]) -> Vec<Message> {
+    aggregate(
+        conversation,
+        raws.iter()
+            .map(|raw| (message_from_json(raw), relation_of(raw)))
+            .collect(),
+    )
 }
 
 /// 從事件的 JSON（sync 或 messages 回來的原樣）組 `Message`。conversation 由呼叫者填（sync 的事件沒有 room_id）。

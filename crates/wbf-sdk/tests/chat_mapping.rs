@@ -97,3 +97,114 @@ fn missing_fields_become_unknown_not_empty() {
     assert_eq!(message.conversation, "unknown");
     assert_eq!((message.r_seq, message.g_seq), (None, None));
 }
+
+// ---- aggregate：同一頁內的關係事件折進目標（PR #9 審查 cirno 💡1、salvia）----
+
+use wbf_sdk::backend::matrix_sdk::messages_from_json;
+
+fn relation(
+    id: &str,
+    sender: &str,
+    event_type: &str,
+    content: serde_json::Value,
+) -> serde_json::Value {
+    json!({ "type": event_type, "event_id": id, "sender": sender, "origin_server_ts": 2, "content": content })
+}
+
+#[test]
+fn reactions_fold_into_target_and_disappear_as_events() {
+    let page = vec![
+        text_event("$a", "hi"),
+        relation(
+            "$r1",
+            "@b:localhost",
+            "m.reaction",
+            json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$a", "key": "👍" } }),
+        ),
+        relation(
+            "$r2",
+            "@c:localhost",
+            "m.reaction",
+            json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$a", "key": "👍" } }),
+        ),
+        relation(
+            "$r3",
+            "@b:localhost",
+            "m.reaction",
+            json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$a", "key": "❤" } }),
+        ),
+    ];
+    let messages = messages_from_json("!r:localhost", &page);
+    assert_eq!(messages.len(), 1, "reaction events are consumed");
+    let reactions = &messages[0].reactions;
+    assert_eq!(reactions.len(), 2);
+    let thumbs = reactions
+        .iter()
+        .find(|reaction| reaction.key == "👍")
+        .unwrap();
+    assert_eq!(thumbs.by, vec!["@b:localhost", "@c:localhost"]);
+    assert_eq!(
+        messages[0].conversation, "!r:localhost",
+        "sync events have no room_id; the page fills it in"
+    );
+}
+
+#[test]
+fn edit_replaces_content_and_marks_editor() {
+    let page = vec![
+        text_event("$a", "first"),
+        relation(
+            "$e",
+            "@a:localhost",
+            "m.room.message",
+            json!({
+                "msgtype": "m.text", "body": "* second",
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$a" },
+                "m.new_content": { "msgtype": "m.text", "body": "second" }
+            }),
+        ),
+    ];
+    let messages = messages_from_json("!r:localhost", &page);
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(&messages[0].kind, MessageKind::Text { body, .. } if body == "second"));
+    assert_eq!(messages[0].edited_by.as_deref(), Some("@a:localhost"));
+}
+
+#[test]
+fn redaction_marks_target_deleted() {
+    let page = vec![
+        text_event("$a", "oops"),
+        relation(
+            "$d",
+            "@a:localhost",
+            "m.room.redaction",
+            json!({ "redacts": "$a", "reason": "typo" }),
+        ),
+    ];
+    let messages = messages_from_json("!r:localhost", &page);
+    assert_eq!(messages.len(), 1);
+    assert!(
+        matches!(&messages[0].kind, MessageKind::Deleted { reason: Some(reason) } if reason == "typo")
+    );
+
+    // room v11 之前 redacts 在頂層
+    let mut old_style = relation("$d2", "@a:localhost", "m.room.redaction", json!({}));
+    old_style["redacts"] = json!("$a");
+    let messages = messages_from_json("!r:localhost", &[text_event("$a", "x"), old_style]);
+    assert!(matches!(messages[0].kind, MessageKind::Deleted { .. }));
+}
+
+#[test]
+fn relation_whose_target_is_not_on_the_page_is_kept() {
+    let page = vec![relation(
+        "$r",
+        "@b:localhost",
+        "m.reaction",
+        json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$elsewhere", "key": "👍" } }),
+    )];
+    let messages = messages_from_json("!r:localhost", &page);
+    assert_eq!(messages.len(), 1, "not dropped");
+    assert!(
+        matches!(&messages[0].kind, MessageKind::Unsupported { event_type, .. } if event_type == "m.reaction")
+    );
+}

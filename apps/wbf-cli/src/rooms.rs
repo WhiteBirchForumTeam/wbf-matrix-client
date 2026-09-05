@@ -16,12 +16,18 @@ use crate::session::write_private;
 use crate::{SendArgs, UploadArgs, WatchArgs};
 
 /// session 檔旁邊的 `matrix/`：matrix-sdk 的 crypto 與 state store（CLI 規格 §7 第 3 步加的）。
-pub fn store_dir_for(session_path: &Path) -> PathBuf {
-    session_path
+pub fn store_dir_for(session_path: &Path) -> Result<PathBuf, SdkError> {
+    // session 路徑沒有上層目錄就報錯，不退到相對 cwd 的 `matrix`（PR #9 審查 cirno ⚠️4）。
+    let parent = session_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-        .join("matrix")
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            SdkError::Usage(format!(
+                "session path {} has no parent directory for the matrix store",
+                session_path.display()
+            ))
+        })?;
+    Ok(parent.join("matrix"))
 }
 
 /// 還原 backend 並做一次增量 sync（timeout 0）：房間列表與新事件到 store，之後的命令才看得到現況。
@@ -123,7 +129,6 @@ pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), Sd
     };
     let once = args.mode == "once";
     let room = args.room.clone();
-    let mut printed = 0u32;
     let mut on_update = |update: Update| -> WatchControl {
         let Update::NewMessage(message) = &update else {
             return WatchControl::Continue;
@@ -137,7 +142,6 @@ pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), Sd
         if own {
             return WatchControl::Continue;
         }
-        printed += 1;
         if once {
             WatchControl::Stop
         } else {
@@ -237,7 +241,8 @@ fn confirm(question: &str) -> Result<bool, SdkError> {
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+    let answer = answer.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 /// watch 的 JSON Lines：一事件一行、即時 flush（CLI 規格 §3.4.2）。

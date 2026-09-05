@@ -124,12 +124,8 @@ pub struct Page {
 pub enum Update {
     /// Box：`Message` 幾百 byte，其他變體只有一個 id（clippy large_enum_variant）。
     NewMessage(Box<Message>),
-    ConversationJoined {
-        id: String,
-    },
-    ConversationLeft {
-        id: String,
-    },
+    /// 第 3 步只有這一個房間層的變化；「新加入的房間」用 `conversations()` 看，watch 還不推。
+    ConversationLeft { id: String },
 }
 
 /// callback 回的：繼續等，還是停。

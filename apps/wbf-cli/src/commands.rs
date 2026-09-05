@@ -193,7 +193,7 @@ async fn login_command(
         None => rpassword::prompt_password("password: ")?,
     };
     // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放 session 檔旁邊的 matrix/。
-    let store_dir = crate::rooms::store_dir_for(&context.session_path);
+    let store_dir = crate::rooms::store_dir_for(&context.session_path)?;
     let mut password = password;
     let login = MatrixBackend::login(&server, user, &password, device_name, &store_dir).await;
     password.zeroize();

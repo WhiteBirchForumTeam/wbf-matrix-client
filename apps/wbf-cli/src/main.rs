@@ -157,7 +157,7 @@ pub struct WatchArgs {
     /// 接上次結束時 stderr 印的 since
     #[arg(long)]
     pub since: Option<String>,
-    /// once 的上限秒數；到了還沒有 exit 5
+    /// once 的上限秒數；到了還沒有 exit 5。不帶就等到有別人的訊息為止
     #[arg(long)]
     pub timeout: Option<u64>,
 }
