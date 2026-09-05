@@ -309,8 +309,8 @@ pub enum Update {
 ## 7. 還開著的（再議）
 
 1. ~~時序與序號~~ 定了：§4.3。
-2. 「跨房間全域最近 N 則」（初開 app 掛載一萬條）：Matrix 沒有這個 API，要做成 fork server 的 pack（server 現成的全域計數器倒著掃就有）。等維護者定要不要。
+2. ~~「跨房間全域最近 N 則」~~ 定了（維護者 2026-09-05）：要做，server 級實作，預設 10000。
 3. §6 的範圍（維護者還沒對這一項表態）。
-4. server 端的 `seq` 與全域最近 N 則是 wbfuwunel 的工作：要不要在那邊開 issue 把規格寫下來。
+4. ~~開 issue~~ 開了：server 端的 `seq` 與全域最近 N 則的規格在 [wbfuwunel #20](http://ai.zooy.cc:30008/amaid/wbfuwunel/issues/20)。client 這邊在它做出來之前照 §4.3 的「沒有 `seq`」那欄走。
 
 已定案的都寫在各節，標「維護者定」。
