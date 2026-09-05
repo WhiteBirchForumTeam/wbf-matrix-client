@@ -12,6 +12,9 @@ use crate::protocol::{
 pub struct WbfClient<C: PackChannel> {
     channel: C,
     next_seq: u32,
+    /// `hello()` 回的 `features`；None = 還沒問過。需要 feature 的命令（`recent`、`send_event`）用它把關，
+    /// 不靠呼叫者記得看 docstring。
+    features: Option<Vec<String>>,
 }
 
 impl<C: PackChannel> WbfClient<C> {
@@ -19,6 +22,7 @@ impl<C: PackChannel> WbfClient<C> {
         WbfClient {
             channel,
             next_seq: 1,
+            features: None,
         }
     }
 
@@ -45,7 +49,38 @@ impl<C: PackChannel> WbfClient<C> {
     ///     client_name: example: "wbf-cli/0.1"
     pub async fn hello(&mut self, client_name: &str) -> Result<HelloAck, SdkError> {
         let ack = self.call(|seq| protocol::hello(client_name, seq)).await?;
-        protocol::parse_meta(&ack)
+        let hello: HelloAck = protocol::parse_meta(&ack)?;
+        self.features = Some(hello.features.clone());
+        Ok(hello)
+    }
+
+    /// Return:
+    ///     Option<&[String]>  `hello()` 回的 features；None = 還沒問過
+    pub fn features(&self) -> Option<&[String]> {
+        self.features.as_deref()
+    }
+
+    /// Args:
+    ///     name: example: "recent"
+    /// Return:
+    ///     bool  1 = 問過且 server 宣告了這個 feature；沒問過一律 0（fail closed）
+    pub fn has_feature(&self, name: &str) -> bool {
+        self.features
+            .as_ref()
+            .is_some_and(|features| features.iter().any(|feature| feature == name))
+    }
+
+    /// 需要 feature 的命令先過這關：沒問過 `hello()` 或 server 沒宣告，都是 `Usage`，不送。
+    fn require_feature(&self, name: &str) -> Result<(), SdkError> {
+        match &self.features {
+            None => Err(SdkError::Usage(format!(
+                "call hello() before using `{name}`: the server's features are not known yet"
+            ))),
+            Some(features) if features.iter().any(|feature| feature == name) => Ok(()),
+            Some(_) => Err(SdkError::Usage(format!(
+                "this server does not advertise the `{name}` feature"
+            ))),
+        }
     }
 
     pub async fn ping(&mut self) -> Result<(), SdkError> {
@@ -110,6 +145,7 @@ impl<C: PackChannel> WbfClient<C> {
         &mut self,
         request: &RecentRequest,
     ) -> Result<(RecentAck, Vec<serde_json::Value>), SdkError> {
+        self.require_feature("recent")?;
         let ack = self.call(|seq| protocol::recent(request, seq)).await?;
         let meta: RecentAck = protocol::parse_meta(&ack)?;
         let events = protocol::parse_recent_events(&ack)?;
@@ -137,8 +173,9 @@ impl<C: PackChannel> WbfClient<C> {
         request: &SendRequest,
         content: Vec<u8>,
     ) -> Result<SendAck, SdkError> {
+        self.require_feature("attachments")?;
         let ack = self
-            .call(|seq| protocol::send_event(request, content.clone(), seq))
+            .call(|seq| protocol::send_event(request, content, seq))
             .await?;
         protocol::parse_meta(&ack)
     }

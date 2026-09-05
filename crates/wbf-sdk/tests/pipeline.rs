@@ -572,3 +572,41 @@ async fn create_ack_header_id_variants() {
         "non-Create must echo id 0: {error}"
     );
 }
+
+/// feature gate 在 runtime 執行（PR #8 審查 rumia 🟡1）：沒問過 hello 或 server 沒宣告，`recent`／`send_event` 不送就拒。
+#[tokio::test]
+async fn feature_gated_commands_refuse_without_advertised_feature() {
+    use wbf_sdk::protocol::{RecentRequest, SendRequest};
+    let request = RecentRequest {
+        limit: 10,
+        cg_seq: None,
+        before: None,
+    };
+    let send = SendRequest {
+        room_id: "!r:fake".into(),
+        event_type: "m.room.message".into(),
+        txn_id: "t".into(),
+        attachments: vec![],
+    };
+
+    let mut server = FakeServer::new();
+    let mut client = WbfClient::new(&mut server);
+    assert!(!client.has_feature("recent"), "nothing known before hello");
+    let error = client.recent(&request).await.unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error}");
+    assert!(server.requests.is_empty(), "nothing was sent");
+
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test").await.unwrap();
+    assert!(client.has_feature("upload") && !client.has_feature("recent"));
+    let error = client.recent(&request).await.unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error}");
+    let error = client.send_event(&send, b"{}".to_vec()).await.unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error}");
+    let sent_kinds: Vec<_> = server.requests.iter().map(|(kind, _, _)| *kind).collect();
+    assert_eq!(
+        sent_kinds,
+        vec![wbf_wire::Kind::Control],
+        "only the Hello went out"
+    );
+}
