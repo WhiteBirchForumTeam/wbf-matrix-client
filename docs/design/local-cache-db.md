@@ -15,7 +15,8 @@
 |---|---|
 | 可以整個丟掉 | schema 版本不對、server 或 user 換了、解不開：刪檔重建，不寫遷移 |
 | 不需要衝突解決 | 同一個 event_id 再寫一次就覆蓋；server 說的算 |
-| 有配額 | 每房最多 500 則、總量 200 MiB（維護者同意的傾向值），超過從最舊的刪 |
+| 事件快取只長不刪 | **500 是同步視窗，不是上限**（維護者 2026-09-05 訂正）：進房時把最新 500 則同步進快取；往舊滑超過就再 load 更舊的存進去；下次重讀那一段從快取拿，不重拉。事件小，不設上限 |
+| 媒體快取有配額 | 預設 **2 GiB 起跳**（維護者：200 MiB 太低），數字待定；LRU 刪最久沒用的檔（§8） |
 | 壞掉的代價只是重拉 | 任何讀到壞資料的地方都 fail closed：當成沒有快取，回 server 拿 |
 
 ## 2. 存什麼、不存什麼
@@ -30,7 +31,7 @@
 | 不存 | 理由 |
 |---|---|
 | 密碼 | 永遠不存（CLI 規格 §9） |
-| 媒體內容 | 第一版不快取，manifest 夠用；要快取是另一份設計（密文可以直接落地，但配額與清理另議） |
+| 媒體內容 | **不進 DB**，寫成檔案放加密的檔案空間（§8）；DB 只放指針（`media_files`） |
 | session 與 token | **不進 DB**（維護者 2026-09-05 定）：另外用同一把主金鑰導出的第三把子金鑰鎖一次，見 §4 與 §5.6 的 `session.sealed` |
 
 ## 3. 加密：SQLCipher，整檔頁級
@@ -54,7 +55,7 @@ local.key（0600）
 
 - **主金鑰** 32 byte，CSPRNG，一台機器一把。
 - **導出**：三把 32 byte 子金鑰，`BLAKE3 derive_key(context, master)`，context 是固定字串
-  `"wbf-matrix-client cache sqlcipher v1"`、`"wbf-matrix-client matrix-sdk store v1"`、`"wbf-matrix-client session v1"`。
+  `"wbf-matrix-client cache sqlcipher v1"`、`"wbf-matrix-client matrix-sdk store v1"`、`"wbf-matrix-client session v1"`，加第四把 `"wbf-matrix-client media store v1"`（§8）。
   第三把用 XChaCha20-Poly1305 把 session 檔（server、user_id、device_id、access_token）整份封成 `session.sealed`：
   session 與 token **不進 DB**，但跟 DB 同一把鎖（維護者 2026-09-05 定）。子金鑰不落地，每次開啟導一次。
   換 context 字串就是換金鑰，所以 context 帶版本。
@@ -125,7 +126,8 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 ```
 <data dir>/wbf/<server host>/<user localpart>/
   local.key      主金鑰（§4）
-  cache.db       我們的快取（SQLCipher）
+  cache.db       我們的快取（SQLCipher）：事件、房間、指針
+  media/         媒體檔案空間，檔級加密（§8）；檔名是隨機 id，不洩原名
   matrix/        SDK 的 store 目錄（crypto.db、state.db；SDK 自己命名）
   session.sealed 第三把子金鑰封住的 session（取代 CLI 規格 §7 的明文 session.json；那一版同步改規格）
 ```
@@ -174,9 +176,70 @@ CREATE TABLE hidden_messages (room_id TEXT NOT NULL, event_id TEXT NOT NULL, hid
 - 配額（§1）以 `seq` 為序刪最舊（沒有 `seq` 的 room 用 `origin_server_ts`）；`rooms` 不受配額。
 - **洞**：有 `seq` 的 room，「快取裡有哪些」就是 `seq` 的集合，缺的就是洞，不存 token。沒有 `seq` 的 room 只快取最新一段連續視窗（chat-model §4.3 的退化表）。
 
-## 7. 還開著的
+## 8. 媒體檔案空間：檔級加密，不進 DB（維護者 2026-09-05 定方向）
+
+媒體不用資料庫讀，寫成檔案；DB 只放事件與指針。檔案空間要加密，方向對齊 [gocryptfs](https://github.com/rfjakob/gocryptfs)：
+**每個檔案自己一把金鑰、內容切固定大小的塊各自 AEAD、檔名不洩原名**。但不用 gocryptfs 本身：它是 FUSE 掛載，Windows 要 WinFsp、Android 沒有；
+我們把同一套做法做在程式裡，UI 拿到的是一個 `Read + Seek` 的把手，不是掛載點。
+
+### 8.1 存什麼
+
+**解密後的明文塊**（維護者：「每塊解密後就放這裡」），再用本地金鑰加密落地。不存 server 上的密文，理由：
+- server 密文的金鑰是每則訊息各自的（事件區塊裡的 `key`），本地要留一堆房間金鑰才讀得回來；存明文塊再用本地金鑰包，本地只有一套金鑰制度。
+- 塊的邊界照約定規格書的 `chunk_size`，下載端解一塊就能存一塊，seek 讀回來也是一塊一塊，**部分快取是自然的**（看了影片中間一段，就只有那幾塊在）。
+
+### 8.2 檔案格式
+
+```
+media/<id 前 2 hex>/<id>          id = 128 bit CSPRNG 的 32 位小寫 hex；原檔名只在 DB
+  header（固定長度）
+    magic "WBFM"、version 1
+    file_id（16 byte，同檔名；進 AAD，防換名／換檔）
+    chunk_size（u32）、file_size（u64）
+    wrapped_file_key：XChaCha20-Poly1305(第四把子金鑰, nonce 24 byte, file_key 32 byte) → 24 + 48 byte
+    nonce_base（8 byte，每檔隨機）
+  body：第 i 塊在固定偏移 header_len + i × (chunk_size + 16)
+    block_i = AEAD(file_key, nonce_base ‖ u32_be(i), aad = "wbf-media-store-v1" ‖ file_id, 明文塊 i)
+```
+
+- 塊的加密就是 `wbf-sdk` 現有的 `FileCipher`（`chunk_crypto`）：同一個 nonce 構造、同一種 AEAD，只換 AAD 與金鑰來源。實作時把 AAD 從常數改成參數，一個小改動。
+- 塊固定偏移，所以**沒下載的塊就是空洞**（檔案 sparse 或先不寫），哪些塊在由 DB 的 bitmap 說；讀到不在的塊 → 不是壞，是沒快取，回 server 拿。
+- 標籤驗證失敗 → 這一塊當壞的丟掉重拉，其他塊不受影響（與下載端的規則一致：完整性是每塊各自驗）。
+- 檔名是隨機 id、目錄用前 2 hex 扇出（一個目錄不會塞幾萬個檔）；大小、mimetype、原名、對應哪個 mxc，全部只在 `cache.db`（它整檔加密）。磁碟上能看到的只有「幾個檔、各多大」。
+
+### 8.3 DB 的指針
+
+```sql
+CREATE TABLE media_files (
+  file_id TEXT PRIMARY KEY,          -- 32 hex，就是檔名
+  mxc TEXT NOT NULL UNIQUE,          -- 對回事件（events.mxc）
+  name TEXT, mimetype TEXT,
+  file_size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
+  blocks_present BLOB NOT NULL,      -- bitmap，第 i 位 = 第 i 塊在不在
+  complete INTEGER NOT NULL,         -- 全部塊都在
+  bytes_on_disk INTEGER NOT NULL,    -- 配額用
+  created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+CREATE INDEX media_files_lru ON media_files (last_used_at);
+```
+
+- 一個 mxc 一個檔；同一個媒體被轉發到別的房間仍是同一個 mxc、同一個檔。
+- 寫入順序：先寫塊、fsync、再更新 bitmap；反過來會出現「DB 說有、檔案沒有」。讀的時候**兩邊都問**：bitmap 說在、標籤也要過。
+
+### 8.4 配額與清理
+
+- 預設 **2 GiB 起跳**（數字待定），只算 `bytes_on_disk` 的加總。
+- 超過就照 `last_used_at` 由舊到新刪整個檔（不做塊級淘汰，簡單），刪檔與刪列一起做；先刪檔再刪列，中途死掉留下的孤兒列在下次啟動掃一次清掉。
+- 正在播放的檔不刪（有把手打開就跳過）。
+- 事件快取不受這個配額（§1）。
+
+### 8.5 與下載管線的接法
+
+`download`／`seek` 現在是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；加快取就是在「交出去」之前多一步「寫進 media store 第 i 塊」，在「`Read`」之前多一步「media store 有第 i 塊就直接用」。
+邊界仍在 `wbf-sdk`：CLI 與 UI 只看到 `Read + Seek` 的把手，不知道底下是快取還是 server。
+
+## 9. 還開著的
 
 1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，另外用第三把子金鑰鎖成 `session.sealed`（§4，維護者 2026-09-05）。
    仍開著的是體感：`PasswordWrapped` 模式下 CLI 每個命令都要輸密碼，除非有 agent 之類的東西；加 local password 那一版再看。
-2. 媒體內容快取：另一份設計。
-3. 配額的數字：500 則／房、200 MiB 總量，用了再調。
+2. ~~媒體內容快取另議~~ 定了方向：§8。
+3. 媒體配額的數字：預設 2 GiB 起跳，待定。事件快取不設上限；同步視窗 500 則／房、初開全域 10000 則是預設值，可調。
