@@ -150,6 +150,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- schema_version、server、user_id、device_id、created_at；任一不符 → 整個重建（§1）
+-- cg_seq：快取裡最新的 g_seq（水位線），餵給 Event/Recent；每次 Recent 回來把 latest_g_seq 寫進來（chat-model §4.3）
 
 CREATE TABLE rooms (
   room_id TEXT PRIMARY KEY, name TEXT, encrypted INTEGER NOT NULL, member_count INTEGER,
@@ -157,7 +158,8 @@ CREATE TABLE rooms (
 
 CREATE TABLE events (
   room_id TEXT NOT NULL, event_id TEXT NOT NULL,
-  seq INTEGER,                       -- server 發的 per-room 連續序號（chat-model §4.3）；非 fork server 的 room 是 NULL
+  r_seq INTEGER,                     -- server 發的 room 內連續序號（unsigned.org.wbftw.wbfuwunel.r_seq）；非 fork server 的 room 是 NULL
+  g_seq INTEGER,                     -- server 的全域序號（…g_seq），只用來算 meta.cg_seq，不排序
   origin_server_ts INTEGER NOT NULL,
   sender TEXT NOT NULL, type TEXT NOT NULL, msgtype TEXT,
   decrypted INTEGER,                 -- 1／0／NULL，同 CLI 規格 §3.4.1 的事件形狀
@@ -166,13 +168,13 @@ CREATE TABLE events (
   chunked_block_json TEXT,           -- msgtype 是 org.wbftw.wbfuwunel.file 時抽出來，給 files 查
   mxc TEXT,
   PRIMARY KEY (room_id, event_id));
-CREATE UNIQUE INDEX events_by_seq ON events (room_id, seq) WHERE seq IS NOT NULL;   -- 排序、判洞、跳第 N 則
+CREATE UNIQUE INDEX events_by_seq ON events (room_id, r_seq) WHERE r_seq IS NOT NULL;   -- 排序、判洞、跳第 N 則
 CREATE INDEX events_by_time ON events (room_id, origin_server_ts);                    -- 顯示與日期跳轉用
 CREATE INDEX events_files ON events (room_id, msgtype) WHERE chunked_block_json IS NOT NULL;
 
 -- 本地 offset：自己讀到哪，只在這台裝置（chat-model §3.5，維護者定）；給遠端看的 read 在 server，不在這裡。
-CREATE TABLE read_positions (room_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, seq INTEGER, ts INTEGER NOT NULL);
--- offset 是一對 (event_id, seq)：event_id 是權威，seq 給算術用；seq 是 NULL 就只能靠 event_id 對齊。
+CREATE TABLE read_positions (room_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, r_seq INTEGER, ts INTEGER NOT NULL);
+-- offset 是一對 (event_id, r_seq)：event_id 是權威，r_seq 給算術用；r_seq 是 NULL 就只能靠 event_id 對齊。
 
 -- Delete for me（chat-model §5，維護者定）：本地清掉並記下來，之後從 server 拿到同一則也忽略。
 -- 不動 server；重新安裝（DB 不在了）就恢復。這張表不受配額清理。
@@ -183,8 +185,9 @@ CREATE TABLE hidden_messages (room_id TEXT NOT NULL, event_id TEXT NOT NULL, hid
 - 寫入 `events` 前先查 `hidden_messages`，有就不寫；讀出來給 UI 前也再濾一次（消費端自己問，不靠寫入端記得）。
 
 - 解不開的加密事件也存（`decrypted = 0` 帶原因），之後拿到金鑰重解時覆蓋；不存等於每次都要重拉。
-- 配額（§1）以 `seq` 為序刪最舊（沒有 `seq` 的 room 用 `origin_server_ts`）；`rooms` 不受配額。
-- **洞**：有 `seq` 的 room，「快取裡有哪些」就是 `seq` 的集合，缺的就是洞，不存 token。沒有 `seq` 的 room 只快取最新一段連續視窗（chat-model §4.3 的退化表）。
+- **洞**：有 `r_seq` 的 room，「快取裡有哪些」就是 `r_seq` 的集合，缺的就是洞，不存 token。沒有 `r_seq` 的 room 只快取最新一段連續視窗（chat-model §4.3 的退化表）。
+- **開 app 的同步**：`Event/Recent` 帶 `meta.cg_seq`，回來的事件逐則寫進 `events`（有 `r_seq`／`g_seq`），`complete=false` 就帶 `before=next` 繼續，最後把 `latest_g_seq` 寫回 `meta.cg_seq`。
+  進房的 500 則視窗是逐房 `/messages` 補的，與 Recent 拿到的合在同一張表，靠 `r_seq` 判洞。
 
 ## 8. 媒體檔案空間：檔級加密，不進 DB（維護者 2026-09-05 定方向）
 

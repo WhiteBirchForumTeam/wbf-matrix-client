@@ -186,6 +186,32 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 - 縮圖：沒有（密文做不出來），事件不帶 `info.thumbnail_*`。
 - `m.video`／`m.audio` 的 `info.duration` 這類明文元資料，v1 不放；要放就放進區塊，之後升 `v`。
 
+### 5.2 ⚠️ 送事件時要宣告附件，否則媒體會被 server 清掉（第一版，等 server 的 feat 定案後再核對）
+
+> 依據：wbfuwunel `docs/design/media-attachments.md`（提案，維護者 2026-09-06 定方向）與 `chunked-upload-spec.md` §12。
+> server 端還沒實作；這一節先寫下 client 該留的位置，server 定案後逐條核對，有出入以 server 的規格為準並回來改這裡。
+
+server 在 E2EE 房間讀不到 `content`，不知道哪則訊息用了哪個 mxc。**沒被任何訊息指到的新媒體計數是 0，
+過保護期（`media_unreferenced_grace_seconds`，至少 7 天）後台掃描會清掉。** 所以 §5 的事件送出時**必須在同一個請求裡宣告附件**：
+
+| 入口 | 怎麼帶 | 什麼時候用 |
+|---|---|---|
+| wbf pack `Event/Send`（kind `0x14`、subtype `0x02`） | meta `{ "room_id", "type", "txn_id", "attachments": ["mxc://…", …] }`，data = 事件 content 的 JSON（E2EE 就是 `m.room.encrypted` 的 content） | 目標；`Hello.features` 有 `attachments` 才用 |
+| HTTP `PUT /_matrix/client/v3/rooms/{room}/send/{type}/{txn}` | header `X-Wbf-Attachments: mxc://a,mxc://b` | 過渡：還用 matrix-rust-sdk 送的時候 |
+
+client 的規則：
+
+- 流程是 **上傳 → `Seal` 拿到 mxc → 把區塊放進（加密的）content → 同一個送訊息請求帶 `attachments: [mxc]`**。🚫 不要分兩個請求：中間掛掉就留下一則指著會消失的媒體的訊息。
+- `attachments` 列的是這則 content 裡**所有**用到的 mxc（§5 的 `url`；之後有縮圖也算）。去重。
+- server 會驗每個 mxc：本站的、找得到、**上傳者是 sender**、沒墓碑；任一不過**整則拒送**（`Error(Conflict)` 說哪個為什麼）。client 收到就是自己的 bug，不重試、把原因印出來。
+- 編輯（`m.replace`）換附件：新事件宣告新的，舊事件不動。轉傳同一個 mxc：再宣告一次（server 計數 +1，各自撤各自 −1）。
+- 明文房間（`cipher: none`）server 自己讀 `url`，可以不宣告；**宣告了也無妨**，所以 client 一律宣告，不分房間，少一個分支。
+- `Hello.features` 沒有 `attachments` = 舊 server：照 Matrix 原樣送，什麼都不帶。這是顯式判斷，不是「帶了沒人理」。
+- 上傳完到送出前的空窗：媒體計數是 0，靠保護期撐著；保護期是 server 的設定，client 不假設它多長，**上傳完就盡快送**，不要先上傳一堆再慢慢寫訊息。
+
+`wbf-sdk` 的落點：`protocol::send_event`／`SendRequest`（已有，等 server）；matrix-sdk 那條路的 header 在第 3 步的 adapter 裡加。
+**CLI 的 `send --file` 從第一版就要走這條**，不然開發期間上傳的媒體 7 天後全部消失。
+
 ## 6. 串流上傳（大小未知）
 
 1. `Create`：`EncryptedFileInfo { file_size: 0, chunk_size: N, chunk_count: 0 }`（線上規格的串流哨兵），

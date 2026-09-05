@@ -194,7 +194,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | 我們 | Matrix 事件 |
 |---|---|
 | `Text` | `m.room.message`，`msgtype: m.text`，`body`；有 `formatted_body` 就進 `Formatted` |
-| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照約定 §5。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
+| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照約定 §5。**送出時同一個請求要宣告 `attachments`**（約定 §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
 | `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為，我們不能保留原文**（本地也不存，§7.1） |
@@ -256,28 +256,35 @@ pub enum Update {
 ### 4.3 順序：為什麼不能用時間戳排序
 
 `sent_at` 是**發送者的 server**蓋的時間，聯邦下兩台 server 時鐘不同，排序會亂。Matrix 的真順序是 DAG 的拓樸序，`/sync` 與 `/messages` 回來的順序就是它。
-維護者 2026-09-05 定：**每個 room 有一個 per-room 連續序號 `seq`，由我們的 server（wbfuwunel）發**，第一個事件是 1、第二個是 2。
-這是 Telegram 的做法：順序由 server 說了算，所以我們的使用者之間一致。
+維護者 2026-09-05 定、server 端 2026-09-06 做完（wbfuwunel #20／#22，規格 `room-seq-and-recent.md`）：**每個 room 一個連續序號**，第一個事件是 1。
+這是 Telegram 的做法：順序由 server 說了算，所以我們的使用者之間一致。兩個數，都在事件的 `unsigned`：
+
+| key | 意思 | client 拿來做什麼 |
+|---|---|---|
+| `org.wbftw.wbfuwunel.r_seq` | **room 內**連續：本站到達順序，新事件 1、2、3…，state 事件也算；只有聯邦 `/backfill` 補回的歷史拿 0、−1、−2；redact 不改號；發出去的正號永不重排 | 排序、未讀數相減、判快取的洞、「跳到第 N 則」 |
+| `org.wbftw.wbfuwunel.g_seq` | **本站全域**序號（就是 server 的 PduCount），跨 room 可比大小，對單一 room 不連號 | 只當**水位線**：「我的快取讀到哪」，餵給 `Event/Recent` 的 `cg_seq` |
 
 | | 怎麼做 |
 |---|---|
-| server 端 | 每個 room 一個計數，append 時發號，寫進事件的 `unsigned.org.wbftw.wbfuwunel.seq`。`unsigned` 是 server 加的、不進雜湊、不影響聯邦，其他 client 無感。聯邦補回的舊歷史用負號（與它現在處理 backfill 同一個做法），發出去的號碼永遠不變 |
-| client 端 | `Message.seq: Option<i64>`。排序、未讀數、判快取的洞、「跳到第 N 則」都用它 |
-| offset | 一對 `(event_id, seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`seq` 是本地算術用；比較用 `seq` |
+| client 端 | `Message.r_seq: Option<i64>`、`Message.g_seq: Option<i64>`（`protocol::event_seqs`）。`unsigned` 是 server 加的、不進雜湊、送聯邦時被剥掉，其他 client 無感 |
+| offset | 一對 `(event_id, r_seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`r_seq` 是本地算術用；比較用 `r_seq` |
 | `sent_at` | 只當顯示用的時間 |
+| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，server 從最新往舊回到碰到它為止（最多 `limit`，預設 10000），這樣**只拿快取缺的**；差距超過 `limit` 就 `complete=false`、帶同一個 `cg_seq` 加 `before=next` 補洞到 `complete`。`latest_g_seq` 存下來當下次的 `cg_seq`。事件新到舊、自帶 `room_id`。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異 |
+| 還沒有的 | server 端「`r_seq` → 事件」的反查（跳到第 N 則直接問）：server 列為候選。現在 client 用 `/messages` 二分逼近，或先只提供「跳到快取裡有的第 N 則」 |
 
-**退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `seq`。client 必須顯式判斷 `seq` 在不在，不靠巧合：
+**退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `r_seq`。client 必須顯式判斷它在不在，不靠巧合：
 
-| 功能 | 有 `seq` | 沒有 `seq` |
+| 功能 | 有 `r_seq` | 沒有 `r_seq` |
 |---|---|---|
-| 順序 | 照 `seq` | 照 backend 交出來的順序 |
+| 順序 | 照 `r_seq` | 照 backend 交出來的順序 |
 | 跳到某則（reply、搜尋結果）帶上下文 | `/context/{event_id}` | 同左，這是 Matrix 標準，都能 |
 | 跳到第 N 則 | 能 | **不能**，UI 不提供 |
 | 依日期跳 | `/timestamp_to_event` 再 `/context` | 同左，標準 |
-| 快取判洞 | 看 `seq` 有沒有斷 | 只快取最新的一段連續視窗，跳過去的段不快取（或存 token 判洞，之後再說） |
-| 未讀數 | `seq` 相減 | 從 offset 往後數，只數快取裡有的 |
+| 快取判洞 | 看 `r_seq` 有沒有斷 | 只快取最新的一段連續視窗，跳過去的段不快取（或存 token 判洞，之後再說） |
+| 未讀數 | `r_seq` 相減 | 從 offset 往後數，只數快取裡有的 |
+| 全域更新 | `Event/Recent` 帶 `cg_seq` | 沒有：逐房 `/sync`／`/messages` |
 
-這張表的「沒有 `seq`」那一欄就是聯邦兼容的代價，不補。
+這張表的「沒有 `r_seq`」那一欄就是聯邦兼容的代價，不補。`Hello.features` 有 `seq`、`recent` 才表示 server 支援（feature 旗標是短名，與 `unsigned` 裡的 key 是兩層）。
 
 ## 5. Telegram 有、Matrix 沒有：全部要審
 
@@ -309,8 +316,9 @@ pub enum Update {
 ## 7. 還開著的（再議）
 
 1. ~~時序與序號~~ 定了：§4.3。
-2. ~~「跨房間全域最近 N 則」~~ 定了（維護者 2026-09-05）：要做，server 級實作，預設 10000。
-3. §6 的範圍（維護者還沒對這一項表態）。
-4. ~~開 issue~~ 開了：server 端的 `seq` 與全域最近 N 則的規格在 [wbfuwunel #20](http://ai.zooy.cc:30008/amaid/wbfuwunel/issues/20)。client 這邊在它做出來之前照 §4.3 的「沒有 `seq`」那欄走。
+2. ~~「跨房間全域最近 N 則」~~ server 做完了（wbfuwunel #22）：`Event/Recent`，帶 `cg_seq` 只拿快取缺的（§4.3）。client 端 `WbfClient::recent` 已接，對著 server 的向量檔有測試。
+3. ~~§6 的範圍~~ 維護者 2026-09-06 同意。
+4. ~~開 issue~~ [wbfuwunel #20](http://ai.zooy.cc:30008/amaid/wbfuwunel/issues/20) 已關，#22 合併：名字定為 `r_seq`／`g_seq`（與 pack 標頭的 `seq` 分開）。
+5. **送事件要宣告附件**（約定 §5.2，server 提案 `media-attachments.md`）：server 端還沒實作，定案後要回來核對約定 §5.2 每一條。第 3 步的 `send --file` 從第一版就要帶。
 
 已定案的都寫在各節，標「維護者定」。
