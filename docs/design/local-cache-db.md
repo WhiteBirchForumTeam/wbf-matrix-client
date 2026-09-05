@@ -144,7 +144,9 @@ CREATE TABLE rooms (
   last_activity_ts INTEGER, next_back_token TEXT, refreshed_at INTEGER NOT NULL);
 
 CREATE TABLE events (
-  room_id TEXT NOT NULL, event_id TEXT NOT NULL, origin_server_ts INTEGER NOT NULL,
+  room_id TEXT NOT NULL, event_id TEXT NOT NULL,
+  seq INTEGER,                       -- server 發的 per-room 連續序號（chat-model §4.3）；非 fork server 的 room 是 NULL
+  origin_server_ts INTEGER NOT NULL,
   sender TEXT NOT NULL, type TEXT NOT NULL, msgtype TEXT,
   decrypted INTEGER,                 -- 1／0／NULL，同 CLI 規格 §3.4.1 的事件形狀
   undecryptable_reason TEXT,
@@ -152,11 +154,13 @@ CREATE TABLE events (
   chunked_block_json TEXT,           -- msgtype 是 org.wbftw.wbfuwunel.file 時抽出來，給 files 查
   mxc TEXT,
   PRIMARY KEY (room_id, event_id));
-CREATE INDEX events_by_time ON events (room_id, origin_server_ts);
+CREATE UNIQUE INDEX events_by_seq ON events (room_id, seq) WHERE seq IS NOT NULL;   -- 排序、判洞、跳第 N 則
+CREATE INDEX events_by_time ON events (room_id, origin_server_ts);                    -- 顯示與日期跳轉用
 CREATE INDEX events_files ON events (room_id, msgtype) WHERE chunked_block_json IS NOT NULL;
 
 -- 本地 offset：自己讀到哪，只在這台裝置（chat-model §3.5，維護者定）；給遠端看的 read 在 server，不在這裡。
-CREATE TABLE read_positions (room_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, ts INTEGER NOT NULL);
+CREATE TABLE read_positions (room_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, seq INTEGER, ts INTEGER NOT NULL);
+-- offset 是一對 (event_id, seq)：event_id 是權威，seq 給算術用；seq 是 NULL 就只能靠 event_id 對齊。
 
 -- Delete for me（chat-model §5，維護者定）：本地清掉並記下來，之後從 server 拿到同一則也忽略。
 -- 不動 server；重新安裝（DB 不在了）就恢復。這張表不受配額清理。
@@ -167,7 +171,8 @@ CREATE TABLE hidden_messages (room_id TEXT NOT NULL, event_id TEXT NOT NULL, hid
 - 寫入 `events` 前先查 `hidden_messages`，有就不寫；讀出來給 UI 前也再濾一次（消費端自己問，不靠寫入端記得）。
 
 - 解不開的加密事件也存（`decrypted = 0` 帶原因），之後拿到金鑰重解時覆蓋；不存等於每次都要重拉。
-- 配額（§1）以 `origin_server_ts` 為序刪最舊；`rooms` 不受配額。
+- 配額（§1）以 `seq` 為序刪最舊（沒有 `seq` 的 room 用 `origin_server_ts`）；`rooms` 不受配額。
+- **洞**：有 `seq` 的 room，「快取裡有哪些」就是 `seq` 的集合，缺的就是洞，不存 token。沒有 `seq` 的 room 只快取最新一段連續視窗（chat-model §4.3 的退化表）。
 
 ## 7. 還開著的
 

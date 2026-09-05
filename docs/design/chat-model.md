@@ -256,9 +256,28 @@ pub enum Update {
 ### 4.3 順序：為什麼不能用時間戳排序
 
 `sent_at` 是**發送者的 server**蓋的時間，聯邦下兩台 server 時鐘不同，排序會亂。Matrix 的真順序是 DAG 的拓樸序，`/sync` 與 `/messages` 回來的順序就是它。
-第 3 步先照這個：**訊息的順序 = backend 交出來的順序**，`Message` 不帶序號；`sent_at` 只當顯示用的時間。
-**時序怎麼定：再議**（維護者 2026-09-05）。
-Telegram 的遞增 message id 我們現在沒有 → 「跳到第 N 則」做不到。**維護者建議要有 per-conversation 序號，再議**：它得由 server 發（client 算不出全局一致的序號），所以是自己的協定／fork server 的事。
+維護者 2026-09-05 定：**每個 room 有一個 per-room 連續序號 `seq`，由我們的 server（wbfuwunel）發**，第一個事件是 1、第二個是 2。
+這是 Telegram 的做法：順序由 server 說了算，所以我們的使用者之間一致。
+
+| | 怎麼做 |
+|---|---|
+| server 端 | 每個 room 一個計數，append 時發號，寫進事件的 `unsigned.org.wbftw.wbfuwunel.seq`。`unsigned` 是 server 加的、不進雜湊、不影響聯邦，其他 client 無感。聯邦補回的舊歷史用負號（與它現在處理 backfill 同一個做法），發出去的號碼永遠不變 |
+| client 端 | `Message.seq: Option<i64>`。排序、未讀數、判快取的洞、「跳到第 N 則」都用它 |
+| offset | 一對 `(event_id, seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`seq` 是本地算術用；比較用 `seq` |
+| `sent_at` | 只當顯示用的時間 |
+
+**退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `seq`。client 必須顯式判斷 `seq` 在不在，不靠巧合：
+
+| 功能 | 有 `seq` | 沒有 `seq` |
+|---|---|---|
+| 順序 | 照 `seq` | 照 backend 交出來的順序 |
+| 跳到某則（reply、搜尋結果）帶上下文 | `/context/{event_id}` | 同左，這是 Matrix 標準，都能 |
+| 跳到第 N 則 | 能 | **不能**，UI 不提供 |
+| 依日期跳 | `/timestamp_to_event` 再 `/context` | 同左，標準 |
+| 快取判洞 | 看 `seq` 有沒有斷 | 只快取最新的一段連續視窗，跳過去的段不快取（或存 token 判洞，之後再說） |
+| 未讀數 | `seq` 相減 | 從 offset 往後數，只數快取裡有的 |
+
+這張表的「沒有 `seq`」那一欄就是聯邦兼容的代價，不補。
 
 ## 5. Telegram 有、Matrix 沒有：全部要審
 
@@ -273,7 +292,7 @@ Telegram 的遞增 message id 我們現在沒有 → 「跳到第 N 則」做不
 | 頻道功能（訂閱、簽名、統計…） | 部分 | 草案，與 fork server 連動 | 維護者定 |
 | 公開頻道不加密、歷史公開可搜 | 可以 | 由 owner 在開 room 時決定；加密與公開可搜是兩個獨立選項，都照 Matrix 實作（§3.6） | 維護者定 |
 | @username 搜人 | user directory，只搜同 server 與共同房間 | 用它 | 兼容 |
-| 訊息序號、跳到第 N 則 | 沒有 | **維護者建議要有，再議**（§4.3） | 再議 |
+| 訊息序號、跳到第 N 則 | 沒有 | per-room 連續 `seq`，由 fork server 發、放 `unsigned`；非 fork server 的 room 沒有就不提供跳第 N 則（§4.3） | 維護者定 |
 | 已讀不通知對方 | 有 `m.read.private` | UI 設定（§3.5） | 兼容 |
 | 排程訊息、草稿同步 | 沒有 | 不做；草稿只做本地版 | 維護者定 |
 | 語音訊息、貼圖、投票 | 有 MSC | 維持 Matrix 模式，優化再議 | 維護者定 |
@@ -289,8 +308,9 @@ Telegram 的遞增 message id 我們現在沒有 → 「跳到第 N 則」做不
 
 ## 7. 還開著的（再議）
 
-1. §4.3 時序怎麼定。
-2. §4.3 per-conversation 訊息序號（維護者建議要有）：由誰發、怎麼與 Matrix 的 event_id 共存。
+1. ~~時序與序號~~ 定了：§4.3。
+2. 「跨房間全域最近 N 則」（初開 app 掛載一萬條）：Matrix 沒有這個 API，要做成 fork server 的 pack（server 現成的全域計數器倒著掃就有）。等維護者定要不要。
 3. §6 的範圍（維護者還沒對這一項表態）。
+4. server 端的 `seq` 與全域最近 N 則是 wbfuwunel 的工作：要不要在那邊開 issue 把規格寫下來。
 
 已定案的都寫在各節，標「維護者定」。
