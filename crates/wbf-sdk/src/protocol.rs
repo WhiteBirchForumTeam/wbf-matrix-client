@@ -3,8 +3,8 @@
 //! 這裡不碰網路、不碰加密：輸入輸出都是 `Pack` 與 JSON。通道在 `channel`，加密在 `chunk_crypto`。
 
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use wbf_wire::pack::{control, download, flags, upload};
+use serde::{Deserialize, Serialize};
+use wbf_wire::pack::{control, download, event, flags, upload};
 use wbf_wire::{EncryptedFileInfo, Kind, Pack};
 
 use crate::error::SdkError;
@@ -260,4 +260,110 @@ pub struct ReadAck {
     pub chunk_size: u32,
     pub chunk_count: u32,
     pub total_len: u64,
+}
+
+// ---- Event（kind 0x14）：server 的 room-seq-and-recent.md §2、media-attachments.md §3 ----
+
+/// `unsigned` 裡 server 加的每房連續序號（第一個事件是 1；聯邦補回的歷史 0、−1、…）。
+pub const R_SEQ_KEY: &str = "org.wbftw.wbfuwunel.r_seq";
+/// `unsigned` 裡 server 加的本站全域序號，跨房間可比大小，client 當水位線。
+pub const G_SEQ_KEY: &str = "org.wbftw.wbfuwunel.g_seq";
+
+/// `Event/Recent` 的請求 meta。欄位順序就是線上的 JSON 順序（向量檔逐 byte 比），不要重排。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RecentRequest {
+    /// 這頁最多幾則；server 的 `wbf_recent_max_limit`（預設 10000）以上會被 clamp。
+    pub limit: u32,
+    /// client 快取裡最新的 `g_seq`；None 或 0 = 沒有快取。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cg_seq: Option<i64>,
+    /// 補洞：只要比它舊的（上一頁 Ack 的 `next`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+}
+
+/// Args:
+///     request: example: RecentRequest { limit: 10000, cg_seq: Some(4700), before: None }
+pub fn recent(request: &RecentRequest, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Event,
+        subtype: event::RECENT,
+        flags: 0,
+        id: 0,
+        seq,
+        meta: serde_json::to_vec(request).expect("RecentRequest serializes"),
+        data: Vec::new(),
+    }
+}
+
+/// `Event/Recent` 的 Ack meta。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RecentAck {
+    pub returned: u32,
+    /// server 此刻最新的全域序號，存下來當下次的 `cg_seq`。
+    pub latest_g_seq: i64,
+    /// false = `cg_seq` 到 `latest_g_seq` 之間有洞，帶同一個 `cg_seq` 加 `before = next` 再問。
+    pub complete: bool,
+    pub next: Option<i64>,
+}
+
+/// `Event/Recent` Ack 的 data：事件的 JSON 陣列，新到舊，每則自帶 `room_id` 與 `unsigned` 的 `r_seq`／`g_seq`。
+///
+/// Return:
+///     Ok(Vec<Value>)    原樣的事件 JSON，這裡不解讀
+///     Err(Protocol)     data 不是 JSON 陣列
+pub fn parse_recent_events(ack: &Pack) -> Result<Vec<serde_json::Value>, SdkError> {
+    if ack.data.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(&ack.data)
+        .map_err(|error| SdkError::Protocol(format!("Recent ack data: {error}")))
+}
+
+/// 從事件 JSON 的 `unsigned` 讀 server 加的序號；沒有就是 None（非 fork server、或舊事件），呼叫者顯式判斷，不猜。
+///
+/// Args:
+///     event: `parse_recent_events` 或 sync 回來的一則事件
+/// Return:
+///     (Option<i64>, Option<i64>)   (r_seq, g_seq)
+pub fn event_seqs(event: &serde_json::Value) -> (Option<i64>, Option<i64>) {
+    let unsigned = event.get("unsigned");
+    let read = |key: &str| {
+        unsigned
+            .and_then(|unsigned| unsigned.get(key))
+            .and_then(|value| value.as_i64())
+    };
+    (read(R_SEQ_KEY), read(G_SEQ_KEY))
+}
+
+/// `Event/Send` 的請求 meta（media-attachments.md §3）。`attachments` 是這則訊息用到的 mxc，
+/// server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（spec §12）。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SendRequest {
+    pub room_id: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub txn_id: String,
+    pub attachments: Vec<String>,
+}
+
+/// Args:
+///     request: example: SendRequest { room_id: "!r:localhost".into(), event_type: "m.room.encrypted".into(), txn_id: "t1".into(), attachments: vec!["mxc://localhost/1122334455667788".into()] }
+///     content: 事件 content 的 JSON bytes（E2EE 就是 `m.room.encrypted` 的 content）
+pub fn send_event(request: &SendRequest, content: Vec<u8>, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Event,
+        subtype: event::SEND,
+        flags: 0,
+        id: 0,
+        seq,
+        meta: serde_json::to_vec(request).expect("SendRequest serializes"),
+        data: content,
+    }
+}
+
+/// `Event/Send` 的 Ack meta。server 端還沒實作（提案階段），形狀照 Matrix 的 send 回應猜：`event_id`。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SendAck {
+    pub event_id: String,
 }

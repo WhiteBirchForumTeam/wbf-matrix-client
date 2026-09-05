@@ -230,3 +230,109 @@ fn length_helpers_reject_zero_chunk_size_and_out_of_range_index() {
     assert_eq!(locate(5, 0), None);
     assert_eq!(chunk_count(u64::MAX, 1), None, "more chunks than indices");
 }
+
+/// `Event/Recent` 對著 server 產生的 `wbf-vectors.json`：請求要逐 byte 一樣（meta 的鍵序也是），Ack 要解得出來。
+#[test]
+fn event_recent_matches_server_vectors() {
+    use wbf_sdk::protocol::{self, event_seqs, parse_recent_events, RecentAck, RecentRequest};
+    use wbf_wire::Pack;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let pack_named = |name: &str| -> Pack {
+        let entry = vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"));
+        Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
+    };
+
+    let expected = [
+        (
+            "recent_first_start",
+            RecentRequest {
+                limit: 2,
+                cg_seq: None,
+                before: None,
+            },
+        ),
+        (
+            "recent_with_cached_g_seq",
+            RecentRequest {
+                limit: 10000,
+                cg_seq: Some(4700),
+                before: None,
+            },
+        ),
+        (
+            "recent_older_page",
+            RecentRequest {
+                limit: 10000,
+                cg_seq: Some(4700),
+                before: Some(4711),
+            },
+        ),
+    ];
+    for (name, request) in expected {
+        let vector = pack_named(name);
+        let ours = protocol::recent(&request, vector.seq);
+        assert_eq!(ours, vector, "{name}");
+        assert_eq!(
+            ours.encode().unwrap(),
+            vector.encode().unwrap(),
+            "{name} bytes"
+        );
+    }
+
+    let ack = pack_named("ack_recent");
+    let request = pack_named("recent_first_start");
+    let ack = protocol::expect_ack(&request, ack).expect("ack echoes seq 10");
+    let meta: RecentAck = protocol::parse_meta(&ack).unwrap();
+    assert_eq!(
+        meta,
+        RecentAck {
+            returned: 2,
+            latest_g_seq: 4712,
+            complete: false,
+            next: Some(4711)
+        }
+    );
+    let events = parse_recent_events(&ack).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        event_seqs(&events[0]),
+        (Some(2), Some(4712)),
+        "newest first"
+    );
+    assert_eq!(event_seqs(&events[1]), (Some(1), Some(4711)));
+    assert_eq!(events[0]["room_id"], "!r:localhost");
+    assert_eq!(
+        event_seqs(&serde_json::json!({ "content": {} })),
+        (None, None),
+        "no unsigned = no seq"
+    );
+}
+
+/// `Event/Send` 的 meta 鍵序照 media-attachments.md §3：room_id、type、txn_id、attachments。
+#[test]
+fn event_send_meta_shape() {
+    use wbf_sdk::protocol::{self, SendRequest};
+    let request = SendRequest {
+        room_id: "!r:localhost".into(),
+        event_type: "m.room.encrypted".into(),
+        txn_id: "t1".into(),
+        attachments: vec!["mxc://localhost/1122334455667788".into()],
+    };
+    let pack = protocol::send_event(
+        &request,
+        br#"{"algorithm":"m.megolm.v1.aes-sha2"}"#.to_vec(),
+        7,
+    );
+    assert_eq!(pack.kind, wbf_wire::Kind::Event);
+    assert_eq!(pack.subtype, wbf_wire::pack::event::SEND);
+    assert_eq!(
+        String::from_utf8(pack.meta).unwrap(),
+        r#"{"room_id":"!r:localhost","type":"m.room.encrypted","txn_id":"t1","attachments":["mxc://localhost/1122334455667788"]}"#
+    );
+}

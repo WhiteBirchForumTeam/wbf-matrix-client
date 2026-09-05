@@ -28,6 +28,8 @@ pub enum Kind {
     Control = 0x01,
     Upload = 0x03,
     Download = 0x04,
+    /// 房間事件的領域（wire-format §3.3）：目前 `Recent`、`Send`。
+    Event = 0x14,
 }
 
 impl Kind {
@@ -41,6 +43,7 @@ impl Kind {
             0x01 => Some(Kind::Control),
             0x03 => Some(Kind::Upload),
             0x04 => Some(Kind::Download),
+            0x14 => Some(Kind::Event),
             _ => None,
         }
     }
@@ -68,6 +71,14 @@ pub mod upload {
 pub mod download {
     pub const INFO: u8 = 0x01;
     pub const READ: u8 = 0x02;
+}
+
+/// `Kind::Event` 的 subtype（server 的 room-seq-and-recent.md §2、media-attachments.md §3）。
+pub mod event {
+    /// 跨房間「在 `cg_seq` 之後的事件」。
+    pub const RECENT: u8 = 0x01;
+    /// 送事件，meta 帶 `attachments` 宣告附件。
+    pub const SEND: u8 = 0x02;
 }
 
 /// `flags` 欄位的位元。沒列的位元必須是 0。

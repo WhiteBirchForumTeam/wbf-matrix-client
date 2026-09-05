@@ -5,7 +5,9 @@ use wbf_wire::Pack;
 
 use crate::channel::PackChannel;
 use crate::error::SdkError;
-use crate::protocol::{self, HelloAck, InfoAck, ReadAck, StatusAck};
+use crate::protocol::{
+    self, HelloAck, InfoAck, ReadAck, RecentAck, RecentRequest, SendAck, SendRequest, StatusAck,
+};
 
 pub struct WbfClient<C: PackChannel> {
     channel: C,
@@ -95,5 +97,49 @@ impl<C: PackChannel> WbfClient<C> {
             )));
         }
         Ok((read, ack.data))
+    }
+
+    /// `Event/Recent`：跨房間、在 `cg_seq` 之後的事件，新到舊（server 的 room-seq-and-recent.md §2）。
+    /// `Hello.features` 有 `recent` 才能用。
+    ///
+    /// Args:
+    ///     request: example: RecentRequest { limit: 10000, cg_seq: Some(4700), before: None }
+    /// Return:
+    ///     Ok((RecentAck, Vec<Value>))   meta 與事件陣列；`complete` 是 false 就帶 `before = next` 再問
+    pub async fn recent(
+        &mut self,
+        request: &RecentRequest,
+    ) -> Result<(RecentAck, Vec<serde_json::Value>), SdkError> {
+        let ack = self.call(|seq| protocol::recent(request, seq)).await?;
+        let meta: RecentAck = protocol::parse_meta(&ack)?;
+        let events = protocol::parse_recent_events(&ack)?;
+        if events.len() as u32 != meta.returned {
+            return Err(SdkError::Protocol(format!(
+                "Recent ack says returned {} but data has {} events",
+                meta.returned,
+                events.len()
+            )));
+        }
+        Ok((meta, events))
+    }
+
+    /// `Event/Send`：送事件並宣告附件（media-attachments.md §3、spec §12）。
+    /// ⚠️ server 端還是提案（2026-09-06），`Hello.features` 有 `attachments` 才能用；沒有就走 HTTP 加 `X-Wbf-Attachments`。
+    ///
+    /// Args:
+    ///     request: room、type、txn_id、這則用到的 mxc
+    ///     content: 事件 content 的 JSON bytes
+    /// Return:
+    ///     Ok(SendAck)       server 收下的 event_id
+    ///     Err(Server)       `Conflict`：某個 mxc 不是本站的、找不到、不是 sender 傳的、或有墓碑；整則沒送
+    pub async fn send_event(
+        &mut self,
+        request: &SendRequest,
+        content: Vec<u8>,
+    ) -> Result<SendAck, SdkError> {
+        let ack = self
+            .call(|seq| protocol::send_event(request, content.clone(), seq))
+            .await?;
+        protocol::parse_meta(&ack)
     }
 }
