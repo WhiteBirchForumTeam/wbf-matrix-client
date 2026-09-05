@@ -31,7 +31,7 @@
 |---|---|
 | 密碼 | 永遠不存（CLI 規格 §9） |
 | 媒體內容 | 第一版不快取，manifest 夠用；要快取是另一份設計（密文可以直接落地，但配額與清理另議） |
-| session 與 token | 第一版留在 session 檔（CLI 規格 §7）；§7 有討論要不要搬進來 |
+| session 與 token | **不進 DB**（維護者 2026-09-05 定）：另外用同一把主金鑰導出的第三把子金鑰鎖一次，見 §4 與 §5.6 的 `session.sealed` |
 
 ## 3. 加密：SQLCipher，整檔頁級
 
@@ -53,8 +53,10 @@ local.key（0600）
 ```
 
 - **主金鑰** 32 byte，CSPRNG，一台機器一把。
-- **導出**：兩個 store 各自一把 32 byte 子金鑰，`BLAKE3 derive_key(context, master)`，context 是固定字串
-  `"wbf-matrix-client cache sqlcipher v1"` 與 `"wbf-matrix-client matrix-sdk store v1"`。子金鑰不落地，每次開啟導一次。
+- **導出**：三把 32 byte 子金鑰，`BLAKE3 derive_key(context, master)`，context 是固定字串
+  `"wbf-matrix-client cache sqlcipher v1"`、`"wbf-matrix-client matrix-sdk store v1"`、`"wbf-matrix-client session v1"`。
+  第三把用 XChaCha20-Poly1305 把 session 檔（server、user_id、device_id、access_token）整份封成 `session.sealed`：
+  session 與 token **不進 DB**，但跟 DB 同一把鎖（維護者 2026-09-05 定）。子金鑰不落地，每次開啟導一次。
   換 context 字串就是換金鑰，所以 context 帶版本。
 - **local password**：Argon2id 從密碼導 KEK，KEK 用 XChaCha20-Poly1305 包住主金鑰。改密碼只重包 48 byte，DB 不動。
   參數寫在檔裡，之後調高不用遷移。
@@ -125,7 +127,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   local.key      主金鑰（§4）
   cache.db       我們的快取（SQLCipher）
   matrix/        SDK 的 store 目錄（crypto.db、state.db；SDK 自己命名）
-  session.json   第一版仍在 CLI 規格 §7 的位置；見 §7
+  session.sealed 第三把子金鑰封住的 session（取代 CLI 規格 §7 的明文 session.json；那一版同步改規格）
 ```
 
 `<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
@@ -161,8 +163,7 @@ CREATE TABLE read_positions (room_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, t
 
 ## 7. 還開著的
 
-1. session 與 token 要不要搬進 `cache.db`（或 `local.key` 旁一個被同一把鎖住的檔）：好處是 local password 一把鎖住所有機密；
-   壞處是 CLI 每個命令都要先開 vault（`Plain` 模式很快，`PasswordWrapped` 模式每個命令都要輸密碼，除非有 agent 之類的東西）。
-   建議：第一版不搬；加 local password 那一版一起決定，因為那時才有「每個命令都要密碼」的體感。
+1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，另外用第三把子金鑰鎖成 `session.sealed`（§4，維護者 2026-09-05）。
+   仍開著的是體感：`PasswordWrapped` 模式下 CLI 每個命令都要輸密碼，除非有 agent 之類的東西；加 local password 那一版再看。
 2. 媒體內容快取：另一份設計。
 3. 配額的數字：500 則／房、200 MiB 總量，用了再調。
