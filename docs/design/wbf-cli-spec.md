@@ -49,7 +49,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `upload <file> [--cipher chacha20-poly1305\|aes-256-gcm\|none] [--chunk-size <bytes>] [--manifest <out.json>] [--sha256]` | 固定大小上傳：Create → 逐塊 → Seal。印 manifest（§5） |
 | `upload --stream [--cipher …] [--link mobile\|wifi] [--chunk-size <bytes>] [--name <n>] [--mimetype <m>] [--manifest <out.json>]` | 從 stdin 讀、`0/0` 哨兵、最後一塊 `IS_LAST`、Seal 帶最終描述。`--link` 決定串流的 `chunk_size`（約定 §2），預設 `mobile` |
 | `status <upload_id>` | 印 `Status` 的 Ack |
-| `abort <upload_id>` | 送 `Abort`，刪狀態檔 |
+| `abort <upload_id> [--file <path>]` | 送 `Abort`；給 `--file` 就順便刪它旁邊的狀態檔（狀態檔跟著檔案放，只有 id 找不到它） |
 
 - `--cipher` 預設：偵測到硬體 AES 用 `aes-256-gcm`，否則 `chacha20-poly1305`（約定 §3）。`none` 是明文模式；第 2 步沒有房間，所以要不要警告是第 3 步 `send` 的事，這裡直接照做。
 - `--chunk-size` 沒給就照約定 §2 的表選；給了就照給的（要在 server 允許的範圍，不然 Create 會被拒）。
@@ -66,6 +66,10 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `seek --manifest <m.json> --at <pos> [--len <n>]` | 只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。
+
+- manifest 的 `server` 與 session 的不同 → exit 1，不拿 A server 的 manifest 去打 B server（與上傳狀態檔的規則一致）。
+- `download` 沒給 `-o` 時用描述的 `name`；它是對方寫的，帶路徑分隔符或是 `.`／`..` 就要求明給 `-o`（exit 1），不寫到意料外的位置。
+- `--token` 模式會先打一次 `whoami` 填真的 user_id，狀態檔的 server／user 核對才有意義。
 
 #### 3.3.1 `seek` 的語意：位置是明文位置，讀的單位是塊
 
@@ -206,12 +210,17 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 `scripts/acceptance.sh`（Windows 跑 Git Bash），對著本機 wbfuwunel，照 plan-v1 §4 的表：
 
 1. `login`，`ping` 看 features 有 `upload`、`download`。
-2. 產生 200 MiB 隨機檔 → `upload` → 標準 `GET /_matrix/client/v1/media/download/…` 拿整份 → 與本地逐塊密文串接後 `cmp`。
+2. 產生 200 MiB 隨機檔 → `upload` → 標準 `GET /_matrix/client/v1/media/download/…` 拿整份 → 長度必須是 `file_size + 塊數 × 16`（明文模式不加）。
+   逐 byte 的密文比對在 `crates/wbf-sdk/tests/e2e_local_server.rs`（CLI 沒有印密文的命令，也不該有）。
 3. `download` → 與原檔 `cmp`。
 4. `seek --at 150000000 --len 4096` → 與 `dd` 從原檔切的同一段 `cmp`；stderr 摘要的 `chunks_read` 只有一個元素。
 5. 上傳到一半 `kill` → 再跑同一條 `upload` → 看到 `resume from chunk N` → 結果同第 2、3 條。
 6. `cat 原檔 | upload --stream` → 同第 3 條。
 7. 三種 `--cipher` 各跑一次第 2、3 條。
+
+實作：`scripts/acceptance.sh`，`WBF_PASSWORD_FILE=<檔> scripts/acceptance.sh`；`WBF_ACCEPT_SIZE_MIB` 可以縮小檔案快速跑。
+第 5 步的「殺掉」走 HTTP 通道（一塊一個請求，慢到來得及殺），殺完先 `status` 確認 `finished` 是 false 才算數。
+2026-09-05 對本機 wbfuwunel 跑 200 MiB 全過，79 秒。
 
 ## 9. 明確不做的
 

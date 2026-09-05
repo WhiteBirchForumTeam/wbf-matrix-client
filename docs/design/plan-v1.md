@@ -1,7 +1,7 @@
 # wbf-matrix-client v1 規劃：SDK crate 加 CLI，UI 之後
 
 > 狀態：**維護者 2026-09-04 同意**，開始實作。程式碼一律開分支送 PR 審查，不直接合到 `main`（維護者 2026-09-04 定）。
-> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。第 2 步拆三個 PR：第 1 個（密碼層與 client 向量，PR #4）2026-09-05 合併，第 2 個（通道與上傳／下載）同日送審。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
+> 進度：§6 第 1 步 `wbf-wire` 做完（PR #1，2026-09-04 合併）。第 2 步拆三個 PR：第 1 個（密碼層與 client 向量，PR #4）2026-09-05 合併，第 2 個（通道與上傳／下載，PR #5）同日合併，第 3 個（`apps/wbf-cli` 與驗收腳本）同日送審。client 約定規格書草案在 `wbf-client-convention-for-chunk.md`。維護者當日的決定：**先不做 UI，先做 SDK crate 加 CLI**；
 > 一個 repo（`crates/` 加 `apps/`）；v1 範圍是最小可用（登入、房間列表、收發文字、分塊上傳／下載媒體）；
 > matrix-rust-sdk 先用上游，需要改再 fork。
 >
@@ -74,10 +74,10 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`seek`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。拆三個 PR：
    1. 密碼層與 client 向量：`cipher`、每塊與描述的 AEAD、事件區塊、seek 算法、`chunk_size` 選法；`docs/design/wbf-client-vectors.json`（約定 §9）。無 async、無網路。（PR #4，2026-09-05 合併）
    2. WebSocket／HTTP 通道、`login`、上傳（固定大小與串流）、下載、seek、續傳；`tests/pipeline.rs` 對著記憶體版 server，
-      `tests/e2e_local_server.rs`（`#[ignore]`，環境變數指定 server）對著真的 wbfuwunel 跑 §4 的驗收表。（2026-09-05 送審）
+      `tests/e2e_local_server.rs`（`#[ignore]`，環境變數指定 server）對著真的 wbfuwunel 跑 §4 的驗收表。（PR #5，2026-09-05 合併）
       順帶發現：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭 `id`，不是線上規格 §2 說的「抄請求的」0；
       SDK 兩種都收，但標頭 id 非 0 時必須等於 Ack meta 的 `id`。要不要對 server 開 issue、還是改規格，等維護者定。
-   3. `apps/wbf-cli` 與驗收腳本（CLI 規格 §8）。
+   3. `apps/wbf-cli` 與 `scripts/acceptance.sh`（CLI 規格 §8）；對本機 wbfuwunel 跑 200 MiB 全過。（2026-09-05 送審）
 3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`watch`。
 4. UI 框架決定與 `apps/desktop`。
 

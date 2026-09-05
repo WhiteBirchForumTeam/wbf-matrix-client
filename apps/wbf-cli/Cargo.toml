@@ -1,0 +1,20 @@
+[package]
+name = "wbf-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wbfuwunel 的命令列：login、upload、download、seek、續傳、串流。介面見 docs/design/wbf-cli-spec.md。"
+
+[[bin]]
+name = "wbf-cli"
+path = "src/main.rs"
+
+[dependencies]
+wbf-sdk = { path = "../../crates/wbf-sdk" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rpassword = "7"
+zeroize = "1"
