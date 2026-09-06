@@ -1,7 +1,14 @@
 # 本地資料庫設計：加密的暫存快取
 
-> 狀態：草案，2026-09-05。維護者同意 §1–§4、§6 的提案；§5（與 matrix-sdk store 的關係）維護者要求寫細再議。
-> 前提在 [plan-v1.md](plan-v1.md) §7.1：**現在不做**，先接通 API；這份是之後動手時的依據。
+> 狀態：2026-09-05 草案，維護者同意 §1–§4、§6 的提案；§5（與 matrix-sdk store 的關係）維護者要求寫細再議。
+> **2026-09-06 起動手**（維護者定：第 3 步第一版之後下一隻專注這裡）。做到哪：
+>
+> | 段 | 狀態 |
+> |---|---|
+> | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
+> | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
+> | §3、§6 `cache.db`（SQLCipher） | ⬜ 下一個 PR |
+> | §8 媒體檔案空間 | ⬜ |
 
 ## 0. 一句話
 
@@ -74,6 +81,18 @@ local.key（0600）
 
   CLI 密碼的來源與 `login` 同一套：`--local-password-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
   ticket 是明文主金鑰落地，安全性等於 `Plain` 模式那 15 分鐘；維護者明說接受（CLI 不是產品面）。這一項不進 UI。
+
+### 4.1 實作與上面的差異（第一個 PR，2026-09-06）
+
+- `local.key` 的 `password` 模式在 JSON 裡 `mode` 值是 `"password"`（上面的 `PasswordWrapped` 是型別名，程式裡也叫 `KeyFile::Password`）。
+- 包主金鑰與封 session 都帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。
+- 多一個 `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問密碼，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
+- `Vault::set_unlock(&Unlock)` 一個函數涵蓋設密碼、改密碼、拿掉密碼：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空字串密碼在這裡被拒。
+- `Vault::from_master(dir, master, mode)` 給 CLI 的 ticket 用；它不驗證主金鑰是不是這個目錄的，信任等於 `Plain`。
+- 第四把子金鑰 `media store v1` 已經導出來（`media_store_key`），還沒有人用；先把 context 字串一次定完。
+- CLI 的資料目錄是**一個** `<data dir>/wbf-cli/`，不是 §5.6 的 `<server>/<user>` 一套：CLI 一次一個 session（CLI 規格 §7）。UI 那一版再照 §5.6。
+- 寫 `local.key`／`session.sealed`／ticket 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
+- 既有的 store 用別把金鑰開會失敗：訊息叫人刪 `matrix/` 重新 `login`，不遷移（§1 的政策；store 只是裝置狀態）。
 
 - **威脅模型**（老實寫）：
 

@@ -6,7 +6,8 @@
 
 第 1 步（`wbf-wire` codec）、第 2 步（`wbf-sdk` 密碼層／通道／上傳下載、`apps/wbf-cli`）做完；
 第 3 步（接 matrix-sdk 做房間）第一版做完：`rooms`、`send --text|--file`、`watch`、`read`、`files` 對本機 wbfuwunel 全走過。
-PR #1–#9 全部合併。**沒有 UI，沒有本地資料庫。**
+本地資料庫第一個 PR（vault 與金鑰：`local.key`、`session.sealed`、matrix store 帶金鑰、CLI 的 unlock ticket）2026-09-06 做完送審。
+PR #1–#10 全部合併。**沒有 UI，`cache.db` 還沒有。**
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -17,7 +18,7 @@ PR #1–#9 全部合併。**沒有 UI，沒有本地資料庫。**
 | 3 | [`design/wbf-client-convention-for-chunk.md`](design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、seek；**§5.2 送事件要宣告附件**（等 server 定案） |
 | 4 | [`design/chat-model.md`](design/chat-model.md) | 聊天模型（Conversation／Message）、怎麼接 Matrix、Telegram 有 Matrix 沒有的逐列定案、`r_seq`／`g_seq`、§6 第 3 步範圍與差異 |
 | 5 | [`design/wbf-cli-spec.md`](design/wbf-cli-spec.md) | CLI 每個命令、exit code、manifest、狀態檔、session 檔、驗收腳本 |
-| 6 | [`design/local-cache-db.md`](design/local-cache-db.md) | 之後的本地資料庫：主金鑰、三把子金鑰、SQLCipher、媒體檔案空間、配額。**還沒做** |
+| 6 | [`design/local-cache-db.md`](design/local-cache-db.md) | 本地資料庫：主金鑰、三把子金鑰、SQLCipher、媒體檔案空間、配額。檔頭有進度表：§4／§5.3 做了，`cache.db`（§3、§6）與媒體（§8）還沒 |
 
 server 端的權威在 wbfuwunel repo：`docs/design/chunked-upload-spec.md`（線上規格）、`room-seq-and-recent.md`、`media-attachments.md`（提案）、`wbf-vectors.json`（整份複製到本 repo，不手改）。
 
@@ -29,8 +30,9 @@ crates/wbf-sdk/src/
   cipher.rs chunk_block.rs chunk_crypto.rs   密碼層（約定 §2–§4、§7）；tests/client_vectors.rs 產生並比對 wbf-client-vectors.json
   protocol.rs channel.rs client.rs upload.rs download.rs manifest.rs login.rs error.rs   通道與上傳／下載（線上規格）
   chat.rs                聊天模型與 ChatBackend trait，沒有 Matrix 型別
-  backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）
-apps/wbf-cli/src/        main.rs（參數、exit code）、session.rs、commands.rs（第 2 步命令）、rooms.rs（第 3 步命令）
+  vault.rs               local.key、三把子金鑰、session.sealed（local-cache-db §4）；沒有 SQLite、沒有 matrix-sdk
+  backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
+apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（資料目錄、密碼來源、unlock ticket）、commands.rs（第 2 步命令）、rooms.rs（第 3 步命令）
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
 ```
@@ -50,7 +52,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 2. config 最小集：`server_name = "localhost"`、`port = 6167`、`allow_registration = true`、`registration_token = "<自訂>"`、`database_path`、`log = "warn"`。啟動要十幾秒，輪詢 `/_matrix/client/versions` 到 200。
 3. 註冊測試帳號：`POST /_matrix/client/v3/register` 帶 `auth.type = m.login.registration_token`。
 4. `WBF_E2E_SERVER=... WBF_E2E_USER=... WBF_E2E_PASSWORD_FILE=... cargo test -p wbf-sdk --test e2e_local_server -- --ignored`（第 2 步的驗收）；`WBF_PASSWORD_FILE=... scripts/acceptance.sh`（CLI 的驗收，200 MiB 約 80 秒；`WBF_ACCEPT_SIZE_MIB=16` 快跑）。
-5. 第 3 步的手動流程：`login` → 用 token `createRoom`（`initial_state` 帶 `m.room.encryption`）→ `rooms` → `send --text` → `read` → `send --file` → `files --save` → `download --manifest`。
+5. 第 3 步的手動流程：`login` → 用 token `createRoom`（`initial_state` 帶 `m.room.encryption`）→ `rooms` → `send --text` → `read` → `send --file` → `files --save` → `download --manifest`。token 現在在 `session.sealed` 裡讀不到，`createRoom` 那步的 token 用 curl 另外登入一次拿（驗收腳本就是這樣做）。
+7. vault 的手動流程：`login --local-password-file pw`（建 `password` 模式的 `local.key`）→ `rooms`（走 ticket，不問）→ `lock` → `rooms`（問密碼；非互動就 exit 1）→ `remove-local-password` → `rooms`（不問）。
 6. 測完 `taskkill //F //IM <複本名>.exe`。
 
 ## 5. 坑（都踩過）
@@ -68,14 +71,14 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
 | **E2EE 房送檔案沒宣告附件**（約定 §5.2） | server 的 `Event/Send` 是提案；matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清。CLI 送檔會印警告 |
-| matrix-sdk store 沒 passphrase | 等 local-cache-db 的 vault | 裝置金鑰明文落在 `<session dir>/matrix/` |
 | `Event/Recent` 沒對真 server 跑過 e2e | 本機測試時 server 是舊 build | SDK 對著 server 向量逐 byte 比過，缺的是真連線 |
 | `RoomCrypto` trait 還沒有 | 加密全在 matrix-sdk 裡，沒東西可包 | 接管送訊息那一版出現 |
 
 ## 7. 下一步（維護者 2026-09-06 同意的順序）
 
-1. CLI `recent` 命令（SDK 已有 `WbfClient::recent`）＋對 `target/e2e/` 那顆 server 的 e2e。小。
-2. 本地資料庫第一個 PR：vault 與金鑰（local-cache-db §4）；順便給 matrix store passphrase。
+1. ~~本地資料庫第一個 PR：vault 與金鑰~~ 做了（2026-09-06 送審）。
+2. 本地資料庫第二個 PR：`cache.db`（SQLCipher，local-cache-db §3、§6）：`rusqlite` 的 `bundled-sqlcipher` 與 matrix-sdk 釘的 rusqlite 0.40 要先確認合得來（§3 的待驗）。
+2b. CLI `recent` 命令（SDK 已有 `WbfClient::recent`）：server 端 Recent 與 r_seq／g_seq 已合併（維護者 2026-09-06 說的），穿插做。
 3. 附件宣告：等 server 定案。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。**走 fork submodule 露出 `Room::encrypt`，還是走 `OlmMachine`，維護者還沒定**；建議後者（plan-v1 §7.2 的方向）。
 4. chat-model §6 剩的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載。穿插。
 5. UI 框架比較文件。

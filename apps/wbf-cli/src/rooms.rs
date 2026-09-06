@@ -2,7 +2,7 @@
 //! 只碰 `wbf-sdk` 的 `ChatBackend` 與模型型別；matrix-sdk 的東西在 SDK 的 adapter 裡（plan-v1 §7.2）。
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -12,36 +12,24 @@ use wbf_sdk::{
 };
 
 use crate::commands::{upload_file_to_manifest, Context};
-use crate::session::write_private;
 use crate::{SendArgs, UploadArgs, WatchArgs};
-
-/// session 檔旁邊的 `matrix/`：matrix-sdk 的 crypto 與 state store（CLI 規格 §7 第 3 步加的）。
-pub fn store_dir_for(session_path: &Path) -> Result<PathBuf, SdkError> {
-    // session 路徑沒有上層目錄就報錯，不退到相對 cwd 的 `matrix`（PR #9 審查 cirno ⚠️4）。
-    let parent = session_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| {
-            SdkError::Usage(format!(
-                "session path {} has no parent directory for the matrix store",
-                session_path.display()
-            ))
-        })?;
-    Ok(parent.join("matrix"))
-}
+use wbf_sdk::vault::write_private;
 
 /// 還原 backend 並做一次增量 sync（timeout 0）：房間列表與新事件到 store，之後的命令才看得到現況。
+/// store 在 `<data dir>/matrix/`，金鑰是 vault 的第二把子金鑰（local-cache-db.md §5.3）。
 async fn backend(context: &Context) -> Result<MatrixBackend, SdkError> {
     let session = context.session().await?;
-    let store_dir = match &session.store_dir {
-        Some(dir) => PathBuf::from(dir),
-        None => {
-            return Err(SdkError::Usage(
-                "this session has no matrix store (logged in with an older wbf-cli or --token); run `login` again".into(),
-            ))
-        }
-    };
-    let backend = MatrixBackend::restore(&session, &store_dir).await?;
+    if session.store_dir.is_none() {
+        return Err(SdkError::Usage(
+            "this session has no matrix store (logged in with an older wbf-cli or --token); run `login` again".into(),
+        ));
+    }
+    let backend = MatrixBackend::restore(
+        &session,
+        &context.unlock.matrix_store_dir(),
+        &context.vault()?.matrix_store_key(),
+    )
+    .await?;
     backend.sync_once(None, Duration::ZERO).await?;
     Ok(backend)
 }

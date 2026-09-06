@@ -17,6 +17,9 @@ getrandom = "0.2"
 wbf-wire = { path = "../wbf-wire" }
 sha2 = "0.10"
 hex = "0.4"
+blake3 = "1"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

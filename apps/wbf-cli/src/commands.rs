@@ -9,12 +9,14 @@ use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, Descrip
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{
     Channel, ChunkedBlock, Cipher, FileCipher, Manifest, SdkError, Session, Transport, UploadState,
-    WbfClient,
+    Vault, WbfClient,
 };
-use zeroize::Zeroize;
 
-use crate::session::{
-    default_session_path, delete_session, read_session, write_private, write_session,
+use wbf_sdk::vault::write_private;
+
+use crate::unlock::{
+    default_data_dir, prompt_new_password, prompt_password_on_terminal, read_password_file,
+    UnlockOptions,
 };
 use crate::{Cli, Command, UploadArgs};
 
@@ -31,8 +33,32 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         Command::Logout => {
             let session = context.session().await?;
             logout(&session).await?;
-            delete_session(&context.session_path)?;
+            if context.token_override.is_none() {
+                context.vault()?.delete_sealed_session()?;
+                context.unlock.delete_ticket()?;
+            }
             print_json(&json!({ "ok": true }))
+        }
+        Command::Lock => {
+            let removed = context.unlock.delete_ticket()?;
+            print_json(&json!({ "ok": true, "had_ticket": removed }))
+        }
+        Command::SetLocalPassword { new_password_file } => {
+            let mut vault = context.unlock.open_vault()?;
+            let password = match new_password_file {
+                Some(path) => read_password_file(&path)?,
+                None => prompt_new_password()?,
+            };
+            vault.set_unlock(&wbf_sdk::Unlock::Password(password))?;
+            // 舊 ticket 是用舊密碼換來的；換了密碼就作廢，下一個命令要用新的。
+            context.unlock.delete_ticket()?;
+            print_json(&json!({ "ok": true, "mode": vault.mode() }))
+        }
+        Command::RemoveLocalPassword => {
+            let mut vault = context.unlock.open_vault()?;
+            vault.set_unlock(&wbf_sdk::Unlock::NoPassword)?;
+            context.unlock.delete_ticket()?;
+            print_json(&json!({ "ok": true, "mode": vault.mode() }))
         }
         Command::Whoami => {
             let who = whoami(&context.session().await?).await?;
@@ -107,7 +133,9 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
 
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
 pub struct Context {
-    pub session_path: PathBuf,
+    pub unlock: UnlockOptions,
+    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從這裡拿，不然 Argon2 跑兩次、ticket 寫兩次。
+    opened_vault: std::sync::OnceLock<Vault>,
     pub server_override: Option<String>,
     pub token_override: Option<String>,
     pub quiet: bool,
@@ -116,12 +144,18 @@ pub struct Context {
 
 impl Context {
     fn from(cli: &Cli) -> Result<Context, SdkError> {
-        let session_path = match &cli.session {
+        let data_dir = match &cli.data_dir {
             Some(path) => path.clone(),
-            None => default_session_path()?,
+            None => default_data_dir()?,
         };
         Ok(Context {
-            session_path,
+            opened_vault: std::sync::OnceLock::new(),
+            unlock: UnlockOptions {
+                data_dir,
+                local_password_file: cli.local_password_file.clone(),
+                unlock_ttl: std::time::Duration::from_secs(cli.unlock_ttl),
+                quiet: cli.quiet,
+            },
             server_override: cli.server.clone(),
             token_override: cli.token.clone(),
             quiet: cli.quiet,
@@ -129,7 +163,7 @@ impl Context {
         })
     }
 
-    /// `--token` 加 `--server` 就不碰 session 檔；否則讀 session 檔，`--server` 可覆蓋。
+    /// `--token` 加 `--server` 就不碰 vault；否則開 vault 讀 `session.sealed`，`--server` 可覆蓋。
     /// `--token` 模式打一次 `whoami` 填真的 user_id：續傳狀態檔的 `is_for` 要靠它分辨「不是你的上傳」，
     /// 填佔位值會讓兩把不同的 token 比成相等（PR #6 審查 rumia 🟡2）。
     pub async fn session(&self) -> Result<Session, SdkError> {
@@ -151,11 +185,25 @@ impl Context {
                 ..probe
             });
         }
-        let mut session = read_session(&self.session_path)?;
+        let mut session = self.vault()?.unseal_session()?.ok_or_else(|| {
+            SdkError::Usage(format!(
+                "no session in {}; run `login` first",
+                self.unlock.data_dir.display()
+            ))
+        })?;
         if let Some(server) = &self.server_override {
             session.server = server.clone();
         }
         Ok(session)
+    }
+
+    /// 開一次、之後都拿同一個（唯讀）。要改鎖法的命令自己 `unlock.open_vault()` 拿可變的那份。
+    pub fn vault(&self) -> Result<&Vault, SdkError> {
+        if let Some(vault) = self.opened_vault.get() {
+            return Ok(vault);
+        }
+        let vault = self.unlock.open_vault()?;
+        Ok(self.opened_vault.get_or_init(|| vault))
     }
 
     pub async fn client(&self) -> Result<WbfClient<Channel>, SdkError> {
@@ -183,22 +231,22 @@ async fn login_command(
         .clone()
         .ok_or_else(|| SdkError::Usage("login needs --server (or WBF_SERVER)".into()))?;
     let password = match password_file {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)?;
-            text.strip_suffix('\n')
-                .map(|stripped| stripped.strip_suffix('\r').unwrap_or(stripped))
-                .unwrap_or(&text)
-                .to_string()
-        }
-        None => rpassword::prompt_password("password: ")?,
+        Some(path) => read_password_file(path)?,
+        None => prompt_password_on_terminal("password: ")?,
     };
-    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放 session 檔旁邊的 matrix/。
-    let store_dir = crate::rooms::store_dir_for(&context.session_path)?;
-    let mut password = password;
-    let login = MatrixBackend::login(&server, user, &password, device_name, &store_dir).await;
-    password.zeroize();
-    let (_backend, session) = login?;
-    write_session(&context.session_path, &session)?;
+    // vault 先開（沒有就建）：store 的金鑰與 session.sealed 都從它來。
+    let vault = context.unlock.open_or_create_vault()?;
+    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放 <data dir>/matrix/。
+    let (_backend, session) = MatrixBackend::login(
+        &server,
+        user,
+        &password,
+        device_name,
+        &context.unlock.matrix_store_dir(),
+        &vault.matrix_store_key(),
+    )
+    .await?;
+    vault.seal_session(&session)?;
     print_json(
         &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server }),
     )

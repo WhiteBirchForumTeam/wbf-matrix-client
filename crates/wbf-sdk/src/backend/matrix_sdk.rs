@@ -22,6 +22,7 @@ use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventConte
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
 use matrix_sdk::ruma::events::MessageLikeEventType;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
+use matrix_sdk::SqliteStoreConfig;
 use matrix_sdk::{Client, Room, SessionMeta};
 
 use crate::chat::{
@@ -31,6 +32,7 @@ use crate::chat::{
 use crate::error::SdkError;
 use crate::login::Session;
 use crate::protocol::event_seqs;
+use crate::vault::Key32;
 
 /// 約定 §5 的 msgtype 與區塊 key。
 pub const FILE_MSGTYPE: &str = "org.wbftw.wbfuwunel.file";
@@ -46,13 +48,14 @@ pub struct MatrixBackend {
 
 impl MatrixBackend {
     /// 登入：拿到裝置與 token，store 落在 `store_dir`（crypto 與 state 兩個 sqlite，plan-v1 §7.1 說的「非存不可」）。
-    /// ⚠️ 這一版 store 沒有 passphrase：主金鑰的 vault 是 local-cache-db.md 那一版的事，到時傳第二把子金鑰進來。
+    /// store 用 `store_key` 包住它自己的 `StoreCipher`（local-cache-db.md §5.3）：這把是 `Vault::matrix_store_key()`。
     ///
     /// Args:
     ///     server: example: "http://localhost:6167"
     ///     user: mxid 或 localpart
     ///     password: 🚫 不印、不 log
-    ///     store_dir: example: "<config>/wbf-cli/matrix"
+    ///     store_dir: example: "<data dir>/wbf-cli/matrix"
+    ///     store_key: example: vault.matrix_store_key()
     /// Return:
     ///     Ok((MatrixBackend, Session))   Session 給呼叫者寫 session 檔
     ///     Err(Server)                    登入被拒（M_FORBIDDEN…）
@@ -62,8 +65,9 @@ impl MatrixBackend {
         password: &str,
         device_name: &str,
         store_dir: &Path,
+        store_key: &Key32,
     ) -> Result<(MatrixBackend, Session), SdkError> {
-        let client = build_client(server, store_dir).await?;
+        let client = build_client(server, store_dir, store_key).await?;
         let response = client
             .matrix_auth()
             .login_username(user, password)
@@ -83,8 +87,12 @@ impl MatrixBackend {
     }
 
     /// 用 session 檔還原：同一個裝置、同一個 store。
-    pub async fn restore(session: &Session, store_dir: &Path) -> Result<MatrixBackend, SdkError> {
-        let client = build_client(&session.server, store_dir).await?;
+    pub async fn restore(
+        session: &Session,
+        store_dir: &Path,
+        store_key: &Key32,
+    ) -> Result<MatrixBackend, SdkError> {
+        let client = build_client(&session.server, store_dir, store_key).await?;
         let user_id = UserId::parse(&session.user_id)
             .map_err(|error| SdkError::Usage(format!("session user_id: {error}")))?;
         client
@@ -332,16 +340,30 @@ impl ChatBackend for MatrixBackend {
     }
 }
 
-async fn build_client(server: &str, store_dir: &Path) -> Result<Client, SdkError> {
+async fn build_client(
+    server: &str,
+    store_dir: &Path,
+    store_key: &Key32,
+) -> Result<Client, SdkError> {
     std::fs::create_dir_all(store_dir)?;
     // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
+    // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（local-cache-db.md §5.3）。
+    let store_config = SqliteStoreConfig::new(store_dir).key(Some(store_key.as_bytes()));
     Client::builder()
         .homeserver_url(server)
         .request_config(RequestConfig::new().timeout(crate::channel::REQUEST_TIMEOUT))
-        .sqlite_store(store_dir, None)
+        .sqlite_store_with_config_and_cache_path(store_config, None::<&Path>)
         .build()
         .await
-        .map_err(|error| SdkError::Network(format!("matrix client: {error}")))
+        .map_err(|error| match error {
+            // 開不了 store 多半是既有的 store 不是這把金鑰包的（舊版沒有金鑰、或 local.key 換過）。
+            // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
+            matrix_sdk::ClientBuildError::SqliteStore(error) => SdkError::Usage(format!(
+                "cannot open the matrix store at {}: {error}; it was made with another key file — delete that directory and run `login` again",
+                store_dir.display()
+            )),
+            other => SdkError::Network(format!("matrix client: {other}")),
+        })
 }
 
 /// matrix-sdk 的錯誤分類到我們的：server 回了 Matrix 的 `errcode`（M_FORBIDDEN…）→ `Server`（code 就是 errcode），其他 → `Network`。

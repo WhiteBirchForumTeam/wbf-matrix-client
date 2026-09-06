@@ -41,7 +41,15 @@ fn spawn_forbidding_server() -> String {
 async fn wrong_password_is_a_server_error_with_errcode() {
     let server = spawn_forbidding_server();
     let store = std::env::temp_dir().join(format!("wbf-sdk-test-{}", std::process::id()));
-    let result = MatrixBackend::login(&server, "alice", "wrong", "test", &store).await;
+    let result = MatrixBackend::login(
+        &server,
+        "alice",
+        "wrong",
+        "test",
+        &store,
+        &wbf_sdk::Key32([1u8; 32]),
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&store);
     let error = result.err().expect("login must fail");
     match &error {
