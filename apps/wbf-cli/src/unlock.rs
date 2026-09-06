@@ -1,7 +1,8 @@
-//! CLI 怎麼打開 vault（local-cache-db.md §4 的 CLI 那一列）：資料目錄在哪、密碼從哪來、unlock ticket。
+//! CLI 怎麼打開 vault（local-cache-db.md §4 的 CLI 那一列）：資料目錄在哪、passphrase 從哪來、unlock ticket。
 //!
-//! 密碼來源的優先順序：`--local-password-file` → 有效的 `unlock.ticket` → `local.key` 是 `Plain` 就不用密碼 → 問終端。
-//! ticket 仿 `sudo`：密碼解鎖成功後把主金鑰加 `expires_at` 寫到 `<data dir>/unlock.ticket`（0600），
+//! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼（只有 `login` 用）。
+//! passphrase 來源的優先順序：`--passphrase-file` → 有效的 `unlock.ticket` → `local.key` 是 `Plain` 就不用 passphrase → 問終端。
+//! ticket 仿 `sudo`：passphrase 解鎖成功後把主金鑰加 `expires_at` 寫到 `<data dir>/unlock.ticket`（0600），
 //! 期內的命令不再問；`lock` 刪掉它。⚠️ 那 15 分鐘的安全性等於 `Plain` 模式，維護者明說接受（CLI 不是產品面）。
 
 use std::path::{Path, PathBuf};
@@ -44,7 +45,7 @@ pub fn default_data_dir() -> Result<PathBuf, SdkError> {
 /// 全域參數裡跟解鎖有關的部分，`Context` 抄一份。
 pub struct UnlockOptions {
     pub data_dir: PathBuf,
-    pub local_password_file: Option<PathBuf>,
+    pub passphrase_file: Option<PathBuf>,
     /// 0 就不寫 ticket。
     pub unlock_ttl: Duration,
     pub quiet: bool,
@@ -63,7 +64,7 @@ impl UnlockOptions {
     ///
     /// Return:
     ///     Ok(Vault)
-    ///     Err(Usage)   沒有 local.key、密碼錯、密碼檔讀不到、終端不能問
+    ///     Err(Usage)   沒有 local.key、passphrase 錯、passphrase 檔讀不到、終端不能問
     pub fn open_vault(&self) -> Result<Vault, SdkError> {
         if !self.data_dir.join(wbf_sdk::vault::KEY_FILE_NAME).exists() {
             let legacy = self.data_dir.join(LEGACY_SESSION_FILE_NAME);
@@ -81,16 +82,16 @@ impl UnlockOptions {
             )));
         }
         if Vault::read_mode(&self.data_dir)? == KeyMode::Plain {
-            // Plain 模式不看 ticket：給了密碼檔就讓 Vault::open 用「配不上」拒絕，不靜默忽略。
-            let unlock = match &self.local_password_file {
-                Some(path) => Unlock::Password(read_password_file(path)?),
-                None => Unlock::NoPassword,
+            // Plain 模式不看 ticket：給了 passphrase 檔就讓 Vault::open 用「配不上」拒絕，不靜默忽略。
+            let unlock = match &self.passphrase_file {
+                Some(path) => Unlock::Passphrase(read_password_file(path)?),
+                None => Unlock::NoPassphrase,
             };
             return Vault::open(&self.data_dir, &unlock);
         }
-        if let Some(path) = &self.local_password_file {
-            let password = read_password_file(path)?;
-            let vault = Vault::open(&self.data_dir, &Unlock::Password(password))?;
+        if let Some(path) = &self.passphrase_file {
+            let passphrase = read_password_file(path)?;
+            let vault = Vault::open(&self.data_dir, &Unlock::Passphrase(passphrase))?;
             self.write_ticket(&vault)?;
             return Ok(vault);
         }
@@ -98,27 +99,27 @@ impl UnlockOptions {
             return Ok(Vault::from_master(
                 &self.data_dir,
                 master,
-                KeyMode::Password,
+                KeyMode::Passphrase,
             ));
         }
-        let password = prompt_password_on_terminal("local password: ")?;
-        let vault = Vault::open(&self.data_dir, &Unlock::Password(password))?;
+        let passphrase = prompt_password_on_terminal("passphrase: ")?;
+        let vault = Vault::open(&self.data_dir, &Unlock::Passphrase(passphrase))?;
         self.write_ticket(&vault)?;
         Ok(vault)
     }
 
     /// `login` 用：有 `local.key` 就照 `open_vault` 開；沒有就建一把，
-    /// 給了 `--local-password-file` 就直接是 `Password` 模式，否則 `Plain`。
+    /// 給了 `--passphrase-file` 就直接是 `Passphrase` 模式，否則 `Plain`。
     pub fn open_or_create_vault(&self) -> Result<Vault, SdkError> {
         if self.data_dir.join(wbf_sdk::vault::KEY_FILE_NAME).exists() {
             return self.open_vault();
         }
-        let unlock = match &self.local_password_file {
-            Some(path) => Unlock::Password(read_password_file(path)?),
-            None => Unlock::NoPassword,
+        let unlock = match &self.passphrase_file {
+            Some(path) => Unlock::Passphrase(read_password_file(path)?),
+            None => Unlock::NoPassphrase,
         };
         let vault = Vault::create(&self.data_dir, &unlock)?;
-        if vault.mode() == KeyMode::Password {
+        if vault.mode() == KeyMode::Passphrase {
             self.write_ticket(&vault)?;
         }
         self.progress(format!(
@@ -126,7 +127,7 @@ impl UnlockOptions {
             vault.dir().join(wbf_sdk::vault::KEY_FILE_NAME).display(),
             match vault.mode() {
                 KeyMode::Plain => "plain",
-                KeyMode::Password => "password",
+                KeyMode::Passphrase => "passphrase",
             }
         ));
         Ok(vault)
@@ -232,7 +233,7 @@ fn is_private_mode(path: &Path) -> Result<bool, SdkError> {
     }
 }
 
-/// `--password-file`／`--local-password-file` 的規則（CLI 規格 §3.1）：整檔就是密碼，去掉結尾一個換行。
+/// `--password-file`／`--passphrase-file` 的規則（CLI 規格 §3.1）：整檔就是那句話，去掉結尾一個換行。
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>, SdkError> {
     let text = Zeroizing::new(std::fs::read_to_string(path)?);
     let trimmed = text
@@ -242,11 +243,11 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>, SdkError> {
     Ok(Zeroizing::new(trimmed.to_string()))
 }
 
-/// 從終端不回顯地讀密碼。stdin 不是終端（腳本、管線、`</dev/null`）就直接拒絕：
+/// 從終端不回顯地讀 password 或 passphrase。stdin 不是終端（腳本、管線、`</dev/null`）就直接拒絕：
 /// rpassword 在 Windows 會繞過 stdin 直接開 console 等人打字，被導向時整個命令會掛在那裡（2026-09-06 實跑踩到）。
 ///
 /// Args:
-///     label: example: "local password: "
+///     label: example: "passphrase: "
 /// Return:
 ///     Ok(Zeroizing<String>)
 ///     Err(Usage)   stdin 不是終端
@@ -254,16 +255,16 @@ pub fn prompt_password_on_terminal(label: &str) -> Result<Zeroizing<String>, Sdk
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(SdkError::Usage(format!(
-            "{} needed but stdin is not a terminal; pass it with a --password-file / --local-password-file",
+            "{} needed but stdin is not a terminal; pass it with a --password-file / --passphrase-file",
             label.trim_end_matches(": ")
         )));
     }
     Ok(Zeroizing::new(rpassword::prompt_password(label)?))
 }
 
-/// 問兩次、要一樣（設新的 local password 用）。
-pub fn prompt_new_password() -> Result<Zeroizing<String>, SdkError> {
-    let first = prompt_password_on_terminal("new local password: ")?;
+/// 問兩次、要一樣（設新的 passphrase 用）。
+pub fn prompt_new_passphrase() -> Result<Zeroizing<String>, SdkError> {
+    let first = prompt_password_on_terminal("new passphrase: ")?;
     let second = prompt_password_on_terminal("again: ")?;
     if *first != *second {
         return Err(SdkError::Usage("the two passwords differ".into()));
@@ -280,7 +281,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         UnlockOptions {
             data_dir: dir,
-            local_password_file: None,
+            passphrase_file: None,
             unlock_ttl: Duration::from_secs(ttl),
             quiet: true,
         }
@@ -294,14 +295,14 @@ mod tests {
     }
 
     #[test]
-    fn password_file_unlock_writes_a_ticket_and_ticket_alone_opens() {
+    fn passphrase_file_unlock_writes_a_ticket_and_ticket_alone_opens() {
         let mut options = scratch_options("ticket", 60);
         let pw = password_file(&options.data_dir, "hunter2\n");
-        options.local_password_file = Some(pw);
+        options.passphrase_file = Some(pw);
         let created = options.open_or_create_vault().unwrap();
-        assert_eq!(created.mode(), KeyMode::Password);
+        assert_eq!(created.mode(), KeyMode::Passphrase);
         assert!(options.data_dir.join(TICKET_FILE_NAME).exists());
-        options.local_password_file = None;
+        options.passphrase_file = None;
         let via_ticket = options.open_vault().unwrap();
         assert_eq!(
             created.master_key().as_bytes(),
@@ -316,7 +317,7 @@ mod tests {
     fn expired_ticket_is_removed_and_not_used() {
         let mut options = scratch_options("expired", 60);
         let pw = password_file(&options.data_dir, "hunter2");
-        options.local_password_file = Some(pw);
+        options.passphrase_file = Some(pw);
         options.open_or_create_vault().unwrap();
         let path = options.data_dir.join(TICKET_FILE_NAME);
         let mut ticket: Ticket = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -331,7 +332,7 @@ mod tests {
     fn ttl_zero_writes_no_ticket_and_plain_mode_never_does() {
         let mut options = scratch_options("nottl", 0);
         let pw = password_file(&options.data_dir, "hunter2");
-        options.local_password_file = Some(pw);
+        options.passphrase_file = Some(pw);
         options.open_or_create_vault().unwrap();
         assert!(!options.data_dir.join(TICKET_FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&options.data_dir);
@@ -341,9 +342,9 @@ mod tests {
         assert_eq!(vault.mode(), KeyMode::Plain);
         assert!(!plain.data_dir.join(TICKET_FILE_NAME).exists());
         assert!(plain.open_vault().is_ok());
-        // Plain 模式給了密碼檔：拒絕，不是靜默忽略。
+        // Plain 模式給了 passphrase 檔：拒絕，不是靜默忽略。
         let mut with_pw = plain;
-        with_pw.local_password_file = Some(password_file(&with_pw.data_dir, "x"));
+        with_pw.passphrase_file = Some(password_file(&with_pw.data_dir, "x"));
         assert!(with_pw.open_vault().is_err());
         let _ = std::fs::remove_dir_all(&with_pw.data_dir);
     }

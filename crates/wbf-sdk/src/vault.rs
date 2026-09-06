@@ -1,9 +1,10 @@
 //! 本地金鑰庫（local-cache-db.md §4、§5.3、§5.6）：一把 32 byte 主金鑰放 `local.key`，
-//! 明文（`Plain`）或被 local password 包住（`PasswordWrapped`）；子金鑰用 BLAKE3 從主金鑰導出，不落地。
+//! 明文（`Plain`）或被 passphrase 包住（`PassphraseWrapped`）；子金鑰用 BLAKE3 從主金鑰導出，不落地。
 //! `session.sealed` 用第三把子金鑰封住 session 與 token。
 //!
 //! 這裡沒有 SQLite、沒有 matrix-sdk：兩個世界只從 `Vault` 拿各自的子金鑰（§5.3 的那一條線）。
-//! 🚫 主金鑰、子金鑰、密碼都不印、不進錯誤訊息。
+//! 🚫 主金鑰、子金鑰、passphrase 都不印、不進錯誤訊息。
+//! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼，這個檔裡沒有它。
 
 use std::path::{Path, PathBuf};
 
@@ -62,11 +63,11 @@ impl std::fmt::Debug for Key32 {
     }
 }
 
-/// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassword`，`PasswordWrapped` 配 `Password`，配錯就 `Err`（§4）。
+/// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassphrase`，`PassphraseWrapped` 配 `Passphrase`，配錯就 `Err`（§4）。
 pub enum Unlock {
-    NoPassword,
-    /// 🚫 不接受空字串：「沒設密碼」是 `Plain` 模式，不是密碼等於空字串。
-    Password(Zeroizing<String>),
+    NoPassphrase,
+    /// 🚫 不接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
+    Passphrase(Zeroizing<String>),
 }
 
 /// `local.key` 現在是哪一種鎖法。
@@ -74,7 +75,7 @@ pub enum Unlock {
 #[serde(rename_all = "snake_case")]
 pub enum KeyMode {
     Plain,
-    Password,
+    Passphrase,
 }
 
 /// `local.key` 在磁碟上的樣子。`mode` 不認得的值 serde 直接拒絕。
@@ -85,7 +86,7 @@ enum KeyFile {
         v: u32,
         master: String,
     },
-    Password {
+    Passphrase {
         v: u32,
         kdf: KdfParams,
         nonce: String,
@@ -121,10 +122,10 @@ impl Vault {
     ///
     /// Args:
     ///     dir: example: "<data dir>/wbf-cli"
-    ///     unlock: example: Unlock::NoPassword
+    ///     unlock: example: Unlock::NoPassphrase
     /// Return:
     ///     Ok(Vault)
-    ///     Err(Usage)   已經有 local.key、或密碼是空字串
+    ///     Err(Usage)   已經有 local.key、或 passphrase 是空字串
     pub fn create(dir: &Path, unlock: &Unlock) -> Result<Vault, SdkError> {
         let key_path = dir.join(KEY_FILE_NAME);
         if key_path.exists() {
@@ -146,10 +147,10 @@ impl Vault {
     ///
     /// Args:
     ///     dir: example: "<data dir>/wbf-cli"
-    ///     unlock: example: Unlock::Password("hunter2".to_string().into())
+    ///     unlock: example: Unlock::Passphrase("hunter2".to_string().into())
     /// Return:
     ///     Ok(Vault)
-    ///     Err(Usage)   沒有 local.key、檔案壞了、模式與 unlock 配不上、密碼錯
+    ///     Err(Usage)   沒有 local.key、檔案壞了、模式與 unlock 配不上、passphrase 錯
     pub fn open(dir: &Path, unlock: &Unlock) -> Result<Vault, SdkError> {
         let key_path = dir.join(KEY_FILE_NAME);
         let bytes = std::fs::read(&key_path).map_err(|error| {
@@ -162,35 +163,38 @@ impl Vault {
             ))
         })?;
         let (master, mode) = match (file, unlock) {
-            (KeyFile::Plain { v, master }, Unlock::NoPassword) => {
+            (KeyFile::Plain { v, master }, Unlock::NoPassphrase) => {
                 if v != KEY_FILE_VERSION {
-                    return Err(SdkError::Usage(format!("key file version {v} is not supported")));
+                    return Err(SdkError::Usage(format!(
+                        "key file version {v} is not supported"
+                    )));
                 }
                 (decode_key32(&master, "master")?, KeyMode::Plain)
             }
-            (KeyFile::Plain { .. }, Unlock::Password(_)) => {
+            (KeyFile::Plain { .. }, Unlock::Passphrase(_)) => {
                 return Err(SdkError::Usage(
-                    "this key file has no local password; do not pass one".into(),
+                    "this key file has no passphrase; do not pass one".into(),
                 ))
             }
-            (KeyFile::Password { .. }, Unlock::NoPassword) => {
-                return Err(SdkError::Usage(
-                    "this key file is locked with a local password; pass --local-password-file or unlock first".into(),
-                ))
-            }
+            (KeyFile::Passphrase { .. }, Unlock::NoPassphrase) => return Err(SdkError::Usage(
+                "this key file is locked with a passphrase; pass --passphrase-file or unlock first"
+                    .into(),
+            )),
             (
-                KeyFile::Password {
+                KeyFile::Passphrase {
                     v,
                     kdf,
                     nonce,
                     wrapped,
                 },
-                Unlock::Password(password),
+                Unlock::Passphrase(passphrase),
             ) => {
                 if v != KEY_FILE_VERSION {
-                    return Err(SdkError::Usage(format!("key file version {v} is not supported")));
+                    return Err(SdkError::Usage(format!(
+                        "key file version {v} is not supported"
+                    )));
                 }
-                let kek = derive_kek(password, &kdf)?;
+                let kek = derive_kek(passphrase, &kdf)?;
                 let nonce = decode_base64(&nonce, "nonce")?;
                 let wrapped = decode_base64(&wrapped, "wrapped")?;
                 let master = XChaCha20Poly1305::new(kek.as_bytes().into())
@@ -201,11 +205,11 @@ impl Vault {
                             aad: WRAP_AAD,
                         },
                     )
-                    .map_err(|_| SdkError::Usage("wrong local password".into()))?;
+                    .map_err(|_| SdkError::Usage("wrong passphrase".into()))?;
                 let master: [u8; 32] = master.as_slice().try_into().map_err(|_| {
                     SdkError::Usage("key file: wrapped master key has the wrong length".into())
                 })?;
-                (Key32(master), KeyMode::Password)
+                (Key32(master), KeyMode::Passphrase)
             }
         };
         Ok(Vault {
@@ -215,7 +219,7 @@ impl Vault {
         })
     }
 
-    /// 只看 `local.key` 是哪種鎖法，不解它。CLI 用這個決定要不要問密碼。
+    /// 只看 `local.key` 是哪種鎖法，不解它。CLI 用這個決定要不要問 passphrase。
     ///
     /// Return:
     ///     Ok(KeyMode)
@@ -233,7 +237,7 @@ impl Vault {
         })?;
         Ok(match file {
             KeyFile::Plain { .. } => KeyMode::Plain,
-            KeyFile::Password { .. } => KeyMode::Password,
+            KeyFile::Passphrase { .. } => KeyMode::Passphrase,
         })
     }
 
@@ -246,7 +250,7 @@ impl Vault {
         }
     }
 
-    /// 換鎖法：設密碼、改密碼、或拿掉密碼。只重寫 `local.key`，DB 與 session 不動（主金鑰沒變）。
+    /// 換鎖法：設 passphrase、改 passphrase、或拿掉 passphrase。只重寫 `local.key`，DB 與 session 不動（主金鑰沒變）。
     pub fn set_unlock(&mut self, unlock: &Unlock) -> Result<(), SdkError> {
         let rewritten = Vault {
             dir: self.dir.clone(),
@@ -377,17 +381,18 @@ impl Vault {
 
     fn write_key_file(mut self, unlock: &Unlock) -> Result<Vault, SdkError> {
         let file = match unlock {
-            Unlock::NoPassword => {
+            Unlock::NoPassphrase => {
                 self.mode = KeyMode::Plain;
                 KeyFile::Plain {
                     v: KEY_FILE_VERSION,
                     master: encode_base64(self.master.as_bytes()),
                 }
             }
-            Unlock::Password(password) => {
-                if password.is_empty() {
+            Unlock::Passphrase(passphrase) => {
+                if passphrase.is_empty() {
                     return Err(SdkError::Usage(
-                        "local password must not be empty; use no password instead".into(),
+                        "passphrase must not be empty; use `remove-passphrase` for no passphrase"
+                            .into(),
                     ));
                 }
                 let mut salt = [0u8; 16];
@@ -401,7 +406,7 @@ impl Vault {
                     p: ARGON2_P,
                     salt: encode_base64(&salt),
                 };
-                let kek = derive_kek(password, &kdf)?;
+                let kek = derive_kek(passphrase, &kdf)?;
                 let nonce = random_nonce()?;
                 let wrapped = XChaCha20Poly1305::new(kek.as_bytes().into())
                     .encrypt(
@@ -412,8 +417,8 @@ impl Vault {
                         },
                     )
                     .map_err(|_| SdkError::Io(std::io::Error::other("wrap master key")))?;
-                self.mode = KeyMode::Password;
-                KeyFile::Password {
+                self.mode = KeyMode::Passphrase;
+                KeyFile::Passphrase {
                     v: KEY_FILE_VERSION,
                     kdf,
                     nonce: encode_base64(&nonce),
@@ -429,8 +434,8 @@ impl Vault {
     }
 }
 
-/// Argon2id 從密碼導 KEK。參數從檔裡來，所以舊檔用舊參數解得開。
-fn derive_kek(password: &str, kdf: &KdfParams) -> Result<Key32, SdkError> {
+/// Argon2id 從 passphrase 導 KEK。參數從檔裡來，所以舊檔用舊參數解得開。
+fn derive_kek(passphrase: &str, kdf: &KdfParams) -> Result<Key32, SdkError> {
     if kdf.name != "argon2id" {
         return Err(SdkError::Usage(format!(
             "key file uses kdf {:?}, which this build does not know",
@@ -442,7 +447,7 @@ fn derive_kek(password: &str, kdf: &KdfParams) -> Result<Key32, SdkError> {
         .map_err(|error| SdkError::Usage(format!("key file kdf params: {error}")))?;
     let mut kek = Key32([0u8; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(password.as_bytes(), &salt, &mut kek.0)
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut kek.0)
         .map_err(|error| SdkError::Usage(format!("argon2: {error}")))?;
     Ok(kek)
 }
@@ -537,8 +542,8 @@ mod tests {
     #[test]
     fn plain_roundtrip_and_derived_keys_are_stable() {
         let dir = scratch_dir("plain");
-        let created = Vault::create(&dir, &Unlock::NoPassword).unwrap();
-        let opened = Vault::open(&dir, &Unlock::NoPassword).unwrap();
+        let created = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
+        let opened = Vault::open(&dir, &Unlock::NoPassphrase).unwrap();
         assert_eq!(
             created.master_key().as_bytes(),
             opened.master_key().as_bytes()
@@ -562,34 +567,34 @@ mod tests {
     #[test]
     fn create_refuses_to_overwrite() {
         let dir = scratch_dir("overwrite");
-        Vault::create(&dir, &Unlock::NoPassword).unwrap();
-        assert!(Vault::create(&dir, &Unlock::NoPassword).is_err());
+        Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
+        assert!(Vault::create(&dir, &Unlock::NoPassphrase).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn password_mode_needs_the_right_password() {
-        let dir = scratch_dir("password");
-        let password = Unlock::Password("hunter2".to_string().into());
-        let created = Vault::create(&dir, &password).unwrap();
-        assert_eq!(created.mode(), KeyMode::Password);
-        let opened = Vault::open(&dir, &password).unwrap();
+    fn passphrase_mode_needs_the_right_passphrase() {
+        let dir = scratch_dir("passphrase");
+        let passphrase = Unlock::Passphrase("hunter2".to_string().into());
+        let created = Vault::create(&dir, &passphrase).unwrap();
+        assert_eq!(created.mode(), KeyMode::Passphrase);
+        let opened = Vault::open(&dir, &passphrase).unwrap();
         assert_eq!(
             created.master_key().as_bytes(),
             opened.master_key().as_bytes()
         );
-        assert!(Vault::open(&dir, &Unlock::Password("hunter3".to_string().into())).is_err());
-        assert!(Vault::open(&dir, &Unlock::NoPassword).is_err());
+        assert!(Vault::open(&dir, &Unlock::Passphrase("hunter3".to_string().into())).is_err());
+        assert!(Vault::open(&dir, &Unlock::NoPassphrase).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn plain_mode_rejects_a_password_and_empty_password_is_not_a_password() {
+    fn plain_mode_rejects_a_passphrase_and_empty_passphrase_is_not_a_passphrase() {
         let dir = scratch_dir("mismatch");
-        Vault::create(&dir, &Unlock::NoPassword).unwrap();
-        assert!(Vault::open(&dir, &Unlock::Password("x".to_string().into())).is_err());
+        Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
+        assert!(Vault::open(&dir, &Unlock::Passphrase("x".to_string().into())).is_err());
         let dir2 = scratch_dir("empty");
-        assert!(Vault::create(&dir2, &Unlock::Password(String::new().into())).is_err());
+        assert!(Vault::create(&dir2, &Unlock::Passphrase(String::new().into())).is_err());
         assert!(!dir2.join(KEY_FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -598,28 +603,28 @@ mod tests {
     #[test]
     fn set_unlock_keeps_the_master_key() {
         let dir = scratch_dir("rewrap");
-        let mut vault = Vault::create(&dir, &Unlock::NoPassword).unwrap();
+        let mut vault = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
         let before = vault.master_key().clone();
         vault.seal_session(&sample_session()).unwrap();
         vault
-            .set_unlock(&Unlock::Password("pw".to_string().into()))
+            .set_unlock(&Unlock::Passphrase("pw".to_string().into()))
             .unwrap();
-        let reopened = Vault::open(&dir, &Unlock::Password("pw".to_string().into())).unwrap();
+        let reopened = Vault::open(&dir, &Unlock::Passphrase("pw".to_string().into())).unwrap();
         assert_eq!(before.as_bytes(), reopened.master_key().as_bytes());
         // session.sealed 沒動，還解得開。
         assert_eq!(
             reopened.unseal_session().unwrap().unwrap().access_token,
             "syt_secret"
         );
-        vault.set_unlock(&Unlock::NoPassword).unwrap();
-        assert!(Vault::open(&dir, &Unlock::NoPassword).is_ok());
+        vault.set_unlock(&Unlock::NoPassphrase).unwrap();
+        assert!(Vault::open(&dir, &Unlock::NoPassphrase).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sealed_session_roundtrip_and_other_key_cannot_open() {
         let dir = scratch_dir("session");
-        let vault = Vault::create(&dir, &Unlock::NoPassword).unwrap();
+        let vault = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
         assert!(vault.unseal_session().unwrap().is_none());
         vault.seal_session(&sample_session()).unwrap();
         let raw = std::fs::read_to_string(vault.sealed_session_path()).unwrap();
@@ -644,13 +649,13 @@ mod tests {
             r#"{"v":1,"mode":"","master":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
         )
         .unwrap();
-        assert!(Vault::open(&dir, &Unlock::NoPassword).is_err());
+        assert!(Vault::open(&dir, &Unlock::NoPassphrase).is_err());
         std::fs::write(
             dir.join(KEY_FILE_NAME),
             r#"{"v":2,"mode":"plain","master":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
         )
         .unwrap();
-        assert!(Vault::open(&dir, &Unlock::NoPassword).is_err());
+        assert!(Vault::open(&dir, &Unlock::NoPassphrase).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

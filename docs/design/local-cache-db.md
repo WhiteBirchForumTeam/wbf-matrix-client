@@ -13,7 +13,7 @@
 ## 0. 一句話
 
 本地有兩個 SQLite 檔：matrix-sdk 自己的 store（它非存不可的東西）與我們的快取（聊天紀錄、房間、事件區塊）。
-兩個都加密，金鑰都從同一把 32 byte 主金鑰導出；主金鑰第一版明文放本地（自解密），加 local password 後被密碼包住，
+兩個都加密，金鑰都從同一把 32 byte 主金鑰導出；主金鑰第一版明文放本地（自解密），加 passphrase 後被密碼包住，
 啟動時要解開，UI 與 CLI 走同一個函數。**快取不是權威**：可以整個刪掉重建，衝突以 server 為準。
 
 ## 1. 定位：快取，不是權威
@@ -52,10 +52,12 @@
 
 ## 4. 金鑰：一把主金鑰，兩種鎖法，型別化
 
+> 用字（維護者 2026-09-07 定）：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼。早先草稿寫的「local password」就是 passphrase，已全部改掉，避免跟帳號密碼混。
+
 ```
 local.key（0600）
   ├─ Plain            : { "v": 1, "mode": "plain", "master": "<base64 32 byte>" }
-  └─ PasswordWrapped  : { "v": 1, "mode": "password",
+  └─ PassphraseWrapped  : { "v": 1, "mode": "passphrase",
                           "kdf": { "name": "argon2id", "m_kib": 65536, "t": 3, "p": 1, "salt": "<base64 16>" },
                           "nonce": "<base64 24>", "wrapped": "<base64 48>" }   // XChaCha20-Poly1305(KEK, master)
 ```
@@ -66,28 +68,28 @@ local.key（0600）
   第三把用 XChaCha20-Poly1305 把 session 檔（server、user_id、device_id、access_token）整份封成 `session.sealed`：
   session 與 token **不進 DB**，但跟 DB 同一把鎖（維護者 2026-09-05 定）。子金鑰不落地，每次開啟導一次。
   換 context 字串就是換金鑰，所以 context 帶版本。
-- **local password**：Argon2id 從密碼導 KEK，KEK 用 XChaCha20-Poly1305 包住主金鑰。改密碼只重包 48 byte，DB 不動。
+- **passphrase**：Argon2id 從 passphrase 導 KEK，KEK 用 XChaCha20-Poly1305 包住主金鑰。改 passphrase 只重包 48 byte，DB 不動。
   參數寫在檔裡，之後調高不用遷移。
-- **模式是型別，不是空字串**：`enum KeyFile { Plain { master }, PasswordWrapped { kdf, nonce, wrapped } }`，
-  讀檔時 `mode` 不認得就拒絕。「沒設密碼」是 `Plain`，不是「密碼等於空字串」——後者會讓空密碼靜默通過。
-- **一個入口**：`Vault::open(dir, Unlock::NoPassword | Unlock::Password(secret))`。`Plain` 配 `NoPassword`、
-  `PasswordWrapped` 配 `Password`，配錯就 `Err`，UI 與 CLI 都只能走這裡。CLI 的密碼來源同 `login`：`--password-file` 或終端不回顯。
+- **模式是型別，不是空字串**：`enum KeyFile { Plain { master }, PassphraseWrapped { kdf, nonce, wrapped } }`，
+  讀檔時 `mode` 不認得就拒絕。「沒設 passphrase」是 `Plain`，不是「passphrase 等於空字串」——後者會讓空 passphrase 靜默通過。
+- **一個入口**：`Vault::open(dir, Unlock::NoPassphrase | Unlock::Passphrase(secret))`。`Plain` 配 `NoPassphrase`、
+  `PassphraseWrapped` 配 `Passphrase`，配錯就 `Err`，UI 與 CLI 都只能走這裡。CLI 的 passphrase 來源同 `login` 的 password：檔案參數或終端不回顯。
 - **解鎖後金鑰放哪**（維護者 2026-09-05：作法由我定，照一般開發工具的做法）：
 
   | | 做法 |
   |---|---|
   | UI | 解鎖一次，主金鑰只在記憶體；UI runtime 與 wbf-sdk 是同一個程序，關掉就沒了 |
-  | CLI（只在開發與 debug 用） | 仿 `sudo`：解鎖成功後寫一張 **unlock ticket**（`<data dir>/unlock.ticket`，0600，內容是主金鑰加 `expires_at`），有效期預設 15 分鐘、`--unlock-ttl <秒>` 可調；期內的命令不再問密碼。`lock` 命令刪掉它。過期的 ticket 讀到就刪，Unix 上模式不是 0600 就拒用 |
+  | CLI（只在開發與 debug 用） | 仿 `sudo`：解鎖成功後寫一張 **unlock ticket**（`<data dir>/unlock.ticket`，0600，內容是主金鑰加 `expires_at`），有效期預設 15 分鐘、`--unlock-ttl <秒>` 可調；期內的命令不再問 passphrase。`lock` 命令刪掉它。過期的 ticket 讀到就刪，Unix 上模式不是 0600 就拒用 |
 
-  CLI 密碼的來源與 `login` 同一套：`--local-password-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
+  CLI passphrase 的來源與 `login` 的 password 同一套：`--passphrase-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
   ticket 是明文主金鑰落地，安全性等於 `Plain` 模式那 15 分鐘；維護者明說接受（CLI 不是產品面）。這一項不進 UI。
 
 ### 4.1 實作與上面的差異（第一個 PR，2026-09-06）
 
-- `local.key` 的 `password` 模式在 JSON 裡 `mode` 值是 `"password"`（上面的 `PasswordWrapped` 是型別名，程式裡也叫 `KeyFile::Password`）。
+- `local.key` 的 `passphrase` 模式在 JSON 裡 `mode` 值是 `"passphrase"`（上面的 `PassphraseWrapped` 是型別名，程式裡也叫 `KeyFile::Passphrase`）。
 - 包主金鑰與封 session 都帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。
-- 多一個 `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問密碼，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
-- `Vault::set_unlock(&Unlock)` 一個函數涵蓋設密碼、改密碼、拿掉密碼：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空字串密碼在這裡被拒。
+- 多一個 `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問 passphrase，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
+- `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空字串 passphrase 在這裡被拒。
 - `Vault::from_master(dir, master, mode)` 給 CLI 的 ticket 用；它不驗證主金鑰是不是這個目錄的，信任等於 `Plain`。
 - 第四把子金鑰 `media store v1` 已經導出來（`media_store_key`），還沒有人用；先把 context 字串一次定完。
 - CLI 的資料目錄是**一個** `<data dir>/wbf-cli/`，不是 §5.6 的 `<server>/<user>` 一套：CLI 一次一個 session（CLI 規格 §7）。UI 那一版再照 §5.6。
@@ -99,7 +101,7 @@ local.key（0600）
 | 防 | 不防 |
 |---|---|
 | 把 DB 檔拷走的人（沒有 `local.key` 解不開） | 能登入這台機器、讀得到 `local.key` 的人（`Plain` 模式） |
-| 加 local password 後：連 `local.key` 一起拷走也解不開（要猜密碼，Argon2id 拖慢） | 跑著的程序記憶體裡的主金鑰；鍵盤側錄 |
+| 加 passphrase 後：連 `local.key` 一起拷走也解不開（要猜 passphrase，Argon2id 拖慢） | 跑著的程序記憶體裡的主金鑰；鍵盤側錄 |
 
 ## 5. 與 matrix-sdk 的 store 怎麼相處（細節）
 
@@ -135,7 +137,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 
 - SDK 那邊用 `open_with_key`，**不用 passphrase**：PBKDF2 20 萬輪每次啟動要花時間，而且我們的密碼 KDF 已經在 §4 做過一次；
   兩個 store 傳同一把子金鑰即可（各自的 `StoreCipher` 仍是隨機的，子金鑰只是包住它們）。
-- 加 local password 後，SDK 的 store 也一起被鎖住：主金鑰解不開就導不出子金鑰，`open_with_key` 就失敗。**不需要動 SDK。**
+- 加 passphrase 後，SDK 的 store 也一起被鎖住：主金鑰解不開就導不出子金鑰，`open_with_key` 就失敗。**不需要動 SDK。**
 - 兩個世界的邊界只有一條線：`Vault::open` 回兩把子金鑰。SDK 不知道 SQLCipher，快取不知道 `StoreCipher`。
 
 ### 5.4 為什麼不把快取塞進 SDK 的 event_cache（方案 B）

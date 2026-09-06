@@ -28,7 +28,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `--server <url>` | `WBF_SERVER` | homeserver 的 base URL，example: `http://localhost:6167`。沒給就用 session 檔的 |
 | `--token <access_token>` | `WBF_ACCESS_TOKEN` | 直接給 token，跳過 session 檔。🚫 不印、不寫進任何輸出 |
 | `--data-dir <dir>` | `WBF_DATA_DIR` | 資料目錄（`local.key`、`session.sealed`、`matrix/`、`unlock.ticket`），預設見 §7 |
-| `--local-password-file <path>` | `WBF_LOCAL_PASSWORD_FILE` | 整檔就是 local password（解 `local.key` 用，去掉結尾一個換行）。沒給就看 unlock ticket，再沒有就從終端讀（不回顯）。🚫 沒有 `--local-password <pw>`、🚫 不接受環境變數給密碼本身 |
+| `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔就是 passphrase（解 `local.key` 用，去掉結尾一個換行）。沒給就看 unlock ticket，再沒有就從終端讀（不回顯）。🚫 沒有 `--passphrase <pw>`、🚫 不接受環境變數給 passphrase 本身 |
 | `--unlock-ttl <秒>` | | 密碼解鎖成功後 unlock ticket 的有效期，預設 900；0 就不寫 ticket（§7.1） |
 | `--json` | | stdout 只印 JSON（預設就是；留這個旗標是為了之後加人類可讀模式時介面不變） |
 | `--quiet` | | stderr 不印進度 |
@@ -40,12 +40,12 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、把 session 封進 `session.sealed`。資料目錄裡沒有 `local.key` 就建一把：給了 `--local-password-file` 就是 `password` 模式，否則 `plain`（§7）。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
+| `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、把 session 封進 `session.sealed`。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`（§7）。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
 | `logout` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪 `session.sealed` 與 unlock ticket（`local.key` 與 `matrix/` 留著：下次 `login` 同一個裝置） | `{ "ok": true }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
-| `lock` | 刪 unlock ticket；下一個命令會再問 local password | `{ "ok": true, "had_ticket": bool }` |
-| `set-local-password [--new-password-file <path>]` | 給 `local.key` 設或改 local password（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "password" }` |
-| `remove-local-password` | 拿掉 local password，`local.key` 回到 `plain` | `{ "ok": true, "mode": "plain" }` |
+| `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
+| `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
+| `remove-passphrase` | 拿掉 passphrase，`local.key` 回到 `plain` | `{ "ok": true, "mode": "plain" }` |
 
 ### 3.2 上傳
 
@@ -169,7 +169,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | code | 意思 |
 |---|---|
 | 0 | 成功 |
-| 1 | 用法錯：參數、找不到檔、`local.key`／`session.sealed` 壞掉或解不開、local password 錯 |
+| 1 | 用法錯：參數、找不到檔、`local.key`／`session.sealed` 壞掉或解不開、passphrase 錯 |
 | 2 | server 回 `Error` pack 或 HTTP 非 2xx；stderr 印 `code` 與 `message` |
 | 3 | **完整性失敗**：CRC、AEAD 標籤、長度、sha256、事件與 `Info` 對不上。半成品已刪 |
 | 4 | 網路：連不上、斷線且續傳次數用完 |
@@ -206,6 +206,8 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 ## 7. 資料目錄（local.key、session.sealed、matrix/）
 
+> 用字（維護者 2026-09-07 定）：**passphrase** 是解 `local.key` 的那句話，只存在這台機器；**password** 一律指 Matrix 帳號密碼，只有 `login` 用一次。旗標、命令、錯誤訊息、文件都照這個分。
+
 | 平台 | 位置 |
 |---|---|
 | Windows | `%APPDATA%\wbf-cli\` |
@@ -216,21 +218,21 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 | 檔 | 什麼 |
 |---|---|
-| `local.key` | 32 byte 主金鑰。`plain` 模式明文；`password` 模式被 Argon2id 導出的 KEK 用 XChaCha20-Poly1305 包住 |
+| `local.key` | 32 byte 主金鑰。`plain` 模式明文；`passphrase` 模式被 Argon2id 導出的 KEK 用 XChaCha20-Poly1305 包住 |
 | `session.sealed` | `{ "server", "user_id", "device_id", "access_token", "store_dir" }` 整份用第三把子金鑰（`wbf-matrix-client session v1`）封住。取代舊的明文 `session.json`；看到舊檔只提示刪掉，不讀 |
 | `matrix/` | matrix-sdk 的 crypto 與 state store（絕對不當快取，plan-v1 §7.1）。store 的 `StoreCipher` 用第二把子金鑰包住（`SqliteStoreConfig::key`，不走 PBKDF2）。用別把金鑰開會被拒：刪掉整個目錄重新 `login` |
-| `unlock.ticket` | 只有 `password` 模式會有，見 §7.1 |
+| `unlock.ticket` | 只有 `passphrase` 模式會有，見 §7.1 |
 
-🚫 任何命令的輸出、log、錯誤訊息都不印 `access_token`、主金鑰、子金鑰、密碼。
+🚫 任何命令的輸出、log、錯誤訊息都不印 `access_token`、主金鑰、子金鑰、passphrase、password。
 🚫 CLI 只用一個資料目錄（不像 local-cache-db.md §5.6 說的 UI 那樣一個 server 加一個 user 一套）：CLI 一次只有一個 session，換帳號就 `--data-dir` 指別處。
 
-### 7.1 unlock ticket（`password` 模式的 CLI 專用）
+### 7.1 unlock ticket（`passphrase` 模式的 CLI 專用）
 
-`local.key` 是 `password` 模式時，每個命令都要密碼。CLI 仿 `sudo`：密碼（檔案或終端）解鎖成功後把**明文主金鑰**加 `expires_at` 寫到 `unlock.ticket`（Unix 0600），有效期 `--unlock-ttl`（預設 900 秒）；期內的命令直接用它。
+`local.key` 是 `passphrase` 模式時，每個命令都要 passphrase。CLI 仿 `sudo`：passphrase（檔案或終端）解鎖成功後把**明文主金鑰**加 `expires_at` 寫到 `unlock.ticket`（Unix 0600），有效期 `--unlock-ttl`（預設 900 秒）；期內的命令直接用它。
 
-- 來源順序：`--local-password-file` → 有效的 ticket → 問終端。`plain` 模式不看 ticket。
+- 來源順序：`--passphrase-file` → 有效的 ticket → 問終端。`plain` 模式不看 ticket。
 - 過期、壞掉的 ticket 讀到就刪；Unix 上 group／other 有任何位元就不認（印一行提示，要人 `lock`）。
-- `lock` 刪它；`logout`、`set-local-password`、`remove-local-password` 也順便刪。
+- `lock` 刪它；`logout`、`set-passphrase`、`remove-passphrase` 也順便刪。
 - ⚠️ ticket 存在的那幾分鐘安全性等於 `plain` 模式。維護者 2026-09-05 明說接受：CLI 是開發與除錯工具，不是產品面。**UI 沒有這個東西**，UI 解鎖一次主金鑰只在記憶體。
 
 ## 8. 驗收腳本（第 2 步交付的一部分）

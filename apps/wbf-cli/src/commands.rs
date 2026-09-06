@@ -15,7 +15,7 @@ use wbf_sdk::{
 use wbf_sdk::vault::write_private;
 
 use crate::unlock::{
-    default_data_dir, prompt_new_password, prompt_password_on_terminal, read_password_file,
+    default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_password_file,
     UnlockOptions,
 };
 use crate::{Cli, Command, UploadArgs};
@@ -43,20 +43,22 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             let removed = context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "had_ticket": removed }))
         }
-        Command::SetLocalPassword { new_password_file } => {
+        Command::SetPassphrase {
+            new_passphrase_file,
+        } => {
             let mut vault = context.unlock.open_vault()?;
-            let password = match new_password_file {
+            let passphrase = match new_passphrase_file {
                 Some(path) => read_password_file(&path)?,
-                None => prompt_new_password()?,
+                None => prompt_new_passphrase()?,
             };
-            vault.set_unlock(&wbf_sdk::Unlock::Password(password))?;
-            // 舊 ticket 是用舊密碼換來的；換了密碼就作廢，下一個命令要用新的。
+            vault.set_unlock(&wbf_sdk::Unlock::Passphrase(passphrase))?;
+            // 舊 ticket 是用舊 passphrase 換來的；換了就作廢，下一個命令要用新的。
             context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "mode": vault.mode() }))
         }
-        Command::RemoveLocalPassword => {
+        Command::RemovePassphrase => {
             let mut vault = context.unlock.open_vault()?;
-            vault.set_unlock(&wbf_sdk::Unlock::NoPassword)?;
+            vault.set_unlock(&wbf_sdk::Unlock::NoPassphrase)?;
             context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "mode": vault.mode() }))
         }
@@ -152,7 +154,7 @@ impl Context {
             opened_vault: std::sync::OnceLock::new(),
             unlock: UnlockOptions {
                 data_dir,
-                local_password_file: cli.local_password_file.clone(),
+                passphrase_file: cli.passphrase_file.clone(),
                 unlock_ttl: std::time::Duration::from_secs(cli.unlock_ttl),
                 quiet: cli.quiet,
             },

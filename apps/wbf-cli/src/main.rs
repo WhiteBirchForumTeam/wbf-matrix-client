@@ -24,10 +24,10 @@ pub struct Cli {
     /// 資料目錄（local.key、session.sealed、matrix/、unlock.ticket），預設見 CLI 規格 §7
     #[arg(long, global = true, env = "WBF_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// 整檔就是 local password（解 local.key 用）；沒給就看 unlock ticket，再沒有就從終端讀
-    #[arg(long, global = true, env = "WBF_LOCAL_PASSWORD_FILE")]
-    pub local_password_file: Option<PathBuf>,
-    /// 密碼解鎖成功後 unlock ticket 的有效秒數；0 就不寫 ticket
+    /// 整檔就是 passphrase（解 local.key 的那句話，不是 Matrix 帳號密碼）；沒給就看 unlock ticket，再沒有就從終端讀
+    #[arg(long, global = true, env = "WBF_PASSPHRASE_FILE")]
+    pub passphrase_file: Option<PathBuf>,
+    /// passphrase 解鎖成功後 unlock ticket 的有效秒數；0 就不寫 ticket
     #[arg(long, global = true, default_value_t = 900)]
     pub unlock_ttl: u64,
     /// stdout 只印 JSON（預設就是；現在是刻意的 no-op，留著是為了之後加人類可讀模式時介面不變，CLI 規格 §2）
@@ -58,15 +58,15 @@ pub enum Command {
     },
     /// 讓 token 失效，刪 session.sealed 與 unlock ticket
     Logout,
-    /// 刪 unlock ticket；下一個命令會再問 local password
+    /// 刪 unlock ticket；下一個命令會再問 passphrase
     Lock,
-    /// 給 local.key 設（或改）local password；沒給檔就從終端讀兩次
-    SetLocalPassword {
+    /// 給 local.key 設（或改）passphrase；沒給檔就從終端讀兩次
+    SetPassphrase {
         #[arg(long)]
-        new_password_file: Option<PathBuf>,
+        new_passphrase_file: Option<PathBuf>,
     },
-    /// 拿掉 local password，local.key 回到明文（plain）模式
-    RemoveLocalPassword,
+    /// 拿掉 passphrase，local.key 回到明文（plain）模式
+    RemovePassphrase,
     Whoami,
     /// Hello 加 Ping，印 server 的 features 與上限
     Ping,
