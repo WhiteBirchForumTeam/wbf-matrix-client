@@ -9,7 +9,7 @@ UI 框架的選擇延後到 SDK 能用之後。規劃與進度看 [`docs/design/
 |---|---|
 | `crates/wbf-wire` | 做完。線上協議的 codec（pack、`EncryptedFileInfo`、CRC-32C），純函數；`cargo test -p wbf-wire` 對著 server 產生的黃金向量跑 |
 | `crates/wbf-sdk` | 做中。密碼層、WebSocket／HTTP 通道、登入、分塊上傳／下載／seek／續傳／串流都有了；`cargo test -p wbf-sdk` 對著 [`wbf-client-vectors.json`](docs/design/wbf-client-vectors.json)、RFC／NIST 向量、記憶體版 server 跑，`tests/e2e_local_server.rs` 對著真的 wbfuwunel 跑（`--ignored`，見檔頭）。第 3 步：`chat`（聊天模型與 `ChatBackend`）與 `backend/matrix_sdk`（feature `matrix`，唯一 `use matrix_sdk` 的檔）第一版做了 |
-| `apps/wbf-cli` | 第 2 步的命令都有了：`login`、`logout`、`whoami`、`ping`、`upload`（含續傳與 `--stream`）、`status`、`abort`、`info`、`download`、`seek`。介面在 [`docs/design/wbf-cli-spec.md`](docs/design/wbf-cli-spec.md)；`scripts/acceptance.sh` 對本機 wbfuwunel 跑 §8 的驗收。第 3 步的 `rooms`、`send --text|--file`、`watch tail|wait|once`、`read`、`files` 第一版做了，`login` 改走 matrix-sdk（有裝置金鑰，E2EE 房間解得開）。本地資料庫第一步：`login` 建 `local.key`、session 封成 `session.sealed`、matrix store 帶金鑰；`--passphrase-file`、`lock`、`set-passphrase`、`remove-passphrase` |
+| `apps/wbf-cli` | 第 2 步的命令都有了：`login`、`logout`、`whoami`、`ping`、`upload`（含續傳與 `--stream`）、`status`、`abort`、`info`、`download`、`seek`。介面在 [`docs/design/wbf-cli-spec.md`](docs/design/wbf-cli-spec.md)；`scripts/acceptance.sh` 對本機 wbfuwunel 跑 §8 的驗收。第 3 步的 `rooms`、`send --text|--file`、`watch tail|wait|once`、`read`、`files` 第一版做了，`login` 改走 matrix-sdk（有裝置金鑰，E2EE 房間解得開）。本地資料庫：`login` 建 `local.key`、session 封成 `session.sealed`、matrix store 帶金鑰；`--passphrase-file`、`lock`、`set-passphrase`、`remove-passphrase`；`cache.db`（SQLCipher，一個 server 一份、多帳號混存）由 `recent` 進料、`read`／`files` 可 `--from-cache`；多帳號：`login` 切 `current`、`--account`、`accounts`、`forget-account` |
 | `apps/desktop` | 之後 |
 
 ## 接手先讀
@@ -24,7 +24,7 @@ UI 框架的選擇延後到 SDK 能用之後。規劃與進度看 [`docs/design/
 | [`wbf-client-convention-for-chunk.md`](docs/design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。server 不讀這些 |
 | [`wbf-cli-spec.md`](docs/design/wbf-cli-spec.md) | CLI 的命令、參數、輸出、exit code、manifest、狀態檔、驗收腳本 |
 | [`chat-model.md`](docs/design/chat-model.md) | 聊天模型與房間設計：Conversation／Peer／Message／Role 的定義、怎麼接到 Matrix、Telegram 有而 Matrix 沒有的一律標「審」 |
-| [`local-cache-db.md`](docs/design/local-cache-db.md) | 本地資料庫：加密的暫存快取、主金鑰與 passphrase、與 matrix-sdk store 的分工。§4 vault 做了（`wbf-sdk::vault`），`cache.db` 還沒 |
+| [`local-cache-db.md`](docs/design/local-cache-db.md) | 本地資料庫：加密的暫存快取、主金鑰與 passphrase、與 matrix-sdk store 的分工。§4 vault（`wbf-sdk::vault`）與 §6 `cache.db`（`wbf-sdk::cache`）做了，§8 媒體池還沒。Windows 編 SQLCipher 要 Strawberry Perl（§3） |
 | [`wbf-vectors.json`](docs/design/wbf-vectors.json) | 線上協議的黃金向量，從 wbfuwunel **整份複製**、不手改；server 規格改了就重新複製，測試紅了就是漂移 |
 
 ## 關聯專案

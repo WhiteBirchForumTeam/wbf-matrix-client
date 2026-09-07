@@ -51,8 +51,8 @@ token=$(curl -sS -X POST "$SERVER/_matrix/client/v3/login" -H 'Content-Type: app
 unset password
 [ -n "$token" ] || fail "curl login for the standard download failed"
 [ -f "$data_dir/local.key" ] || fail "login did not create local.key"
-[ -f "$data_dir/session.sealed" ] || fail "login did not create session.sealed"
-grep -q '"access_token"' "$data_dir/session.sealed" && fail "session.sealed holds the token in plaintext"
+sealed=$(ls "$data_dir"/servers/*/accounts/*/session.sealed 2>/dev/null | head -1); [ -n "$sealed" ] || fail "login did not create servers/<host>/accounts/<user>/session.sealed"
+grep -q '"access_token"' "$sealed" && fail "session.sealed holds the token in plaintext"
 
 # 步驟 2 與 3，一個 cipher 一次。
 upload_download_roundtrip() {

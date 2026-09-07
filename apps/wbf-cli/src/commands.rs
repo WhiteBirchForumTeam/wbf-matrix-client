@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use wbf_sdk::backend::matrix_sdk::MatrixBackend;
+use wbf_sdk::cache::{Cache, CacheIdentity, OpenOutcome};
+
+use crate::accounts::{self, AccountDir};
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{
@@ -20,7 +23,7 @@ use crate::unlock::{
 };
 use crate::{Cli, Command, UploadArgs};
 
-const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
+pub const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
 
 pub async fn run(cli: Cli) -> Result<(), SdkError> {
     let context = Context::from(&cli)?;
@@ -34,11 +37,33 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             let session = context.session().await?;
             logout(&session).await?;
             if context.token_override.is_none() {
-                context.vault()?.delete_sealed_session()?;
+                let account = context.account()?;
+                context
+                    .vault()?
+                    .delete_sealed_session(&account.session_path())?;
                 context.unlock.delete_ticket()?;
+                // Matrix 的 logout 讓這個裝置失效；下次 login 是新裝置，舊的 crypto store 會擋登入
+                // （"account in the store doesn't match"，2026-09-07 實跑）。store 跟著走；local.key 與 cache.db 留著。
+                account.delete_matrix_store()?;
+                accounts::clear_current_if(&context.unlock.data_dir, account)?;
+                // 這個 server 最後一個帳號登出：快取沒有主人了，整個丟（維護者：「除非所有帳號被登出」）。
+                let server_dir = account.server_dir();
+                if !accounts::has_any_logged_in_account(&server_dir)
+                    && wbf_sdk::cache::remove_cache(&server_dir)?
+                {
+                    context.progress(format!(
+                        "removed {} (no account on this server is logged in any more)",
+                        server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).display()
+                    ));
+                }
             }
             print_json(&json!({ "ok": true }))
         }
+        Command::Accounts => {
+            let listed = accounts::list_accounts(&context.unlock.data_dir)?;
+            print_json(&serde_json::to_value(listed).expect("serializes"))
+        }
+        Command::ForgetAccount { user, yes } => forget_account_command(&context, &user, yes).await,
         Command::Lock => {
             let removed = context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "had_ticket": removed }))
@@ -104,18 +129,24 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         Command::Rooms => crate::rooms::rooms_command(&context).await,
         Command::Send(args) => crate::rooms::send_command(&context, &args).await,
         Command::Watch(args) => crate::rooms::watch_command(&context, &args).await,
+        Command::Recent {
+            limit,
+            from_scratch,
+        } => crate::recent::recent_command(&context, limit, from_scratch).await,
         Command::Read {
             room,
             limit,
             before,
             types,
             sender,
+            from_cache,
         } => {
             crate::rooms::read_command(
                 &context,
                 &room,
                 limit,
                 before.as_deref(),
+                from_cache,
                 &types,
                 sender.as_deref(),
             )
@@ -126,9 +157,17 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             limit,
             before,
             save,
+            from_cache,
         } => {
-            crate::rooms::files_command(&context, &room, limit, before.as_deref(), save.as_deref())
-                .await
+            crate::rooms::files_command(
+                &context,
+                &room,
+                limit,
+                before.as_deref(),
+                from_cache,
+                save.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -138,6 +177,9 @@ pub struct Context {
     pub unlock: UnlockOptions,
     /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從這裡拿，不然 Argon2 跑兩次、ticket 寫兩次。
     opened_vault: std::sync::OnceLock<Vault>,
+    /// 這個命令用的帳號目錄，也只解析一次。
+    account: std::sync::OnceLock<AccountDir>,
+    pub account_override: Option<String>,
     pub server_override: Option<String>,
     pub token_override: Option<String>,
     pub quiet: bool,
@@ -152,6 +194,8 @@ impl Context {
         };
         Ok(Context {
             opened_vault: std::sync::OnceLock::new(),
+            account: std::sync::OnceLock::new(),
+            account_override: cli.account.clone(),
             unlock: UnlockOptions {
                 data_dir,
                 passphrase_file: cli.passphrase_file.clone(),
@@ -187,16 +231,59 @@ impl Context {
                 ..probe
             });
         }
-        let mut session = self.vault()?.unseal_session()?.ok_or_else(|| {
-            SdkError::Usage(format!(
-                "no session in {}; run `login` first",
-                self.unlock.data_dir.display()
-            ))
-        })?;
+        let mut session = self.stored_session()?;
         if let Some(server) = &self.server_override {
             session.server = server.clone();
         }
         Ok(session)
+    }
+
+    /// 帳號目錄裡封著的 session，原樣（沒套 `--server`）。快取的身份用它的 server。
+    fn stored_session(&self) -> Result<Session, SdkError> {
+        let account = self.account()?;
+        self.vault()?
+            .unseal_session(&account.session_path())?
+            .ok_or_else(|| {
+                SdkError::Usage(format!(
+                    "{} is not logged in ({} missing); run `login` first",
+                    account.key(),
+                    account.session_path().display()
+                ))
+            })
+    }
+
+    /// 這個命令用哪個帳號：`--account`（配 `--server` 消歧）→ `current`。只解析一次。
+    ///
+    /// Return:
+    ///     Ok(&AccountDir)
+    ///     Err(Usage)   沒登入過、`--account` 找不到或有歧義、資料目錄還是舊的單一目錄佈局
+    pub fn account(&self) -> Result<&AccountDir, SdkError> {
+        if let Some(account) = self.account.get() {
+            return Ok(account);
+        }
+        accounts::reject_legacy_layout(&self.unlock.data_dir)?;
+        let account = match &self.account_override {
+            Some(user) => accounts::find_account(
+                &self.unlock.data_dir,
+                user,
+                self.server_override.as_deref(),
+            )?,
+            None => {
+                let key = accounts::read_current(&self.unlock.data_dir)?.ok_or_else(|| {
+                    SdkError::Usage(format!(
+                        "no current account in {}; run `login` first (or pass --account)",
+                        self.unlock.data_dir.display()
+                    ))
+                })?;
+                accounts::account_from_key(&self.unlock.data_dir, &key).ok_or_else(|| {
+                    SdkError::Usage(format!(
+                        "current account {key} has no directory in {}; run `login` again",
+                        self.unlock.data_dir.display()
+                    ))
+                })?
+            }
+        };
+        Ok(self.account.get_or_init(|| account))
     }
 
     /// 開一次、之後都拿同一個（唯讀）。要改鎖法的命令自己 `unlock.open_vault()` 拿可變的那份。
@@ -206,6 +293,40 @@ impl Context {
         }
         let vault = self.unlock.open_vault()?;
         Ok(self.opened_vault.get_or_init(|| vault))
+    }
+
+    /// 這個 server 的 `cache.db`（local-cache-db.md §6，所有帳號共用）與「我是誰」（mxid，讀寫快取都要帶）。
+    /// 金鑰是 vault 的第一把子金鑰，身份是封著的 session 的 server。server 不符、解不開就重建（§1），重建時 stderr 說一聲。
+    /// `--token` 模式沒有 vault 也沒有帳號目錄，不給快取。
+    pub async fn cache(&self) -> Result<(Cache, String), SdkError> {
+        if self.token_override.is_some() {
+            return Err(SdkError::Usage(
+                "the cache needs a logged-in account (local.key + session.sealed); --token mode has none".into(),
+            ));
+        }
+        let stored = self.stored_session()?;
+        let cache = self.open_cache(&stored.server)?;
+        Ok((cache, stored.user_id))
+    }
+
+    fn open_cache(&self, server: &str) -> Result<Cache, SdkError> {
+        let identity = CacheIdentity {
+            server: server.to_string(),
+        };
+        let (cache, outcome) = Cache::open(
+            &self.account()?.server_dir(),
+            &self.vault()?.cache_key(),
+            &identity,
+        )?;
+        match outcome {
+            OpenOutcome::Reused => {}
+            OpenOutcome::Created => self.progress(format!("created {}", cache.path().display())),
+            OpenOutcome::Rebuilt => self.progress(format!(
+                "rebuilt {} (it belonged to another server, or could not be opened)",
+                cache.path().display()
+            )),
+        }
+        Ok(cache)
     }
 
     pub async fn client(&self) -> Result<WbfClient<Channel>, SdkError> {
@@ -236,22 +357,98 @@ async fn login_command(
         Some(path) => read_password_file(path)?,
         None => prompt_password_on_terminal("password: ")?,
     };
+    accounts::reject_legacy_layout(&context.unlock.data_dir)?;
     // vault 先開（沒有就建）：store 的金鑰與 session.sealed 都從它來。
     let vault = context.unlock.open_or_create_vault()?;
-    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放 <data dir>/matrix/。
+    // 帳號目錄由 server host 加 localpart 決定（store 在 login 前就要有路徑）。
+    let account = AccountDir::locate(&context.unlock.data_dir, &server, user);
+    // 沒有 session 卻留著 matrix/：上次沒走 logout（或舊版的 logout 沒刪），那個 store 綁著已經失效的裝置。消費端自己再清一次。
+    if !account.is_logged_in() && account.matrix_store_dir().exists() {
+        context.progress("removing a matrix store left over from a previous device".into());
+        account.delete_matrix_store()?;
+    }
+    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放帳號目錄的 matrix/。
     let (_backend, session) = MatrixBackend::login(
         &server,
         user,
         &password,
         device_name,
-        &context.unlock.matrix_store_dir(),
+        &account.matrix_store_dir(),
         &vault.matrix_store_key(),
     )
     .await?;
-    vault.seal_session(&session)?;
+    // server 回的 user_id 才是權威（大小寫、localpart 正規化可能跟 --user 打的不一樣）：目錄名對不上就搬過去。
+    let canonical = AccountDir::locate(&context.unlock.data_dir, &server, &session.user_id);
+    let account = if canonical.dir != account.dir {
+        if canonical.dir.exists() {
+            return Err(SdkError::Usage(format!(
+                "server says you are {} but {} already exists; logout that account first",
+                session.user_id,
+                canonical.dir.display()
+            )));
+        }
+        std::fs::create_dir_all(canonical.dir.parent().expect("account dir has a parent"))?;
+        std::fs::rename(&account.dir, &canonical.dir)?;
+        canonical
+    } else {
+        account
+    };
+    vault.seal_session(&account.session_path(), &session)?;
+    accounts::write_current(&context.unlock.data_dir, &account)?;
     print_json(
-        &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server }),
+        &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server, "account": account.key() }),
     )
+}
+
+/// `forget-account <mxid>`：摧毀這個帳號在 cache.db 裡的本機紀錄（local-cache-db.md §6 的忘掉鏈）。
+/// 要開哪個 server 的快取：`--server`，或那個帳號還登入著就用它封著的 session。
+async fn forget_account_command(context: &Context, user: &str, yes: bool) -> Result<(), SdkError> {
+    if !user.starts_with('@') || !user.contains(':') {
+        return Err(SdkError::Usage(format!(
+            "forget-account needs the full mxid (example: @alice:localhost), got {user}"
+        )));
+    }
+    let account = accounts::find_account(
+        &context.unlock.data_dir,
+        user,
+        context.server_override.as_deref(),
+    )?;
+    let server = match &context.server_override {
+        Some(server) => server.clone(),
+        None => context
+            .vault()?
+            .unseal_session(&account.session_path())?
+            .map(|session| session.server)
+            .ok_or_else(|| {
+                SdkError::Usage(format!(
+                    "{} is logged out, so the server URL is unknown; pass --server",
+                    account.key()
+                ))
+            })?,
+    };
+    if !yes && !crate::rooms::confirm(&format!("destroy the local records of {user} on {server}?"))?
+    {
+        return Err(SdkError::Usage("cancelled".into()));
+    }
+    // 快取在 server 層；用這個帳號的目錄定位它（不需要它是 current）。
+    let identity = CacheIdentity { server };
+    let (mut cache, _) = Cache::open(
+        &account.server_dir(),
+        &context.vault()?.cache_key(),
+        &identity,
+    )?;
+    let report = cache.forget_account(user)?;
+    // 池還沒有（local-cache-db.md §8 下一個 PR）；先把該刪的檔名印出來，不假裝刪過。
+    for file in &report.orphan_pool_files {
+        context.progress(format!(
+            "orphan pool file (no media pool yet, nothing deleted): {file}"
+        ));
+    }
+    print_json(&json!({
+        "ok": true, "user": user,
+        "events_removed": report.events_removed, "media_removed": report.media_removed,
+        "orphan_pool_files": report.orphan_pool_files,
+    }))
 }
 
 // ---- 上傳 ----

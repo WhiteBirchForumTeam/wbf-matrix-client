@@ -15,7 +15,6 @@ use wbf_sdk::{Key32, KeyMode, SdkError, Unlock, Vault};
 use zeroize::Zeroizing;
 
 pub const TICKET_FILE_NAME: &str = "unlock.ticket";
-pub const MATRIX_STORE_DIR_NAME: &str = "matrix";
 /// 舊版（PR #9 之前）的明文 session 檔；看到它只提示，不讀。
 const LEGACY_SESSION_FILE_NAME: &str = "session.json";
 
@@ -52,10 +51,6 @@ pub struct UnlockOptions {
 }
 
 impl UnlockOptions {
-    pub fn matrix_store_dir(&self) -> PathBuf {
-        self.data_dir.join(MATRIX_STORE_DIR_NAME)
-    }
-
     fn ticket_path(&self) -> PathBuf {
         self.data_dir.join(TICKET_FILE_NAME)
     }
