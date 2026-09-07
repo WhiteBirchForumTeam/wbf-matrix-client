@@ -24,8 +24,8 @@ cli="$repo_root/target/release/wbf-cli"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-session="$work/session.json"
-wbf() { "$cli" --server "$SERVER" --session "$session" "$@"; }
+data_dir="$work/data"
+wbf() { "$cli" --server "$SERVER" --data-dir "$data_dir" "$@"; }
 
 step() { echo; echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -43,7 +43,16 @@ head -c $((SIZE_MIB * 1024 * 1024)) /dev/urandom >"$big"
 size=$(stat -c %s "$big" 2>/dev/null || stat -f %z "$big")
 [ "$SEEK_AT" -lt "$size" ] || SEEK_AT=$((size / 2))
 
-token=$(grep -o '"access_token": *"[^"]*"' "$session" | cut -d'"' -f4)
+# session.sealed 是封住的，讀不到 token；標準下載那一步的 curl 自己登入一次拿。
+password=$(cat "$PASSWORD_FILE"); password=${password%$'\r'}
+token=$(curl -sS -X POST "$SERVER/_matrix/client/v3/login" -H 'Content-Type: application/json' \
+    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$USER_ID\"},\"password\":\"$password\",\"initial_device_display_name\":\"acceptance-curl\"}" \
+    | grep -o '"access_token": *"[^"]*"' | cut -d'"' -f4)
+unset password
+[ -n "$token" ] || fail "curl login for the standard download failed"
+[ -f "$data_dir/local.key" ] || fail "login did not create local.key"
+[ -f "$data_dir/session.sealed" ] || fail "login did not create session.sealed"
+grep -q '"access_token"' "$data_dir/session.sealed" && fail "session.sealed holds the token in plaintext"
 
 # 步驟 2 與 3，一個 cipher 一次。
 upload_download_roundtrip() {
@@ -92,7 +101,7 @@ resume_src="$work/resume.bin"
 cp "$big" "$resume_src"
 log="$work/resume.log"
 # HTTP 通道一塊一個請求，慢到夠我們在中途殺掉。直接跑 exe 不經 shell 函數：$! 才是它本人，kill 才殺得到。
-"$cli" --server "$SERVER" --session "$session" --transport http upload "$resume_src" \
+"$cli" --server "$SERVER" --data-dir "$data_dir" --transport http upload "$resume_src" \
     --cipher chacha20-poly1305 --chunk-size 65536 --manifest "$work/resume.json" 2>"$log" >/dev/null &
 upload_pid=$!
 for _ in $(seq 1 600); do

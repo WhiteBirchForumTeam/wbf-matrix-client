@@ -9,6 +9,7 @@
 //! - `client` + `upload` + `download`：`WbfClient`，一條通道上的命令。
 //! - `login`：純 HTTP 拿 token。
 //! - `manifest`：CLI 印的 manifest 與上傳狀態檔。
+//! - `vault`：本地金鑰庫（`local.key`、子金鑰、`session.sealed`），local-cache-db.md §4。
 //!
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
 
@@ -25,6 +26,7 @@ pub mod login;
 pub mod manifest;
 pub mod protocol;
 pub mod upload;
+pub mod vault;
 
 pub use channel::{Channel, PackChannel, Transport};
 pub use chat::{
@@ -40,3 +42,4 @@ pub use error::SdkError;
 pub use login::Session;
 pub use manifest::{Manifest, UploadState};
 pub use upload::SentSummary;
+pub use vault::{Key32, KeyMode, Unlock, Vault};

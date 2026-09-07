@@ -1,12 +1,19 @@
 # 本地資料庫設計：加密的暫存快取
 
-> 狀態：草案，2026-09-05。維護者同意 §1–§4、§6 的提案；§5（與 matrix-sdk store 的關係）維護者要求寫細再議。
-> 前提在 [plan-v1.md](plan-v1.md) §7.1：**現在不做**，先接通 API；這份是之後動手時的依據。
+> 狀態：2026-09-05 草案，維護者同意 §1–§4、§6 的提案；§5（與 matrix-sdk store 的關係）維護者要求寫細再議。
+> **2026-09-06 起動手**（維護者定：第 3 步第一版之後下一隻專注這裡）。做到哪：
+>
+> | 段 | 狀態 |
+> |---|---|
+> | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
+> | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
+> | §3、§6 `cache.db`（SQLCipher） | ⬜ 下一個 PR |
+> | §8 媒體儲存池 | ⬜ 設計 2026-09-07 依維護者糾正重寫（一個池、一把鑰、整檔不分片） |
 
 ## 0. 一句話
 
 本地有兩個 SQLite 檔：matrix-sdk 自己的 store（它非存不可的東西）與我們的快取（聊天紀錄、房間、事件區塊）。
-兩個都加密，金鑰都從同一把 32 byte 主金鑰導出；主金鑰第一版明文放本地（自解密），加 local password 後被密碼包住，
+兩個都加密，金鑰都從同一把 32 byte 主金鑰導出；主金鑰第一版明文放本地（自解密），加 passphrase 後被密碼包住，
 啟動時要解開，UI 與 CLI 走同一個函數。**快取不是權威**：可以整個刪掉重建，衝突以 server 為準。
 
 ## 1. 定位：快取，不是權威
@@ -16,7 +23,7 @@
 | 可以整個丟掉 | schema 版本不對、server 或 user 換了、解不開：刪檔重建，不寫遷移 |
 | 不需要衝突解決 | 同一個 event_id 再寫一次就覆蓋；server 說的算 |
 | 事件快取只長不刪 | **500 是同步視窗，不是上限**（維護者 2026-09-05 訂正）：進房時把最新 500 則同步進快取；往舊滑超過就再 load 更舊的存進去；下次重讀那一段從快取拿，不重拉。事件小，不設上限 |
-| 媒體快取有配額，但是 best effort | **2 GiB**（維護者 2026-09-05 定），不是 hard limit；另有 **7 天保護期**，期內用過的檔不自動刪（§8.4） |
+| 媒體快取有配額，但是 best effort | **2 GiB**（維護者 2026-09-05 定），不是 hard limit；另有 **7 天保護期**，期內用過的檔不自動刪（§8.5） |
 | 壞掉的代價只是重拉 | 任何讀到壞資料的地方都 fail closed：當成沒有快取，回 server 拿 |
 
 ## 2. 存什麼、不存什麼
@@ -31,7 +38,7 @@
 | 不存 | 理由 |
 |---|---|
 | 密碼 | 永遠不存（CLI 規格 §9） |
-| 媒體內容 | **不進 DB**，寫成檔案放加密的檔案空間（§8）；DB 只放指針（`media_files`） |
+| 媒體內容 | **不進 DB**，整檔明文放進加密的儲存池（§8）；DB 只放指針（`media_files`） |
 | session 與 token | **不進 DB**（維護者 2026-09-05 定）：另外用同一把主金鑰導出的第三把子金鑰鎖一次，見 §4 與 §5.6 的 `session.sealed` |
 
 ## 3. 加密：SQLCipher，整檔頁級
@@ -45,42 +52,56 @@
 
 ## 4. 金鑰：一把主金鑰，兩種鎖法，型別化
 
+> 用字（維護者 2026-09-07 定）：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼。早先草稿寫的「local password」就是 passphrase，已全部改掉，避免跟帳號密碼混。
+
 ```
 local.key（0600）
   ├─ Plain            : { "v": 1, "mode": "plain", "master": "<base64 32 byte>" }
-  └─ PasswordWrapped  : { "v": 1, "mode": "password",
+  └─ PassphraseWrapped  : { "v": 1, "mode": "passphrase",
                           "kdf": { "name": "argon2id", "m_kib": 65536, "t": 3, "p": 1, "salt": "<base64 16>" },
                           "nonce": "<base64 24>", "wrapped": "<base64 48>" }   // XChaCha20-Poly1305(KEK, master)
 ```
 
 - **主金鑰** 32 byte，CSPRNG，一台機器一把。
 - **導出**：三把 32 byte 子金鑰，`BLAKE3 derive_key(context, master)`，context 是固定字串
-  `"wbf-matrix-client cache sqlcipher v1"`、`"wbf-matrix-client matrix-sdk store v1"`、`"wbf-matrix-client session v1"`，加第四把 `"wbf-matrix-client media store v1"`（§8）。
+  `"wbf-matrix-client cache sqlcipher v1"`、`"wbf-matrix-client matrix-sdk store v1"`、`"wbf-matrix-client session v1"`，加第四把 `"wbf-matrix-client media store v1"`（§8 的池，就這一把）。
   第三把用 XChaCha20-Poly1305 把 session 檔（server、user_id、device_id、access_token）整份封成 `session.sealed`：
   session 與 token **不進 DB**，但跟 DB 同一把鎖（維護者 2026-09-05 定）。子金鑰不落地，每次開啟導一次。
   換 context 字串就是換金鑰，所以 context 帶版本。
-- **local password**：Argon2id 從密碼導 KEK，KEK 用 XChaCha20-Poly1305 包住主金鑰。改密碼只重包 48 byte，DB 不動。
+- **passphrase**：Argon2id 從 passphrase 導 KEK，KEK 用 XChaCha20-Poly1305 包住主金鑰。改 passphrase 只重包 48 byte，DB 不動。
   參數寫在檔裡，之後調高不用遷移。
-- **模式是型別，不是空字串**：`enum KeyFile { Plain { master }, PasswordWrapped { kdf, nonce, wrapped } }`，
-  讀檔時 `mode` 不認得就拒絕。「沒設密碼」是 `Plain`，不是「密碼等於空字串」——後者會讓空密碼靜默通過。
-- **一個入口**：`Vault::open(dir, Unlock::NoPassword | Unlock::Password(secret))`。`Plain` 配 `NoPassword`、
-  `PasswordWrapped` 配 `Password`，配錯就 `Err`，UI 與 CLI 都只能走這裡。CLI 的密碼來源同 `login`：`--password-file` 或終端不回顯。
+- **模式是型別，不是空字串**：`enum KeyFile { Plain { master }, PassphraseWrapped { kdf, nonce, wrapped } }`，
+  讀檔時 `mode` 不認得就拒絕。「沒設 passphrase」是 `Plain`，不是「passphrase 等於空字串」——後者會讓空 passphrase 靜默通過。
+- **一個入口**：`Vault::open(dir, Unlock::NoPassphrase | Unlock::Passphrase(secret))`。`Plain` 配 `NoPassphrase`、
+  `PassphraseWrapped` 配 `Passphrase`，配錯就 `Err`，UI 與 CLI 都只能走這裡。CLI 的 passphrase 來源同 `login` 的 password：檔案參數或終端不回顯。
 - **解鎖後金鑰放哪**（維護者 2026-09-05：作法由我定，照一般開發工具的做法）：
 
   | | 做法 |
   |---|---|
   | UI | 解鎖一次，主金鑰只在記憶體；UI runtime 與 wbf-sdk 是同一個程序，關掉就沒了 |
-  | CLI（只在開發與 debug 用） | 仿 `sudo`：解鎖成功後寫一張 **unlock ticket**（`<data dir>/unlock.ticket`，0600，內容是主金鑰加 `expires_at`），有效期預設 15 分鐘、`--unlock-ttl <秒>` 可調；期內的命令不再問密碼。`lock` 命令刪掉它。過期的 ticket 讀到就刪，Unix 上模式不是 0600 就拒用 |
+  | CLI（只在開發與 debug 用） | 仿 `sudo`：解鎖成功後寫一張 **unlock ticket**（`<data dir>/unlock.ticket`，0600，內容是主金鑰加 `expires_at`），有效期預設 15 分鐘、`--unlock-ttl <秒>` 可調；期內的命令不再問 passphrase。`lock` 命令刪掉它。過期的 ticket 讀到就刪，Unix 上模式不是 0600 就拒用 |
 
-  CLI 密碼的來源與 `login` 同一套：`--local-password-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
+  CLI passphrase 的來源與 `login` 的 password 同一套：`--passphrase-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
   ticket 是明文主金鑰落地，安全性等於 `Plain` 模式那 15 分鐘；維護者明說接受（CLI 不是產品面）。這一項不進 UI。
+
+### 4.1 實作與上面的差異（第一個 PR，2026-09-06）
+
+- `local.key` 的 `passphrase` 模式在 JSON 裡 `mode` 值是 `"passphrase"`（上面的 `PassphraseWrapped` 是型別名，程式裡也叫 `KeyFile::Passphrase`）。
+- 包主金鑰與封 session 都帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。
+- 多一個 `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問 passphrase，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
+- `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空字串 passphrase 在這裡被拒。
+- `Vault::from_master(dir, master, mode)` 給 CLI 的 ticket 用；它不驗證主金鑰是不是這個目錄的，信任等於 `Plain`。
+- 第四把子金鑰 `media store v1` 已經導出來（`media_store_key`），還沒有人用；先把 context 字串一次定完。
+- CLI 的資料目錄是**一個** `<data dir>/wbf-cli/`，不是 §5.6 的 `<server>/<user>` 一套：CLI 一次一個 session（CLI 規格 §7）。UI 那一版再照 §5.6。
+- 寫 `local.key`／`session.sealed`／ticket 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
+- 既有的 store 用別把金鑰開會失敗：訊息叫人刪 `matrix/` 重新 `login`，不遷移（§1 的政策；store 只是裝置狀態）。
 
 - **威脅模型**（老實寫）：
 
 | 防 | 不防 |
 |---|---|
 | 把 DB 檔拷走的人（沒有 `local.key` 解不開） | 能登入這台機器、讀得到 `local.key` 的人（`Plain` 模式） |
-| 加 local password 後：連 `local.key` 一起拷走也解不開（要猜密碼，Argon2id 拖慢） | 跑著的程序記憶體裡的主金鑰；鍵盤側錄 |
+| 加 passphrase 後：連 `local.key` 一起拷走也解不開（要猜 passphrase，Argon2id 拖慢） | 跑著的程序記憶體裡的主金鑰；鍵盤側錄 |
 
 ## 5. 與 matrix-sdk 的 store 怎麼相處（細節）
 
@@ -116,7 +137,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 
 - SDK 那邊用 `open_with_key`，**不用 passphrase**：PBKDF2 20 萬輪每次啟動要花時間，而且我們的密碼 KDF 已經在 §4 做過一次；
   兩個 store 傳同一把子金鑰即可（各自的 `StoreCipher` 仍是隨機的，子金鑰只是包住它們）。
-- 加 local password 後，SDK 的 store 也一起被鎖住：主金鑰解不開就導不出子金鑰，`open_with_key` 就失敗。**不需要動 SDK。**
+- 加 passphrase 後，SDK 的 store 也一起被鎖住：主金鑰解不開就導不出子金鑰，`open_with_key` 就失敗。**不需要動 SDK。**
 - 兩個世界的邊界只有一條線：`Vault::open` 回兩把子金鑰。SDK 不知道 SQLCipher，快取不知道 `StoreCipher`。
 
 ### 5.4 為什麼不把快取塞進 SDK 的 event_cache（方案 B）
@@ -137,7 +158,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 <data dir>/wbf/<server host>/<user localpart>/
   local.key      主金鑰（§4）
   cache.db       我們的快取（SQLCipher）：事件、房間、指針
-  media/         媒體檔案空間，檔級加密（§8）；檔名是隨機 id，不洩原名
+  media/         媒體儲存池，整個池加密、裡面是完整明文檔（§8）；檔名是隨機 id，不洩原名
   matrix/        SDK 的 store 目錄（crypto.db、state.db；SDK 自己命名）
   session.sealed 第三把子金鑰封住的 session（取代 CLI 規格 §7 的明文 session.json；那一版同步改規格）
 ```
@@ -189,56 +210,65 @@ CREATE TABLE hidden_messages (room_id TEXT NOT NULL, event_id TEXT NOT NULL, hid
 - **開 app 的同步**：`Event/Recent` 帶 `meta.cg_seq`，回來的事件逐則寫進 `events`（有 `r_seq`／`g_seq`），`complete=false` 就帶 `before=next` 繼續，最後把 `latest_g_seq` 寫回 `meta.cg_seq`。
   進房的 500 則視窗是逐房 `/messages` 補的，與 Recent 拿到的合在同一張表，靠 `r_seq` 判洞。
 
-## 8. 媒體檔案空間：檔級加密，不進 DB（維護者 2026-09-05 定方向）
+## 8. 媒體儲存池：整檔明文放進一個加密的池，不進 DB（維護者 2026-09-07 定）
 
-媒體不用資料庫讀，寫成檔案；DB 只放事件與指針。檔案空間要加密，方向對齊 [gocryptfs](https://github.com/rfjakob/gocryptfs)：
-**每個檔案自己一把金鑰、內容切固定大小的塊各自 AEAD、檔名不洩原名**。但不用 gocryptfs 本身：它是 FUSE 掛載，Windows 要 WinFsp、Android 沒有；
-我們把同一套做法做在程式裡，UI 拿到的是一個 `Read + Seek` 的把手，不是掛載點。
+> 2026-09-05 的版本寫成「每個檔一把金鑰、內容切固定塊各自 AEAD、bitmap 記哪塊在」。那是把 **server 端**的分片設計套到本地：server 那邊確實是 mxc 唯一、每檔各自 key、分片存、給下載與 seek 用；**本地快取跟它無關**。維護者 2026-09-07 糾正，改成下面這樣。
 
-### 8.1 存什麼
+一句話：本地有**一個加密的儲存池**，裡面是**一個個完整的明文檔**；下載時解一塊就順序 append 進去，下載完 DB 記一列。池用**一把金鑰**。
 
-**解密後的明文塊**（維護者：「每塊解密後就放這裡」），再用本地金鑰加密落地。不存 server 上的密文，理由：
-- server 密文的金鑰是每則訊息各自的（事件區塊裡的 `key`），本地要留一堆房間金鑰才讀得回來；存明文塊再用本地金鑰包，本地只有一套金鑰制度。
-- 塊的邊界照約定規格書的 `chunk_size`，下載端解一塊就能存一塊，seek 讀回來也是一塊一塊，**部分快取是自然的**（看了影片中間一段，就只有那幾塊在）。
+### 8.1 池是什麼
 
-### 8.2 檔案格式
+- 對上層（下載管線、UI）看起來像掛載了一塊區域：開檔、順序寫、讀、刪，檔就是完整明文，**檔內不分片**。
+- 落地時整個池是加密的。池是 `wbf-sdk` 裡的一層虛擬層，不用 FUSE／WinFsp（Windows 要裝東西、Android 沒有）。
+- 池只用**一把金鑰**：第四把子金鑰 `"wbf-matrix-client media store v1"`（§4）。沒有每檔金鑰。
+- 為了「順序 append」與「從中間讀」，池內部落地會分段加密（gocryptfs、Cryptomator、age 都是這樣）。**那是池的實作細節，對上層完全隱藏**；設計文件不規定段大小，實作時定、寫在程式的 docstring。
+
+存的是**解密後的明文**（維護者：「每塊解密後就放這裡」），不存 server 密文：server 密文的金鑰是每則訊息各自的（事件區塊裡的 `key`），本地要留一堆房間金鑰才讀得回來；明文進池，本地只有一套金鑰制度。
+
+### 8.2 磁碟上
 
 ```
-media/<id 前 2 hex>/<id>          id = 128 bit CSPRNG 的 32 位小寫 hex；原檔名只在 DB
-  header（固定長度）
-    magic "WBFM"、version 1
-    file_id（16 byte，同檔名；進 AAD，防換名／換檔）
-    chunk_size（u32）、file_size（u64）
-    wrapped_file_key：XChaCha20-Poly1305(第四把子金鑰, nonce 24 byte, file_key 32 byte) → 24 + 48 byte
-    nonce_base（8 byte，每檔隨機）
-  body：第 i 塊在固定偏移 header_len + i × (chunk_size + 16)
-    block_i = AEAD(file_key, nonce_base ‖ u32_be(i), aad = "wbf-media-store-v1" ‖ file_id, 明文塊 i)
+media/<id 前 2 hex>/<id>     id = 128 bit CSPRNG 的 32 位小寫 hex；原檔名、mimetype、mxc 只在 cache.db
 ```
 
-- 塊的加密就是 `wbf-sdk` 現有的 `FileCipher`（`chunk_crypto`）：同一個 nonce 構造、同一種 AEAD，只換 AAD 與金鑰來源。實作時把 AAD 從常數改成參數，一個小改動。
-- 塊固定偏移，所以**沒下載的塊就是空洞**（檔案 sparse 或先不寫），哪些塊在由 DB 的 bitmap 說；讀到不在的塊 → 不是壞，是沒快取，回 server 拿。
-- 標籤驗證失敗 → 這一塊當壞的丟掉重拉，其他塊不受影響（與下載端的規則一致：完整性是每塊各自驗）。
-- 檔名是隨機 id、目錄用前 2 hex 扇出（一個目錄不會塞幾萬個檔）；大小、mimetype、原名、對應哪個 mxc，全部只在 `cache.db`（它整檔加密）。磁碟上能看到的只有「幾個檔、各多大」。
+- 檔名隨機、目錄用前 2 hex 扇出（一個目錄不會塞幾萬個檔）。磁碟上能看到的只有「幾個檔、各多大」。
+- 一個 mxc 一個檔；同一個媒體被轉發到別的房間仍是同一個 mxc、同一個檔。
 
-### 8.3 DB 的指針
+### 8.3 下載時怎麼寫（只考慮 download 模式）
+
+第一版只做**順序整檔下載**：`download` 從第 0 塊拿到最後一塊，每解出一塊就 append 進池裡那個檔。串流與 seek 先不管（§8.6）。
+
+```
+開始   ：cache.db 插一列 media_files（complete = 0，chunks_written = 0）；池裡開一個新檔
+每一塊 ：解密 → 驗 → append 進檔 → 記憶體裡的 chunks_written += 1
+每 1–2 秒：把記憶體的 chunks_written 寫回 cache.db（一次 UPDATE），不每塊寫 DB
+結束   ：檔 fsync → cache.db 把 complete = 1、chunks_written = 總塊數、bytes_on_disk 寫齊
+```
+
+- **進度在記憶體，DB 是每 1–2 秒的快照**（維護者定）。這樣 DB 不會被每塊一次的寫入打爆，而中斷最多重下一兩秒的量。
+- **中斷續傳**：下次開始前查到 `complete = 0` 的列，把池裡那個檔**截到 `chunks_written × chunk_size`**（最後一次快照之後 append 的塊可能只寫了一半，不信任它），從第 `chunks_written` 塊續。這跟 `wbf-sdk` 現有的上傳狀態檔是同一種思路：狀態說到哪就從哪開始，不猜。
+- **寫入順序**：先 append 檔、再更新 DB；反過來會出現「DB 說有、檔案沒有」。讀的時候 `complete = 1` 才當成有快取。
+- 一塊驗證失敗：這次下載中止、檔截回上次快照，下次續。與下載端現有的規則一致（完整性每塊各自驗）。
+
+### 8.4 DB 的指針
 
 ```sql
 CREATE TABLE media_files (
-  file_id TEXT PRIMARY KEY,          -- 32 hex，就是檔名
+  file_id TEXT PRIMARY KEY,          -- 32 hex，就是池裡的檔名
   mxc TEXT NOT NULL UNIQUE,          -- 對回事件（events.mxc）
   name TEXT, mimetype TEXT,
-  file_size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
-  blocks_present BLOB NOT NULL,      -- bitmap，第 i 位 = 第 i 塊在不在
-  complete INTEGER NOT NULL,         -- 全部塊都在
-  bytes_on_disk INTEGER NOT NULL,    -- 配額用
+  file_size INTEGER NOT NULL,        -- 明文總長，從事件區塊來
+  chunk_size INTEGER NOT NULL,       -- 下載時用的塊大小，續傳截檔用
+  chunks_written INTEGER NOT NULL,   -- 最後一次快照時已經 append 的塊數（§8.3）
+  complete INTEGER NOT NULL,         -- 1 = 整檔都在，讀快取只認這個
+  bytes_on_disk INTEGER NOT NULL,    -- 配額用（池落地後的實際大小）
   created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
 CREATE INDEX media_files_lru ON media_files (last_used_at);
 ```
 
-- 一個 mxc 一個檔；同一個媒體被轉發到別的房間仍是同一個 mxc、同一個檔。
-- 寫入順序：先寫塊、fsync、再更新 bitmap；反過來會出現「DB 說有、檔案沒有」。讀的時候**兩邊都問**：bitmap 說在、標籤也要過。
+沒有 bitmap：檔要嘛完整、要嘛是一個「寫到第 N 塊」的半成品，沒有中間有洞的狀態。
 
-### 8.4 配額與清理（維護者 2026-09-05 定）
+### 8.5 配額與清理（維護者 2026-09-05 定，沒變）
 
 兩個數字，都是 UI 設定、可調：
 
@@ -251,18 +281,23 @@ CREATE INDEX media_files_lru ON media_files (last_used_at);
 
 - 只算 `bytes_on_disk` 的加總。超過配額時，候選只有**保護期外**的檔，照 `last_used_at` 由舊到新刪整個檔，刪到不超過或候選用完為止。
 - 候選用完還是超過（7 天內瘋狂下載）：**不刪、不擋**，UI 顯示「媒體快取超過配額」並提供**手動清理**（清全部、或清到某個日期以前）。
-- 單一檔就超過配額（一個 2 GiB 的分塊檔）：照樣下、照樣存；下一個檔進來時，它若已出保護期就是第一個被刪的，若還在保護期就留著。多個小檔超過配額、砂最舊的（7 天外），是正常情形。
-- 不做塊級淘汰，整檔進整檔出。先刪檔再刪列，中途死掉留下的孤兒列在下次啟動掃一次清掉。
-- 正在播放的檔不刪（有把手打開就跳過）；讀一次就更新 `last_used_at`，所以正在看的東西自然在保護期內。
+- 單一檔就超過配額（一個 2 GiB 的分塊檔）：照樣下、照樣存；下一個檔進來時，它若已出保護期就是第一個被刪的，若還在保護期就留著。多個小檔超過配額、刪最舊的（7 天外），是正常情形。
+- 整檔進整檔出。先刪檔再刪列，中途死掉留下的孤兒列在下次啟動掃一次清掉；`complete = 0` 且沒有下載在跑的半成品也在啟動時掃，超過保護期就清。
+- 有把手打開的檔不刪；讀一次就更新 `last_used_at`，所以正在看的東西自然在保護期內。
 - 事件快取不受這個配額（§1）。
 
-### 8.5 與下載管線的接法
+### 8.6 先不做的
 
-`download`／`seek` 現在是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；加快取就是在「交出去」之前多一步「寫進 media store 第 i 塊」，在「`Read`」之前多一步「media store 有第 i 塊就直接用」。
-邊界仍在 `wbf-sdk`：CLI 與 UI 只看到 `Read + Seek` 的把手，不知道底下是快取還是 server。
+- **串流與 seek 對著池讀**：之後 UI 要播中間一段，是對著池裡的完整檔 `Read + Seek`，不是對著分片；沒下載完的檔就先下載完（或只走 server 的 seek，不進池）。哪一種等 UI 那版再定。
+- **部分快取**（只存看過的那幾塊）：不做。檔要嘛完整、要嘛是續傳中的半成品。
+
+### 8.7 與下載管線的接法
+
+`download` 現在是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；加快取就是：開始前問 `media_files` 有沒有 `complete = 1` 的列，有就直接從池裡讀整檔；沒有就照 §8.3 邊下邊 append。
+邊界仍在 `wbf-sdk`：CLI 與 UI 只看到一個檔的把手，不知道底下是池還是 server。
 
 ## 9. 還開著的
 
 1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，`session.sealed`（§4）。~~CLI 每個命令輸密碼的體感~~ 定了：仿 sudo 的 unlock ticket（§4）。
-2. ~~媒體內容快取另議~~ 定了方向：§8。
-3. ~~媒體配額的數字~~ 定了：2 GiB best effort、保護期 7 天（§8.4）。事件快取不設上限；同步視窗 500 則／房、初開全域 10000 則是預設值，可調。
+2. ~~媒體內容快取另議~~ 定了：§8（2026-09-07 重寫成儲存池）。
+3. ~~媒體配額的數字~~ 定了：2 GiB best effort、保護期 7 天（§8.5）。事件快取不設上限；同步視窗 500 則／房、初開全域 10000 則是預設值，可調。
