@@ -39,6 +39,11 @@ const SEALED_VERSION: u32 = 1;
 const ARGON2_M_KIB: u32 = 65536;
 const ARGON2_T: u32 = 3;
 const ARGON2_P: u32 = 1;
+/// 讀檔時的上限（PR #11 審查 rumia 🟡1／salvia 🟡2）：參數來自 `local.key`，一把塞了 `m_kib = 2_000_000` 的檔
+/// 每次解鎖吃 2 GiB。超過就拒絕，不算。1 GiB、10 輪、8 lane 遠高於任何合理設定。
+const ARGON2_MAX_M_KIB: u32 = 1_048_576;
+const ARGON2_MAX_T: u32 = 10;
+const ARGON2_MAX_P: u32 = 8;
 
 /// 32 byte 的金鑰，drop 時歸零。主金鑰與每一把子金鑰都是這個型別。
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -442,6 +447,12 @@ fn derive_kek(passphrase: &str, kdf: &KdfParams) -> Result<Key32, SdkError> {
             kdf.name
         )));
     }
+    if kdf.m_kib > ARGON2_MAX_M_KIB || kdf.t > ARGON2_MAX_T || kdf.p > ARGON2_MAX_P {
+        return Err(SdkError::Usage(format!(
+            "key file kdf params (m_kib {}, t {}, p {}) exceed the limits ({ARGON2_MAX_M_KIB}, {ARGON2_MAX_T}, {ARGON2_MAX_P}); refusing to unlock",
+            kdf.m_kib, kdf.t, kdf.p
+        )));
+    }
     let salt = decode_base64(&kdf.salt, "salt")?;
     let params = Params::new(kdf.m_kib, kdf.t, kdf.p, Some(32))
         .map_err(|error| SdkError::Usage(format!("key file kdf params: {error}")))?;
@@ -488,11 +499,13 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
     {
         std::fs::create_dir_all(parent)?;
     }
+    // 暫存檔名帶 pid：兩個 process 同時寫同一個檔不會競寫同一個暫存檔（PR #11 審查 rumia 🟢3）。
     let scratch_path = path.with_extension(format!(
-        "{}.tmp",
+        "{}.{}.tmp",
         path.extension()
             .and_then(|extension| extension.to_str())
-            .unwrap_or("")
+            .unwrap_or(""),
+        std::process::id()
     ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -637,6 +650,49 @@ mod tests {
         assert!(other.unseal_session().is_err());
         vault.delete_sealed_session().unwrap();
         assert!(vault.unseal_session().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 這些字串一旦進過任何一個已存在的 `local.key`／`session.sealed`，就是檔案格式的一部分：
+    /// 改一個字，舊 vault 會靜默導出不同的子金鑰，資料等於鎖死（PR #11 審查 rumia 🟢2）。
+    /// 這裡失敗＝有人改了格式，要換版本字串（v2）而不是改 v1。
+    #[test]
+    fn context_and_aad_strings_are_frozen() {
+        assert_eq!(CACHE_KEY_CONTEXT, "wbf-matrix-client cache sqlcipher v1");
+        assert_eq!(
+            MATRIX_STORE_KEY_CONTEXT,
+            "wbf-matrix-client matrix-sdk store v1"
+        );
+        assert_eq!(SESSION_KEY_CONTEXT, "wbf-matrix-client session v1");
+        assert_eq!(MEDIA_STORE_KEY_CONTEXT, "wbf-matrix-client media store v1");
+        assert_eq!(SESSION_AAD, b"wbf-matrix-client session.sealed v1");
+        assert_eq!(WRAP_AAD, b"wbf-matrix-client local.key v1");
+        // 導出的子金鑰也釘住：主金鑰全 7 時 cache key 的前 4 byte。改 BLAKE3 用法或 context 都會炸。
+        let vault = Vault::from_master(Path::new("."), Key32([7u8; 32]), KeyMode::Plain);
+        let cache = vault.cache_key();
+        let matrix = vault.matrix_store_key();
+        assert_ne!(cache.as_bytes(), matrix.as_bytes());
+        assert_eq!(
+            blake3::derive_key("wbf-matrix-client cache sqlcipher v1", &[7u8; 32]),
+            *cache.as_bytes()
+        );
+    }
+
+    #[test]
+    fn oversized_argon2_params_in_key_file_are_refused() {
+        let dir = scratch_dir("argon2-limit");
+        Vault::create(&dir, &Unlock::Passphrase("pw".to_string().into())).unwrap();
+        let path = dir.join(KEY_FILE_NAME);
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"m_kib\": 65536", "\"m_kib\": 2000000");
+        assert!(text.contains("2000000"), "fixture did not rewrite m_kib");
+        std::fs::write(&path, text).unwrap();
+        let error = match Vault::open(&dir, &Unlock::Passphrase("pw".to_string().into())) {
+            Ok(_) => panic!("oversized argon2 params were accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceed the limits"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

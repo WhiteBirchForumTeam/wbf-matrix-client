@@ -219,18 +219,16 @@ fn now_unix() -> u64 {
 }
 
 /// Unix 上 ticket 的模式必須是 0600（group／other 沒有任何位元）；Windows 靠目錄 ACL，一律算對。
+#[cfg(unix)]
 fn is_private_mode(path: &Path) -> Result<bool, SdkError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        return Ok(mode & 0o077 == 0);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(true)
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    Ok(mode & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn is_private_mode(_path: &Path) -> Result<bool, SdkError> {
+    Ok(true)
 }
 
 /// `--password-file`／`--passphrase-file` 的規則（CLI 規格 §3.1）：整檔就是那句話，去掉結尾一個換行。
