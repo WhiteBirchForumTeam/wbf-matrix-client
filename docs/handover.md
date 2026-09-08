@@ -83,14 +83,14 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
 | **E2EE 房送檔案沒宣告附件**（約定 §5.2） | server 的 `Event/Send` 是提案；matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清。CLI 送檔會印警告 |
-| `Event/Recent` 沒對真 server 跑過 e2e | 本機測試時 server 是舊 build | SDK 對著 server 向量逐 byte 比過，缺的是真連線 |
 | `RoomCrypto` trait 還沒有 | 加密全在 matrix-sdk 裡，沒東西可包 | 接管送訊息那一版出現 |
 
 ## 7. 下一步（維護者 2026-09-06 同意的順序）
 
 1. ~~本地資料庫第一個 PR：vault 與金鑰~~ 做了（2026-09-06 送審）。
-2. ~~本地資料庫第二個 PR：`cache.db`~~ 做了（2026-09-07 送審，含 `recent`）。rusqlite 0.40 與 matrix-sdk 合得來，代價是 Windows 要 Strawberry Perl（local-cache-db §3）。
-2c. ~~媒體池（local-cache-db §8）~~ 做了（2026-09-08 送審）：`media_pool.rs`（格式）、`media.rs`（fetch／gc／sweep）、CLI `download` 走快取、`media-stats`／`media-gc`。
+2. ~~本地資料庫第二個 PR：`cache.db`~~ 做了（PR #13）。rusqlite 0.40 與 matrix-sdk 合得來，代價是 Windows 要 Strawberry Perl（local-cache-db §3）。
+2b. `recent` 2026-09-08 依 wbfuwunel #33 改成拉窗＋`Event/Batch` 串流（issue #15，PR #16）：三層分工 `RecentPlan { max_events, window, batch }`、`WbfClient::recent_window`／`recent_sync`、`PackChannel::request_stream`、wire 多了 `Kind::Session` 與 `event::BATCH`、向量檔換新。
+2c. ~~媒體池（local-cache-db §8）~~ 做了（PR #14）：`media_pool.rs`（格式）、`media.rs`（fetch／gc／sweep）、CLI `download` 走快取、`media-stats`／`media-gc`。
 3. 附件宣告：等 server 定案。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。**走 fork submodule 露出 `Room::encrypt`，還是走 `OlmMachine`，維護者還沒定**；建議後者（plan-v1 §7.2 的方向）。
 4. chat-model §6 剩的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載。穿插。
 5. UI 框架比較文件。

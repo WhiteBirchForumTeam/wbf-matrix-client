@@ -28,7 +28,9 @@ pub enum Kind {
     Control = 0x01,
     Upload = 0x03,
     Download = 0x04,
-    /// 房間事件的領域（wire-format §3.3）：目前 `Recent`、`Send`。
+    /// 連線背後的 session（wire-format §6.3）：`Login`、`Refresh`、`Logout`。client 這邊還沒用，先認得它才能解 server 的向量。
+    Session = 0x10,
+    /// 房間事件的領域（wire-format §3.3）：`Recent`、`Send`、`Batch`。
     Event = 0x14,
 }
 
@@ -43,6 +45,7 @@ impl Kind {
             0x01 => Some(Kind::Control),
             0x03 => Some(Kind::Upload),
             0x04 => Some(Kind::Download),
+            0x10 => Some(Kind::Session),
             0x14 => Some(Kind::Event),
             _ => None,
         }
@@ -75,10 +78,19 @@ pub mod download {
 
 /// `Kind::Event` 的 subtype（server 的 room-seq-and-recent.md §2、media-attachments.md §3）。
 pub mod event {
-    /// 跨房間「在 `cg_seq` 之後的事件」。
+    /// 跨房間「在 `cg_seq` 之後的事件」：請求一窗，回應是一串 `Batch`（不是 `Ack`）。
     pub const RECENT: u8 = 0x01;
     /// 送事件，meta 帶 `attachments` 宣告附件。
     pub const SEND: u8 = 0x02;
+    /// 只有 server → client：`Recent` 一窗裡的一批事件，meta `{ tc, bc, fs, ls, r }`，data 是 u32 大端長度前綴的事件 JSON。
+    pub const BATCH: u8 = 0x03;
+}
+
+/// kind `0x10 Session`（wire-format §6.3）。
+pub mod session {
+    pub const LOGIN: u8 = 0x01;
+    pub const REFRESH: u8 = 0x02;
+    pub const LOGOUT: u8 = 0x03;
 }
 
 /// `flags` 欄位的位元。沒列的位元必須是 0。
