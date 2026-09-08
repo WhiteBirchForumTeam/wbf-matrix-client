@@ -41,7 +41,7 @@ pub use chat::{
 pub use chunk_block::{BlockError, ChunkedBlock};
 pub use chunk_crypto::{CryptoError, DescriptionSlot, FileCipher, Link, SeekTarget};
 pub use cipher::Cipher;
-pub use client::{OnBatch, RecentSync, RecentWindow, WbfClient};
+pub use client::{OnBatch, RecentPlan, RecentSync, RecentWindow, WbfClient};
 pub use download::{DownloadReport, SeekResult};
 pub use error::SdkError;
 pub use login::Session;

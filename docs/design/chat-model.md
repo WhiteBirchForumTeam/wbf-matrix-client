@@ -269,7 +269,7 @@ pub enum Update {
 | client 端 | `Message.r_seq: Option<i64>`、`Message.g_seq: Option<i64>`（`protocol::event_seqs`）。`unsigned` 是 server 加的、不進雜湊、送聯邦時被剥掉，其他 client 無感 |
 | offset | 一對 `(event_id, r_seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`r_seq` 是本地算術用；比較用 `r_seq` |
 | `sent_at` | 只當顯示用的時間 |
-| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（server 的 pack-pipeline §6.4）：一窗收完且 `tc < limit` 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`tc == limit` 帶 `before = 最後的 ls` 再一窗、水位不動；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。這就是「初開 app 掛載一萬則」的實作（一萬則是 client 自己累計），而且之後每次開都只拿差異。wbfuwunel #33（2026-09-07）從一頁一個 Ack 改成這樣 |
+| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（server 的 pack-pipeline §6.4）：一窗收完且 `tc < limit` 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`tc == limit` 帶 `before = 最後的 ls` 再一窗、水位不動；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。wbfuwunel #33（2026-09-07）從一頁一個 Ack 改成這樣 |
 | 還沒有的 | server 端「`r_seq` → 事件」的反查（跳到第 N 則直接問）：server 列為候選。現在 client 用 `/messages` 二分逼近，或先只提供「跳到快取裡有的第 N 則」 |
 
 **退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `r_seq`。client 必須顯式判斷它在不在，不靠巧合：

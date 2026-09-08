@@ -131,9 +131,17 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         Command::Watch(args) => crate::rooms::watch_command(&context, &args).await,
         Command::Recent {
             limit,
+            window,
             batch,
             from_scratch,
-        } => crate::recent::recent_command(&context, limit, batch, from_scratch).await,
+        } => {
+            let plan = wbf_sdk::RecentPlan {
+                max_events: (limit > 0).then_some(limit),
+                window,
+                batch,
+            };
+            crate::recent::recent_command(&context, plan, from_scratch).await
+        }
         Command::Read {
             room,
             limit,

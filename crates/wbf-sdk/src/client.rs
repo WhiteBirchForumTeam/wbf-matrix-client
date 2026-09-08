@@ -40,11 +40,36 @@ pub struct RecentWindow {
 /// `recent_sync` 整輪的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecentSync {
-    /// 追平後該存的新水位（第一窗第一個 Batch 的 `fs`）；整輪沒有事件就 None，水位不動。
+    /// 該存的新水位（第一窗第一個 Batch 的 `fs`）；整輪沒有事件就 None，水位不動。
+    /// 不管是追平還是碰到總量上限停的都可以存：比它新的全都拿到了。
     pub new_cg_seq: Option<i64>,
     pub windows: u32,
     pub events: u64,
     pub last_ls: Option<i64>,
+    /// true = 一窗 `tc < window` 回到了 `cg_seq`；false = 被 `max_events` 停下，`last_ls` 以下到舊水位之間還沒拿
+    /// （那段之後靠逐房翻頁補，local-cache-db §6 的「洞」）。
+    pub caught_up: bool,
+}
+
+/// `recent_sync` 的三個數字（維護者 2026-09-08 定的分層）：上層要幾則、底層一窗幾則、一批幾則。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecentPlan {
+    /// 這一輪總共最多要幾則；None = 拉到追平為止。UI 初開 app 用 10000。
+    pub max_events: Option<u64>,
+    /// 一窗幾則（一次 `Recent` 請求）；會 clamp 到 server 的 `recent_max_limit`（500）。
+    pub window: u32,
+    /// 每個 Batch 幾則；None 用 server 預設（10）。
+    pub batch: Option<u32>,
+}
+
+impl Default for RecentPlan {
+    fn default() -> RecentPlan {
+        RecentPlan {
+            max_events: Some(10_000),
+            window: protocol::RECENT_DEFAULT_LIMIT,
+            batch: None,
+        }
+    }
 }
 
 /// client 約定的等待上限（維護者定）：第一窗 server 要合併＋數，給 60 秒；之後的窗 10 秒。
@@ -239,26 +264,32 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(window)
     }
 
-    /// 整輪同步（pack-pipeline §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉到追平。
-    /// - 一窗收完且 `tc < limit`：追平，`new_cg_seq` 是**第一窗第一個 Batch 的 `fs`**（這輪最新的一則）。
-    /// - `tc == limit`：可能還有更舊的，帶 `before = 最後的 ls` 再一窗，水位不動。
+    /// 整輪同步（pack-pipeline §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉，拉到追平或湊滿 `plan.max_events`。
+    /// 三層：上層要 `max_events` 則 → 底層每次 `Recent` 要一窗（`window`，≤ 500）→ server 每 `batch` 則回一個 `Batch`。
+    /// 最後一窗會縮成剩下的數量，總量剛好不多拿。
+    /// - 一窗收完且 `tc < 這窗要的`：追平（`caught_up`）。
+    /// - `tc == 這窗要的`：可能還有更舊的，帶 `before = 最後的 ls` 再一窗；湊滿 `max_events` 就停。
+    /// - 新水位一律是**第一窗第一個 Batch 的 `fs`**（比它新的全都拿到了），追平或被總量停下都可以存。
     /// - 中途錯誤：原樣回；已交給 `on_batch` 的事件有效，`new_cg_seq` 不會給（呼叫者不推水位，下次重來會拿到同樣的）。
     ///
     /// 逾時：第一窗每個 Batch 之間 `RECENT_FIRST_WINDOW_TIMEOUT`，之後 `RECENT_NEXT_WINDOW_TIMEOUT`（維護者定）。
     ///
     /// Args:
     ///     cg_seq: 快取的水位線，example: Some(4700)
-    ///     limit: 一窗幾則，example: 320（會 clamp 到 server 的上限）
-    ///     batch: 每 Batch 幾則，example: Some(10)
+    ///     plan: example: RecentPlan { max_events: Some(1000), window: 320, batch: Some(10) }
     /// Return:
     ///     Ok(RecentSync)    `new_cg_seq` 是 None 表示這輪一則都沒有（水位維持原樣）
     pub async fn recent_sync(
         &mut self,
         cg_seq: Option<i64>,
-        limit: u32,
-        batch: Option<u32>,
+        plan: RecentPlan,
         on_batch: OnBatch<'_>,
     ) -> Result<RecentSync, SdkError> {
+        let RecentPlan {
+            max_events,
+            window,
+            batch,
+        } = plan;
         let max_limit = self
             .hello
             .as_ref()
@@ -269,32 +300,43 @@ impl<C: PackChannel> WbfClient<C> {
             .as_ref()
             .and_then(|hello| hello.recent_max_batch)
             .unwrap_or(protocol::RECENT_MAX_BATCH);
-        let limit = limit.clamp(1, max_limit);
+        let window = window.clamp(1, max_limit);
         let batch = batch.map(|batch| batch.clamp(1, max_batch));
         let mut request = RecentRequest {
-            limit,
+            limit: window,
             cg_seq: cg_seq.filter(|seq| *seq > 0),
             before: None,
             batch,
         };
         let mut summary = RecentSync::default();
         loop {
+            // 最後一窗縮成剩下的數量：要 1000、窗 320 → 320、320、320、40。
+            if let Some(max_events) = max_events {
+                let remaining = max_events.saturating_sub(summary.events);
+                if remaining == 0 {
+                    break;
+                }
+                request.limit = window.min(u32::try_from(remaining).unwrap_or(u32::MAX));
+            }
             let timeout = if summary.windows == 0 {
                 RECENT_FIRST_WINDOW_TIMEOUT
             } else {
                 RECENT_NEXT_WINDOW_TIMEOUT
             };
-            let window = self.recent_window(&request, timeout, on_batch).await?;
+            let asked = request.limit;
+            let window_result = self.recent_window(&request, timeout, on_batch).await?;
             if summary.windows == 0 {
-                summary.new_cg_seq = window.first_fs;
+                summary.new_cg_seq = window_result.first_fs;
             }
             summary.windows += 1;
-            summary.events += window.events;
-            summary.last_ls = window.last_ls.or(summary.last_ls);
-            if window.tc < limit {
+            summary.events += window_result.events;
+            summary.last_ls = window_result.last_ls.or(summary.last_ls);
+            if window_result.tc < asked {
+                summary.caught_up = true;
                 break;
             }
-            let Some(last_ls) = window.last_ls else {
+            let Some(last_ls) = window_result.last_ls else {
+                summary.caught_up = true;
                 break;
             };
             request.before = Some(last_ls);

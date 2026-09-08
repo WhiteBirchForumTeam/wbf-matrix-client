@@ -126,11 +126,14 @@ pub enum Command {
     Send(SendArgs),
     /// 等新事件，來一則立刻印一則，JSON Lines（CLI 規格 §3.4.2）
     Watch(WatchArgs),
-    /// Event/Recent：一窗一窗把 cache.db 水位線之後的事件跨房間拉回來寫進快取，直到追平（CLI 規格 §3.5）
+    /// Event/Recent：把 cache.db 水位線之後的事件跨房間拉回來寫進快取，直到追平或湊滿 --limit（CLI 規格 §3.5）
     Recent {
-        /// 一窗最多幾則；server 上限 500（Hello 會說），超過先 clamp
+        /// 這一輪總共最多幾則（上層要的數量）；0 = 拉到追平為止
+        #[arg(long, default_value_t = 10000)]
+        limit: u64,
+        /// 底層一次 Recent 要一窗幾則；server 上限 500（Hello 會說），超過先 clamp
         #[arg(long, default_value_t = 320)]
-        limit: u32,
+        window: u32,
         /// 每個 Batch 幾則；沒給用 server 預設（10），上限 100
         #[arg(long)]
         batch: Option<u32>,

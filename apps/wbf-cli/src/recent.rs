@@ -8,13 +8,11 @@ use wbf_sdk::SdkError;
 use crate::commands::Context;
 
 /// Args:
-///     limit: 一窗最多幾則，example: 320（server 上限 500，超過會 clamp）
-///     batch: 每個 Batch 幾則，example: Some(10)（server 上限 100）
+///     plan: 總量／一窗幾則／一批幾則，example: RecentPlan { max_events: Some(10000), window: 320, batch: None }
 ///     from_scratch: true 就不帶 cg_seq（把快取水位線當沒有），server 從最新往回給
 pub async fn recent_command(
     context: &Context,
-    limit: u32,
-    batch: Option<u32>,
+    plan: wbf_sdk::RecentPlan,
     from_scratch: bool,
 ) -> Result<(), SdkError> {
     let (mut cache, me) = context.cache().await?;
@@ -51,9 +49,7 @@ pub async fn recent_command(
         Ok(())
     };
     // 中途斷線或 server 回錯：已寫進快取的有效、水位不動（pack-pipeline §6.4）；下次再跑會從水位重來。
-    let summary = client
-        .recent_sync(cg_seq, limit, batch, &mut on_batch)
-        .await?;
+    let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
     if skipped_without_room > 0 {
         context.progress(format!(
             "recent: skipped {skipped_without_room} event(s) without room_id"
@@ -62,8 +58,15 @@ pub async fn recent_command(
     if let Some(new_cg_seq) = summary.new_cg_seq {
         cache.set_cg_seq(&me, new_cg_seq)?;
     }
+    if !summary.caught_up {
+        context.progress(format!(
+            "recent: stopped at the {} event limit; older events (below g_seq {:?}) are not in the cache yet",
+            summary.events, summary.last_ls
+        ));
+    }
     crate::rooms::print_json(&json!({
         "pulled": pulled, "written": written, "windows": summary.windows, "batches": batches,
+        "caught_up": summary.caught_up,
         "cg_seq_before": cg_seq, "cg_seq_after": summary.new_cg_seq.or(cg_seq),
     }))
 }
