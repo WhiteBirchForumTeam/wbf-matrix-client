@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use wbf_sdk::backend::matrix_sdk::MatrixBackend;
 use wbf_sdk::cache::{Cache, CacheIdentity, OpenOutcome};
+use wbf_sdk::media::{self, FetchOutcome};
+use wbf_sdk::media_pool::MediaPool;
 
 use crate::accounts::{self, AccountDir};
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
@@ -124,7 +126,16 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             print_json(&json!({ "ok": true }))
         }
         Command::Info { mxc, manifest } => info_command(&context, &mxc, manifest.as_deref()).await,
-        Command::Download { manifest, out } => download_command(&context, &manifest, out).await,
+        Command::Download {
+            manifest,
+            out,
+            no_cache,
+        } => download_command(&context, &manifest, out, no_cache).await,
+        Command::MediaStats => media_stats_command(&context).await,
+        Command::MediaGc {
+            quota_mib,
+            protect_days,
+        } => media_gc_command(&context, quota_mib, protect_days).await,
         Command::Seek { manifest, at, len } => seek_command(&context, &manifest, at, len).await,
         Command::Rooms => crate::rooms::rooms_command(&context).await,
         Command::Send(args) => crate::rooms::send_command(&context, &args).await,
@@ -318,6 +329,14 @@ impl Context {
         Ok((cache, stored.user_id))
     }
 
+    /// 這個 server 的媒體儲存池（local-cache-db.md §8），跟 `cache.db` 同層；金鑰是第四把子金鑰。
+    pub fn media_pool(&self) -> Result<MediaPool, SdkError> {
+        MediaPool::open(
+            &self.account()?.server_dir(),
+            self.vault()?.media_store_key(),
+        )
+    }
+
     fn open_cache(&self, server: &str) -> Result<Cache, SdkError> {
         let identity = CacheIdentity {
             server: server.to_string(),
@@ -447,16 +466,19 @@ async fn forget_account_command(context: &Context, user: &str, yes: bool) -> Res
         &identity,
     )?;
     let report = cache.forget_account(user)?;
-    // 池還沒有（local-cache-db.md §8 下一個 PR）；先把該刪的檔名印出來，不假裝刪過。
+    // DB 先、檔案後（local-cache-db.md §6 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。刪不掉只說一聲，下次 media-gc 的 sweep 會再收。
+    let pool = MediaPool::open(&account.server_dir(), context.vault()?.media_store_key())?;
+    let mut files_removed = 0u64;
     for file in &report.orphan_pool_files {
-        context.progress(format!(
-            "orphan pool file (no media pool yet, nothing deleted): {file}"
-        ));
+        match pool.remove(file) {
+            Ok(()) => files_removed += 1,
+            Err(error) => context.progress(format!("could not remove pool file {file}: {error}")),
+        }
     }
     print_json(&json!({
         "ok": true, "user": user,
         "events_removed": report.events_removed, "media_removed": report.media_removed,
-        "orphan_pool_files": report.orphan_pool_files,
+        "pool_files_removed": files_removed,
     }))
 }
 
@@ -702,12 +724,17 @@ async fn download_command(
     context: &Context,
     manifest_path: &Path,
     out: Option<PathBuf>,
+    no_cache: bool,
 ) -> Result<(), SdkError> {
     let manifest = read_manifest(context, manifest_path).await?;
     let out = match out {
         Some(out) => out,
         None => output_path_from_name(manifest.block.name.as_deref())?,
     };
+    // 登入中且沒說 --no-cache：走媒體快取（池裡有就不連 server；沒有就邊下邊進池、可續傳），再從池複製到 --out。
+    if !no_cache && context.token_override.is_none() {
+        return download_via_cache(context, &manifest, &out).await;
+    }
     let mut client = context.client().await?;
     let mut file = std::fs::File::create(&out)?;
     let result = client
@@ -729,6 +756,89 @@ async fn download_command(
         &json!({ "out": out.display().to_string(), "bytes": report.bytes, "chunks": report.chunks,
         "sha256_verified": report.sha256_verified }),
     )
+}
+
+/// `download` 的快取路徑（local-cache-db.md §8.7）：`media::fetch` 負責命中／續傳／進池，這裡只把池裡的檔複製出來。
+async fn download_via_cache(
+    context: &Context,
+    manifest: &Manifest,
+    out: &Path,
+) -> Result<(), SdkError> {
+    let (mut cache, _me) = context.cache().await?;
+    let pool = context.media_pool()?;
+    let mut client = context.client().await?;
+    let fetched = media::fetch(
+        &mut client,
+        manifest,
+        &mut cache,
+        &pool,
+        &mut |done, total| context.progress(format!("chunk {done}/{total}")),
+    )
+    .await?;
+    let pool_file = fetched
+        .entry
+        .pool_file
+        .as_deref()
+        .ok_or_else(|| SdkError::Io(std::io::Error::other("fetched media has no pool file")))?;
+    let mut reader = pool.open_read(pool_file)?;
+    let mut file = std::fs::File::create(out)?;
+    let bytes = std::io::copy(&mut reader, &mut file)?;
+    file.flush()?;
+    // sha256_verified 只在這次真的逐塊下載、整檔核對過才是 true；命中快取沒有重算，報 false，`hash` 給的是快取列記的校驗碼
+    // （PR #14 審查 rumia 🟡1）。
+    let (source, chunks, sha256_verified) = match fetched.outcome {
+        FetchOutcome::CacheHit => ("cache", 0, false),
+        FetchOutcome::Downloaded { chunks, .. } => {
+            ("server", chunks, manifest.block.sha256.is_some())
+        }
+    };
+    print_json(&json!({
+        "out": out.display().to_string(), "bytes": bytes, "chunks": chunks, "source": source,
+        "pool_file": pool_file, "hash": fetched.entry.hash, "sha256_verified": sha256_verified,
+    }))
+}
+
+async fn media_stats_command(context: &Context) -> Result<(), SdkError> {
+    let (cache, _me) = context.cache().await?;
+    let pool = context.media_pool()?;
+    let complete = cache.list_media_by_last_used()?;
+    let incomplete = cache.list_media_incomplete()?;
+    print_json(&json!({
+        "pool_dir": pool.dir().display().to_string(),
+        "bytes_on_disk": cache.media_bytes_on_disk()?,
+        "complete_files": complete.len(),
+        "incomplete_files": incomplete.len(),
+        "pending_on_disk": pool.list_pending()?.len(),
+        "oldest_last_used_at": complete.first().map(|entry| entry.last_used_at),
+    }))
+}
+
+async fn media_gc_command(
+    context: &Context,
+    quota_mib: u64,
+    protect_days: u64,
+) -> Result<(), SdkError> {
+    let (mut cache, _me) = context.cache().await?;
+    let pool = context.media_pool()?;
+    let protect = std::time::Duration::from_secs(protect_days * 24 * 3600);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let swept = media::sweep(&mut cache, &pool, protect, now)?;
+    let report = media::collect_garbage(&mut cache, &pool, quota_mib * 1024 * 1024, protect, now)?;
+    if report.still_over_quota {
+        context.progress(format!(
+            "media cache is still over quota ({} bytes > {} MiB); everything left is inside the {protect_days}-day protection window",
+            report.bytes_after, quota_mib
+        ));
+    }
+    print_json(&json!({
+        "bytes_before": report.bytes_before, "bytes_after": report.bytes_after,
+        "files_removed": report.files_removed, "still_over_quota": report.still_over_quota,
+        "swept_missing_files": swept.reset_rows, "swept_pending": swept.removed_pending,
+        "swept_orphan_files": swept.removed_orphan_files,
+    }))
 }
 
 async fn seek_command(

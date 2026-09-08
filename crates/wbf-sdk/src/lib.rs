@@ -9,6 +9,7 @@
 //! - `client` + `upload` + `download`：`WbfClient`，一條通道上的命令。
 //! - `login`：純 HTTP 拿 token。
 //! - `manifest`：CLI 印的 manifest 與上傳狀態檔。
+//! - `media_pool`：媒體儲存池（local-cache-db.md §8），整檔明文的加密池；`media`（feature `cache`）把下載管線、池與 `cache.db` 接起來。
 //! - `cache`（feature `cache`）：`cache.db`，SQLCipher 的本地快取（local-cache-db.md §6）；金鑰從 `vault` 來。
 //! - `vault`：本地金鑰庫（`local.key`、子金鑰、`session.sealed`），local-cache-db.md §4。
 //!
@@ -29,6 +30,9 @@ pub mod error;
 pub mod event_json;
 pub mod login;
 pub mod manifest;
+#[cfg(feature = "cache")]
+pub mod media;
+pub mod media_pool;
 pub mod protocol;
 pub mod upload;
 pub mod vault;
