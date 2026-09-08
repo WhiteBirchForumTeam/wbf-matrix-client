@@ -281,7 +281,7 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - **威脅模型的邊界（PR #13 審查 rumia 🟡1，維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
 - **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`（PR #13 審查 salvia 🟢3、cirno）。
 - **洞**：有 `r_seq` 的 room，「快取裡有哪些」就是 `r_seq` 的集合，缺的就是洞，不存 token。沒有 `r_seq` 的 room 只快取最新一段連續視窗。
-- **開 app 的同步**（UI 的順序，維護者定）：先刷房間清單（`room_list`）→ `Event/Recent` 帶這個帳號的 `cg_seq`，回來的事件逐則寫進 `events` 加 `events_synced_log`，`complete=false` 就帶 `before=next` 繼續，最後把 `latest_g_seq` 寫回 `sync_state` → 點進房間才刷該房歷史（`/messages`）。
+- **開 app 的同步**（UI 的順序，維護者定）：先刷房間清單（`room_list`）→ `Event/Recent` 帶這個帳號的 `cg_seq` 一窗一窗拉（每個 `Batch` 寫一次 DB：事件進 `events` 加 `events_synced_log`），`tc == limit` 就帶 `before = 最後的 ls` 再一窗；追平（`tc < limit`）才把**第一窗第一個 Batch 的 `fs`** 寫回 `sync_state`，中途斷線不推水位（server 的 pack-pipeline §6.4）→ 點進房間才刷該房歷史（`/messages`）。
 
 ### 6.1 實作備註
 

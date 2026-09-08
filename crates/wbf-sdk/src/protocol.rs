@@ -201,6 +201,18 @@ pub struct HelloAck {
     pub chunk_size_default: u32,
     pub chunk_size_large: u32,
     pub data_max_bytes: u64,
+    /// pack-pipeline §6：`Recent` 一窗的預設與上限；舊 server 沒有這些欄，None 時 client 用自己的預設（`RECENT_*`）。
+    #[serde(default)]
+    pub recent_default_limit: Option<u32>,
+    #[serde(default)]
+    pub recent_max_limit: Option<u32>,
+    #[serde(default)]
+    pub recent_default_batch: Option<u32>,
+    #[serde(default)]
+    pub recent_max_batch: Option<u32>,
+    /// pack-pipeline §2.1：每個 device 最多幾條 WS；超過 server 回 `TooManyConnections`。
+    #[serde(default)]
+    pub max_connections_per_device: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -269,55 +281,174 @@ pub const R_SEQ_KEY: &str = "org.wbftw.wbfuwunel.r_seq";
 /// `unsigned` 裡 server 加的本站全域序號，跨房間可比大小，client 當水位線。
 pub const G_SEQ_KEY: &str = "org.wbftw.wbfuwunel.g_seq";
 
-/// `Event/Recent` 的請求 meta。欄位順序就是線上的 JSON 順序（向量檔逐 byte 比），不要重排。
+/// `Recent` 的預設與上限（server 的 `wbf_recent_*`；pack-pipeline §6.1）。server 的 `Hello` 有給就用它的。
+pub const RECENT_DEFAULT_LIMIT: u32 = 320;
+pub const RECENT_MAX_LIMIT: u32 = 500;
+pub const RECENT_DEFAULT_BATCH: u32 = 10;
+pub const RECENT_MAX_BATCH: u32 = 100;
+
+/// `Event/Recent` 的請求 meta：**一窗**。欄位順序就是線上的 JSON 順序（向量檔逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RecentRequest {
-    /// 這頁最多幾則；server 的 `wbf_recent_max_limit`（預設 10000）以上會被 clamp。
+    /// 這一窗最多幾則；server 的 `wbf_recent_max_limit`（預設 500）以上會被 clamp，所以 client 也先 clamp（不然算不出「窗滿了沒」）。
     pub limit: u32,
     /// client 快取裡最新的 `g_seq`；None 或 0 = 沒有快取。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cg_seq: Option<i64>,
-    /// 補洞：只要比它舊的（上一頁 Ack 的 `next`）。
+    /// 下一窗：只要比它舊的（上一窗最後一個 Batch 的 `ls`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<i64>,
+    /// 每個 Batch 幾則；None 用 server 預設（10），上限 100。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<u32>,
 }
 
 /// Args:
-///     request: example: RecentRequest { limit: 10000, cg_seq: Some(4700), before: None }
-pub fn recent(request: &RecentRequest, seq: u32) -> Pack {
+///     request: example: RecentRequest { limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
+///     id: client 自己選的，回應（一串 `Batch`）抄它；不能是靠 seq 對回應的 0
+///     seq: 請求號
+pub fn recent(request: &RecentRequest, id: u64, seq: u32) -> Pack {
     Pack {
         kind: Kind::Event,
         subtype: event::RECENT,
         flags: 0,
-        id: 0,
+        id,
         seq,
         meta: serde_json::to_vec(request).expect("RecentRequest serializes"),
         data: Vec::new(),
     }
 }
 
-/// `Event/Recent` 的 Ack meta。
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct RecentAck {
-    pub returned: u32,
-    /// server 此刻最新的全域序號，存下來當下次的 `cg_seq`。
-    pub latest_g_seq: i64,
-    /// false = `cg_seq` 到 `latest_g_seq` 之間有洞，帶同一個 `cg_seq` 加 `before = next` 再問。
-    pub complete: bool,
-    pub next: Option<i64>,
+/// `Event/Batch` 的 meta（pack-pipeline §6.2）。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct BatchMeta {
+    /// total count：這一窗總共幾則（≤ limit），同一窗每個 Batch 都一樣。
+    pub tc: u32,
+    /// batch count：這個 Batch 幾則。
+    pub bc: u32,
+    /// 這批最新那則的 g_seq（空 Batch 是 0）。
+    pub fs: i64,
+    /// 這批最舊那則的 g_seq；最後一個 Batch 的 `ls` 是下一窗的 `before`。
+    pub ls: i64,
+    /// remain：這批之後這一窗還剩幾則；0 就是這窗結束。
+    pub r: u32,
 }
 
-/// `Event/Recent` Ack 的 data：事件的 JSON 陣列，新到舊，每則自帶 `room_id` 與 `unsigned` 的 `r_seq`／`g_seq`。
+/// `Recent` 的回應要是 `Event/Batch`：`IS_RESPONSE`、`id` 抄請求、`seq` 是這窗的第幾個 Batch（從 0 嚴格 +1）。
+/// `Control/Error` 照 `expect_ack` 一樣變 `Server`。
+///
+/// Args:
+///     request: 送出去的 `Recent`
+///     response: 收到的一個 pack
+///     expected_seq: 這是這窗的第幾個 Batch，example: 0
+/// Return:
+///     Ok(Pack)          Batch，交給 `parse_batch`
+///     Err(Server)       server 回 Error（例：走 HTTP 的 `Unsupported`）
+///     Err(Protocol)     不是 Batch、id 沒抄、seq 跳號
+pub fn expect_batch(request: &Pack, response: Pack, expected_seq: u32) -> Result<Pack, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    if response.kind != Kind::Event
+        || response.subtype != event::BATCH
+        || response.flags & flags::IS_RESPONSE == 0
+    {
+        return Err(SdkError::Protocol(format!(
+            "expected an Event/Batch response, got kind {:?} subtype {:#04x} flags {:#04x}",
+            response.kind, response.subtype, response.flags
+        )));
+    }
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "Batch id {} does not echo the Recent id {}",
+            response.id, request.id
+        )));
+    }
+    if response.seq != expected_seq {
+        return Err(SdkError::Protocol(format!(
+            "Batch seq {} where {expected_seq} was expected (batches must be 0, 1, 2, …)",
+            response.seq
+        )));
+    }
+    Ok(response)
+}
+
+/// 一個 Batch → meta 與事件 JSON（新到舊）。data 是 `bc` 則「u32 大端長度 ＋ 事件 JSON」。
 ///
 /// Return:
-///     Ok(Vec<Value>)    原樣的事件 JSON，這裡不解讀
-///     Err(Protocol)     data 不是 JSON 陣列
-pub fn parse_recent_events(ack: &Pack) -> Result<Vec<serde_json::Value>, SdkError> {
-    if ack.data.is_empty() {
-        return Ok(Vec::new());
+///     Ok((BatchMeta, Vec<Value>))
+///     Err(Protocol)     meta 不是 BatchMeta、長度前綴切不齊、則數與 `bc` 不符、事件不是 JSON、`tc < bc + r`
+pub fn parse_batch(batch: &Pack) -> Result<(BatchMeta, Vec<serde_json::Value>), SdkError> {
+    let meta: BatchMeta = parse_meta(batch)?;
+    let items = split_length_prefixed(&batch.data)?;
+    if items.len() as u32 != meta.bc {
+        return Err(SdkError::Protocol(format!(
+            "Batch meta says bc {} but data holds {} events",
+            meta.bc,
+            items.len()
+        )));
     }
-    serde_json::from_slice(&ack.data)
-        .map_err(|error| SdkError::Protocol(format!("Recent ack data: {error}")))
+    if meta.tc < meta.bc.saturating_add(meta.r) {
+        return Err(SdkError::Protocol(format!(
+            "Batch meta inconsistent: tc {} < bc {} + r {}",
+            meta.tc, meta.bc, meta.r
+        )));
+    }
+    if meta.bc > 0 && meta.fs < meta.ls {
+        return Err(SdkError::Protocol(format!(
+            "Batch fs {} < ls {} (events must be newest first)",
+            meta.fs, meta.ls
+        )));
+    }
+    let mut events = Vec::with_capacity(items.len());
+    for (position, item) in items.iter().enumerate() {
+        let event: serde_json::Value = serde_json::from_slice(item).map_err(|error| {
+            SdkError::Protocol(format!("Batch event {position} is not JSON: {error}"))
+        })?;
+        events.push(event);
+    }
+    Ok((meta, events))
+}
+
+/// `u32 大端長度 ＋ bytes` 重複到底。多一個 byte、長度指過檔尾都是錯。
+///
+/// Args:
+///     data: example: [0,0,0,2, b'{', b'}']
+/// Return:
+///     Ok(Vec<&[u8]>)    每一段
+///     Err(Protocol)     切不齊
+pub fn split_length_prefixed(data: &[u8]) -> Result<Vec<&[u8]>, SdkError> {
+    let mut items = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        if rest.len() < 4 {
+            return Err(SdkError::Protocol(format!(
+                "length-prefixed data ends with {} stray byte(s)",
+                rest.len()
+            )));
+        }
+        let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        rest = &rest[4..];
+        if rest.len() < len {
+            return Err(SdkError::Protocol(format!(
+                "length prefix {len} runs past the end ({} bytes left)",
+                rest.len()
+            )));
+        }
+        items.push(&rest[..len]);
+        rest = &rest[len..];
+    }
+    Ok(items)
+}
+
+/// `split_length_prefixed` 的反向（測試與 fake server 用）。
+pub fn join_length_prefixed(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        out.extend_from_slice(&(item.len() as u32).to_be_bytes());
+        out.extend_from_slice(item);
+    }
+    out
 }
 
 /// 從事件 JSON 的 `unsigned` 讀 server 加的序號；沒有就是 None（非 fork server、或舊事件），呼叫者顯式判斷，不猜。

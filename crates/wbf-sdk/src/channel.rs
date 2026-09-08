@@ -1,6 +1,9 @@
 //! 一個 pack 進、一個 pack 出的通道（線上規格 §1）：WebSocket 主要、HTTP 給測試與腳本。
 //!
 //! 兩者都是「送一個、等一個」；連發與滑動窗口不在 v1（本機 64 KiB 一塊來回夠快，先求對）。
+//! 唯一的例外是 `request_stream`：`Event/Recent` 的回應是一串 `Batch`（pack-pipeline §6），送一個、收到呼叫者說停。
+
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use http::header::AUTHORIZATION;
@@ -23,6 +26,19 @@ pub trait PackChannel {
     ///     Ok(Pack)          對方回的那個 pack（可能是 Error pack，這裡不解讀）
     ///     Err(SdkError)     `Network`（送不出、收不到）、`Protocol`／`Integrity`（回來的 bytes 解不開）
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError>;
+
+    /// 送一個、收多個：每收到一個 pack 就叫 `on_pack`，它回 `Ok(true)` 繼續等下一個、`Ok(false)` 停。
+    /// 每個 pack 之間最多等 `per_pack_timeout`。HTTP 一次只回一個 pack，所以只叫一次 `on_pack`。
+    ///
+    /// Return:
+    ///     Ok(())            `on_pack` 說停了
+    ///     Err(SdkError)     `Network`（逾時、斷線）、`on_pack` 回的錯原樣往上
+    async fn request_stream(
+        &mut self,
+        pack: Pack,
+        per_pack_timeout: Duration,
+        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+    ) -> Result<(), SdkError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +97,26 @@ impl PackChannel for Channel {
             Channel::Http(channel) => channel.request(pack).await,
         }
     }
+
+    async fn request_stream(
+        &mut self,
+        pack: Pack,
+        per_pack_timeout: Duration,
+        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+    ) -> Result<(), SdkError> {
+        match self {
+            Channel::WebSocket(channel) => {
+                channel
+                    .request_stream(pack, per_pack_timeout, on_pack)
+                    .await
+            }
+            Channel::Http(channel) => {
+                channel
+                    .request_stream(pack, per_pack_timeout, on_pack)
+                    .await
+            }
+        }
+    }
 }
 
 /// `GET /_wbf/v1/ws`，一個 binary message 一個 pack。
@@ -118,8 +154,8 @@ impl WsChannel {
     }
 }
 
-impl PackChannel for WsChannel {
-    async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
+impl WsChannel {
+    async fn send_pack(&mut self, pack: Pack) -> Result<(), SdkError> {
         let bytes = pack.encode()?;
         tokio::time::timeout(
             REQUEST_TIMEOUT,
@@ -127,9 +163,13 @@ impl PackChannel for WsChannel {
         )
         .await
         .map_err(|_| SdkError::Network("websocket send timed out".into()))?
-        .map_err(|error| SdkError::Network(format!("websocket send: {error}")))?;
+        .map_err(|error| SdkError::Network(format!("websocket send: {error}")))
+    }
+
+    /// 等下一個 binary message；ping／pong／文字 frame 跳過。
+    async fn receive_pack(&mut self, timeout: Duration) -> Result<Pack, SdkError> {
         loop {
-            let message = tokio::time::timeout(REQUEST_TIMEOUT, self.socket.next())
+            let message = tokio::time::timeout(timeout, self.socket.next())
                 .await
                 .map_err(|_| SdkError::Network("websocket response timed out".into()))?
                 .ok_or_else(|| {
@@ -147,6 +187,28 @@ impl PackChannel for WsChannel {
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
                     continue
                 }
+            }
+        }
+    }
+}
+
+impl PackChannel for WsChannel {
+    async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
+        self.send_pack(pack).await?;
+        self.receive_pack(REQUEST_TIMEOUT).await
+    }
+
+    async fn request_stream(
+        &mut self,
+        pack: Pack,
+        per_pack_timeout: Duration,
+        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+    ) -> Result<(), SdkError> {
+        self.send_pack(pack).await?;
+        loop {
+            let response = self.receive_pack(per_pack_timeout).await?;
+            if !on_pack(response)? {
+                return Ok(());
             }
         }
     }
@@ -174,6 +236,18 @@ impl HttpChannel {
 }
 
 impl PackChannel for HttpChannel {
+    /// HTTP 一請求一回應：串流的請求（`Recent`）server 會回 `Error(Unsupported)`，這裡照樣交給 `on_pack` 去判。
+    async fn request_stream(
+        &mut self,
+        pack: Pack,
+        _per_pack_timeout: Duration,
+        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+    ) -> Result<(), SdkError> {
+        let response = self.request(pack).await?;
+        on_pack(response)?;
+        Ok(())
+    }
+
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
         let bytes = pack.encode()?;
         let response = self

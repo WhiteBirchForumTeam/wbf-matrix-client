@@ -39,6 +39,12 @@ pub struct FakeServer {
     pub create_ack_header_is_upload_id: bool,
     /// 故障：下一個回應的標頭 id 填這個值（模擬不抄回的 server），只觸發一次。
     pub wrong_response_id_once: Option<u64>,
+    /// `Event/Recent` 的資料：事件 JSON，`unsigned` 帶 `g_seq`（照 g_seq 由新到舊排好）。
+    pub recent_events: Vec<serde_json::Value>,
+    /// `Hello.features` 多宣告的（例：`["recent", "batch"]`）。
+    pub extra_features: Vec<&'static str>,
+    /// 故障：這窗送到第 n 個 Batch 之後就斷線（回 Network 錯），只觸發一次。
+    pub drop_stream_after_batches: Option<u32>,
 }
 
 impl FakeServer {
@@ -53,9 +59,17 @@ impl FakeServer {
         self.requests
             .push((request.kind, request.subtype, request.seq));
         let result = match (request.kind, request.subtype) {
+            (Kind::Event, wbf_wire::pack::event::RECENT) => Err((
+                "Unsupported",
+                "Event/Recent streams; use the WebSocket channel".to_string(),
+                serde_json::json!({}),
+            )),
             (Kind::Control, control::HELLO) => Ok((
-                serde_json::json!({ "protocol": 1, "server": "fake", "features": ["upload", "download"],
-                    "chunk_size_default": 65536, "chunk_size_large": 1048576, "data_max_bytes": 16781312 }),
+                serde_json::json!({ "protocol": 1, "server": "fake",
+                    "features": self.advertised_features(),
+                    "chunk_size_default": 65536, "chunk_size_large": 1048576, "data_max_bytes": 16781312,
+                    "recent_default_limit": 320, "recent_max_limit": 500, "recent_default_batch": 10, "recent_max_batch": 100,
+                    "max_connections_per_device": 4 }),
                 Vec::new(),
             )),
             (Kind::Control, control::PING) => {
@@ -355,7 +369,101 @@ fn mxc_of(meta: &[u8]) -> Result<String, (&'static str, String, serde_json::Valu
     ))
 }
 
+impl FakeServer {
+    fn advertised_features(&self) -> Vec<&'static str> {
+        let mut features = vec!["upload", "download"];
+        features.extend(self.extra_features.iter().copied());
+        features
+    }
+
+    /// `Event/Recent` 一窗 → 一串 `Batch`（pack-pipeline §6）：只在 `(cg_seq, before)` 之間數 `limit` 則，每 `batch` 則一個 Batch。
+    fn recent_batches(&self, request: &Pack) -> Vec<Pack> {
+        let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
+        let limit = meta["limit"].as_u64().unwrap_or(320).clamp(1, 500) as usize;
+        let batch = meta["batch"].as_u64().unwrap_or(10).clamp(1, 100) as usize;
+        let cg_seq = meta["cg_seq"].as_i64().unwrap_or(0);
+        let before = meta["before"].as_i64();
+        let g_seq_of = |event: &serde_json::Value| {
+            event["unsigned"]["org.wbftw.wbfuwunel.g_seq"]
+                .as_i64()
+                .unwrap_or(0)
+        };
+        let window: Vec<&serde_json::Value> = self
+            .recent_events
+            .iter()
+            .filter(|event| {
+                let g = g_seq_of(event);
+                g > cg_seq && before.is_none_or(|before| g < before)
+            })
+            .take(limit)
+            .collect();
+        let tc = window.len();
+        let mut packs = Vec::new();
+        let mut sent = 0usize;
+        let make = |seq: u32, slice: &[&serde_json::Value], sent_after: usize| {
+            let items: Vec<Vec<u8>> = slice
+                .iter()
+                .map(|event| event.to_string().into_bytes())
+                .collect();
+            let (fs, ls) = match (slice.first(), slice.last()) {
+                (Some(first), Some(last)) => (g_seq_of(first), g_seq_of(last)),
+                _ => (0, 0),
+            };
+            Pack {
+                kind: Kind::Event,
+                subtype: wbf_wire::pack::event::BATCH,
+                flags: flags::IS_RESPONSE,
+                id: request.id,
+                seq,
+                meta: serde_json::json!({ "bc": slice.len(), "fs": fs, "ls": ls, "r": tc - sent_after, "tc": tc })
+                    .to_string()
+                    .into_bytes(),
+                data: wbf_sdk::protocol::join_length_prefixed(&items),
+            }
+        };
+        if tc == 0 {
+            return vec![make(0, &[], 0)];
+        }
+        let mut seq = 0u32;
+        while sent < tc {
+            let end = (sent + batch).min(tc);
+            packs.push(make(seq, &window[sent..end], end));
+            sent = end;
+            seq += 1;
+        }
+        packs
+    }
+}
+
 impl PackChannel for FakeServer {
+    async fn request_stream(
+        &mut self,
+        pack: Pack,
+        _per_pack_timeout: std::time::Duration,
+        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+    ) -> Result<(), SdkError> {
+        let bytes = pack.encode()?;
+        let decoded = Pack::decode(&bytes)?;
+        self.requests
+            .push((decoded.kind, decoded.subtype, decoded.seq));
+        if (decoded.kind, decoded.subtype) != (Kind::Event, wbf_wire::pack::event::RECENT) {
+            let response = self.handle(&decoded);
+            on_pack(Pack::decode(&response.encode()?)?)?;
+            return Ok(());
+        }
+        let batches = self.recent_batches(&decoded);
+        let drop_after = self.drop_stream_after_batches.take();
+        for (index, batch) in batches.into_iter().enumerate() {
+            if drop_after.is_some_and(|after| index as u32 >= after) {
+                return Err(SdkError::Network("simulated disconnect mid-window".into()));
+            }
+            if !on_pack(Pack::decode(&batch.encode()?)?)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
         // 走一次真正的編碼與解碼，pack 層的問題也會在這裡冒出來。
         let bytes = pack.encode()?;
@@ -373,5 +481,16 @@ impl PackChannel for FakeServer {
 impl PackChannel for &mut FakeServer {
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
         (**self).request(pack).await
+    }
+
+    async fn request_stream(
+        &mut self,
+        pack: Pack,
+        per_pack_timeout: std::time::Duration,
+        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+    ) -> Result<(), SdkError> {
+        (**self)
+            .request_stream(pack, per_pack_timeout, on_pack)
+            .await
     }
 }

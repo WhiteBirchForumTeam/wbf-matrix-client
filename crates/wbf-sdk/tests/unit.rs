@@ -231,10 +231,12 @@ fn length_helpers_reject_zero_chunk_size_and_out_of_range_index() {
     assert_eq!(chunk_count(u64::MAX, 1), None, "more chunks than indices");
 }
 
-/// `Event/Recent` 對著 server 產生的 `wbf-vectors.json`：請求要逐 byte 一樣（meta 的鍵序也是），Ack 要解得出來。
+/// `Event/Recent` 對著 server 產生的 `wbf-vectors.json`（pack-pipeline §6）：請求要逐 byte 一樣（meta 的鍵序也是，
+/// `id` 是 client 選的），回應是 `Event/Batch`，data 是 u32 大端長度前綴的事件。
 #[test]
-fn event_recent_matches_server_vectors() {
-    use wbf_sdk::protocol::{self, event_seqs, parse_recent_events, RecentAck, RecentRequest};
+fn event_recent_and_batch_match_server_vectors() {
+    use wbf_sdk::protocol::{self, event_seqs, BatchMeta, RecentRequest};
+    use wbf_sdk::SdkError;
     use wbf_wire::Pack;
     let vectors: serde_json::Value =
         serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
@@ -255,28 +257,31 @@ fn event_recent_matches_server_vectors() {
                 limit: 2,
                 cg_seq: None,
                 before: None,
+                batch: Some(1),
             },
         ),
         (
             "recent_with_cached_g_seq",
             RecentRequest {
-                limit: 10000,
+                limit: 320,
                 cg_seq: Some(4700),
                 before: None,
+                batch: Some(10),
             },
         ),
         (
-            "recent_older_page",
+            "recent_next_window",
             RecentRequest {
-                limit: 10000,
+                limit: 320,
                 cg_seq: Some(4700),
                 before: Some(4711),
+                batch: Some(10),
             },
         ),
     ];
     for (name, request) in expected {
         let vector = pack_named(name);
-        let ours = protocol::recent(&request, vector.seq);
+        let ours = protocol::recent(&request, vector.id, vector.seq);
         assert_eq!(ours, vector, "{name}");
         assert_eq!(
             ours.encode().unwrap(),
@@ -285,33 +290,98 @@ fn event_recent_matches_server_vectors() {
         );
     }
 
-    let ack = pack_named("ack_recent");
+    // 一窗兩個 Batch：seq 0 的 r = 1，seq 1 的 r = 0；id 都抄請求的 10。
     let request = pack_named("recent_first_start");
-    let ack = protocol::expect_ack(&request, ack).expect("ack echoes seq 10");
-    let meta: RecentAck = protocol::parse_meta(&ack).unwrap();
+    let first = protocol::expect_batch(&request, pack_named("batch_first"), 0).expect("seq 0");
+    let (meta, events) = protocol::parse_batch(&first).unwrap();
     assert_eq!(
         meta,
-        RecentAck {
-            returned: 2,
-            latest_g_seq: 4712,
-            complete: false,
-            next: Some(4711)
+        BatchMeta {
+            tc: 2,
+            bc: 1,
+            fs: 4712,
+            ls: 4712,
+            r: 1
         }
     );
-    let events = parse_recent_events(&ack).unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(
-        event_seqs(&events[0]),
-        (Some(2), Some(4712)),
-        "newest first"
-    );
-    assert_eq!(event_seqs(&events[1]), (Some(1), Some(4711)));
+    assert_eq!(events.len(), 1);
+    assert_eq!(event_seqs(&events[0]), (Some(2), Some(4712)));
     assert_eq!(events[0]["room_id"], "!r:localhost");
+    let last = protocol::expect_batch(&request, pack_named("batch_last"), 1).expect("seq 1");
+    let (meta, events) = protocol::parse_batch(&last).unwrap();
+    assert_eq!(
+        meta,
+        BatchMeta {
+            tc: 2,
+            bc: 1,
+            fs: 4711,
+            ls: 4711,
+            r: 0
+        }
+    );
+    assert_eq!(event_seqs(&events[0]), (Some(1), Some(4711)));
+    // seq 跳號、id 沒抄都要拒。
+    assert!(protocol::expect_batch(&request, pack_named("batch_last"), 0).is_err());
+    let other = pack_named("recent_with_cached_g_seq");
+    assert!(protocol::expect_batch(&other, pack_named("batch_first"), 0).is_err());
+    // 空窗：一個 bc = 0、r = 0、fs = ls = 0 的 Batch。
+    let empty = protocol::expect_batch(&other, pack_named("batch_empty_window"), 0).unwrap();
+    let (meta, events) = protocol::parse_batch(&empty).unwrap();
+    assert_eq!(
+        meta,
+        BatchMeta {
+            tc: 0,
+            bc: 0,
+            fs: 0,
+            ls: 0,
+            r: 0
+        }
+    );
+    assert!(events.is_empty());
+    // 走 HTTP 的 Recent：server 回 Error(Unsupported)，expect_batch 變 Server 錯。
+    match protocol::expect_batch(&request, pack_named("error_unsupported"), 0) {
+        Err(SdkError::Server { code, .. }) => assert_eq!(code, "Unsupported"),
+        other => panic!("expected Server(Unsupported), got {other:?}"),
+    }
+    match protocol::server_error(&pack_named("error_too_many_connections").meta) {
+        SdkError::Server { code, meta, .. } => {
+            assert_eq!(code, "TooManyConnections");
+            assert_eq!(meta["max_connections"], 4);
+        }
+        other => panic!("{other:?}"),
+    }
     assert_eq!(
         event_seqs(&serde_json::json!({ "content": {} })),
         (None, None),
         "no unsigned = no seq"
     );
+}
+
+/// Batch data 的 u32 前綴切法：round trip、空的、多一個 byte、長度指過檔尾（server review 建議先落這個測試）。
+#[test]
+fn length_prefixed_events_round_trip_and_reject_misaligned_data() {
+    use wbf_sdk::protocol::{join_length_prefixed, split_length_prefixed};
+    let items: Vec<Vec<u8>> = vec![b"{}".to_vec(), Vec::new(), vec![0xffu8; 70000]];
+    let joined = join_length_prefixed(&items);
+    assert_eq!(joined.len(), 4 * 3 + 2 + 70000);
+    let split = split_length_prefixed(&joined).unwrap();
+    assert_eq!(split.len(), 3);
+    assert_eq!(split[0], b"{}");
+    assert!(split[1].is_empty());
+    assert_eq!(split[2].len(), 70000);
+    assert!(split_length_prefixed(&[]).unwrap().is_empty());
+    assert!(
+        split_length_prefixed(&joined[..joined.len() - 1]).is_err(),
+        "truncated last item"
+    );
+    assert!(split_length_prefixed(&[0, 0, 0]).is_err(), "stray bytes");
+    assert!(
+        split_length_prefixed(&[0, 0, 0, 9, 1]).is_err(),
+        "prefix past end"
+    );
+    let mut extra = joined.clone();
+    extra.push(0);
+    assert!(split_length_prefixed(&extra).is_err(), "one trailing byte");
 }
 
 /// `Event/Send` 的 meta 鍵序照 media-attachments.md §3：room_id、type、txn_id、attachments。

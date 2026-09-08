@@ -131,8 +131,9 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         Command::Watch(args) => crate::rooms::watch_command(&context, &args).await,
         Command::Recent {
             limit,
+            batch,
             from_scratch,
-        } => crate::recent::recent_command(&context, limit, from_scratch).await,
+        } => crate::recent::recent_command(&context, limit, batch, from_scratch).await,
         Command::Read {
             room,
             limit,
