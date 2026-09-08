@@ -8,7 +8,7 @@
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（`accounts`／`forget-account`／`--account`）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | §8 媒體儲存池 | ⬜ 設計 2026-09-07 依維護者糾正重寫（一個池、一把鑰、整檔不分片） |
+> | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
 ## 0. 一句話
 
@@ -303,6 +303,8 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - 池只用**一把金鑰**：第四把子金鑰 `"wbf-matrix-client media store v1"`（§4）。沒有每檔金鑰。
 - 為了「順序 append」與「從中間讀」，池內部落地會分段加密（gocryptfs、Cryptomator、age 都是這樣）。**那是池的實作細節，對上層完全隱藏**；設計文件不規定段大小，實作時定、寫在程式的 docstring。
 
+**實作（`wbf-sdk::media_pool`，2026-09-08）**：檔頭 32 byte（magic `WBFP`、版本、段大小、每檔隨機的 16 byte nonce_base）；之後每段明文 64 KiB（只有最後一段可短）各自 XChaCha20-Poly1305，nonce = nonce_base ‖ 段號、AAD = `"wbf-media-pool v1"` ‖ nonce_base ‖ 段號，密文段 = 明文 + 16 byte 標籤、固定偏移所以能隨機讀。對上層是 `PoolWriter`（`Write`，順序 append）與 `PoolReader`（`Read + Seek`，明文位置）。段號進 nonce 與 AAD：把第 3 段搬到第 5 段解不開；nonce_base 每檔隨機：同內容的兩份暫存檔密文不同，去重靠 hash 不靠密文。
+
 存的是**解密後的明文**（維護者：「每塊解密後就放這裡」），不存 server 密文：server 密文的金鑰是每則訊息各自的（事件區塊裡的 `key`），本地要留一堆房間金鑰才讀得回來；明文進池，本地只有一套金鑰制度。
 
 ### 8.2 磁碟上
@@ -331,6 +333,12 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 - **寫入順序**：先 append 檔、再更新 DB；反過來會出現「DB 說有、檔案沒有」。讀的時候 `complete = 1` 才當成有快取。
 - 一塊驗證失敗：這次下載中止、檔截回上次快照，下次續。與下載端現有的規則一致（完整性每塊各自驗）。
 
+**實作（`wbf-sdk::media`，2026-09-08）**：
+- `fetch(client, manifest, cache, pool)`：`media_begin` 建或取列 → 完整且檔在就 `CacheHit`（touch）→ 不然決定續傳點（上次快照的 `chunks_written`，而且 `chunk_size` 要一樣）→ `pool.resume_pending` 或 `create_pending` → 逐塊 `read_and_open_chunk` 寫進 `PoolWriter`，每 1.5 秒 `sync` 加 `media_progress` → 完成 `finish()` 拿 BLAKE3 → `adopt`（同 hash 去重）→ `media_finish`。中止時 DB 停在上次快照、檔留著。
+- **暫定段**：進度快照時記憶體裡湊不滿 64 KiB 的那段也要落地，不然快照指到的資料不在磁碟上、續不了。`PoolWriter::sync()` 把它先封成一個短段寫在檔尾，下次湊滿再把檔截回該段起點重封（每 1.5 秒重寫最多 64 KiB，可忽略）。續傳時 `resume_pending(trusted_len)` 解到 trusted_len 為止、把最後那個不完整段的明文放回記憶體、檔截到該段起點，BLAKE3 從頭重算。
+- 暫存檔名是 `m<media.id>`，在 `media/pending/`。
+- 實跑（2026-09-08，本機 wbfuwunel，40 MiB、64 KiB 塊、HTTP 通道）：在第 204 塊殺掉，續傳從第 172 塊（上次快照）開始，sha256 對。
+
 ### 8.4 DB 的指針
 
 表在 §6（`media` 與 `event_media`）。沒有 bitmap：檔要嘛完整、要嘛是一個「寫到第 N 塊」的半成品，沒有中間有洞的狀態。
@@ -354,6 +362,8 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 - 有把手打開的檔不刪；讀一次就更新 `last_used_at`，所以正在看的東西自然在保護期內。
 - 事件快取不受這個配額（§1）。
 
+**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now)` 啟動掃：DB 說完整但檔不在 → reset；半成品超過保護期 → 刪暫存檔加 reset；`pending/` 裡沒有列認領的 → 刪。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（CLI 規格 §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
+
 ### 8.6 先不做的
 
 - **串流與 seek 對著池讀**：之後 UI 要播中間一段，是對著池裡的完整檔 `Read + Seek`，不是對著分片；沒下載完的檔就先下載完（或只走 server 的 seek，不進池）。哪一種等 UI 那版再定。
@@ -362,7 +372,9 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 ### 8.7 與下載管線的接法
 
 `download` 現在是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；加快取就是：開始前問 `media` 有沒有 `complete = 1` 的列，有就直接從池裡讀整檔；沒有就照 §8.3 邊下邊 append。
-邊界仍在 `wbf-sdk`：CLI 與 UI 只看到一個檔的把手，不知道底下是池還是 server。
+邊界仍在 `wbf-sdk`：CLI 與 UI 只看到一個檔的把手（`PoolReader`），不知道底下是池還是 server。
+
+做法（2026-09-08）：`download.rs` 的 `read_and_open_chunk` 開成 crate 內可見，`media::fetch` 用它逐塊拿；`WbfClient::download`（直接寫到 `Write`）留著給 `--no-cache` 與 `--token` 模式。三個模組的關係：`cache` 不知道池、`media_pool` 不知道 DB、下載管線不知道兩者，只有 `media.rs` 同時碰三者。
 
 ## 9. 還開著的
 

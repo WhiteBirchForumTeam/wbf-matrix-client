@@ -483,24 +483,139 @@ impl Cache {
                 "SELECT mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
                  FROM media WHERE mxc = ?1",
                 params![mxc],
-                |row| {
-                    Ok(MediaEntry {
-                        mxc: row.get(0)?,
-                        pool_file: row.get(1)?,
-                        name: row.get(2)?,
-                        mimetype: row.get(3)?,
-                        file_size: row.get::<_, i64>(4)? as u64,
-                        chunk_size: row.get::<_, i64>(5)? as u32,
-                        chunks_written: row.get::<_, i64>(6)? as u64,
-                        complete: row.get::<_, i64>(7)? == 1,
-                        bytes_on_disk: row.get::<_, i64>(8)? as u64,
-                        created_at: row.get(9)?,
-                        last_used_at: row.get(10)?,
-                    })
-                },
+                media_entry_from_row,
             )
             .optional()
             .map_err(db_error)
+    }
+
+    /// 下載前叫：沒有這個 mxc 的列就建（`download --manifest` 可能沒有對應的事件），有就原樣回。
+    ///
+    /// Return:
+    ///     Ok(MediaEntry)   `complete` 是 true 就不用下載了
+    pub fn media_begin(
+        &mut self,
+        mxc: &str,
+        name: Option<&str>,
+        mimetype: Option<&str>,
+        file_size: u64,
+        chunk_size: u32,
+    ) -> Result<MediaEntry, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        media_row_id(&transaction, mxc, name, mimetype, file_size, chunk_size)?;
+        transaction.commit().map_err(db_error)?;
+        self.find_media(mxc)?
+            .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished after insert")))
+    }
+
+    /// `media.id`：池裡暫存檔的名字（§8.2）。
+    pub fn media_pending_name(&self, mxc: &str) -> Result<Option<String>, SdkError> {
+        self.connection
+            .query_row("SELECT id FROM media WHERE mxc = ?1", params![mxc], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()
+            .map_err(db_error)
+            .map(|id| id.map(|id| format!("m{id}")))
+    }
+
+    /// 進度快照（§8.3：記憶體每 1–2 秒 flush 一次）。`chunk_size` 也一起寫：續傳截檔用的是下載時的塊大小。
+    pub fn media_progress(
+        &mut self,
+        mxc: &str,
+        chunks_written: u64,
+        chunk_size: u32,
+    ) -> Result<(), SdkError> {
+        self.connection
+            .execute(
+                "UPDATE media SET chunks_written = ?2, chunk_size = ?3, complete = 0 WHERE mxc = ?1",
+                params![mxc, chunks_written as i64, chunk_size as i64],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// 下載完、檔已 adopt 進池：寫齊 `pool_file`、`complete`、`bytes_on_disk`。
+    pub fn media_finish(
+        &mut self,
+        mxc: &str,
+        pool_file: &str,
+        chunks_written: u64,
+        bytes_on_disk: u64,
+    ) -> Result<(), SdkError> {
+        let now = now_millis();
+        self.connection
+            .execute(
+                "UPDATE media SET pool_file = ?2, complete = 1, chunks_written = ?3, bytes_on_disk = ?4, last_used_at = ?5 WHERE mxc = ?1",
+                params![mxc, pool_file, chunks_written as i64, bytes_on_disk as i64, now],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// 這個檔的本地副本不算數了（壞掉、被刪）：回到「還沒下載」。列留著（事件還指著它）。
+    pub fn media_reset(&mut self, mxc: &str) -> Result<(), SdkError> {
+        self.connection
+            .execute(
+                "UPDATE media SET pool_file = NULL, complete = 0, chunks_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
+                params![mxc],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// 還有幾個 `media` 列指著這個池檔（去重過的檔刪之前要問）。
+    pub fn media_references(&self, pool_file: &str) -> Result<u64, SdkError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM media WHERE pool_file = ?1",
+                params![pool_file],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(db_error)
+    }
+
+    /// 配額用：完成檔的 `bytes_on_disk` 加總（同一個池檔被多個 mxc 指著只算一次）。
+    pub fn media_bytes_on_disk(&self) -> Result<u64, SdkError> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(bytes), 0) FROM (SELECT MAX(bytes_on_disk) AS bytes FROM media WHERE complete = 1 GROUP BY pool_file)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|sum| sum as u64)
+            .map_err(db_error)
+    }
+
+    /// 完成檔，照 `last_used_at` 由舊到新（LRU 清理用，§8.5）。
+    pub fn list_media_by_last_used(&self) -> Result<Vec<MediaEntry>, SdkError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                 FROM media WHERE complete = 1 ORDER BY last_used_at ASC, mxc",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], media_entry_from_row)
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    /// 半成品（`complete = 0` 但 `chunks_written > 0`），啟動時掃孤兒用。
+    pub fn list_media_incomplete(&self) -> Result<Vec<MediaEntry>, SdkError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                 FROM media WHERE complete = 0 AND chunks_written > 0 ORDER BY mxc",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], media_entry_from_row)
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
     /// 看過一次：更新 `last_used_at`（配額的保護期靠它，§8.5）。
@@ -586,6 +701,14 @@ impl Cache {
         })
     }
 
+    /// 測試用後門：跑一句 UPDATE／DELETE（例如把 `last_used_at` 撥到很久以前）。🚫 正式碼不用；參數只收字串。
+    #[doc(hidden)]
+    pub fn debug_execute(&mut self, sql: &str, params: &[&String]) -> Result<usize, SdkError> {
+        self.connection
+            .execute(sql, rusqlite::params_from_iter(params.iter()))
+            .map_err(db_error)
+    }
+
     /// 除錯與測試用：一張表有幾列。
     pub fn count_rows(&self, table: &str) -> Result<u64, SdkError> {
         const TABLES: [&str; 9] = [
@@ -609,6 +732,22 @@ impl Cache {
             .map(|count| count as u64)
             .map_err(db_error)
     }
+}
+
+fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry> {
+    Ok(MediaEntry {
+        mxc: row.get(0)?,
+        pool_file: row.get(1)?,
+        name: row.get(2)?,
+        mimetype: row.get(3)?,
+        file_size: row.get::<_, i64>(4)? as u64,
+        chunk_size: row.get::<_, i64>(5)? as u32,
+        chunks_written: row.get::<_, i64>(6)? as u64,
+        complete: row.get::<_, i64>(7)? == 1,
+        bytes_on_disk: row.get::<_, i64>(8)? as u64,
+        created_at: row.get(9)?,
+        last_used_at: row.get(10)?,
+    })
 }
 
 struct EventRow {
