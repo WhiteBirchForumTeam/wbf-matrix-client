@@ -19,7 +19,7 @@ use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
 /// 換 schema 就加一，舊檔整個重建（§1）。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// `events.kind` 的整數碼。順序是格式的一部分，只能往後加。
 const KIND_TEXT: i64 = 0;
@@ -77,6 +77,9 @@ pub struct MediaEntry {
     pub pool_file: Option<String>,
     pub name: Option<String>,
     pub mimetype: Option<String>,
+    /// 明文的校驗碼，`<algo>:<hex>`：事件區塊有帶就是 `sha256:…`（上傳者算的），沒帶就下載完填 `blake3:…`（我們算的，同 `pool_file`）。
+    /// 還沒下載完而區塊也沒帶時是 None。
+    pub hash: Option<String>,
     pub file_size: u64,
     pub chunk_size: u32,
     pub chunks_written: u64,
@@ -293,6 +296,7 @@ impl Cache {
                         &attachment.mxc,
                         attachment.block.name.as_deref(),
                         attachment.block.mimetype.as_deref(),
+                        block_hash(attachment.block.sha256.as_deref()).as_deref(),
                         attachment.block.file_size.unwrap_or(0),
                         attachment.block.chunk_size,
                     )?;
@@ -480,7 +484,7 @@ impl Cache {
     pub fn find_media(&self, mxc: &str) -> Result<Option<MediaEntry>, SdkError> {
         self.connection
             .query_row(
-                "SELECT mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
                  FROM media WHERE mxc = ?1",
                 params![mxc],
                 media_entry_from_row,
@@ -498,11 +502,20 @@ impl Cache {
         mxc: &str,
         name: Option<&str>,
         mimetype: Option<&str>,
+        block_sha256_hex: Option<&str>,
         file_size: u64,
         chunk_size: u32,
     ) -> Result<MediaEntry, SdkError> {
         let transaction = self.connection.transaction().map_err(db_error)?;
-        media_row_id(&transaction, mxc, name, mimetype, file_size, chunk_size)?;
+        media_row_id(
+            &transaction,
+            mxc,
+            name,
+            mimetype,
+            block_hash(block_sha256_hex).as_deref(),
+            file_size,
+            chunk_size,
+        )?;
         transaction.commit().map_err(db_error)?;
         self.find_media(mxc)?
             .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished after insert")))
@@ -546,7 +559,8 @@ impl Cache {
         let now = now_millis();
         self.connection
             .execute(
-                "UPDATE media SET pool_file = ?2, complete = 1, chunks_written = ?3, bytes_on_disk = ?4, last_used_at = ?5 WHERE mxc = ?1",
+                "UPDATE media SET pool_file = ?2, complete = 1, chunks_written = ?3, bytes_on_disk = ?4, last_used_at = ?5,
+                   hash = COALESCE(hash, 'blake3:' || ?2) WHERE mxc = ?1",
                 params![mxc, pool_file, chunks_written as i64, bytes_on_disk as i64, now],
             )
             .map_err(db_error)?;
@@ -593,7 +607,7 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
                  FROM media WHERE complete = 1 ORDER BY last_used_at ASC, mxc",
             )
             .map_err(db_error)?;
@@ -608,7 +622,7 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
                  FROM media WHERE complete = 0 AND chunks_written > 0 ORDER BY mxc",
             )
             .map_err(db_error)?;
@@ -740,13 +754,14 @@ fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry>
         pool_file: row.get(1)?,
         name: row.get(2)?,
         mimetype: row.get(3)?,
-        file_size: row.get::<_, i64>(4)? as u64,
-        chunk_size: row.get::<_, i64>(5)? as u32,
-        chunks_written: row.get::<_, i64>(6)? as u64,
-        complete: row.get::<_, i64>(7)? == 1,
-        bytes_on_disk: row.get::<_, i64>(8)? as u64,
-        created_at: row.get(9)?,
-        last_used_at: row.get(10)?,
+        hash: row.get(4)?,
+        file_size: row.get::<_, i64>(5)? as u64,
+        chunk_size: row.get::<_, i64>(6)? as u32,
+        chunks_written: row.get::<_, i64>(7)? as u64,
+        complete: row.get::<_, i64>(8)? == 1,
+        bytes_on_disk: row.get::<_, i64>(9)? as u64,
+        created_at: row.get(10)?,
+        last_used_at: row.get(11)?,
     })
 }
 
@@ -871,22 +886,39 @@ fn find_event_row_id(
 }
 
 /// `media` 有這個 mxc 就用它（不動既有欄），沒有就建一列「還沒下載」。
+/// 事件區塊的 `sha256`（hex）→ `media.hash` 的形式 `sha256:<hex>`；沒帶就 None。
+fn block_hash(sha256_hex: Option<&str>) -> Option<String> {
+    sha256_hex
+        .filter(|hex| !hex.is_empty())
+        .map(|hex| format!("sha256:{}", hex.to_ascii_lowercase()))
+}
+
 fn media_row_id(
     transaction: &Transaction<'_>,
     mxc: &str,
     name: Option<&str>,
     mimetype: Option<&str>,
+    hash: Option<&str>,
     file_size: u64,
     chunk_size: u32,
 ) -> Result<i64, SdkError> {
     let now = now_millis();
     transaction
         .execute(
-            "INSERT OR IGNORE INTO media (mxc, pool_file, name, mimetype, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 0, 0, ?6, ?6)",
-            params![mxc, name, mimetype, file_size as i64, chunk_size as i64, now],
+            "INSERT OR IGNORE INTO media (mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?7)",
+            params![mxc, name, mimetype, hash, file_size as i64, chunk_size as i64, now],
         )
         .map_err(db_error)?;
+    // 舊列沒有 hash、這次的區塊有帶：補上（同一個 mxc 的區塊 sha256 不會變，只會從沒有變成有）。
+    if let Some(hash) = hash {
+        transaction
+            .execute(
+                "UPDATE media SET hash = ?2 WHERE mxc = ?1 AND hash IS NULL",
+                params![mxc, hash],
+            )
+            .map_err(db_error)?;
+    }
     transaction
         .query_row("SELECT id FROM media WHERE mxc = ?1", params![mxc], |row| {
             row.get(0)
@@ -1009,6 +1041,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                mxc TEXT NOT NULL UNIQUE,
                pool_file TEXT,
                name TEXT, mimetype TEXT,
+               hash TEXT,
                file_size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
                chunks_written INTEGER NOT NULL, complete INTEGER NOT NULL, bytes_on_disk INTEGER NOT NULL,
                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
@@ -1447,6 +1480,68 @@ mod tests {
         let report = cache.forget_account(ALICE).unwrap();
         assert_eq!(report.media_removed, 1);
         assert!(report.orphan_pool_files.is_empty(), "{report:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_hash_comes_from_the_block_or_is_filled_with_blake3() {
+        let (mut cache, dir) = open("hash");
+        // 區塊沒帶 sha256、還沒下載完：None。
+        cache
+            .upsert_messages(ALICE, &[file("!h", "$n", 1, "mxc://localhost/nohash")])
+            .unwrap();
+        assert_eq!(
+            cache
+                .find_media("mxc://localhost/nohash")
+                .unwrap()
+                .unwrap()
+                .hash,
+            None
+        );
+        // 區塊帶 sha256：進來就是 sha256:<hex>（小寫）。
+        let mut with_sha = file("!h", "$s", 2, "mxc://localhost/withhash");
+        if let MessageKind::File { attachment, .. } = &mut with_sha.kind {
+            attachment.block.sha256 = Some("ABCDEF".into());
+        }
+        cache
+            .upsert_messages(ALICE, std::slice::from_ref(&with_sha))
+            .unwrap();
+        assert_eq!(
+            cache
+                .find_media("mxc://localhost/withhash")
+                .unwrap()
+                .unwrap()
+                .hash
+                .as_deref(),
+            Some("sha256:abcdef")
+        );
+        // 沒帶的下載完：用 blake3 補；之後 reset 也不清（校驗碼是內容的事實，不是本地副本的）。
+        cache
+            .media_finish("mxc://localhost/nohash", "hash-n", 1, 100)
+            .unwrap();
+        cache.media_reset("mxc://localhost/nohash").unwrap();
+        assert_eq!(
+            cache
+                .find_media("mxc://localhost/nohash")
+                .unwrap()
+                .unwrap()
+                .hash
+                .as_deref(),
+            Some("blake3:hash-n")
+        );
+        // 帶 sha256 的下載完：不被 blake3 蓋掉。
+        cache
+            .media_finish("mxc://localhost/withhash", "hash-s", 1, 100)
+            .unwrap();
+        assert_eq!(
+            cache
+                .find_media("mxc://localhost/withhash")
+                .unwrap()
+                .unwrap()
+                .hash
+                .as_deref(),
+            Some("sha256:abcdef")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

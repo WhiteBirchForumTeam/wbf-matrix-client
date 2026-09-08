@@ -59,6 +59,7 @@ pub async fn fetch<C: PackChannel>(
         &manifest.mxc,
         block.name.as_deref(),
         block.mimetype.as_deref(),
+        block.sha256.as_deref(),
         manifest.file_size(),
         block.chunk_size,
     )?;

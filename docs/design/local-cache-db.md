@@ -254,6 +254,7 @@ CREATE TABLE media (
   mxc TEXT NOT NULL UNIQUE,
   pool_file TEXT,                       -- NULL = 還在下載
   name TEXT, mimetype TEXT,
+  hash TEXT,                            -- 明文校驗碼 "<algo>:<hex>"：事件區塊有 sha256 就是 "sha256:…"（上傳者算的）；沒帶就下載完填 "blake3:…"（我們算的，同 pool_file）
   file_size INTEGER NOT NULL,           -- 明文總長，從事件區塊來
   chunk_size INTEGER NOT NULL,          -- 下載時的塊大小，續傳截檔用
   chunks_written INTEGER NOT NULL,      -- 最後一次快照時已 append 的塊數（§8.3，每 1–2 秒 flush）
@@ -421,7 +422,7 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 
 **跟 server 的 chunk 無關**：server 的 `chunk_size` 是傳輸單位、每檔可不同（事件區塊裡）；池的 `segment_size` 是儲存單位、寫在每個檔頭。下載時一個 chunk 的明文丟進 `PoolWriter`，它照自己的 64 KiB 切，兩邊不必對齊；續傳點落在段中間也照上面的尾巴規則處理。
 
-**檔名與目錄**：完成檔是 `media/<hash 前 2 hex>/<hash>`（hash = 明文 BLAKE3，32 位小寫 hex），下載中是 `media/pending/m<media.id>`。**檔案本身不帶任何 metadata**：原檔名、mimetype、mxc、大小都只在 `cache.db` 的 `media` 列（來源是事件區塊的 `name`／`mimetype`，上傳者填的；同內容去重成一個池檔時，每個 mxc 各自保留自己的 name／mimetype）。磁碟上能看到的只有幾個檔、各多大。
+**檔名與目錄**：完成檔是 `media/<hash 前 2 hex>/<hash>`（hash = 明文 BLAKE3，32 位小寫 hex），下載中是 `media/pending/m<media.id>`。**檔案本身不帶任何 metadata**：原檔名、mimetype、校驗碼、mxc、大小都只在 `cache.db` 的 `media` 列（`name`／`mimetype`／`hash` 來自事件區塊，上傳者填的；`hash` 的形式是 `<algo>:<hex>`，區塊沒帶 sha256 時下載完用我們算的 BLAKE3 補成 `blake3:…`；同內容去重成一個池檔時，每個 mxc 各自保留自己的 name／mimetype／hash）。磁碟上能看到的只有幾個檔、各多大。
 
 **安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；金鑰不進錯誤訊息。**不防**：能讀 `local.key` 的人（同 §4 的威脅模型）、檔案大小與數量。
 

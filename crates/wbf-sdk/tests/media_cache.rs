@@ -113,6 +113,12 @@ async fn fetch_downloads_then_hits_cache_and_dedups_same_content() {
     let pool_file = fetched.entry.pool_file.clone().unwrap();
     assert_eq!(pool_file, blake3::hash(&plain).to_hex().to_string());
     assert!(fetched.entry.complete);
+    // upload 時算了 sha256（summary.sha256 進區塊），所以 hash 是上傳者的 sha256，不是 blake3 補的。
+    let expected_sha = {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(&plain)))
+    };
+    assert_eq!(fetched.entry.hash.as_deref(), Some(expected_sha.as_str()));
     assert_eq!(read_pool(&pool, &pool_file), plain);
     assert!(pool.list_pending().unwrap().is_empty());
 
@@ -173,6 +179,7 @@ async fn fetch_resumes_from_the_last_snapshot() {
             &manifest.mxc,
             Some("r.bin"),
             None,
+            None,
             plain.len() as u64,
             CHUNK,
         )
@@ -213,7 +220,7 @@ async fn fetch_resumes_from_the_last_snapshot() {
     // 塊大小不同的舊快照不能續：從頭。
     let manifest_b = upload(&mut server, "s.bin", &sample(CHUNK as usize * 2, 3)).await;
     cache
-        .media_begin(&manifest_b.mxc, None, None, CHUNK as u64 * 2, 4096)
+        .media_begin(&manifest_b.mxc, None, None, None, CHUNK as u64 * 2, 4096)
         .unwrap();
     cache.media_progress(&manifest_b.mxc, 5, 4096).unwrap();
     let mut client = WbfClient::new(&mut server);
