@@ -759,6 +759,44 @@ async fn recent_sync_total_cap_splits_into_windows_and_shrinks_the_last_one() {
     );
     assert_eq!(summary.last_ls, Some(1201));
 
+    // 水位卡在總量中間：1200 則、cg_seq = 1700 → 比它新的只有 500 則；要 1000 → 320 一窗滿了再要，第二窗只有 180（< 320）→ 追平停，
+    // 不會去要第三窗；水位仍是第一窗的 fs（2200）。
+    server.recent_events = recent_fixture(1200);
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test").await.unwrap();
+    let mut window_sizes: Vec<u32> = Vec::new();
+    let mut oldest_seen = i64::MAX;
+    let summary = client
+        .recent_sync(
+            Some(1700),
+            RecentPlan {
+                max_events: Some(1000),
+                window: 320,
+                batch: Some(100),
+            },
+            &mut |meta, events| {
+                if meta.r + meta.bc == meta.tc {
+                    window_sizes.push(meta.tc);
+                }
+                for event in &events {
+                    let g = event["unsigned"]["org.wbftw.wbfuwunel.g_seq"]
+                        .as_i64()
+                        .unwrap();
+                    oldest_seen = oldest_seen.min(g);
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(window_sizes, vec![320, 180]);
+    assert_eq!(summary.events, 500);
+    assert_eq!(summary.windows, 2);
+    assert!(summary.caught_up);
+    assert_eq!(summary.new_cg_seq, Some(2200));
+    assert_eq!(summary.last_ls, Some(1701));
+    assert_eq!(oldest_seen, 1701, "nothing at or below cg_seq came back");
+
     // 總量比實際少：要 1000、只有 50 → 一窗 50 就追平。
     server.recent_events = recent_fixture(50);
     let mut client = WbfClient::new(&mut server);
