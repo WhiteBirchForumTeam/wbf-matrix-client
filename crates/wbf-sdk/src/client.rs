@@ -290,15 +290,16 @@ impl<C: PackChannel> WbfClient<C> {
             window,
             batch,
         } = plan;
+        // server 宣告的上限是 0（設定誤植）就當沒宣告：`clamp(1, 0)` 會 panic（PR #16 審查 rumia 🟡2）。
         let max_limit = self
             .hello
             .as_ref()
-            .and_then(|hello| hello.recent_max_limit)
+            .and_then(|hello| hello.recent_max_limit.filter(|max| *max > 0))
             .unwrap_or(protocol::RECENT_MAX_LIMIT);
         let max_batch = self
             .hello
             .as_ref()
-            .and_then(|hello| hello.recent_max_batch)
+            .and_then(|hello| hello.recent_max_batch.filter(|max| *max > 0))
             .unwrap_or(protocol::RECENT_MAX_BATCH);
         let window = window.clamp(1, max_limit);
         let batch = batch.map(|batch| batch.clamp(1, max_batch));

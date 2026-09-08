@@ -45,6 +45,8 @@ pub struct FakeServer {
     pub extra_features: Vec<&'static str>,
     /// 故障：這窗送到第 n 個 Batch 之後就斷線（回 Network 錯），只觸發一次。
     pub drop_stream_after_batches: Option<u32>,
+    /// 故障：Hello 宣告的 `recent_max_limit`／`recent_max_batch`（預設 500／100；設 0 模擬 server 設定誤植）。
+    pub hello_recent_max: Option<(u32, u32)>,
 }
 
 impl FakeServer {
@@ -68,7 +70,8 @@ impl FakeServer {
                 serde_json::json!({ "protocol": 1, "server": "fake",
                     "features": self.advertised_features(),
                     "chunk_size_default": 65536, "chunk_size_large": 1048576, "data_max_bytes": 16781312,
-                    "recent_default_limit": 320, "recent_max_limit": 500, "recent_default_batch": 10, "recent_max_batch": 100,
+                    "recent_default_limit": 320, "recent_max_limit": self.hello_recent_max.map_or(500, |m| m.0),
+                    "recent_default_batch": 10, "recent_max_batch": self.hello_recent_max.map_or(100, |m| m.1),
                     "max_connections_per_device": 4 }),
                 Vec::new(),
             )),

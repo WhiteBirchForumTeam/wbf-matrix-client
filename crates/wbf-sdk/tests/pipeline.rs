@@ -875,6 +875,30 @@ async fn recent_sync_mid_window_disconnect_keeps_what_arrived_and_gives_no_water
     assert_eq!((summary.windows, summary.events), (1, 12));
 }
 
+/// server 的 Hello 把上限宣告成 0（設定誤植）：當沒宣告，用 client 預設，不 panic（PR #16 審查 rumia 🟡2）。
+#[tokio::test]
+async fn recent_sync_survives_a_zero_max_in_hello() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["recent", "batch"];
+    server.hello_recent_max = Some((0, 0));
+    server.recent_events = recent_fixture(7);
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test").await.unwrap();
+    let summary = client
+        .recent_sync(
+            None,
+            RecentPlan {
+                max_events: None,
+                window: 9999,
+                batch: Some(9999),
+            },
+            &mut |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!((summary.windows, summary.events), (1, 7));
+}
+
 /// `Recent` 走一請求一回應的通道（HTTP）：server 回 `Error(Unsupported)`，client 回 `Server`。
 #[tokio::test]
 async fn recent_over_a_single_response_channel_is_unsupported() {

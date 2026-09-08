@@ -237,6 +237,7 @@ impl HttpChannel {
 
 impl PackChannel for HttpChannel {
     /// HTTP 一請求一回應：串流的請求（`Recent`）server 會回 `Error(Unsupported)`，這裡照樣交給 `on_pack` 去判。
+    /// `on_pack` 說「還要」就是錯：這條通道給不出第二個 pack，不能無聲當成功（PR #16 審查 rumia 🟢4）。
     async fn request_stream(
         &mut self,
         pack: Pack,
@@ -244,7 +245,11 @@ impl PackChannel for HttpChannel {
         on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
     ) -> Result<(), SdkError> {
         let response = self.request(pack).await?;
-        on_pack(response)?;
+        if on_pack(response)? {
+            return Err(SdkError::Protocol(
+                "the HTTP channel served a single pack but the caller wanted more; use the WebSocket channel".into(),
+            ));
+        }
         Ok(())
     }
 

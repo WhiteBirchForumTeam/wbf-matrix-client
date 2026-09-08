@@ -454,7 +454,7 @@ pub fn join_length_prefixed(items: &[Vec<u8>]) -> Vec<u8> {
 /// 從事件 JSON 的 `unsigned` 讀 server 加的序號；沒有就是 None（非 fork server、或舊事件），呼叫者顯式判斷，不猜。
 ///
 /// Args:
-///     event: `parse_recent_events` 或 sync 回來的一則事件
+///     event: `parse_batch`（`recent_window`／`recent_sync` 交出來的）或 sync 回來的一則事件
 /// Return:
 ///     (Option<i64>, Option<i64>)   (r_seq, g_seq)
 pub fn event_seqs(event: &serde_json::Value) -> (Option<i64>, Option<i64>) {
