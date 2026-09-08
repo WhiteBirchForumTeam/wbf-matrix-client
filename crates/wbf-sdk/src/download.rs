@@ -162,7 +162,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    async fn read_and_open_chunk(
+    pub(crate) async fn read_and_open_chunk(
         &mut self,
         manifest: &Manifest,
         target: &VerifiedTarget,

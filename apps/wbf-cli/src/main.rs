@@ -104,12 +104,26 @@ pub enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// 整檔下載，全部檢查照約定 §3.1
+    /// 整檔下載，全部檢查照約定 §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（local-cache-db §8）
     Download {
         #[arg(long)]
         manifest: PathBuf,
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// 不經媒體快取，直接寫到 --out（--token 模式本來就這樣）
+        #[arg(long)]
+        no_cache: bool,
+    },
+    /// 媒體快取的狀態：池的大小、幾個檔、半成品（CLI 規格 §3.5）
+    MediaStats,
+    /// 媒體快取清理：超過配額就從最久沒用的刪，保護期內不刪（local-cache-db §8.5）；順便掃孤兒
+    MediaGc {
+        /// 配額，MiB；預設 2048
+        #[arg(long, default_value_t = 2048)]
+        quota_mib: u64,
+        /// 保護期，天；預設 7
+        #[arg(long, default_value_t = 7)]
+        protect_days: u64,
     },
     /// 只讀含 --at 的那一塊，明文寫到 stdout（CLI 規格 §3.3.1）
     Seek {

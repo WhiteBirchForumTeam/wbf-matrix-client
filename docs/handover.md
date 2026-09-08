@@ -6,8 +6,8 @@
 
 第 1 步（`wbf-wire` codec）、第 2 步（`wbf-sdk` 密碼層／通道／上傳下載、`apps/wbf-cli`）做完；
 第 3 步（接 matrix-sdk 做房間）第一版做完：`rooms`、`send --text|--file`、`watch`、`read`、`files` 對本機 wbfuwunel 全走過。
-本地資料庫：第一個 PR（vault 與金鑰，#11）合併；第二個 PR（`cache.db`：SQLCipher 快取、多帳號混存、CLI `recent`／`--from-cache`／寫穿／`accounts`／`forget-account`）2026-09-07 做完送審。
-PR #1–#12 全部合併。**沒有 UI，媒體池（local-cache-db §8）還沒有。**
+本地資料庫三個 PR：vault 與金鑰（#11）、`cache.db` 多帳號混存（#13）都合併；媒體池（`download` 進池、命中、續傳、配額清理）2026-09-08 做完送審。
+PR #1–#13 全部合併。**沒有 UI。**
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -32,6 +32,8 @@ crates/wbf-sdk/src/
   chat.rs                聊天模型與 ChatBackend trait，沒有 Matrix 型別
   vault.rs               local.key、三把子金鑰、session.sealed（local-cache-db §4）；沒有 SQLite、沒有 matrix-sdk
   cache.rs               cache.db（feature `cache`，SQLCipher；local-cache-db §6）：users／rooms／events／events_synced_log／room_list／sync_state／read_positions／media／event_media
+  media_pool.rs          媒體儲存池的落地格式（64 KiB 段各自 AEAD、暫定段、續傳、BLAKE3 檔名）；沒有 SQL、沒有網路
+  media.rs               fetch／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
   event_json.rs          原始 Matrix 事件 JSON → Message；matrix backend 與 recent 共用，不掛 feature
   backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
 apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（passphrase 來源、unlock ticket）、accounts.rs（每個帳號的資料放哪、current、--account 解析）、commands.rs（第 2 步命令、Context）、rooms.rs（第 3 步命令、寫穿快取）、recent.rs（Event/Recent 進料）
@@ -57,6 +59,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 4. `WBF_E2E_SERVER=... WBF_E2E_USER=... WBF_E2E_PASSWORD_FILE=... cargo test -p wbf-sdk --test e2e_local_server -- --ignored`（第 2 步的驗收）；`WBF_PASSWORD_FILE=... scripts/acceptance.sh`（CLI 的驗收，200 MiB 約 80 秒；`WBF_ACCEPT_SIZE_MIB=16` 快跑）。
 5. 第 3 步的手動流程：`login` → 用 token `createRoom`（`initial_state` 帶 `m.room.encryption`）→ `rooms` → `send --text` → `read` → `send --file` → `files --save` → `download --manifest`。token 現在在 `session.sealed` 裡讀不到，`createRoom` 那步的 token 用 curl 另外登入一次拿（驗收腳本就是這樣做）。
 8. 快取的手動流程（一個帳號）：`recent`（第一次 `cg_seq_before` 是 null）→ `read <room> --from-cache` → `recent` 再跑一次（`pulled` 應該是 0）。
+10. 媒體池：`upload --sha256 --manifest m.json` → `download --manifest m.json -o a`（`source: server`，池裡出現 `media/<hh>/<hash>`）→ 再 `download` 一次（`source: cache`）→ `media-stats` → 大檔用 `--transport http` 下到一半殺掉 → `media-stats` 看到 `incomplete_files: 1` → 再 `download` 的第一行進度從上次快照的塊數開始、sha 對 → `media-gc --quota-mib 1 --protect-days 0` 清光。2026-09-08 跑過一次全對。
 9. 多帳號混存（兩個帳號 alice、bob，同一個 `--data-dir`）：alice `login` → 建只有 alice 的房 A 與邀 bob 的房 C，各送幾則 → `recent` → bob `login`（alice 不 logout）→ `accounts` 兩個、current 是 bob → `rooms` 只有 C → `read A --from-cache` 0 則、`read C --from-cache` 0 則（bob 還沒親自拿過）→ `recent` → `read C --from-cache` 有了，而且 alice 解過的那幾則是明文 → `--account alice read A --from-cache` 仍有 → alice `logout`（`cache.db` 還在）→ bob `logout`（`cache.db` 被刪）。`forget-account @alice:localhost --yes` 後 alice 的 `--from-cache` 全空、bob 的不受影響。2026-09-07 跑過一次全對。
 7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms`（走 ticket，不問）→ `lock` → `rooms`（問 passphrase；非互動就 exit 1）→ `remove-passphrase` → `rooms`（不問）。
 6. 測完 `taskkill //F //IM <複本名>.exe`。
@@ -87,7 +90,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 
 1. ~~本地資料庫第一個 PR：vault 與金鑰~~ 做了（2026-09-06 送審）。
 2. ~~本地資料庫第二個 PR：`cache.db`~~ 做了（2026-09-07 送審，含 `recent`）。rusqlite 0.40 與 matrix-sdk 合得來，代價是 Windows 要 Strawberry Perl（local-cache-db §3）。
-2c. 媒體池（local-cache-db §8）：一個加密池、一把鑰、整檔、順序 append、進度每 1–2 秒 flush；`media`／`event_media` 表已經建好。
+2c. ~~媒體池（local-cache-db §8）~~ 做了（2026-09-08 送審）：`media_pool.rs`（格式）、`media.rs`（fetch／gc／sweep）、CLI `download` 走快取、`media-stats`／`media-gc`。
 3. 附件宣告：等 server 定案。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。**走 fork submodule 露出 `Room::encrypt`，還是走 `OlmMachine`，維護者還沒定**；建議後者（plan-v1 §7.2 的方向）。
 4. chat-model §6 剩的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載。穿插。
 5. UI 框架比較文件。
