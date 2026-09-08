@@ -1,7 +1,10 @@
 //! wbf-cli：介面照 `docs/design/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
-//! 每個命令在 `commands.rs`（第 2 步）與 `rooms.rs`（第 3 步），vault 怎麼解鎖在 `unlock.rs`。
+//! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
+//! 每個帳號的資料放哪在 `accounts.rs`。
 
+mod accounts;
 mod commands;
+mod recent;
 mod rooms;
 mod unlock;
 
@@ -21,9 +24,12 @@ pub struct Cli {
     /// 直接給 access token，跳過 session 檔。不印、不寫進任何輸出
     #[arg(long, global = true, env = "WBF_ACCESS_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
-    /// 資料目錄（local.key、session.sealed、matrix/、unlock.ticket），預設見 CLI 規格 §7
+    /// 資料目錄（local.key、current、servers/<host>/cache.db、servers/<host>/accounts/<user>/…），預設見 CLI 規格 §7
     #[arg(long, global = true, env = "WBF_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+    /// 用哪個帳號（mxid 或 localpart）；沒給就是最後一次 login 的那個。同名 localpart 在多個 server 時要配 --server
+    #[arg(long, global = true, env = "WBF_ACCOUNT")]
+    pub account: Option<String>,
     /// 整檔就是 passphrase（解 local.key 的那句話，不是 Matrix 帳號密碼）；沒給就看 unlock ticket，再沒有就從終端讀
     #[arg(long, global = true, env = "WBF_PASSPHRASE_FILE")]
     pub passphrase_file: Option<PathBuf>,
@@ -56,8 +62,18 @@ pub enum Command {
         #[arg(long, default_value = "wbf-cli")]
         device_name: String,
     },
-    /// 讓 token 失效，刪 session.sealed 與 unlock ticket
+    /// 讓 token 失效；刪這個帳號的 session.sealed 與 matrix/，cache.db 留著（這個 server 最後一個帳號登出時才刪）
     Logout,
+    /// 列出資料目錄裡的帳號（不開 vault）
+    Accounts,
+    /// 摧毀一個帳號在 cache.db 裡的本機紀錄（它同步過的事件、房間清單、已讀位置；別的帳號也同步過的事件留著）
+    ForgetAccount {
+        /// 完整 mxid，example: @alice:localhost
+        user: String,
+        /// 不問確認（腳本用）
+        #[arg(long)]
+        yes: bool,
+    },
     /// 刪 unlock ticket；下一個命令會再問 passphrase
     Lock,
     /// 給 local.key 設（或改）passphrase；沒給檔就從終端讀兩次
@@ -110,14 +126,26 @@ pub enum Command {
     Send(SendArgs),
     /// 等新事件，來一則立刻印一則，JSON Lines（CLI 規格 §3.4.2）
     Watch(WatchArgs),
+    /// Event/Recent：把 cache.db 水位線之後的事件跨房間拉回來寫進快取（CLI 規格 §3.5）
+    Recent {
+        /// 一輪最多幾則；server 會 clamp 到它的上限（預設 10000）
+        #[arg(long, default_value_t = 10000)]
+        limit: u32,
+        /// 不帶 cg_seq：從 server 最新的往回拉，不管快取裡已經有什麼
+        #[arg(long)]
+        from_scratch: bool,
+    },
     /// 歷史，從最新往回（CLI 規格 §3.4.1）
     Read {
         room: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        /// 接上一頁印的 next
+        /// 接上一頁印的 next；--from-cache 時是 r_seq（只要比它小的）
         #[arg(long)]
         before: Option<String>,
+        /// 不連 server，從 cache.db 讀（CLI 規格 §3.5）
+        #[arg(long)]
+        from_cache: bool,
         /// client 端過濾：事件 type，可多個
         #[arg(long = "type")]
         types: Vec<String>,
@@ -133,6 +161,9 @@ pub enum Command {
         before: Option<String>,
         #[arg(long)]
         save: Option<PathBuf>,
+        /// 不連 server，從 cache.db 讀（CLI 規格 §3.5）
+        #[arg(long)]
+        from_cache: bool,
     },
 }
 
@@ -206,14 +237,33 @@ pub struct UploadArgs {
     pub mimetype: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// 主執行緒的棧在 Windows 只有 1 MB，debug build 裡 matrix-sdk 送訊息那條 async 路徑會爆棧（2026-09-07 實跑：`send` 直接
+/// "overflowed its stack"）。所以 runtime 跑在自己開的執行緒上，棧給 64 MiB；release 不需要但一致比較不會踩到。
+const MAIN_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match commands::run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+    let worker = std::thread::Builder::new()
+        .name("wbf-cli-main".into())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(MAIN_THREAD_STACK_BYTES)
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(commands::run(cli))
+        })
+        .expect("spawn main thread");
+    match worker.join() {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(error)) => {
             eprintln!("error: {error}");
             ExitCode::from(exit_code(&error))
+        }
+        Err(_) => {
+            eprintln!("error: wbf-cli main thread panicked");
+            ExitCode::from(1)
         }
     }
 }

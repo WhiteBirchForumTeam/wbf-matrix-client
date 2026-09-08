@@ -1,8 +1,7 @@
-//! `backend/matrix_sdk.rs` 的事件轉換：JSON → `Message`、關係事件的聚合。不需要 server；要開 `--features matrix`。
-#![cfg(feature = "matrix")]
+//! `event_json.rs` 的事件轉換：JSON → `Message`、關係事件的聚合。不需要 server、不需要 matrix feature。
 
 use serde_json::json;
-use wbf_sdk::backend::matrix_sdk::message_from_json;
+use wbf_sdk::event_json::message_from_json;
 use wbf_sdk::MessageKind;
 
 fn text_event(id: &str, body: &str) -> serde_json::Value {
@@ -100,7 +99,7 @@ fn missing_fields_become_unknown_not_empty() {
 
 // ---- aggregate：同一頁內的關係事件折進目標（PR #9 審查 cirno 💡1、salvia）----
 
-use wbf_sdk::backend::matrix_sdk::messages_from_json;
+use wbf_sdk::event_json::messages_from_json;
 
 fn relation(
     id: &str,

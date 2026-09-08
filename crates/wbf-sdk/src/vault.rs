@@ -303,12 +303,11 @@ impl Vault {
         Key32(blake3::derive_key(context, self.master.as_bytes()))
     }
 
-    pub fn sealed_session_path(&self) -> PathBuf {
-        self.dir.join(SEALED_SESSION_FILE_NAME)
-    }
-
-    /// 把 session（含 access_token）封進 `session.sealed`。
-    pub fn seal_session(&self, session: &Session) -> Result<(), SdkError> {
+    /// 把 session（含 access_token）封進 `path`（CLI 放帳號目錄的 `session.sealed`）。
+    ///
+    /// Args:
+    ///     path: example: "<data dir>/servers/localhost_6167/accounts/alice/session.sealed"
+    pub fn seal_session(&self, path: &Path, session: &Session) -> Result<(), SdkError> {
         let plaintext = Zeroizing::new(serde_json::to_vec(session).expect("Session serializes"));
         let nonce = random_nonce()?;
         let sealed = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
@@ -326,18 +325,17 @@ impl Vault {
             sealed: encode_base64(&sealed),
         };
         write_private(
-            &self.sealed_session_path(),
+            path,
             &serde_json::to_vec_pretty(&file).expect("SealedFile serializes"),
         )
     }
 
     /// Return:
-    ///     Ok(Some(Session))  有 `session.sealed` 而且解得開
+    ///     Ok(Some(Session))  `path` 存在而且解得開
     ///     Ok(None)           沒有這個檔
     ///     Err(Usage)         檔案壞了、或不是這把主金鑰封的
-    pub fn unseal_session(&self) -> Result<Option<Session>, SdkError> {
-        let path = self.sealed_session_path();
-        let bytes = match std::fs::read(&path) {
+    pub fn unseal_session(&self, path: &Path) -> Result<Option<Session>, SdkError> {
+        let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -376,8 +374,8 @@ impl Vault {
         Ok(Some(session))
     }
 
-    pub fn delete_sealed_session(&self) -> Result<(), SdkError> {
-        match std::fs::remove_file(self.sealed_session_path()) {
+    pub fn delete_sealed_session(&self, path: &Path) -> Result<(), SdkError> {
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
@@ -618,7 +616,8 @@ mod tests {
         let dir = scratch_dir("rewrap");
         let mut vault = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
         let before = vault.master_key().clone();
-        vault.seal_session(&sample_session()).unwrap();
+        let sealed = dir.join(SEALED_SESSION_FILE_NAME);
+        vault.seal_session(&sealed, &sample_session()).unwrap();
         vault
             .set_unlock(&Unlock::Passphrase("pw".to_string().into()))
             .unwrap();
@@ -626,7 +625,11 @@ mod tests {
         assert_eq!(before.as_bytes(), reopened.master_key().as_bytes());
         // session.sealed 沒動，還解得開。
         assert_eq!(
-            reopened.unseal_session().unwrap().unwrap().access_token,
+            reopened
+                .unseal_session(&sealed)
+                .unwrap()
+                .unwrap()
+                .access_token,
             "syt_secret"
         );
         vault.set_unlock(&Unlock::NoPassphrase).unwrap();
@@ -638,18 +641,22 @@ mod tests {
     fn sealed_session_roundtrip_and_other_key_cannot_open() {
         let dir = scratch_dir("session");
         let vault = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
-        assert!(vault.unseal_session().unwrap().is_none());
-        vault.seal_session(&sample_session()).unwrap();
-        let raw = std::fs::read_to_string(vault.sealed_session_path()).unwrap();
+        let sealed = dir
+            .join("accounts")
+            .join("alice")
+            .join(SEALED_SESSION_FILE_NAME);
+        assert!(vault.unseal_session(&sealed).unwrap().is_none());
+        vault.seal_session(&sealed, &sample_session()).unwrap();
+        let raw = std::fs::read_to_string(&sealed).unwrap();
         assert!(!raw.contains("syt_secret"));
         assert_eq!(
-            vault.unseal_session().unwrap().unwrap().user_id,
+            vault.unseal_session(&sealed).unwrap().unwrap().user_id,
             "@alice:localhost"
         );
         let other = Vault::from_master(&dir, Key32([7u8; 32]), KeyMode::Plain);
-        assert!(other.unseal_session().is_err());
-        vault.delete_sealed_session().unwrap();
-        assert!(vault.unseal_session().unwrap().is_none());
+        assert!(other.unseal_session(&sealed).is_err());
+        vault.delete_sealed_session(&sealed).unwrap();
+        assert!(vault.unseal_session(&sealed).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

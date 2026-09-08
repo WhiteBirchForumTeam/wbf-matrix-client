@@ -27,7 +27,8 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 |---|---|---|
 | `--server <url>` | `WBF_SERVER` | homeserver 的 base URL，example: `http://localhost:6167`。沒給就用 session 檔的 |
 | `--token <access_token>` | `WBF_ACCESS_TOKEN` | 直接給 token，跳過 session 檔。🚫 不印、不寫進任何輸出 |
-| `--data-dir <dir>` | `WBF_DATA_DIR` | 資料目錄（`local.key`、`session.sealed`、`matrix/`、`unlock.ticket`），預設見 §7 |
+| `--data-dir <dir>` | `WBF_DATA_DIR` | 資料目錄（`local.key`、`current`、`servers/<host>/cache.db`、`servers/<host>/accounts/<user>/…`），預設見 §7 |
+| `--account <mxid 或 localpart>` | `WBF_ACCOUNT` | 用哪個帳號；沒給就是最後一次 `login` 的那個（`current`）。同名 localpart 在多個 server 都有時要配 `--server`（§7） |
 | `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔就是 passphrase（解 `local.key` 用，去掉結尾一個換行）。沒給就看 unlock ticket，再沒有就從終端讀（不回顯）。🚫 沒有 `--passphrase <pw>`、🚫 不接受環境變數給 passphrase 本身 |
 | `--unlock-ttl <秒>` | | 密碼解鎖成功後 unlock ticket 的有效期，預設 900；0 就不寫 ticket（§7.1） |
 | `--json` | | stdout 只印 JSON（預設就是；留這個旗標是為了之後加人類可讀模式時介面不變） |
@@ -40,8 +41,10 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、把 session 封進 `session.sealed`。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`（§7）。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
-| `logout` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪 `session.sealed` 與 unlock ticket（`local.key` 與 `matrix/` 留著：下次 `login` 同一個裝置） | `{ "ok": true }` |
+| `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、把 session 封進這個帳號目錄的 `session.sealed`，並把它設成 `current`（§7）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著，`login` 只是切換。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
+| `logout` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/` 與 unlock ticket；`current` 指到它就清掉。**`local.key` 與 `cache.db` 留著**（維護者 2026-09-07 定：快取是我們自己的 DB，只綁帳號不綁裝置；要摧毀用 `forget-account`）。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了） | `{ "ok": true }` |
+| `accounts` | 列資料目錄裡的帳號（掃目錄，不開 vault、不問 passphrase） | `[{ "server", "localpart", "logged_in", "current" }…]` |
+| `forget-account <mxid> [--yes]` | 摧毀這個帳號在 `cache.db` 裡的本機紀錄（§3.5 的忘掉鏈）。要完整 mxid。帳號登出中就要配 `--server`（快取的身份要 server URL）。沒 `--yes` 就終端確認 | `{ "ok", "user", "events_removed", "media_removed", "orphan_pool_files" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 | `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
 | `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
@@ -160,6 +163,24 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 - **自己送的也印**（`sender` 是自己），腳本自己濾。`once` 不把自己的算進「第一則」，不然 `send` 完接著 `once` 永遠等到的是自己。
 - **第 2 步的 session 在加密房間照樣能用**，只是每則都 `decrypted: false`；`once` 還是算有回應。
 
+### 3.5 本地快取（local-cache-db.md §6，2026-09-07）
+
+`cache.db` 在 `servers/<host>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：server 不符、schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
+
+多帳號混存怎麼不漏（維護者 2026-09-07 定，細節在 local-cache-db.md §6）：
+
+- 事件只存一份；**誰看得到哪一則逐則記**（`events_synced_log`）：server 經 `/messages`、`/sync`、`Recent` 任一條路給過這個帳號的才算。沒有列就看不到，fail closed。不用「每人一個 r_seq 下界」——離開再加入、`history_visibility` 改過都會切洞，下界會 fail open。
+- 所以 user1 與 user2 都在 room1：各自 `recent` 或 `read` 過的事件各自看得到；一則兩人都拿過只存一份。**一人解過的明文另一人也讀得到明文**（都是同一台機器上同一個人的帳號，維護者接受）：bob 的裝置沒有 Megolm 金鑰，`read --from-cache` 仍看到 alice 解過的內容。
+- 房間清單、`cg_seq` 水位線、已讀位置、Delete-for-me 都是一人一份。
+
+| 命令 | 做什麼 | stdout |
+|---|---|---|
+| `recent [--limit <n>] [--from-scratch]` | `Event/Recent`：從**這個帳號**的水位線 `cg_seq` 起把新事件跨房間拉回來寫進快取，`complete=false` 就帶 `before=next` 繼續，最後把 `latest_g_seq` 寫回水位線。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "rounds", "cg_seq_before", "cg_seq_after" }` |
+| `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的。排序照 `r_seq`（沒有 `r_seq` 的房間退到時間）。`--before` 這時是 **r_seq 的數字**（上一頁印的 `next`），不是 server 的翻頁 token；沒有 `r_seq` 的房間 `next` 是 null、翻不了頁 | 與不帶時同形 |
+| `forget-account <mxid>` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。回傳已經沒人用的池檔名（池還沒有，這一版只印在 stderr） | 見 §3.1 |
+
+寫穿：`rooms` 把房間列表、`read`／`files`／`watch` 把印過的事件順手寫進快取（帶著這個帳號的 mxid）。**寫穿失敗只在 stderr 說一聲，命令照樣成功**（快取壞了的代價是重拉）。`--token` 模式沒有 vault 也沒有帳號目錄，沒有快取：`--from-cache` 與 `recent` 會 exit 1。
+
 ## 4. 輸出與 exit code
 
 - stdout：**一個 JSON 物件**，命令成功才印。兩個例外：`seek` 印明文 bytes；`watch` 印 JSON Lines，一事件一行、即時 flush（§3.4.2）。
@@ -204,7 +225,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 - 續傳時 SDK 對 server 的 `Status` 有兩種修正：狀態檔比 server 舊（重送已收的塊）server 回冪等 Ack、跳到 `received`；
   比 server 新（從沒收到的塊開始）server 回 `OutOfOrder`、跳回 `expected_seq`。所以 CLI 只要「從 `Status.received` 送」，不必自己算。
 
-## 7. 資料目錄（local.key、session.sealed、matrix/）
+## 7. 資料目錄：一台機器一把鑰、一個 server 一份快取、一個帳號一套 session
 
 > 用字（維護者 2026-09-07 定）：**passphrase** 是解 `local.key` 的那句話，只存在這台機器；**password** 一律指 Matrix 帳號密碼，只有 `login` 用一次。旗標、命令、錯誤訊息、文件都照這個分。
 
@@ -214,17 +235,25 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | Linux | `$XDG_DATA_HOME/wbf-cli/`（沒設就 `~/.local/share/wbf-cli/`） |
 | macOS | `~/Library/Application Support/wbf-cli/` |
 
-裡面（local-cache-db.md §4、§5.3、§5.6；`Vault` 在 `wbf-sdk::vault`，UI 之後也只能走同一個入口）：
+```
+<data dir>/
+  local.key                      32 byte 主金鑰，一台機器一把（local-cache-db.md §4）；所有帳號共用
+  unlock.ticket                  只有 passphrase 模式會有（§7.1）
+  current                        目前帳號：一行 "<server host>/<localpart>"；沒有這個檔 = 沒登入過
+  servers/<server host>/
+    cache.db                     這個 server 上所有帳號共用的快取（§3.5；local-cache-db.md §6）
+    accounts/<localpart>/
+      session.sealed             { "server", "user_id", "device_id", "access_token", "store_dir" } 用第三把子金鑰封住
+      matrix/                    matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
+```
 
-| 檔 | 什麼 |
-|---|---|
-| `local.key` | 32 byte 主金鑰。`plain` 模式明文；`passphrase` 模式被 Argon2id 導出的 KEK 用 XChaCha20-Poly1305 包住 |
-| `session.sealed` | `{ "server", "user_id", "device_id", "access_token", "store_dir" }` 整份用第三把子金鑰（`wbf-matrix-client session v1`）封住。取代舊的明文 `session.json`；看到舊檔只提示刪掉，不讀 |
-| `matrix/` | matrix-sdk 的 crypto 與 state store（絕對不當快取，plan-v1 §7.1）。store 的 `StoreCipher` 用第二把子金鑰包住（`SqliteStoreConfig::key`，不走 PBKDF2）。用別把金鑰開會被拒：刪掉整個目錄重新 `login` |
-| `unlock.ticket` | 只有 `passphrase` 模式會有，見 §7.1 |
+- `<server host>` 是 URL 的 host 加非預設 port（`localhost_6167`、`matrix.example.org`），`<localpart>` 是 mxid `@` 到 `:` 之間；兩者都只留 `[A-Za-z0-9._-]`。**目錄名只是定位**：真正的 server URL 與 mxid 在 `session.sealed` 裡，不從目錄名反推。
+- 哪個帳號：`--account` → `current`。`login` 寫 `current`；`logout` 的帳號是 `current` 就清掉。
+- `local.key` 為什麼在頂層不在帳號底下：主金鑰的定位是「這台機器」（local-cache-db.md §4），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase，沒有理由。
+- `cache.db` 為什麼在 server 層：`r_seq`／`g_seq` 是 fork server 發的，同一個 room 在不同 homeserver 上序號不同；共用範圍就是同一個 server 的帳號（§3.5）。
+- PR #11 的單一目錄佈局（頂層直接放 `session.sealed`／`matrix/`／`cache.db`）：看到就報錯叫人刪掉重新 `login`，不搬移（快取不是權威、session 重登就有）。
 
 🚫 任何命令的輸出、log、錯誤訊息都不印 `access_token`、主金鑰、子金鑰、passphrase、password。
-🚫 CLI 只用一個資料目錄（不像 local-cache-db.md §5.6 說的 UI 那樣一個 server 加一個 user 一套）：CLI 一次只有一個 session，換帳號就 `--data-dir` 指別處。
 
 ### 7.1 unlock ticket（`passphrase` 模式的 CLI 專用）
 
