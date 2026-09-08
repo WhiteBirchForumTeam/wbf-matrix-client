@@ -36,8 +36,20 @@ pub async fn recent_command(
         let (ack, raws) = client.recent(&request).await?;
         rounds += 1;
         pulled += raws.len();
-        // Recent 的事件自帶 room_id；conversation 參數只在事件沒帶時用到。一頁一起 aggregate：關係事件折進同頁的目標。
-        let messages = messages_from_json("unknown", &raws);
+        // Recent 的事件自帶 room_id（server 的 room-seq-and-recent.md §2）。沒帶的不猜、不寫（會落到 room "unknown"，
+        // 之後查不到，PR #13 審查 salvia 🟢2）：跳過並在 stderr 說一聲。一頁一起 aggregate：關係事件折進同頁的目標。
+        let (with_room, without_room): (Vec<_>, Vec<_>) = raws.iter().cloned().partition(|raw| {
+            raw.get("room_id")
+                .and_then(|value| value.as_str())
+                .is_some()
+        });
+        if !without_room.is_empty() {
+            context.progress(format!(
+                "recent: skipped {} event(s) without room_id",
+                without_room.len()
+            ));
+        }
+        let messages = messages_from_json("unknown", &with_room);
         written += cache.upsert_messages(&me, &messages)?;
         context.progress(format!(
             "recent: round {rounds}, {} events, complete {}, latest_g_seq {}",

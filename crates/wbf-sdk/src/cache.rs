@@ -248,7 +248,10 @@ impl Cache {
                      ON CONFLICT(room, event_id) DO UPDATE SET sender = excluded.sender, r_seq = excluded.r_seq,
                        g_seq = excluded.g_seq, origin_server_ts = excluded.origin_server_ts, kind = excluded.kind,
                        decrypted = excluded.decrypted, message_json = excluded.message_json
-                     WHERE NOT (events.decrypted = 1 AND excluded.decrypted = 0)",
+                     WHERE NOT (events.decrypted IS 1 AND excluded.decrypted IS 0)",
+                    // ↑ 用 null-safe 的 `IS`（PR #13 審查 salvia／cirno）：decrypted 是 NULL（本來就不是加密事件）時
+                    //   `NULL = 1` 是 NULL，整個 WHERE 變 NULL，NULL→NULL 的覆蓋會被靜默跳掉；`NULL IS 1` 是 FALSE，就不會。
+                    //   語意就是「只有『明文被密文蓋』這一種要擋」，其他一律覆蓋。有測試 null_decrypted_rows_still_get_overwritten。
                 )
                 .map_err(db_error)?;
             let mut event_row_id = transaction
@@ -914,7 +917,7 @@ fn remove_database_files(path: &Path) -> Result<(), SdkError> {
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -1177,6 +1180,29 @@ mod tests {
             cache.history(BOB, "!r", None, 1).unwrap()[0].decrypted,
             Some(true)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// decrypted 是 NULL（非加密事件）的列再寫一次也要覆蓋：三值邏輯不能讓 NULL→NULL 靜默跳過（PR #13 審查）。
+    #[test]
+    fn null_decrypted_rows_still_get_overwritten() {
+        let (mut cache, dir) = open("nullnull");
+        let mut first = text("!r", "$n", Some(1), 1);
+        first.decrypted = None;
+        cache
+            .upsert_messages(ALICE, std::slice::from_ref(&first))
+            .unwrap();
+        let mut edited = first.clone();
+        edited.kind = MessageKind::Text {
+            body: "edited".into(),
+            formatted_html: None,
+        };
+        cache
+            .upsert_messages(ALICE, std::slice::from_ref(&edited))
+            .unwrap();
+        let stored = cache.history(ALICE, "!r", None, 1).unwrap().remove(0);
+        assert!(matches!(&stored.kind, MessageKind::Text { body, .. } if body == "edited"));
+        assert_eq!(stored.decrypted, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
