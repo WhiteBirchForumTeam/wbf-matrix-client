@@ -424,7 +424,9 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 
 **檔名與目錄**：完成檔是 `media/<hash 前 2 hex>/<hash>`（hash = 明文 BLAKE3，32 位小寫 hex），下載中是 `media/pending/m<media.id>`。**檔案本身不帶任何 metadata**：原檔名、mimetype、校驗碼、mxc、大小都只在 `cache.db` 的 `media` 列（`name`／`mimetype`／`hash` 來自事件區塊，上傳者填的；`hash` 的形式是 `<algo>:<hex>`，區塊沒帶 sha256 時下載完用我們算的 BLAKE3 補成 `blake3:…`；同內容去重成一個池檔時，每個 mxc 各自保留自己的 name／mimetype／hash）。磁碟上能看到的只有幾個檔、各多大。
 
-**安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；金鑰不進錯誤訊息。**不防**：能讀 `local.key` 的人（同 §4 的威脅模型）、檔案大小與數量。
+**安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；金鑰不進錯誤訊息。**暫定段用自己的 nonce**（段號最高位設 1，PR #14 審查 rumia 🟡3）：同段號的暫定段與之後的正式段是兩個 nonce，每個 nonce 只封一次——AEAD 同 (key, nonce) 封兩份不同明文會漏 Poly1305 金鑰，這條路被堵死；段號因此只用 63 位。`resume_pending` 讀暫存檔尾巴時先用暫定 nonce、解不開再用正式的（尾巴可能是暫定段，也可能是快照點落在中間的正式整段）；完成檔裡永遠沒有暫定段。**不防**：能讀 `local.key` 的人（同 §4 的威脅模型）、檔案大小與數量。
+
+**快取命中的核對**（PR #14 審查 rumia／salvia 🟡）：`fetch` 命中前比對池檔開得起來、明文長度等於區塊 `file_size`、區塊帶 sha256 時要等於 `media.hash`；任一不符 `media_reset` 重下。CLI 的 `sha256_verified` 只在這次真的下載才 true，命中報 false 並附 `hash`。
 
 **測試**（`media_pool.rs` 的單元測試）：跨段寫讀與 seek、去重、續傳在段中／段界／可信長度超過檔長要拒、翻一個 byte／錯金鑰／第 0 段搬到第 1 段都拒、空檔。
 

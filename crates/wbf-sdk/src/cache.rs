@@ -548,20 +548,21 @@ impl Cache {
         Ok(())
     }
 
-    /// 下載完、檔已 adopt 進池：寫齊 `pool_file`、`complete`、`bytes_on_disk`。
+    /// 下載完、檔已 adopt 進池：寫齊 `pool_file`、`complete`、`file_size`（下載到的長度是事實，蓋掉區塊說的）、`bytes_on_disk`。
     pub fn media_finish(
         &mut self,
         mxc: &str,
         pool_file: &str,
         chunks_written: u64,
+        file_size: u64,
         bytes_on_disk: u64,
     ) -> Result<(), SdkError> {
         let now = now_millis();
         self.connection
             .execute(
-                "UPDATE media SET pool_file = ?2, complete = 1, chunks_written = ?3, bytes_on_disk = ?4, last_used_at = ?5,
+                "UPDATE media SET pool_file = ?2, complete = 1, chunks_written = ?3, file_size = ?4, bytes_on_disk = ?5, last_used_at = ?6,
                    hash = COALESCE(hash, 'blake3:' || ?2) WHERE mxc = ?1",
-                params![mxc, pool_file, chunks_written as i64, bytes_on_disk as i64, now],
+                params![mxc, pool_file, chunks_written as i64, file_size as i64, bytes_on_disk as i64, now],
             )
             .map_err(db_error)?;
         Ok(())
@@ -718,6 +719,12 @@ impl Cache {
     /// 測試用後門：跑一句 UPDATE／DELETE（例如把 `last_used_at` 撥到很久以前）。🚫 正式碼不用；參數只收字串。
     #[doc(hidden)]
     pub fn debug_execute(&mut self, sql: &str, params: &[&String]) -> Result<usize, SdkError> {
+        // 只准 UPDATE（PR #14 審查 rumia 🟢2）：測試要的只是撥時間戳，不給它 DROP／DELETE 的能力。
+        if !sql.trim_start().to_ascii_uppercase().starts_with("UPDATE ") {
+            return Err(SdkError::Usage(
+                "debug_execute only runs UPDATE statements".into(),
+            ));
+        }
         self.connection
             .execute(sql, rusqlite::params_from_iter(params.iter()))
             .map_err(db_error)
@@ -1517,7 +1524,7 @@ mod tests {
         );
         // 沒帶的下載完：用 blake3 補；之後 reset 也不清（校驗碼是內容的事實，不是本地副本的）。
         cache
-            .media_finish("mxc://localhost/nohash", "hash-n", 1, 100)
+            .media_finish("mxc://localhost/nohash", "hash-n", 1, 10, 100)
             .unwrap();
         cache.media_reset("mxc://localhost/nohash").unwrap();
         assert_eq!(
@@ -1531,7 +1538,7 @@ mod tests {
         );
         // 帶 sha256 的下載完：不被 blake3 蓋掉。
         cache
-            .media_finish("mxc://localhost/withhash", "hash-s", 1, 100)
+            .media_finish("mxc://localhost/withhash", "hash-s", 1, 10, 100)
             .unwrap();
         assert_eq!(
             cache

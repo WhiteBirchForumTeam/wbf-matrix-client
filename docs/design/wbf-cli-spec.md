@@ -44,7 +44,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、把 session 封進這個帳號目錄的 `session.sealed`，並把它設成 `current`（§7）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著，`login` 只是切換。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
 | `logout` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/` 與 unlock ticket；`current` 指到它就清掉。**`local.key` 與 `cache.db` 留著**（維護者 2026-09-07 定：快取是我們自己的 DB，只綁帳號不綁裝置；要摧毀用 `forget-account`）。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了） | `{ "ok": true }` |
 | `accounts` | 列資料目錄裡的帳號（掃目錄，不開 vault、不問 passphrase） | `[{ "server", "localpart", "logged_in", "current" }…]` |
-| `forget-account <mxid> [--yes]` | 摧毀這個帳號在 `cache.db` 裡的本機紀錄（§3.5 的忘掉鏈）。要完整 mxid。帳號登出中就要配 `--server`（快取的身份要 server URL）。沒 `--yes` 就終端確認 | `{ "ok", "user", "events_removed", "media_removed", "orphan_pool_files" }` |
+| `forget-account <mxid> [--yes]` | 摧毀這個帳號在 `cache.db` 裡的本機紀錄（§3.5 的忘掉鏈），連池裡沒人指的檔一起刪。要完整 mxid。帳號登出中就要配 `--server`（快取的身份要 server URL）。沒 `--yes` 就終端確認 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 | `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
 | `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
@@ -70,7 +70,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | 命令 | 做什麼 |
 |---|---|
 | `info <mxc> [--manifest <m.json>]` | 印 `Info` 的 Ack（server 知道的欄位）。有 manifest 就順便解描述印出來，並做約定 §3.1 第 2 條的核對 |
-| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照約定 §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：池裡有完整檔就不連 server（stdout 多 `source: cache`）；沒有就邊下邊進池、可續傳，再從池複製到 `-o`。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
+| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照約定 §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：池裡有完整檔（長度與校驗碼都對）就不連 server（stdout `source: cache`、`sha256_verified: false`、`hash` 是快取記的校驗碼）；沒有就邊下邊進池、可續傳，再從池複製到 `-o`。快取路徑上一塊驗不過仍 exit 3，但**池裡的半成品留著給下次續**（local-cache-db.md §8.3），`-o` 不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
 | `seek --manifest <m.json> --at <pos> [--len <n>]` | 只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。
@@ -177,9 +177,9 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 |---|---|---|
 | `recent [--limit <n>] [--from-scratch]` | `Event/Recent`：從**這個帳號**的水位線 `cg_seq` 起把新事件跨房間拉回來寫進快取，`complete=false` 就帶 `before=next` 繼續，最後把 `latest_g_seq` 寫回水位線。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "rounds", "cg_seq_before", "cg_seq_after" }` |
 | `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的。排序照 `r_seq`（沒有 `r_seq` 的房間退到時間）。`--before` 這時是 **r_seq 的數字**（上一頁印的 `next`），不是 server 的翻頁 token；沒有 `r_seq` 的房間 `next` 是 null、翻不了頁 | 與不帶時同形 |
-| `forget-account <mxid>` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。回傳已經沒人用的池檔名（這一版只印在 stderr，`media-gc` 的 sweep 會把沒列指著的檔收掉） | 見 §3.1 |
+| `forget-account <mxid>` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收） | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
-| `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪），再照 local-cache-db.md §8.5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending" }` |
+| `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 local-cache-db.md §8.5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
 
 寫穿：`rooms` 把房間列表、`read`／`files`／`watch` 把印過的事件順手寫進快取（帶著這個帳號的 mxid）。**寫穿失敗只在 stderr 說一聲，命令照樣成功**（快取壞了的代價是重拉）。`--token` 模式沒有 vault 也沒有帳號目錄，沒有快取：`--from-cache` 與 `recent` 會 exit 1。
 

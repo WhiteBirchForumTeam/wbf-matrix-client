@@ -13,6 +13,7 @@
 //! - 續傳：`PoolWriter::resume()` 把最後那個不完整的段解回記憶體、檔截到該段起點，接著寫；BLAKE3 從頭重算（本機讀，便宜）。
 //! - 檔名是明文 hash（§8.2），寫完才知道；寫的時候用呼叫者給的暫存名，`finish()` 回 hash 由呼叫者 rename（`adopt`）。
 //! - 段索引進 nonce 與 AAD：把第 3 段搬到第 5 段解不開；nonce_base 每檔隨機：同內容的兩個暫存檔密文不同（去重靠 hash，不靠密文）。
+//! - 暫定段（`sync()` 寫在檔尾、之後會被截掉重封）用段號最高位設 1 的 nonce：同段號的暫定段與正式段是兩個 nonce，每個 nonce 只封一次。
 //!
 //! 🚫 金鑰不進錯誤訊息、不 log。這裡沒有 SQL、沒有網路。
 
@@ -142,7 +143,11 @@ impl MediaPool {
         }
         let mut buffer = Vec::with_capacity(header.segment_size as usize);
         if tail > 0 {
-            let plain = read_segment(&cipher, &header, &mut file, full_segments)?;
+            // 尾巴那段可能是 sync() 留的暫定段（自己的 nonce），也可能是已經封好的正式整段（快照點在它中間）。
+            let plain = match read_segment_as(&cipher, &header, &mut file, full_segments, true) {
+                Ok(plain) => plain,
+                Err(_) => read_segment(&cipher, &header, &mut file, full_segments)?,
+            };
             if plain.len() < tail {
                 return Err(pool_error(format!(
                     "last segment has {} bytes, trusted length needs {tail}",
@@ -215,6 +220,29 @@ impl MediaPool {
         remove_if_exists(&self.path_of(pool_file)?)
     }
 
+    /// 掃 `media/<hh>/`：所有完成檔的 hash（啟動時對照 DB 清沒人指的孤兒用）。
+    pub fn list_files(&self) -> Result<Vec<String>, SdkError> {
+        let mut names = Vec::new();
+        for shard in std::fs::read_dir(&self.dir)? {
+            let shard = shard?;
+            let shard_name = shard.file_name().to_string_lossy().into_owned();
+            if !shard.file_type()?.is_dir()
+                || shard_name == PENDING_DIR_NAME
+                || shard_name.len() != 2
+            {
+                continue;
+            }
+            for entry in std::fs::read_dir(shard.path())? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// 掃 `pending/`：所有暫存檔名（啟動時對照 DB 清孤兒用）。
     pub fn list_pending(&self) -> Result<Vec<String>, SdkError> {
         let mut names = Vec::new();
@@ -280,7 +308,13 @@ impl PoolWriter {
             return Ok(());
         }
         self.drop_provisional()?;
-        let sealed = seal_segment(&self.cipher, &self.header, self.segment_index, &self.buffer)?;
+        let sealed = seal_segment(
+            &self.cipher,
+            &self.header,
+            self.segment_index,
+            false,
+            &self.buffer,
+        )?;
         self.file.write_all(&sealed)?;
         self.segment_index += 1;
         self.buffer.clear();
@@ -304,8 +338,14 @@ impl PoolWriter {
     pub fn sync(&mut self) -> Result<(), SdkError> {
         if !self.buffer.is_empty() {
             self.drop_provisional()?;
-            let sealed =
-                seal_segment(&self.cipher, &self.header, self.segment_index, &self.buffer)?;
+            // 暫定段用自己的 nonce（PROVISIONAL_BIT）：同段號之後正式重封是另一個 nonce，不是 nonce 重用。
+            let sealed = seal_segment(
+                &self.cipher,
+                &self.header,
+                self.segment_index,
+                true,
+                &self.buffer,
+            )?;
             self.file.write_all(&sealed)?;
             self.provisional_on_disk = true;
         }
@@ -439,14 +479,24 @@ fn segment_offset(header: &Header, index: u64) -> u64 {
     HEADER_LEN + index * (u64::from(header.segment_size) + TAG_LEN)
 }
 
-fn nonce_and_aad(header: &Header, index: u64) -> ([u8; 24], Vec<u8>) {
+/// 暫定段（`sync()` 寫在檔尾、之後會被截掉重封的那段）用另一組 nonce：段號的最高位設 1。
+/// 同一個 (key, nonce) 封兩份不同的明文是 AEAD 的大忌（Poly1305 的金鑰會漏），而暫定段與它之後的正式段就是「同段號、不同明文」；
+/// 分開 nonce 之後兩者各自只封一次（PR #14 審查 rumia 🟡3）。段號只用 63 位，夠用（2^63 × 64 KiB）。
+const PROVISIONAL_BIT: u64 = 1 << 63;
+
+fn nonce_and_aad(header: &Header, index: u64, provisional: bool) -> ([u8; 24], Vec<u8>) {
+    let tagged_index = if provisional {
+        index | PROVISIONAL_BIT
+    } else {
+        index
+    };
     let mut nonce = [0u8; 24];
     nonce[..NONCE_BASE_LEN].copy_from_slice(&header.nonce_base);
-    nonce[NONCE_BASE_LEN..].copy_from_slice(&index.to_le_bytes());
+    nonce[NONCE_BASE_LEN..].copy_from_slice(&tagged_index.to_le_bytes());
     let mut aad = Vec::with_capacity(AAD_PREFIX.len() + NONCE_BASE_LEN + 8);
     aad.extend_from_slice(AAD_PREFIX);
     aad.extend_from_slice(&header.nonce_base);
-    aad.extend_from_slice(&index.to_le_bytes());
+    aad.extend_from_slice(&tagged_index.to_le_bytes());
     (nonce, aad)
 }
 
@@ -454,9 +504,13 @@ fn seal_segment(
     cipher: &XChaCha20Poly1305,
     header: &Header,
     index: u64,
+    provisional: bool,
     plain: &[u8],
 ) -> Result<Vec<u8>, SdkError> {
-    let (nonce, aad) = nonce_and_aad(header, index);
+    if index & PROVISIONAL_BIT != 0 {
+        return Err(pool_error(format!("segment index {index} is out of range")));
+    }
+    let (nonce, aad) = nonce_and_aad(header, index, provisional);
     cipher
         .encrypt(
             XNonce::from_slice(&nonce),
@@ -475,6 +529,17 @@ fn read_segment(
     file: &mut File,
     index: u64,
 ) -> Result<Vec<u8>, SdkError> {
+    read_segment_as(cipher, header, file, index, false)
+}
+
+/// `provisional` = true 用暫定段的 nonce 解（只有 `resume_pending` 讀暫存檔的尾巴會用）。
+fn read_segment_as(
+    cipher: &XChaCha20Poly1305,
+    header: &Header,
+    file: &mut File,
+    index: u64,
+    provisional: bool,
+) -> Result<Vec<u8>, SdkError> {
     let start = segment_offset(header, index);
     let total = file.metadata()?.len();
     if start >= total {
@@ -484,7 +549,7 @@ fn read_segment(
     let mut sealed = vec![0u8; sealed_len];
     file.seek(SeekFrom::Start(start))?;
     file.read_exact(&mut sealed)?;
-    let (nonce, aad) = nonce_and_aad(header, index);
+    let (nonce, aad) = nonce_and_aad(header, index, provisional);
     cipher
         .decrypt(
             XNonce::from_slice(&nonce),
@@ -686,6 +751,46 @@ mod tests {
         let mut reader = pool.open_read(&finished.hash_hex).unwrap();
         reader.seek(SeekFrom::Start(SEGMENT_SIZE as u64)).unwrap();
         assert!(reader.read(&mut [0u8; 8]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 暫定段與正式段是兩個 nonce：暫定段用正式 nonce 解不開（反之亦然），所以同段號重封不是 nonce 重用。
+    #[test]
+    fn provisional_segment_uses_its_own_nonce() {
+        let (pool, dir) = scratch_pool("provisional");
+        let plain = pattern(SEGMENT_SIZE as usize + 3000);
+        let mut writer = pool.create_pending("p").unwrap();
+        writer.write_all(&plain).unwrap();
+        writer.sync().unwrap(); // 段 1 是 3000 byte 的暫定段
+        let path = writer.path().to_path_buf();
+        drop(writer);
+        let cipher = XChaCha20Poly1305::new(Key32([9u8; 32]).as_bytes().into());
+        let mut file = File::open(&path).unwrap();
+        let header = read_header(&mut file).unwrap();
+        assert!(
+            read_segment(&cipher, &header, &mut file, 1).is_err(),
+            "final nonce must not open a provisional segment"
+        );
+        assert_eq!(
+            read_segment_as(&cipher, &header, &mut file, 1, true).unwrap(),
+            &plain[SEGMENT_SIZE as usize..]
+        );
+        assert!(
+            read_segment_as(&cipher, &header, &mut file, 0, true).is_err(),
+            "provisional nonce must not open a final segment"
+        );
+        // 續上去寫完：尾段被截掉、用正式 nonce 重封，完成檔裡沒有暫定段。
+        let mut resumed = pool.resume_pending("p", plain.len() as u64).unwrap();
+        resumed.write_all(&[7u8; 10]).unwrap();
+        let finished = resumed.finish().unwrap();
+        pool.adopt("p", &finished.hash_hex).unwrap();
+        let mut back = Vec::new();
+        pool.open_read(&finished.hash_hex)
+            .unwrap()
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back.len(), plain.len() + 10);
+        assert_eq!(pool.list_files().unwrap(), vec![finished.hash_hex.clone()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

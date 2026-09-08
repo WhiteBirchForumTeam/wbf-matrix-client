@@ -144,6 +144,31 @@ async fn fetch_downloads_then_hits_cache_and_dedups_same_content() {
         cache.media_bytes_on_disk().unwrap(),
         fetched.entry.bytes_on_disk
     );
+    // 命中前會核對：列說的長度跟 manifest 不一樣就不算命中，reset 後重下。
+    cache
+        .debug_execute(
+            "UPDATE media SET file_size = 1 WHERE mxc = ?1",
+            &[&manifest.mxc],
+        )
+        .unwrap();
+    let mut client = WbfClient::new(&mut server);
+    let refetched = media::fetch(&mut client, &manifest, &mut cache, &pool, &mut |_, _| {})
+        .await
+        .unwrap();
+    assert!(matches!(refetched.outcome, FetchOutcome::Downloaded { .. }));
+    assert_eq!(refetched.entry.file_size, plain.len() as u64);
+    // 區塊的 sha256 跟列記的不一樣（同 mxc 換了內容）也不算命中。
+    let mut other_block = manifest.clone();
+    other_block.block.sha256 = Some("00".repeat(32));
+    let mut client = WbfClient::new(&mut server);
+    let error = media::fetch(&mut client, &other_block, &mut cache, &pool, &mut |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, wbf_sdk::SdkError::Integrity(_)),
+        "redownload verifies against the fake sha256: {error}"
+    );
+
     // 一個檔在磁碟上（前 2 hex 扇出）。
     let files: Vec<_> = walkdir(&pool.dir().to_path_buf());
     assert_eq!(files.iter().filter(|p| p.ends_with(&pool_file)).count(), 1);
@@ -349,14 +374,27 @@ async fn sweep_resets_missing_files_and_removes_orphan_pending() {
     // 有人手動刪了池檔；另外 pending/ 裡有個沒人認領的暫存檔。
     pool.remove(&pool_file).unwrap();
     std::fs::write(pool.pending_path("m999"), b"junk").unwrap();
-    let (reset_rows, removed_pending) = media::sweep(
+    // 還有一個沒人指的完成檔（forget-account 之後會留下這種）。
+    let mut orphan = pool.create_pending("orphan").unwrap();
+    orphan.write_all(b"nobody points at me").unwrap();
+    let orphan_hash = orphan.finish().unwrap().hash_hex;
+    pool.adopt("orphan", &orphan_hash).unwrap();
+    let swept = media::sweep(
         &mut cache,
         &pool,
         Duration::from_secs(7 * 24 * 3600),
         10_000_000_000_000,
     )
     .unwrap();
-    assert_eq!((reset_rows, removed_pending), (1, 1));
+    assert_eq!(
+        (
+            swept.reset_rows,
+            swept.removed_pending,
+            swept.removed_orphan_files
+        ),
+        (1, 1, 1)
+    );
+    assert!(pool.open_read(&orphan_hash).is_err());
     assert!(!cache.find_media(&manifest.mxc).unwrap().unwrap().complete);
     assert!(pool.list_pending().unwrap().is_empty());
     // reset 之後再 fetch 會重新下載。

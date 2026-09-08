@@ -457,16 +457,19 @@ async fn forget_account_command(context: &Context, user: &str, yes: bool) -> Res
         &identity,
     )?;
     let report = cache.forget_account(user)?;
-    // 池還沒有（local-cache-db.md §8 下一個 PR）；先把該刪的檔名印出來，不假裝刪過。
+    // DB 先、檔案後（local-cache-db.md §6 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。刪不掉只說一聲，下次 media-gc 的 sweep 會再收。
+    let pool = MediaPool::open(&account.server_dir(), context.vault()?.media_store_key())?;
+    let mut files_removed = 0u64;
     for file in &report.orphan_pool_files {
-        context.progress(format!(
-            "orphan pool file (no media pool yet, nothing deleted): {file}"
-        ));
+        match pool.remove(file) {
+            Ok(()) => files_removed += 1,
+            Err(error) => context.progress(format!("could not remove pool file {file}: {error}")),
+        }
     }
     print_json(&json!({
         "ok": true, "user": user,
         "events_removed": report.events_removed, "media_removed": report.media_removed,
-        "orphan_pool_files": report.orphan_pool_files,
+        "pool_files_removed": files_removed,
     }))
 }
 
@@ -772,13 +775,17 @@ async fn download_via_cache(
     let mut file = std::fs::File::create(out)?;
     let bytes = std::io::copy(&mut reader, &mut file)?;
     file.flush()?;
-    let (source, chunks) = match fetched.outcome {
-        FetchOutcome::CacheHit => ("cache", 0),
-        FetchOutcome::Downloaded { chunks, .. } => ("server", chunks),
+    // sha256_verified 只在這次真的逐塊下載、整檔核對過才是 true；命中快取沒有重算，報 false，`hash` 給的是快取列記的校驗碼
+    // （PR #14 審查 rumia 🟡1）。
+    let (source, chunks, sha256_verified) = match fetched.outcome {
+        FetchOutcome::CacheHit => ("cache", 0, false),
+        FetchOutcome::Downloaded { chunks, .. } => {
+            ("server", chunks, manifest.block.sha256.is_some())
+        }
     };
     print_json(&json!({
         "out": out.display().to_string(), "bytes": bytes, "chunks": chunks, "source": source,
-        "pool_file": pool_file, "sha256_verified": manifest.block.sha256.is_some(),
+        "pool_file": pool_file, "hash": fetched.entry.hash, "sha256_verified": sha256_verified,
     }))
 }
 
@@ -809,7 +816,7 @@ async fn media_gc_command(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0);
-    let (reset_rows, removed_pending) = media::sweep(&mut cache, &pool, protect, now)?;
+    let swept = media::sweep(&mut cache, &pool, protect, now)?;
     let report = media::collect_garbage(&mut cache, &pool, quota_mib * 1024 * 1024, protect, now)?;
     if report.still_over_quota {
         context.progress(format!(
@@ -820,7 +827,8 @@ async fn media_gc_command(
     print_json(&json!({
         "bytes_before": report.bytes_before, "bytes_after": report.bytes_after,
         "files_removed": report.files_removed, "still_over_quota": report.still_over_quota,
-        "swept_missing_files": reset_rows, "swept_pending": removed_pending,
+        "swept_missing_files": swept.reset_rows, "swept_pending": swept.removed_pending,
+        "swept_orphan_files": swept.removed_orphan_files,
     }))
 }
 
