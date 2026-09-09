@@ -7,11 +7,11 @@
 ## 0. 一句話
 
 ```
-wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.1 JSON WS（明文）──> CLI / Desktop / Android / Python
+wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.1 NDJSON ＋ HTTP（明文）──> CLI / Desktop / Android / Python
 ```
 
 **kernel 是內核**：所有通訊協議、加解密（matrix-sdk）、客製的 wbf 協議、本地資料、session 都在它裡面。
-前端一律是**薄包裝**，只講一種語言：本地的 JSON RPC。
+前端一律是**薄包裝**，只講兩件事：本地的 JSON RPC（控制）與本地的 HTTP（媒體）。
 
 ## 1. 為什麼要這一層（三個現在就在痛的點）
 
@@ -33,10 +33,10 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 │             Rust         Rust 原生      Kotlin       任意   │
 └───────┬─────────┬────────────┬─────────────┬────────────────┘
         └─────────┴────────────┴─────────────┘
-     控制 ws://127.0.0.1（JSON）  ＋  資料 http://127.0.0.1（bytes，Range）  §4
+   控制 tcp://127.0.0.1（NDJSON）  ＋  資料 http://127.0.0.1（bytes，Range）  §4
                               │
 ┌─────────────────────────────┴───────────────────────────┐
-│ kernel（crates/wbf-kernel）                              │
+│ kernel（crates/wbf-core ＋ crates/wbf-kernel）           │
 │   session 與多帳號狀態、vault 解鎖一次、RPC 服務          │
 │   事件分發、進度回報、與 server 的長連線與游標            │
 └───────┬──────────────────────────┬──────────────────────┘
@@ -58,10 +58,10 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 | 界線 | 協議 | 加密 | 跨信任邊界？ |
 |---|---|---|---|
 | kernel ↔ server | **wbf-pack**（二進位） | 是（E2EE 的密文在裡面流動） | **是**：server 不可信 |
-| 前端 ↔ kernel（控制） | **JSON over WS** | **否，一律明文** | **否**：同一台機器、同一個使用者 |
+| 前端 ↔ kernel（控制） | **NDJSON over 裸 TCP** | **否，一律明文** | **否**：同一台機器、同一個使用者 |
 | 前端 ↔ kernel（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上） | 否 |
 
-前端那條**不加密是刻意的**（維護者 2026-09-09）：它在 loopback 上、兩端是同一個人的同一台機器，加密只會讓四個語言各自實作一次密碼學，而**風險換不到東西**。真正的防護是 §4.3 的認證。
+前端那條**不加密是刻意的**（維護者 2026-09-09）：它在 loopback 上、兩端是同一個人的同一台機器，加密只會讓四個語言各自實作一次密碼學，而**風險換不到東西**。真正的防護是 §4.4 的認證。
 
 ## 3. kernel 的職責邊界
 
@@ -82,16 +82,24 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 
 判準：**跨越這條界線的只有資料，不是政策**（全域 CLAUDE.md A4）。kernel 不需要知道前端是誰、長什麼樣。
 
-## 4. 本地介面：兩個平面，兩個 port
+## 4. 本地介面：兩個平面，兩個 port（維護者 2026-09-09 定案）
 
 ```
-控制平面   ws://127.0.0.1:<rpc port>     JSON    命令、狀態、事件、進度
-資料平面   http://127.0.0.1:<data port>  bytes   媒體進出，支援 Range
+控制平面   tcp://127.0.0.1:<rpc port>    NDJSON   命令、狀態、事件、進度
+資料平面   http://127.0.0.1:<data port>  bytes    媒體進出：GET 帶 Range、PUT 上傳
 ```
 
-### 4.1 為什麼分成兩個 port（維護者 2026-09-09 定）
+三種傳輸、三個名字，**沒有任何兩個長得像**——這是刻意的，免得寫的人搞混（維護者 2026-09-09 提的顧慮）：
 
-**因為兩種連線的特性完全相反**：
+| 誰跟誰 | 傳輸 | framing | 叫什麼 |
+|---|---|---|---|
+| kernel ↔ wbfuwunel | WebSocket | **長度前綴的二進位** | **wire**（`wbf-wire`） |
+| 前端 ↔ kernel（控制） | 裸 TCP | **換行分隔的文字** | **RPC** |
+| 前端 ↔ kernel（媒體） | HTTP | HTTP 自己的 | **資料平面** |
+
+### 4.1 為什麼分成兩個 port
+
+**兩種連線的特性完全相反**：
 
 | | 控制平面 | 資料平面 |
 |---|---|---|
@@ -100,46 +108,77 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 | 並行 | 一條就夠 | 播放器會同時開好幾條發 Range |
 | buffer／timeout | 小、短 | 大、長 |
 
-混在一個 listener 上，這四項全都要折衷，還要寫 HTTP upgrade 的分流。
-分開之後兩邊各自調自己的，而且**資料平面完全不必懂 WS，控制平面完全不必懂 Range**。
+混在一個 listener 上這四項全要折衷，還要寫 HTTP upgrade 的分流。
+分開之後**資料平面不必懂 NDJSON，控制平面不必懂 Range**。
 
-### 4.2 為什麼控制平面是 WS 而不是 HTTP／stdio
+### 4.2 控制平面為什麼是裸 TCP ＋ NDJSON，不是 WebSocket
 
-要三件事同時成立：**雙向**（kernel 推事件給前端）、**多工**（一個下載跑著同時能送訊息）、**每個語言都好接**。
-WS 三個都給；HTTP 要靠 SSE 或輪詢補雙向，stdio 在 Android 上不成立。
+WS 的握手、frame、ping/pong **全是為了穿過 HTTP 基礎設施**（proxy、防火牆、CDN）。
+本地一條 loopback 連線一樣都用不到，卻要每個語言各自找一個 WS library。
 
-### 4.3 認證：loopback 不等於安全
+換成 NDJSON（一行一個 JSON）之後，三個語言都是 stdlib 一行：
 
-⚠️ **同一台機器上任何程序都連得到 `127.0.0.1`**，包括別的使用者跑的東西。兩個平面的認證方式**刻意不同**：
+| | 讀一則訊息 |
+|---|---|
+| Rust | `BufReader::lines()`，或 tokio 的 `LinesCodec` |
+| Python | `sock.makefile("rb").readline()`，或 asyncio 的 `readuntil(b"\n")` |
+| Kotlin | `BufferedReader.readLine()` |
 
-**控制平面：一把全域 token**
+📎 也考慮過長度前綴（4 byte LE ＋ payload）。它更直接、可以放 binary，但**不可讀**——
+出問題時沒辦法把往返原文貼出來看。控制平面的訊息都很小、又常要 debug，所以選可讀的那個；
+binary 本來就走資料平面（§4.7）。
 
-1. kernel 啟動時綁 `127.0.0.1:0`（隨機 port），產生 32 byte 隨機 token。
-2. 兩個 port 與控制平面的 token 寫進 `<data dir>/kernel.json`，**Unix 0600**；跟 `unlock.ticket` 同一套權限規矩（CLI 規格 §7.1）：
+📎 而且這讓兩條協議**連 framing 方式都相反**（對 server 是長度前綴的二進位、對前端是換行分隔的文字），
+不可能寫混。
+
+### 4.3 framing：`\n` 切訊息，重組交給 buffered reader
+
+TCP 是 byte stream，**沒有訊息邊界**——一則 JSON 被切成好幾個 TCP 分片是正常且必然的。
+讀取端累積到 buffer 裡，**只有看到 `\n` 才切出一則**：
+
+```
+收到  {"id":1,"ok":true,        ← 沒有 \n，留在 buffer 裡
+收到  "result":[…]}\n           ← 接上了，這時才切出一則完整訊息
+```
+
+所以永遠不會 parse 到半個 JSON。上面那三個 stdlib 的 reader 做的就是這件事，我們不必自己寫。
+
+**`\n` 能當分隔符的前提**：JSON 字串裡**不允許裸的 0x0A**（換行必須逃脫成 `\n` 兩個字元）。
+所以只要用標準 serializer，輸出裡不會有會誤切的換行。⚠️ 前提是：
+
+| 規則 | 為什麼 |
+|---|---|
+| **一律 compact，🚫 不 pretty print** | `to_string_pretty` 會產生真的換行，一則訊息被切成好幾片，每片都 parse 失敗 |
+| **單行上限 1 MiB**，超過**斷連線** | 對方一直不送 `\n`（壞了或惡意）時 buffer 會無限長大。這個上限正好跟 §4.7「超過就走資料平面」對上 |
+| **trim 尾隨的 `\r`** | Windows 上被誰用文字模式寫成 `\r\n` 時的便宜保險 |
+| **一行 parse 失敗就回錯誤、跳過那一行**，🚫 不斷連線 | 一則壞訊息不該讓整條連線陪葬（連續失敗才斷） |
+
+### 4.4 認證：token 就在第一則訊息裡
+
+⚠️ **同一台機器上任何程序都連得到 `127.0.0.1`**，包括別的使用者跑的東西。所以要認證——
+但**不需要另外一套機制**（維護者 2026-09-09：不要複雜化），token 直接包在 JSON 裡：
+
+1. kernel 啟動時綁 `127.0.0.1:0`（兩個隨機 port），產生 32 byte 隨機 token。
+2. 寫進 `<data dir>/kernel.json`，**Unix 0600**——跟 `unlock.ticket` 同一套權限規矩（CLI 規格 §7.1）：
 
    ```json
    { "rpc_port": 51234, "data_port": 51235, "token": "<base64, 32 bytes>" }
    ```
 
-3. 前端讀那個檔，握手的第一個訊息帶 token。**不對就關連線**，🚫 不回「token 錯」以外的資訊。
-4. kernel 結束時刪掉那個檔。讀到過期的檔（連不上那個 port）就當作沒有 kernel。
+3. 前端連上之後**第一則訊息**必須是：
 
-**資料平面：每個資源一張 capability URL，🚫 沒有全域 token**
+   ```jsonc
+   { "id": 0, "method": "hello", "params": { "token": "…", "client": "wbf-cli/0.1.0" } }
+   ```
 
-```
-http://127.0.0.1:<data port>/media/<resource token>
-```
+4. 不對、或第一則不是 `hello`：回一則錯誤然後**關連線**，🚫 不回「token 錯」以外的資訊。
+5. kernel 結束時刪掉 `kernel.json`。讀到過期的檔（連不上那個 port）就當作沒有 kernel。
 
-- token **綁單一資源**（這一個檔、這一次傳輸）、**有 TTL**、**可以重複使用**。
-  ⚠️ 不能「用一次就失效」：播放器 seek 一次就是一次新的 Range 請求，一個影片會發幾十次。
-- token **放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
-  （Android 的 ExoPlayer 可以設，很多圖片元件不行）。做成 capability URL，任何吃 URL 的東西都能直接用。
-- 代價老實寫：URL 會進到那個元件自己的 log。在 loopback 上、短命、綁單一資源，可接受。
-- 認不得的 token、過期的 token：一律 **404**，🚫 不分辨「不存在」與「過期」（那會變成探測工具）。
+📎 資料平面**沒有全域 token**，每個資源一張 capability URL——見 §4.7。
 
 🚫 **兩個平面都不用「反正是 localhost 就放行」**：那等於同機器上任何程式都能讀你的訊息、拿你的 session。
 
-### 4.4 控制平面的訊息形狀
+### 4.5 訊息形狀
 
 三種，都是一行 JSON：
 
@@ -156,13 +195,25 @@ http://127.0.0.1:<data port>/media/<resource token>
 { "event": "progress",     "data": { "id": 17, "done": 1200, "total": 4096 } }
 ```
 
-- **`id` 由前端給**，單調遞增即可；kernel 原樣回。一個連線上可以同時有很多個未完成的 `id`。
-- **`method` 是 `名詞.動詞`**（`account.add`、`room.send_text`、`media.download`），不是 CLI 的字串命令列——
+- **`id` 由前端給**，單調遞增即可；kernel 原樣回。一條連線上可以同時有很多個未完成的 `id`。
+- **`method` 是 `名詞.動詞`**（`account.add`、`room.send_text`、`media.open`），不是 CLI 的字串命令列——
   🚫 不要讓前端組命令列字串再由 kernel 解析，那是把 shell 的問題搬進 RPC。
 - **錯誤有機器可讀的 `code`**（穩定、可比對）加上給人看的 `message`。exit code 那套留給 CLI 自己映射。
-- **推播要先訂閱**（`subscribe`／`unsubscribe`），🚫 不預設把所有事件推給每個連線。
+- **推播要先訂閱**（`subscribe`／`unsubscribe`），🚫 不預設把所有事件推給每條連線。
 
-### 4.5 大資料走資料平面，不走 RPC
+### 4.6 連線數：實務上 1:1，但不寫死
+
+維護者 2026-09-09：**幾乎必然只會 1:1，RPC 只服務一個 client。**
+
+所以：🚫 **不做任何「哪個 client 是主」的概念**——沒有主從、沒有權限分級、沒有連線間的協調。
+
+但也**不硬性拒絕第二條連線**，理由是那樣反而更複雜：要寫拒絕邏輯、要定錯誤碼、
+而且 Desktop 開著時想跑一下 CLI 就會被擋（開發時很煩）。
+事件推播本來就要用 broadcast channel，多一條訂閱者是免費的。
+
+**結論：允許多條連線，但每條都平等、各自訂閱，kernel 不記得誰比較重要。**
+
+### 4.7 大資料走資料平面，不走 RPC
 
 ⚠️ 下載一個 2 GB 的檔不可能塞進 JSON，改成 binary frame 串流也會逼**每個前端各自實作一次串流組裝**。
 
@@ -181,6 +232,19 @@ http://127.0.0.1:<data port>/media/<resource token>
 既然不能給路徑，剩下的通用介面就只有 **URL**。所以 loopback HTTP 不是多造一個輪子，
 是**把加密池接上這些現成輪子的唯一接頭**。Range 也不是額外工作：媒體池的 64 KiB 分段
 本來就是為隨機讀設計的（local-cache-db §8.1），`seek` 的語意早就定好了（約定 §7）。
+
+**資料平面的認證：每個資源一張 capability URL，🚫 沒有全域 token**
+
+```
+http://127.0.0.1:<data port>/media/<resource token>
+```
+
+- token **綁單一資源**（這一個檔、這一次傳輸）、**有 TTL**、**可以重複使用**。
+  ⚠️ 不能「用一次就失效」：播放器 seek 一次就是一次新的 Range 請求，一個影片會發幾十次。
+- token **放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
+  （Android 的 ExoPlayer 可以設，很多圖片元件不行）。做成 capability URL，任何吃 URL 的東西都能直接用。
+- 代價老實寫：URL 會進到那個元件自己的 log。在 loopback 上、短命、綁單一資源，可接受。
+- 認不得的 token、過期的 token：一律 **404**，🚫 不分辨「不存在」與「過期」（那會變成探測工具）。
 
 **播放／顯示**：
 
@@ -215,7 +279,7 @@ http://127.0.0.1:<data port>/media/<resource token>
 這裡明文落地是**使用者要的**，不是我們偷偷做的——這條界線要守住。CLI 的 `download -o` 就是它。
 
 📎 **小東西**（頭像縮圖之類）可以直接 base64 進 RPC 的 result，省一次來回。界線放在
-單則 RPC 訊息 **1 MiB**，超過一律走資料平面。
+單則 RPC 訊息 **1 MiB**（跟 §4.3 的單行上限同一個數），超過一律走資料平面。
 
 📎 效能：多一次 loopback 的記憶體複製，但**少了一次磁碟往返**（本來是「解密→寫檔→播放器讀檔」，
 現在是「解密→socket→播放器」），還不用清暫存檔。控制平面那邊一趟往返 < 0.1 ms，
@@ -226,12 +290,14 @@ http://127.0.0.1:<data port>/media/<resource token>
 | 前端 | 怎麼啟動 kernel | 怎麼講話 |
 |---|---|---|
 | **CLI** | 連不到就自己 spawn 一個（使用者無感）。開發時不必先手動起 daemon | 同一份 RPC |
+
+📎 ⚠️ **RPC vs uniffi 這個決策還沒定**：如果不要程序隔離，Desktop 與 Android 也可以用 uniffi 直接綁 library（matrix-rust-sdk 自己就是這樣給 Element X 用的），完全不需要 RPC。兩條路的取捨是**安全隔離 vs 簡單**，不是工作量——見 §8 第 7 點。
 | **Desktop**（Rust 原生） | 同程序起一個 task（內嵌），或連外部的 | 同一份 RPC |
-| **Android**（JNI `.so`） | JNI 只有 **`kernel_start(data_dir) -> {rpc_port, data_port, token}`** 與 **`kernel_stop()`** | Kotlin 直接連 loopback WS；媒體 URL 直接餵 ExoPlayer |
+| **Android**（JNI `.so`） | JNI 只有 **`kernel_start(data_dir) -> {rpc_port, data_port, token}`** 與 **`kernel_stop()`** | Kotlin 直接連 loopback TCP 讀行；媒體 URL 直接餵 ExoPlayer |
 | **Python** | spawn kernel 程序 | 同一份 RPC |
 
 ⚠️ **Android 那格是這個設計最大的收穫**：JNI 最痛的是跨語言型別轉換與生命週期，包一個大介面等於維護第二套 API。
-只包「啟動／停止」兩個函數，其餘全部走 WS＋JSON——**JNI 表面積是兩個函數，而且永遠不會長大**。
+只包「啟動／停止」兩個函數，其餘全部走 TCP＋NDJSON——**JNI 表面積是兩個函數，而且永遠不會長大**。
 同程序內連 loopback 有點繞，但成本可忽略，換到的是「介面只有一個」。
 
 📎 Android 的 WS 生命週期：**app 開著才連**，關掉或縮到背景就斷，回來再連。
@@ -256,15 +322,26 @@ kernel 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 ```
 crates/wbf-wire     不動：pack 的 codec
 crates/wbf-sdk      不動：協議、chunk 加解密、cache.db、媒體池、vault、matrix backend
-crates/wbf-kernel   新：常駐狀態（多帳號 session、解鎖一次）、RPC 服務、事件分發
-apps/wbf-cli        瘦身：變成 RPC 的一個前端；命令的「做什麼」搬進 kernel
+crates/wbf-core     新：常駐狀態（多帳號 session、解鎖一次）、事件分發。**沒有 RPC**
+crates/wbf-kernel   新：core ＋ RPC 服務 ＋ 資料平面。library ＋ binary
+apps/wbf-cli        瘦身：變成 RPC 的一個前端；命令的「做什麼」搬進 core
 ```
 
-- **`wbf-sdk` 保持是純 library**（plan-v1 §7.2 的方向不變）：kernel 是它的使用者，不是它的一部分。
+**`core` 與 `kernel` 刻意分開**，因為它們的命運不同：
+
+| | 是什麼 | 選 RPC 時 | 選 uniffi 時（§8 第 7 點） |
+|---|---|---|---|
+| `wbf-core` | 狀態與邏輯，不知道有誰在跟它講話 | 用 | **照樣用** |
+| `wbf-kernel` | 把 core 開一扇門出去 | 用 | 不需要 |
+
+所以那個還沒定的決策**不會擋住開工**：先做 `wbf-core`，它兩條路都要。
+
+- **`wbf-sdk` 保持是純 library**（plan-v1 §7.2 的方向不變）：core 是它的使用者，不是它的一部分。
 - **`wbf-kernel` 同時是 library 與 binary**：Desktop 內嵌用 library，其他人 spawn binary。
-- ⚠️ **kernel 的公開介面要 FFI 友善**（Android 要 JNI）：方法收 `&self`、參數與回傳用簡單型別，
-  🚫 公開介面上不要出現複雜生命週期、trait object、`impl Trait`；kernel 自己持有 tokio runtime，不要求宿主提供。
-  好消息是這個約束**只作用在 `kernel_start`／`kernel_stop` 兩個函數上**（§5），其餘都在 WS 後面。
+- ⚠️ **`wbf-core` 的公開介面不能假設「同程序」**：方法收 `&self`、參數與回傳用簡單型別、
+  事件用 channel 而不是回呼引用、自己持有 tokio runtime 不要求宿主提供。
+  🚫 公開介面上不要出現複雜生命週期、trait object、`impl Trait`。
+  這樣它之後包 RPC 或包 uniffi 都不用改——**這是現在唯一要守的紀律**。
 
 ### 7.1 CLI 的假設要重新檢視
 
@@ -291,7 +368,14 @@ CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印�
    現在定會是憑空猜，要等 Desktop 的實際使用模式出來。
 5. **資料平面 token 的 TTL 與撤銷**：TTL 多長（播一部長片要多久？）、`logout` 時要不要立刻讓所有 token 失效
    （應該要）、同一個資源重複開要不要發新 token。
-6. **縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（§4.5 的 1 MiB 規則），
+6. **縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（§4.7 的 1 MiB 規則），
    還是發一張涵蓋多個資源的 token？後者違反「一張 token 一個資源」，要想清楚再定。
-7. **Desktop 的 UI 框架**：不走 web（維護者 2026-09-09），候選是 egui／iced／slint／gtk-rs 這一類。
+7. ⚠️ **RPC 還是 uniffi**（這份文件假設 RPC，但沒定死）：
+   RPC 的**唯一**硬理由是**程序隔離＝安全隔離**——UI 要解圖片、解影片，那是 CVE 大戶；
+   kernel 持有金鑰。分成兩個程序，UI 被一張惡意圖片打穿也拿不到 Megolm 金鑰與 `local.key`。
+   維護者 2026-09-09 自己也提到同一件事：不想 Python 直接包 Rust，怕「Rust 掛了全部一起死」。
+   反過來，uniffi（matrix-rust-sdk 自己就用它給 Element X）可以零序列化直接綁，Desktop 與 Android 都省事。
+   **建議等 Desktop 有原型、摸到實際使用模式再定**；在那之前 `wbf-core` 的介面兩條路都能接（§7）。
+   📎 如果選 uniffi，這一章（§4）整個不需要——但 `wbf-core` 不會白做。
+8. **Desktop 的 UI 框架**：不走 web（維護者 2026-09-09），候選是 egui／iced／slint／gtk-rs 這一類。
    評估維度見 handover §7；長列表虛擬化與 IME（中文輸入）是原生 Rust GUI 的傳統弱項，要單獨驗。
