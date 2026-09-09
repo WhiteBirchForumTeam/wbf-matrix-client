@@ -47,16 +47,27 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `login --user <mxid> [--password-file <path>] [--device-name <name>]`<br>`account add …`（同一件事的另一個名字） | 登入、把 session 封進這個帳號目錄的 `session.sealed`，**登入成功自動切成 `current`** 並印一行 switch 提示（§3.1.1）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server", "switched_from" }` |
-| `account status` | 列本機所有帳號：掃目錄，不開 vault、不問 passphrase。哪個是 `current`、各自登入了沒 | `[{ "server", "localpart", "logged_in", "current" }…]` |
-| `account switch <user>` | 只改 `current`，不連 server。印 switch 提示（§3.1.1）。`<user>` 是 mxid 或 localpart；同名 localpart 在多個 server 都有就要配 `--server`。指到沒登入的帳號會警告但照切（下一個要連線的命令才會失敗） | `{ "ok": true, "current", "switched_from" }` |
+| `account status` | 列本機所有帳號：掃目錄，不開 vault、不問 passphrase。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy` | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
+| `account switch <user>` | 只改 `current`，不連 server。印 switch 提示（§3.1.1）。指到沒登入的帳號會警告但照切（下一個要連線的命令才會失敗） | `{ "ok": true, "current", "switched_from" }` |
 | `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/`、**`room-keys/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門**：只有「server backup 開著 ＆ `recovery().state() == Enabled`」才直接走；其他任何狀態（沒 recovery key、`SERVER_BACKUP=off`、`Unknown`／`Incomplete`、問不到 server）exit 1，要 `--accept-history-loss` 才走（§3.6） | `{ "ok": true, "user" }` |
-| `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。要完整 mxid；帳號已經登出就要配 `--server`（快取的身份要 server URL）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
+| `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 | `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
 | `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
 | `remove-passphrase` | 拿掉 passphrase，`local.key` 回到 `plain` | `{ "ok": true, "mode": "plain" }` |
 
 ⚠️ 舊名 `accounts` 與 `forget-account` **移除**（維護者 2026-09-09）：碰到就報錯並指向新名字，不留別名。
+
+🔑 **`<user>` 一律是完整 mxid**（維護者 2026-09-09）：`@bob:matrix.org`，🚫 不省略 server name。
+`account switch`／`del`／`destroy` 的位置參數都一樣 —— 這些命令會登出、會刪檔，變更的對象不該靠猜。
+只給 localpart 就報錯並列出本機的帳號（🚫 不推測、不拿唯一一個頂替）：
+
+```
+error: expected a full Matrix ID like @bob:matrix.org, got "bob"
+       accounts on this machine: @alice:matrix.org, @bob:matrix.org, @bob:localhost
+```
+
+全域的 `--account`（§2）仍然收 localpart 簡寫：它只決定這一次命令用誰，猜錯了最多是讀錯人的快取，而且歧義時本來就要配 `--server`（§7）。
 
 #### 3.1.1 切換帳號的提示訊息
 
@@ -77,6 +88,42 @@ switched to @alice:localhost on http://localhost:6167 (no previous account)
 ```
 warning: @bob:localhost is not logged in; commands that need the server will fail until you run `login --user @bob:localhost`
 switched to @bob:localhost on http://localhost:6167 (was @alice:localhost)
+```
+
+#### 3.1.2 一輪多帳號長什麼樣
+
+```bash
+# 兩個帳號共用一個資料目錄（一把 local.key、一份 cache.db）
+wbf-cli --data-dir ~/.wbf login --user @alice:matrix.org --password-file pw-alice
+# stderr: switched to @alice:matrix.org on https://matrix.org (no previous account)
+
+wbf-cli --data-dir ~/.wbf login --user @bob:matrix.org --password-file pw-bob
+# stderr: switched to @bob:matrix.org on https://matrix.org (was @alice:matrix.org)
+
+wbf-cli --data-dir ~/.wbf account status
+# [{"user_id":"@alice:matrix.org","server":"https://matrix.org","localpart":"alice","logged_in":true,"current":false},
+#  {"user_id":"@bob:matrix.org","server":"https://matrix.org","localpart":"bob","logged_in":true,"current":true}]
+
+# 換預設帳號：完整 mxid，不是 "alice"
+wbf-cli --data-dir ~/.wbf account switch @alice:matrix.org
+# stderr: switched to @alice:matrix.org on https://matrix.org (was @bob:matrix.org)
+# stdout: {"ok":true,"current":"@alice:matrix.org","switched_from":"@bob:matrix.org"}
+
+# 只有這一條用 bob，current 不動
+wbf-cli --data-dir ~/.wbf --account @bob:matrix.org rooms
+
+# 登出 bob：session、matrix/、room-keys/ 沒了，cache.db 裡的紀錄還在
+wbf-cli --data-dir ~/.wbf account del @bob:matrix.org
+
+# 連 bob 在本機的紀錄一起清掉（alice 也看得到的那些不動）
+wbf-cli --data-dir ~/.wbf account destroy @bob:matrix.org --yes
+```
+
+同一個 localpart 在兩個 server 上是**兩個帳號**，完整 mxid 才分得開：
+
+```bash
+wbf-cli --data-dir ~/.wbf account switch @bob:matrix.org   # 這個
+wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同一個人
 ```
 
 ### 3.2 上傳
