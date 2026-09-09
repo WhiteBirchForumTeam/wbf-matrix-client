@@ -33,7 +33,7 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 │             Rust         Rust 原生      Kotlin       任意   │
 └───────┬─────────┬────────────┬─────────────┬────────────────┘
         └─────────┴────────────┴─────────────┘
-                  127.0.0.1 JSON over WebSocket（明文，§4）
+     控制 ws://127.0.0.1（JSON）  ＋  資料 http://127.0.0.1（bytes，Range）  §4
                               │
 ┌─────────────────────────────┴───────────────────────────┐
 │ kernel（crates/wbf-kernel）                              │
@@ -58,9 +58,10 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 | 界線 | 協議 | 加密 | 跨信任邊界？ |
 |---|---|---|---|
 | kernel ↔ server | **wbf-pack**（二進位） | 是（E2EE 的密文在裡面流動） | **是**：server 不可信 |
-| 前端 ↔ kernel | **JSON**（文字） | **否，一律明文** | **否**：同一台機器、同一個使用者 |
+| 前端 ↔ kernel（控制） | **JSON over WS** | **否，一律明文** | **否**：同一台機器、同一個使用者 |
+| 前端 ↔ kernel（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上） | 否 |
 
-前端那條**不加密是刻意的**（維護者 2026-09-09）：它在 loopback 上、兩端是同一個人的同一台機器，加密只會讓四個語言各自實作一次密碼學，而**風險換不到東西**。真正的防護是 §4.2 的認證。
+前端那條**不加密是刻意的**（維護者 2026-09-09）：它在 loopback 上、兩端是同一個人的同一台機器，加密只會讓四個語言各自實作一次密碼學，而**風險換不到東西**。真正的防護是 §4.3 的認證。
 
 ## 3. kernel 的職責邊界
 
@@ -81,25 +82,64 @@ wbfuwunel ──wbf-pack（二進位，可加密）──> kernel ──127.0.0.
 
 判準：**跨越這條界線的只有資料，不是政策**（全域 CLAUDE.md A4）。kernel 不需要知道前端是誰、長什麼樣。
 
-## 4. RPC：本地的 JSON over WebSocket
+## 4. 本地介面：兩個平面，兩個 port
 
-### 4.1 為什麼是 WS 而不是 HTTP／stdio
+```
+控制平面   ws://127.0.0.1:<rpc port>     JSON    命令、狀態、事件、進度
+資料平面   http://127.0.0.1:<data port>  bytes   媒體進出，支援 Range
+```
 
-要三件事同時成立：**雙向**（server 推事件給前端）、**多工**（一個下載跑著同時能送訊息）、**每個語言都好接**。
+### 4.1 為什麼分成兩個 port（維護者 2026-09-09 定）
+
+**因為兩種連線的特性完全相反**：
+
+| | 控制平面 | 資料平面 |
+|---|---|---|
+| 訊息大小 | 幾百 byte | 幾百 MB |
+| 連線壽命 | 整場開著 | 一個傳輸一條 |
+| 並行 | 一條就夠 | 播放器會同時開好幾條發 Range |
+| buffer／timeout | 小、短 | 大、長 |
+
+混在一個 listener 上，這四項全都要折衷，還要寫 HTTP upgrade 的分流。
+分開之後兩邊各自調自己的，而且**資料平面完全不必懂 WS，控制平面完全不必懂 Range**。
+
+### 4.2 為什麼控制平面是 WS 而不是 HTTP／stdio
+
+要三件事同時成立：**雙向**（kernel 推事件給前端）、**多工**（一個下載跑著同時能送訊息）、**每個語言都好接**。
 WS 三個都給；HTTP 要靠 SSE 或輪詢補雙向，stdio 在 Android 上不成立。
 
-### 4.2 認證：loopback 不等於安全
+### 4.3 認證：loopback 不等於安全
 
-⚠️ **同一台機器上任何程序都連得到 `127.0.0.1`**，包括別的使用者跑的東西。所以：
+⚠️ **同一台機器上任何程序都連得到 `127.0.0.1`**，包括別的使用者跑的東西。兩個平面的認證方式**刻意不同**：
 
-1. kernel 啟動時綁 `127.0.0.1:0`（隨機 port），產生一個 32 byte 隨機 token。
-2. 把 `{ "port": …, "token": "…" }` 寫進 `<data dir>/kernel.json`，**Unix 0600**；跟 `unlock.ticket` 同一套權限規矩（CLI 規格 §7.1）。
+**控制平面：一把全域 token**
+
+1. kernel 啟動時綁 `127.0.0.1:0`（隨機 port），產生 32 byte 隨機 token。
+2. 兩個 port 與控制平面的 token 寫進 `<data dir>/kernel.json`，**Unix 0600**；跟 `unlock.ticket` 同一套權限規矩（CLI 規格 §7.1）：
+
+   ```json
+   { "rpc_port": 51234, "data_port": 51235, "token": "<base64, 32 bytes>" }
+   ```
+
 3. 前端讀那個檔，握手的第一個訊息帶 token。**不對就關連線**，🚫 不回「token 錯」以外的資訊。
 4. kernel 結束時刪掉那個檔。讀到過期的檔（連不上那個 port）就當作沒有 kernel。
 
-🚫 **不用「反正是 localhost 就放行」**：那等於同機器上任何程式都能讀你的訊息、拿你的 session。
+**資料平面：每個資源一張 capability URL，🚫 沒有全域 token**
 
-### 4.3 訊息形狀
+```
+http://127.0.0.1:<data port>/media/<resource token>
+```
+
+- token **綁單一資源**（這一個檔、這一次傳輸）、**有 TTL**、**可以重複使用**。
+  ⚠️ 不能「用一次就失效」：播放器 seek 一次就是一次新的 Range 請求，一個影片會發幾十次。
+- token **放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
+  （Android 的 ExoPlayer 可以設，很多圖片元件不行）。做成 capability URL，任何吃 URL 的東西都能直接用。
+- 代價老實寫：URL 會進到那個元件自己的 log。在 loopback 上、短命、綁單一資源，可接受。
+- 認不得的 token、過期的 token：一律 **404**，🚫 不分辨「不存在」與「過期」（那會變成探測工具）。
+
+🚫 **兩個平面都不用「反正是 localhost 就放行」**：那等於同機器上任何程式都能讀你的訊息、拿你的 session。
+
+### 4.4 控制平面的訊息形狀
 
 三種，都是一行 JSON：
 
@@ -122,21 +162,64 @@ WS 三個都給；HTTP 要靠 SSE 或輪詢補雙向，stdio 在 Android 上不�
 - **錯誤有機器可讀的 `code`**（穩定、可比對）加上給人看的 `message`。exit code 那套留給 CLI 自己映射。
 - **推播要先訂閱**（`subscribe`／`unsubscribe`），🚫 不預設把所有事件推給每個連線。
 
-### 4.4 大資料：檔案路徑進出，內容不走 RPC
+### 4.5 大資料走資料平面，不走 RPC
 
 ⚠️ 下載一個 2 GB 的檔不可能塞進 JSON，改成 binary frame 串流也會逼**每個前端各自實作一次串流組裝**。
 
-所以：**RPC 只傳控制與進度，內容用檔案路徑交換。**
+⚠️ 而且**不能給檔案路徑**（2026-09-09 維護者指出，這是初稿的錯）：媒體池裡的東西是**加密的**
+（local-cache-db §8），給前端一個池裡的路徑，它讀到的是密文；kernel 先解密寫到某個路徑，那就是
+**明文落地**——整個加密池的意義就沒了。
+
+所以 bytes 走資料平面，而它是 HTTP **因為媒體最終要餵給既有的消費者，而那些消費者只吃 URL 或路徑**：
+
+| 消費者 | 吃什麼 |
+|---|---|
+| Android ExoPlayer | URL（或自訂 DataSource） |
+| Desktop 的影片（GStreamer／ffmpeg／libmpv） | URL 或路徑 |
+| 圖片解碼器 | bytes 或 Reader |
+
+既然不能給路徑，剩下的通用介面就只有 **URL**。所以 loopback HTTP 不是多造一個輪子，
+是**把加密池接上這些現成輪子的唯一接頭**。Range 也不是額外工作：媒體池的 64 KiB 分段
+本來就是為隨機讀設計的（local-cache-db §8.1），`seek` 的語意早就定好了（約定 §7）。
+
+**播放／顯示**：
 
 ```jsonc
-{ "id": 9, "method": "media.download", "params": { "account": "…", "event": "$xyz", "out": "/home/me/video.mkv" } }
-{ "id": 9, "event": "progress", "data": { "done": 52428800, "total": 1073741824 } }
-{ "id": 9, "ok": true, "result": { "path": "/home/me/video.mkv", "source": "cache" } }
+{ "id": 9, "method": "media.open", "params": { "account": "…", "event": "$xyz" } }
+{ "id": 9, "ok": true, "result": {
+    "url": "http://127.0.0.1:51235/media/9f3a…",
+    "mimetype": "video/x-matroska", "size": 1073741824, "expires_in": 3600 } }
 ```
 
-上傳同理：前端給路徑，kernel 讀。媒體池本來就是檔案（local-cache-db §8），這是零成本的做法，而且四個語言都不必寫串流。
+前端把 `url` 直接交給播放器／圖片元件，它自己發 Range。kernel 邊解密邊吐，
+🚫 **不把整個檔案讀進記憶體**。
 
-📎 例外是**小東西**（頭像縮圖之類），那種可以直接 base64 進 JSON；界線放在單則 RPC 訊息 1 MiB，超過一律走檔案。
+**上傳**：
+
+```jsonc
+{ "id": 12, "method": "media.create", "params": { "account": "…", "room": "…", "name": "video.mkv" } }
+{ "id": 12, "ok": true, "result": { "url": "http://127.0.0.1:51235/upload/7c1b…" } }
+// 前端 PUT bytes 進去；kernel 邊收邊加密邊走 chunk 上傳
+{ "event": "progress", "data": { "id": 12, "done": 52428800, "total": 1073741824 } }
+```
+
+⚠️ **Android 沒有別的選擇**：SAF 給的是 `content://` URI，**根本沒有檔案路徑可給**。
+所以 PUT 這條路在 Android 上不是「比較好」，是必要的。
+
+**另存新檔**（使用者明確要把明文放到自己選的位置）仍然走路徑：
+
+```jsonc
+{ "id": 15, "method": "media.save_to", "params": { "account": "…", "event": "$xyz", "out": "/home/me/video.mkv" } }
+```
+
+這裡明文落地是**使用者要的**，不是我們偷偷做的——這條界線要守住。CLI 的 `download -o` 就是它。
+
+📎 **小東西**（頭像縮圖之類）可以直接 base64 進 RPC 的 result，省一次來回。界線放在
+單則 RPC 訊息 **1 MiB**，超過一律走資料平面。
+
+📎 效能：多一次 loopback 的記憶體複製，但**少了一次磁碟往返**（本來是「解密→寫檔→播放器讀檔」，
+現在是「解密→socket→播放器」），還不用清暫存檔。控制平面那邊一趟往返 < 0.1 ms，
+比它後面接的 SQLite 查詢與 AEAD 解密都便宜——**不是瓶頸**。
 
 ## 5. 四個前端怎麼接
 
@@ -144,7 +227,7 @@ WS 三個都給；HTTP 要靠 SSE 或輪詢補雙向，stdio 在 Android 上不�
 |---|---|---|
 | **CLI** | 連不到就自己 spawn 一個（使用者無感）。開發時不必先手動起 daemon | 同一份 RPC |
 | **Desktop**（Rust 原生） | 同程序起一個 task（內嵌），或連外部的 | 同一份 RPC |
-| **Android**（JNI `.so`） | JNI 只有 **`kernel_start(data_dir) -> {port, token}`** 與 **`kernel_stop()`** | Kotlin 直接連 loopback WS |
+| **Android**（JNI `.so`） | JNI 只有 **`kernel_start(data_dir) -> {rpc_port, data_port, token}`** 與 **`kernel_stop()`** | Kotlin 直接連 loopback WS；媒體 URL 直接餵 ExoPlayer |
 | **Python** | spawn kernel 程序 | 同一份 RPC |
 
 ⚠️ **Android 那格是這個設計最大的收穫**：JNI 最痛的是跨語言型別轉換與生命週期，包一個大介面等於維護第二套 API。
@@ -202,6 +285,13 @@ CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印�
 3. **fork submodule 的範圍**：`Client::base_client()` 或 `olm_machine()` 目前是 `pub(crate)`，
    而 to-device 要餵給 SDK 需要 `OlmMachine::receive_sync_changes`（那個是 pub）。
    維護者還沒定要不要 fork——這跟 `Room::encrypt`（chat-model／handover §7）是**同一個決策**，一起定。
-4. **kernel 的生命週期**：誰負責關掉它、閒置多久自己結束、多個前端同時連著時誰說了算。
-5. **Desktop 的 UI 框架**：不走 web（維護者 2026-09-09），候選是 egui／iced／slint／gtk-rs 這一類。
+4. **kernel 的生命週期**：誰負責關掉它、閒置多久自己結束、多個前端同時連著時誰說了算、
+   兩個前端同時 spawn 時怎麼收斂（lock 檔？先到先贏？）。
+   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。
+   現在定會是憑空猜，要等 Desktop 的實際使用模式出來。
+5. **資料平面 token 的 TTL 與撤銷**：TTL 多長（播一部長片要多久？）、`logout` 時要不要立刻讓所有 token 失效
+   （應該要）、同一個資源重複開要不要發新 token。
+6. **縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（§4.5 的 1 MiB 規則），
+   還是發一張涵蓋多個資源的 token？後者違反「一張 token 一個資源」，要想清楚再定。
+7. **Desktop 的 UI 框架**：不走 web（維護者 2026-09-09），候選是 egui／iced／slint／gtk-rs 這一類。
    評估維度見 handover §7；長列表虛擬化與 IME（中文輸入）是原生 Rust GUI 的傳統弱項，要單獨驗。
