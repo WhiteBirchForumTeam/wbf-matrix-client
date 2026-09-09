@@ -23,49 +23,25 @@ use crate::unlock::{
     default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_password_file,
     UnlockOptions,
 };
-use crate::{Cli, Command, UploadArgs};
+use crate::{AccountAction, Cli, Command, LoginArgs, UploadArgs};
 
 pub const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
 
 pub async fn run(cli: Cli) -> Result<(), SdkError> {
     let context = Context::from(&cli)?;
     match cli.command {
-        Command::Login {
-            user,
-            password_file,
-            device_name,
-        } => login_command(&context, &user, password_file.as_deref(), &device_name).await,
+        Command::Login(args) => login_command(&context, &args).await,
         Command::Logout => {
-            let session = context.session().await?;
-            logout(&session).await?;
-            if context.token_override.is_none() {
-                let account = context.account()?;
-                context
-                    .vault()?
-                    .delete_sealed_session(&account.session_path())?;
-                context.unlock.delete_ticket()?;
-                // Matrix 的 logout 讓這個裝置失效；下次 login 是新裝置，舊的 crypto store 會擋登入
-                // （"account in the store doesn't match"，2026-09-07 實跑）。store 跟著走；local.key 與 cache.db 留著。
-                account.delete_matrix_store()?;
-                accounts::clear_current_if(&context.unlock.data_dir, account)?;
-                // 這個 server 最後一個帳號登出：快取沒有主人了，整個丟（維護者：「除非所有帳號被登出」）。
-                let server_dir = account.server_dir();
-                if !accounts::has_any_logged_in_account(&server_dir)
-                    && wbf_sdk::cache::remove_cache(&server_dir)?
-                {
-                    context.progress(format!(
-                        "removed {} (no account on this server is logged in any more)",
-                        server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).display()
-                    ));
-                }
+            // --token 模式沒有帳號目錄，只讓 server 端的 token 失效。
+            if context.token_override.is_some() {
+                logout(&context.session().await?).await?;
+                return print_json(&json!({ "ok": true }));
             }
-            print_json(&json!({ "ok": true }))
+            let account = context.account()?.clone();
+            let user = log_out_account(&context, &account).await?;
+            print_json(&json!({ "ok": true, "user": user }))
         }
-        Command::Accounts => {
-            let listed = accounts::list_accounts(&context.unlock.data_dir)?;
-            print_json(&serde_json::to_value(listed).expect("serializes"))
-        }
-        Command::ForgetAccount { user, yes } => forget_account_command(&context, &user, yes).await,
+        Command::Account { action } => account_command(&context, action).await,
         Command::Lock => {
             let removed = context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "had_ticket": removed }))
@@ -266,7 +242,7 @@ impl Context {
             .ok_or_else(|| {
                 SdkError::Usage(format!(
                     "{} is not logged in ({} missing); run `login` first",
-                    account.key(),
+                    account.label(),
                     account.session_path().display()
                 ))
             })
@@ -281,26 +257,30 @@ impl Context {
         if let Some(account) = self.account.get() {
             return Ok(account);
         }
-        accounts::reject_legacy_layout(&self.unlock.data_dir)?;
+        // 兩層目錄名都是加密的（local-cache-db.md §11），所以定位帳號一定要先解鎖。
+        let vault = self.vault()?;
+        let dir_key = vault.account_dir_key();
         let account = match &self.account_override {
             Some(user) => accounts::find_account(
                 &self.unlock.data_dir,
+                vault,
                 user,
                 self.server_override.as_deref(),
             )?,
             None => {
-                let key = accounts::read_current(&self.unlock.data_dir)?.ok_or_else(|| {
+                let current = accounts::read_current(&self.unlock.data_dir)?.ok_or_else(|| {
                     SdkError::Usage(format!(
                         "no current account in {}; run `login` first (or pass --account)",
                         self.unlock.data_dir.display()
                     ))
                 })?;
-                accounts::account_from_key(&self.unlock.data_dir, &key).ok_or_else(|| {
-                    SdkError::Usage(format!(
-                        "current account {key} has no directory in {}; run `login` again",
-                        self.unlock.data_dir.display()
-                    ))
-                })?
+                accounts::find_account_of_current(&self.unlock.data_dir, &dir_key, &current)
+                    .ok_or_else(|| {
+                        SdkError::Usage(format!(
+                            "the current account has no readable directory in {}; run `login` again",
+                            self.unlock.data_dir.display()
+                        ))
+                    })?
             }
         };
         Ok(self.account.get_or_init(|| account))
@@ -371,25 +351,22 @@ impl Context {
     }
 }
 
-async fn login_command(
-    context: &Context,
-    user: &str,
-    password_file: Option<&Path>,
-    device_name: &str,
-) -> Result<(), SdkError> {
+/// `login`＝`account add`：登入、封 session、**自動切成 current** 並印一行 switch 提示（CLI 規格 §3.1.1）。
+async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkError> {
+    let (user, device_name) = (args.user.as_str(), args.device_name.as_str());
     let server = context
         .server_override
         .clone()
         .ok_or_else(|| SdkError::Usage("login needs --server (or WBF_SERVER)".into()))?;
-    let password = match password_file {
+    let password = match args.password_file.as_deref() {
         Some(path) => read_password_file(path)?,
         None => prompt_password_on_terminal("password: ")?,
     };
-    accounts::reject_legacy_layout(&context.unlock.data_dir)?;
     // vault 先開（沒有就建）：store 的金鑰與 session.sealed 都從它來。
     let vault = context.unlock.open_or_create_vault()?;
     // 帳號目錄由 server host 加 localpart 決定（store 在 login 前就要有路徑）。
-    let account = AccountDir::locate(&context.unlock.data_dir, &server, user);
+    let dir_key = vault.account_dir_key();
+    let account = AccountDir::locate(&context.unlock.data_dir, &dir_key, &server, user)?;
     // 沒有 session 卻留著 matrix/：上次沒走 logout（或舊版的 logout 沒刪），那個 store 綁著已經失效的裝置。消費端自己再清一次。
     if !account.is_logged_in() && account.matrix_store_dir().exists() {
         context.progress("removing a matrix store left over from a previous device".into());
@@ -406,7 +383,12 @@ async fn login_command(
     )
     .await?;
     // server 回的 user_id 才是權威（大小寫、localpart 正規化可能跟 --user 打的不一樣）：目錄名對不上就搬過去。
-    let canonical = AccountDir::locate(&context.unlock.data_dir, &server, &session.user_id);
+    let canonical = AccountDir::locate(
+        &context.unlock.data_dir,
+        &dir_key,
+        &server,
+        &session.user_id,
+    )?;
     let account = if canonical.dir != account.dir {
         if canonical.dir.exists() {
             return Err(SdkError::Usage(format!(
@@ -422,25 +404,175 @@ async fn login_command(
         account
     };
     vault.seal_session(&account.session_path(), &session)?;
-    accounts::write_current(&context.unlock.data_dir, &account)?;
+    let switched_from = switch_current_to(context, &dir_key, &account)?;
     print_json(
-        &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server, "account": account.key() }),
+        &json!({ "user_id": session.user_id, "device_id": session.device_id, "server": session.server, "switched_from": switched_from }),
     )
 }
 
-/// `forget-account <mxid>`：摧毀這個帳號在 cache.db 裡的本機紀錄（local-cache-db.md §6 的忘掉鏈）。
-/// 要開哪個 server 的快取：`--server`，或那個帳號還登入著就用它封著的 session。
-async fn forget_account_command(context: &Context, user: &str, yes: bool) -> Result<(), SdkError> {
+/// `account <action>`（CLI 規格 §3.1）。多帳號是前提：一台機器上可以同時登入好幾個，
+/// `current` 只回答「沒帶 `--account` 時用誰」。
+async fn account_command(context: &Context, action: AccountAction) -> Result<(), SdkError> {
+    match action {
+        AccountAction::Add(args) => login_command(context, &args).await,
+        AccountAction::Status => {
+            // 目錄名是加密的（local-cache-db.md §11），所以列帳號要先解鎖——這跟 2026-09-09 之前不一樣。
+            let vault = context.vault()?;
+            let listed = accounts::list_accounts(&context.unlock.data_dir, vault)?;
+            if let Some(hint) = accounts::find_undecryptable_layout_hint(
+                &context.unlock.data_dir,
+                &vault.account_dir_key(),
+            ) {
+                context.progress(hint);
+            }
+            print_json(&serde_json::to_value(listed).expect("serializes"))
+        }
+        AccountAction::Switch { user } => {
+            let account = find_account_by_full_mxid(context, &user)?;
+            if !account.is_logged_in() {
+                context.progress(format!(
+                    "warning: {user} is not logged in; commands that need the server will fail until you run `login --user {user}`"
+                ));
+            }
+            let dir_key = context.vault()?.account_dir_key();
+            let switched_from = switch_current_to(context, &dir_key, &account)?;
+            print_json(&json!({
+                "ok": true,
+                "current": describe_account(context, &account),
+                "switched_from": switched_from,
+            }))
+        }
+        AccountAction::Del { user } => {
+            let account = find_account_by_full_mxid(context, &user)?;
+            let user = log_out_account(context, &account).await?;
+            print_json(&json!({ "ok": true, "user": user }))
+        }
+        AccountAction::Destroy { user, yes } => destroy_account_command(context, &user, yes).await,
+    }
+}
+
+/// `account switch|del|destroy` 的 `<user>`：**一律完整 mxid**（維護者 2026-09-09）——
+/// 這些命令會登出、會刪檔，變更的對象不該靠猜。只給 localpart 就報錯並列出本機的帳號，
+/// 🚫 不推測、🚫 不拿唯一一個頂替。
+///
+/// Args:
+///     user: example: "@bob:matrix.org"
+/// Return:
+///     Ok(AccountDir)
+///     Err(Usage)   不是完整 mxid、找不到、或同名 localpart 有歧義
+fn find_account_by_full_mxid(context: &Context, user: &str) -> Result<AccountDir, SdkError> {
+    let vault = context.vault()?;
     if !user.starts_with('@') || !user.contains(':') {
+        let known = accounts::list_accounts(&context.unlock.data_dir, vault)?;
+        let names: Vec<String> = known
+            .iter()
+            .map(|summary| match &summary.user_id {
+                Some(user_id) => user_id.clone(),
+                None => format!("{} on {} (logged out)", summary.localpart, summary.server),
+            })
+            .collect();
+        let names = if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        };
         return Err(SdkError::Usage(format!(
-            "forget-account needs the full mxid (example: @alice:localhost), got {user}"
+            "expected a full Matrix ID like @bob:matrix.org, got \"{user}\"\n       accounts on this machine: {names}"
         )));
     }
-    let account = accounts::find_account(
+    accounts::find_account(
         &context.unlock.data_dir,
+        vault,
         user,
         context.server_override.as_deref(),
-    )?;
+    )
+}
+
+/// 給人看的一句話。登入中的用 `session.sealed` 裡的權威 mxid 與 server URL；
+/// 登出的只剩目錄名解出來的明文（localpart 與 host），組不出可靠的 mxid，所以老實說它登出了。
+fn describe_account(context: &Context, account: &AccountDir) -> String {
+    match context
+        .vault()
+        .and_then(|vault| vault.unseal_session(&account.session_path()))
+    {
+        Ok(Some(session)) => format!("{} on {}", session.user_id, session.server),
+        _ => format!("{} (not logged in)", account.label()),
+    }
+}
+
+/// 改 `current` 並印一行 switch 提示（CLI 規格 §3.1.1）。
+///
+/// Args:
+///     dir_key: example: vault.account_dir_key()
+/// Return:
+///     Ok(Some(String))   換掉的是誰
+///     Ok(None)           本來就沒有 current（第一次登入），或本來就是它
+fn switch_current_to(
+    context: &Context,
+    dir_key: &wbf_sdk::Key32,
+    account: &AccountDir,
+) -> Result<Option<String>, SdkError> {
+    let previous = accounts::read_current(&context.unlock.data_dir)?
+        .and_then(|current| {
+            accounts::find_account_of_current(&context.unlock.data_dir, dir_key, &current)
+        })
+        .filter(|previous| previous.dir != account.dir)
+        .map(|previous| describe_account(context, &previous));
+    accounts::write_current(&context.unlock.data_dir, account)?;
+    let now = describe_account(context, account);
+    context.progress(match &previous {
+        Some(previous) => format!("switched to {now} (was {previous})"),
+        None => format!("switched to {now} (no previous account)"),
+    });
+    Ok(previous)
+}
+
+/// 裝置層的登出（CLI 規格 §3.1：`logout` 就是 `account del <current 帳號>`）：讓 token 失效，
+/// 刪這個帳號的 `session.sealed` 與 `matrix/`。`cache.db` 裡的紀錄留著——要連那些一起清是 `account destroy`。
+///
+/// `matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊的 crypto store 會擋登入
+/// （"account in the store doesn't match"，2026-09-07 實跑）。
+///
+/// 🚫 自己不印 stdout：`destroy` 會接在它後面再做資料層，兩邊都印就成了兩個 JSON 物件（CLI 規格 §4）。
+///
+/// Return:
+///     Ok(String)   這次登出的是誰（給呼叫者印）, example: "@alice:localhost on http://localhost:6167"
+async fn log_out_account(context: &Context, account: &AccountDir) -> Result<String, SdkError> {
+    let described = describe_account(context, account);
+    let vault = context.vault()?;
+    match vault.unseal_session(&account.session_path())? {
+        Some(session) => {
+            logout(&session).await?;
+            vault.delete_sealed_session(&account.session_path())?;
+        }
+        // 已經登出但目錄還在（上次清到一半、或 del 一個登出中的帳號）：本地照樣清乾淨。
+        None => context.progress(format!(
+            "{} is already logged out; cleaning up the local files",
+            account.label()
+        )),
+    }
+    context.unlock.delete_ticket()?;
+    account.delete_matrix_store()?;
+    accounts::clear_current_if(&context.unlock.data_dir, account)?;
+    // 這個 server 最後一個帳號登出：快取沒有主人了，整個丟（維護者：「除非所有帳號被登出」）。
+    let server_dir = account.server_dir();
+    if !accounts::has_any_logged_in_account(&server_dir)
+        && wbf_sdk::cache::remove_cache(&server_dir)?
+    {
+        context.progress(format!(
+            "removed {} (no account on this server is logged in any more)",
+            server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).display()
+        ));
+    }
+    Ok(described)
+}
+
+/// `account destroy <mxid>`：裝置層加資料層。先 `account del` 那一整套，再跑忘掉鏈
+/// （local-cache-db.md §6）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 別的帳號也持有的一律不動
+/// （維護者 2026-09-09：扣除別人帳號的持有）。
+/// 要開哪個 server 的快取：`--server`，或那個帳號還登入著就用它封著的 session。
+async fn destroy_account_command(context: &Context, user: &str, yes: bool) -> Result<(), SdkError> {
+    let account = find_account_by_full_mxid(context, user)?;
     let server = match &context.server_override {
         Some(server) => server.clone(),
         None => context
@@ -450,14 +582,19 @@ async fn forget_account_command(context: &Context, user: &str, yes: bool) -> Res
             .ok_or_else(|| {
                 SdkError::Usage(format!(
                     "{} is logged out, so the server URL is unknown; pass --server",
-                    account.key()
+                    account.label()
                 ))
             })?,
     };
-    if !yes && !crate::rooms::confirm(&format!("destroy the local records of {user} on {server}?"))?
+    if !yes
+        && !crate::rooms::confirm(&format!(
+            "destroy {user} on {server}? this logs the device out and deletes its session, crypto store, and the cached events only this account has"
+        ))?
     {
         return Err(SdkError::Usage("cancelled".into()));
     }
+    // 先裝置層（logout、session.sealed、matrix/）再資料層：反過來的話 logout 要用的 session 已經被刪了。
+    log_out_account(context, &account).await?;
     // 快取在 server 層；用這個帳號的目錄定位它（不需要它是 current）。
     let identity = CacheIdentity { server };
     let (mut cache, _) = Cache::open(

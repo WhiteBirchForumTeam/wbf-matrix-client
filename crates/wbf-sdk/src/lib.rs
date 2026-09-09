@@ -16,6 +16,7 @@
 //! - `event_json`：原始 Matrix 事件 JSON → `Message`，matrix backend 與 `recent` 共用。
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
 
+pub mod account_dir;
 pub mod backend;
 #[cfg(feature = "cache")]
 pub mod cache;
@@ -37,6 +38,7 @@ pub mod protocol;
 pub mod upload;
 pub mod vault;
 
+pub use account_dir::{find_dir_name_plaintext, to_dir_name, DirScope};
 pub use channel::{Channel, PackChannel, Transport};
 pub use chat::{
     Attachment, ChatBackend, Conversation, ConversationKind, Message, MessageKind, Page, Update,

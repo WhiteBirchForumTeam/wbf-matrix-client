@@ -49,30 +49,57 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// `login` 與 `account add` 是同一件事，參數只定義一次。
+#[derive(Args)]
+pub struct LoginArgs {
+    /// mxid 或 localpart，example: @alice:localhost
+    #[arg(long)]
+    pub user: String,
+    /// 整檔就是密碼；沒給就從終端讀（不回顯）
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
+    #[arg(long, default_value = "wbf-cli")]
+    pub device_name: String,
+}
+
+/// `account` 底下的動作。`<user>` 一律是完整 mxid（維護者 2026-09-09）：
+/// 這些命令會登出、會刪檔，變更的對象不該靠猜。
 #[derive(Subcommand)]
-pub enum Command {
-    /// 登入、寫 session 檔
-    Login {
-        /// mxid 或 localpart，example: @alice:localhost
-        #[arg(long)]
+pub enum AccountAction {
+    /// 登入一個帳號並切成 current（等同 login）
+    Add(LoginArgs),
+    /// 列出本機所有帳號。⚠️ 要解鎖：目錄名是加密的（local-cache-db.md §11）
+    Status,
+    /// 換預設帳號（只改 current，不連 server）
+    Switch {
+        /// 完整 mxid，example: @bob:matrix.org
         user: String,
-        /// 整檔就是密碼；沒給就從終端讀（不回顯）
-        #[arg(long)]
-        password_file: Option<PathBuf>,
-        #[arg(long, default_value = "wbf-cli")]
-        device_name: String,
     },
-    /// 讓 token 失效；刪這個帳號的 session.sealed 與 matrix/，cache.db 留著（這個 server 最後一個帳號登出時才刪）
-    Logout,
-    /// 列出資料目錄裡的帳號（不開 vault）
-    Accounts,
-    /// 摧毀一個帳號在 cache.db 裡的本機紀錄（它同步過的事件、房間清單、已讀位置；別的帳號也同步過的事件留著）
-    ForgetAccount {
-        /// 完整 mxid，example: @alice:localhost
+    /// 裝置層：登出、刪掉這個帳號的 session.sealed 與 matrix/；cache.db 裡的紀錄留著
+    Del {
+        /// 完整 mxid，example: @bob:matrix.org
+        user: String,
+    },
+    /// 裝置層加資料層：del 再加上清掉這個帳號在 cache.db 裡獨有的紀錄（別人也持有的不動）
+    Destroy {
+        /// 完整 mxid，example: @bob:matrix.org
         user: String,
         /// 不問確認（腳本用）
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// 登入、寫 session 檔；成功後自動切成 current（等同 `account add`）
+    Login(LoginArgs),
+    /// 讓 current 帳號的 token 失效；刪它的 session.sealed 與 matrix/（等同 `account del <current>`）
+    Logout,
+    /// 帳號：新增、列出、切換、登出、摧毀（CLI 規格 §3.1）
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
     },
     /// 刪 unlock ticket；下一個命令會再問 passphrase
     Lock,

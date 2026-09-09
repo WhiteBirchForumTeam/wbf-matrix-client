@@ -18,6 +18,8 @@ wbf-wire = { path = "../wbf-wire" }
 sha2 = "0.10"
 hex = "0.4"
 blake3 = "1"
+# 目錄名的 Base58（local-cache-db.md §11.2）：字母表沒有 0OIl 也沒有底線，所以 `_` 能當分隔符。
+bs58 = "0.5"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
