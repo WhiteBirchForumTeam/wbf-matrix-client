@@ -103,6 +103,10 @@ pub enum KeyBackupAction {
     Status,
     /// 把 crypto store 裡的金鑰推上 server，傳完才 exit（上游的上傳是背景 task，命令 exit 就被 abort）
     Upload,
+    /// 把全部房間金鑰倒進本地快照 room-keys/snapshot（全量覆蓋，一輪 PBKDF2 約半秒）
+    Save,
+    /// 把本地快照餵回 crypto store（重新 login、或刪過 matrix/ 之後用）
+    Import,
     /// 產生 recovery key。⚠️ 只印一次、拿不回來；設好之後 server 上那份換裝置也解得開
     Recovery,
 }

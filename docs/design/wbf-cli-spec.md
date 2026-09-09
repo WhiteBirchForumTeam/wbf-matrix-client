@@ -266,9 +266,10 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `key-backup status` | 本地池有幾把、crypto store 有幾把、server 的 backup version 與 count、落後幾把、有沒有 recovery key。不連 server 也能印本地那半（server 那半是 null） | `{ "local_keys", "store_keys", "server_version", "server_keys", "behind", "has_recovery_key", "server_backup", "local_room_keys" }` |
-| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。`SERVER_BACKUP=off` 時 exit 1 並說明是設定關掉的 | `{ "uploaded", "total", "server_version" }` |
-| `key-backup import` | 把本地 `room-keys/` 的金鑰餵回 crypto store（重新 `login`、或刪過 `matrix/` 之後用）。壞掉的記錄停在那裡，前面的照樣匯入並說明第幾筆之後截斷 | `{ "imported", "total_records", "truncated_at" }` |
+| `key-backup status` | server 上有沒有 backup、本機有沒有在上傳、有沒有 recovery key（只認 `RecoveryState::Enabled`）、本地快照存在嗎／多大／什麼時候存的。⚠️ 「幾把金鑰」印不出來：上游的匯出是不透明的全量檔（local-cache-db §10.4） | `{ "server_backup_exists", "uploading_locally", "has_recovery_key", "recovery_state", "local_snapshot", "local_snapshot_bytes", "local_snapshot_saved_at" }` |
+| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。順手也跑一次 `save`（local-cache-db §10.5） | `{ "ok": true, "server_backup_exists", "has_recovery_key", "local_snapshot_bytes" }` |
+| `key-backup save` | 把 crypto store 裡的**全部**房間金鑰倒進 `room-keys/snapshot`（全量覆蓋，先寫 `.tmp` 再 rename）。一輪 PBKDF2 500k 約半秒，所以是命令觸發的（local-cache-db §10.5） | `{ "ok": true, "bytes" }` |
+| `key-backup import` | 把 `room-keys/snapshot` 餵回 crypto store（重新 `login`、或刪過 `matrix/` 之後用） | `{ "ok": true, "imported", "total" }` |
 | `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**。⚠️ 印完拿不回來，只能 reset。🚫 不寫進任何檔、不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
 
 **警告什麼時候印**（stderr，維護者 2026-09-09：recovery key 延後但要有警告）：

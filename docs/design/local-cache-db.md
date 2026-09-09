@@ -8,7 +8,7 @@
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | §10 房間金鑰備份（server 一份、本地一份） | 📝 2026-09-09 設計定案，還沒實作。conf 檔（CLI 規格 §10）是它的前提，先做 conf 再做這個 |
+> | §10 房間金鑰備份（server 一份、本地一份） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`recovery`、`logout` 的閘門、`room_keys` 模組。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）；conf 的開關還沒做，目前寫死是開的 |
 > | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | 📝 2026-09-09 設計定案，還沒實作。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
@@ -468,7 +468,7 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 | 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | `accounts/<localpart>/room-keys/`（§10.4） |
 | 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §10.3） | 意外：`crypto.db` 壞掉、`matrix/` 被刪掉重 `login`、server 端資料沒了 |
 | 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，§4） |
-| 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§10.6） | **同步寫**，命令結束前落地（§10.5） |
+| 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§10.6） | **命令觸發**：`key-backup save`，`upload` 時順手一起（§10.5） |
 | 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，CLI 規格 §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
 | 生命週期 | 跟帳號走，`logout` 不動它 | **跟這台機器上的這個帳號走：`logout` 連它一起刪**（維護者 2026-09-09，§10.7） |
 | 互通性 | 有：Element 之類的 client 用同一份 | 沒有：只有這個 client 讀得懂 |
@@ -493,47 +493,55 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
 - 關掉（`SERVER_BACKUP=off`）就是 `auto_enable_backups: false` 且不跑上傳；**已經在 server 上的 version 不動、不刪**
   （刪 server 端備份是不可逆的，要顯式命令，見 §10.8）。
 
-### 10.4 本地端：一房一檔的加密金鑰池
+### 10.4 本地端：一個全量快照檔（2026-09-09 實作時改的）
 
 放在**帳號層**（維護者 2026-09-09 定）：
 
 ```
-accounts/<localpart>/room-keys/
-  <room 識別>.keys        一房一檔，順序 append
+accounts/<b58>_<b58>/room-keys/
+  snapshot        上游 export_room_keys 倒出來的全量加密快照
+  snapshot.tmp    寫入時的暫存檔，寫完 rename 成 snapshot
 ```
 
-- **第五把子金鑰**：`BLAKE3 derive_key("wbf-matrix-client room key backup v1", master)`（§4 的表加一列）。
-- **`<room 識別>` 是 keyed hash，不是 room_id**：`BLAKE3 keyed_hash(第五把子金鑰, room_id)` 取前 32 hex。
-  兩個理由：room_id 含 `!` 與 `:`，Windows 檔名不合法；而且目錄名不該洩漏這個帳號在哪些房（沒有金鑰就看不出是哪一間）。
-- **檔案格式**（`WBFRK1`）：32 byte 檔頭 + 一串長度前綴的密文記錄。
+> ⚠️ **這一節 2026-09-09 實作時改過**。原本定的是「一房一檔、逐把 append 的 `WBFRK1` 格式，
+> 每個命令結束前比對後只寫新的那幾筆」。做不到，因為**上游只給全量匯出**：
+> `Encryption::export_room_keys(path, passphrase, predicate)` 直接把金鑰寫成一個加密檔，
+> 而拿逐把金鑰要 `Client::olm_machine()`，那是 `pub(crate)`（只有 `olm_machine_for_testing()` 露出來，
+> 名字就是契約，🚫 不碰）。
+>
+> 改成全量快照之後**反而簡單得多**，而且原本那套 append 格式的理由都消失了：
+>
+> | 原本要解決的 | 全量快照為什麼不需要 |
+> |---|---|
+> | 去重（同一把 session 存很多次） | 每次覆蓋整份，本來就沒有重複 |
+> | 檔案愈積愈長 | 快照大小 ＝ 金鑰總量，不隨備份次數長 |
+> | 自訂的 `WBFRK1` 格式與它的 nonce／序號 | 不用了，格式是上游的 |
+> | 尾巴壞掉要截斷 | 先寫 `.tmp` 再 rename，要嘛舊的完整、要嘛新的完整 |
+>
+> 代價只有一個：拿不到「只寫增量」，每次要跑一輪 PBKDF2 500,000（約半秒）。所以它是**命令觸發**的（§10.5）。
 
-  ```
-  檔頭  magic "WBFRK1\0\0"(8) | version u16 = 1 | reserved(6) | file_id(16 隨機)
-  記錄  u32 明文長度 | u24 序號 | XChaCha20-Poly1305 密文 + tag
-        nonce = file_id 前 8 byte || 序號(u64 little endian)      序號從 0 起，每筆 +1
-        aad   = 檔頭全部 32 byte                                  搬到別的檔就解不開
-  ```
-
-  明文是一筆金鑰的 JSON，欄位就是上游 `ExportedRoomKey` 的（`algorithm`、`room_id`、`sender_key`、`session_id`、
-  `session_key`、`sender_claimed_keys`、`forwarding_curve25519_key_chain`）。**不自己發明欄位**：這樣 import 直接餵回上游。
-- **只 append，不改寫、不刪單筆**（檔案內容層面；整個目錄什麼時候被清掉見 §10.7）。同一個 `session_id` 可以出現多次（後來拿到 index 更小、更完整的那把）；
-  import 時全部餵給上游，由它比 `first_known_index` 決定留哪把。**我們不做取捨**，少一個會出錯的判斷。
-- **壞掉怎麼辦**：某一筆解不開就停在那裡，把**前面成功的那些**照樣 import，並印一行說明第幾筆之後被截斷。
-  順序 append 的檔案壞掉多半是尾巴（寫到一半斷電），前面的仍然有效；🚫 不因為尾巴壞掉就丟掉整個檔。
+- **passphrase 是 vault 第五把子金鑰的 base64**（`BLAKE3 derive_key("wbf-matrix-client room key backup v1", master)`），
+  不是使用者打的字——所以「passphrase 太弱被暴力破」在這裡不存在。
+- **🚫 不再包一層我們自己的 AEAD**：上游的匯出格式本身就是加密的，而它的 passphrase 已經是 vault 保護的，
+  多包一層不增加任何安全性，只多一個要維護的格式（全域 CLAUDE.md A2）。
+- **金鑰不進我們的記憶體**：上游直接寫檔、直接讀檔，我們只給路徑與 passphrase。
+- 一房一檔也做得到（`predicate` 可以按房過濾），但那會變成「房間數 × 半秒」。**維護者當初說的
+  「以 server & 房間為識別碼」在這裡沒有照做**，理由就是這個；要改回一房一檔的話只是把 predicate
+  換成迴圈，格式不用動。
 
 ### 10.5 什麼時候寫
 
-**同步寫，不靠背景 task。** 每個會拿到房間金鑰的命令（`read`、`recent`、`watch`、`sync`、`rooms`）在結束前：
+**命令觸發，不是每個命令都做**——每次一輪 PBKDF2 500,000（約半秒），掛在 `read` 這種命令上太貴。
 
-1. 從 crypto store 匯出金鑰（上游 `encryption().export_room_keys()`，predicate 限定這次碰過的房間）。
-2. 跟該房 `.keys` 檔已有的 `(session_id, first_known_index)` 集合比對 —— 開檔時掃一遍建這個集合（一房幾百到幾千筆，每筆約 200 byte，掃得動）。
-3. 只 append 新的那幾筆，`fsync` 後才算數。
+| 時機 | 做什麼 |
+|---|---|
+| `key-backup save` | 手動存一份 |
+| `key-backup upload` | 推完 server 那份**順手也存本地這份**：兩份備份的用途不同（§10.2），但沒有理由讓使用者記得跑兩個命令 |
+| `logout` 的閘門擋下來時 | 訊息告訴他有 `key-backup save` 這條路（也老實說 logout 會連它一起刪） |
 
-為什麼不用上游的背景 task：`BackupUploadingTask` 的 `Drop` 直接 `abort()`，CLI 命令 exit 時它可能一筆都還沒送出去。
-本地這份是「不能漏」的那一份，所以走同步；server 那份允許落後（§10.6）。
-
-⚠️ 效能：`export_room_keys` 會解密全部 session。房間多、金鑰多的時候這一步會變慢。
-第一版接受（正確優先），量大了再換成訂閱上游的 room key stream 只寫增量 —— 換的時候格式不用動。
+⚠️ 所以本地這份**不是「一定不會漏」**：兩次 `save` 之間拿到的金鑰，只在 crypto store 與（有跑 upload 的話）
+server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那是建立在「拿得到逐把金鑰」的假設上，而那個假設是錯的。
+真正的保險仍然是 §10.3 的 server 端 backup 加 recovery key。
 
 ### 10.6 server 那份怎麼追平：`key-backup upload`
 
@@ -551,7 +559,7 @@ accounts/<localpart>/room-keys/
 
 | 情形 | `matrix/` | `room-keys/` | 怎麼把歷史找回來 |
 |---|---|---|---|
-| **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 餵回新的 crypto store |
+| **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
 | **有意**：`logout`／`account del <user>`（同一件事，CLI 規格 §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
 | **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
 

@@ -409,6 +409,65 @@ impl MatrixBackend {
             .map_err(|error| SdkError::Network(format!("key backup upload: {error}")))
     }
 
+    /// 把 crypto store 裡的**全部**房間金鑰倒進本地快照（`key-backup save`；local-cache-db.md §10.4）。
+    ///
+    /// 上游直接寫檔，金鑰不經過我們的記憶體。先寫 `temp_path` 再 rename 到 `path`：
+    /// 寫到一半斷電不會把上一份好的蓋成半個檔。
+    ///
+    /// 匯出是**全量**的（上游只給這條路，拿不到逐把金鑰），所以每次都覆蓋整份——
+    /// crypto store 只增不減，新的快照一定含得下舊的，不必去重也不會愈積愈多。
+    /// 代價是每次一輪 PBKDF2 500,000（約半秒），所以這是命令觸發的，不是每個命令都做。
+    ///
+    /// Args:
+    ///     path: example: room_keys::snapshot_path(&account.dir)
+    ///     temp_path: example: room_keys::snapshot_temp_path(&account.dir)
+    ///     passphrase: 🚫 不印、不 log, example: room_keys::snapshot_passphrase(&key)
+    /// Return:
+    ///     Ok(u64)      快照有多少 byte
+    ///     Err(Usage)   store 開不了、寫不進去
+    pub async fn save_room_key_snapshot(
+        &self,
+        path: &Path,
+        temp_path: &Path,
+        passphrase: &str,
+    ) -> Result<u64, SdkError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.client
+            .encryption()
+            .export_room_keys(temp_path.to_path_buf(), passphrase, |_| true)
+            .await
+            .map_err(|error| SdkError::Usage(format!("cannot export room keys: {error}")))?;
+        std::fs::rename(temp_path, path)?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// 把本地快照餵回 crypto store（`key-backup import`）。重新 `login`、或刪過 `matrix/` 之後用。
+    ///
+    /// Return:
+    ///     Ok((imported, total))   這次新匯入幾把、快照裡總共幾把
+    ///     Err(Usage)              沒有快照、解不開（不是這把 local.key 存的）、格式壞掉
+    pub async fn import_room_key_snapshot(
+        &self,
+        path: &Path,
+        passphrase: &str,
+    ) -> Result<(usize, usize), SdkError> {
+        if !path.exists() {
+            return Err(SdkError::Usage(format!(
+                "no local room key snapshot at {}; run `key-backup save` while logged in",
+                path.display()
+            )));
+        }
+        let result = self
+            .client
+            .encryption()
+            .import_room_keys(path.to_path_buf(), passphrase)
+            .await
+            .map_err(|error| SdkError::Usage(format!("cannot import room keys: {error}")))?;
+        Ok((result.imported_count, result.total_count))
+    }
+
     /// 產生 recovery key（`key-backup recovery`）。設好之後 server 上那份備份**換裝置也解得開**。
     ///
     /// Return:

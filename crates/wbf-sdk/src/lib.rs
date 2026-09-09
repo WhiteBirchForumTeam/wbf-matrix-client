@@ -53,6 +53,6 @@ pub use download::{DownloadReport, SeekResult};
 pub use error::SdkError;
 pub use login::Session;
 pub use manifest::{Manifest, UploadState};
-pub use room_keys::{RoomKeyRecords, RoomKeyStore};
+pub use room_keys::{get_snapshot_status, SnapshotStatus};
 pub use upload::SentSummary;
 pub use vault::{Key32, KeyMode, Unlock, Vault};

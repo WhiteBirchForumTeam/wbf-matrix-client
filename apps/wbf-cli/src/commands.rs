@@ -8,7 +8,7 @@ use wbf_sdk::backend::matrix_sdk::MatrixBackend;
 use wbf_sdk::cache::{Cache, CacheIdentity, OpenOutcome};
 use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::media_pool::MediaPool;
-use wbf_sdk::room_keys::{RoomKeyStore, ROOM_KEYS_DIR_NAME};
+use wbf_sdk::room_keys;
 
 use crate::accounts::{self, AccountDir};
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
@@ -544,24 +544,44 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
     match action {
         KeyBackupAction::Status => {
             let status = backend.backup_status().await?;
-            let local_keys = local_room_key_store(context)?.count_keys()?;
+            let snapshot = room_keys::get_snapshot_status(&context.account()?.dir);
             print_json(&json!({
                 "server_backup_exists": status.exists_on_server,
                 "uploading_locally": status.enabled_locally,
                 "has_recovery_key": status.has_recovery_key,
                 "recovery_state": status.recovery_state,
-                "local_keys": local_keys,
+                "local_snapshot": snapshot.exists,
+                "local_snapshot_bytes": snapshot.bytes,
+                "local_snapshot_saved_at": snapshot.saved_at,
             }))
         }
         KeyBackupAction::Upload => {
-            context.progress("uploading room keys to the server backup…".into());
+            context.progress("uploading room keys to the server backup...".into());
             backend.upload_room_keys().await?;
+            // 順手把本地那份也更新：兩份備份的用途不同（§10.2），但沒有理由讓使用者記得跑兩個命令。
+            let bytes = save_room_key_snapshot(context, &backend).await?;
             let status = backend.backup_status().await?;
             print_json(&json!({
                 "ok": true,
                 "server_backup_exists": status.exists_on_server,
                 "has_recovery_key": status.has_recovery_key,
+                "local_snapshot_bytes": bytes,
             }))
+        }
+        KeyBackupAction::Save => {
+            let bytes = save_room_key_snapshot(context, &backend).await?;
+            print_json(&json!({ "ok": true, "bytes": bytes }))
+        }
+        KeyBackupAction::Import => {
+            let account = context.account()?;
+            let key = context.vault()?.room_key_backup_key();
+            let (imported, total) = backend
+                .import_room_key_snapshot(
+                    &room_keys::snapshot_path(&account.dir),
+                    &room_keys::snapshot_passphrase(&key),
+                )
+                .await?;
+            print_json(&json!({ "ok": true, "imported": imported, "total": total }))
         }
         KeyBackupAction::Recovery => {
             let recovery_key = backend.enable_recovery().await?;
@@ -575,12 +595,23 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
     }
 }
 
-/// 這個帳號的本地金鑰備份（local-cache-db.md §10.4）。
-fn local_room_key_store(context: &Context) -> Result<RoomKeyStore, SdkError> {
-    RoomKeyStore::open(
-        &context.account()?.dir,
-        context.vault()?.room_key_backup_key(),
-    )
+/// 把全部房間金鑰倒進本地快照（`key-backup save`，以及 `login` 之後自動存一次）。
+///
+/// Return:
+///     Ok(u64)   快照有多少 byte
+async fn save_room_key_snapshot(
+    context: &Context,
+    backend: &MatrixBackend,
+) -> Result<u64, SdkError> {
+    let account = context.account()?;
+    let key = context.vault()?.room_key_backup_key();
+    backend
+        .save_room_key_snapshot(
+            &room_keys::snapshot_path(&account.dir),
+            &room_keys::snapshot_temp_path(&account.dir),
+            &room_keys::snapshot_passphrase(&key),
+        )
+        .await
 }
 
 /// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
@@ -622,6 +653,8 @@ async fn refuse_if_history_would_be_lost(
          about to be deleted. Logging out like this makes {}'s history unreadable.\n       \
          Run `wbf-cli key-backup recovery` first to create a recovery key (printed once, keep it\n       \
          safe), then log out.\n       \
+         If you only need the history on this machine, `wbf-cli key-backup save` writes a local\n       \
+         snapshot — but note that logging out deletes it too.\n       \
          If you do not want that history, pass --accept-history-loss.",
         account.label()
     )))
@@ -660,11 +693,7 @@ async fn log_out_account(
     account.delete_matrix_store()?;
     // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（local-cache-db.md §10.7）。
     // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。
-    match std::fs::remove_dir_all(account.dir.join(ROOM_KEYS_DIR_NAME)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    room_keys::del_snapshot(&account.dir)?;
     accounts::clear_current_if(&context.unlock.data_dir, account)?;
     // 這個 server 最後一個帳號登出：快取沒有主人了，整個丟（維護者：「除非所有帳號被登出」）。
     let server_dir = account.server_dir();
