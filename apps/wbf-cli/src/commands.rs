@@ -606,6 +606,30 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
                 .await?;
             print_json(&json!({ "ok": true, "imported": imported, "total": total }))
         }
+        KeyBackupAction::Restore => {
+            // logout 之後重新 login 是新裝置：crypto store 沒有 SSSS 的 secrets，
+            // RecoveryState 是 Incomplete，server 上那份備份解不開。這條命令補上那一步
+            // （2026-09-09 對真 server 驗證時發現的缺口）。
+            let session = context.session().await?;
+            let key = crate::recovery::find(
+                &context.unlock.data_dir,
+                context.vault()?,
+                &session.user_id,
+            )?
+            .ok_or_else(|| {
+                SdkError::Usage(format!(
+                    "no recovery key is kept here for {}; run `key-backup recovery` first, or restore it from wherever you wrote it down",
+                    session.user_id
+                ))
+            })?;
+            backend.recover_with(&key).await?;
+            let status = backend.backup_status().await?;
+            print_json(&json!({
+                "ok": true,
+                "recovery_enabled": status.recovery_enabled,
+                "recovery_state": status.recovery_state,
+            }))
+        }
         KeyBackupAction::Recovery => {
             let recovery_key = backend.enable_recovery().await?;
             // 封進 <data dir>/recovery/（🚫 不是帳號目錄——`logout` 會把那裡清光，
@@ -617,10 +641,12 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
                 &session.user_id,
                 &recovery_key,
             )?;
-            // 唯一會印秘密的命令，而且只印這一次（CLI 規格 §3.6）。
+            // 會印秘密的命令（另一個是 `recovery show`）。CLI 規格 §3.6。
             context.progress(
-                "this recovery key is now sealed in this account's directory, so you will not be asked to type it.
-                          Still write it down: if this machine is lost, it is the only way back into the server-side backup."
+                "this recovery key is now sealed under <data dir>/recovery/, which survives logout,\n       \
+                 so you will not be asked to type it on this machine.\n       \
+                 Still write it down: if this machine is lost, it is the only way back into the\n       \
+                 server-side backup."
                     .into(),
             );
             print_json(&json!({ "recovery_key": recovery_key }))

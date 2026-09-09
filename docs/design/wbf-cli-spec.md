@@ -270,6 +270,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。順手也跑一次 `save`（local-cache-db §10.5） | `{ "ok": true, "server_backup_exists", "has_recovery_key", "local_snapshot_bytes" }` |
 | `key-backup save` | 把 crypto store 裡的**全部**房間金鑰倒進 `room-keys/snapshot`（全量覆蓋，先寫 `.tmp` 再 rename）。一輪 PBKDF2 500k 約半秒，所以是命令觸發的（local-cache-db §10.5） | `{ "ok": true, "bytes" }` |
 | `key-backup import` | 把 `room-keys/snapshot` 餵回 crypto store（重新 `login`、或刪過 `matrix/` 之後用） | `{ "ok": true, "imported", "total" }` |
+| `key-backup restore` | 用 `<data dir>/recovery/` 保管的那把 key 恢復**這台裝置**（解 SSSS、拿回 backup 的解密金鑰）。⚠️ **重新 `login` 之後一定要跑**：新裝置的 crypto store 沒有 SSSS 的 secrets，`RecoveryState` 會是 `Incomplete`，server 上那份備份解不開（2026-09-09 對真 server 驗證時發現的缺口） | `{ "ok": true, "recovery_enabled", "recovery_state" }` |
 | `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**。⚠️ 印完拿不回來，只能 reset。🚫 不寫進任何檔、不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
 
 #### 3.6.1 `recovery`：這台機器保管著誰的 recovery key

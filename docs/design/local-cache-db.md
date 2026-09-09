@@ -616,10 +616,15 @@ server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損
 | `account destroy` | **一起摧毀**（那個命令的語意就是「什麼都不留」）。⚠️ 之後 server 上那份備份永遠解不開 |
 | `recovery list` | 列出這台機器保管著誰的（只解**檔名**，🚫 不解內容） |
 | `recovery show <user>` | 印出某一個（會印秘密，跟 `key-backup recovery` 一樣） |
+| `key-backup restore` | 拿它**恢復這台裝置**——重新 `login` 之後必跑，見下 |
 
 - **檔名跟其他兩層一樣加密**（`DirScope::Recovery`，第六把子金鑰）：外面看不出這台機器保管著誰的 key。
 - **內容用第三把子金鑰封**（跟 `session.sealed` 同一把，AAD 不同所以密文換不過去）。
 - 目錄 0700。
+- ⚠️ **重新 `login` 之後要跑 `key-backup restore`**（2026-09-09 對真 server 驗證時發現）：
+  `logout` 之後再 `login` 是**新裝置**，它的 crypto store 沒有 SSSS 的 secrets，
+  `RecoveryState` 會是 `Incomplete`、server 上那份備份解不開。保管著 recovery key 不會自動生效，
+  要有人拿它去 `recovery().recover()`。
 - ⚠️ 老實說它的邊界：這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台
   機器上，整台被拿走就一起沒了。真正換裝置時仍然要使用者手上有那串字，所以 `key-backup recovery`
   印出來時還是會叫他寫下來。

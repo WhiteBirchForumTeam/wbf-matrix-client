@@ -121,6 +121,8 @@ pub enum KeyBackupAction {
     Save,
     /// 把本地快照餵回 crypto store（重新 login、或刪過 matrix/ 之後用）
     Import,
+    /// 用保管的 recovery key 恢復這台裝置（重新 login 之後要跑；沒有它 server 上的備份解不開）
+    Restore,
     /// 產生 recovery key。⚠️ 只印一次、拿不回來；設好之後 server 上那份換裝置也解得開
     Recovery,
 }

@@ -480,6 +480,28 @@ impl MatrixBackend {
         Ok((result.imported_count, result.total_count))
     }
 
+    /// 拿 recovery key 把**這台裝置**恢復：解開 SSSS、把 backup 的解密金鑰收進 crypto store。
+    ///
+    /// 什麼時候要：`logout` 之後重新 `login` 是**新裝置**，它的 crypto store 沒有 SSSS 的 secrets，
+    /// 所以 `RecoveryState` 會是 `Incomplete`，server 上那份備份也解不開——直到跑過這個
+    /// （2026-09-09 對真 server 驗證時發現這個缺口：recovery key 保管著卻沒有入口用它）。
+    ///
+    /// 跑完之後 `backup_download_strategy` 才有東西可以下載：解不開的訊息會自動去 backup 拿金鑰。
+    ///
+    /// Args:
+    ///     recovery_key: 🚫 不印、不 log
+    /// Return:
+    ///     Ok(())        恢復了
+    ///     Err(Network)  key 不對、或問不到 server
+    pub async fn recover_with(&self, recovery_key: &str) -> Result<(), SdkError> {
+        self.client
+            .encryption()
+            .recovery()
+            .recover(recovery_key)
+            .await
+            .map_err(|error| SdkError::Network(format!("recover: {error}")))
+    }
+
     /// 使用者手上**真的有**這個帳號的 recovery key 嗎——拿他打的那串去開 secret storage。
     ///
     /// 這是唯一驗得到的方式（維護者 2026-09-09 定）：`BackupStatus::recovery_enabled` 只說得出
