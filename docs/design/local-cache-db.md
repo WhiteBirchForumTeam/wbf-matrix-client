@@ -9,7 +9,7 @@
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
 > | §10 房間金鑰備份（server 一份、本地一份） | 📝 2026-09-09 設計定案，還沒實作。conf 檔（CLI 規格 §10）是它的前提，先做 conf 再做這個 |
-> | §11 帳號目錄名加密、§12 passphrase 是任意 bytes | 📝 2026-09-09 設計定案，還沒實作。跟第一個實作 PR（conf 加 `account` 一族）一起做；§11.6 的遷移不能省（目錄裡有 crypto store） |
+> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | 📝 2026-09-09 設計定案，還沒實作。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
 ## 0. 一句話
@@ -78,7 +78,7 @@ local.key（0600）
 - **導出**：三把 32 byte 子金鑰，`BLAKE3 derive_key(context, master)`，context 是固定字串
   `"wbf-matrix-client cache sqlcipher v1"`、`"wbf-matrix-client matrix-sdk store v1"`、`"wbf-matrix-client session v1"`，加第四把 `"wbf-matrix-client media store v1"`（§8 的池，就這一把）、
   第五把 `"wbf-matrix-client room key backup v1"`（§10.4 的本地房間金鑰池，加密與檔名 keyed hash 都用它）、
-  第六把 `"wbf-matrix-client account directory v1"`（§11 的帳號目錄名加密）。
+  第六把 `"wbf-matrix-client account directory v1"`（§11 的目錄名加密，`servers/` 與 `accounts/` 兩層共用這一把，靠 aad 分）。
   第三把用 XChaCha20-Poly1305 把 session 檔（server、user_id、device_id、access_token）整份封成 `session.sealed`：
   session 與 token **不進 DB**，但跟 DB 同一把鎖（維護者 2026-09-05 定）。子金鑰不落地，每次開啟導一次。
   換 context 字串就是換金鑰，所以 context 帶版本。
@@ -174,12 +174,11 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   local.key                      主金鑰（§4），一台機器一把，所有帳號共用
   unlock.ticket                  CLI 的 unlock ticket（§4）
   current                        CLI 的目前帳號
-  servers/<server host>/
+  servers/<b58>_<b58>/           **server host 加密後的名字**（§11.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用（§6）
     media/                       媒體儲存池（§8），跟 cache.db 同層、同範圍
     accounts/
-      layout                     一行 `v2`：下面的目錄名是加密的（§11.6）；沒這個檔就是舊佈局，要遷移
-      <base58>/                  帳號目錄，名字是 localpart 加密後的 Base58（§11.2）；第六把子金鑰
+      <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 §11.2）
         session.sealed           第三把子金鑰封住的 session
         matrix/                  SDK 的 store（crypto.db、state.db），綁 device；logout 刪
         room-keys/               本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
@@ -190,7 +189,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 與 2026-09-05 草稿的差異（維護者 2026-09-07 定）：
 - 草稿寫 `<data dir>/wbf/<server host>/<user localpart>/` 一帳號一套、`local.key` 在帳號底下。改成 **`local.key` 在頂層**：主金鑰的定位是「這台機器」（§4 第一條），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase。
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§6）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
-- 帳號目錄名 **2026-09-09 起是加密的**（§11）：外面只看得到 Base58，要知道是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
+- **兩層目錄名 2026-09-09 起都是加密的**（§11）：`servers/` 與 `accounts/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
 ## 6. 快取的 schema（v2，2026-09-07 維護者定；就是 `wbf-sdk::cache` 建的）
 
@@ -588,96 +587,117 @@ server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損
 - 還開著：本地金鑰池要不要配額或壓縮（append-only 會一直長）。一筆約 200 byte，一萬把也才 2 MB，第一版不管。
 - 還開著：UI 那版怎麼呈現 recovery key（CLI 只印一次就算了，UI 要有「我存好了」的確認流程）。
 
-## 11. 帳號目錄名加密：外面連「這台機器有誰的帳號」都看不到（維護者 2026-09-09 定）
+## 11. 路徑兩層都加密：外面連「哪家 server、誰的帳號」都看不到（維護者 2026-09-09 定）
 
 ### 11.1 為什麼
 
-`servers/<host>/accounts/<localpart>/` 的 `<localpart>` 是**明文**。DB 加密了、session 封起來了、媒體進了加密池，
-結果目錄名把「這台機器上有 alice 跟 bob」直接寫在檔案總管裡。維護者 2026-09-09 定：**localpart 要加密**，
-外部只看得到一串 Base58。
+`servers/<server host>/accounts/<localpart>/` **兩層都是明文**。DB 加密了、session 封起來了、媒體進了加密池，
+結果路徑把「這台機器上有 alice 跟 bob，都在 matrix.org」直接寫在檔案總管裡。
+維護者 2026-09-09 定：**server host 與 localpart 都要加密**，外部只看得到 `base58/base58`。
 
 ⚠️ 連帶的兩個地方，不改就等於沒加密：
 
 | 地方 | 現在 | 要變成 |
 |---|---|---|
-| `current`（CLI 記「預設用誰」） | 一行 `<server host>/<localpart>` **明文** | 記加密後的目錄名；要知道那是誰得解密 |
-| `account status` 列帳號 | 掃目錄就有，**不開 vault、不問 passphrase** | 必須解鎖才列得出來（§11.5）。這是這個決定的代價，寫在這裡不藏 |
+| `current`（CLI 記「預設用誰」） | 一行 `<server host>/<localpart>` **明文** | 兩層都是加密後的目錄名；要知道那是誰得解密 |
+| `account status` 列帳號 | 掃目錄就有，**不開 vault、不問 passphrase** | 必須解鎖才列得出來（§11.6）。這是這個決定的代價，寫在這裡不藏 |
 
-### 11.2 怎麼加密
+### 11.2 名字的樣子：`<base58 nonce>_<base58 密文>`
 
-**第六把子金鑰**：`BLAKE3 derive_key("wbf-matrix-client account directory v1", master)`（§4 的表加一列）。
-維護者說金鑰隨我挑；挑一把新的，一把鑰一個用途。
+Base58 的字母表**沒有底線**，所以 `_` 可以當分隔符，兩段各自編碼，解析不必靠「前 24 byte 是 nonce」這種長度常數
+（維護者 2026-09-09 出的主意）。
+
+**第六把子金鑰**一把就夠（`BLAKE3 derive_key("wbf-matrix-client account directory v1", master)`，§4）：
+兩層用不同的 aad 與不同的 nonce context 分開，🚫 不需要第七把。
 
 ```
-目錄名 = Base58( nonce(24) ‖ XChaCha20-Poly1305(第六把子金鑰, nonce, localpart, aad) )
-  nonce = BLAKE3 keyed_hash(第六把子金鑰, "account-dir-nonce v1" ‖ <server host> ‖ localpart) 前 24 byte
-  aad   = "wbf-matrix-client account dir v1" ‖ <server host>
+第一層  servers/<B58(nonce_s)>_<B58(ct_s)>/
+  nonce_s = BLAKE3 keyed_hash(key, "wbf server-dir-nonce v1" ‖ host) 前 24 byte
+  ct_s    = XChaCha20-Poly1305(key, nonce_s, host,      aad = "wbf-matrix-client server dir v1")
+
+第二層  accounts/<B58(nonce_a)>_<B58(ct_a)>/
+  nonce_a = BLAKE3 keyed_hash(key, "wbf account-dir-nonce v1" ‖ host ‖ 0x00 ‖ localpart) 前 24 byte
+  ct_a    = XChaCha20-Poly1305(key, nonce_a, localpart, aad = "wbf-matrix-client account dir v1" ‖ host)
 ```
 
-- **nonce 由 localpart 導出（確定性），但仍然存在目錄名裡**。兩件事都要，理由不同：
-  - 存進去：解密時要先有 nonce 才解得開，而 nonce 是從還沒解出來的明文導出的 —— 不存就永遠解不開。
-  - 確定性：`login` 時能**直接算出**目錄名去定位既有帳號，不必先掃描全部目錄。同一個帳號永遠是同一個目錄，
-    重新 `login` 不會長出第二個。
-- 🚫 **不可以用固定 nonce**。同一把金鑰配同一個 nonce 加密不同的 localpart，XChaCha20 是 stream cipher，
-  兩份密文 XOR 就洩漏明文 XOR。nonce 從明文導出正好保證「不同 localpart → 不同 nonce」。
-- **aad 綁 server host**：把 `matrix.org` 底下的帳號目錄搬到 `localhost` 底下就解不開（fail closed），
-  而且同一個 localpart 在兩個 server 上目錄名不同。
-- **Base58**（維護者指定，Bitcoin 字母表）：沒有 `0OIl`，不含 `/`、`+`、`=`，檔名安全、看不出結構。
+- **nonce 由明文確定性導出，而且照樣寫進名字裡**。兩件事都要，理由不同：
+  - 寫進去：解密時要先有 nonce，而 nonce 是從還沒解出來的明文導出的 —— 不寫就永遠解不開。
+  - 確定性：`login` 能**直接算出**兩層路徑去定位，不必先掃描；同一個帳號永遠是同一個目錄，重登不會長出第二個。
+- 🚫 **不可以用固定 nonce**。同一把金鑰配同一個 nonce 加密不同的明文，XChaCha20 是 stream cipher，
+  兩份密文 XOR 就洩漏明文 XOR。nonce 從明文導出正好保證「不同明文 → 不同 nonce」。
+- **第二層的 aad 與 nonce 都綁明文 host**：帳號目錄從一個 server 目錄搬到另一個底下就解不開（fail closed），
+  而且同一個 localpart 在兩個 server 上目錄名不同。第一層的 aad 是固定字串（它上面沒有東西可綁）。
+- nonce context 之間加 `0x00` 分隔：`host="a" localpart="bc"` 與 `host="ab" localpart="c"` 不會導出同一個 nonce。
 
-### 11.3 Windows 的大小寫陷阱
+### 11.3 加密之前先正規化，否則同一個 server 會長出兩個目錄
 
-⚠️ Base58 **區分大小寫**，Windows 的檔名**不區分**。所以「兩個不同密文只差大小寫」在 Windows 上會是同一個目錄。
+加密是逐 byte 的：`matrix.org` 與 `MATRIX.ORG` 進去就是兩個不同的目錄。
+原本 `server_key()` 做的檔名安全化現在改當**正規化**，在加密之前跑：
+
+- **host**：取 URL 的 host，小寫；非預設 port 才帶上（`localhost:6167`、`matrix.org`）。
+  🚫 不再過濾 `[A-Za-z0-9._-]` —— 那是為了當檔名才做的，現在檔名是 Base58，過濾只會讓不同的 host 撞在一起。
+- **localpart**：以 **server 回的 `user_id`** 為權威（現有的 `login` 已經這樣做：目錄名對不上就搬過去）。
+  🚫 不拿使用者打的 `--user` 直接加密。
+
+### 11.4 Windows 的大小寫陷阱與長度
+
+⚠️ Base58 **區分大小寫**，Windows 的檔名**不區分**。所以「兩個名字只差大小寫」在 Windows 上是同一個目錄。
 密文有 40 byte 以上的熵，實際碰不到，但 🚫 不靠「不可能碰撞」寫程式（全域 CLAUDE.md A5）：
 
-- **建目錄前先檢查**：目標名字已經存在時，把它解密出來比對 —— 是同一個 localpart 才用，不是就報錯，
+- **建目錄前先檢查**：目標名字已經存在時，把它解密出來比對 —— 是同一個 host／localpart 才用，不是就報錯，
   🚫 不覆蓋、🚫 不加後綴自己找一個空位。
-- 目錄名長度上限 **200 字元**（Windows 單一路徑元件是 255）。超過就報錯，🚫 不截斷（截斷等於不可逆）。
-  Base58 大約是 byte 數的 1.37 倍，200 字元反推 localpart 大約 100 byte 以上才會踩到 —— Matrix 的 localpart
-  上限是 255 byte，所以踩得到，要有這個檢查。
+- 每一段名字上限 **200 字元**（Windows 單一路徑元件是 255）。Base58 大約是 byte 數的 1.37 倍，
+  nonce 那段固定約 33 字元，所以密文那段大約 120 byte 以上才會踩到 —— Matrix 的 localpart 上限是 255 byte，
+  踩得到，要有這個檢查。超過就報錯，🚫 不截斷（截斷等於不可逆）。
 
-### 11.4 讀回來：掃描一次，建記憶體裡的對照
+### 11.5 讀回來：掃兩層，建記憶體裡的對照
 
-維護者要的流程：**首次讀取時掃下面的目錄、逐一嘗試解密，把 Base58 名字與 mxid 關聯起來。**
+維護者要的流程：**起始時掃一次雙層結構、嘗試解密，解失敗的不加入清單，成功的就把 Base58 映射成明文帶進路徑。**
 
 ```
-servers/<host>/accounts/ 底下每個目錄名
-  → Base58 解碼失敗          → 跳過（不是我們的東西）
-  → 前 24 byte 當 nonce，解  → 失敗：跳過並在 stderr 說一聲（別把 local.key 的、或壞掉的）
-                             → 成功：localpart，配上 <host> 組回 @localpart:<server_name>
+servers/ 底下每個目錄名
+  → 沒有 `_`、任一段 Base58 解碼失敗、AEAD 解不開  → 跳過，不加入清單
+  → 解得開                                        → host，再往下掃它的 accounts/
+       accounts/ 底下每個目錄名
+         → 解不開（aad 綁的是這一層的 host）        → 跳過
+         → 解得開                                  → localpart，組回 @localpart:<server_name>
 ```
 
 - 對照表**只在記憶體裡**，一個命令的生命週期。🚫 不落地成明文索引檔 —— 那等於把剛加密的東西再寫一次明文。
-  （要落地只能進 `cache.db`，但那是 server 層、另一把金鑰，第一版不做。）
-- 掃描成本：一個目錄一次 AEAD，帳號數量是個位數，微秒級。
-- **解不開的目錄不猜、不刪**：可能是另一把 `local.key` 建的（同一台機器換過 data dir）。fail closed 是「當它不存在」。
+- **掃描只在需要列舉時做**（`account status`、或要走遍所有帳號的路徑）。定位單一帳號用 §11.2 的確定性直接算，
+  不必掃 —— 帳號一多的時候差別就出來了。
+- **解不開的不猜、不刪、不報錯**：可能是另一把 `local.key` 建的（換過 data dir），也可能是舊版留下的。
+  fail closed 是「當它不存在」。整個 `servers/` 都解不開時印一行提示（§11.7）。
 
-### 11.5 代價：`account status` 現在要解鎖
+### 11.6 代價：`account status` 現在要解鎖
 
 原本 `account status`（舊名 `accounts`）明說「掃目錄，不開 vault、不問 passphrase」——
-加密之後做不到了：目錄名不解密就不知道是誰。
+兩層都加密之後做不到了：不解密就不知道有哪些 server、哪些帳號。
 
 - `passphrase` 模式下 `account status` 會問 passphrase（或吃 unlock ticket）。
-- 🚫 不做「列出加密名字但不解密」的半套輸出：一串 Base58 對使用者沒有意義，只會讓人以為壞了。
-- 定位單一帳號**不需要掃描**（§11.2 的確定性）：`--account @bob:matrix.org` 直接算出目錄名。
-  但那仍然要第六把子金鑰，所以一樣要解鎖 —— 本來需要帳號目錄的命令就都要解鎖，這條沒有變差。
+- 🚫 不做「列出 Base58 但不解密」的半套輸出：那對使用者沒有意義，只會讓人以為壞了。
+- 本來就要開帳號目錄的命令沒有變差（它們早就要解鎖才讀得到 `session.sealed`）。
 
-### 11.6 從舊佈局搬過來：**要遷移，不能刪掉重來**
+### 11.7 舊的 data dir：砍掉重來，不寫遷移
 
-§1 對快取的政策是「解不開就刪掉重建」，🚫 **這一條不適用於帳號目錄**：裡面有 `matrix/`（crypto store）
-與 `room-keys/`，刪掉就是 §10 整章要防的事。
+維護者 2026-09-09：**server 從未上線、client 從未被使用，breaking 就 breaking，當前環境直接砍掉沒問題。**
+所以這裡 🚫 不寫遷移、🚫 不留 `layout` 之類的版本標記檔 —— 少一個檔、少一段只跑一次的程式。
 
-- **判別靠標記檔，不靠猜名字**：`servers/<host>/accounts/layout` 一行 `v2` = 目錄名是加密的。
-  沒有這個檔就是舊佈局（明文 localpart）。🚫 不用「這個名字像不像 Base58」判斷 —— `alice` 本身就是合法 Base58。
-- 遷移：解鎖之後，把每個舊目錄照 §11.2 算出新名字 `rename` 過去，重寫 `current`，最後寫 `layout`。
-  rename 是同一個檔案系統內的搬移，內容不動。中途斷掉：`layout` 還沒寫，下次再跑一次，已經搬好的目錄
-  算出來的名字就是它現在的名字（確定性），不會搬第二次。
-- 舊佈局但**沒有** `local.key` 可解（不該發生）：報錯，🚫 不刪。
+- 明文佈局的舊目錄在 §11.5 的掃描裡本來就解不開，會被跳過（fail closed），不會被誤認成別人的帳號。
+- `servers/` 底下有東西但**一個都解不開**時，印一行提示就好：
 
-### 11.7 還開著
+  ```
+  warning: no account directory here could be decrypted with this local.key; if this data dir was made
+           by an older build, delete it and run `login` again
+  ```
 
-- `servers/<server host>/` 還是**明文**：外面仍看得出這台機器連過哪些 homeserver、每家有幾個帳號。
-  維護者這次只指定 localpart。同一套機制套上去就能加密它（aad 換成固定字串），要不要做等維護者決定。
-- 目錄的 mtime／檔案大小仍會洩漏活躍程度。這是檔案系統層面的事，這一版不處理。
+- 📎 順帶：`servers/` 兩層都改了之後，CLI 規格 §7 那條「PR #11 的單一目錄佈局要報錯」也失去意義了
+  （那個佈局同樣解不開、同樣被跳過）。實作時可以一併拿掉那段檢查。
+
+### 11.8 還開著
+
+- 目錄的 mtime、檔案大小、帳號數量仍會洩漏活躍程度：外面數得出這台機器上有幾個 server、幾個帳號，
+  只是不知道是誰、在哪家。這是檔案系統層面的事，這一版不處理。
 
 ## 12. passphrase 是任意 bytes，不是字串（維護者 2026-09-09 定）
 
@@ -698,20 +718,15 @@ servers/<host>/accounts/ 底下每個目錄名
 - 終端輸入：讀到的那一行的 UTF-8 bytes（不含結尾換行）。終端只打得出字，這是它的天然子集。
 - 空的判斷改成 **`bytes.is_empty()`**（「沒設 passphrase」仍然是 `Plain` 模式，不是空 passphrase，§4）。
 
-### 12.3 相容：`local.key` 升到 `v: 2`
+### 12.3 沒有相容包袱：`v: 1` 直接就是新的定義
 
-改讀法會改變 KEK，舊檔會突然解不開 —— 而解不開 `local.key` 就等於失去 `cache.db`、`session.sealed`、
-`room-keys/` 全部。所以**版本號決定怎麼讀**：
+改讀法會改變 KEK，舊的 `local.key` 會突然解不開。維護者 2026-09-09：
+**server 從未上線、client 從未被使用，breaking 就 breaking，當前環境直接砍掉沒問題。**
 
-| `v` | passphrase 怎麼餵給 Argon2id |
-|---|---|
-| 1 | 舊行為：檔案當 UTF-8 讀，去掉結尾一個 `\n`（前面有 `\r` 也去掉），取那個字串的 bytes |
-| 2 | 整檔原始 bytes，一個都不動 |
-
-- `Vault::open` 照檔裡的 `v` 選，兩種都解得開。🚫 不猜、🚫 不「先試 v2 再試 v1」——
-  試兩次等於把 Argon2id 跑兩次，而且會讓「passphrase 錯」跟「版本猜錯」混在一起。
-- `set-passphrase`／`remove-passphrase` 重寫 `local.key` 時**一律寫 v2**。所以升級路徑是：跑一次 `set-passphrase`。
-- v1 的讀法只留在一個函數裡，標記為相容用，🚫 不散在別處。
+- 所以 🚫 **不寫兩套讀法**、🚫 不升版本號、🚫 不留 v1 相容分支：`v: 1` 的定義就改成「整檔原始 bytes」。
+  一個問題一份實作，少一個永遠不會有人再讀第二次的分支。
+- 現有的 `local.key` 解不開時，錯誤訊息就照現在的：叫人刪掉 data dir 重新 `login`（§11.7 同一個處置）。
+- 📎 這條的前提是「還沒有使用者」。**之後有了就不再適用** —— 那時候要改 KDF 的輸入就得升版本號、留讀舊檔的路徑。
 
 ### 12.4 `--password-file` **不跟著改**
 
