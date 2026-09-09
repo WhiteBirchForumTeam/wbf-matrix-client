@@ -31,6 +31,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `--account <mxid 或 localpart>` | `WBF_ACCOUNT` | 用哪個帳號；沒給就是最後一次 `login` 的那個（`current`）。同名 localpart 在多個 server 都有時要配 `--server`（§7） |
 | `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔就是 passphrase（解 `local.key` 用，去掉結尾一個換行）。沒給就看 unlock ticket，再沒有就從終端讀（不回顯）。🚫 沒有 `--passphrase <pw>`、🚫 不接受環境變數給 passphrase 本身 |
 | `--unlock-ttl <秒>` | | 密碼解鎖成功後 unlock ticket 的有效期，預設 900；0 就不寫 ticket（§7.1） |
+| `--config <path>` | `WBF_CONFIG` | conf 檔的位置（§10）。沒給就看 `<data dir>/wbf.conf`；明指了卻找不到就報錯，🚫 不默默 fallback |
 | `--json` | | stdout 只印 JSON（預設就是；留這個旗標是為了之後加人類可讀模式時介面不變） |
 | `--quiet` | | stderr 不印進度 |
 | `--transport ws\|http` | | 預設 `ws`；`http` 走 `POST /_wbf/v1/pack` 一請求一包，給除錯與 server 端測試用 |
@@ -177,11 +178,49 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 |---|---|---|
 | `recent [--limit <n>] [--window <n>] [--batch <n>] [--from-scratch]` | `Event/Recent`（只走 WS；`--transport http` 會拿到 `Unsupported`）。三層（維護者 2026-09-08 定）：`--limit` 是**這一輪總共要幾則**（預設 10000，0 = 拉到追平），底層拆成一次 `Recent` 一窗 `--window` 則（預設 320、server 上限 500 先 clamp），server 每 `--batch` 則回一個 Batch（預設 10、上限 100）；要 1000 就是 320、320、320、40 四窗。每個 Batch 寫一次快取；一窗 `tc == 要的` 就帶 `before = 最後的 ls` 再一窗，`tc < 要的` 是追平（`caught_up`）；湊滿 `--limit` 也停（stderr 說更舊的還沒進快取）。水位一律是第一窗第一個 Batch 的 `fs`（比它新的全拿到了），中途斷線或 server 回錯就 exit、已寫的有效、水位不動。等待：第一窗每個 Batch 之間 60 秒、之後 10 秒。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "windows", "batches", "caught_up", "cg_seq_before", "cg_seq_after" }` |
 | `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的。排序照 `r_seq`（沒有 `r_seq` 的房間退到時間）。`--before` 這時是 **r_seq 的數字**（上一頁印的 `next`），不是 server 的翻頁 token；沒有 `r_seq` 的房間 `next` 是 null、翻不了頁 | 與不帶時同形 |
-| `forget-account <mxid>` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收） | 見 §3.1 |
+| `forget-account <mxid> [--delete-room-keys]` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**`room-keys/` 預設留著**（維護者 2026-09-09：默認不刪 room session），要一起丟得帶 `--delete-room-keys`，那個旗標會多問一次確認（刪金鑰不可逆，§3.6） | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
 | `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 local-cache-db.md §8.5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
 
 寫穿：`rooms` 把房間列表、`read`／`files`／`watch` 把印過的事件順手寫進快取（帶著這個帳號的 mxid）。**寫穿失敗只在 stderr 說一聲，命令照樣成功**（快取壞了的代價是重拉）。`--token` 模式沒有 vault 也沒有帳號目錄，沒有快取：`--from-cache` 與 `recent` 會 exit 1。
+
+### 3.6 房間金鑰備份（local-cache-db.md §10，2026-09-09 定，還沒實作）
+
+房間金鑰有兩份備份：server 端的標準 Matrix key backup，與本地 `accounts/<localpart>/room-keys/` 的加密金鑰池。
+兩個開關都在 conf 的 `[backup]`（§10），預設都是 `on`。
+
+| 命令 | 做什麼 | stdout |
+|---|---|---|
+| `key-backup status` | 本地池有幾把、crypto store 有幾把、server 的 backup version 與 count、落後幾把、有沒有 recovery key。不連 server 也能印本地那半（server 那半是 null） | `{ "local_keys", "store_keys", "server_version", "server_keys", "behind", "has_recovery_key", "server_backup", "local_room_keys" }` |
+| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。`SERVER_BACKUP=off` 時 exit 1 並說明是設定關掉的 | `{ "uploaded", "total", "server_version" }` |
+| `key-backup import` | 把本地 `room-keys/` 的金鑰餵回 crypto store（重新 `login`、或刪過 `matrix/` 之後用）。壞掉的記錄停在那裡，前面的照樣匯入並說明第幾筆之後截斷 | `{ "imported", "total_records", "truncated_at" }` |
+| `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**。⚠️ 印完拿不回來，只能 reset。🚫 不寫進任何檔、不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
+
+**警告什麼時候印**（stderr，維護者 2026-09-09：recovery key 延後但要有警告）：
+
+- `login` 成功之後，如果 server backup 開著但還沒有 recovery key：
+
+  ```
+  warning: 房間金鑰備份已經開始上傳到 server，但解開它的私鑰目前只在這台機器上。
+           換一台機器（或這台重灌）會拿不到歷史訊息。
+           要讓備份在別的裝置也解得開，跑一次 `wbf-cli key-backup recovery` 產生 recovery key 並自己保管。
+           本地還有一份金鑰備份在 <data dir>/servers/<host>/accounts/<localpart>/room-keys/（logout 不會刪它）。
+  ```
+
+- `SERVER_BACKUP=off` 時，任何會拿到房間金鑰的命令印一次：
+
+  ```
+  warning: server 端的房間金鑰備份是關的（wbf.conf 的 [backup] SERVER_BACKUP=off）。
+           金鑰只留在這台機器：<data dir>/servers/<host>/accounts/<localpart>/room-keys/
+  ```
+
+- `LOCAL_ROOM_KEYS=off` 且 `SERVER_BACKUP=off`：兩份都關，改印
+
+  ```
+  warning: 兩份房間金鑰備份都關掉了（wbf.conf 的 [backup]）。crypto store 一旦刪掉或壞掉，歷史訊息就解不開了。
+  ```
+
+🚫 這些警告不印金鑰、不印 recovery key、不印 token。
 
 ## 4. 輸出與 exit code
 
@@ -240,6 +279,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 ```
 <data dir>/
   local.key                      32 byte 主金鑰，一台機器一把（local-cache-db.md §4）；所有帳號共用
+  wbf.conf                       設定檔（§10）；指定了 --data-dir 而這裡還沒有時自動生成一份
   unlock.ticket                  只有 passphrase 模式會有（§7.1）
   current                        目前帳號：一行 "<server host>/<localpart>"；沒有這個檔 = 沒登入過
   servers/<server host>/
@@ -247,6 +287,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
     accounts/<localpart>/
       session.sealed             { "server", "user_id", "device_id", "access_token", "store_dir" } 用第三把子金鑰封住
       matrix/                    matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
+      room-keys/                 本地房間金鑰備份（local-cache-db.md §10.4），一房一檔；第五把子金鑰；🚫 logout 不刪、forget-account 預設也不刪
     media/                       媒體儲存池（local-cache-db.md §8）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
 ```
 
@@ -289,3 +330,77 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 - 沒有互動模式、沒有進度條以外的 UI。
 - 不存密碼，只存 token。
 - 第 3 步還沒做的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載（chat-model §6）。
+- 🚫 `key-backup` 不做「刪掉 server 上的 backup version」（不可逆，而且會連帶其他裝置，local-cache-db.md §10.8）。
+- 🚫 conf 不改寫已經存在的檔、不寫秘密（§10.3、§10.5）。
+
+## 10. conf 檔：不用每次指定環境變數（維護者 2026-09-09 要求）
+
+### 10.1 在哪、長怎樣
+
+檔名 `wbf.conf`，放在**資料目錄裡**（`<data dir>/wbf.conf`）。找的順序：
+
+1. `--config <path>` 明指的那個（找不到就報錯，🚫 不默默 fallback —— 明指了還讀到別的比讀不到更糟）。
+2. `<data dir>/wbf.conf`（`<data dir>` 由 `--data-dir` → `WBF_DATA_DIR` → §7 的平台預設決定）。
+3. 都沒有就全用預設值。
+
+```ini
+; wbf.conf —— 分號或井號開頭是註解
+# 值後面的 # / ; 前面有空白才算註解；要保留就用雙引號包住整個值
+
+[general]
+SERVER=http://localhost:6167
+ACCOUNT=@alice:localhost
+TRANSPORT=ws
+UNLOCK_TTL=900
+
+[backup]
+SERVER_BACKUP=on          ; 標準 Matrix key backup（local-cache-db.md §10.3）
+LOCAL_ROOM_KEYS=on        ; 本地加密金鑰池（同 §10.4）
+
+[media]
+QUOTA_MIB=2048
+PROTECT_DAYS=7
+
+[recent]
+MAX_EVENTS=10000
+WINDOW=500
+```
+
+- **區段**：`[名稱]` 一行一個，之後的鍵都屬於它。鍵名在區段內唯一；同一個鍵出現兩次以後面的為準（並印一行警告）。
+- **鍵名就是環境變數去掉 `WBF_` 前綴**（`SERVER` ↔ `WBF_SERVER`）。這樣兩邊不會漂移，也不必另外背一套名字。
+- **註解**：`;` 或 `#` 起，到行尾。⚠️ 只有**行首**或**前面是空白**時才起註解 —— `PASSWORD_FILE=/tmp/a#b` 裡的 `#` 是值的一部分。
+  要讓值以 `#` 開頭或含前後空白，用雙引號包住整個值（`KEY="  # 這是值  "`）。
+- 值前後的空白去掉；空值（`KEY=`）**當作沒寫**，不是空字串（全域 CLAUDE.md：佔位值不用空字串）。
+
+### 10.2 優先序：旗標 > 環境變數 > conf > 內建預設
+
+維護者 2026-09-09 定：**環境變數優先於 conf**。命令列旗標仍然最高（它是「就這一次」的意思）。
+每個值各自比一次，不是整份取代：conf 給了 `SERVER`、環境給了 `WBF_ACCOUNT`，兩個都生效。
+
+### 10.3 自動生成
+
+維護者 2026-09-09 要求：**指定了資料目錄時，conf 自動生成在同一個目錄下，把當前的值寫進去。**
+
+- 觸發條件（三個都要成立）：`--data-dir` 或 `WBF_DATA_DIR` 有給、那個目錄下**還沒有** `wbf.conf`、這次命令**成功**結束。
+- 寫進去的是**這次實際生效的值**（旗標／環境／預設合併之後的），每個值後面附一行註解說它是從哪來的。
+- 已經存在的 `wbf.conf` **永遠不改寫**（連補鍵都不做）：那是使用者的檔，不是我們的狀態檔。要重生成先自己刪掉。
+- 🚫 **不寫任何秘密**：`ACCESS_TOKEN` 不寫（conf 也不支援這個鍵，見 §10.5），`PASSWORD_FILE`／`PASSPHRASE_FILE`
+  這種「秘密在哪」的路徑自動生成時也不寫 —— 要就手動加，讓它是使用者的決定。
+
+### 10.4 認不得的東西怎麼辦：不是正面認得就落到安全值
+
+- **認不得的區段或鍵**：印一行警告到 stderr，忽略它，命令照跑。（conf 要往前相容：舊版 CLI 讀到新版寫的鍵不該整個掛掉。）
+- **認得的鍵、認不得的值**：⚠️ 開關型的鍵（`SERVER_BACKUP`、`LOCAL_ROOM_KEYS`）**只正面認得 `on` 與 `off`**（不分大小寫）；
+  其他任何值（`true`、`1`、`yes`、拼錯的 `of`）一律警告並落到**安全值**，也就是 `on`。
+  判斷一律寫成「**正面認得 `off` 才關**」，🚫 不寫成「不等於 `on` 就關」—— 壞掉的時候要壞在「備份還開著」那一邊，不是「以為開著、其實沒開」。
+- **數值型的鍵**（`UNLOCK_TTL`、`QUOTA_MIB`…）：parse 不出來就警告並用內建預設，不用半套的值。
+- conf 檔本身壞掉（不是 UTF-8、區段語法錯）：**報錯 exit**，不當作沒有這個檔。設定檔讀一半比讀不到危險。
+
+### 10.5 conf 不放什麼
+
+| 不放 | 理由 |
+|---|---|
+| `ACCESS_TOKEN` | token 是秘密，🚫 不落地在明文檔裡。要臨時指定用 `--token`／`WBF_ACCESS_TOKEN`（§2） |
+| passphrase、password 本身 | 同上，而且 §2 已經定了秘密只能從檔案或終端來 |
+| `PASSWORD_FILE`／`PASSPHRASE_FILE` 的自動生成 | 可以手寫（它們是路徑不是秘密，維護者要的正是「不用每次指定」），但自動生成不替使用者決定秘密放哪 |
+| 帳號狀態（`current`、session） | 那是狀態不是設定，各有各的檔（§7）。設定檔可以刪掉不影響登入 |
