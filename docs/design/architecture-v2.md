@@ -179,7 +179,7 @@ kernel 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 | **已解鎖** | 全部 method | 正常 |
 
 ```jsonc
-{ "jsonrpc": "2.0", "method": "vault.unlock", "params": { "passphrase_file": "/path/to/pw" }, "id": 1 }
+{ "method": "vault.unlock", "params": { "passphrase_file": "/path/to/pw" }, "id": 1 }
 // 或 { "passphrase_base64": "…" }：passphrase 是任意 bytes（local-cache-db §12），不一定是字串
 ```
 
@@ -191,14 +191,18 @@ kernel 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 ### 4.6 訊息形狀（加密之前的內容）
 
-**參考 JSON-RPC 2.0，但回應不完全相容**（維護者 2026-09-09 定的形狀）——
-⚠️ 這一點要寫在最前面：拿現成的 JSON-RPC library 直接接會炸，回應的形狀是我們自己的。
+**形狀借自 JSON-RPC 2.0 的習慣，但這是我們自己的協議**（維護者 2026-09-09 定）：
+`method` ＋ `params` ＋ `id`、有 `id` 要回、沒有 `id` 不回——這幾條照抄，因為它們好用。
 
-**請求**（標準 JSON-RPC 2.0）：
+⚠️ 但**回應的形狀不一樣**（標準是 `result`／`error` 二選一，這裡是 `code`／`msg` 平鋪），
+所以 🚫 **不宣告 `"jsonrpc": "2.0"`**，也不要拿現成的 JSON-RPC library 來接——
+與其假裝相容然後在某個角落炸掉，不如一開始就說清楚這是自己的東西。
+版本識別走 `hello` 的 `protocol` 欄位（§4.4）。
+
+**請求**：
 
 ```json
 {
-  "jsonrpc": "2.0",
   "method": "room.send_text",
   "params": { "account": "@alice:localhost", "room": "!abc:localhost", "body": "hi" },
   "id": 1
@@ -209,7 +213,6 @@ kernel 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 ```json
 {
-  "jsonrpc": "2.0",
   "code": 0,
   "msg": "ok",
   "result": { "event_id": "$xyz" },
@@ -219,7 +222,6 @@ kernel 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 ```json
 {
-  "jsonrpc": "2.0",
   "code": 1001,
   "msg": "the vault is locked; call vault.unlock first",
   "result": null,
@@ -227,14 +229,14 @@ kernel 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 }
 ```
 
-為什麼不用標準的 `result`／`error` 二選一：**`code` 一個欄位就判斷得出成敗**，前端不必先看有沒有
-`error` 欄位再決定讀哪邊。代價是不能用現成 library——但我們本來就要自己寫（外面還包著一層加密）。
+為什麼是 `code`／`msg` 而不是標準的 `result`／`error` 二選一：**一個欄位就判斷得出成敗**，
+前端不必先看有沒有 `error` 欄位再決定讀哪邊。代價是不能用現成 library——
+但我們本來就要自己寫（外面還包著一層加密），那個代價是零。
 
-**推播**（沒有 `id` 的請求，也就是 JSON-RPC 的 notification）：
+**推播**（沒有 `id` 的請求）：
 
 ```json
 {
-  "jsonrpc": "2.0",
   "method": "room.message",
   "params": { "account": "…", "room": "…", "message": { } }
 }
@@ -242,14 +244,13 @@ kernel 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 ```json
 {
-  "jsonrpc": "2.0",
   "method": "progress",
   "params": { "id": 17, "done": 1200, "total": 4096 }
 }
 ```
 
-📎 推播刻意跟請求**同構**（都是 `method` ＋ `params`），少一種形狀要記；
-分辨方式就是 JSON-RPC 的規矩：**有 `id` 要回、沒有 `id` 不回**。
+📎 推播刻意跟請求**同構**（都是 `method` ＋ `params`），所以只有兩種形狀要記；
+分辨方式就是那條照抄來的規矩：**有 `id` 要回、沒有 `id` 不回**。
 
 規矩：
 
@@ -310,8 +311,8 @@ http://127.0.0.1:<data port>/media/<resource token>
 **播放／顯示**：
 
 ```jsonc
-{ "jsonrpc": "2.0", "method": "media.open", "params": { "account": "…", "event": "$xyz" }, "id": 9 }
-{ "jsonrpc": "2.0", "code": 0, "msg": "ok", "id": 9, "result": {
+{ "method": "media.open", "params": { "account": "…", "event": "$xyz" }, "id": 9 }
+{ "code": 0, "msg": "ok", "id": 9, "result": {
     "url": "http://127.0.0.1:51235/media/9f3a…",
     "mimetype": "video/x-matroska", "size": 1073741824, "expires_in": 3600 } }
 ```
@@ -322,10 +323,10 @@ http://127.0.0.1:<data port>/media/<resource token>
 **上傳**：
 
 ```jsonc
-{ "jsonrpc": "2.0", "method": "media.create", "params": { "account": "…", "room": "…", "name": "video.mkv" }, "id": 12 }
-{ "jsonrpc": "2.0", "code": 0, "msg": "ok", "result": { "url": "http://127.0.0.1:51235/upload/7c1b…" }, "id": 12 }
+{ "method": "media.create", "params": { "account": "…", "room": "…", "name": "video.mkv" }, "id": 12 }
+{ "code": 0, "msg": "ok", "result": { "url": "http://127.0.0.1:51235/upload/7c1b…" }, "id": 12 }
 // 前端 PUT bytes 進去；kernel 邊收邊加密邊走 chunk 上傳
-{ "jsonrpc": "2.0", "method": "progress", "params": { "id": 12, "done": 52428800, "total": 1073741824 } }
+{ "method": "progress", "params": { "id": 12, "done": 52428800, "total": 1073741824 } }
 ```
 
 ⚠️ **Android 沒有別的選擇**：SAF 給的是 `content://` URI，**根本沒有檔案路徑可給**。
@@ -334,7 +335,7 @@ http://127.0.0.1:<data port>/media/<resource token>
 **另存新檔**（使用者明確要把明文放到自己選的位置）仍然走路徑：
 
 ```jsonc
-{ "jsonrpc": "2.0", "method": "media.save_to", "params": { "account": "…", "event": "$xyz", "out": "/home/me/video.mkv" }, "id": 15 }
+{ "method": "media.save_to", "params": { "account": "…", "event": "$xyz", "out": "/home/me/video.mkv" }, "id": 15 }
 ```
 
 這裡明文落地是**使用者要的**，不是我們偷偷做的——這條界線要守住。CLI 的 `download -o` 就是它。
