@@ -393,15 +393,15 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
   local.key                      32 byte 主金鑰，一台機器一把（local-cache-db.md §4）；所有帳號共用
   wbf.conf                       設定檔（§10）；指定了 --data-dir 而這裡還沒有時自動生成一份
   unlock.ticket                  只有 passphrase 模式會有（§7.1）
-  recovery/<b58>_<b58>           recovery key（local-cache-db.md §10.8）；🚫 logout 不碰它
+  r/<b58>_<b58>                  recovery key（local-cache-db.md §10.8）；🚫 logout 不碰它
   current                        目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"；沒有這個檔 = 沒登入過。🚫 兩層都不寫明文（寫了等於把剛加密的名字再漏一次）
-  servers/<b58>_<b58>/           **server host 加密後的名字**（local-cache-db.md §11.2）：外面看不出這台機器連過哪家
+  s/<b58>_<b58>/                 **server host 加密後的名字**（local-cache-db.md §11.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用的快取（§3.5；local-cache-db.md §6）
-    accounts/
+    a/
       <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 §11.2），第六把子金鑰
         session.sealed           { "server", "user_id", "device_id", "access_token", "store_dir" } 用第三把子金鑰封住
-        matrix/                  matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
-        room-keys/               本地房間金鑰備份（local-cache-db.md §10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
+        m/                       matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
+        k/snapshot               本地房間金鑰備份（local-cache-db.md §10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
     media/                       媒體儲存池（local-cache-db.md §8）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
 ```
 

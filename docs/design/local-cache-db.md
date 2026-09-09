@@ -174,16 +174,19 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   local.key                      主金鑰（§4），一台機器一把，所有帳號共用
   unlock.ticket                  CLI 的 unlock ticket（§4）
   current                        CLI 的目前帳號
-  recovery/<b58>_<b58>           recovery key（§10.8）：檔名是 `recovery-key@mxid` 加密後的樣子。
+  r/<b58>_<b58>                  recovery key（§10.8）：檔名是 `recovery-key@mxid` 加密後的樣子。
                                  🚫 logout 不碰它——那是它不放在帳號目錄底下的全部理由
-  servers/<b58>_<b58>/           **server host 加密後的名字**（§11.2）：外面看不出這台機器連過哪家
+  s/<b58>_<b58>/                 **server host 加密後的名字**（§11.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用（§6）
     media/                       媒體儲存池（§8），跟 cache.db 同層、同範圍
-    accounts/
+    a/
       <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 §11.2）
         session.sealed           第三把子金鑰封住的 session
-        matrix/                  SDK 的 store（crypto.db、state.db），綁 device；logout 刪
-        room-keys/               本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
+        m/                       SDK 的 store（crypto.db、state.db），綁 device；logout 刪
+        k/snapshot               本地房間金鑰備份（§10.4）；`account del`／`destroy` 連它一起刪
+
+⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母，理由是 Windows 的 MAX_PATH（§11.4.1）——
+兩段加密名字就吃掉 106 字元。
 ```
 
 `<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
@@ -500,7 +503,7 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
 放在**帳號層**（維護者 2026-09-09 定）：
 
 ```
-accounts/<b58>_<b58>/room-keys/
+a/<b58>_<b58>/k/
   snapshot        上游 export_room_keys 倒出來的全量加密快照
   snapshot.tmp    寫入時的暫存檔，寫完 rename 成 snapshot
 ```
@@ -660,14 +663,29 @@ Base58 的字母表**沒有底線**，所以 `_` 可以當分隔符，兩段各�
 兩層用不同的 aad 與不同的 nonce context 分開，🚫 不需要第七把。
 
 ```
-第一層  servers/<B58(nonce_s)>_<B58(ct_s)>/
-  nonce_s = BLAKE3 keyed_hash(key, "wbf server-dir-nonce v1" ‖ host) 前 24 byte
-  ct_s    = XChaCha20-Poly1305(key, nonce_s, host,      aad = "wbf-matrix-client server dir v1")
+第一層  s/<B58(nonce_s)>_<B58(ct_s)>/
+  nonce_s = BLAKE3 keyed_hash(key, "wbf server-dir-nonce v1" ‖ host) 前 12 byte
+  ct_s    = ChaCha20-Poly1305(key, nonce_s, host,      aad = "wbf-matrix-client server dir v1")
 
-第二層  accounts/<B58(nonce_a)>_<B58(ct_a)>/
-  nonce_a = BLAKE3 keyed_hash(key, "wbf account-dir-nonce v1" ‖ host ‖ 0x00 ‖ localpart) 前 24 byte
-  ct_a    = XChaCha20-Poly1305(key, nonce_a, localpart, aad = "wbf-matrix-client account dir v1" ‖ host)
+第二層  a/<B58(nonce_a)>_<B58(ct_a)>/
+  nonce_a = BLAKE3 keyed_hash(key, "wbf account-dir-nonce v1" ‖ host ‖ 0x00 ‖ localpart) 前 12 byte
+  ct_a    = ChaCha20-Poly1305(key, nonce_a, localpart, aad = "wbf-matrix-client account dir v1" ‖ host)
 ```
+
+⚠️ **nonce 是 12 byte、演算法是 ChaCha20-Poly1305 而不是 XChaCha20**（維護者 2026-09-09 定，
+起因是實跑撞到 Windows 的 MAX_PATH）：
+
+| | 24 byte nonce（XChaCha） | 12 byte nonce |
+|---|---|---|
+| nonce 那段 base58 | 33 字元 | **17 字元** |
+| 兩層合計省 | — | **32 字元** |
+
+12 byte 夠不夠：nonce 是 `BLAKE3 keyed_hash(key, …‖明文)` 的前 12 byte，碰撞要兩個**不同明文**的
+hash 前 96 bit 相同——生日界是 2^48 個明文，而這裡的明文是「這台機器的 server host 與 localpart」，
+數量是個位數。🚫 這個推導**只在明文數量極少時成立**，別把同一套搬去命名數以萬計的東西。
+
+📎 中間那幾段目錄名也縮到一個字母（`s`／`a`／`m`／`k`／`r`），再省 18 字元。可讀性本來就沒有——
+它們夾在兩段密文之間。
 
 - **nonce 由明文確定性導出，而且照樣寫進名字裡**。兩件事都要，理由不同：
   - 寫進去：解密時要先有 nonce，而 nonce 是從還沒解出來的明文導出的 —— 不寫就永遠解不開。
@@ -696,7 +714,7 @@ Base58 的字母表**沒有底線**，所以 `_` 可以當分隔符，兩段各�
 - **建目錄前先檢查**：目標名字已經存在時，把它解密出來比對 —— 是同一個 host／localpart 才用，不是就報錯，
   🚫 不覆蓋、🚫 不加後綴自己找一個空位。
 - 每一段名字上限 **200 字元**（Windows 單一路徑元件是 255）。Base58 大約是 byte 數的 1.37 倍，
-  nonce 那段固定約 33 字元，所以密文那段大約 120 byte 以上才會踩到 —— Matrix 的 localpart 上限是 255 byte，
+  nonce 那段固定 17 字元，所以密文那段大約 130 byte 以上才會踩到 —— Matrix 的 localpart 上限是 255 byte，
   踩得到，要有這個檢查。超過就報錯，🚫 不截斷（截斷等於不可逆）。
 
 ### 11.5 讀回來：掃兩層，建記憶體裡的對照
@@ -742,6 +760,23 @@ servers/ 底下每個目錄名
 
 - 📎 順帶：`servers/` 兩層都改了之後，CLI 規格 §7 那條「PR #11 的單一目錄佈局要報錯」也失去意義了
   （那個佈局同樣解不開、同樣被跳過）。實作時可以一併拿掉那段檢查。
+
+#### 11.4.1 ⚠️ 真正咬人的不是單段長度，是**整條路徑**（2026-09-09 實測）
+
+Windows 的 `MAX_PATH` 是 **260**，而加密把兩段目錄名從 19 字元（`localhost_6167` ＋ `alice`）
+撐到 106。實測 `matrix-sdk-event-cache.sqlite3` 的完整路徑：
+
+| | 加密名字合計 | 最長路徑（data dir 39 字元） |
+|---|---|---|
+| 24 byte nonce ＋ 長目錄名 | 138 | **230**（餘裕 20，data dir 稍深就爆） |
+| **12 byte nonce ＋ `s`／`a`／`m`** | **106** | **184**（餘裕 76） |
+
+⚠️ 第一次驗證時用 130 字元的 data dir **直接失敗**，而且錯誤訊息把它誤報成
+「it was made with another key file」——害人去刪一個其實沒問題的目錄。
+現在 `build_client` 會先看路徑長度再決定怎麼報（`backend/matrix_sdk.rs`）。
+
+📎 這條的教訓寫下來：**目錄名加密的成本不在 CPU，在路徑預算**。之後要再加一層加密目錄之前，
+先算一次最深的那條路徑。
 
 ### 11.8 還開著
 

@@ -562,12 +562,25 @@ async fn build_client(
         .build()
         .await
         .map_err(|error| match error {
-            // 開不了 store 多半是既有的 store 不是這把金鑰包的（舊版沒有金鑰、或 local.key 換過）。
-            // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
-            matrix_sdk::ClientBuildError::SqliteStore(error) => SdkError::Usage(format!(
-                "cannot open the matrix store at {}: {error}; it was made with another key file — delete that directory and run `login` again",
-                store_dir.display()
-            )),
+            // 開不了 store 通常是兩個原因之一，而它們的處置完全不同——所以先分辨再報。
+            matrix_sdk::ClientBuildError::SqliteStore(error) => {
+                let path = store_dir.display().to_string();
+                // ⚠️ 路徑太長時 sqlite 也回「開不了」，2026-09-09 實測被誤報成「金鑰不對」，
+                // 害人去刪一個其實沒問題的目錄。Windows 的 MAX_PATH 是 260，
+                // 上游的 store 檔名最長是 matrix-sdk-event-cache.sqlite3（30 字元）。
+                if cfg!(windows) && path.chars().count() + 31 > 250 {
+                    SdkError::Usage(format!(
+                        "cannot open the matrix store at {path}: the path is {} characters and Windows \
+                         refuses paths over 260 - move the data dir somewhere shorter (--data-dir)",
+                        path.chars().count()
+                    ))
+                } else {
+                    // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
+                    SdkError::Usage(format!(
+                        "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
+                    ))
+                }
+            }
             other => SdkError::Network(format!("matrix client: {other}")),
         })
 }

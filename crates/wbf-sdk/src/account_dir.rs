@@ -12,11 +12,13 @@
 //!
 //! - **nonce 由明文確定性導出，而且照樣寫進名字裡**。寫進去是因為解密時要先有 nonce，
 //!   而它是從還沒解出來的明文導出的；確定性是為了 `login` 能直接算出路徑去定位，不必先掃描。
-//! - 🚫 **固定 nonce 會洩漏明文**：XChaCha20 是 stream cipher，同 key 同 nonce 的兩份密文
+//! - 🚫 **固定 nonce 會洩漏明文**：ChaCha20 是 stream cipher，同 key 同 nonce 的兩份密文
 //!   XOR 起來就是兩份明文的 XOR。從明文導出正好保證「不同明文 → 不同 nonce」。
+//! - **nonce 用 12 byte 而不是 XChaCha 的 24**：目錄名進路徑，而 Windows 的 MAX_PATH 是 260。
+//!   理由與安全性推導見 `NONCE_LEN`。
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
 use crate::vault::Key32;
 use crate::SdkError;
@@ -24,7 +26,16 @@ use crate::SdkError;
 /// 分隔 nonce 與密文。Base58 的字母表沒有底線，所以它不會出現在兩段裡面。
 const SEPARATOR: char = '_';
 
-const NONCE_LEN: usize = 24;
+/// ChaCha20-Poly1305 的 nonce 長度。
+///
+/// ⚠️ 這裡**不用 XChaCha20**（那是 24 byte），因為 nonce 要寫進目錄名，而目錄名進路徑：
+/// 24 byte 的 base58 是 33 字元、兩層就 66，在 Windows 的 MAX_PATH（260）下是付不起的
+/// （2026-09-09 對真 server 驗證時撞到：長一點的 data dir 直接開不了 sqlite）。
+///
+/// 12 byte 夠不夠：nonce 是 `BLAKE3 keyed_hash(key, …‖plaintext)` 的前 12 byte，
+/// 碰撞要兩個**不同明文**的 hash 前 96 bit 相同——生日界是 2^48 個明文，
+/// 而這裡的明文是「這台機器的 server host 與 localpart」，數量是個位數。
+const NONCE_LEN: usize = 12;
 
 /// 一段目錄名的字元上限。Windows 單一路徑元件是 255；留餘裕給呼叫者接副檔名之類。
 const MAX_DIR_NAME_CHARS: usize = 200;
@@ -91,9 +102,9 @@ pub fn to_dir_name(key: &Key32, scope: DirScope<'_>, plaintext: &str) -> Result<
         ));
     }
     let nonce = nonce_of(key, scope, plaintext);
-    let ciphertext = XChaCha20Poly1305::new(key.as_bytes().into())
+    let ciphertext = ChaCha20Poly1305::new(key.as_bytes().into())
         .encrypt(
-            XNonce::from_slice(&nonce),
+            Nonce::from_slice(&nonce),
             Payload {
                 msg: plaintext.as_bytes(),
                 aad: &scope.aad(),
@@ -132,9 +143,9 @@ pub fn find_dir_name_plaintext(key: &Key32, scope: DirScope<'_>, dir_name: &str)
         return None;
     }
     let ciphertext = bs58::decode(ciphertext_part).into_vec().ok()?;
-    let plaintext = XChaCha20Poly1305::new(key.as_bytes().into())
+    let plaintext = ChaCha20Poly1305::new(key.as_bytes().into())
         .decrypt(
-            XNonce::from_slice(&nonce),
+            Nonce::from_slice(&nonce),
             Payload {
                 msg: &ciphertext,
                 aad: &scope.aad(),

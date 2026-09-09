@@ -4,14 +4,16 @@
 //! <data dir>/
 //!   local.key、unlock.ticket            一台機器一把主金鑰（vault）
 //!   current                             目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"
-//!   servers/<b58>_<b58>/                正規化過的 server host，加密（§11.2）
+//!   r/<b58>_<b58>                       recovery key（recovery.rs）；🚫 logout 不碰
+//!   s/<b58>_<b58>/                      正規化過的 server host，加密（§11.2）
 //!     cache.db                          這個 server 上所有帳號共用的快取
-//!     accounts/<b58>_<b58>/             localpart，加密
+//!     a/<b58>_<b58>/                    localpart，加密
 //!       session.sealed                  這個帳號的 session（第三把子金鑰封住）
-//!       matrix/                         matrix-sdk store，綁 device；logout 刪
+//!       m/                              matrix-sdk store，綁 device；logout 刪
 //! ```
 //!
 //! **兩層目錄名都是加密的**，所以這個模組的每個進入點都要第六把子金鑰（`vault.account_dir_key()`）。
+//! 中間那幾段（`s`／`a`／`m`）短到只剩一個字母，理由是 Windows 的 MAX_PATH——見 `SERVERS_DIR_NAME`。
 //! 明文的 server URL 與 mxid 仍然在 `session.sealed` 裡，不從目錄名反推。
 //!
 //! 路徑映射刻意**沒有**全域的可變 map（維護者 2026-09-09 說「全局變數 map，或寫成 function」，
@@ -25,9 +27,11 @@ use wbf_sdk::account_dir::{find_dir_name_plaintext, to_dir_name, DirScope};
 use wbf_sdk::vault::{write_private, Key32, Vault, SEALED_SESSION_FILE_NAME};
 use wbf_sdk::SdkError;
 
-pub const SERVERS_DIR_NAME: &str = "servers";
-pub const ACCOUNTS_DIR_NAME: &str = "accounts";
-pub const MATRIX_STORE_DIR_NAME: &str = "matrix";
+// ⚠️ 這三個名字**故意很短**：它們夾在兩段加密目錄名之間，而 Windows 的 MAX_PATH 是 260
+// （2026-09-09 對真 server 驗證時撞到）。可讀性在這裡本來就沒了——下一層就是密文。
+pub const SERVERS_DIR_NAME: &str = "s";
+pub const ACCOUNTS_DIR_NAME: &str = "a";
+pub const MATRIX_STORE_DIR_NAME: &str = "m";
 pub const CURRENT_FILE_NAME: &str = "current";
 
 /// 一個帳號在磁碟上的位置。`server_host` 與 `localpart` 是明文，`dir` 裡的兩段是加密的。

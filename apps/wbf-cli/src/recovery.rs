@@ -1,7 +1,7 @@
 //! recovery key 的本機保管（local-cache-db.md §10.9；維護者 2026-09-09 定）：
 //!
 //! ```text
-//! <data dir>/recovery/<b58>_<b58>      檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
+//! <data dir>/r/<b58>_<b58>             檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
 //! ```
 //!
 //! **為什麼不放在帳號目錄底下**：`logout`／`account del` 要把帳號目錄整個清乾淨
@@ -27,11 +27,12 @@ use wbf_sdk::account_dir::{find_dir_name_plaintext, to_dir_name, DirScope};
 use wbf_sdk::vault::Vault;
 use wbf_sdk::SdkError;
 
-pub const RECOVERY_DIR_NAME: &str = "recovery";
+/// 短名字的理由跟 `accounts::SERVERS_DIR_NAME` 一樣：MAX_PATH。
+pub const RECOVERY_DIR_NAME: &str = "r";
 /// 檔名的明文長這樣，example: `recovery-key@alice:localhost`
 const NAME_PREFIX: &str = "recovery-key";
 
-/// `<data dir>/recovery/`。
+/// `<data dir>/r/`。
 pub fn dir(data_dir: &Path) -> PathBuf {
     data_dir.join(RECOVERY_DIR_NAME)
 }
@@ -43,7 +44,7 @@ pub fn dir(data_dir: &Path) -> PathBuf {
 ///     vault: example: context.vault()?
 ///     user_id: 完整 mxid, example: "@alice:localhost"
 /// Return:
-///     Ok(PathBuf)   `<data dir>/recovery/<b58>_<b58>`
+///     Ok(PathBuf)   `<data dir>/r/<b58>_<b58>`
 ///     Err(Usage)    加密後的名字太長（§11.4）
 pub fn path_of(data_dir: &Path, vault: &Vault, user_id: &str) -> Result<PathBuf, SdkError> {
     let name = to_dir_name(
@@ -56,7 +57,7 @@ pub fn path_of(data_dir: &Path, vault: &Vault, user_id: &str) -> Result<PathBuf,
 
 /// 這台機器保管著誰的 recovery key（`recovery list`）。
 ///
-/// 掃 `<data dir>/recovery/` 解密**檔名**——🚫 不開檔、不解內容：列清單不需要看到金鑰本身。
+/// 掃 `<data dir>/r/` 解密**檔名**——🚫 不開檔、不解內容：列清單不需要看到金鑰本身。
 /// 解不開的檔一律跳過（別把 `local.key` 建的，fail closed）。
 ///
 /// Return:

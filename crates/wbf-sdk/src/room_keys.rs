@@ -1,5 +1,5 @@
-//! 本地的房間金鑰備份（local-cache-db.md §10.4）：`room-keys/snapshot` 一個檔，
-//! 內容就是上游 `export_room_keys` 倒出來的**全量加密快照**。
+//! 本地的房間金鑰備份（local-cache-db.md §10.4）：`k/snapshot` 一個檔（`k` 是 room-keys，
+//! 名字短是為了 MAX_PATH），內容就是上游 `export_room_keys` 倒出來的**全量加密快照**。
 //!
 //! 為什麼要有它：房間金鑰（Megolm inbound session）平常只活在 matrix-sdk 的 `crypto.db` 裡，
 //! 那個目錄 `logout` 會刪、壞掉也叫人刪。server 端的標準 backup 是主力，但在使用者產生
@@ -25,7 +25,8 @@ use zeroize::Zeroizing;
 use crate::vault::Key32;
 use crate::SdkError;
 
-pub const ROOM_KEYS_DIR_NAME: &str = "room-keys";
+/// 短名字的理由跟資料目錄其他幾段一樣：Windows 的 MAX_PATH（2026-09-09 實測撞到）。
+pub const ROOM_KEYS_DIR_NAME: &str = "k";
 const SNAPSHOT_FILE_NAME: &str = "snapshot";
 /// 寫的時候先寫這個再 rename：寫到一半斷電不會把上一份好的蓋成半個檔。
 const SNAPSHOT_TEMP_FILE_NAME: &str = "snapshot.tmp";
