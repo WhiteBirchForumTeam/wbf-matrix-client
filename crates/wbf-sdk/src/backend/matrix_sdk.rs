@@ -17,6 +17,8 @@ use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::SessionTokens;
 use matrix_sdk::config::{RequestConfig, SyncSettings};
 use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
+use matrix_sdk::encryption::recovery::RecoveryState;
+use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
@@ -338,6 +340,90 @@ impl ChatBackend for MatrixBackend {
     }
 }
 
+/// server 端房間金鑰備份的設定（local-cache-db.md §10.3）。
+///
+/// `auto_enable_backups`：`login` 之後 server 上沒有 backup version 就建一個，並開始上傳。
+/// ⚠️ 建 version 時 **backup 的私鑰只存在本機 crypto store**，沒進 SSSS —— 所以在使用者跑
+/// `key-backup recovery` 之前，server 上那份**換一台機器也解不開**（它防的是本機 crypto.db 壞掉，
+/// 不是換裝置）。這句話要出現在警告與 `logout` 的閘門裡。
+///
+/// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，🚫 不一開機就全下載。
+fn backup_encryption_settings() -> EncryptionSettings {
+    EncryptionSettings {
+        auto_enable_backups: true,
+        auto_enable_cross_signing: true,
+        backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+    }
+}
+
+/// `key-backup status` 印的東西（CLI 規格 §3.6）。🚫 不含任何金鑰內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupStatus {
+    /// server 上有沒有 backup version。
+    pub exists_on_server: bool,
+    /// 本機的 backup 有沒有啟用（有金鑰、會上傳）。
+    pub enabled_locally: bool,
+    /// recovery key 是不是真的設好了。**只有 `Enabled` 算數**：`Unknown`、`Incomplete`、
+    /// `Disabled` 一律當作沒有（fail closed，§10.7 的閘門靠這個判斷）。
+    pub has_recovery_key: bool,
+    /// 上游 `RecoveryState` 的名字，給人看的。
+    pub recovery_state: String,
+}
+
+impl MatrixBackend {
+    /// server 端備份現在是什麼狀態（`key-backup status`、`logout` 的閘門都用它）。
+    ///
+    /// Return:
+    ///     Ok(BackupStatus)
+    ///     Err(Network)   問不到 server（閘門會因此擋下來——問不到就不是「正面認得救得回來」）
+    pub async fn backup_status(&self) -> Result<BackupStatus, SdkError> {
+        let backups = self.client.encryption().backups();
+        let exists_on_server = backups
+            .fetch_exists_on_server()
+            .await
+            .map_err(|error| SdkError::Network(format!("key backup: {error}")))?;
+        let recovery_state = self.client.encryption().recovery().state();
+        Ok(BackupStatus {
+            exists_on_server,
+            enabled_locally: backups.are_enabled().await,
+            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（local-cache-db.md §10.7）。
+            has_recovery_key: matches!(recovery_state, RecoveryState::Enabled),
+            recovery_state: format!("{recovery_state:?}"),
+        })
+    }
+
+    /// 把 crypto store 裡的房間金鑰推上 server，**傳完才回來**（`key-backup upload`）。
+    ///
+    /// 為什麼要有這個命令：上游的上傳是背景 task，而 `BackupUploadingTask` 的 `Drop` 直接
+    /// `abort()`——CLI 一個命令跑完就 exit，那個 task 可能一筆都還沒送出去（local-cache-db.md §10.6）。
+    ///
+    /// Return:
+    ///     Ok(())        追平了
+    ///     Err(Network)  server 不收、或中途斷線
+    pub async fn upload_room_keys(&self) -> Result<(), SdkError> {
+        self.client
+            .encryption()
+            .backups()
+            .wait_for_steady_state()
+            .await
+            .map_err(|error| SdkError::Network(format!("key backup upload: {error}")))
+    }
+
+    /// 產生 recovery key（`key-backup recovery`）。設好之後 server 上那份備份**換裝置也解得開**。
+    ///
+    /// Return:
+    ///     Ok(String)   recovery key，🚫 只印一次、不寫檔、不進 log
+    ///     Err(Network) server 不收
+    pub async fn enable_recovery(&self) -> Result<String, SdkError> {
+        self.client
+            .encryption()
+            .recovery()
+            .enable()
+            .await
+            .map_err(|error| SdkError::Network(format!("recovery: {error}")))
+    }
+}
+
 async fn build_client(
     server: &str,
     store_dir: &Path,
@@ -350,6 +436,7 @@ async fn build_client(
     Client::builder()
         .homeserver_url(server)
         .request_config(RequestConfig::new().timeout(crate::channel::REQUEST_TIMEOUT))
+        .with_encryption_settings(backup_encryption_settings())
         .sqlite_store_with_config_and_cache_path(store_config, None::<&Path>)
         .build()
         .await

@@ -19,7 +19,7 @@ use wbf_sdk::vault::write_private;
 
 /// 還原 backend 並做一次增量 sync（timeout 0）：房間列表與新事件到 store，之後的命令才看得到現況。
 /// store 在帳號目錄的 `matrix/`，金鑰是 vault 的第二把子金鑰（local-cache-db.md §5.3）。
-async fn backend(context: &Context) -> Result<MatrixBackend, SdkError> {
+pub(crate) async fn backend(context: &Context) -> Result<MatrixBackend, SdkError> {
     let session = context.session().await?;
     if session.store_dir.is_none() {
         return Err(SdkError::Usage(

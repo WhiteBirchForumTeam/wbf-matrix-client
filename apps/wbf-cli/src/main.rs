@@ -79,6 +79,9 @@ pub enum AccountAction {
     Del {
         /// 完整 mxid，example: @bob:matrix.org
         user: String,
+        /// 明知 server 上的備份還解不開，照樣登出（local-cache-db.md §10.7）
+        #[arg(long)]
+        accept_history_loss: bool,
     },
     /// 裝置層加資料層：del 再加上清掉這個帳號在 cache.db 裡獨有的紀錄（別人也持有的不動）
     Destroy {
@@ -87,7 +90,21 @@ pub enum AccountAction {
         /// 不問確認（腳本用）
         #[arg(long)]
         yes: bool,
+        /// 明知 server 上的備份還解不開，照樣登出（local-cache-db.md §10.7）
+        #[arg(long)]
+        accept_history_loss: bool,
     },
+}
+
+/// 房間金鑰備份（local-cache-db.md §10）。
+#[derive(Subcommand)]
+pub enum KeyBackupAction {
+    /// server 上的 backup version、有沒有 recovery key、本機備份幾把金鑰
+    Status,
+    /// 把 crypto store 裡的金鑰推上 server，傳完才 exit（上游的上傳是背景 task，命令 exit 就被 abort）
+    Upload,
+    /// 產生 recovery key。⚠️ 只印一次、拿不回來；設好之後 server 上那份換裝置也解得開
+    Recovery,
 }
 
 #[derive(Subcommand)]
@@ -95,11 +112,20 @@ pub enum Command {
     /// 登入、寫 session 檔；成功後自動切成 current（等同 `account add`）
     Login(LoginArgs),
     /// 讓 current 帳號的 token 失效；刪它的 session.sealed 與 matrix/（等同 `account del <current>`）
-    Logout,
+    Logout {
+        /// 明知 server 上的備份還解不開，照樣登出（會失去這個帳號的歷史，local-cache-db.md §10.7）
+        #[arg(long)]
+        accept_history_loss: bool,
+    },
     /// 帳號：新增、列出、切換、登出、摧毀（CLI 規格 §3.1）
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+    /// 房間金鑰備份：狀態、上傳、產生 recovery key（CLI 規格 §3.6）
+    KeyBackup {
+        #[command(subcommand)]
+        action: KeyBackupAction,
     },
     /// 刪 unlock ticket；下一個命令會再問 passphrase
     Lock,

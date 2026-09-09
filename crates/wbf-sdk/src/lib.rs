@@ -35,6 +35,7 @@ pub mod manifest;
 pub mod media;
 pub mod media_pool;
 pub mod protocol;
+pub mod room_keys;
 pub mod upload;
 pub mod vault;
 
@@ -52,5 +53,6 @@ pub use download::{DownloadReport, SeekResult};
 pub use error::SdkError;
 pub use login::Session;
 pub use manifest::{Manifest, UploadState};
+pub use room_keys::{RoomKeyRecords, RoomKeyStore};
 pub use upload::SentSummary;
 pub use vault::{Key32, KeyMode, Unlock, Vault};

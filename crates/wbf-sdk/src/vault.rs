@@ -27,6 +27,7 @@ const MATRIX_STORE_KEY_CONTEXT: &str = "wbf-matrix-client matrix-sdk store v1";
 const SESSION_KEY_CONTEXT: &str = "wbf-matrix-client session v1";
 const MEDIA_STORE_KEY_CONTEXT: &str = "wbf-matrix-client media store v1";
 const ACCOUNT_DIR_KEY_CONTEXT: &str = "wbf-matrix-client account directory v1";
+const ROOM_KEY_BACKUP_KEY_CONTEXT: &str = "wbf-matrix-client room key backup v1";
 
 /// `session.sealed` 的 AEAD 附加資料：綁住用途，拿別的檔的密文換過來解不開。
 const SESSION_AAD: &[u8] = b"wbf-matrix-client session.sealed v1";
@@ -294,6 +295,11 @@ impl Vault {
     /// 媒體檔案空間（§8）。這一版還沒有人用，先導出來讓 context 字串一次定完。
     pub fn media_store_key(&self) -> Key32 {
         self.derive(MEDIA_STORE_KEY_CONTEXT)
+    }
+
+    /// 本地的房間金鑰備份（`room_keys`；local-cache-db.md §10.4）：檔案內容的加密與檔名的 keyed hash 都用它。
+    pub fn room_key_backup_key(&self) -> Key32 {
+        self.derive(ROOM_KEY_BACKUP_KEY_CONTEXT)
     }
 
     /// 資料目錄裡兩層目錄名的加密（`account_dir`；local-cache-db.md §11.2）。
@@ -682,6 +688,10 @@ mod tests {
         assert_eq!(
             ACCOUNT_DIR_KEY_CONTEXT,
             "wbf-matrix-client account directory v1"
+        );
+        assert_eq!(
+            ROOM_KEY_BACKUP_KEY_CONTEXT,
+            "wbf-matrix-client room key backup v1"
         );
         assert_eq!(SESSION_AAD, b"wbf-matrix-client session.sealed v1");
         assert_eq!(WRAP_AAD, b"wbf-matrix-client local.key v1");

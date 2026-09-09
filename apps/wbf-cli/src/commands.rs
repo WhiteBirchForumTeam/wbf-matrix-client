@@ -8,6 +8,7 @@ use wbf_sdk::backend::matrix_sdk::MatrixBackend;
 use wbf_sdk::cache::{Cache, CacheIdentity, OpenOutcome};
 use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::media_pool::MediaPool;
+use wbf_sdk::room_keys::{RoomKeyStore, ROOM_KEYS_DIR_NAME};
 
 use crate::accounts::{self, AccountDir};
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
@@ -23,7 +24,7 @@ use crate::unlock::{
     default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_password_file,
     UnlockOptions,
 };
-use crate::{AccountAction, Cli, Command, LoginArgs, UploadArgs};
+use crate::{AccountAction, Cli, Command, KeyBackupAction, LoginArgs, UploadArgs};
 
 pub const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
 
@@ -31,17 +32,20 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
     let context = Context::from(&cli)?;
     match cli.command {
         Command::Login(args) => login_command(&context, &args).await,
-        Command::Logout => {
+        Command::Logout {
+            accept_history_loss,
+        } => {
             // --token 模式沒有帳號目錄，只讓 server 端的 token 失效。
             if context.token_override.is_some() {
                 logout(&context.session().await?).await?;
                 return print_json(&json!({ "ok": true }));
             }
             let account = context.account()?.clone();
-            let user = log_out_account(&context, &account).await?;
+            let user = log_out_account(&context, &account, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": user }))
         }
         Command::Account { action } => account_command(&context, action).await,
+        Command::KeyBackup { action } => key_backup_command(&context, action).await,
         Command::Lock => {
             let removed = context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "had_ticket": removed }))
@@ -442,12 +446,19 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
                 "switched_from": switched_from,
             }))
         }
-        AccountAction::Del { user } => {
+        AccountAction::Del {
+            user,
+            accept_history_loss,
+        } => {
             let account = find_account_by_full_mxid(context, &user)?;
-            let user = log_out_account(context, &account).await?;
+            let user = log_out_account(context, &account, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": user }))
         }
-        AccountAction::Destroy { user, yes } => destroy_account_command(context, &user, yes).await,
+        AccountAction::Destroy {
+            user,
+            yes,
+            accept_history_loss,
+        } => destroy_account_command(context, &user, yes, accept_history_loss).await,
     }
 }
 
@@ -527,6 +538,95 @@ fn switch_current_to(
     Ok(previous)
 }
 
+/// `key-backup <action>`（CLI 規格 §3.6；local-cache-db.md §10）。
+async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Result<(), SdkError> {
+    let backend = crate::rooms::backend(context).await?;
+    match action {
+        KeyBackupAction::Status => {
+            let status = backend.backup_status().await?;
+            let local_keys = local_room_key_store(context)?.count_keys()?;
+            print_json(&json!({
+                "server_backup_exists": status.exists_on_server,
+                "uploading_locally": status.enabled_locally,
+                "has_recovery_key": status.has_recovery_key,
+                "recovery_state": status.recovery_state,
+                "local_keys": local_keys,
+            }))
+        }
+        KeyBackupAction::Upload => {
+            context.progress("uploading room keys to the server backup…".into());
+            backend.upload_room_keys().await?;
+            let status = backend.backup_status().await?;
+            print_json(&json!({
+                "ok": true,
+                "server_backup_exists": status.exists_on_server,
+                "has_recovery_key": status.has_recovery_key,
+            }))
+        }
+        KeyBackupAction::Recovery => {
+            let recovery_key = backend.enable_recovery().await?;
+            // 唯一會印秘密的命令，而且只印這一次（CLI 規格 §3.6）。
+            context.progress(
+                "keep this recovery key somewhere safe: it is printed once and cannot be shown again"
+                    .into(),
+            );
+            print_json(&json!({ "recovery_key": recovery_key }))
+        }
+    }
+}
+
+/// 這個帳號的本地金鑰備份（local-cache-db.md §10.4）。
+fn local_room_key_store(context: &Context) -> Result<RoomKeyStore, SdkError> {
+    RoomKeyStore::open(
+        &context.account()?.dir,
+        context.vault()?.room_key_backup_key(),
+    )
+}
+
+/// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
+///
+/// 這些命令會連 `matrix/`（crypto store）一起刪，而在還沒有 recovery key 的預設狀態下，
+/// **server 端備份的私鑰就在那個 store 裡**——照樣登出的話這個帳號的歷史就回不來了。
+///
+/// 判斷寫成**正面認得**的形式：只有「server 上有 backup ＆ `RecoveryState::Enabled`」才放行；
+/// 其他任何狀態（沒 recovery key、問不到 server、`Unknown`／`Incomplete`）一律擋。
+/// 🚫 不寫成「沒有 recovery key 才擋」——那樣新增一種狀態就默默放行。
+///
+/// Args:
+///     accept_history_loss: `--accept-history-loss`，使用者明說接受
+/// Return:
+///     Ok(())       放行（救得回來、使用者接受、或這個帳號本來就登出了）
+///     Err(Usage)   擋下來，訊息告訴他下一步
+async fn refuse_if_history_would_be_lost(
+    context: &Context,
+    account: &AccountDir,
+    accept_history_loss: bool,
+) -> Result<(), SdkError> {
+    if accept_history_loss || !account.is_logged_in() {
+        // 已經登出的帳號沒有 session 可以問 server，也沒有 token 要失效；只是清本地殘留。
+        return Ok(());
+    }
+    let status = match crate::rooms::backend(context).await {
+        Ok(backend) => backend.backup_status().await.ok(),
+        Err(_) => None,
+    };
+    if status
+        .as_ref()
+        .is_some_and(|status| status.exists_on_server && status.has_recovery_key)
+    {
+        return Ok(());
+    }
+    Err(SdkError::Usage(format!(
+        "this would delete the room keys on this machine (matrix/ and room-keys/), and the\n       \
+         server-side backup cannot be decrypted yet — its key lives in the crypto store that is\n       \
+         about to be deleted. Logging out like this makes {}'s history unreadable.\n       \
+         Run `wbf-cli key-backup recovery` first to create a recovery key (printed once, keep it\n       \
+         safe), then log out.\n       \
+         If you do not want that history, pass --accept-history-loss.",
+        account.label()
+    )))
+}
+
 /// 裝置層的登出（CLI 規格 §3.1：`logout` 就是 `account del <current 帳號>`）：讓 token 失效，
 /// 刪這個帳號的 `session.sealed` 與 `matrix/`。`cache.db` 裡的紀錄留著——要連那些一起清是 `account destroy`。
 ///
@@ -537,8 +637,13 @@ fn switch_current_to(
 ///
 /// Return:
 ///     Ok(String)   這次登出的是誰（給呼叫者印）, example: "@alice:localhost on http://localhost:6167"
-async fn log_out_account(context: &Context, account: &AccountDir) -> Result<String, SdkError> {
+async fn log_out_account(
+    context: &Context,
+    account: &AccountDir,
+    accept_history_loss: bool,
+) -> Result<String, SdkError> {
     let described = describe_account(context, account);
+    refuse_if_history_would_be_lost(context, account, accept_history_loss).await?;
     let vault = context.vault()?;
     match vault.unseal_session(&account.session_path())? {
         Some(session) => {
@@ -553,6 +658,13 @@ async fn log_out_account(context: &Context, account: &AccountDir) -> Result<Stri
     }
     context.unlock.delete_ticket()?;
     account.delete_matrix_store()?;
+    // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（local-cache-db.md §10.7）。
+    // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。
+    match std::fs::remove_dir_all(account.dir.join(ROOM_KEYS_DIR_NAME)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     accounts::clear_current_if(&context.unlock.data_dir, account)?;
     // 這個 server 最後一個帳號登出：快取沒有主人了，整個丟（維護者：「除非所有帳號被登出」）。
     let server_dir = account.server_dir();
@@ -571,7 +683,12 @@ async fn log_out_account(context: &Context, account: &AccountDir) -> Result<Stri
 /// （local-cache-db.md §6）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 別的帳號也持有的一律不動
 /// （維護者 2026-09-09：扣除別人帳號的持有）。
 /// 要開哪個 server 的快取：`--server`，或那個帳號還登入著就用它封著的 session。
-async fn destroy_account_command(context: &Context, user: &str, yes: bool) -> Result<(), SdkError> {
+async fn destroy_account_command(
+    context: &Context,
+    user: &str,
+    yes: bool,
+    accept_history_loss: bool,
+) -> Result<(), SdkError> {
     let account = find_account_by_full_mxid(context, user)?;
     let server = match &context.server_override {
         Some(server) => server.clone(),
@@ -594,7 +711,7 @@ async fn destroy_account_command(context: &Context, user: &str, yes: bool) -> Re
         return Err(SdkError::Usage("cancelled".into()));
     }
     // 先裝置層（logout、session.sealed、matrix/）再資料層：反過來的話 logout 要用的 session 已經被刪了。
-    log_out_account(context, &account).await?;
+    log_out_account(context, &account, accept_history_loss).await?;
     // 快取在 server 層；用這個帳號的目錄定位它（不需要它是 current）。
     let identity = CacheIdentity { server };
     let (mut cache, _) = Cache::open(
