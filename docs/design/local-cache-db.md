@@ -7,7 +7,7 @@
 > |---|---|
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
-> | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（`accounts`／`forget-account`／`--account`）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
+> | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
 > | §10 房間金鑰備份（server 一份、本地一份） | 📝 2026-09-09 設計定案，還沒實作。conf 檔（CLI 規格 §10）是它的前提，先做 conf 再做這個 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
@@ -178,7 +178,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
     accounts/<localpart>/
       session.sealed             第三把子金鑰封住的 session
       matrix/                    SDK 的 store（crypto.db、state.db），綁 device；logout 刪
-      room-keys/                 本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；logout 與 forget-account 連它一起刪（§10.7 的閘門）
+      room-keys/                 本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
 ```
 
 `<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
@@ -282,7 +282,7 @@ CREATE INDEX event_media_by_media ON event_media (media);
 
 - **寫入**（`upsert_messages(user_id, &[Message])`，一個 transaction）：mxid／room_id 換成整數 id（`INSERT OR IGNORE` 再 `SELECT id`）→ 事件 upsert（`ON CONFLICT(room, event_id)`；**唯一不覆蓋的情況是密文不蓋明文**：快取裡 `decrypted = 1`、來的 `decrypted = 0` 就跳過）→ file 事件建 `media`（已有就不動）與 `event_media` → `events_synced_log(event, user)` upsert（新列 `hidden = 0`，已有只更新 `last_synced_at`）。
 - **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model §4.3 的退化表）。
-- **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。**預設不叫它；`logout` 不叫它**；這個 server 最後一個帳號登出時 CLI 直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
+- **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。**預設不叫它；`account del`（即 `logout`）不叫它，只有 `account destroy` 叫**；這個 server 最後一個帳號登出時 CLI 直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
 - 解不開的加密事件也存（`decrypted = 0` 帶原因），之後拿到金鑰重解時覆蓋；不存等於每次都要重拉。`recent` 拿到的原始 `m.room.encrypted` 是 `decrypted = 0`、原因 `NotDecryptedHere`。
 - **威脅模型的邊界（PR #13 審查 rumia 🟡1，維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
 - **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`（PR #13 審查 salvia 🟢3、cirno）。
@@ -549,10 +549,10 @@ accounts/<localpart>/room-keys/
 | 情形 | `matrix/` | `room-keys/` | 怎麼把歷史找回來 |
 |---|---|---|---|
 | **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 餵回新的 crypto store |
-| **有意**：`logout` | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以 `logout` 有閘門，見下） |
-| **有意**：`forget-account <mxid>` | 不是它的事 | **一起刪** | 同上。它本來就是「摧毀這個帳號在本機的紀錄」 |
+| **有意**：`logout`／`account del <user>`（同一件事，CLI 規格 §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
+| **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
 
-為什麼 `logout` 連著刪（維護者 2026-09-09）：`logout` 在心智上是「我離開這台機器」，
+為什麼 `logout`（即 `account del`）連著刪（維護者 2026-09-09）：它在心智上是「我離開這台機器」，
 留一個能解開全部歷史的檔案在磁碟上是驚嚇，而且跟「crypto store 一定會被刪」不一致。
 
 #### `logout` 的閘門：不是正面認得救得回來，就不准走
