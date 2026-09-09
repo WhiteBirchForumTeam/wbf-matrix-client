@@ -8,8 +8,8 @@
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | §10 房間金鑰備份（server 一份、本地一份） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`recovery`、`logout` 的閘門、`room_keys` 模組。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）；conf 的開關還沒做，目前寫死是開的 |
-> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | 📝 2026-09-09 設計定案，還沒實作。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
+> | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`recovery/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）；conf 的開關還沒做，目前寫死是開的 |
+> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | ✅ §11 2026-09-09 做了（`account_dir`）；§12 還沒。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
 ## 0. 一句話
@@ -174,6 +174,8 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   local.key                      主金鑰（§4），一台機器一把，所有帳號共用
   unlock.ticket                  CLI 的 unlock ticket（§4）
   current                        CLI 的目前帳號
+  recovery/<b58>_<b58>           recovery key（§10.8）：檔名是 `recovery-key@mxid` 加密後的樣子。
+                                 🚫 logout 不碰它——那是它不放在帳號目錄底下的全部理由
   servers/<b58>_<b58>/           **server host 加密後的名字**（§11.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用（§6）
     media/                       媒體儲存池（§8），跟 cache.db 同層、同範圍
@@ -574,9 +576,18 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 所以 `logout` 前面加一道閘門，寫成**正面認得**的形式：
 
 ```
-准走（照常 logout，room-keys/ 一起刪）  ⟸  server backup 開著 ＆ recovery().state() == Enabled
+准走（照常 logout，room-keys/ 一起刪）  ⟸  ① server 上有 backup ＆ recovery().state() == Enabled
+                                          ＆ ② 這台機器保管著這個帳號的 recovery key（§10.8）
 其他任何狀態                            ⟹  exit 1，要 --accept-history-loss 才走
 ```
+
+⚠️ **兩關都要過，而且第二關才是真的**（維護者 2026-09-09）：`RecoveryState::Enabled` 的上游定義是
+「secret storage is set up and we have all the secrets locally」——它說得出 SSSS 設好了，
+**說不出那串 recovery key 在誰手上**。跑過 `key-backup recovery`、印出來、沒抄就關掉終端的人，
+第一關照樣過。第二關看的是 `<data dir>/recovery/` 有沒有封著這個帳號的 key，
+而那個目錄 `logout` 不碰——所以刪完 `matrix/` 與 `room-keys/` 之後它還在，歷史真的救得回來。
+
+🚫 **不問使用者手打 recovery key**（維護者 2026-09-09 定）：既然我們自己就保管著，問他等於刁難。
 
 「其他任何狀態」包含：沒有 recovery key、`SERVER_BACKUP=off`（使用者自己關掉的，那本地這份就是唯一一份）、
 `RecoveryState` 是 `Unknown`／`Incomplete`、問不到 server。🚫 不寫成「沒有 recovery key 才擋」——
@@ -588,7 +599,32 @@ server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損
 📎 副作用（好的）：這讓「recovery key 延後」不會被無限期延後 —— **延到第一次 `logout` 為止**。
 本地池的定位因此也清楚了：它是**線上那份還沒真的可攜之前的中繼**，不是永久保險。
 
-### 10.8 明確不做的 / 還開著的
+### 10.8 recovery key 存哪：獨立的資料夾，`logout` 不碰（維護者 2026-09-09 定）
+
+```
+<data dir>/recovery/<b58>_<b58>      檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
+```
+
+**為什麼不放在帳號目錄底下**：`logout`／`account del` 要把帳號目錄整個清乾淨
+（`session.sealed`、`matrix/`、`room-keys/`），而 recovery key 正好是**清完之後唯一回得去的路**。
+放在一起就會一起被刪，那等於 server 上的備份也沒了——閘門（§10.7）就變成在檢查一個馬上要被自己刪掉的東西。
+
+| 誰 | 對 recovery key 做什麼 |
+|---|---|
+| `key-backup recovery` | 產生、印出來一次、**封進這裡** |
+| `logout`／`account del` | **不碰**——這是它跟帳號目錄分開放的全部理由 |
+| `account destroy` | **一起摧毀**（那個命令的語意就是「什麼都不留」）。⚠️ 之後 server 上那份備份永遠解不開 |
+| `recovery list` | 列出這台機器保管著誰的（只解**檔名**，🚫 不解內容） |
+| `recovery show <user>` | 印出某一個（會印秘密，跟 `key-backup recovery` 一樣） |
+
+- **檔名跟其他兩層一樣加密**（`DirScope::Recovery`，第六把子金鑰）：外面看不出這台機器保管著誰的 key。
+- **內容用第三把子金鑰封**（跟 `session.sealed` 同一把，AAD 不同所以密文換不過去）。
+- 目錄 0700。
+- ⚠️ 老實說它的邊界：這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台
+  機器上，整台被拿走就一起沒了。真正換裝置時仍然要使用者手上有那串字，所以 `key-backup recovery`
+  印出來時還是會叫他寫下來。
+
+### 10.9 明確不做的 / 還開著的
 
 - 🚫 不自己發明備份格式上傳到 fork server（走 pack 通道）：標準路徑已經可用，自訂等於放棄互通又要 server 改。
 - 🚫 `key-backup` 不做「刪掉 server 上的 backup version」：不可逆，而且會讓其他裝置的備份一起失效。要刪去別的 client 刪。

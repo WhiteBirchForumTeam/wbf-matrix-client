@@ -20,6 +20,8 @@ use crate::login::Session;
 
 pub const KEY_FILE_NAME: &str = "local.key";
 pub const SEALED_SESSION_FILE_NAME: &str = "session.sealed";
+/// recovery key 產生之後就封在這裡（local-cache-db.md §10.9）：使用者不必自己抄那串字。
+pub const SEALED_RECOVERY_FILE_NAME: &str = "recovery.sealed";
 
 /// 子金鑰的 BLAKE3 context（§4）。字串帶版本：換字串就是換金鑰。
 const CACHE_KEY_CONTEXT: &str = "wbf-matrix-client cache sqlcipher v1";
@@ -31,6 +33,8 @@ const ROOM_KEY_BACKUP_KEY_CONTEXT: &str = "wbf-matrix-client room key backup v1"
 
 /// `session.sealed` 的 AEAD 附加資料：綁住用途，拿別的檔的密文換過來解不開。
 const SESSION_AAD: &[u8] = b"wbf-matrix-client session.sealed v1";
+/// `recovery.sealed` 的 AEAD 附加資料：跟 session 的密文互換也解不開。
+const RECOVERY_AAD: &[u8] = b"wbf-matrix-client recovery.sealed v1";
 /// `local.key` 包主金鑰的 AEAD 附加資料。
 const WRAP_AAD: &[u8] = b"wbf-matrix-client local.key v1";
 
@@ -341,6 +345,80 @@ impl Vault {
             path,
             &serde_json::to_vec_pretty(&file).expect("SealedFile serializes"),
         )
+    }
+
+    /// 把 `key-backup recovery` 產生的那串 recovery key 封進 `path`（維護者 2026-09-09）。
+    ///
+    /// 用第三把子金鑰（跟 `session.sealed` 同一把，AAD 不同所以兩者的密文換不過去）。
+    ///
+    /// ⚠️ 這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台機器上，
+    /// 一起被拿走就一起沒了。閘門（CLI 的 `refuse_if_history_would_be_lost`）用它省去每次
+    /// 手打，但刪帳號前仍會把它印出來要使用者確認看到（local-cache-db.md §10.9）。
+    ///
+    /// Args:
+    ///     path: example: "<account dir>/recovery.sealed"
+    ///     recovery_key: 🚫 不印、不 log
+    pub fn seal_recovery_key(&self, path: &Path, recovery_key: &str) -> Result<(), SdkError> {
+        let nonce = random_nonce()?;
+        let sealed = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: recovery_key.as_bytes(),
+                    aad: RECOVERY_AAD,
+                },
+            )
+            .map_err(|_| SdkError::Io(std::io::Error::other("seal recovery key")))?;
+        let file = SealedFile {
+            v: SEALED_VERSION,
+            nonce: encode_base64(&nonce),
+            sealed: encode_base64(&sealed),
+        };
+        write_private(
+            path,
+            &serde_json::to_vec_pretty(&file).expect("SealedFile serializes"),
+        )
+    }
+
+    /// Return:
+    ///     Ok(Some(String))   封著的 recovery key
+    ///     Ok(None)           沒有這個檔（這個帳號還沒跑過 `key-backup recovery`）
+    ///     Err(Usage)         檔案壞了、或不是這把主金鑰封的
+    pub fn unseal_recovery_key(&self, path: &Path) -> Result<Option<Zeroizing<String>>, SdkError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let file: SealedFile = serde_json::from_slice(&bytes).map_err(|error| {
+            SdkError::Usage(format!("{} is not readable: {error}", path.display()))
+        })?;
+        if file.v != SEALED_VERSION {
+            return Err(SdkError::Usage(format!(
+                "{} has version {}, this build understands {SEALED_VERSION}",
+                path.display(),
+                file.v
+            )));
+        }
+        let nonce = decode_base64(&file.nonce, "nonce")?;
+        let sealed = decode_base64(&file.sealed, "sealed")?;
+        let plaintext = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &sealed,
+                    aad: RECOVERY_AAD,
+                },
+            )
+            .map_err(|_| {
+                SdkError::Usage(format!(
+                    "cannot open {}; it was sealed with another key file",
+                    path.display()
+                ))
+            })?;
+        let text = String::from_utf8(plaintext)
+            .map_err(|_| SdkError::Usage(format!("{} does not hold text", path.display())))?;
+        Ok(Some(Zeroizing::new(text)))
     }
 
     /// Return:

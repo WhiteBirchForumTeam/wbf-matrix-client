@@ -90,6 +90,46 @@ pub fn get_snapshot_status(account_dir: &Path) -> SnapshotStatus {
     }
 }
 
+/// 建好 `room-keys/` 並把權限收成只有自己（Unix 0700）。
+///
+/// ⚠️ 上游的 `export_room_keys` 用 `File::create` 寫檔，那走 umask 預設（多半是 0644），
+/// 而這個檔是**全部房間金鑰的密文**。內容層有 PBKDF2-500k 加 32 byte 隨機 passphrase 頂著，
+/// 但跟 vault 全面 0600 的紀律不一致（PR #19 審查 rumia🟡2／salvia🟡4）。
+/// 所以：目錄先收成 0700，寫完的檔再收成 0600（`set_snapshot_permissions`）。
+///
+/// Args:
+///     dir: **`room-keys/` 本身**, example: snapshot_path(&account.dir).parent()
+/// Return:
+///     Ok(())   目錄在，權限也對了
+///     Err(Io)  建不起來
+pub fn prepare_dir(dir: &Path) -> Result<(), SdkError> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// 把寫好的快照收成 0600。`rename` 保留來源檔的權限，所以這一步要在 rename **之前**做。
+///
+/// Args:
+///     path: 剛寫好的暫存檔, example: snapshot_temp_path(&account.dir)
+/// Return:
+///     Ok(())   收好了（非 Unix 平台是 no-op）
+///     Err(Io)  改不動
+pub fn set_snapshot_permissions(path: &Path) -> Result<(), SdkError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// 刪掉這個帳號的本地快照（`logout` 與 `account destroy` 用；local-cache-db.md §10.7）。
 ///
 /// Return:

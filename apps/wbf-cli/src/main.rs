@@ -5,6 +5,7 @@
 mod accounts;
 mod commands;
 mod recent;
+mod recovery;
 mod rooms;
 mod unlock;
 
@@ -96,6 +97,19 @@ pub enum AccountAction {
     },
 }
 
+/// recovery key 的本機保管（local-cache-db.md §10.9）。
+/// 它跟帳號目錄分開放，所以 `logout` 不會刪掉——那正是它存在的意義。
+#[derive(Subcommand)]
+pub enum RecoveryAction {
+    /// 列出這台機器保管著誰的 recovery key（只解檔名，🚫 不印金鑰本身）
+    List,
+    /// 印出某個帳號的 recovery key。⚠️ 這會把秘密印到 stdout
+    Show {
+        /// 完整 mxid，example: @bob:matrix.org
+        user: String,
+    },
+}
+
 /// 房間金鑰備份（local-cache-db.md §10）。
 #[derive(Subcommand)]
 pub enum KeyBackupAction {
@@ -130,6 +144,11 @@ pub enum Command {
     KeyBackup {
         #[command(subcommand)]
         action: KeyBackupAction,
+    },
+    /// 這台機器保管著誰的 recovery key（local-cache-db §10.9）
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryAction,
     },
     /// 刪 unlock ticket；下一個命令會再問 passphrase
     Lock,

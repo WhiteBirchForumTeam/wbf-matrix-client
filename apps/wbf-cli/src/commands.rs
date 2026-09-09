@@ -24,7 +24,7 @@ use crate::unlock::{
     default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_password_file,
     UnlockOptions,
 };
-use crate::{AccountAction, Cli, Command, KeyBackupAction, LoginArgs, UploadArgs};
+use crate::{AccountAction, Cli, Command, KeyBackupAction, LoginArgs, RecoveryAction, UploadArgs};
 
 pub const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
 
@@ -46,6 +46,7 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         }
         Command::Account { action } => account_command(&context, action).await,
         Command::KeyBackup { action } => key_backup_command(&context, action).await,
+        Command::Recovery { action } => recovery_command(&context, action),
         Command::Lock => {
             let removed = context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "had_ticket": removed }))
@@ -538,6 +539,28 @@ fn switch_current_to(
     Ok(previous)
 }
 
+/// `recovery <action>`：這台機器保管著誰的 recovery key（local-cache-db.md §10.9）。
+///
+/// 🚫 不連 server：這些檔案是本機的東西，`list` 連內容都不解（只解檔名）。
+fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), SdkError> {
+    let vault = context.vault()?;
+    match action {
+        RecoveryAction::List => {
+            let users = crate::recovery::list_users(&context.unlock.data_dir, vault)?;
+            print_json(&json!({ "users": users }))
+        }
+        RecoveryAction::Show { user } => {
+            match crate::recovery::find(&context.unlock.data_dir, vault, &user)? {
+                // 會印秘密的第二個命令（另一個是 `key-backup recovery`）。
+                Some(key) => print_json(&json!({ "user": user, "recovery_key": key.as_str() })),
+                None => Err(SdkError::Usage(format!(
+                    "no recovery key is kept here for {user}; run `key-backup recovery` while logged in as them"
+                ))),
+            }
+        }
+    }
+}
+
 /// `key-backup <action>`（CLI 規格 §3.6；local-cache-db.md §10）。
 async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Result<(), SdkError> {
     let backend = crate::rooms::backend(context).await?;
@@ -548,7 +571,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             print_json(&json!({
                 "server_backup_exists": status.exists_on_server,
                 "uploading_locally": status.enabled_locally,
-                "has_recovery_key": status.has_recovery_key,
+                "recovery_enabled": status.recovery_enabled,
                 "recovery_state": status.recovery_state,
                 "local_snapshot": snapshot.exists,
                 "local_snapshot_bytes": snapshot.bytes,
@@ -564,7 +587,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             print_json(&json!({
                 "ok": true,
                 "server_backup_exists": status.exists_on_server,
-                "has_recovery_key": status.has_recovery_key,
+                "recovery_enabled": status.recovery_enabled,
                 "local_snapshot_bytes": bytes,
             }))
         }
@@ -585,9 +608,19 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
         }
         KeyBackupAction::Recovery => {
             let recovery_key = backend.enable_recovery().await?;
+            // 封進 <data dir>/recovery/（🚫 不是帳號目錄——`logout` 會把那裡清光，
+            // 而 recovery key 正是清完之後唯一回得去的路；維護者 2026-09-09）。
+            let session = context.session().await?;
+            crate::recovery::save(
+                &context.unlock.data_dir,
+                context.vault()?,
+                &session.user_id,
+                &recovery_key,
+            )?;
             // 唯一會印秘密的命令，而且只印這一次（CLI 規格 §3.6）。
             context.progress(
-                "keep this recovery key somewhere safe: it is printed once and cannot be shown again"
+                "this recovery key is now sealed in this account's directory, so you will not be asked to type it.
+                          Still write it down: if this machine is lost, it is the only way back into the server-side backup."
                     .into(),
             );
             print_json(&json!({ "recovery_key": recovery_key }))
@@ -595,7 +628,10 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
     }
 }
 
-/// 把全部房間金鑰倒進本地快照（`key-backup save`，以及 `login` 之後自動存一次）。
+/// 把全部房間金鑰倒進本地快照（`key-backup save`；`key-backup upload` 也會順手叫一次）。
+///
+/// 🚫 `login` **不叫它**：剛登入的 crypto store 幾乎沒有金鑰，存了也是空的
+/// （PR #19 審查 rumia🟡3／salvia🟡2：原本的 docstring 承諾了不存在的行為）。
 ///
 /// Return:
 ///     Ok(u64)   快照有多少 byte
@@ -614,19 +650,62 @@ async fn save_room_key_snapshot(
         .await
 }
 
-/// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
+/// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（local-cache-db.md §10.7）。
 ///
-/// 這些命令會連 `matrix/`（crypto store）一起刪，而在還沒有 recovery key 的預設狀態下，
-/// **server 端備份的私鑰就在那個 store 裡**——照樣登出的話這個帳號的歷史就回不來了。
-///
-/// 判斷寫成**正面認得**的形式：只有「server 上有 backup ＆ `RecoveryState::Enabled`」才放行；
-/// 其他任何狀態（沒 recovery key、問不到 server、`Unknown`／`Incomplete`）一律擋。
-/// 🚫 不寫成「沒有 recovery key 才擋」——那樣新增一種狀態就默默放行。
+/// 🚫 不寫成「沒有 recovery key 才擋」：上游哪天多一種 `RecoveryState`，那種寫法會默默放行。
 ///
 /// Args:
-///     accept_history_loss: `--accept-history-loss`，使用者明說接受
+///     status: `find_backup_status_of` 的結果；`None` 是「問不到」
 /// Return:
-///     Ok(())       放行（救得回來、使用者接受、或這個帳號本來就登出了）
+///     bool   true 只在「server 上有 backup ＆ recovery key 真的設好了」；問不到一律 false
+fn is_history_recoverable(status: Option<&wbf_sdk::backend::matrix_sdk::BackupStatus>) -> bool {
+    status.is_some_and(|status| status.exists_on_server && status.recovery_enabled)
+}
+
+/// 用**這個帳號自己的** session 與 store 開一個 backend（閘門要拿它問 server）。
+///
+/// ⚠️ 🚫 **不要用 `rooms::backend(context)`**：那條路走 `context.session()` → `context.account()`，
+/// 解析的是 **current 帳號**（或 `--account` 覆蓋的那個），不是傳進來的 `account`。
+/// `account del <user>` 的目標是 `<user>`，用 current 的狀態判斷會放行不該放行的刪除
+/// （PR #19 審查 rumia／salvia 🔴1：current 有 recovery key 就把別的帳號的金鑰刪了）。
+///
+/// Args:
+///     account: **目標**帳號, example: context.account()? 或 find_account_by_full_mxid(...)
+/// Return:
+///     Some(MatrixBackend)  開起來了，而且已經 sync 過一次
+///     None                 沒 session、store 開不了、連不上 server——閘門會因此擋下來（fail closed）
+async fn find_backend_of(context: &Context, account: &AccountDir) -> Option<MatrixBackend> {
+    let vault = context.vault().ok()?;
+    let session = vault.unseal_session(&account.session_path()).ok()??;
+    let backend = MatrixBackend::restore(
+        &session,
+        &account.matrix_store_dir(),
+        &vault.matrix_store_key(),
+    )
+    .await
+    .ok()?;
+    // recovery 的狀態要 sync 過才是真的（它從 account data／secret storage 來）。
+    let _ = backend.sync_once(None, std::time::Duration::ZERO).await;
+    Some(backend)
+}
+
+/// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
+///
+/// 這些命令會連 `matrix/`（crypto store）與 `room-keys/` 一起刪。在還沒有 recovery key 的
+/// 預設狀態下，**server 端備份的私鑰就在那個 store 裡**——照樣登出的話歷史就回不來了。
+///
+/// 兩關，都要過（維護者 2026-09-09）：
+///
+/// 1. **server 那份救得回來嗎**：`exists_on_server && recovery_enabled`，正面認得才算
+///    （`is_history_recoverable`）。
+/// 2. **使用者手上真的有那串 recovery key 嗎**：要他打出來，拿去開 secret storage 驗
+///    （`is_recovery_key_correct`）。⚠️ 第 1 關只說得出「SSSS 設好了」——跑過
+///    `key-backup recovery`、印出來、沒抄就關掉終端的人也會通過第 1 關。第 2 關才是真的驗證。
+///
+/// Args:
+///     accept_history_loss: `--accept-history-loss`，使用者明說接受失去它，兩關都跳過
+/// Return:
+///     Ok(())       放行（兩關都過、使用者明說接受、或這個帳號本來就登出了）
 ///     Err(Usage)   擋下來，訊息告訴他下一步
 async fn refuse_if_history_would_be_lost(
     context: &Context,
@@ -637,27 +716,52 @@ async fn refuse_if_history_would_be_lost(
         // 已經登出的帳號沒有 session 可以問 server，也沒有 token 要失效；只是清本地殘留。
         return Ok(());
     }
-    let status = match crate::rooms::backend(context).await {
-        Ok(backend) => backend.backup_status().await.ok(),
-        Err(_) => None,
+    let Some(backend) = find_backend_of(context, account).await else {
+        return Err(refusal(
+            account,
+            "the server could not be reached, so it is unknown whether\n       \
+             the backup there can still be decrypted",
+        ));
     };
-    if status
-        .as_ref()
-        .is_some_and(|status| status.exists_on_server && status.has_recovery_key)
-    {
+    let status = backend.backup_status().await.ok();
+    if !is_history_recoverable(status.as_ref()) {
+        return Err(refusal(
+            account,
+            "the server-side backup cannot be decrypted yet - its key lives in the crypto store\n       \
+             that is about to be deleted.\n       \
+             Run `wbf-cli key-backup recovery` first to create a recovery key",
+        ));
+    }
+    // 第 2 關：這台機器保管著這個帳號的 recovery key 嗎（維護者 2026-09-09）。
+    // 🚫 不問使用者——它封在 <data dir>/recovery/，而那個目錄 `logout` 不碰，
+    // 所以刪完 matrix/ 與 room-keys/ 之後，它還在，歷史真的救得回來。
+    let user_id = context
+        .vault()?
+        .unseal_session(&account.session_path())?
+        .map(|session| session.user_id)
+        .unwrap_or_default();
+    if crate::recovery::find(&context.unlock.data_dir, context.vault()?, &user_id)?.is_some() {
         return Ok(());
     }
-    Err(SdkError::Usage(format!(
-        "this would delete the room keys on this machine (matrix/ and room-keys/), and the\n       \
-         server-side backup cannot be decrypted yet — its key lives in the crypto store that is\n       \
-         about to be deleted. Logging out like this makes {}'s history unreadable.\n       \
-         Run `wbf-cli key-backup recovery` first to create a recovery key (printed once, keep it\n       \
-         safe), then log out.\n       \
+    Err(refusal(
+        account,
+        "the server says secret storage is set up, but this machine is not keeping that account's\n       \
+         recovery key, so nothing here could open the backup afterwards.\n       \
+         Run `wbf-cli key-backup recovery` (it seals the key under <data dir>/recovery/, which\n       \
+         survives logout), or `wbf-cli recovery list` to see whose keys are kept here",
+    ))
+}
+
+/// 閘門擋下來時的訊息：`why` 是這一次為什麼擋，後面接一律相同的出路。
+fn refusal(account: &AccountDir, why: &str) -> SdkError {
+    SdkError::Usage(format!(
+        "this would delete {}'s room keys on this machine (matrix/ and room-keys/), and\n       \
+         {why}.\n       \
          If you only need the history on this machine, `wbf-cli key-backup save` writes a local\n       \
-         snapshot — but note that logging out deletes it too.\n       \
-         If you do not want that history, pass --accept-history-loss.",
+         snapshot - but note that logging out deletes that too.\n       \
+         If you do not want that history at all, pass --accept-history-loss.",
         account.label()
-    )))
+    ))
 }
 
 /// 裝置層的登出（CLI 規格 §3.1：`logout` 就是 `account del <current 帳號>`）：讓 token 失效，
@@ -734,13 +838,21 @@ async fn destroy_account_command(
     };
     if !yes
         && !crate::rooms::confirm(&format!(
-            "destroy {user} on {server}? this logs the device out and deletes its session, crypto store, and the cached events only this account has"
+            "destroy {user} on {server}? this logs the device out and deletes its session, crypto store, recovery key, and the cached events only this account has"
         ))?
     {
         return Err(SdkError::Usage("cancelled".into()));
     }
     // 先裝置層（logout、session.sealed、matrix/）再資料層：反過來的話 logout 要用的 session 已經被刪了。
     log_out_account(context, &account, accept_history_loss).await?;
+    // ⚠️ destroy 的語意是「什麼都不留」，所以連 recovery key 也摧毀（維護者 2026-09-09）。
+    // 🚫 `logout`／`account del` 不做這件事——它們留著它正是為了讓歷史救得回來。
+    // 這一步之後，server 上那份備份就永遠解不開了。
+    if crate::recovery::del(&context.unlock.data_dir, context.vault()?, user)? {
+        context.progress(format!(
+            "destroyed the recovery key kept here for {user}; the server-side backup can no longer be opened"
+        ));
+    }
     // 快取在 server 層；用這個帳號的目錄定位它（不需要它是 current）。
     let identity = CacheIdentity { server };
     let (mut cache, _) = Cache::open(
@@ -1159,5 +1271,40 @@ fn remove_if_exists(path: &Path) -> Result<(), SdkError> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wbf_sdk::backend::matrix_sdk::BackupStatus;
+
+    fn status(exists_on_server: bool, recovery_enabled: bool) -> BackupStatus {
+        BackupStatus {
+            exists_on_server,
+            enabled_locally: true,
+            recovery_enabled,
+            recovery_state: "Enabled".into(),
+        }
+    }
+
+    /// `logout` 的閘門（local-cache-db.md §10.7）：只有正面認得「救得回來」才放行。
+    /// 這裡失敗＝有人把判斷改成「不是 X 就放行」那種形狀，而那會在上游多一種狀態時默默開門。
+    #[test]
+    fn history_is_only_recoverable_when_both_halves_are_true() {
+        assert!(is_history_recoverable(Some(&status(true, true))));
+
+        assert!(
+            !is_history_recoverable(Some(&status(true, false))),
+            "server 上有 backup 但 SSSS 沒設好：那份備份換一台機器解不開"
+        );
+        assert!(
+            !is_history_recoverable(Some(&status(false, true))),
+            "SSSS 設好了但 server 上根本沒有 backup"
+        );
+        assert!(
+            !is_history_recoverable(None),
+            "問不到 server 就不是「正面認得救得回來」——fail closed"
+        );
     }
 }

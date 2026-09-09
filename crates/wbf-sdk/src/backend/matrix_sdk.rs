@@ -363,9 +363,17 @@ pub struct BackupStatus {
     pub exists_on_server: bool,
     /// 本機的 backup 有沒有啟用（有金鑰、會上傳）。
     pub enabled_locally: bool,
-    /// recovery key 是不是真的設好了。**只有 `Enabled` 算數**：`Unknown`、`Incomplete`、
-    /// `Disabled` 一律當作沒有（fail closed，§10.7 的閘門靠這個判斷）。
-    pub has_recovery_key: bool,
+    /// SSSS（secret storage）設好了、而且本機有全部的 secrets——上游 `RecoveryState::Enabled`
+    /// 的原話是 "Secret storage is set up and we have all the secrets locally"。
+    ///
+    /// ⚠️ **它不代表使用者手上真的有那串 recovery key**：跑過 `key-backup recovery`、
+    /// 印出來、然後沒抄下來就關掉終端，這個欄位一樣是 true。技術上沒有辦法驗證那件事
+    /// （維護者 2026-09-09 問到這點）。所以欄位叫 `recovery_enabled` 而不是
+    /// `has_recovery_key`——🚫 名字不要承諾我們驗不到的事。
+    ///
+    /// **只有 `Enabled` 算數**：`Unknown`、`Incomplete`、`Disabled` 一律當作沒有
+    /// （fail closed，§10.7 的閘門靠這個判斷）。
+    pub recovery_enabled: bool,
     /// 上游 `RecoveryState` 的名字，給人看的。
     pub recovery_state: String,
 }
@@ -387,7 +395,7 @@ impl MatrixBackend {
             exists_on_server,
             enabled_locally: backups.are_enabled().await,
             // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（local-cache-db.md §10.7）。
-            has_recovery_key: matches!(recovery_state, RecoveryState::Enabled),
+            recovery_enabled: matches!(recovery_state, RecoveryState::Enabled),
             recovery_state: format!("{recovery_state:?}"),
         })
     }
@@ -432,13 +440,17 @@ impl MatrixBackend {
         passphrase: &str,
     ) -> Result<u64, SdkError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            // 目錄 0700、檔案 0600：上游的 export 走 umask 預設，而這是全部房間金鑰的密文
+            // （PR #19 審查 rumia🟡2／salvia🟡4）。
+            crate::room_keys::prepare_dir(parent)?;
         }
         self.client
             .encryption()
             .export_room_keys(temp_path.to_path_buf(), passphrase, |_| true)
             .await
             .map_err(|error| SdkError::Usage(format!("cannot export room keys: {error}")))?;
+        // rename 保留來源檔的權限，所以要在 rename 之前收。
+        crate::room_keys::set_snapshot_permissions(temp_path)?;
         std::fs::rename(temp_path, path)?;
         Ok(std::fs::metadata(path)?.len())
     }
@@ -466,6 +478,34 @@ impl MatrixBackend {
             .await
             .map_err(|error| SdkError::Usage(format!("cannot import room keys: {error}")))?;
         Ok((result.imported_count, result.total_count))
+    }
+
+    /// 使用者手上**真的有**這個帳號的 recovery key 嗎——拿他打的那串去開 secret storage。
+    ///
+    /// 這是唯一驗得到的方式（維護者 2026-09-09 定）：`BackupStatus::recovery_enabled` 只說得出
+    /// 「SSSS 設好了」，說不出「那串字在誰手上」。要刪掉本機金鑰之前，只有這個能證明歷史真的救得回來。
+    ///
+    /// 🚫 用 `open_secret_store` 而不是 `recovery().recover()`：後者會把 secrets 匯進來、
+    /// 還可能觸發 backup 下載，而我們只想問一句「這串字對不對」。
+    ///
+    /// Args:
+    ///     recovery_key: 使用者打的那串, example: "EsTc ...";🚫 不印、不 log
+    /// Return:
+    ///     Ok(true)     開得起來——他手上確實有
+    ///     Ok(false)    開不起來（打錯、或那不是這個帳號的）
+    ///     Err(Network) 問不到 server，分辨不出來——呼叫端要 fail closed
+    pub async fn is_recovery_key_correct(&self, recovery_key: &str) -> Result<bool, SdkError> {
+        match self
+            .client
+            .encryption()
+            .secret_storage()
+            .open_secret_store(recovery_key)
+            .await
+        {
+            Ok(_) => Ok(true),
+            // 🚫 錯誤訊息不帶出去：它可能含 key 的片段，而且對使用者只有「對或不對」有意義。
+            Err(_) => Ok(false),
+        }
     }
 
     /// 產生 recovery key（`key-backup recovery`）。設好之後 server 上那份備份**換裝置也解得開**。

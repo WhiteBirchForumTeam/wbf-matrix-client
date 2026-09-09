@@ -356,16 +356,25 @@ pub fn find_account(
 /// ⚠️ 這是**加密的輸入**（§11.3），不是檔名了：所以要正規化到底（小寫），
 /// 🚫 不再過濾 `[A-Za-z0-9._-]` —— 那是為了當檔名才做的，留著只會讓不同的 host 撞成同一個目錄。
 pub fn server_host_of(server: &str) -> String {
-    let without_scheme = server
+    // scheme 先小寫再比：`HTTPS://x:443` 與 `https://x:443` 必須算同一台，
+    // 不然 443 只在其中一邊被當成預設 port 拿掉，同一個 server 長出兩個目錄
+    // （PR #19 審查 rumia🟢／salvia🟡4；正是 §11.3 要根除的形狀）。
+    let lowered = server.to_lowercase();
+    let without_scheme = lowered
         .trim_end_matches('/')
         .split_once("://")
         .map(|(_, rest)| rest)
-        .unwrap_or(server);
-    let host_port = without_scheme
+        .unwrap_or(&lowered);
+    // `user:pass@host` 的憑證不是 host 的一部分（Matrix 的 URL 極少這樣寫，但寫了不該壞）。
+    let without_credentials = without_scheme
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(without_scheme);
+    let host_port = without_credentials
         .split(['/', '?', '#'])
         .next()
-        .unwrap_or(without_scheme);
-    let is_https = server.starts_with("https://");
+        .unwrap_or(without_credentials);
+    let is_https = lowered.starts_with("https://");
     let host = match host_port.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
             let default = if is_https { "443" } else { "80" };
@@ -377,7 +386,7 @@ pub fn server_host_of(server: &str) -> String {
         }
         _ => host_port.to_string(),
     };
-    host.to_lowercase()
+    host
 }
 
 /// `@alice:localhost` → `alice`；`alice` → `alice`。
@@ -425,6 +434,27 @@ mod tests {
         assert_eq!(
             server_host_of("https://MATRIX.example.ORG"),
             server_host_of("https://matrix.example.org")
+        );
+        // scheme 也要一起小寫，不然只有其中一邊會把預設 port 拿掉（PR #19 審查）。
+        assert_eq!(
+            server_host_of("HTTPS://matrix.example.org:443"),
+            server_host_of("https://matrix.example.org")
+        );
+        assert_eq!(
+            server_host_of("HTTP://localhost:6167"),
+            server_host_of("http://localhost:6167")
+        );
+    }
+
+    #[test]
+    fn credentials_in_the_url_are_not_part_of_the_host() {
+        assert_eq!(
+            server_host_of("http://token@localhost:6167"),
+            "localhost:6167"
+        );
+        assert_eq!(
+            server_host_of("https://user:pass@matrix.example.org"),
+            "matrix.example.org"
         );
     }
 

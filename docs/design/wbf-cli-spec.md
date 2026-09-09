@@ -47,9 +47,9 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `login --user <mxid> [--password-file <path>] [--device-name <name>]`<br>`account add …`（同一件事的另一個名字） | 登入、把 session 封進這個帳號目錄的 `session.sealed`，**登入成功自動切成 `current`** 並印一行 switch 提示（§3.1.1）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server", "switched_from" }` |
-| `account status` | 列本機所有帳號：**掃雙層**（`servers/` 再 `accounts/`）逐一解密目錄名（local-cache-db.md §11.5）。⚠️ **要解鎖**（`passphrase` 模式會問或吃 ticket），因為目錄名是加密的；這跟 2026-09-09 之前的「不開 vault」不一樣。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy` | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
+| `account status` | 列本機所有帳號：**掃雙層**（`servers/` 再 `accounts/`）逐一解密目錄名（local-cache-db.md §11.5）。⚠️ **要解鎖**（`passphrase` 模式會問或吃 ticket），因為目錄名是加密的；這跟 2026-09-09 之前的「不開 vault」不一樣。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy`。⚠️ **登出的帳號是 `null`**：目錄名只解得出 localpart 與 host，組不出可靠的 mxid，🚫 不自己拼一個 | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
 | `account switch <user>` | 只改 `current`，不連 server。印 switch 提示（§3.1.1）。指到沒登入的帳號會警告但照切（下一個要連線的命令才會失敗） | `{ "ok": true, "current", "switched_from" }` |
-| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/`、**`room-keys/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門**：只有「server backup 開著 ＆ `recovery().state() == Enabled`」才直接走；其他任何狀態（沒 recovery key、`SERVER_BACKUP=off`、`Unknown`／`Incomplete`、問不到 server）exit 1，要 `--accept-history-loss` 才走（§3.6） | `{ "ok": true, "user" }` |
+| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/`、**`room-keys/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門兩關**（local-cache-db §10.7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才是真的。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著） | `{ "ok": true, "user" }` |
 | `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 | `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
@@ -272,6 +272,19 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | `key-backup import` | 把 `room-keys/snapshot` 餵回 crypto store（重新 `login`、或刪過 `matrix/` 之後用） | `{ "ok": true, "imported", "total" }` |
 | `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**。⚠️ 印完拿不回來，只能 reset。🚫 不寫進任何檔、不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
 
+#### 3.6.1 `recovery`：這台機器保管著誰的 recovery key
+
+`key-backup recovery` 產生的那串 key 會封進 `<data dir>/recovery/`（local-cache-db §10.8），
+**`logout` 不碰那個目錄**——它是清完帳號目錄之後唯一回得去 server 備份的路。
+
+| 命令 | 做什麼 | stdout |
+|---|---|---|
+| `recovery list` | 列出保管著誰的（只解**檔名**，🚫 不解內容、不印金鑰） | `{ "users": ["@alice:localhost", …] }` |
+| `recovery show <mxid>` | 印出某一個。⚠️ 會把秘密印到 stdout | `{ "user", "recovery_key" }` |
+
+⚠️ `account destroy` **會連目標帳號的 recovery key 一起摧毀**（維護者 2026-09-09），
+之後 server 上那份備份就永遠解不開了；`logout`／`account del` 🚫 不做這件事。
+
 **警告什麼時候印**（stderr，維護者 2026-09-09：recovery key 延後但要有警告）：
 
 - `login` 成功之後，如果 server backup 開著但還沒有 recovery key：
@@ -379,6 +392,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
   local.key                      32 byte 主金鑰，一台機器一把（local-cache-db.md §4）；所有帳號共用
   wbf.conf                       設定檔（§10）；指定了 --data-dir 而這裡還沒有時自動生成一份
   unlock.ticket                  只有 passphrase 模式會有（§7.1）
+  recovery/<b58>_<b58>           recovery key（local-cache-db.md §10.8）；🚫 logout 不碰它
   current                        目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"；沒有這個檔 = 沒登入過。🚫 兩層都不寫明文（寫了等於把剛加密的名字再漏一次）
   servers/<b58>_<b58>/           **server host 加密後的名字**（local-cache-db.md §11.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用的快取（§3.5；local-cache-db.md §6）
