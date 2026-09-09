@@ -17,6 +17,8 @@ use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::SessionTokens;
 use matrix_sdk::config::{RequestConfig, SyncSettings};
 use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
+use matrix_sdk::encryption::recovery::RecoveryState;
+use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
@@ -338,6 +340,211 @@ impl ChatBackend for MatrixBackend {
     }
 }
 
+/// server 端房間金鑰備份的設定（local-cache-db.md §10.3）。
+///
+/// `auto_enable_backups`：`login` 之後 server 上沒有 backup version 就建一個，並開始上傳。
+/// ⚠️ 建 version 時 **backup 的私鑰只存在本機 crypto store**，沒進 SSSS —— 所以在使用者跑
+/// `key-backup recovery` 之前，server 上那份**換一台機器也解不開**（它防的是本機 crypto.db 壞掉，
+/// 不是換裝置）。這句話要出現在警告與 `logout` 的閘門裡。
+///
+/// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，🚫 不一開機就全下載。
+fn backup_encryption_settings() -> EncryptionSettings {
+    EncryptionSettings {
+        auto_enable_backups: true,
+        auto_enable_cross_signing: true,
+        backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+    }
+}
+
+/// `key-backup status` 印的東西（CLI 規格 §3.6）。🚫 不含任何金鑰內容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupStatus {
+    /// server 上有沒有 backup version。
+    pub exists_on_server: bool,
+    /// 本機的 backup 有沒有啟用（有金鑰、會上傳）。
+    pub enabled_locally: bool,
+    /// SSSS（secret storage）設好了、而且本機有全部的 secrets——上游 `RecoveryState::Enabled`
+    /// 的原話是 "Secret storage is set up and we have all the secrets locally"。
+    ///
+    /// ⚠️ **它不代表使用者手上真的有那串 recovery key**：跑過 `key-backup recovery`、
+    /// 印出來、然後沒抄下來就關掉終端，這個欄位一樣是 true。技術上沒有辦法驗證那件事
+    /// （維護者 2026-09-09 問到這點）。所以欄位叫 `recovery_enabled` 而不是
+    /// `has_recovery_key`——🚫 名字不要承諾我們驗不到的事。
+    ///
+    /// **只有 `Enabled` 算數**：`Unknown`、`Incomplete`、`Disabled` 一律當作沒有
+    /// （fail closed，§10.7 的閘門靠這個判斷）。
+    pub recovery_enabled: bool,
+    /// 上游 `RecoveryState` 的名字，給人看的。
+    pub recovery_state: String,
+}
+
+impl MatrixBackend {
+    /// server 端備份現在是什麼狀態（`key-backup status`、`logout` 的閘門都用它）。
+    ///
+    /// Return:
+    ///     Ok(BackupStatus)
+    ///     Err(Network)   問不到 server（閘門會因此擋下來——問不到就不是「正面認得救得回來」）
+    pub async fn backup_status(&self) -> Result<BackupStatus, SdkError> {
+        let backups = self.client.encryption().backups();
+        let exists_on_server = backups
+            .fetch_exists_on_server()
+            .await
+            .map_err(|error| SdkError::Network(format!("key backup: {error}")))?;
+        let recovery_state = self.client.encryption().recovery().state();
+        Ok(BackupStatus {
+            exists_on_server,
+            enabled_locally: backups.are_enabled().await,
+            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（local-cache-db.md §10.7）。
+            recovery_enabled: matches!(recovery_state, RecoveryState::Enabled),
+            recovery_state: format!("{recovery_state:?}"),
+        })
+    }
+
+    /// 把 crypto store 裡的房間金鑰推上 server，**傳完才回來**（`key-backup upload`）。
+    ///
+    /// 為什麼要有這個命令：上游的上傳是背景 task，而 `BackupUploadingTask` 的 `Drop` 直接
+    /// `abort()`——CLI 一個命令跑完就 exit，那個 task 可能一筆都還沒送出去（local-cache-db.md §10.6）。
+    ///
+    /// Return:
+    ///     Ok(())        追平了
+    ///     Err(Network)  server 不收、或中途斷線
+    pub async fn upload_room_keys(&self) -> Result<(), SdkError> {
+        self.client
+            .encryption()
+            .backups()
+            .wait_for_steady_state()
+            .await
+            .map_err(|error| SdkError::Network(format!("key backup upload: {error}")))
+    }
+
+    /// 把 crypto store 裡的**全部**房間金鑰倒進本地快照（`key-backup save`；local-cache-db.md §10.4）。
+    ///
+    /// 上游直接寫檔，金鑰不經過我們的記憶體。先寫 `temp_path` 再 rename 到 `path`：
+    /// 寫到一半斷電不會把上一份好的蓋成半個檔。
+    ///
+    /// 匯出是**全量**的（上游只給這條路，拿不到逐把金鑰），所以每次都覆蓋整份——
+    /// crypto store 只增不減，新的快照一定含得下舊的，不必去重也不會愈積愈多。
+    /// 代價是每次一輪 PBKDF2 500,000（約半秒），所以這是命令觸發的，不是每個命令都做。
+    ///
+    /// Args:
+    ///     path: example: room_keys::snapshot_path(&account.dir)
+    ///     temp_path: example: room_keys::snapshot_temp_path(&account.dir)
+    ///     passphrase: 🚫 不印、不 log, example: room_keys::snapshot_passphrase(&key)
+    /// Return:
+    ///     Ok(u64)      快照有多少 byte
+    ///     Err(Usage)   store 開不了、寫不進去
+    pub async fn save_room_key_snapshot(
+        &self,
+        path: &Path,
+        temp_path: &Path,
+        passphrase: &str,
+    ) -> Result<u64, SdkError> {
+        if let Some(parent) = path.parent() {
+            // 目錄 0700、檔案 0600：上游的 export 走 umask 預設，而這是全部房間金鑰的密文
+            // （PR #19 審查 rumia🟡2／salvia🟡4）。
+            crate::room_keys::prepare_dir(parent)?;
+        }
+        self.client
+            .encryption()
+            .export_room_keys(temp_path.to_path_buf(), passphrase, |_| true)
+            .await
+            .map_err(|error| SdkError::Usage(format!("cannot export room keys: {error}")))?;
+        // rename 保留來源檔的權限，所以要在 rename 之前收。
+        crate::room_keys::set_snapshot_permissions(temp_path)?;
+        std::fs::rename(temp_path, path)?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// 把本地快照餵回 crypto store（`key-backup import`）。重新 `login`、或刪過 `matrix/` 之後用。
+    ///
+    /// Return:
+    ///     Ok((imported, total))   這次新匯入幾把、快照裡總共幾把
+    ///     Err(Usage)              沒有快照、解不開（不是這把 local.key 存的）、格式壞掉
+    pub async fn import_room_key_snapshot(
+        &self,
+        path: &Path,
+        passphrase: &str,
+    ) -> Result<(usize, usize), SdkError> {
+        if !path.exists() {
+            return Err(SdkError::Usage(format!(
+                "no local room key snapshot at {}; run `key-backup save` while logged in",
+                path.display()
+            )));
+        }
+        let result = self
+            .client
+            .encryption()
+            .import_room_keys(path.to_path_buf(), passphrase)
+            .await
+            .map_err(|error| SdkError::Usage(format!("cannot import room keys: {error}")))?;
+        Ok((result.imported_count, result.total_count))
+    }
+
+    /// 拿 recovery key 把**這台裝置**恢復：解開 SSSS、把 backup 的解密金鑰收進 crypto store。
+    ///
+    /// 什麼時候要：`logout` 之後重新 `login` 是**新裝置**，它的 crypto store 沒有 SSSS 的 secrets，
+    /// 所以 `RecoveryState` 會是 `Incomplete`，server 上那份備份也解不開——直到跑過這個
+    /// （2026-09-09 對真 server 驗證時發現這個缺口：recovery key 保管著卻沒有入口用它）。
+    ///
+    /// 跑完之後 `backup_download_strategy` 才有東西可以下載：解不開的訊息會自動去 backup 拿金鑰。
+    ///
+    /// Args:
+    ///     recovery_key: 🚫 不印、不 log
+    /// Return:
+    ///     Ok(())        恢復了
+    ///     Err(Network)  key 不對、或問不到 server
+    pub async fn recover_with(&self, recovery_key: &str) -> Result<(), SdkError> {
+        self.client
+            .encryption()
+            .recovery()
+            .recover(recovery_key)
+            .await
+            .map_err(|error| SdkError::Network(format!("recover: {error}")))
+    }
+
+    /// 使用者手上**真的有**這個帳號的 recovery key 嗎——拿他打的那串去開 secret storage。
+    ///
+    /// 這是唯一驗得到的方式（維護者 2026-09-09 定）：`BackupStatus::recovery_enabled` 只說得出
+    /// 「SSSS 設好了」，說不出「那串字在誰手上」。要刪掉本機金鑰之前，只有這個能證明歷史真的救得回來。
+    ///
+    /// 🚫 用 `open_secret_store` 而不是 `recovery().recover()`：後者會把 secrets 匯進來、
+    /// 還可能觸發 backup 下載，而我們只想問一句「這串字對不對」。
+    ///
+    /// Args:
+    ///     recovery_key: 使用者打的那串, example: "EsTc ...";🚫 不印、不 log
+    /// Return:
+    ///     Ok(true)     開得起來——他手上確實有
+    ///     Ok(false)    開不起來（打錯、或那不是這個帳號的）
+    ///     Err(Network) 問不到 server，分辨不出來——呼叫端要 fail closed
+    pub async fn is_recovery_key_correct(&self, recovery_key: &str) -> Result<bool, SdkError> {
+        match self
+            .client
+            .encryption()
+            .secret_storage()
+            .open_secret_store(recovery_key)
+            .await
+        {
+            Ok(_) => Ok(true),
+            // 🚫 錯誤訊息不帶出去：它可能含 key 的片段，而且對使用者只有「對或不對」有意義。
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// 產生 recovery key（`key-backup recovery`）。設好之後 server 上那份備份**換裝置也解得開**。
+    ///
+    /// Return:
+    ///     Ok(String)   recovery key，🚫 只印一次、不寫檔、不進 log
+    ///     Err(Network) server 不收
+    pub async fn enable_recovery(&self) -> Result<String, SdkError> {
+        self.client
+            .encryption()
+            .recovery()
+            .enable()
+            .await
+            .map_err(|error| SdkError::Network(format!("recovery: {error}")))
+    }
+}
+
 async fn build_client(
     server: &str,
     store_dir: &Path,
@@ -350,16 +557,30 @@ async fn build_client(
     Client::builder()
         .homeserver_url(server)
         .request_config(RequestConfig::new().timeout(crate::channel::REQUEST_TIMEOUT))
+        .with_encryption_settings(backup_encryption_settings())
         .sqlite_store_with_config_and_cache_path(store_config, None::<&Path>)
         .build()
         .await
         .map_err(|error| match error {
-            // 開不了 store 多半是既有的 store 不是這把金鑰包的（舊版沒有金鑰、或 local.key 換過）。
-            // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
-            matrix_sdk::ClientBuildError::SqliteStore(error) => SdkError::Usage(format!(
-                "cannot open the matrix store at {}: {error}; it was made with another key file — delete that directory and run `login` again",
-                store_dir.display()
-            )),
+            // 開不了 store 通常是兩個原因之一，而它們的處置完全不同——所以先分辨再報。
+            matrix_sdk::ClientBuildError::SqliteStore(error) => {
+                let path = store_dir.display().to_string();
+                // ⚠️ 路徑太長時 sqlite 也回「開不了」，2026-09-09 實測被誤報成「金鑰不對」，
+                // 害人去刪一個其實沒問題的目錄。Windows 的 MAX_PATH 是 260，
+                // 上游的 store 檔名最長是 matrix-sdk-event-cache.sqlite3（30 字元）。
+                if cfg!(windows) && path.chars().count() + 31 > 250 {
+                    SdkError::Usage(format!(
+                        "cannot open the matrix store at {path}: the path is {} characters and Windows \
+                         refuses paths over 260 - move the data dir somewhere shorter (--data-dir)",
+                        path.chars().count()
+                    ))
+                } else {
+                    // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
+                    SdkError::Usage(format!(
+                        "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
+                    ))
+                }
+            }
             other => SdkError::Network(format!("matrix client: {other}")),
         })
 }

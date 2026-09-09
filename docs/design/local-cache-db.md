@@ -8,8 +8,8 @@
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | §10 房間金鑰備份（server 一份、本地一份） | 📝 2026-09-09 設計定案，還沒實作。conf 檔（CLI 規格 §10）是它的前提，先做 conf 再做這個 |
-> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | 📝 2026-09-09 設計定案，還沒實作。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
+> | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`recovery/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）；conf 的開關還沒做，目前寫死是開的 |
+> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | ✅ §11 2026-09-09 做了（`account_dir`）；§12 還沒。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
 ## 0. 一句話
@@ -174,14 +174,19 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   local.key                      主金鑰（§4），一台機器一把，所有帳號共用
   unlock.ticket                  CLI 的 unlock ticket（§4）
   current                        CLI 的目前帳號
-  servers/<b58>_<b58>/           **server host 加密後的名字**（§11.2）：外面看不出這台機器連過哪家
+  r/<b58>_<b58>                  recovery key（§10.8）：檔名是 `recovery-key@mxid` 加密後的樣子。
+                                 🚫 logout 不碰它——那是它不放在帳號目錄底下的全部理由
+  s/<b58>_<b58>/                 **server host 加密後的名字**（§11.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用（§6）
     media/                       媒體儲存池（§8），跟 cache.db 同層、同範圍
-    accounts/
+    a/
       <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 §11.2）
         session.sealed           第三把子金鑰封住的 session
-        matrix/                  SDK 的 store（crypto.db、state.db），綁 device；logout 刪
-        room-keys/               本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
+        m/                       SDK 的 store（crypto.db、state.db），綁 device；logout 刪
+        k/snapshot               本地房間金鑰備份（§10.4）；`account del`／`destroy` 連它一起刪
+
+⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母，理由是 Windows 的 MAX_PATH（§11.4.1）——
+兩段加密名字就吃掉 106 字元。
 ```
 
 `<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
@@ -468,7 +473,7 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 | 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | `accounts/<localpart>/room-keys/`（§10.4） |
 | 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §10.3） | 意外：`crypto.db` 壞掉、`matrix/` 被刪掉重 `login`、server 端資料沒了 |
 | 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，§4） |
-| 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§10.6） | **同步寫**，命令結束前落地（§10.5） |
+| 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§10.6） | **命令觸發**：`key-backup save`，`upload` 時順手一起（§10.5） |
 | 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，CLI 規格 §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
 | 生命週期 | 跟帳號走，`logout` 不動它 | **跟這台機器上的這個帳號走：`logout` 連它一起刪**（維護者 2026-09-09，§10.7） |
 | 互通性 | 有：Element 之類的 client 用同一份 | 沒有：只有這個 client 讀得懂 |
@@ -493,47 +498,55 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
 - 關掉（`SERVER_BACKUP=off`）就是 `auto_enable_backups: false` 且不跑上傳；**已經在 server 上的 version 不動、不刪**
   （刪 server 端備份是不可逆的，要顯式命令，見 §10.8）。
 
-### 10.4 本地端：一房一檔的加密金鑰池
+### 10.4 本地端：一個全量快照檔（2026-09-09 實作時改的）
 
 放在**帳號層**（維護者 2026-09-09 定）：
 
 ```
-accounts/<localpart>/room-keys/
-  <room 識別>.keys        一房一檔，順序 append
+a/<b58>_<b58>/k/
+  snapshot        上游 export_room_keys 倒出來的全量加密快照
+  snapshot.tmp    寫入時的暫存檔，寫完 rename 成 snapshot
 ```
 
-- **第五把子金鑰**：`BLAKE3 derive_key("wbf-matrix-client room key backup v1", master)`（§4 的表加一列）。
-- **`<room 識別>` 是 keyed hash，不是 room_id**：`BLAKE3 keyed_hash(第五把子金鑰, room_id)` 取前 32 hex。
-  兩個理由：room_id 含 `!` 與 `:`，Windows 檔名不合法；而且目錄名不該洩漏這個帳號在哪些房（沒有金鑰就看不出是哪一間）。
-- **檔案格式**（`WBFRK1`）：32 byte 檔頭 + 一串長度前綴的密文記錄。
+> ⚠️ **這一節 2026-09-09 實作時改過**。原本定的是「一房一檔、逐把 append 的 `WBFRK1` 格式，
+> 每個命令結束前比對後只寫新的那幾筆」。做不到，因為**上游只給全量匯出**：
+> `Encryption::export_room_keys(path, passphrase, predicate)` 直接把金鑰寫成一個加密檔，
+> 而拿逐把金鑰要 `Client::olm_machine()`，那是 `pub(crate)`（只有 `olm_machine_for_testing()` 露出來，
+> 名字就是契約，🚫 不碰）。
+>
+> 改成全量快照之後**反而簡單得多**，而且原本那套 append 格式的理由都消失了：
+>
+> | 原本要解決的 | 全量快照為什麼不需要 |
+> |---|---|
+> | 去重（同一把 session 存很多次） | 每次覆蓋整份，本來就沒有重複 |
+> | 檔案愈積愈長 | 快照大小 ＝ 金鑰總量，不隨備份次數長 |
+> | 自訂的 `WBFRK1` 格式與它的 nonce／序號 | 不用了，格式是上游的 |
+> | 尾巴壞掉要截斷 | 先寫 `.tmp` 再 rename，要嘛舊的完整、要嘛新的完整 |
+>
+> 代價只有一個：拿不到「只寫增量」，每次要跑一輪 PBKDF2 500,000（約半秒）。所以它是**命令觸發**的（§10.5）。
 
-  ```
-  檔頭  magic "WBFRK1\0\0"(8) | version u16 = 1 | reserved(6) | file_id(16 隨機)
-  記錄  u32 明文長度 | u24 序號 | XChaCha20-Poly1305 密文 + tag
-        nonce = file_id 前 8 byte || 序號(u64 little endian)      序號從 0 起，每筆 +1
-        aad   = 檔頭全部 32 byte                                  搬到別的檔就解不開
-  ```
-
-  明文是一筆金鑰的 JSON，欄位就是上游 `ExportedRoomKey` 的（`algorithm`、`room_id`、`sender_key`、`session_id`、
-  `session_key`、`sender_claimed_keys`、`forwarding_curve25519_key_chain`）。**不自己發明欄位**：這樣 import 直接餵回上游。
-- **只 append，不改寫、不刪單筆**（檔案內容層面；整個目錄什麼時候被清掉見 §10.7）。同一個 `session_id` 可以出現多次（後來拿到 index 更小、更完整的那把）；
-  import 時全部餵給上游，由它比 `first_known_index` 決定留哪把。**我們不做取捨**，少一個會出錯的判斷。
-- **壞掉怎麼辦**：某一筆解不開就停在那裡，把**前面成功的那些**照樣 import，並印一行說明第幾筆之後被截斷。
-  順序 append 的檔案壞掉多半是尾巴（寫到一半斷電），前面的仍然有效；🚫 不因為尾巴壞掉就丟掉整個檔。
+- **passphrase 是 vault 第五把子金鑰的 base64**（`BLAKE3 derive_key("wbf-matrix-client room key backup v1", master)`），
+  不是使用者打的字——所以「passphrase 太弱被暴力破」在這裡不存在。
+- **🚫 不再包一層我們自己的 AEAD**：上游的匯出格式本身就是加密的，而它的 passphrase 已經是 vault 保護的，
+  多包一層不增加任何安全性，只多一個要維護的格式（全域 CLAUDE.md A2）。
+- **金鑰不進我們的記憶體**：上游直接寫檔、直接讀檔，我們只給路徑與 passphrase。
+- 一房一檔也做得到（`predicate` 可以按房過濾），但那會變成「房間數 × 半秒」。**維護者當初說的
+  「以 server & 房間為識別碼」在這裡沒有照做**，理由就是這個；要改回一房一檔的話只是把 predicate
+  換成迴圈，格式不用動。
 
 ### 10.5 什麼時候寫
 
-**同步寫，不靠背景 task。** 每個會拿到房間金鑰的命令（`read`、`recent`、`watch`、`sync`、`rooms`）在結束前：
+**命令觸發，不是每個命令都做**——每次一輪 PBKDF2 500,000（約半秒），掛在 `read` 這種命令上太貴。
 
-1. 從 crypto store 匯出金鑰（上游 `encryption().export_room_keys()`，predicate 限定這次碰過的房間）。
-2. 跟該房 `.keys` 檔已有的 `(session_id, first_known_index)` 集合比對 —— 開檔時掃一遍建這個集合（一房幾百到幾千筆，每筆約 200 byte，掃得動）。
-3. 只 append 新的那幾筆，`fsync` 後才算數。
+| 時機 | 做什麼 |
+|---|---|
+| `key-backup save` | 手動存一份 |
+| `key-backup upload` | 推完 server 那份**順手也存本地這份**：兩份備份的用途不同（§10.2），但沒有理由讓使用者記得跑兩個命令 |
+| `logout` 的閘門擋下來時 | 訊息告訴他有 `key-backup save` 這條路（也老實說 logout 會連它一起刪） |
 
-為什麼不用上游的背景 task：`BackupUploadingTask` 的 `Drop` 直接 `abort()`，CLI 命令 exit 時它可能一筆都還沒送出去。
-本地這份是「不能漏」的那一份，所以走同步；server 那份允許落後（§10.6）。
-
-⚠️ 效能：`export_room_keys` 會解密全部 session。房間多、金鑰多的時候這一步會變慢。
-第一版接受（正確優先），量大了再換成訂閱上游的 room key stream 只寫增量 —— 換的時候格式不用動。
+⚠️ 所以本地這份**不是「一定不會漏」**：兩次 `save` 之間拿到的金鑰，只在 crypto store 與（有跑 upload 的話）
+server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那是建立在「拿得到逐把金鑰」的假設上，而那個假設是錯的。
+真正的保險仍然是 §10.3 的 server 端 backup 加 recovery key。
 
 ### 10.6 server 那份怎麼追平：`key-backup upload`
 
@@ -551,7 +564,7 @@ accounts/<localpart>/room-keys/
 
 | 情形 | `matrix/` | `room-keys/` | 怎麼把歷史找回來 |
 |---|---|---|---|
-| **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 餵回新的 crypto store |
+| **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
 | **有意**：`logout`／`account del <user>`（同一件事，CLI 規格 §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
 | **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
 
@@ -566,9 +579,18 @@ accounts/<localpart>/room-keys/
 所以 `logout` 前面加一道閘門，寫成**正面認得**的形式：
 
 ```
-准走（照常 logout，room-keys/ 一起刪）  ⟸  server backup 開著 ＆ recovery().state() == Enabled
+准走（照常 logout，room-keys/ 一起刪）  ⟸  ① server 上有 backup ＆ recovery().state() == Enabled
+                                          ＆ ② 這台機器保管著這個帳號的 recovery key（§10.8）
 其他任何狀態                            ⟹  exit 1，要 --accept-history-loss 才走
 ```
+
+⚠️ **兩關都要過，而且第二關才是真的**（維護者 2026-09-09）：`RecoveryState::Enabled` 的上游定義是
+「secret storage is set up and we have all the secrets locally」——它說得出 SSSS 設好了，
+**說不出那串 recovery key 在誰手上**。跑過 `key-backup recovery`、印出來、沒抄就關掉終端的人，
+第一關照樣過。第二關看的是 `<data dir>/recovery/` 有沒有封著這個帳號的 key，
+而那個目錄 `logout` 不碰——所以刪完 `matrix/` 與 `room-keys/` 之後它還在，歷史真的救得回來。
+
+🚫 **不問使用者手打 recovery key**（維護者 2026-09-09 定）：既然我們自己就保管著，問他等於刁難。
 
 「其他任何狀態」包含：沒有 recovery key、`SERVER_BACKUP=off`（使用者自己關掉的，那本地這份就是唯一一份）、
 `RecoveryState` 是 `Unknown`／`Incomplete`、問不到 server。🚫 不寫成「沒有 recovery key 才擋」——
@@ -580,7 +602,37 @@ server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損
 📎 副作用（好的）：這讓「recovery key 延後」不會被無限期延後 —— **延到第一次 `logout` 為止**。
 本地池的定位因此也清楚了：它是**線上那份還沒真的可攜之前的中繼**，不是永久保險。
 
-### 10.8 明確不做的 / 還開著的
+### 10.8 recovery key 存哪：獨立的資料夾，`logout` 不碰（維護者 2026-09-09 定）
+
+```
+<data dir>/recovery/<b58>_<b58>      檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
+```
+
+**為什麼不放在帳號目錄底下**：`logout`／`account del` 要把帳號目錄整個清乾淨
+（`session.sealed`、`matrix/`、`room-keys/`），而 recovery key 正好是**清完之後唯一回得去的路**。
+放在一起就會一起被刪，那等於 server 上的備份也沒了——閘門（§10.7）就變成在檢查一個馬上要被自己刪掉的東西。
+
+| 誰 | 對 recovery key 做什麼 |
+|---|---|
+| `key-backup recovery` | 產生、印出來一次、**封進這裡** |
+| `logout`／`account del` | **不碰**——這是它跟帳號目錄分開放的全部理由 |
+| `account destroy` | **一起摧毀**（那個命令的語意就是「什麼都不留」）。⚠️ 之後 server 上那份備份永遠解不開 |
+| `recovery list` | 列出這台機器保管著誰的（只解**檔名**，🚫 不解內容） |
+| `recovery show <user>` | 印出某一個（會印秘密，跟 `key-backup recovery` 一樣） |
+| `key-backup restore` | 拿它**恢復這台裝置**——重新 `login` 之後必跑，見下 |
+
+- **檔名跟其他兩層一樣加密**（`DirScope::Recovery`，第六把子金鑰）：外面看不出這台機器保管著誰的 key。
+- **內容用第三把子金鑰封**（跟 `session.sealed` 同一把，AAD 不同所以密文換不過去）。
+- 目錄 0700。
+- ⚠️ **重新 `login` 之後要跑 `key-backup restore`**（2026-09-09 對真 server 驗證時發現）：
+  `logout` 之後再 `login` 是**新裝置**，它的 crypto store 沒有 SSSS 的 secrets，
+  `RecoveryState` 會是 `Incomplete`、server 上那份備份解不開。保管著 recovery key 不會自動生效，
+  要有人拿它去 `recovery().recover()`。
+- ⚠️ 老實說它的邊界：這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台
+  機器上，整台被拿走就一起沒了。真正換裝置時仍然要使用者手上有那串字，所以 `key-backup recovery`
+  印出來時還是會叫他寫下來。
+
+### 10.9 明確不做的 / 還開著的
 
 - 🚫 不自己發明備份格式上傳到 fork server（走 pack 通道）：標準路徑已經可用，自訂等於放棄互通又要 server 改。
 - 🚫 `key-backup` 不做「刪掉 server 上的 backup version」：不可逆，而且會讓其他裝置的備份一起失效。要刪去別的 client 刪。
@@ -611,14 +663,29 @@ Base58 的字母表**沒有底線**，所以 `_` 可以當分隔符，兩段各�
 兩層用不同的 aad 與不同的 nonce context 分開，🚫 不需要第七把。
 
 ```
-第一層  servers/<B58(nonce_s)>_<B58(ct_s)>/
-  nonce_s = BLAKE3 keyed_hash(key, "wbf server-dir-nonce v1" ‖ host) 前 24 byte
-  ct_s    = XChaCha20-Poly1305(key, nonce_s, host,      aad = "wbf-matrix-client server dir v1")
+第一層  s/<B58(nonce_s)>_<B58(ct_s)>/
+  nonce_s = BLAKE3 keyed_hash(key, "wbf server-dir-nonce v1" ‖ host) 前 12 byte
+  ct_s    = ChaCha20-Poly1305(key, nonce_s, host,      aad = "wbf-matrix-client server dir v1")
 
-第二層  accounts/<B58(nonce_a)>_<B58(ct_a)>/
-  nonce_a = BLAKE3 keyed_hash(key, "wbf account-dir-nonce v1" ‖ host ‖ 0x00 ‖ localpart) 前 24 byte
-  ct_a    = XChaCha20-Poly1305(key, nonce_a, localpart, aad = "wbf-matrix-client account dir v1" ‖ host)
+第二層  a/<B58(nonce_a)>_<B58(ct_a)>/
+  nonce_a = BLAKE3 keyed_hash(key, "wbf account-dir-nonce v1" ‖ host ‖ 0x00 ‖ localpart) 前 12 byte
+  ct_a    = ChaCha20-Poly1305(key, nonce_a, localpart, aad = "wbf-matrix-client account dir v1" ‖ host)
 ```
+
+⚠️ **nonce 是 12 byte、演算法是 ChaCha20-Poly1305 而不是 XChaCha20**（維護者 2026-09-09 定，
+起因是實跑撞到 Windows 的 MAX_PATH）：
+
+| | 24 byte nonce（XChaCha） | 12 byte nonce |
+|---|---|---|
+| nonce 那段 base58 | 33 字元 | **17 字元** |
+| 兩層合計省 | — | **32 字元** |
+
+12 byte 夠不夠：nonce 是 `BLAKE3 keyed_hash(key, …‖明文)` 的前 12 byte，碰撞要兩個**不同明文**的
+hash 前 96 bit 相同——生日界是 2^48 個明文，而這裡的明文是「這台機器的 server host 與 localpart」，
+數量是個位數。🚫 這個推導**只在明文數量極少時成立**，別把同一套搬去命名數以萬計的東西。
+
+📎 中間那幾段目錄名也縮到一個字母（`s`／`a`／`m`／`k`／`r`），再省 18 字元。可讀性本來就沒有——
+它們夾在兩段密文之間。
 
 - **nonce 由明文確定性導出，而且照樣寫進名字裡**。兩件事都要，理由不同：
   - 寫進去：解密時要先有 nonce，而 nonce 是從還沒解出來的明文導出的 —— 不寫就永遠解不開。
@@ -647,7 +714,7 @@ Base58 的字母表**沒有底線**，所以 `_` 可以當分隔符，兩段各�
 - **建目錄前先檢查**：目標名字已經存在時，把它解密出來比對 —— 是同一個 host／localpart 才用，不是就報錯，
   🚫 不覆蓋、🚫 不加後綴自己找一個空位。
 - 每一段名字上限 **200 字元**（Windows 單一路徑元件是 255）。Base58 大約是 byte 數的 1.37 倍，
-  nonce 那段固定約 33 字元，所以密文那段大約 120 byte 以上才會踩到 —— Matrix 的 localpart 上限是 255 byte，
+  nonce 那段固定 17 字元，所以密文那段大約 130 byte 以上才會踩到 —— Matrix 的 localpart 上限是 255 byte，
   踩得到，要有這個檢查。超過就報錯，🚫 不截斷（截斷等於不可逆）。
 
 ### 11.5 讀回來：掃兩層，建記憶體裡的對照
@@ -693,6 +760,23 @@ servers/ 底下每個目錄名
 
 - 📎 順帶：`servers/` 兩層都改了之後，CLI 規格 §7 那條「PR #11 的單一目錄佈局要報錯」也失去意義了
   （那個佈局同樣解不開、同樣被跳過）。實作時可以一併拿掉那段檢查。
+
+#### 11.4.1 ⚠️ 真正咬人的不是單段長度，是**整條路徑**（2026-09-09 實測）
+
+Windows 的 `MAX_PATH` 是 **260**，而加密把兩段目錄名從 19 字元（`localhost_6167` ＋ `alice`）
+撐到 106。實測 `matrix-sdk-event-cache.sqlite3` 的完整路徑：
+
+| | 加密名字合計 | 最長路徑（data dir 39 字元） |
+|---|---|---|
+| 24 byte nonce ＋ 長目錄名 | 138 | **230**（餘裕 20，data dir 稍深就爆） |
+| **12 byte nonce ＋ `s`／`a`／`m`** | **106** | **184**（餘裕 76） |
+
+⚠️ 第一次驗證時用 130 字元的 data dir **直接失敗**，而且錯誤訊息把它誤報成
+「it was made with another key file」——害人去刪一個其實沒問題的目錄。
+現在 `build_client` 會先看路徑長度再決定怎麼報（`backend/matrix_sdk.rs`）。
+
+📎 這條的教訓寫下來：**目錄名加密的成本不在 CPU，在路徑預算**。之後要再加一層加密目錄之前，
+先算一次最深的那條路徑。
 
 ### 11.8 還開著
 

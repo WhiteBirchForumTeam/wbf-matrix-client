@@ -5,6 +5,7 @@
 mod accounts;
 mod commands;
 mod recent;
+mod recovery;
 mod rooms;
 mod unlock;
 
@@ -49,30 +50,107 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// `login` 與 `account add` 是同一件事，參數只定義一次。
+#[derive(Args)]
+pub struct LoginArgs {
+    /// mxid 或 localpart，example: @alice:localhost
+    #[arg(long)]
+    pub user: String,
+    /// 整檔就是密碼；沒給就從終端讀（不回顯）
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
+    #[arg(long, default_value = "wbf-cli")]
+    pub device_name: String,
+}
+
+/// `account` 底下的動作。`<user>` 一律是完整 mxid（維護者 2026-09-09）：
+/// 這些命令會登出、會刪檔，變更的對象不該靠猜。
 #[derive(Subcommand)]
-pub enum Command {
-    /// 登入、寫 session 檔
-    Login {
-        /// mxid 或 localpart，example: @alice:localhost
-        #[arg(long)]
+pub enum AccountAction {
+    /// 登入一個帳號並切成 current（等同 login）
+    Add(LoginArgs),
+    /// 列出本機所有帳號。⚠️ 要解鎖：目錄名是加密的（local-cache-db.md §11）
+    Status,
+    /// 換預設帳號（只改 current，不連 server）
+    Switch {
+        /// 完整 mxid，example: @bob:matrix.org
         user: String,
-        /// 整檔就是密碼；沒給就從終端讀（不回顯）
-        #[arg(long)]
-        password_file: Option<PathBuf>,
-        #[arg(long, default_value = "wbf-cli")]
-        device_name: String,
     },
-    /// 讓 token 失效；刪這個帳號的 session.sealed 與 matrix/，cache.db 留著（這個 server 最後一個帳號登出時才刪）
-    Logout,
-    /// 列出資料目錄裡的帳號（不開 vault）
-    Accounts,
-    /// 摧毀一個帳號在 cache.db 裡的本機紀錄（它同步過的事件、房間清單、已讀位置；別的帳號也同步過的事件留著）
-    ForgetAccount {
-        /// 完整 mxid，example: @alice:localhost
+    /// 裝置層：登出、刪掉這個帳號的 session.sealed 與 matrix/；cache.db 裡的紀錄留著
+    Del {
+        /// 完整 mxid，example: @bob:matrix.org
+        user: String,
+        /// 明知 server 上的備份還解不開，照樣登出（local-cache-db.md §10.7）
+        #[arg(long)]
+        accept_history_loss: bool,
+    },
+    /// 裝置層加資料層：del 再加上清掉這個帳號在 cache.db 裡獨有的紀錄（別人也持有的不動）
+    Destroy {
+        /// 完整 mxid，example: @bob:matrix.org
         user: String,
         /// 不問確認（腳本用）
         #[arg(long)]
         yes: bool,
+        /// 明知 server 上的備份還解不開，照樣登出（local-cache-db.md §10.7）
+        #[arg(long)]
+        accept_history_loss: bool,
+    },
+}
+
+/// recovery key 的本機保管（local-cache-db.md §10.9）。
+/// 它跟帳號目錄分開放，所以 `logout` 不會刪掉——那正是它存在的意義。
+#[derive(Subcommand)]
+pub enum RecoveryAction {
+    /// 列出這台機器保管著誰的 recovery key（只解檔名，🚫 不印金鑰本身）
+    List,
+    /// 印出某個帳號的 recovery key。⚠️ 這會把秘密印到 stdout
+    Show {
+        /// 完整 mxid，example: @bob:matrix.org
+        user: String,
+    },
+}
+
+/// 房間金鑰備份（local-cache-db.md §10）。
+#[derive(Subcommand)]
+pub enum KeyBackupAction {
+    /// server 上的 backup version、有沒有 recovery key、本機備份幾把金鑰
+    Status,
+    /// 把 crypto store 裡的金鑰推上 server，傳完才 exit（上游的上傳是背景 task，命令 exit 就被 abort）
+    Upload,
+    /// 把全部房間金鑰倒進本地快照 room-keys/snapshot（全量覆蓋，一輪 PBKDF2 約半秒）
+    Save,
+    /// 把本地快照餵回 crypto store（重新 login、或刪過 matrix/ 之後用）
+    Import,
+    /// 用保管的 recovery key 恢復這台裝置（重新 login 之後要跑；沒有它 server 上的備份解不開）
+    Restore,
+    /// 產生 recovery key。⚠️ 只印一次、拿不回來；設好之後 server 上那份換裝置也解得開
+    Recovery,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// 登入、寫 session 檔；成功後自動切成 current（等同 `account add`）
+    Login(LoginArgs),
+    /// 讓 current 帳號的 token 失效；刪它的 session.sealed 與 matrix/（等同 `account del <current>`）
+    Logout {
+        /// 明知 server 上的備份還解不開，照樣登出（會失去這個帳號的歷史，local-cache-db.md §10.7）
+        #[arg(long)]
+        accept_history_loss: bool,
+    },
+    /// 帳號：新增、列出、切換、登出、摧毀（CLI 規格 §3.1）
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+    /// 房間金鑰備份：狀態、上傳、產生 recovery key（CLI 規格 §3.6）
+    KeyBackup {
+        #[command(subcommand)]
+        action: KeyBackupAction,
+    },
+    /// 這台機器保管著誰的 recovery key（local-cache-db §10.9）
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryAction,
     },
     /// 刪 unlock ticket；下一個命令會再問 passphrase
     Lock,
