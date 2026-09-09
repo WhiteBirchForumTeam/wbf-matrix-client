@@ -95,7 +95,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 還沒做的：
 
 0. ⚠️ **房間金鑰備份與周邊**（維護者 2026-09-09 提，排到最前面）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10，實作分兩個 PR ——
-   先 **conf 檔加 `account` 一族**（CLI 規格 §10 與 §3.1：conf 是「備份預設開、可手動關」的前提；`account status`／`switch`／`del`／`destroy` 取代 `accounts`／`forget-account`，**CLI 輸出一律英文**），再做 **金鑰備份**（server 端標準 backup、本地 `room-keys/` 加密池、`key-backup` 命令、`logout` 的閘門）。
+   先 **conf 檔加 `account` 一族加帳號目錄加密**（CLI 規格 §10 與 §3.1、local-cache-db §11／§12：conf 是「備份預設開、可手動關」的前提；`account status`／`switch`／`del`／`destroy` 取代 `accounts`／`forget-account`，**CLI 輸出一律英文**；帳號目錄名改成加密後的 Base58，`current` 跟著改，passphrase 改吃原始 bytes、`local.key` 升 `v: 2`），再做 **金鑰備份**（server 端標準 backup、本地 `room-keys/` 加密池、`key-backup` 命令、`logout` 的閘門）。
+   ⚠️ 第一個 PR 有一段**不能省的遷移**（local-cache-db §11.6）：明文 localpart 的舊帳號目錄要 rename 過去，🚫 不能照舊政策叫人刪掉重登 —— 那個目錄裡有 crypto store。
 1. chat-model §6 剩的房間功能：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載。穿插。
 2. 附件宣告：等 server 定案（`media-attachments.md` 仍是提案）。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。**走 fork submodule 露出 `Room::encrypt`，還是走 `OlmMachine`，維護者還沒定**；建議後者（plan-v1 §7.2 的方向）。
 3. UI 框架比較文件。UI 的同步流程已經有 SDK 介面可接：開一個 task 跑 `recent_sync`，callback 把每個 Batch 丟 channel 給寫 DB 的 task（chat-model §4.3）；媒體用 `media::fetch` 加 `PoolReader`。
