@@ -27,7 +27,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 |---|---|---|
 | `--server <url>` | `WBF_SERVER` | homeserver 的 base URL，example: `http://localhost:6167`。沒給就用 session 檔的 |
 | `--token <access_token>` | `WBF_ACCESS_TOKEN` | 直接給 token，跳過 session 檔。🚫 不印、不寫進任何輸出 |
-| `--data-dir <dir>` | `WBF_DATA_DIR` | 資料目錄（`local.key`、`wbf.conf`、`current`、`servers/<b58>_<b58>/cache.db`、`…/accounts/<b58>_<b58>/`），預設見 §7 |
+| `--data-dir <dir>` | `WBF_DATA_DIR` | 資料目錄（`local.key`、`wbf.conf`、`current`、`s/<b58>_<b58>/cache.db`、`…/a/<b58>_<b58>/`），預設見 §7 |
 | `--account <mxid 或 localpart>` | `WBF_ACCOUNT` | 用哪個帳號，**就這一次**（要改預設用 `account switch`，§3.1）；沒給就是 `current`。同名 localpart 在多個 server 都有時要配 `--server`（§7） |
 | `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔的**原始 bytes** 就是 passphrase（解 `local.key` 用）。🚫 不去尾換行、🚫 不驗 UTF-8：可以是中文、可以是一個 mp3（local-cache-db.md §12）。沒給就看 unlock ticket，再沒有就從終端讀（不回顯）。🚫 沒有 `--passphrase <pw>`、🚫 不接受環境變數給 passphrase 本身 |
 | `--unlock-ttl <秒>` | | 密碼解鎖成功後 unlock ticket 的有效期，預設 900；0 就不寫 ticket（§7.1） |
@@ -112,7 +112,7 @@ wbf-cli --data-dir ~/.wbf account switch @alice:matrix.org
 # 只有這一條用 bob，current 不動
 wbf-cli --data-dir ~/.wbf --account @bob:matrix.org rooms
 
-# 登出 bob：session、matrix/、room-keys/ 沒了，cache.db 裡的紀錄還在
+# 登出 bob：session、m/（crypto store）、k/（金鑰快照）沒了，cache.db 裡的紀錄還在
 wbf-cli --data-dir ~/.wbf account del @bob:matrix.org
 
 # 連 bob 在本機的紀錄一起清掉（alice 也看得到的那些不動）
@@ -405,7 +405,9 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
     media/                       媒體儲存池（local-cache-db.md §8）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
 ```
 
-- **兩層目錄名都是加密的**（local-cache-db.md §11）：`<base58 nonce>_<base58 密文>`，底線分隔（Base58 字母表沒有 `_`）。上層是正規化過的 server host（小寫、非預設 port 才帶），下層是 localpart。要知道是哪家、是誰得解密，所以連 `account status` 都要先解鎖（§11.6）。真正的 server URL 與 mxid 仍然在 `session.sealed` 裡，不從目錄名反推。
+- **兩層目錄名都是加密的**（local-cache-db.md §11）：`<base58 nonce>_<base58 密文>`，底線分隔（Base58 字母表沒有 `_`）。
+  ⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母：兩段加密名字就吃掉 106 字元，
+  而 Windows 的 `MAX_PATH` 是 260（local-cache-db.md §11.4.1，2026-09-09 實測撞到）。上層是正規化過的 server host（小寫、非預設 port 才帶），下層是 localpart。要知道是哪家、是誰得解密，所以連 `account status` 都要先解鎖（§11.6）。真正的 server URL 與 mxid 仍然在 `session.sealed` 裡，不從目錄名反推。
 - 哪個帳號：`--account` → `current`。`login` 寫 `current`；`logout` 的帳號是 `current` 就清掉。
 - `local.key` 為什麼在頂層不在帳號底下：主金鑰的定位是「這台機器」（local-cache-db.md §4），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase，沒有理由。
 - `cache.db` 為什麼在 server 層：`r_seq`／`g_seq` 是 fork server 發的，同一個 room 在不同 homeserver 上序號不同；共用範圍就是同一個 server 的帳號（§3.5）。
