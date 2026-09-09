@@ -401,7 +401,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
       <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 §11.2），第六把子金鑰
         session.sealed           { "server", "user_id", "device_id", "access_token", "store_dir" } 用第三把子金鑰封住
         m/                       matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
-        k/snapshot               本地房間金鑰備份（local-cache-db.md §10.4），一房一檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
+        k/snapshot               本地房間金鑰備份（local-cache-db.md §10.4），全量快照一個檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
     media/                       媒體儲存池（local-cache-db.md §8）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
 ```
 
