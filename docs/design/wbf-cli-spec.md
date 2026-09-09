@@ -43,9 +43,9 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `login --user <mxid> [--password-file <path>] [--device-name <name>]` | 登入、把 session 封進這個帳號目錄的 `session.sealed`，並把它設成 `current`（§7）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著，`login` 只是切換。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server" }` |
-| `logout` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/` 與 unlock ticket；`current` 指到它就清掉。**`local.key` 與 `cache.db` 留著**（維護者 2026-09-07 定：快取是我們自己的 DB，只綁帳號不綁裝置；要摧毀用 `forget-account`）。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了） | `{ "ok": true }` |
+| `logout [--accept-history-loss]` | `POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/`、**`room-keys/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`local.key` 與 `cache.db` 留著**（維護者 2026-09-07 定：快取是我們自己的 DB，只綁帳號不綁裝置；要摧毀用 `forget-account`）。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門**：只有「server backup 開著 ＆ `recovery().state() == Enabled`」才直接走；其他任何狀態（沒 recovery key、`SERVER_BACKUP=off`、`Unknown`／`Incomplete`、問不到 server）exit 1，要 `--accept-history-loss` 才走（§3.6） | `{ "ok": true }` |
 | `accounts` | 列資料目錄裡的帳號（掃目錄，不開 vault、不問 passphrase） | `[{ "server", "localpart", "logged_in", "current" }…]` |
-| `forget-account <mxid> [--yes]` | 摧毀這個帳號在 `cache.db` 裡的本機紀錄（§3.5 的忘掉鏈），連池裡沒人指的檔一起刪。要完整 mxid。帳號登出中就要配 `--server`（快取的身份要 server URL）。沒 `--yes` 就終端確認 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
+| `forget-account <mxid> [--yes]` | 摧毀這個帳號在 `cache.db` 裡的本機紀錄（§3.5 的忘掉鏈），連池裡沒人指的檔與這個帳號的 `room-keys/` 一起刪。要完整 mxid。帳號登出中就要配 `--server`（快取的身份要 server URL）。沒 `--yes` 就終端確認 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 | `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
 | `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
@@ -178,7 +178,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 |---|---|---|
 | `recent [--limit <n>] [--window <n>] [--batch <n>] [--from-scratch]` | `Event/Recent`（只走 WS；`--transport http` 會拿到 `Unsupported`）。三層（維護者 2026-09-08 定）：`--limit` 是**這一輪總共要幾則**（預設 10000，0 = 拉到追平），底層拆成一次 `Recent` 一窗 `--window` 則（預設 320、server 上限 500 先 clamp），server 每 `--batch` 則回一個 Batch（預設 10、上限 100）；要 1000 就是 320、320、320、40 四窗。每個 Batch 寫一次快取；一窗 `tc == 要的` 就帶 `before = 最後的 ls` 再一窗，`tc < 要的` 是追平（`caught_up`）；湊滿 `--limit` 也停（stderr 說更舊的還沒進快取）。水位一律是第一窗第一個 Batch 的 `fs`（比它新的全拿到了），中途斷線或 server 回錯就 exit、已寫的有效、水位不動。等待：第一窗每個 Batch 之間 60 秒、之後 10 秒。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "windows", "batches", "caught_up", "cg_seq_before", "cg_seq_after" }` |
 | `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的。排序照 `r_seq`（沒有 `r_seq` 的房間退到時間）。`--before` 這時是 **r_seq 的數字**（上一頁印的 `next`），不是 server 的翻頁 token；沒有 `r_seq` 的房間 `next` 是 null、翻不了頁 | 與不帶時同形 |
-| `forget-account <mxid> [--delete-room-keys]` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**`room-keys/` 預設留著**（維護者 2026-09-09：默認不刪 room session），要一起丟得帶 `--delete-room-keys`，那個旗標會多問一次確認（刪金鑰不可逆，§3.6） | 見 §3.1 |
+| `forget-account <mxid> [--yes]` | 忘掉鏈：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**這個帳號的 `room-keys/` 也一起刪**（它就是「摧毀本機紀錄」，跟 `logout` 一致，local-cache-db §10.7）；沒 `--yes` 的確認提示要把這件事講出來 | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
 | `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 local-cache-db.md §8.5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
 
@@ -202,9 +202,9 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
   ```
   warning: 房間金鑰備份已經開始上傳到 server，但解開它的私鑰目前只在這台機器上。
-           換一台機器（或這台重灌）會拿不到歷史訊息。
-           要讓備份在別的裝置也解得開，跑一次 `wbf-cli key-backup recovery` 產生 recovery key 並自己保管。
-           本地還有一份金鑰備份在 <data dir>/servers/<host>/accounts/<localpart>/room-keys/（logout 不會刪它）。
+           換一台機器（或這台重灌）會拿不到歷史訊息，而且 logout 會先擋下來。
+           跑一次 `wbf-cli key-backup recovery` 產生 recovery key 並自己保管，server 上那份就換裝置也解得開了。
+           在那之前，能救回歷史的只有本機這份：<data dir>/servers/<host>/accounts/<localpart>/room-keys/
   ```
 
 - `SERVER_BACKUP=off` 時，任何會拿到房間金鑰的命令印一次：
@@ -219,6 +219,19 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
   ```
   warning: 兩份房間金鑰備份都關掉了（wbf.conf 的 [backup]）。crypto store 一旦刪掉或壞掉，歷史訊息就解不開了。
   ```
+
+- `logout` 的閘門（local-cache-db §10.7）擋下來時，exit 1 並印：
+
+  ```
+  error: 這次 logout 會連這台機器上的房間金鑰一起刪（matrix/ 與 room-keys/），
+         而 server 上那份備份現在還解不開（它的私鑰就在即將被刪的 crypto store 裡）。
+         照這樣登出，這個帳號的歷史訊息就回不來了。
+         先跑 `wbf-cli key-backup recovery` 產生 recovery key（只印一次，自己保管），再 logout。
+         確定不要這些歷史就帶 --accept-history-loss。
+  ```
+
+  閘門寫成**正面認得**的形式：只有「server backup 開著 ＆ `recovery().state() == Enabled`」才放行，
+  其他任何狀態（含 `SERVER_BACKUP=off`、`Unknown`／`Incomplete`、問不到 server）一律擋下來。
 
 🚫 這些警告不印金鑰、不印 recovery key、不印 token。
 
@@ -287,7 +300,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
     accounts/<localpart>/
       session.sealed             { "server", "user_id", "device_id", "access_token", "store_dir" } 用第三把子金鑰封住
       matrix/                    matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
-      room-keys/                 本地房間金鑰備份（local-cache-db.md §10.4），一房一檔；第五把子金鑰；🚫 logout 不刪、forget-account 預設也不刪
+      room-keys/                 本地房間金鑰備份（local-cache-db.md §10.4），一房一檔；第五把子金鑰；logout 與 forget-account 連它一起刪（§10.7 的閘門）
     media/                       媒體儲存池（local-cache-db.md §8）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
 ```
 

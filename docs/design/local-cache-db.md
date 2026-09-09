@@ -178,7 +178,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
     accounts/<localpart>/
       session.sealed             第三把子金鑰封住的 session
       matrix/                    SDK 的 store（crypto.db、state.db），綁 device；logout 刪
-      room-keys/                 本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；🚫 logout 不刪
+      room-keys/                 本地房間金鑰備份（§10.4），一房一檔；第五把子金鑰；logout 與 forget-account 連它一起刪（§10.7 的閘門）
 ```
 
 `<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
@@ -463,10 +463,11 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 | | server 端（標準 Matrix key backup） | 本地端（我們自己的加密金鑰池） |
 |---|---|---|
 | 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | `accounts/<localpart>/room-keys/`（§10.4） |
-| 防什麼 | 這台機器整個沒了 | server 端資料沒了、重灌 server、`matrix/` 被刪掉重 `login` |
+| 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §10.3） | 意外：`crypto.db` 壞掉、`matrix/` 被刪掉重 `login`、server 端資料沒了 |
 | 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，§4） |
 | 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§10.6） | **同步寫**，命令結束前落地（§10.5） |
 | 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，CLI 規格 §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
+| 生命週期 | 跟帳號走，`logout` 不動它 | **跟這台機器上的這個帳號走：`logout` 連它一起刪**（維護者 2026-09-09，§10.7） |
 | 互通性 | 有：Element 之類的 client 用同一份 | 沒有：只有這個 client 讀得懂 |
 
 兩份都是 best effort 的**副本**，權威永遠是 crypto store。任何一份讀壞就當作沒有（fail closed），不要拿壞掉的金鑰去覆蓋 store。
@@ -512,7 +513,7 @@ accounts/<localpart>/room-keys/
 
   明文是一筆金鑰的 JSON，欄位就是上游 `ExportedRoomKey` 的（`algorithm`、`room_id`、`sender_key`、`session_id`、
   `session_key`、`sender_claimed_keys`、`forwarding_curve25519_key_chain`）。**不自己發明欄位**：這樣 import 直接餵回上游。
-- **只 append，不改寫、不刪**（維護者 2026-09-09：默認不刪）。同一個 `session_id` 可以出現多次（後來拿到 index 更小、更完整的那把）；
+- **只 append，不改寫、不刪單筆**（檔案內容層面；整個目錄什麼時候被清掉見 §10.7）。同一個 `session_id` 可以出現多次（後來拿到 index 更小、更完整的那把）；
   import 時全部餵給上游，由它比 `first_known_index` 決定留哪把。**我們不做取捨**，少一個會出錯的判斷。
 - **壞掉怎麼辦**：某一筆解不開就停在那裡，把**前面成功的那些**照樣 import，並印一行說明第幾筆之後被截斷。
   順序 append 的檔案壞掉多半是尾巴（寫到一半斷電），前面的仍然有效；🚫 不因為尾巴壞掉就丟掉整個檔。
@@ -541,16 +542,40 @@ accounts/<localpart>/room-keys/
 - `key-backup status` 印：本地池有幾把、crypto store 有幾把、server 上的 version 與 count、是否落後、有沒有 recovery key。
   🚫 不印任何金鑰內容。
 
-### 10.7 給 `matrix/` 被刪的那條路留門：`key-backup import`
+### 10.7 誰刪 `room-keys/`：意外留門，離開就清乾淨
 
-維護者 2026-09-09 定：**store 開不了的政策維持現狀**（報錯，叫人刪 `matrix/` 重新 `login`，不遷移）。
-這條政策站得住的前提是**本地金鑰池不跟著被刪**，而且有一條讀回來的路：
+分界是**這次是意外還是有意的**（維護者 2026-09-09 定）：
 
-- `logout` 刪 `matrix/`（Matrix logout 讓裝置失效，留著 crypto store 會擋下一次 `login`），**🚫 不刪 `room-keys/`**。
-- 「刪掉 `matrix/` 重新 `login`」也一樣：`room-keys/` 是另一個目錄，不在被刪的範圍內。
-- 重新 `login` 之後跑 `key-backup import`，把 `room-keys/` 的金鑰餵回新的 crypto store，歷史就解得開。
-- `forget-account <mxid>` 是**顯式**的「忘掉這個帳號」，但它預設**仍然保留** `room-keys/`（維護者 2026-09-09：默認不刪）；
-  要連金鑰一起丟得帶 `--delete-room-keys`，而且那個旗標會多問一次。刪金鑰是不可逆的，fail closed 的一邊是「留著」。
+| 情形 | `matrix/` | `room-keys/` | 怎麼把歷史找回來 |
+|---|---|---|---|
+| **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 餵回新的 crypto store |
+| **有意**：`logout` | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以 `logout` 有閘門，見下） |
+| **有意**：`forget-account <mxid>` | 不是它的事 | **一起刪** | 同上。它本來就是「摧毀這個帳號在本機的紀錄」 |
+
+為什麼 `logout` 連著刪（維護者 2026-09-09）：`logout` 在心智上是「我離開這台機器」，
+留一個能解開全部歷史的檔案在磁碟上是驚嚇，而且跟「crypto store 一定會被刪」不一致。
+
+#### `logout` 的閘門：不是正面認得救得回來，就不准走
+
+⚠️ 直接刪有一個連鎖：在還沒有 recovery key 的預設狀態下，**server backup 的私鑰是存在 crypto store 裡的**（§10.3），
+而 `logout` 正要刪掉 crypto store。所以「crypto store 沒了 ＋ room-keys 也刪了 ＋ server 那份解不開」＝ 歷史三份全滅。
+
+所以 `logout` 前面加一道閘門，寫成**正面認得**的形式：
+
+```
+准走（照常 logout，room-keys/ 一起刪）  ⟸  server backup 開著 ＆ recovery().state() == Enabled
+其他任何狀態                            ⟹  exit 1，要 --accept-history-loss 才走
+```
+
+「其他任何狀態」包含：沒有 recovery key、`SERVER_BACKUP=off`（使用者自己關掉的，那本地這份就是唯一一份）、
+`RecoveryState` 是 `Unknown`／`Incomplete`、問不到 server。🚫 不寫成「沒有 recovery key 才擋」——
+那樣新增一種狀態就默默放行；要壞就壞在「多擋一次」那一邊。
+
+擋下來的時候印的訊息要直接給下一步（原文在 CLI 規格 §3.6）：先跑 `key-backup recovery` 產生 recovery key，
+server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損失。
+
+📎 副作用（好的）：這讓「recovery key 延後」不會被無限期延後 —— **延到第一次 `logout` 為止**。
+本地池的定位因此也清楚了：它是**線上那份還沒真的可攜之前的中繼**，不是永久保險。
 
 ### 10.8 明確不做的 / 還開著的
 
