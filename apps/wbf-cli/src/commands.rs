@@ -198,6 +198,22 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), SdkError> {
     }
 }
 
+/// `login` 要讀哪個 password 檔：旗標沒給就用 conf 的 `PASSWORD_FILE`（CLI 規格 §10.5）。
+///
+/// ⚠️ 存進 conf 的是**路徑**，秘密是那個檔的**內容**——它從來不進 conf，自動生成也不寫這個鍵。
+///
+/// Args:
+///     args: example: &LoginArgs { .. }
+///     conf: example: &context.conf
+/// Return:
+///     Some(PathBuf)  旗標給的，或 conf 寫的
+///     None           兩邊都沒有——從終端問
+fn find_password_file(args: &LoginArgs, conf: &Conf) -> Option<PathBuf> {
+    args.password_file
+        .clone()
+        .or_else(|| conf.find("PASSWORD_FILE").map(PathBuf::from))
+}
+
 /// 開關型的值寫回 conf 時長什麼樣（§10.4 只認得這兩個字）。
 fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
@@ -578,7 +594,13 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkErr
         .server_override
         .clone()
         .ok_or_else(|| SdkError::Usage("login needs --server (or WBF_SERVER)".into()))?;
-    let password = match args.password_file.as_deref() {
+    // conf 的 `PASSWORD_FILE` 補上旗標沒給的那格（CLI 規格 §10.5：它是**路徑**不是秘密，
+    // 手寫進 conf 正是維護者要的「不用每次指定」）。
+    // 🚫 它在 `KNOWN_CONF_KEYS` 裡卻沒人讀 = 使用者寫了一行、login 照樣問密碼、一句話都不說
+    //（PR #22 審查 rumia🔴1／salvia🟡1／cirno）——那正是這個檔在 `refuse_switched_off`
+    // 底下譴責的形狀。
+    let password_file = find_password_file(args, &context.conf);
+    let password = match password_file.as_deref() {
         Some(path) => read_password_file(path)?,
         None => prompt_password_on_terminal("password: ")?,
     };
@@ -1677,6 +1699,44 @@ mod conf_precedence_tests {
         );
         // 兩個開關的安全值都是「開著」。
         assert!(context.server_backup && context.local_room_keys);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn login_args(password_file: Option<&str>) -> LoginArgs {
+        LoginArgs {
+            user: "@alice:localhost".into(),
+            password_file: password_file.map(std::path::PathBuf::from),
+            device_name: "wbf-cli".into(),
+        }
+    }
+
+    #[test]
+    fn the_conf_file_supplies_the_password_file_path_when_the_flag_did_not() {
+        // ⚠️ 進 conf 的是**路徑**不是秘密（§10.5）——秘密是那個檔的內容，它從來不進 conf。
+        let dir = scratch("pwfile");
+        std::fs::write(
+            dir.join(crate::conf::CONF_FILE_NAME),
+            "[general]
+PASSWORD_FILE=/tmp/from-conf
+",
+        )
+        .unwrap();
+        let context = Context::from(&cli_with(&dir)).unwrap();
+
+        // 🚫 認得卻沒人讀 = 使用者寫了一行、login 照樣問密碼、一句話都不說
+        //（PR #22 審查 rumia🔴1）。這一條就是在釘「有人讀」。
+        assert_eq!(
+            find_password_file(&login_args(None), &context.conf),
+            Some(std::path::PathBuf::from("/tmp/from-conf"))
+        );
+        // 旗標照樣蓋過 conf。
+        assert_eq!(
+            find_password_file(&login_args(Some("/tmp/from-flag")), &context.conf),
+            Some(std::path::PathBuf::from("/tmp/from-flag"))
+        );
+        // 兩邊都沒有就是 None（呼叫端會去問終端）。
+        let empty = Context::from(&cli_with(&scratch("pwfile-empty"))).unwrap();
+        assert_eq!(find_password_file(&login_args(None), &empty.conf), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

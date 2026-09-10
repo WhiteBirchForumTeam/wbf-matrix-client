@@ -331,13 +331,20 @@ pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, SdkEr
     Ok(true)
 }
 
-/// 值有前後空白、或以 `#`／`;` 起頭時要包引號，不然自己寫出來的檔自己讀不回來。
+/// 值有前後空白、以 `#`／`;` 起頭、或本身首尾就是雙引號時要包引號，
+/// 不然自己寫出來的檔自己讀不回來。
+///
+/// ⚠️ 這幾個條件是 `strip_comment` 與 `unquote` 的鏡像：那兩個改了，這裡要跟著改，
+/// 不然 round-trip 會裂開（`generating_never_overwrites_and_reads_back_the_same` 蓋著這條）。
 fn quote_if_needed(value: &str) -> String {
     let needs = value.trim() != value
         || value.starts_with('#')
         || value.starts_with(';')
         || value.contains(" #")
-        || value.contains(" ;");
+        || value.contains(" ;")
+        // 值本身就是 `"x"`：不包起來寫出去，讀回來會被 `unquote` 剝成 `x`
+        //（PR #22 審查 rumia🟢1）。
+        || (value.starts_with('"') && value.ends_with('"'));
     if needs {
         format!("\"{value}\"")
     } else {
@@ -460,12 +467,20 @@ mod tests {
                 value: "  #odd  ".to_string(),
                 origin: "built-in default",
             },
+            Entry {
+                section: "general",
+                key: "TRANSPORT",
+                // 值本身首尾就是雙引號的極端情形。
+                value: "\"quoted\"".to_string(),
+                origin: "built-in default",
+            },
         ];
         assert!(write_if_absent(&dir, &entries).unwrap());
         // 自己寫出來的自己讀得回來（含要包引號的那種值）。
         let conf = load(None, &dir).unwrap();
         assert_eq!(conf.find("SERVER"), Some("http://localhost:6167"));
         assert_eq!(conf.find("ACCOUNT"), Some("  #odd  "));
+        assert_eq!(conf.find("TRANSPORT"), Some("\"quoted\""));
 
         // 🚫 已經有一份就永遠不動它。
         assert!(!write_if_absent(&dir, &entries).unwrap());

@@ -266,9 +266,9 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `key-backup status` | server 上有沒有 backup、本機有沒有在上傳、secret storage 設好了沒（`recovery_enabled`，只認 `RecoveryState::Enabled`；⚠️ 它說不出那串 key 在誰手上）、本地快照存在嗎／多大／什麼時候存的。⚠️ 「幾把金鑰」印不出來：上游的匯出是不透明的全量檔（local-cache-db §10.4） | `{ "server_backup_exists", "uploading_locally", "recovery_enabled", "recovery_state", "local_snapshot", "local_snapshot_bytes", "local_snapshot_saved_at" }` |
-| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。順手也跑一次 `save`（local-cache-db §10.5） | `{ "ok": true, "server_backup_exists", "recovery_enabled", "local_snapshot_bytes" }` |
-| `key-backup save` | 把 crypto store 裡的**全部**房間金鑰倒進 `k/snapshot`（全量覆蓋，先寫 `.tmp` 再 rename）。一輪 PBKDF2 500k 約半秒，所以是命令觸發的（local-cache-db §10.5） | `{ "ok": true, "bytes" }` |
+| `key-backup status` | server 上有沒有 backup、本機有沒有在上傳、secret storage 設好了沒（`recovery_enabled`，只認 `RecoveryState::Enabled`；⚠️ 它說不出那串 key 在誰手上）、本地快照存在嗎／多大／什麼時候存的，以及 conf 的兩個開關現在是什麼（`server_backup_setting`／`local_room_keys_setting`，§10）。⚠️ 前面那些是**上游現在的狀態**、後兩個是**這台機器的設定叫它做什麼**，對不上時要看得出來。⚠️ 「幾把金鑰」印不出來：上游的匯出是不透明的全量檔（local-cache-db §10.4） | `{ "server_backup_setting", "local_room_keys_setting", "server_backup_exists", "uploading_locally", "recovery_enabled", "recovery_state", "local_snapshot", "local_snapshot_bytes", "local_snapshot_saved_at" }` |
+| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。順手也跑一次 `save`（local-cache-db §10.5）。⚠️ `SERVER_BACKUP=off` 時整個命令**拒絕**；`LOCAL_ROOM_KEYS=off` 時只跳過 `save` 那一步（使用者要的是 server 那份） | `{ "ok": true, "server_backup_exists", "recovery_enabled", "local_snapshot_bytes" }`<br>⚠️ `local_snapshot_bytes` 在 `LOCAL_ROOM_KEYS=off` 時是 `null` |
+| `key-backup save` | 把 crypto store 裡的**全部**房間金鑰倒進 `k/snapshot`（全量覆蓋，先寫 `.tmp` 再 rename）。一輪 PBKDF2 500k 約半秒，所以是命令觸發的（local-cache-db §10.5）。⚠️ `LOCAL_ROOM_KEYS=off` 時**拒絕**並說是哪個鍵關的——🚫 不靜默跳過：命令是他打的 | `{ "ok": true, "bytes" }` |
 | `key-backup import` | 把 `k/snapshot` 餵回 crypto store（重新 `login`、或刪過 `m/` 之後用） | `{ "ok": true, "imported", "total" }` |
 | `key-backup restore` | 用 `<data dir>/r/` 保管的那把 key 恢復**這台裝置**（解 SSSS、拿回 backup 的解密金鑰）。⚠️ **重新 `login` 之後一定要跑**：新裝置的 crypto store 沒有 SSSS 的 secrets，`RecoveryState` 會是 `Incomplete`，server 上那份備份解不開（2026-09-09 對真 server 驗證時發現的缺口） | `{ "ok": true, "recovery_enabled", "recovery_state" }` |
 | `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**，同時封進 `<data dir>/r/`（§3.6.1）。⚠️ 印完 server 那邊拿不回來，只能 reset。🚫 不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
@@ -520,5 +520,5 @@ WINDOW=500
 |---|---|
 | `ACCESS_TOKEN` | token 是秘密，🚫 不落地在明文檔裡。要臨時指定用 `--token`／`WBF_ACCESS_TOKEN`（§2） |
 | passphrase、password 本身 | 同上，而且 §2 已經定了秘密只能從檔案或終端來 |
-| `PASSWORD_FILE`／`PASSPHRASE_FILE` 的自動生成 | 可以手寫（它們是路徑不是秘密，維護者要的正是「不用每次指定」），但自動生成不替使用者決定秘密放哪 |
+| `PASSWORD_FILE`／`PASSPHRASE_FILE` 的自動生成 | **可以手寫**，兩個都讀得到（它們是路徑不是秘密，維護者要的正是「不用每次指定」；秘密是那個檔的**內容**）。但自動生成不寫它們——不替使用者決定秘密放哪 |
 | 帳號狀態（`current`、session） | 那是狀態不是設定，各有各的檔（§7）。設定檔可以刪掉不影響登入。⚠️ `current` 的**內容一樣要加密**（§7：兩層都寫加密後的目錄名）—— 它不在 conf 裡，但不能因此漏了 |
