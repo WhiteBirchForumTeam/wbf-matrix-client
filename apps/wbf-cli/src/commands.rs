@@ -226,6 +226,8 @@ pub struct Context {
     effective: Vec<crate::conf::Entry>,
     /// `--data-dir`／`WBF_DATA_DIR` 有給嗎——自動生成的三個條件之一。
     data_dir_was_given: bool,
+    /// 備份關掉的警告一個命令只印一次（`rooms::backend` 可能被叫不只一次）。
+    warned_about_backups: std::sync::OnceLock<()>,
 }
 
 /// conf 認得的鍵。⚠️ 加新鍵時要回來加一筆，不然它會被當成「認不得」印警告（§10.4）——
@@ -329,6 +331,7 @@ impl Context {
         .filter(|entry: &Entry| !entry.value.is_empty())
         .collect();
         Ok(Context {
+            warned_about_backups: std::sync::OnceLock::new(),
             opened_vault: std::sync::OnceLock::new(),
             account: std::sync::OnceLock::new(),
             account_override: cli
@@ -519,6 +522,47 @@ impl Context {
         Ok(())
     }
 
+    /// 備份被關掉時，任何會拿到房間金鑰的命令印一次（CLI 規格 §3.6）。
+    ///
+    /// ⚠️ 一個命令只印一次：`rooms::backend` 在同一個命令裡可能被叫不只一次，
+    /// 而重複三次的警告等於沒有警告。
+    ///
+    /// 🚫 這不是「順便提醒」：關掉備份的後果是**歷史會消失**，而它是設定檔裡一行字造成的
+    /// ——那行字可能是幾個月前寫的，也可能是別人寫的。
+    pub fn warn_if_backups_are_off(&self) {
+        if self.server_backup && self.local_room_keys {
+            return;
+        }
+        if self.warned_about_backups.set(()).is_err() {
+            return;
+        }
+        let keys_live_here = || match self.account() {
+            Ok(account) => room_keys::snapshot_path(&account.dir)
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| "<account dir>/k/".to_string()),
+            Err(_) => "<account dir>/k/".to_string(),
+        };
+        match (self.server_backup, self.local_room_keys) {
+            (false, false) => self.progress(
+                "warning: both room key backups are disabled ([backup] in wbf.conf). If the crypto store is\n         \
+                 deleted or breaks, your history becomes unreadable - there is no copy anywhere."
+                    .into(),
+            ),
+            (false, true) => self.progress(format!(
+                "warning: server-side room key backup is off ([backup] SERVER_BACKUP=off in wbf.conf).\n         \
+                 Your room keys stay on this machine only:\n         {}",
+                keys_live_here()
+            )),
+            (true, false) => self.progress(
+                "warning: the local room key snapshot is off ([backup] LOCAL_ROOM_KEYS=off in wbf.conf);\n         \
+                 only the server-side backup is keeping your room keys."
+                    .into(),
+            ),
+            (true, true) => {}
+        }
+    }
+
     /// conf 解析出來的警告（認不得的值、parse 不出來的數字）。`--quiet` 就不印。
     pub fn warn(&self, warnings: &[String]) {
         for warning in warnings {
@@ -549,6 +593,7 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkErr
         account.delete_matrix_store()?;
     }
     // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放帳號目錄的 m/。
+    context.warn_if_backups_are_off();
     let (_backend, session) = MatrixBackend::login(
         &server,
         user,

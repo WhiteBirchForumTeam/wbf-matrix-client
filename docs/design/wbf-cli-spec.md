@@ -451,7 +451,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 - 🚫 不把目錄名的對照表落地成明文索引（local-cache-db.md §11.5）：那等於把剛加密的東西再寫一次明文。
 - 🚫 不把 `--password-file` 也改成原始 bytes（local-cache-db.md §12.4）：password 要送給 server，它本來就是字串。
 
-## 10. conf 檔：不用每次指定環境變數（維護者 2026-09-09 要求）
+## 10. conf 檔：不用每次指定環境變數（維護者 2026-09-09 要求，✅ 2026-09-10 實作）
 
 ### 10.1 在哪、長怎樣
 

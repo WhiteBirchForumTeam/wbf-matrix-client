@@ -8,7 +8,7 @@
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）；conf 的開關還沒做，目前寫死是開的 |
+> | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）。✅ 2026-09-10 補上 conf 的兩個開關（`SERVER_BACKUP`／`LOCAL_ROOM_KEYS`）與關掉時的警告 |
 > | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | ✅ §11 2026-09-09 做了（`account_dir`）、§12 2026-09-10 做了（`read_passphrase_file`）。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪，舊 `local.key` 解不開也直接刪 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
