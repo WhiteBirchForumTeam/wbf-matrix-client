@@ -10,8 +10,9 @@ use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::media_pool::MediaPool;
 use wbf_sdk::room_keys;
 
-use crate::accounts::{self, AccountDir, DataDirMap};
 use crate::conf::{Conf, Entry};
+use wbf_core::accounts::{self, AccountDir, DataDirMap};
+use wbf_core::Core;
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{
@@ -222,8 +223,11 @@ fn on_off(value: bool) -> String {
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
 pub struct Context {
     pub unlock: UnlockOptions,
-    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從這裡拿，不然 Argon2 跑兩次、ticket 寫兩次。
-    opened_vault: std::sync::OnceLock<Vault>,
+    /// 常駐狀態（architecture-v2 §7）。⚠️ 現在一個命令建一個、命令結束就丟；
+    /// daemon 接手之後它會活過整個程序，而這裡的程式碼不必改——這正是先做 `wbf-core` 的理由。
+    ///
+    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次、ticket 寫兩次。
+    core: Core,
     /// 這個命令用的帳號目錄，也只解析一次。
     account: std::sync::OnceLock<AccountDir>,
     pub account_override: Option<String>,
@@ -348,7 +352,7 @@ impl Context {
         .collect();
         Ok(Context {
             warned_about_backups: std::sync::OnceLock::new(),
-            opened_vault: std::sync::OnceLock::new(),
+            core: Core::open(&data_dir),
             account: std::sync::OnceLock::new(),
             account_override: cli
                 .account
@@ -429,41 +433,39 @@ impl Context {
             return Ok(account);
         }
         // 兩層目錄名都是加密的（local-cache-db.md §11），所以定位帳號一定要先解鎖。
-        let vault = self.vault()?;
-        let dir_key = vault.account_dir_key();
+        self.vault()?;
         let account = match &self.account_override {
-            Some(user) => accounts::find_account(
-                &self.unlock.data_dir,
-                vault,
-                user,
-                self.server_override.as_deref(),
-            )?,
-            None => {
-                let current = accounts::read_current(&self.unlock.data_dir)?.ok_or_else(|| {
-                    SdkError::Usage(format!(
-                        "no current account in {}; run `login` first (or pass --account)",
-                        self.unlock.data_dir.display()
-                    ))
-                })?;
-                accounts::find_account_of_current(&self.unlock.data_dir, &dir_key, &current)
-                    .ok_or_else(|| {
-                        SdkError::Usage(format!(
-                            "the current account has no readable directory in {}; run `login` again",
-                            self.unlock.data_dir.display()
-                        ))
-                    })?
-            }
+            Some(user) => self
+                .core
+                .find_account(user, self.server_override.as_deref())?,
+            // 🚫 訊息裡的「run `login`／pass --account」是 rpc-cli 的話，不是 core 的：
+            // core 不知道呼叫它的人有沒有命令列。
+            None => self.core.current_account().map_err(|error| {
+                SdkError::Usage(format!("{error}; run `login` first (or pass --account)"))
+            })?,
         };
         Ok(self.account.get_or_init(|| account))
     }
 
     /// 開一次、之後都拿同一個（唯讀）。要改鎖法的命令自己 `unlock.open_vault()` 拿可變的那份。
+    /// ⚠️ rpc-cli 這一側負責**把 passphrase 生出來**（旗標的檔、ticket、問終端），
+    /// 解鎖本身在 `Core`。daemon 那邊會換成 `core.unlock(RPC 進來的 bytes)`，
+    /// 而底下所有用 `vault()` 的程式碼一行都不必改。
     pub fn vault(&self) -> Result<&Vault, SdkError> {
-        if let Some(vault) = self.opened_vault.get() {
-            return Ok(vault);
+        if self.core.is_unlocked() {
+            return self.core.vault();
         }
-        let vault = self.unlock.open_vault()?;
-        Ok(self.opened_vault.get_or_init(|| vault))
+        Ok(self.core.adopt_unlocked_vault(self.unlock.open_vault()?))
+    }
+
+    /// 這個命令的常駐狀態，**保證已經解鎖**。
+    ///
+    /// ⚠️ 「怎麼拿到 passphrase」是 rpc-cli 這一側的責任（旗標的檔、ticket、問終端），
+    /// 所以每次交出 `Core` 之前先在這裡把它解開——這樣底下的程式碼不必各自記得。
+    /// daemon 那邊沒有這一步：解鎖是一次性的 RPC（`vault.unlock`），不是每個命令做一次。
+    pub fn core(&self) -> Result<&Core, SdkError> {
+        self.vault()?;
+        Ok(&self.core)
     }
 
     /// 這個 server 的 `cache.db`（local-cache-db.md §6，所有帳號共用）與「我是誰」（mxid，讀寫快取都要帶）。
@@ -662,14 +664,14 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
         AccountAction::Status => {
             // 目錄名是加密的（local-cache-db.md §11），所以列帳號要先解鎖——這跟 2026-09-09 之前不一樣。
             let vault = context.vault()?;
-            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, vault)?;
+            let map = context.core()?.refresh_data_dir_map()?;
             if let Some(hint) = map.find_undecryptable_layout_hint() {
                 context.progress(hint);
             }
             print_json(&serde_json::to_value(map.list_accounts(vault)?).expect("serializes"))
         }
         AccountAction::Switch { user } => {
-            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, context.vault()?)?;
+            let map = context.core()?.refresh_data_dir_map()?;
             let account = find_account_by_full_mxid(context, &map, &user)?;
             if !account.is_logged_in() {
                 context.progress(format!(
@@ -688,7 +690,7 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
             user,
             accept_history_loss,
         } => {
-            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, context.vault()?)?;
+            let map = context.core()?.refresh_data_dir_map()?;
             let account = find_account_by_full_mxid(context, &map, &user)?;
             let user = log_out_account(context, &account, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": user }))
@@ -783,20 +785,20 @@ fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), Sdk
     let vault = context.vault()?;
     match action {
         RecoveryAction::List => {
-            let users = crate::recovery::list_users(&context.unlock.data_dir, vault)?;
+            let users = context.core()?.list_recovery_key_users()?;
             print_json(&json!({ "users": users }))
         }
         RecoveryAction::Show { user } => {
             // 跟 `destroy` 走同一條：`list` 印得出 `@alice:localhost`，打 `@ALICE:LocalHost`
             // 卻說沒有，是同一個命令家族內的兩套規則（PR #21 審查 salvia🟢）。
-            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, vault)?;
+            let map = context.core()?.refresh_data_dir_map()?;
             let missing = || {
                 SdkError::Usage(format!(
                     "no recovery key is kept here for {user}; run `key-backup recovery` while logged in as them"
                 ))
             };
             let user_id = map.find_recovery_key_user_id(&user)?.ok_or_else(missing)?;
-            let key = crate::recovery::find(&context.unlock.data_dir, vault, user_id)?
+            let key = wbf_core::recovery::find(&context.unlock.data_dir, vault, user_id)?
                 .ok_or_else(missing)?;
             // 會印秘密的第二個命令（另一個是 `key-backup recovery`）。
             print_json(&json!({ "user": user_id, "recovery_key": key.as_str() }))
@@ -877,7 +879,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             // RecoveryState 是 Incomplete，server 上那份備份解不開。這條命令補上那一步
             // （2026-09-09 對真 server 驗證時發現的缺口）。
             let session = context.session().await?;
-            let key = crate::recovery::find(
+            let key = wbf_core::recovery::find(
                 &context.unlock.data_dir,
                 context.vault()?,
                 &session.user_id,
@@ -901,7 +903,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             // 封進 <data dir>/r/（🚫 不是帳號目錄——`logout` 會把那裡清光，
             // 而 recovery key 正是清完之後唯一回得去的路；維護者 2026-09-09）。
             let session = context.session().await?;
-            crate::recovery::save(
+            wbf_core::recovery::save(
                 &context.unlock.data_dir,
                 context.vault()?,
                 &session.user_id,
@@ -1055,7 +1057,7 @@ async fn refuse_if_history_would_be_lost(
             "its session could not be opened, so it is unknown which account this is",
         ));
     };
-    if crate::recovery::find(&context.unlock.data_dir, context.vault()?, &session.user_id)?
+    if wbf_core::recovery::find(&context.unlock.data_dir, context.vault()?, &session.user_id)?
         .is_some()
     {
         return Ok(());
@@ -1141,7 +1143,7 @@ async fn destroy_account_command(
 ) -> Result<(), SdkError> {
     // 維護者 2026-09-10：會刪檔的命令，路徑當場刷新一次再比對——帳號目錄與 recovery key
     // 都從**同一份**快照來，中間不再掃第二次（掃兩次就有兩個不同時刻的答案）。
-    let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, context.vault()?)?;
+    let map = context.core()?.refresh_data_dir_map()?;
     let account = find_account_by_full_mxid(context, &map, user)?;
     // 🚫 在 logout 之前先問：`del` 只認精確的 mxid，而使用者打的那串大小寫可能跟
     // 封存時用的權威 mxid 不同（PR #19 審查 rumia🟡1／salvia）。
@@ -1174,7 +1176,7 @@ async fn destroy_account_command(
     // 🚫 `logout`／`account del` 不做這件事——它們留著它正是為了讓歷史救得回來。
     // 這一步之後，server 上那份備份就永遠解不開了。
     if let Some(kept_user_id) = &kept_recovery_key_user_id {
-        crate::recovery::del(&context.unlock.data_dir, context.vault()?, kept_user_id)?;
+        wbf_core::recovery::del(&context.unlock.data_dir, context.vault()?, kept_user_id)?;
         context.progress(format!(
             "destroyed the recovery key kept here for {kept_user_id}; the server-side backup can no longer be opened"
         ));

@@ -2,6 +2,11 @@
 //!
 //! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼（只有 `login` 用）。
 //! passphrase 來源的優先順序：`--passphrase-file` → 有效的 `unlock.ticket` → `local.key` 是 `Plain` 就不用 passphrase → 問終端。
+//! ⚠️ 這整個模組是「**一個命令一個程序**」的產物：ticket、問終端、讀 passphrase 檔，
+//! 都是為了「每次執行都要重新解鎖」而存在。daemon 常駐之後（architecture-v2 §1、§4.5）
+//! **ticket 整條消失**，passphrase 改從 RPC 進來——所以 🚫 這些都沒有搬進 `wbf-core`。
+//! 這裡的責任是「把 passphrase 生出來」，解鎖本身交給 `Core`。
+//!
 //! ticket 仿 `sudo`：passphrase 解鎖成功後把主金鑰加 `expires_at` 寫到 `<data dir>/unlock.ticket`（0600），
 //! 期內的命令不再問；`lock` 刪掉它。⚠️ 那 15 分鐘的安全性等於 `Plain` 模式，維護者明說接受（CLI 不是產品面）。
 

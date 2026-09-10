@@ -1,12 +1,10 @@
 //! wbf-cli：介面照 `docs/design/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
 //! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
-//! 每個帳號的資料放哪在 `accounts.rs`。
+//! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §7）。
 
-mod accounts;
 mod commands;
 mod conf;
 mod recent;
-mod recovery;
 mod rooms;
 mod unlock;
 
