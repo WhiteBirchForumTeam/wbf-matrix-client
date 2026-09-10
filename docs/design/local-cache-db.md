@@ -8,8 +8,8 @@
 > | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）；conf 的開關還沒做，目前寫死是開的 |
-> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | ✅ §11 2026-09-09 做了（`account_dir`）；§12 還沒。跟第一個實作 PR（conf 加 `account` 一族）一起做。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪 |
+> | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）。✅ 2026-09-10 補上 conf 的兩個開關（`SERVER_BACKUP`／`LOCAL_ROOM_KEYS`）與關掉時的警告 |
+> | §11 路徑兩層都加密、§12 passphrase 是任意 bytes | ✅ §11 2026-09-09 做了（`account_dir`）、§12 2026-09-10 做了（`read_passphrase_file`）。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪，舊 `local.key` 解不開也直接刪 |
 > | §8 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 §8.1、§8.3 的「實作」段 |
 
 ## 0. 一句話
@@ -821,10 +821,14 @@ Windows 的 `MAX_PATH` 是 **260**，而加密把兩段目錄名從 19 字元（
 > 維護者的原話：passphrase 可以是任何字元、純二進位文檔，**不要擅自翻譯成純 ASCII**；
 > 可以是 UTF-8 的中文，可以是一個 mp3，可以是任何東西。最常見的用法才是一串字。
 
-### 12.1 現在是什麼樣（要改）
+### 12.1 改之前是什麼樣（✅ 2026-09-10 已改）
 
-`read_password_file` 用 `std::fs::read_to_string`（**要求整檔是合法 UTF-8**）再 `strip_suffix('\n')`
-（**吃掉結尾的換行**，`\r\n` 也吃）。所以現在：mp3 直接讀失敗，而結尾多一個 byte 的檔會導出不同的 KEK。
+`--passphrase-file` 原本跟 `--password-file` 共用 `read_password_file`：`std::fs::read_to_string`
+（**要求整檔是合法 UTF-8**）再 `strip_suffix`（**吃掉結尾的換行**，CRLF 也吃）。
+所以 mp3 直接讀失敗，而結尾多一個 byte 的檔會導出不同的 KEK。
+
+現在兩者分家：`read_passphrase_file`（原始 bytes）與 `read_password_file`（UTF-8、去尾換行），
+分岔的理由在 §12.4。
 
 ### 12.2 要變成什麼樣
 

@@ -11,6 +11,7 @@ use wbf_sdk::media_pool::MediaPool;
 use wbf_sdk::room_keys;
 
 use crate::accounts::{self, AccountDir, DataDirMap};
+use crate::conf::{Conf, Entry};
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{
@@ -21,8 +22,8 @@ use wbf_sdk::{
 use wbf_sdk::vault::write_private;
 
 use crate::unlock::{
-    default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_password_file,
-    UnlockOptions,
+    default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_passphrase_file,
+    read_password_file, UnlockOptions,
 };
 use crate::{AccountAction, Cli, Command, KeyBackupAction, LoginArgs, RecoveryAction, UploadArgs};
 
@@ -30,8 +31,17 @@ pub const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
 
 pub async fn run(cli: Cli) -> Result<(), SdkError> {
     let context = Context::from(&cli)?;
-    match cli.command {
-        Command::Login(args) => login_command(&context, &args).await,
+    let result = dispatch(&context, cli.command).await;
+    if result.is_ok() {
+        context.write_conf_if_asked_for()?;
+    }
+    result
+}
+
+/// ⚠️ 自動生成（§10.3）在**這裡之後**：三個條件之一是「這次命令成功結束」。
+async fn dispatch(context: &Context, command: Command) -> Result<(), SdkError> {
+    match command {
+        Command::Login(args) => login_command(context, &args).await,
         Command::Logout {
             accept_history_loss,
         } => {
@@ -41,12 +51,12 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
                 return print_json(&json!({ "ok": true }));
             }
             let account = context.account()?.clone();
-            let user = log_out_account(&context, &account, accept_history_loss).await?;
+            let user = log_out_account(context, &account, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": user }))
         }
-        Command::Account { action } => account_command(&context, action).await,
-        Command::KeyBackup { action } => key_backup_command(&context, action).await,
-        Command::Recovery { action } => recovery_command(&context, action),
+        Command::Account { action } => account_command(context, action).await,
+        Command::KeyBackup { action } => key_backup_command(context, action).await,
+        Command::Recovery { action } => recovery_command(context, action),
         Command::Lock => {
             let removed = context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "had_ticket": removed }))
@@ -56,7 +66,7 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         } => {
             let mut vault = context.unlock.open_vault()?;
             let passphrase = match new_passphrase_file {
-                Some(path) => read_password_file(&path)?,
+                Some(path) => read_passphrase_file(&path)?,
                 None => prompt_new_passphrase()?,
             };
             vault.set_unlock(&wbf_sdk::Unlock::Passphrase(passphrase))?;
@@ -86,9 +96,9 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         }
         Command::Upload(args) => {
             if args.stream {
-                upload_stream(&context, &args).await
+                upload_stream(context, &args).await
             } else {
-                upload_file(&context, &args).await
+                upload_file(context, &args).await
             }
         }
         Command::Status { upload_id } => {
@@ -106,33 +116,48 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             }
             print_json(&json!({ "ok": true }))
         }
-        Command::Info { mxc, manifest } => info_command(&context, &mxc, manifest.as_deref()).await,
+        Command::Info { mxc, manifest } => info_command(context, &mxc, manifest.as_deref()).await,
         Command::Download {
             manifest,
             out,
             no_cache,
-        } => download_command(&context, &manifest, out, no_cache).await,
-        Command::MediaStats => media_stats_command(&context).await,
+        } => download_command(context, &manifest, out, no_cache).await,
+        Command::MediaStats => media_stats_command(context).await,
         Command::MediaGc {
             quota_mib,
             protect_days,
-        } => media_gc_command(&context, quota_mib, protect_days).await,
-        Command::Seek { manifest, at, len } => seek_command(&context, &manifest, at, len).await,
-        Command::Rooms => crate::rooms::rooms_command(&context).await,
-        Command::Send(args) => crate::rooms::send_command(&context, &args).await,
-        Command::Watch(args) => crate::rooms::watch_command(&context, &args).await,
+        } => {
+            let mut warnings = Vec::new();
+            let quota_mib = quota_mib
+                .unwrap_or_else(|| context.conf.get_number("QUOTA_MIB", 2048, &mut warnings));
+            let protect_days = protect_days
+                .unwrap_or_else(|| context.conf.get_number("PROTECT_DAYS", 7, &mut warnings));
+            context.warn(&warnings);
+            media_gc_command(context, quota_mib, protect_days).await
+        }
+        Command::Seek { manifest, at, len } => seek_command(context, &manifest, at, len).await,
+        Command::Rooms => crate::rooms::rooms_command(context).await,
+        Command::Send(args) => crate::rooms::send_command(context, &args).await,
+        Command::Watch(args) => crate::rooms::watch_command(context, &args).await,
         Command::Recent {
             limit,
             window,
             batch,
             from_scratch,
         } => {
+            let mut warnings = Vec::new();
+            // ⚠️ conf 的鍵叫 MAX_EVENTS（跟 `RecentPlan` 的欄位同名），旗標叫 `--limit`。
+            let limit = limit
+                .unwrap_or_else(|| context.conf.get_number("MAX_EVENTS", 10_000, &mut warnings));
+            let window =
+                window.unwrap_or_else(|| context.conf.get_number("WINDOW", 320, &mut warnings));
+            context.warn(&warnings);
             let plan = wbf_sdk::RecentPlan {
                 max_events: (limit > 0).then_some(limit),
                 window,
                 batch,
             };
-            crate::recent::recent_command(&context, plan, from_scratch).await
+            crate::recent::recent_command(context, plan, from_scratch).await
         }
         Command::Read {
             room,
@@ -143,7 +168,7 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             from_cache,
         } => {
             crate::rooms::read_command(
-                &context,
+                context,
                 &room,
                 limit,
                 before.as_deref(),
@@ -161,7 +186,7 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             from_cache,
         } => {
             crate::rooms::files_command(
-                &context,
+                context,
                 &room,
                 limit,
                 before.as_deref(),
@@ -171,6 +196,27 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
             .await
         }
     }
+}
+
+/// `login` 要讀哪個 password 檔：旗標沒給就用 conf 的 `PASSWORD_FILE`（CLI 規格 §10.5）。
+///
+/// ⚠️ 存進 conf 的是**路徑**，秘密是那個檔的**內容**——它從來不進 conf，自動生成也不寫這個鍵。
+///
+/// Args:
+///     args: example: &LoginArgs { .. }
+///     conf: example: &context.conf
+/// Return:
+///     Some(PathBuf)  旗標給的，或 conf 寫的
+///     None           兩邊都沒有——從終端問
+fn find_password_file(args: &LoginArgs, conf: &Conf) -> Option<PathBuf> {
+    args.password_file
+        .clone()
+        .or_else(|| conf.find("PASSWORD_FILE").map(PathBuf::from))
+}
+
+/// 開關型的值寫回 conf 時長什麼樣（§10.4 只認得這兩個字）。
+fn on_off(value: bool) -> String {
+    if value { "on" } else { "off" }.to_string()
 }
 
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
@@ -185,28 +231,148 @@ pub struct Context {
     pub token_override: Option<String>,
     pub quiet: bool,
     pub transport: Transport,
+    /// 這次讀到的 conf（CLI 規格 §10）。命令自己的旗標沒給時從這裡拿預設。
+    pub conf: Conf,
+    /// `SERVER_BACKUP`：標準 Matrix key backup 開著嗎（local-cache-db §10.3）。
+    /// ⚠️ 認不得的值落到 `true`——壞掉要壞在「備份還開著」那一邊。
+    pub server_backup: bool,
+    /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 §10.4）。同樣落到 `true`。
+    pub local_room_keys: bool,
+    /// 這次實際生效的值，給自動生成用（§10.3）。🚫 裡面沒有秘密。
+    effective: Vec<crate::conf::Entry>,
+    /// `--data-dir`／`WBF_DATA_DIR` 有給嗎——自動生成的三個條件之一。
+    data_dir_was_given: bool,
+    /// 備份關掉的警告一個命令只印一次（`rooms::backend` 可能被叫不只一次）。
+    warned_about_backups: std::sync::OnceLock<()>,
 }
 
+/// conf 認得的鍵。⚠️ 加新鍵時要回來加一筆，不然它會被當成「認不得」印警告（§10.4）——
+/// 那是**警告**不是錯誤，所以漏掉只會吵，不會讓命令壞掉。
+const KNOWN_CONF_KEYS: &[&str] = &[
+    "SERVER",
+    "ACCOUNT",
+    "TRANSPORT",
+    "UNLOCK_TTL",
+    "PASSPHRASE_FILE",
+    "PASSWORD_FILE",
+    "SERVER_BACKUP",
+    "LOCAL_ROOM_KEYS",
+    "QUOTA_MIB",
+    "PROTECT_DAYS",
+    "MAX_EVENTS",
+    "WINDOW",
+];
+
 impl Context {
+    /// 優先序：**旗標 > 環境變數 > conf > 內建預設**（CLI 規格 §10.2），每個值各自比一次。
+    ///
+    /// 旗標與環境變數由 clap 合在一起處理（`env = "WBF_…"`），所以這裡看到 `None` 就是
+    /// 「兩者都沒給」——conf 接手。⚠️ 這也是那幾個旗標拿掉 clap 預設值的理由：留著預設值
+    /// 就永遠不是 `None`，conf 會被一個「使用者根本沒打」的值蓋掉。
     fn from(cli: &Cli) -> Result<Context, SdkError> {
+        // ⚠️ 資料目錄不能從 conf 來：conf 就在它裡面（§10.1）。
         let data_dir = match &cli.data_dir {
             Some(path) => path.clone(),
             None => default_data_dir()?,
         };
+        let conf = crate::conf::load(cli.config.as_deref(), &data_dir)?;
+        let mut warnings = conf.warnings().to_vec();
+        warnings.extend(conf.warn_about_unknown_keys(KNOWN_CONF_KEYS));
+        let server = cli
+            .server
+            .clone()
+            .or_else(|| conf.find("SERVER").map(str::to_string));
+        let server_backup = conf.is_on("SERVER_BACKUP", true, &mut warnings);
+        let local_room_keys = conf.is_on("LOCAL_ROOM_KEYS", true, &mut warnings);
+        let unlock_ttl = match cli.unlock_ttl {
+            Some(seconds) => seconds,
+            None => conf.get_number("UNLOCK_TTL", 900, &mut warnings),
+        };
+        let transport_name = cli
+            .transport
+            .clone()
+            .or_else(|| conf.find("TRANSPORT").map(str::to_string))
+            .unwrap_or_else(|| "ws".to_string());
+        let transport = Transport::from_name(&transport_name).ok_or_else(|| {
+            SdkError::Usage(format!(
+                "TRANSPORT={transport_name:?} is not `ws` or `http`"
+            ))
+        })?;
+        if !cli.quiet {
+            for warning in &warnings {
+                eprintln!("{warning}");
+            }
+        }
+        // 這次實際生效的值。🚫 不放 token、password、passphrase 的檔案路徑（§10.5）。
+        let effective = vec![
+            Entry {
+                section: "general",
+                key: "SERVER",
+                value: server.clone().unwrap_or_default(),
+                origin: crate::conf::origin_of(cli.server.is_some(), conf.find("SERVER").is_some()),
+            },
+            Entry {
+                section: "general",
+                key: "TRANSPORT",
+                value: transport_name.clone(),
+                origin: crate::conf::origin_of(
+                    cli.transport.is_some(),
+                    conf.find("TRANSPORT").is_some(),
+                ),
+            },
+            Entry {
+                section: "general",
+                key: "UNLOCK_TTL",
+                value: unlock_ttl.to_string(),
+                origin: crate::conf::origin_of(
+                    cli.unlock_ttl.is_some(),
+                    conf.find("UNLOCK_TTL").is_some(),
+                ),
+            },
+            Entry {
+                section: "backup",
+                key: "SERVER_BACKUP",
+                value: on_off(server_backup),
+                origin: crate::conf::origin_of(false, conf.find("SERVER_BACKUP").is_some()),
+            },
+            Entry {
+                section: "backup",
+                key: "LOCAL_ROOM_KEYS",
+                value: on_off(local_room_keys),
+                origin: crate::conf::origin_of(false, conf.find("LOCAL_ROOM_KEYS").is_some()),
+            },
+        ]
+        .into_iter()
+        // 沒有值的鍵不寫進去：`SERVER=` 讀回來是「沒寫」，寫它只是噪音。
+        .filter(|entry: &Entry| !entry.value.is_empty())
+        .collect();
         Ok(Context {
+            warned_about_backups: std::sync::OnceLock::new(),
             opened_vault: std::sync::OnceLock::new(),
             account: std::sync::OnceLock::new(),
-            account_override: cli.account.clone(),
+            account_override: cli
+                .account
+                .clone()
+                .or_else(|| conf.find("ACCOUNT").map(str::to_string)),
             unlock: UnlockOptions {
                 data_dir,
-                passphrase_file: cli.passphrase_file.clone(),
-                unlock_ttl: std::time::Duration::from_secs(cli.unlock_ttl),
+                passphrase_file: cli
+                    .passphrase_file
+                    .clone()
+                    .or_else(|| conf.find("PASSPHRASE_FILE").map(PathBuf::from)),
+                unlock_ttl: std::time::Duration::from_secs(unlock_ttl),
                 quiet: cli.quiet,
             },
-            server_override: cli.server.clone(),
+            server_override: server.clone(),
+            // 🚫 token 不從 conf 來（§10.5）：秘密不落地在明文檔裡。
             token_override: cli.token.clone(),
             quiet: cli.quiet,
-            transport: Transport::from_name(&cli.transport).expect("clap restricts the values"),
+            transport,
+            conf,
+            server_backup,
+            local_room_keys,
+            effective,
+            data_dir_was_given: cli.data_dir.is_some(),
         })
     }
 
@@ -354,6 +520,71 @@ impl Context {
             eprintln!("{line}");
         }
     }
+
+    /// 自動生成 `wbf.conf`（CLI 規格 §10.3）。三個條件都要成立，這裡管前兩個，
+    /// 第三個（命令成功）由呼叫點決定——它在 `dispatch` 的結果是 `Ok` 之後才叫。
+    ///
+    /// 🚫 已經存在的永遠不改寫，連補鍵都不做：那是使用者的檔，不是我們的狀態檔。
+    fn write_conf_if_asked_for(&self) -> Result<(), SdkError> {
+        if !self.data_dir_was_given {
+            return Ok(());
+        }
+        if crate::conf::write_if_absent(&self.unlock.data_dir, &self.effective)? {
+            self.progress(format!(
+                "wrote {} with the values this run used; edit it or delete it, it will not be rewritten",
+                self.unlock.data_dir.join(crate::conf::CONF_FILE_NAME).display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// 備份被關掉時，任何會拿到房間金鑰的命令印一次（CLI 規格 §3.6）。
+    ///
+    /// ⚠️ 一個命令只印一次：`rooms::backend` 在同一個命令裡可能被叫不只一次，
+    /// 而重複三次的警告等於沒有警告。
+    ///
+    /// 🚫 這不是「順便提醒」：關掉備份的後果是**歷史會消失**，而它是設定檔裡一行字造成的
+    /// ——那行字可能是幾個月前寫的，也可能是別人寫的。
+    pub fn warn_if_backups_are_off(&self) {
+        if self.server_backup && self.local_room_keys {
+            return;
+        }
+        if self.warned_about_backups.set(()).is_err() {
+            return;
+        }
+        let keys_live_here = || match self.account() {
+            Ok(account) => room_keys::snapshot_path(&account.dir)
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| "<account dir>/k/".to_string()),
+            Err(_) => "<account dir>/k/".to_string(),
+        };
+        match (self.server_backup, self.local_room_keys) {
+            (false, false) => self.progress(
+                "warning: both room key backups are disabled ([backup] in wbf.conf). If the crypto store is\n         \
+                 deleted or breaks, your history becomes unreadable - there is no copy anywhere."
+                    .into(),
+            ),
+            (false, true) => self.progress(format!(
+                "warning: server-side room key backup is off ([backup] SERVER_BACKUP=off in wbf.conf).\n         \
+                 Your room keys stay on this machine only:\n         {}",
+                keys_live_here()
+            )),
+            (true, false) => self.progress(
+                "warning: the local room key snapshot is off ([backup] LOCAL_ROOM_KEYS=off in wbf.conf);\n         \
+                 only the server-side backup is keeping your room keys."
+                    .into(),
+            ),
+            (true, true) => {}
+        }
+    }
+
+    /// conf 解析出來的警告（認不得的值、parse 不出來的數字）。`--quiet` 就不印。
+    pub fn warn(&self, warnings: &[String]) {
+        for warning in warnings {
+            self.progress(warning.clone());
+        }
+    }
 }
 
 /// `login`＝`account add`：登入、封 session、**自動切成 current** 並印一行 switch 提示（CLI 規格 §3.1.1）。
@@ -363,7 +594,13 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkErr
         .server_override
         .clone()
         .ok_or_else(|| SdkError::Usage("login needs --server (or WBF_SERVER)".into()))?;
-    let password = match args.password_file.as_deref() {
+    // conf 的 `PASSWORD_FILE` 補上旗標沒給的那格（CLI 規格 §10.5：它是**路徑**不是秘密，
+    // 手寫進 conf 正是維護者要的「不用每次指定」）。
+    // 🚫 它在 `KNOWN_CONF_KEYS` 裡卻沒人讀 = 使用者寫了一行、login 照樣問密碼、一句話都不說
+    //（PR #22 審查 rumia🔴1／salvia🟡1／cirno）——那正是這個檔在 `refuse_switched_off`
+    // 底下譴責的形狀。
+    let password_file = find_password_file(args, &context.conf);
+    let password = match password_file.as_deref() {
         Some(path) => read_password_file(path)?,
         None => prompt_password_on_terminal("password: ")?,
     };
@@ -378,6 +615,7 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkErr
         account.delete_matrix_store()?;
     }
     // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放帳號目錄的 m/。
+    context.warn_if_backups_are_off();
     let (_backend, session) = MatrixBackend::login(
         &server,
         user,
@@ -385,6 +623,7 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkErr
         device_name,
         &account.matrix_store_dir(),
         &vault.matrix_store_key(),
+        context.server_backup,
     )
     .await?;
     // server 回的 user_id 才是權威（大小寫、localpart 正規化可能跟 --user 打的不一樣）：目錄名對不上就搬過去。
@@ -573,6 +812,10 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             let status = backend.backup_status().await?;
             let snapshot = room_keys::get_snapshot_status(&context.account()?.dir);
             print_json(&json!({
+                // conf 的兩個開關也印出來：`uploading_locally` 說的是上游現在的狀態，
+                // 這兩個說的是「這台機器的設定叫它做什麼」，對不上時要看得出來（§10.4）。
+                "server_backup_setting": on_off(context.server_backup),
+                "local_room_keys_setting": on_off(context.local_room_keys),
                 "server_backup_exists": status.exists_on_server,
                 "uploading_locally": status.enabled_locally,
                 "recovery_enabled": status.recovery_enabled,
@@ -583,10 +826,22 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             }))
         }
         KeyBackupAction::Upload => {
+            if !context.server_backup {
+                return Err(refuse_switched_off("SERVER_BACKUP", "upload to the server"));
+            }
             context.progress("uploading room keys to the server backup...".into());
             backend.upload_room_keys().await?;
             // 順手把本地那份也更新：兩份備份的用途不同（§10.2），但沒有理由讓使用者記得跑兩個命令。
-            let bytes = save_room_key_snapshot(context, &backend).await?;
+            // ⚠️ 本地那份關掉時只跳過它，🚫 不讓整個 upload 失敗——使用者要的是 server 那份。
+            let bytes = match context.local_room_keys {
+                true => Some(save_room_key_snapshot(context, &backend).await?),
+                false => {
+                    context.progress(
+                        "LOCAL_ROOM_KEYS=off, so the local snapshot was not updated".into(),
+                    );
+                    None
+                }
+            };
             let status = backend.backup_status().await?;
             print_json(&json!({
                 "ok": true,
@@ -596,6 +851,13 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             }))
         }
         KeyBackupAction::Save => {
+            // 🚫 明說要存卻被設定關掉：拒絕並說是誰關的，不要假裝存了。
+            if !context.local_room_keys {
+                return Err(refuse_switched_off(
+                    "LOCAL_ROOM_KEYS",
+                    "write a local snapshot",
+                ));
+            }
             let bytes = save_room_key_snapshot(context, &backend).await?;
             print_json(&json!({ "ok": true, "bytes": bytes }))
         }
@@ -680,6 +942,21 @@ async fn save_room_key_snapshot(
         .await
 }
 
+/// 使用者明說要做的事，被 conf 的開關關掉了（§10.4）。
+///
+/// ⚠️ 🚫 不靜默跳過：命令是他打的，回一句「好了」卻什麼都沒做，比拒絕更糟。
+/// 訊息要說出**是哪個鍵**關的，不然他得自己翻檔案找。
+///
+/// Args:
+///     key: example: "LOCAL_ROOM_KEYS"
+///     what: example: "write a local snapshot"
+fn refuse_switched_off(key: &str, what: &str) -> SdkError {
+    SdkError::Usage(format!(
+        "{key}=off in the config file, so this command will not {what}; \
+         set {key}=on (or remove the line) to allow it"
+    ))
+}
+
 /// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（local-cache-db.md §10.7）。
 ///
 /// 🚫 不寫成「沒有 recovery key 才擋」：上游哪天多一種 `RecoveryState`，那種寫法會默默放行。
@@ -711,6 +988,7 @@ async fn find_backend_of(context: &Context, account: &AccountDir) -> Option<Matr
         &session,
         &account.matrix_store_dir(),
         &vault.matrix_store_key(),
+        context.server_backup,
     )
     .await
     .ok()?;
@@ -1327,6 +1605,210 @@ fn remove_if_exists(path: &Path) -> Result<(), SdkError> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod conf_precedence_tests {
+    //! 優先序（CLI 規格 §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次。
+    //!
+    //! 🚫 這裡不設環境變數：`std::env::set_var` 是行程全域的，跟同時跑的測試會互相汙染。
+    //! 環境變數那一格由 clap 負責（`env = "WBF_…"`），它把旗標與環境合成同一個 `Option`——
+    //! 所以這裡測得到的是「**沒給**就落到 conf、conf 沒有就落到內建預設」那兩格。
+
+    use super::*;
+
+    fn cli_with(data_dir: &std::path::Path) -> Cli {
+        Cli {
+            server: None,
+            token: None,
+            data_dir: Some(data_dir.to_path_buf()),
+            account: None,
+            config: None,
+            passphrase_file: None,
+            unlock_ttl: None,
+            json: false,
+            quiet: true,
+            transport: None,
+            command: Command::Whoami,
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wbf-prec-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn conf_fills_in_what_the_flags_did_not_give() {
+        let dir = scratch("conf");
+        std::fs::write(
+            dir.join(crate::conf::CONF_FILE_NAME),
+            "[general]\nSERVER=http://from-conf:6167\nACCOUNT=@alice:localhost\nUNLOCK_TTL=60\nTRANSPORT=http\n[backup]\nSERVER_BACKUP=off\n",
+        )
+        .unwrap();
+        let context = Context::from(&cli_with(&dir)).unwrap();
+        assert_eq!(
+            context.server_override.as_deref(),
+            Some("http://from-conf:6167")
+        );
+        assert_eq!(
+            context.account_override.as_deref(),
+            Some("@alice:localhost")
+        );
+        assert_eq!(
+            context.unlock.unlock_ttl,
+            std::time::Duration::from_secs(60)
+        );
+        assert!(!context.server_backup);
+        // 🚫 沒寫的鍵落到安全值，不是落到 false。
+        assert!(context.local_room_keys);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flag_beats_the_conf_file() {
+        let dir = scratch("flag");
+        std::fs::write(
+            dir.join(crate::conf::CONF_FILE_NAME),
+            "[general]\nSERVER=http://from-conf:6167\nUNLOCK_TTL=60\n",
+        )
+        .unwrap();
+        let mut cli = cli_with(&dir);
+        cli.server = Some("http://from-flag:6167".into());
+        cli.unlock_ttl = Some(5);
+        let context = Context::from(&cli).unwrap();
+        assert_eq!(
+            context.server_override.as_deref(),
+            Some("http://from-flag:6167")
+        );
+        assert_eq!(context.unlock.unlock_ttl, std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_conf_file_means_the_built_in_defaults() {
+        let dir = scratch("none");
+        let context = Context::from(&cli_with(&dir)).unwrap();
+        assert_eq!(context.server_override, None);
+        assert_eq!(
+            context.unlock.unlock_ttl,
+            std::time::Duration::from_secs(900)
+        );
+        // 兩個開關的安全值都是「開著」。
+        assert!(context.server_backup && context.local_room_keys);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn login_args(password_file: Option<&str>) -> LoginArgs {
+        LoginArgs {
+            user: "@alice:localhost".into(),
+            password_file: password_file.map(std::path::PathBuf::from),
+            device_name: "wbf-cli".into(),
+        }
+    }
+
+    #[test]
+    fn the_conf_file_supplies_the_password_file_path_when_the_flag_did_not() {
+        // ⚠️ 進 conf 的是**路徑**不是秘密（§10.5）——秘密是那個檔的內容，它從來不進 conf。
+        let dir = scratch("pwfile");
+        std::fs::write(
+            dir.join(crate::conf::CONF_FILE_NAME),
+            "[general]
+PASSWORD_FILE=/tmp/from-conf
+",
+        )
+        .unwrap();
+        let context = Context::from(&cli_with(&dir)).unwrap();
+
+        // 🚫 認得卻沒人讀 = 使用者寫了一行、login 照樣問密碼、一句話都不說
+        //（PR #22 審查 rumia🔴1）。這一條就是在釘「有人讀」。
+        assert_eq!(
+            find_password_file(&login_args(None), &context.conf),
+            Some(std::path::PathBuf::from("/tmp/from-conf"))
+        );
+        // 旗標照樣蓋過 conf。
+        assert_eq!(
+            find_password_file(&login_args(Some("/tmp/from-flag")), &context.conf),
+            Some(std::path::PathBuf::from("/tmp/from-flag"))
+        );
+        // 兩邊都沒有就是 None（呼叫端會去問終端）。
+        let empty = Context::from(&cli_with(&scratch("pwfile-empty"))).unwrap();
+        assert_eq!(find_password_file(&login_args(None), &empty.conf), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_secret_in_the_conf_file_is_not_used() {
+        let dir = scratch("secret");
+        std::fs::write(
+            dir.join(crate::conf::CONF_FILE_NAME),
+            "[general]\nACCESS_TOKEN=syt_nope\n",
+        )
+        .unwrap();
+        let context = Context::from(&cli_with(&dir)).unwrap();
+        assert_eq!(
+            context.token_override, None,
+            "🚫 token 不從 conf 來（§10.5）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generating_writes_what_this_run_used_and_reads_back_the_same() {
+        let dir = scratch("gen");
+        let mut cli = cli_with(&dir);
+        cli.server = Some("http://from-flag:6167".into());
+        let context = Context::from(&cli).unwrap();
+        context.write_conf_if_asked_for().unwrap();
+
+        let written = std::fs::read_to_string(dir.join(crate::conf::CONF_FILE_NAME)).unwrap();
+        assert!(
+            written.contains("SERVER=http://from-flag:6167"),
+            "{written}"
+        );
+        assert!(written.contains("; flag or env"), "{written}");
+        assert!(written.contains("SERVER_BACKUP=on"), "{written}");
+        // 🚫 秘密與「秘密在哪」的路徑都不寫（§10.5）。
+        assert!(!written.contains("ACCESS_TOKEN") && !written.contains("PASSPHRASE_FILE"));
+
+        // 讀回來就是同一組值。
+        let again = Context::from(&cli_with(&dir)).unwrap();
+        assert_eq!(
+            again.server_override.as_deref(),
+            Some("http://from-flag:6167")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_conf_is_never_rewritten() {
+        let dir = scratch("keep");
+        let path = dir.join(crate::conf::CONF_FILE_NAME);
+        std::fs::write(&path, "[general]\nSERVER=http://mine:6167\n").unwrap();
+        let context = Context::from(&cli_with(&dir)).unwrap();
+        context.write_conf_if_asked_for().unwrap();
+        // 使用者的檔，一個 byte 都不動——連補鍵都不做。
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[general]\nSERVER=http://mine:6167\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_generated_without_an_explicit_data_dir() {
+        let dir = scratch("nodatadir");
+        let mut cli = cli_with(&dir);
+        // 三個條件之一：`--data-dir`／`WBF_DATA_DIR` 有給。裝成沒給。
+        cli.data_dir = None;
+        let mut context = Context::from(&cli_with(&dir)).unwrap();
+        context.data_dir_was_given = false;
+        context.write_conf_if_asked_for().unwrap();
+        assert!(!dir.join(crate::conf::CONF_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

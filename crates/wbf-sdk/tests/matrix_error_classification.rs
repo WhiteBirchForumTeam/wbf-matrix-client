@@ -48,6 +48,7 @@ async fn wrong_password_is_a_server_error_with_errcode() {
         "test",
         &store,
         &wbf_sdk::Key32([1u8; 32]),
+        true,
     )
     .await;
     let _ = std::fs::remove_dir_all(&store);

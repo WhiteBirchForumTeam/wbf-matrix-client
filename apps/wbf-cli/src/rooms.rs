@@ -26,10 +26,12 @@ pub(crate) async fn backend(context: &Context) -> Result<MatrixBackend, SdkError
             "this session has no matrix store (logged in with an older wbf-cli or --token); run `login` again".into(),
         ));
     }
+    context.warn_if_backups_are_off();
     let backend = MatrixBackend::restore(
         &session,
         &context.account()?.matrix_store_dir(),
         &context.vault()?.matrix_store_key(),
+        context.server_backup,
     )
     .await?;
     backend.sync_once(None, Duration::ZERO).await?;

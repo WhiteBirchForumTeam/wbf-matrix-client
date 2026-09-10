@@ -40,7 +40,7 @@ crates/wbf-sdk/src/
   media.rs               fetch／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
   event_json.rs          原始 Matrix 事件 JSON → Message；matrix backend 與 recent 共用，不掛 feature
   backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
-apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（passphrase 來源、unlock ticket）、accounts.rs（每個帳號的資料放哪、current、--account 解析）、recovery.rs（`r/` 的 recovery key 保管，logout 不碰它）、commands.rs（第 2 步命令、Context）、rooms.rs（第 3 步命令、寫穿快取）、recent.rs（Event/Recent 進料）
+apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（passphrase 來源、unlock ticket）、accounts.rs（每個帳號的資料放哪、current、--account 解析）、conf.rs（wbf.conf 的解析與自動生成）、recovery.rs（`r/` 的 recovery key 保管，logout 不碰它）、commands.rs（第 2 步命令、Context）、rooms.rs（第 3 步命令、寫穿快取）、recent.rs（Event/Recent 進料）
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
 ```
@@ -101,9 +101,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 
 還沒做的：
 
-0. **房間金鑰備份與周邊**（維護者 2026-09-09 提）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10。
+0. ✅ **房間金鑰備份與周邊**（維護者 2026-09-09 提；2026-09-10 全部做完）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10。
    ✅ **PR #19 合併了大半**：兩層路徑加密、`account` 一族、CLI 輸出英文、金鑰備份（server 端 backup、本地全量快照、`key-backup` 六個子命令（status／upload／save／import／restore／recovery）、`logout` 的兩關閘門、`r/` 獨立保管與 `recovery list`／`show`）。
-   ⚠️ **還沒做的**（這一項要收掉就剩這兩塊）：conf 檔（CLI 規格 §10）、passphrase 改吃原始 bytes（local-cache-db §12）。
+   ✅ **2026-09-10 收掉了剩下兩塊**：`wbf.conf`（CLI 規格 §10：解析、旗標 > 環境 > conf > 預設、自動生成、`SERVER_BACKUP`／`LOCAL_ROOM_KEYS` 兩個開關）、passphrase 吃原始 bytes（local-cache-db §12）。**這一項到此關掉。**
    ⚠️ PR #19 是 **breaking 的**：舊的 data dir（明文目錄名）一律**砍掉重來，🚫 不寫遷移**。本機測試環境要重新 `login`。
    ✅ **2026-09-09 對真 server 跑過全流**（步驟見 §4 的 9b），含 principal 修正的迴歸（current=alice 刪 bob 時看的是 bob 的狀態）。
    ✅ **Windows MAX_PATH 已解**：nonce 縮到 12 byte、目錄名縮成 `s`／`a`／`m`／`k`／`r`，最長路徑 230 → 184、餘裕 20 → 76；路徑太長時的錯誤訊息也不再誤導成「it was made with another key file」。前後對照與教訓在 local-cache-db §11.4.1。

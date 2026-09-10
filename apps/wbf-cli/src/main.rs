@@ -4,6 +4,7 @@
 
 mod accounts;
 mod commands;
+mod conf;
 mod recent;
 mod recovery;
 mod rooms;
@@ -31,21 +32,24 @@ pub struct Cli {
     /// 用哪個帳號（mxid 或 localpart）；沒給就是最後一次 login 的那個。同名 localpart 在多個 server 時要配 --server
     #[arg(long, global = true, env = "WBF_ACCOUNT")]
     pub account: Option<String>,
+    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（CLI 規格 §10.1）
+    #[arg(long, global = true, env = "WBF_CONFIG")]
+    pub config: Option<PathBuf>,
     /// 整檔就是 passphrase（解 local.key 的那句話，不是 Matrix 帳號密碼）；沒給就看 unlock ticket，再沒有就從終端讀
     #[arg(long, global = true, env = "WBF_PASSPHRASE_FILE")]
     pub passphrase_file: Option<PathBuf>,
-    /// passphrase 解鎖成功後 unlock ticket 的有效秒數；0 就不寫 ticket
-    #[arg(long, global = true, default_value_t = 900)]
-    pub unlock_ttl: u64,
+    /// passphrase 解鎖成功後 unlock ticket 的有效秒數；0 就不寫 ticket。預設 900，可用 conf 的 UNLOCK_TTL 改
+    #[arg(long, global = true)]
+    pub unlock_ttl: Option<u64>,
     /// stdout 只印 JSON（預設就是；現在是刻意的 no-op，留著是為了之後加人類可讀模式時介面不變，CLI 規格 §2）
     #[arg(long, global = true)]
     pub json: bool,
     /// stderr 不印進度
     #[arg(long, global = true)]
     pub quiet: bool,
-    /// ws（預設）或 http
-    #[arg(long, global = true, default_value = "ws", value_parser = ["ws", "http"])]
-    pub transport: String,
+    /// ws（預設）或 http；可用 conf 的 TRANSPORT 改
+    #[arg(long, global = true, value_parser = ["ws", "http"])]
+    pub transport: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -196,12 +200,12 @@ pub enum Command {
     MediaStats,
     /// 媒體快取清理：超過配額就從最久沒用的刪，保護期內不刪（local-cache-db §8.5）；順便掃孤兒
     MediaGc {
-        /// 配額，MiB；預設 2048
-        #[arg(long, default_value_t = 2048)]
-        quota_mib: u64,
-        /// 保護期，天；預設 7
-        #[arg(long, default_value_t = 7)]
-        protect_days: u64,
+        /// 配額，MiB；預設 2048，可用 conf 的 QUOTA_MIB 改
+        #[arg(long)]
+        quota_mib: Option<u64>,
+        /// 保護期，天；預設 7，可用 conf 的 PROTECT_DAYS 改
+        #[arg(long)]
+        protect_days: Option<u64>,
     },
     /// 只讀含 --at 的那一塊，明文寫到 stdout（CLI 規格 §3.3.1）
     Seek {
@@ -220,12 +224,12 @@ pub enum Command {
     Watch(WatchArgs),
     /// Event/Recent：把 cache.db 水位線之後的事件跨房間拉回來寫進快取，直到追平或湊滿 --limit（CLI 規格 §3.5）
     Recent {
-        /// 這一輪總共最多幾則（上層要的數量）；0 = 拉到追平為止
-        #[arg(long, default_value_t = 10000)]
-        limit: u64,
-        /// 底層一次 Recent 要一窗幾則；server 上限 500（Hello 會說），超過先 clamp
-        #[arg(long, default_value_t = 320)]
-        window: u32,
+        /// 這一輪總共最多幾則（上層要的數量）；0 = 拉到追平為止。預設 10000，可用 conf 的 MAX_EVENTS 改
+        #[arg(long)]
+        limit: Option<u64>,
+        /// 底層一次 Recent 要一窗幾則；server 上限 500（Hello 會說），超過先 clamp。預設 320，可用 conf 的 WINDOW 改
+        #[arg(long)]
+        window: Option<u32>,
         /// 每個 Batch 幾則；沒給用 server 預設（10），上限 100
         #[arg(long)]
         batch: Option<u32>,
