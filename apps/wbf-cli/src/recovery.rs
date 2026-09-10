@@ -55,64 +55,46 @@ pub fn path_of(data_dir: &Path, vault: &Vault, user_id: &str) -> Result<PathBuf,
     Ok(dir(data_dir).join(name))
 }
 
-/// 這台機器保管著誰的 recovery key（`recovery list`）。
+/// 掃 `<data dir>/r/`，回「明文的 mxid → 磁碟上那個（加密的）檔名」。
 ///
-/// 掃 `<data dir>/r/` 解密**檔名**——🚫 不開檔、不解內容：列清單不需要看到金鑰本身。
-/// 解不開的檔一律跳過（別把 `local.key` 建的，fail closed）。
+/// 🚫 不開檔、不解內容：這一層只需要看得懂檔名。解不開的檔一律跳過（別把 `local.key`
+/// 建的，fail closed）。⚠️ 這是**當下**的磁碟狀態，不是快取——見 `accounts::refresh_data_dir_map`。
 ///
 /// Return:
-///     Ok(Vec<String>)   完整 mxid，排序過；一個都沒有就是空的
-pub fn list_users(data_dir: &Path, vault: &Vault) -> Result<Vec<String>, SdkError> {
+///     Ok(Vec<(String, String)>)   (完整 mxid, 檔名)；一個都沒有就是空的
+pub fn list_kept(data_dir: &Path, vault: &Vault) -> Result<Vec<(String, String)>, SdkError> {
     let key = vault.account_dir_key();
-    let mut users = Vec::new();
+    let mut kept = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir(data_dir)) else {
-        return Ok(users);
+        return Ok(kept);
     };
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(plaintext) = find_dir_name_plaintext(&key, DirScope::Recovery, &name) else {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(plaintext) = find_dir_name_plaintext(&key, DirScope::Recovery, &file_name) else {
             continue;
         };
         if let Some(user_id) = plaintext.strip_prefix(NAME_PREFIX) {
-            users.push(user_id.to_string());
+            kept.push((user_id.to_string(), file_name));
         }
     }
-    users.sort();
-    Ok(users)
+    Ok(kept)
 }
 
-/// 這台機器保管的哪一個 mxid，對應到使用者打的這串。
+/// 這台機器保管著誰的 recovery key（`recovery list`）。
 ///
-/// 封存時用的是 server 的權威 mxid，而使用者可能打成 `@BOB:Matrix.org`——檔名是那串明文
-/// 加密出來的，大小寫差一個字就算出另一個名字，於是刪不到（PR #19 審查 rumia🟡1／salvia）。
-/// 所以先試精確的，再拿 `r/` 裡的清單做大小寫不敏感的比對。
-/// ⚠️ 對到兩個以上就回 None——寧可說「沒有」，也不要刪掉另一個人的。
-///
-/// Args:
-///     user_id: 使用者打的 mxid, example: "@BOB:matrix.org"
 /// Return:
-///     Ok(Some(String))  這台機器實際保管的那串, example: "@bob:matrix.org"
-///     Ok(None)          沒保管、或對到不只一個
-pub fn find_kept_user_id(
-    data_dir: &Path,
-    vault: &Vault,
-    user_id: &str,
-) -> Result<Option<String>, SdkError> {
-    let kept = list_users(data_dir, vault)?;
-    if kept.iter().any(|one| one == user_id) {
-        return Ok(Some(user_id.to_string()));
-    }
-    let mut matches = kept
+///     Ok(Vec<String>)   完整 mxid，排序過；一個都沒有就是空的
+pub fn list_users(data_dir: &Path, vault: &Vault) -> Result<Vec<String>, SdkError> {
+    let mut users: Vec<String> = list_kept(data_dir, vault)?
         .into_iter()
-        .filter(|one| one.eq_ignore_ascii_case(user_id));
-    match (matches.next(), matches.next()) {
-        (Some(only), None) => Ok(Some(only)),
-        _ => Ok(None),
-    }
+        .map(|(user_id, _)| user_id)
+        .collect();
+    users.sort();
+    Ok(users)
 }
 
 /// 把 recovery key 封進來（`key-backup recovery` 產生之後）。
@@ -149,7 +131,7 @@ pub fn find(
 /// 🚫 `logout`／`account del` 不准叫這個——它們留著 recovery key 正是為了讓歷史救得回來。
 ///
 /// ⚠️ 只認**精確**的 mxid（檔名是它加密出來的）。使用者打的字串要先過
-/// [`find_kept_user_id`]。
+/// `accounts::DataDirMap::find_recovery_key_user_id`。
 ///
 /// Return:
 ///     Ok(true)    刪掉了
@@ -227,29 +209,6 @@ mod tests {
             "{name}"
         );
         assert!(name.contains('_'), "應該是 <b58 nonce>_<b58 密文>：{name}");
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
-
-    #[test]
-    fn a_differently_cased_mxid_still_finds_the_kept_one() {
-        let (data_dir, vault) = scratch("casing");
-        save(&data_dir, &vault, "@alice:localhost", "EsTc 1234").unwrap();
-
-        // 精確的那串本來就找得到。
-        assert_eq!(
-            find_kept_user_id(&data_dir, &vault, "@alice:localhost").unwrap(),
-            Some("@alice:localhost".to_string())
-        );
-        // 使用者打成大寫也要對上——不然 `account destroy` 會宣稱「什麼都不留」卻留著。
-        assert_eq!(
-            find_kept_user_id(&data_dir, &vault, "@ALICE:LocalHost").unwrap(),
-            Some("@alice:localhost".to_string())
-        );
-        // 沒保管的就是沒有，🚫 不要挑一個最像的給它。
-        assert_eq!(
-            find_kept_user_id(&data_dir, &vault, "@bob:localhost").unwrap(),
-            None
-        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

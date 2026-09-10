@@ -16,9 +16,17 @@
 //! 中間那幾段（`s`／`a`／`m`）短到只剩一個字母，理由是 Windows 的 MAX_PATH——見 `SERVERS_DIR_NAME`。
 //! 明文的 server URL 與 mxid 仍然在 `session.sealed` 裡，不從目錄名反推。
 //!
-//! 路徑映射刻意**沒有**全域的可變 map（維護者 2026-09-09 說「全局變數 map，或寫成 function」，
-//! 這裡選後者）：加密是確定性的，所以定位單一帳號用 `AccountDir::locate` 直接算得出來；
-//! 只有「列出全部」才需要掃描，而掃描的結果就是 `list_accounts` 的回傳值，不必存成狀態。
+//! 路徑映射有兩條路，用途不同（維護者 2026-09-10 定）：
+//!
+//! | 手上有什麼 | 用哪個 |
+//! |---|---|
+//! | **確定就是這個明文**（剛登入、`current` 解出來的） | `AccountDir::locate`：加密是確定性的，直接算，不碰磁碟 |
+//! | **使用者打的字串**（`account del @BOB:…`） | `refresh_data_dir_map` 當場掃一次，再從 map 比對 |
+//!
+//! 第二條路不能用算的：`@BOB:matrix.org` 加密出來的名字跟 `@bob:matrix.org` 完全不同，
+//! 而大小寫不敏感的比對**沒有算式**，只能拿現場有什麼來比。所以會刪檔的命令一律是
+//! 「**當場**刷新 → 解密 → 建 map → 比對」，🚫 不留成長命的全域狀態——存起來的那一份
+//! 不會知道中間有東西被刪掉，而它決定的是刪哪個目錄。
 
 use std::path::{Path, PathBuf};
 
@@ -141,92 +149,280 @@ pub struct AccountSummary {
     pub current: bool,
 }
 
-/// 掃 `s/*/a/*` **兩層**，逐一解密目錄名（local-cache-db.md §11.5）。
+/// 資料目錄現在有什麼：明文 → 磁碟上那個（加密的）名字。
 ///
-/// 解不開的目錄一律跳過（fail closed）：可能是別把 `local.key` 建的，也可能是舊版留下的明文佈局。
+/// ⚠️ **快照，不是快取**：`refresh_data_dir_map` 那一刻的磁碟狀態。要用就當場刷新一次。
+pub struct DataDirMap {
+    data_dir: PathBuf,
+    servers: Vec<ServerEntry>,
+    /// 完整 mxid → `r/` 底下那個檔名（`recovery::list_kept`）。
+    recovery_keys: Vec<Mapping>,
+}
+
+/// 一段名字：明文，與它在磁碟上加密後的樣子。
+struct Mapping {
+    plaintext: String,
+    dir_name: String,
+}
+
+struct ServerEntry {
+    /// 明文是正規化過的 server host, example: "localhost:6167"
+    server: Mapping,
+    /// 明文是 localpart, example: "alice"
+    accounts: Vec<Mapping>,
+}
+
+/// 掃 `s/*/a/*` 兩層與 `r/`，解密每一段名字，做成 map（local-cache-db.md §11.5）。
+///
+/// 解不開的一律跳過（fail closed）：可能是別把 `local.key` 建的，也可能是舊版留下的明文佈局。
 /// 🚫 不猜、🚫 不刪、🚫 不報錯——當它不存在。
 ///
 /// Args:
 ///     data_dir: example: "<data dir>"
-///     vault: 導目錄金鑰、也用來解 session 拿權威 mxid, example: context.vault()?
+///     vault: example: context.vault()?
 /// Return:
-///     Ok(Vec<AccountSummary>)   照 server、localpart 排序；一個都沒有就是空的
-pub fn list_accounts(data_dir: &Path, vault: &Vault) -> Result<Vec<AccountSummary>, SdkError> {
-    let key = &vault.account_dir_key();
-    let current = read_current(data_dir)?;
-    let mut summaries = Vec::new();
-    let Ok(server_entries) = std::fs::read_dir(data_dir.join(SERVERS_DIR_NAME)) else {
-        return Ok(summaries);
+///     Ok(DataDirMap)   解得開的都在裡面；一個都解不開就是空的
+pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap, SdkError> {
+    let key = vault.account_dir_key();
+    let mut map = DataDirMap {
+        data_dir: data_dir.to_path_buf(),
+        servers: Vec::new(),
+        recovery_keys: Vec::new(),
     };
-    for server_entry in server_entries {
-        let server_entry = server_entry?;
-        let server_dir_name = server_entry.file_name().to_string_lossy().into_owned();
-        let Some(server_host) = find_dir_name_plaintext(key, DirScope::Server, &server_dir_name)
-        else {
-            continue;
-        };
-        let scope = DirScope::Account {
-            server_host: &server_host,
-        };
-        let Ok(account_entries) = std::fs::read_dir(server_entry.path().join(ACCOUNTS_DIR_NAME))
-        else {
-            continue;
-        };
-        for account_entry in account_entries {
-            let account_entry = account_entry?;
-            if !account_entry.file_type()?.is_dir() {
+    if let Ok(server_entries) = std::fs::read_dir(data_dir.join(SERVERS_DIR_NAME)) {
+        for server_entry in server_entries {
+            let server_entry = server_entry?;
+            if !server_entry.file_type()?.is_dir() {
                 continue;
             }
-            let account_dir_name = account_entry.file_name().to_string_lossy().into_owned();
-            let Some(localpart) = find_dir_name_plaintext(key, scope, &account_dir_name) else {
+            let server_dir_name = server_entry.file_name().to_string_lossy().into_owned();
+            let Some(server_host) =
+                find_dir_name_plaintext(&key, DirScope::Server, &server_dir_name)
+            else {
                 continue;
             };
-            let session_path = account_entry.path().join(SEALED_SESSION_FILE_NAME);
-            summaries.push(AccountSummary {
-                // 解不開的 session 不擋掉整份清單：那個帳號就當登出的看待（fail closed）。
-                user_id: vault
-                    .unseal_session(&session_path)
-                    .ok()
-                    .flatten()
-                    .map(|session| session.user_id),
-                logged_in: session_path.exists(),
-                current: current.as_deref()
-                    == Some(format!("{server_dir_name}/{account_dir_name}").as_str()),
-                server: server_host.clone(),
-                localpart,
+            map.add_server(server_host.clone(), server_dir_name);
+            // localpart 的密文綁著它上面那層的 host 明文（§11.2），所以 scope 要帶進去。
+            let scope = DirScope::Account {
+                server_host: &server_host,
+            };
+            let Ok(account_entries) =
+                std::fs::read_dir(server_entry.path().join(ACCOUNTS_DIR_NAME))
+            else {
+                continue;
+            };
+            for account_entry in account_entries {
+                let account_entry = account_entry?;
+                if !account_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let account_dir_name = account_entry.file_name().to_string_lossy().into_owned();
+                let Some(localpart) = find_dir_name_plaintext(&key, scope, &account_dir_name)
+                else {
+                    continue;
+                };
+                map.add_account(&server_host, localpart, account_dir_name);
+            }
+        }
+    }
+    for (user_id, file_name) in crate::recovery::list_kept(data_dir, vault)? {
+        map.add_recovery_key(user_id, file_name);
+    }
+    Ok(map)
+}
+
+impl DataDirMap {
+    fn add_server(&mut self, server_host: String, dir_name: String) {
+        self.servers.push(ServerEntry {
+            server: Mapping {
+                plaintext: server_host,
+                dir_name,
+            },
+            accounts: Vec::new(),
+        });
+    }
+
+    /// ⚠️ `server_host` 要是 `add_server` 進來過的那個明文——它就是上一層掃出來的，所以對得上。
+    fn add_account(&mut self, server_host: &str, localpart: String, dir_name: String) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|entry| entry.server.plaintext == server_host)
+        {
+            entry.accounts.push(Mapping {
+                plaintext: localpart,
+                dir_name,
             });
         }
     }
-    summaries.sort_by(|left, right| {
-        left.server
-            .cmp(&right.server)
-            .then(left.localpart.cmp(&right.localpart))
-    });
-    Ok(summaries)
+
+    fn add_recovery_key(&mut self, user_id: String, file_name: String) {
+        self.recovery_keys.push(Mapping {
+            plaintext: user_id,
+            dir_name: file_name,
+        });
+    }
+
+    /// 使用者打的那串 → 帳號目錄。`server` 沒給就掃所有 server 找同名 localpart。
+    ///
+    /// Args:
+    ///     user: mxid 或 localpart, example: "@BOB:matrix.org"
+    ///     server: example: Some("http://localhost:6167")
+    /// Return:
+    ///     Ok(AccountDir)
+    ///     Err(Usage)   找不到；或多個 server 都有這個 localpart 而 `server` 沒給
+    pub fn find_account_dir(
+        &self,
+        user: &str,
+        server: Option<&str>,
+    ) -> Result<AccountDir, SdkError> {
+        let localpart = localpart_of(user);
+        let servers: Vec<&ServerEntry> = match server {
+            Some(server) => find_one(
+                &self.servers,
+                |entry| &entry.server.plaintext,
+                &server_host_of(server),
+            )
+            .into_iter()
+            .collect(),
+            None => self.servers.iter().collect(),
+        };
+        let matches: Vec<(&ServerEntry, &Mapping)> = servers
+            .into_iter()
+            .filter_map(|entry| {
+                find_one(&entry.accounts, |account| &account.plaintext, localpart)
+                    .map(|account| (entry, account))
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Err(SdkError::Usage(format!(
+                "no account {user}{} in {}; run `login` first",
+                server
+                    .map(|server| format!(" on {server}"))
+                    .unwrap_or_default(),
+                self.data_dir.display()
+            ))),
+            [(entry, account)] => Ok(self.account_dir_of(entry, account)),
+            many => Err(SdkError::Usage(format!(
+                "{user} exists on {} servers ({}); pass --server too",
+                many.len(),
+                many.iter()
+                    .map(|(entry, _)| entry.server.plaintext.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// 使用者打的那串 → 這台機器**實際保管**的那個 mxid（`account destroy` 用）。
+    ///
+    /// 封存時用的是 server 的權威 mxid，而使用者可能打成 `@BOB:Matrix.org`——檔名是那串明文
+    /// 加密出來的，大小寫差一個字就算出另一個名字，於是刪不到（PR #19 審查 rumia🟡1／salvia）。
+    ///
+    /// Args:
+    ///     user_id: 使用者打的 mxid, example: "@BOB:matrix.org"
+    /// Return:
+    ///     Some(&str)   這台機器實際保管的那串, example: "@bob:matrix.org"
+    ///     None         沒保管、或大小寫對到不只一個
+    pub fn find_recovery_key_user_id(&self, user_id: &str) -> Option<&str> {
+        find_one(&self.recovery_keys, |entry| &entry.plaintext, user_id)
+            .map(|entry| entry.plaintext.as_str())
+    }
+
+    /// 這台機器上的每個帳號（`account status`）。
+    ///
+    /// 🚫 目錄名解出來的只有 localpart 與 host，組不出可靠的 mxid——權威的那串在
+    /// `session.sealed` 裡，所以這裡才需要 `vault`。
+    ///
+    /// Return:
+    ///     Ok(Vec<AccountSummary>)   照 server、localpart 排序；一個都沒有就是空的
+    pub fn list_accounts(&self, vault: &Vault) -> Result<Vec<AccountSummary>, SdkError> {
+        let current = read_current(&self.data_dir)?;
+        let current = current.as_deref();
+        let mut summaries: Vec<AccountSummary> = self
+            .servers
+            .iter()
+            .flat_map(|server| {
+                server.accounts.iter().map(move |account| {
+                    let dir = self.account_dir_of(server, account);
+                    AccountSummary {
+                        // 解不開的 session 不擋掉整份清單：那個帳號就當登出的看待（fail closed）。
+                        user_id: vault
+                            .unseal_session(&dir.session_path())
+                            .ok()
+                            .flatten()
+                            .map(|session| session.user_id),
+                        logged_in: dir.is_logged_in(),
+                        current: current == Some(dir.key().as_str()),
+                        server: dir.server_host,
+                        localpart: dir.localpart,
+                    }
+                })
+            })
+            .collect();
+        summaries.sort_by(|left, right| {
+            left.server
+                .cmp(&right.server)
+                .then(left.localpart.cmp(&right.localpart))
+        });
+        Ok(summaries)
+    }
+
+    /// `s/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
+    /// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（local-cache-db.md §11.7）。
+    ///
+    /// Return:
+    ///     Some(String)   該印的那一行
+    ///     None           沒有 `s/`、或至少解得開一個
+    pub fn find_undecryptable_layout_hint(&self) -> Option<String> {
+        if !self.servers.is_empty() {
+            return None;
+        }
+        let servers = self.data_dir.join(SERVERS_DIR_NAME);
+        let any_entry = std::fs::read_dir(&servers).ok()?.flatten().next().is_some();
+        any_entry.then(|| {
+            format!(
+                "warning: no directory in {} could be decrypted with this local.key; if this data dir was made by an older build, delete it and run `login` again",
+                servers.display()
+            )
+        })
+    }
+
+    fn account_dir_of(&self, server: &ServerEntry, account: &Mapping) -> AccountDir {
+        AccountDir {
+            dir: self
+                .data_dir
+                .join(SERVERS_DIR_NAME)
+                .join(&server.server.dir_name)
+                .join(ACCOUNTS_DIR_NAME)
+                .join(&account.dir_name),
+            server_host: server.server.plaintext.clone(),
+            localpart: account.plaintext.clone(),
+            server_dir_name: server.server.dir_name.clone(),
+            account_dir_name: account.dir_name.clone(),
+        }
+    }
 }
 
-/// `s/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
-/// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（local-cache-db.md §11.7）。
+/// 明文比對的**唯一**規則，整個資料目錄共用：先精確，再大小寫不敏感。
 ///
-/// Return:
-///     Some(String)   該印的那一行
-///     None           沒有 `s/`、或至少解得開一個
-pub fn find_undecryptable_layout_hint(data_dir: &Path, key: &Key32) -> Option<String> {
-    let servers = data_dir.join(SERVERS_DIR_NAME);
-    let entries: Vec<_> = std::fs::read_dir(&servers).ok()?.flatten().collect();
-    if entries.is_empty() {
-        return None;
+/// ⚠️ 大小寫不敏感那一輪對到兩個以上就回 None —— 這些名字決定的是刪哪個目錄，
+/// 寧可說「沒有」，也不要挑一個最像的（fail closed）。
+fn find_one<'a, T>(
+    entries: &'a [T],
+    plaintext_of: impl Fn(&T) -> &str,
+    wanted: &str,
+) -> Option<&'a T> {
+    if let Some(exact) = entries.iter().find(|entry| plaintext_of(entry) == wanted) {
+        return Some(exact);
     }
-    let any_readable = entries.iter().any(|entry| {
-        find_dir_name_plaintext(key, DirScope::Server, &entry.file_name().to_string_lossy())
-            .is_some()
-    });
-    (!any_readable).then(|| {
-        format!(
-            "warning: no directory in {} could be decrypted with this local.key; if this data dir was made by an older build, delete it and run `login` again",
-            servers.display()
-        )
-    })
+    let mut insensitive = entries
+        .iter()
+        .filter(|entry| plaintext_of(entry).eq_ignore_ascii_case(wanted));
+    match (insensitive.next(), insensitive.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 /// 這個 server 底下還有沒有任何登入中的帳號（`logout` 用：都沒有就把 `cache.db` 一起刪）。
@@ -302,7 +498,7 @@ pub fn find_account_of_current(data_dir: &Path, key: &Key32, current: &str) -> O
     })
 }
 
-/// `--account <mxid 或 localpart>` 解析：給了 `server` 就直接算路徑，沒給就掃所有 server 找同名 localpart。
+/// `--account <mxid 或 localpart>` 解析：當場刷新一次，再從 map 比對（大小寫不敏感）。
 ///
 /// Args:
 ///     data_dir: example: "<data dir>"
@@ -318,41 +514,7 @@ pub fn find_account(
     user: &str,
     server: Option<&str>,
 ) -> Result<AccountDir, SdkError> {
-    let localpart = localpart_of(user);
-    if let Some(server) = server {
-        let account = AccountDir::locate(data_dir, &vault.account_dir_key(), server, user)?;
-        if account.dir.is_dir() {
-            return Ok(account);
-        }
-        return Err(SdkError::Usage(format!(
-            "no account {user} on {server} in {}; run `login` first",
-            data_dir.display()
-        )));
-    }
-    let matches: Vec<AccountSummary> = list_accounts(data_dir, vault)?
-        .into_iter()
-        .filter(|summary| summary.localpart == localpart)
-        .collect();
-    match matches.as_slice() {
-        [] => Err(SdkError::Usage(format!(
-            "no account {user} in {}; run `login` first",
-            data_dir.display()
-        ))),
-        [one] => AccountDir::locate(
-            data_dir,
-            &vault.account_dir_key(),
-            &one.server,
-            &one.localpart,
-        ),
-        many => Err(SdkError::Usage(format!(
-            "{user} exists on {} servers ({}); pass --server too",
-            many.len(),
-            many.iter()
-                .map(|summary| summary.server.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-    }
+    refresh_data_dir_map(data_dir, vault)?.find_account_dir(user, server)
 }
 
 /// `http://localhost:6167` → `localhost:6167`；`https://matrix.example.org` → `matrix.example.org`（預設 port 不帶）。
@@ -495,7 +657,11 @@ mod tests {
     fn list_and_current_round_trip() {
         let (data_dir, vault) = scratch_dir_with_vault("list");
         let key = vault.account_dir_key();
-        assert!(list_accounts(&data_dir, &vault).unwrap().is_empty());
+        assert!(refresh_data_dir_map(&data_dir, &vault)
+            .unwrap()
+            .list_accounts(&vault)
+            .unwrap()
+            .is_empty());
         assert_eq!(read_current(&data_dir).unwrap(), None);
 
         let alice =
@@ -510,7 +676,10 @@ mod tests {
         std::fs::create_dir_all(&bob.dir).unwrap();
         write_current(&data_dir, &alice).unwrap();
 
-        let listed = list_accounts(&data_dir, &vault).unwrap();
+        let listed = refresh_data_dir_map(&data_dir, &vault)
+            .unwrap()
+            .list_accounts(&vault)
+            .unwrap();
         assert_eq!(listed.len(), 2);
         assert!(listed[0].logged_in && listed[0].current && listed[0].localpart == "alice");
         assert_eq!(listed[0].user_id, None, "session 解不開就沒有權威 mxid");
@@ -542,18 +711,92 @@ mod tests {
         // 另一台機器的 local.key（同一份 data dir 被拷走的情境）。
         let (other_dir, other_vault) = scratch_dir_with_vault("otherkey-2");
         assert!(
-            list_accounts(&data_dir, &other_vault).unwrap().is_empty(),
+            refresh_data_dir_map(&data_dir, &other_vault)
+                .unwrap()
+                .list_accounts(&other_vault)
+                .unwrap()
+                .is_empty(),
             "別把金鑰不該看到任何帳號"
         );
+        assert!(refresh_data_dir_map(&data_dir, &other_vault)
+            .unwrap()
+            .find_undecryptable_layout_hint()
+            .is_some());
         assert!(
-            find_undecryptable_layout_hint(&data_dir, &other_vault.account_dir_key()).is_some()
-        );
-        assert!(
-            find_undecryptable_layout_hint(&data_dir, &vault.account_dir_key()).is_none(),
+            refresh_data_dir_map(&data_dir, &vault)
+                .unwrap()
+                .find_undecryptable_layout_hint()
+                .is_none(),
             "自己的金鑰解得開就不該印提示"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn a_differently_cased_mxid_still_finds_the_account_and_its_recovery_key() {
+        let (data_dir, vault) = scratch_dir_with_vault("casing");
+        let alice = AccountDir::locate(
+            &data_dir,
+            &vault.account_dir_key(),
+            "http://localhost:6167",
+            "@alice:localhost",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&alice.dir).unwrap();
+        crate::recovery::save(&data_dir, &vault, "@alice:localhost", "EsTc 1234").unwrap();
+
+        let map = refresh_data_dir_map(&data_dir, &vault).unwrap();
+        // 精確的那串本來就找得到。
+        assert_eq!(
+            map.find_account_dir("@alice:localhost", None).unwrap(),
+            alice
+        );
+        assert_eq!(
+            map.find_recovery_key_user_id("@alice:localhost"),
+            Some("@alice:localhost")
+        );
+        // 打成大寫也要對上——不然 `account del` 說找不到、`account destroy` 宣稱
+        // 「什麼都不留」卻留著 recovery key。
+        assert_eq!(
+            map.find_account_dir("@ALICE:LocalHost", None).unwrap(),
+            alice
+        );
+        assert_eq!(
+            map.find_recovery_key_user_id("@ALICE:LocalHost"),
+            Some("@alice:localhost")
+        );
+        // server 那一段同樣不敏感（大小寫在 URL 裡很常見）。
+        assert_eq!(
+            map.find_account_dir("@alice:localhost", Some("http://LOCALHOST:6167"))
+                .unwrap(),
+            alice
+        );
+        // 🚫 沒保管的就是沒有，不要挑一個最像的。
+        assert_eq!(map.find_recovery_key_user_id("@bob:localhost"), None);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn the_map_is_a_snapshot_so_a_stale_one_is_never_reused() {
+        let (data_dir, vault) = scratch_dir_with_vault("snapshot");
+        let alice = AccountDir::locate(
+            &data_dir,
+            &vault.account_dir_key(),
+            "http://localhost:6167",
+            "@alice:localhost",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&alice.dir).unwrap();
+        let before = refresh_data_dir_map(&data_dir, &vault).unwrap();
+        assert!(before.find_account_dir("@alice:localhost", None).is_ok());
+
+        std::fs::remove_dir_all(&alice.dir).unwrap();
+        // 舊的那份還說得出路徑——這正是它不能被存起來重複用的理由（會刪檔的命令要當場刷新）。
+        assert!(before.find_account_dir("@alice:localhost", None).is_ok());
+        let after = refresh_data_dir_map(&data_dir, &vault).unwrap();
+        assert!(after.find_account_dir("@alice:localhost", None).is_err());
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

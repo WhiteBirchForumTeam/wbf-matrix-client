@@ -10,7 +10,7 @@ use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::media_pool::MediaPool;
 use wbf_sdk::room_keys;
 
-use crate::accounts::{self, AccountDir};
+use crate::accounts::{self, AccountDir, DataDirMap};
 use wbf_sdk::chunk_crypto::{choose_chunk_size, choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{
@@ -423,17 +423,15 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
         AccountAction::Status => {
             // 目錄名是加密的（local-cache-db.md §11），所以列帳號要先解鎖——這跟 2026-09-09 之前不一樣。
             let vault = context.vault()?;
-            let listed = accounts::list_accounts(&context.unlock.data_dir, vault)?;
-            if let Some(hint) = accounts::find_undecryptable_layout_hint(
-                &context.unlock.data_dir,
-                &vault.account_dir_key(),
-            ) {
+            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, vault)?;
+            if let Some(hint) = map.find_undecryptable_layout_hint() {
                 context.progress(hint);
             }
-            print_json(&serde_json::to_value(listed).expect("serializes"))
+            print_json(&serde_json::to_value(map.list_accounts(vault)?).expect("serializes"))
         }
         AccountAction::Switch { user } => {
-            let account = find_account_by_full_mxid(context, &user)?;
+            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, context.vault()?)?;
+            let account = find_account_by_full_mxid(context, &map, &user)?;
             if !account.is_logged_in() {
                 context.progress(format!(
                     "warning: {user} is not logged in; commands that need the server will fail until you run `login --user {user}`"
@@ -451,7 +449,8 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
             user,
             accept_history_loss,
         } => {
-            let account = find_account_by_full_mxid(context, &user)?;
+            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, context.vault()?)?;
+            let account = find_account_by_full_mxid(context, &map, &user)?;
             let user = log_out_account(context, &account, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": user }))
         }
@@ -472,10 +471,14 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
 /// Return:
 ///     Ok(AccountDir)
 ///     Err(Usage)   不是完整 mxid、找不到、或同名 localpart 有歧義
-fn find_account_by_full_mxid(context: &Context, user: &str) -> Result<AccountDir, SdkError> {
+fn find_account_by_full_mxid(
+    context: &Context,
+    map: &DataDirMap,
+    user: &str,
+) -> Result<AccountDir, SdkError> {
     let vault = context.vault()?;
     if !user.starts_with('@') || !user.contains(':') {
-        let known = accounts::list_accounts(&context.unlock.data_dir, vault)?;
+        let known = map.list_accounts(vault)?;
         let names: Vec<String> = known
             .iter()
             .map(|summary| match &summary.user_id {
@@ -492,12 +495,7 @@ fn find_account_by_full_mxid(context: &Context, user: &str) -> Result<AccountDir
             "expected a full Matrix ID like @bob:matrix.org, got \"{user}\"\n       accounts on this machine: {names}"
         )));
     }
-    accounts::find_account(
-        &context.unlock.data_dir,
-        vault,
-        user,
-        context.server_override.as_deref(),
-    )
+    map.find_account_dir(user, context.server_override.as_deref())
 }
 
 /// 給人看的一句話。登入中的用 `session.sealed` 裡的權威 mxid 與 server URL；
@@ -857,7 +855,13 @@ async fn destroy_account_command(
     yes: bool,
     accept_history_loss: bool,
 ) -> Result<(), SdkError> {
-    let account = find_account_by_full_mxid(context, user)?;
+    // 維護者 2026-09-10：會刪檔的命令，路徑當場刷新一次再比對——帳號目錄與 recovery key
+    // 都從**同一份**快照來，中間不再掃第二次（掃兩次就有兩個不同時刻的答案）。
+    let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, context.vault()?)?;
+    let account = find_account_by_full_mxid(context, &map, user)?;
+    // 🚫 在 logout 之前先問：`del` 只認精確的 mxid，而使用者打的那串大小寫可能跟
+    // 封存時用的權威 mxid 不同（PR #19 審查 rumia🟡1／salvia）。
+    let kept_recovery_key_user_id = map.find_recovery_key_user_id(user).map(str::to_string);
     let server = match &context.server_override {
         Some(server) => server.clone(),
         None => context
@@ -883,11 +887,8 @@ async fn destroy_account_command(
     // ⚠️ destroy 的語意是「什麼都不留」，所以連 recovery key 也摧毀（維護者 2026-09-09）。
     // 🚫 `logout`／`account del` 不做這件事——它們留著它正是為了讓歷史救得回來。
     // 這一步之後，server 上那份備份就永遠解不開了。
-    // 🚫 不直接拿 `user` 算檔名：封存時用的是 server 的權威 mxid（PR #19 審查 rumia🟡1／salvia）。
-    if let Some(kept_user_id) =
-        crate::recovery::find_kept_user_id(&context.unlock.data_dir, context.vault()?, user)?
-    {
-        crate::recovery::del(&context.unlock.data_dir, context.vault()?, &kept_user_id)?;
+    if let Some(kept_user_id) = &kept_recovery_key_user_id {
+        crate::recovery::del(&context.unlock.data_dir, context.vault()?, kept_user_id)?;
         context.progress(format!(
             "destroyed the recovery key kept here for {kept_user_id}; the server-side backup can no longer be opened"
         ));
