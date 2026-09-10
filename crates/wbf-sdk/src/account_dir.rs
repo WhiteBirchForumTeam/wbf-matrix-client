@@ -1,8 +1,8 @@
 //! 資料目錄裡兩層目錄名的加密（local-cache-db.md §11）。
 //!
 //! ```text
-//! servers/<b58 nonce>_<b58 密文>/            ← 正規化過的 server host
-//!   accounts/<b58 nonce>_<b58 密文>/         ← localpart
+//! s/<b58 nonce>_<b58 密文>/            ← 正規化過的 server host
+//!   a/<b58 nonce>_<b58 密文>/         ← localpart
 //! ```
 //!
 //! 外面只看得到 Base58，看不出這台機器連過哪家 server、有誰的帳號。
@@ -44,11 +44,11 @@ const MAX_DIR_NAME_CHARS: usize = 200;
 /// 兩層的名字互相解不開，帳號目錄搬到另一個 server 目錄底下也解不開。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirScope<'a> {
-    /// `servers/<這一段>/`，明文是正規化過的 server host。
+    /// `s/<這一段>/`，明文是正規化過的 server host。
     Server,
-    /// `servers/<…>/accounts/<這一段>/`，明文是 localpart；綁住它上面那層的 host 明文。
+    /// `s/<…>/a/<這一段>/`，明文是 localpart；綁住它上面那層的 host 明文。
     Account { server_host: &'a str },
-    /// `recovery/<這一段>`，明文是 `recovery-key@bob:matrix.org`（local-cache-db.md §10.9）。
+    /// `r/<這一段>`，明文是 `recovery-key@bob:matrix.org`（local-cache-db.md §10.8）。
     ///
     /// 它**不在帳號目錄底下**，因為 `logout` 要把帳號目錄整個清掉而 recovery key 要留著：
     /// 前者是“這台機器上的裝置狀態”，後者是“回到 server 備份的鑰匙”。
@@ -93,7 +93,7 @@ impl DirScope<'_> {
 ///     scope: example: DirScope::Account { server_host: "localhost:6167" }
 ///     plaintext: 正規化過的 host 或 localpart, example: "alice"
 /// Return:
-///     Ok(String)   目錄名, example: "3vQB7B6MrGQZaxCuFg4oh_2NEpo7TZRRrLZSizrsHo"
+///     Ok(String)   目錄名（17 字元 nonce ＋ 密文，長度隨明文），example: "3mnWyBHFfpAh6XUp2_EtqtjDzSZLMWiKSiNjP4MP579qnwt"
 ///     Err(Usage)   明文是空的、或名字會超過 200 字元（🚫 不截斷：截斷就解不回來了）
 pub fn to_dir_name(key: &Key32, scope: DirScope<'_>, plaintext: &str) -> Result<String, SdkError> {
     if plaintext.is_empty() {
@@ -131,7 +131,7 @@ pub fn to_dir_name(key: &Key32, scope: DirScope<'_>, plaintext: &str) -> Result<
 /// Args:
 ///     key: example: vault.account_dir_key()
 ///     scope: example: DirScope::Server
-///     dir_name: 磁碟上那個目錄的名字, example: "3vQB7B6MrGQZaxCuFg4oh_2NEpo7TZRRrLZSizrsHo"
+///     dir_name: 磁碟上那個目錄的名字, example: "3mnWyBHFfpAh6XUp2_EtqtjDzSZLMWiKSiNjP4MP579qnwt"
 /// Return:
 ///     Some(String)   明文, example: "alice"
 ///     None           沒有底線、Base58 解不開、nonce 長度不對、AEAD 驗不過、
@@ -252,7 +252,7 @@ mod tests {
             "_",
             "notbase58!_x",
             "3vQB7B6MrGQZaxCuFg4oh_",
-            // nonce 那段長度不對（Base58 解得開，但不是 24 byte）
+            // nonce 那段長度不對（Base58 解得開，但不是 12 byte）
             "2NEpo7_2NEpo7TZRRrLZSizrsHo",
         ] {
             assert_eq!(

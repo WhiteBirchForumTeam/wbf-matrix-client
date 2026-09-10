@@ -100,7 +100,7 @@ pub struct ForgetReport {
 
 impl Cache {
     /// Args:
-    ///     dir: example: "<data dir>/servers/localhost_6167"
+    ///     dir: example: "<data dir>/s/<b58 nonce>_<b58 密文>"
     ///     key: example: vault.cache_key()
     ///     identity: example: CacheIdentity { server: "http://localhost:6167".into() }
     /// Return:

@@ -65,7 +65,7 @@ impl UnlockOptions {
             let legacy = self.data_dir.join(LEGACY_SESSION_FILE_NAME);
             let hint = if legacy.exists() {
                 format!(
-                    "; {} is an old plaintext session — delete it and the matrix/ directory next to it",
+                    "; {} is an old plaintext session — delete it and the m/ directory next to it",
                     legacy.display()
                 )
             } else {

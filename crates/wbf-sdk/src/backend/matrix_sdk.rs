@@ -455,7 +455,7 @@ impl MatrixBackend {
         Ok(std::fs::metadata(path)?.len())
     }
 
-    /// 把本地快照餵回 crypto store（`key-backup import`）。重新 `login`、或刪過 `matrix/` 之後用。
+    /// 把本地快照餵回 crypto store（`key-backup import`）。重新 `login`、或刪過 `m/` 之後用。
     ///
     /// Return:
     ///     Ok((imported, total))   這次新匯入幾把、快照裡總共幾把
@@ -500,34 +500,6 @@ impl MatrixBackend {
             .recover(recovery_key)
             .await
             .map_err(|error| SdkError::Network(format!("recover: {error}")))
-    }
-
-    /// 使用者手上**真的有**這個帳號的 recovery key 嗎——拿他打的那串去開 secret storage。
-    ///
-    /// 這是唯一驗得到的方式（維護者 2026-09-09 定）：`BackupStatus::recovery_enabled` 只說得出
-    /// 「SSSS 設好了」，說不出「那串字在誰手上」。要刪掉本機金鑰之前，只有這個能證明歷史真的救得回來。
-    ///
-    /// 🚫 用 `open_secret_store` 而不是 `recovery().recover()`：後者會把 secrets 匯進來、
-    /// 還可能觸發 backup 下載，而我們只想問一句「這串字對不對」。
-    ///
-    /// Args:
-    ///     recovery_key: 使用者打的那串, example: "EsTc ...";🚫 不印、不 log
-    /// Return:
-    ///     Ok(true)     開得起來——他手上確實有
-    ///     Ok(false)    開不起來（打錯、或那不是這個帳號的）
-    ///     Err(Network) 問不到 server，分辨不出來——呼叫端要 fail closed
-    pub async fn is_recovery_key_correct(&self, recovery_key: &str) -> Result<bool, SdkError> {
-        match self
-            .client
-            .encryption()
-            .secret_storage()
-            .open_secret_store(recovery_key)
-            .await
-        {
-            Ok(_) => Ok(true),
-            // 🚫 錯誤訊息不帶出去：它可能含 key 的片段，而且對使用者只有「對或不對」有意義。
-            Err(_) => Ok(false),
-        }
     }
 
     /// 產生 recovery key（`key-backup recovery`）。設好之後 server 上那份備份**換裝置也解得開**。

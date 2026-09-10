@@ -1,11 +1,11 @@
-//! recovery key 的本機保管（local-cache-db.md §10.9；維護者 2026-09-09 定）：
+//! recovery key 的本機保管（local-cache-db.md §10.8；維護者 2026-09-09 定）：
 //!
 //! ```text
 //! <data dir>/r/<b58>_<b58>             檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
 //! ```
 //!
 //! **為什麼不放在帳號目錄底下**：`logout`／`account del` 要把帳號目錄整個清乾淨
-//! （`session.sealed`、`matrix/`、`room-keys/`），而 recovery key 正好是**清完之後唯一回得去的路**——
+//! （`session.sealed`、`m/`、`k/`），而 recovery key 正好是**清完之後唯一回得去的路**——
 //! 它是「回到 server 備份的鑰匙」，不是「這台機器上的裝置狀態」。放在一起就會一起被刪，
 //! 那等於備份也沒了。
 //!
@@ -85,6 +85,36 @@ pub fn list_users(data_dir: &Path, vault: &Vault) -> Result<Vec<String>, SdkErro
     Ok(users)
 }
 
+/// 這台機器保管的哪一個 mxid，對應到使用者打的這串。
+///
+/// 封存時用的是 server 的權威 mxid，而使用者可能打成 `@BOB:Matrix.org`——檔名是那串明文
+/// 加密出來的，大小寫差一個字就算出另一個名字，於是刪不到（PR #19 審查 rumia🟡1／salvia）。
+/// 所以先試精確的，再拿 `r/` 裡的清單做大小寫不敏感的比對。
+/// ⚠️ 對到兩個以上就回 None——寧可說「沒有」，也不要刪掉另一個人的。
+///
+/// Args:
+///     user_id: 使用者打的 mxid, example: "@BOB:matrix.org"
+/// Return:
+///     Ok(Some(String))  這台機器實際保管的那串, example: "@bob:matrix.org"
+///     Ok(None)          沒保管、或對到不只一個
+pub fn find_kept_user_id(
+    data_dir: &Path,
+    vault: &Vault,
+    user_id: &str,
+) -> Result<Option<String>, SdkError> {
+    let kept = list_users(data_dir, vault)?;
+    if kept.iter().any(|one| one == user_id) {
+        return Ok(Some(user_id.to_string()));
+    }
+    let mut matches = kept
+        .into_iter()
+        .filter(|one| one.eq_ignore_ascii_case(user_id));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Ok(Some(only)),
+        _ => Ok(None),
+    }
+}
+
 /// 把 recovery key 封進來（`key-backup recovery` 產生之後）。
 pub fn save(
     data_dir: &Path,
@@ -117,6 +147,9 @@ pub fn find(
 ///
 /// ⚠️ 不可逆：刪掉之後 server 上那份備份就再也解不開了。
 /// 🚫 `logout`／`account del` 不准叫這個——它們留著 recovery key 正是為了讓歷史救得回來。
+///
+/// ⚠️ 只認**精確**的 mxid（檔名是它加密出來的）。使用者打的字串要先過
+/// [`find_kept_user_id`]。
 ///
 /// Return:
 ///     Ok(true)    刪掉了
@@ -194,6 +227,29 @@ mod tests {
             "{name}"
         );
         assert!(name.contains('_'), "應該是 <b58 nonce>_<b58 密文>：{name}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn a_differently_cased_mxid_still_finds_the_kept_one() {
+        let (data_dir, vault) = scratch("casing");
+        save(&data_dir, &vault, "@alice:localhost", "EsTc 1234").unwrap();
+
+        // 精確的那串本來就找得到。
+        assert_eq!(
+            find_kept_user_id(&data_dir, &vault, "@alice:localhost").unwrap(),
+            Some("@alice:localhost".to_string())
+        );
+        // 使用者打成大寫也要對上——不然 `account destroy` 會宣稱「什麼都不留」卻留著。
+        assert_eq!(
+            find_kept_user_id(&data_dir, &vault, "@ALICE:LocalHost").unwrap(),
+            Some("@alice:localhost".to_string())
+        );
+        // 沒保管的就是沒有，🚫 不要挑一個最像的給它。
+        assert_eq!(
+            find_kept_user_id(&data_dir, &vault, "@bob:localhost").unwrap(),
+            None
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

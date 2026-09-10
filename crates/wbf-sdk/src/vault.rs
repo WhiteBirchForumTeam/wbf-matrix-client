@@ -20,8 +20,6 @@ use crate::login::Session;
 
 pub const KEY_FILE_NAME: &str = "local.key";
 pub const SEALED_SESSION_FILE_NAME: &str = "session.sealed";
-/// recovery key 產生之後就封在這裡（local-cache-db.md §10.9）：使用者不必自己抄那串字。
-pub const SEALED_RECOVERY_FILE_NAME: &str = "recovery.sealed";
 
 /// 子金鑰的 BLAKE3 context（§4）。字串帶版本：換字串就是換金鑰。
 const CACHE_KEY_CONTEXT: &str = "wbf-matrix-client cache sqlcipher v1";
@@ -33,7 +31,8 @@ const ROOM_KEY_BACKUP_KEY_CONTEXT: &str = "wbf-matrix-client room key backup v1"
 
 /// `session.sealed` 的 AEAD 附加資料：綁住用途，拿別的檔的密文換過來解不開。
 const SESSION_AAD: &[u8] = b"wbf-matrix-client session.sealed v1";
-/// `recovery.sealed` 的 AEAD 附加資料：跟 session 的密文互換也解不開。
+/// recovery key 的 AEAD 附加資料：跟 session 的密文互換也解不開。
+/// 🚫 字串不要改：改了就是換金鑰，已經封好的 recovery key 全部打不開。
 const RECOVERY_AAD: &[u8] = b"wbf-matrix-client recovery.sealed v1";
 /// `local.key` 包主金鑰的 AEAD 附加資料。
 const WRAP_AAD: &[u8] = b"wbf-matrix-client local.key v1";
@@ -352,11 +351,11 @@ impl Vault {
     /// 用第三把子金鑰（跟 `session.sealed` 同一把，AAD 不同所以兩者的密文換不過去）。
     ///
     /// ⚠️ 這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台機器上，
-    /// 一起被拿走就一起沒了。閘門（CLI 的 `refuse_if_history_would_be_lost`）用它省去每次
-    /// 手打，但刪帳號前仍會把它印出來要使用者確認看到（local-cache-db.md §10.9）。
+    /// 一起被拿走就一起沒了。閘門（CLI 的 `refuse_if_history_would_be_lost`）拿它當第 2 關，
+    /// 🚫 不問使用者（local-cache-db.md §10.8）。
     ///
     /// Args:
-    ///     path: example: "<account dir>/recovery.sealed"
+    ///     path: example: "<data dir>/r/<b58 nonce>_<b58 密文>"
     ///     recovery_key: 🚫 不印、不 log
     pub fn seal_recovery_key(&self, path: &Path, recovery_key: &str) -> Result<(), SdkError> {
         let nonce = random_nonce()?;

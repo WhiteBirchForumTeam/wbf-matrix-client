@@ -25,7 +25,7 @@ pub struct Cli {
     /// 直接給 access token，跳過 session 檔。不印、不寫進任何輸出
     #[arg(long, global = true, env = "WBF_ACCESS_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
-    /// 資料目錄（local.key、current、servers/<host>/cache.db、servers/<host>/accounts/<user>/…），預設見 CLI 規格 §7
+    /// 資料目錄（local.key、current、s/<b58>/cache.db、s/<b58>/a/<b58>/…），預設見 CLI 規格 §7
     #[arg(long, global = true, env = "WBF_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// 用哪個帳號（mxid 或 localpart）；沒給就是最後一次 login 的那個。同名 localpart 在多個 server 時要配 --server
@@ -76,7 +76,7 @@ pub enum AccountAction {
         /// 完整 mxid，example: @bob:matrix.org
         user: String,
     },
-    /// 裝置層：登出、刪掉這個帳號的 session.sealed 與 matrix/；cache.db 裡的紀錄留著
+    /// 裝置層：登出、刪掉這個帳號的 session.sealed 與 m/；cache.db 裡的紀錄留著
     Del {
         /// 完整 mxid，example: @bob:matrix.org
         user: String,
@@ -97,7 +97,7 @@ pub enum AccountAction {
     },
 }
 
-/// recovery key 的本機保管（local-cache-db.md §10.9）。
+/// recovery key 的本機保管（local-cache-db.md §10.8）。
 /// 它跟帳號目錄分開放，所以 `logout` 不會刪掉——那正是它存在的意義。
 #[derive(Subcommand)]
 pub enum RecoveryAction {
@@ -117,9 +117,9 @@ pub enum KeyBackupAction {
     Status,
     /// 把 crypto store 裡的金鑰推上 server，傳完才 exit（上游的上傳是背景 task，命令 exit 就被 abort）
     Upload,
-    /// 把全部房間金鑰倒進本地快照 room-keys/snapshot（全量覆蓋，一輪 PBKDF2 約半秒）
+    /// 把全部房間金鑰倒進本地快照 k/snapshot（全量覆蓋，一輪 PBKDF2 約半秒）
     Save,
-    /// 把本地快照餵回 crypto store（重新 login、或刪過 matrix/ 之後用）
+    /// 把本地快照餵回 crypto store（重新 login、或刪過 m/ 之後用）
     Import,
     /// 用保管的 recovery key 恢復這台裝置（重新 login 之後要跑；沒有它 server 上的備份解不開）
     Restore,
@@ -131,7 +131,7 @@ pub enum KeyBackupAction {
 pub enum Command {
     /// 登入、寫 session 檔；成功後自動切成 current（等同 `account add`）
     Login(LoginArgs),
-    /// 讓 current 帳號的 token 失效；刪它的 session.sealed 與 matrix/（等同 `account del <current>`）
+    /// 讓 current 帳號的 token 失效；刪它的 session.sealed 與 m/（等同 `account del <current>`）
     Logout {
         /// 明知 server 上的備份還解不開，照樣登出（會失去這個帳號的歷史，local-cache-db.md §10.7）
         #[arg(long)]
@@ -147,7 +147,7 @@ pub enum Command {
         #[command(subcommand)]
         action: KeyBackupAction,
     },
-    /// 這台機器保管著誰的 recovery key（local-cache-db §10.9）
+    /// 這台機器保管著誰的 recovery key（local-cache-db §10.8）
     Recovery {
         #[command(subcommand)]
         action: RecoveryAction,

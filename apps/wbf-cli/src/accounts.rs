@@ -41,7 +41,7 @@ pub struct AccountDir {
     pub server_host: String,
     /// localpart（明文），example: "alice"
     pub localpart: String,
-    /// `<data dir>/servers/<b58>_<b58>/accounts/<b58>_<b58>`
+    /// `<data dir>/s/<b58>_<b58>/a/<b58>_<b58>`
     pub dir: PathBuf,
     /// `current` 檔記的就是這兩段（都是加密後的名字）。
     server_dir_name: String,
@@ -96,7 +96,7 @@ impl AccountDir {
         self.dir.join(MATRIX_STORE_DIR_NAME)
     }
 
-    /// `servers/<b58>_<b58>/`：`cache.db` 與媒體池在這一層，同 server 的帳號共用。
+    /// `s/<b58>_<b58>/`：`cache.db` 與媒體池在這一層，同 server 的帳號共用。
     pub fn server_dir(&self) -> PathBuf {
         self.dir
             .parent()
@@ -141,7 +141,7 @@ pub struct AccountSummary {
     pub current: bool,
 }
 
-/// 掃 `servers/*/accounts/*` **兩層**，逐一解密目錄名（local-cache-db.md §11.5）。
+/// 掃 `s/*/a/*` **兩層**，逐一解密目錄名（local-cache-db.md §11.5）。
 ///
 /// 解不開的目錄一律跳過（fail closed）：可能是別把 `local.key` 建的，也可能是舊版留下的明文佈局。
 /// 🚫 不猜、🚫 不刪、🚫 不報錯——當它不存在。
@@ -205,12 +205,12 @@ pub fn list_accounts(data_dir: &Path, vault: &Vault) -> Result<Vec<AccountSummar
     Ok(summaries)
 }
 
-/// `servers/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
+/// `s/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
 /// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（local-cache-db.md §11.7）。
 ///
 /// Return:
 ///     Some(String)   該印的那一行
-///     None           沒有 `servers/`、或至少解得開一個
+///     None           沒有 `s/`、或至少解得開一個
 pub fn find_undecryptable_layout_hint(data_dir: &Path, key: &Key32) -> Option<String> {
     let servers = data_dir.join(SERVERS_DIR_NAME);
     let entries: Vec<_> = std::fs::read_dir(&servers).ok()?.flatten().collect();

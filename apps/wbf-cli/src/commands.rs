@@ -372,12 +372,12 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), SdkErr
     // 帳號目錄由 server host 加 localpart 決定（store 在 login 前就要有路徑）。
     let dir_key = vault.account_dir_key();
     let account = AccountDir::locate(&context.unlock.data_dir, &dir_key, &server, user)?;
-    // 沒有 session 卻留著 matrix/：上次沒走 logout（或舊版的 logout 沒刪），那個 store 綁著已經失效的裝置。消費端自己再清一次。
+    // 沒有 session 卻留著 m/（crypto store）：上次沒走 logout（或舊版的 logout 沒刪），那個 store 綁著已經失效的裝置。消費端自己再清一次。
     if !account.is_logged_in() && account.matrix_store_dir().exists() {
         context.progress("removing a matrix store left over from a previous device".into());
         account.delete_matrix_store()?;
     }
-    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放帳號目錄的 matrix/。
+    // 第 3 步起走 matrix-sdk 登入：拿到的是有裝置金鑰的 session，E2EE 房間才解得開。store 放帳號目錄的 m/。
     let (_backend, session) = MatrixBackend::login(
         &server,
         user,
@@ -539,7 +539,7 @@ fn switch_current_to(
     Ok(previous)
 }
 
-/// `recovery <action>`：這台機器保管著誰的 recovery key（local-cache-db.md §10.9）。
+/// `recovery <action>`：這台機器保管著誰的 recovery key（local-cache-db.md §10.8）。
 ///
 /// 🚫 不連 server：這些檔案是本機的東西，`list` 連內容都不解（只解檔名）。
 fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), SdkError> {
@@ -632,7 +632,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
         }
         KeyBackupAction::Recovery => {
             let recovery_key = backend.enable_recovery().await?;
-            // 封進 <data dir>/recovery/（🚫 不是帳號目錄——`logout` 會把那裡清光，
+            // 封進 <data dir>/r/（🚫 不是帳號目錄——`logout` 會把那裡清光，
             // 而 recovery key 正是清完之後唯一回得去的路；維護者 2026-09-09）。
             let session = context.session().await?;
             crate::recovery::save(
@@ -643,7 +643,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             )?;
             // 會印秘密的命令（另一個是 `recovery show`）。CLI 規格 §3.6。
             context.progress(
-                "this recovery key is now sealed under <data dir>/recovery/, which survives logout,\n       \
+                "this recovery key is now sealed under <data dir>/r/, which survives logout,\n       \
                  so you will not be asked to type it on this machine.\n       \
                  Still write it down: if this machine is lost, it is the only way back into the\n       \
                  server-side backup."
@@ -717,16 +717,20 @@ async fn find_backend_of(context: &Context, account: &AccountDir) -> Option<Matr
 
 /// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
 ///
-/// 這些命令會連 `matrix/`（crypto store）與 `room-keys/` 一起刪。在還沒有 recovery key 的
+/// 這些命令會連 `m/`（crypto store）與 `k/`（本地快照）一起刪。在還沒有 recovery key 的
 /// 預設狀態下，**server 端備份的私鑰就在那個 store 裡**——照樣登出的話歷史就回不來了。
 ///
 /// 兩關，都要過（維護者 2026-09-09）：
 ///
 /// 1. **server 那份救得回來嗎**：`exists_on_server && recovery_enabled`，正面認得才算
 ///    （`is_history_recoverable`）。
-/// 2. **使用者手上真的有那串 recovery key 嗎**：要他打出來，拿去開 secret storage 驗
-///    （`is_recovery_key_correct`）。⚠️ 第 1 關只說得出「SSSS 設好了」——跑過
-///    `key-backup recovery`、印出來、沒抄就關掉終端的人也會通過第 1 關。第 2 關才是真的驗證。
+/// 2. **這台機器保管著這個帳號的 recovery key 嗎**：查 `<data dir>/r/`（`recovery::find`）。
+///    ⚠️ 第 1 關只說得出「SSSS 設好了」——跑過 `key-backup recovery`、印出來、沒抄就關掉
+///    終端的人也會通過第 1 關。第 2 關才確認得了「刪完之後這裡還有東西打得開那份備份」。
+///
+/// 🚫 第 2 關**不問使用者**（維護者 2026-09-09 定）：`key-backup recovery` 產生的當下就封進
+/// `r/` 了，而那個目錄 `logout` 不碰。⚠️ 所以它證明的是「這台機器回得去」，不是「使用者手上有」
+/// ——機器整台沒了就兩份都沒了，訊息裡因此仍然叫人抄下來。
 ///
 /// Args:
 ///     accept_history_loss: `--accept-history-loss`，使用者明說接受失去它，兩關都跳過
@@ -759,21 +763,26 @@ async fn refuse_if_history_would_be_lost(
         ));
     }
     // 第 2 關：這台機器保管著這個帳號的 recovery key 嗎（維護者 2026-09-09）。
-    // 🚫 不問使用者——它封在 <data dir>/recovery/，而那個目錄 `logout` 不碰，
-    // 所以刪完 matrix/ 與 room-keys/ 之後，它還在，歷史真的救得回來。
-    let user_id = context
-        .vault()?
-        .unseal_session(&account.session_path())?
-        .map(|session| session.user_id)
-        .unwrap_or_default();
-    if crate::recovery::find(&context.unlock.data_dir, context.vault()?, &user_id)?.is_some() {
+    // 🚫 不問使用者——它封在 <data dir>/r/，而那個目錄 `logout` 不碰，
+    // 所以刪完 m/ 與 k/ 之後，它還在，歷史真的救得回來。
+    // 🚫 不用使用者打的字串：封存時用的是 server 的權威 mxid。解不出 session 就是問不出
+    // 這個帳號是誰——擋下來，不要拿佔位值去查（查不到會變成「沒保管」，方向剛好相反）。
+    let Some(session) = context.vault()?.unseal_session(&account.session_path())? else {
+        return Err(refusal(
+            account,
+            "its session could not be opened, so it is unknown which account this is",
+        ));
+    };
+    if crate::recovery::find(&context.unlock.data_dir, context.vault()?, &session.user_id)?
+        .is_some()
+    {
         return Ok(());
     }
     Err(refusal(
         account,
         "the server says secret storage is set up, but this machine is not keeping that account's\n       \
          recovery key, so nothing here could open the backup afterwards.\n       \
-         Run `wbf-cli key-backup recovery` (it seals the key under <data dir>/recovery/, which\n       \
+         Run `wbf-cli key-backup recovery` (it seals the key under <data dir>/r/, which\n       \
          survives logout), or `wbf-cli recovery list` to see whose keys are kept here",
     ))
 }
@@ -781,7 +790,7 @@ async fn refuse_if_history_would_be_lost(
 /// 閘門擋下來時的訊息：`why` 是這一次為什麼擋，後面接一律相同的出路。
 fn refusal(account: &AccountDir, why: &str) -> SdkError {
     SdkError::Usage(format!(
-        "this would delete {}'s room keys on this machine (matrix/ and room-keys/), and\n       \
+        "this would delete {}'s room keys on this machine (m/ and k/), and\n       \
          {why}.\n       \
          If you only need the history on this machine, `wbf-cli key-backup save` writes a local\n       \
          snapshot - but note that logging out deletes that too.\n       \
@@ -791,9 +800,9 @@ fn refusal(account: &AccountDir, why: &str) -> SdkError {
 }
 
 /// 裝置層的登出（CLI 規格 §3.1：`logout` 就是 `account del <current 帳號>`）：讓 token 失效，
-/// 刪這個帳號的 `session.sealed` 與 `matrix/`。`cache.db` 裡的紀錄留著——要連那些一起清是 `account destroy`。
+/// 刪這個帳號的 `session.sealed` 與 `m/`。`cache.db` 裡的紀錄留著——要連那些一起清是 `account destroy`。
 ///
-/// `matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊的 crypto store 會擋登入
+/// `m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊的 crypto store 會擋登入
 /// （"account in the store doesn't match"，2026-09-07 實跑）。
 ///
 /// 🚫 自己不印 stdout：`destroy` 會接在它後面再做資料層，兩邊都印就成了兩個 JSON 物件（CLI 規格 §4）。
@@ -869,14 +878,18 @@ async fn destroy_account_command(
     {
         return Err(SdkError::Usage("cancelled".into()));
     }
-    // 先裝置層（logout、session.sealed、matrix/）再資料層：反過來的話 logout 要用的 session 已經被刪了。
+    // 先裝置層（logout、session.sealed、m/）再資料層：反過來的話 logout 要用的 session 已經被刪了。
     log_out_account(context, &account, accept_history_loss).await?;
     // ⚠️ destroy 的語意是「什麼都不留」，所以連 recovery key 也摧毀（維護者 2026-09-09）。
     // 🚫 `logout`／`account del` 不做這件事——它們留著它正是為了讓歷史救得回來。
     // 這一步之後，server 上那份備份就永遠解不開了。
-    if crate::recovery::del(&context.unlock.data_dir, context.vault()?, user)? {
+    // 🚫 不直接拿 `user` 算檔名：封存時用的是 server 的權威 mxid（PR #19 審查 rumia🟡1／salvia）。
+    if let Some(kept_user_id) =
+        crate::recovery::find_kept_user_id(&context.unlock.data_dir, context.vault()?, user)?
+    {
+        crate::recovery::del(&context.unlock.data_dir, context.vault()?, &kept_user_id)?;
         context.progress(format!(
-            "destroyed the recovery key kept here for {user}; the server-side backup can no longer be opened"
+            "destroyed the recovery key kept here for {kept_user_id}; the server-side backup can no longer be opened"
         ));
     }
     // 快取在 server 層；用這個帳號的目錄定位它（不需要它是 current）。
