@@ -41,19 +41,19 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 ### 3.1 帳號：`account` 一族（維護者 2026-09-09 定）
 
 **多帳號是前提，不是附加功能**（維護者 2026-09-09）：CLI 與 UI 都要能同時登入多個帳號，甚至同時跑起來。
-所以帳號目錄一帳號一套（§7），`matrix/`（裝置狀態）也一帳號一套 —— 這正是拿帳號當 `matrix/` 分界的理由。
+所以帳號目錄一帳號一套（§7），`m/`（matrix-sdk 的 store，裝置狀態）也一帳號一套 —— 這正是拿帳號當那個 store 分界的理由。
 `current` 只回答一個問題：**沒帶 `--account` 時用誰**。
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `login --user <mxid> [--password-file <path>] [--device-name <name>]`<br>`account add …`（同一件事的另一個名字） | 登入、把 session 封進這個帳號目錄的 `session.sealed`，**登入成功自動切成 `current`** 並印一行 switch 提示（§3.1.1）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server", "switched_from" }` |
-| `account status` | 列本機所有帳號：**掃雙層**（`servers/` 再 `accounts/`）逐一解密目錄名（local-cache-db.md §11.5）。⚠️ **要解鎖**（`passphrase` 模式會問或吃 ticket），因為目錄名是加密的；這跟 2026-09-09 之前的「不開 vault」不一樣。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy`。⚠️ **登出的帳號是 `null`**：目錄名只解得出 localpart 與 host，組不出可靠的 mxid，🚫 不自己拼一個 | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
+| `account status` | 列本機所有帳號：**掃雙層**（`s/` 再 `a/`）逐一解密目錄名（local-cache-db.md §11.5）。⚠️ **要解鎖**（`passphrase` 模式會問或吃 ticket），因為目錄名是加密的；這跟 2026-09-09 之前的「不開 vault」不一樣。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy`。⚠️ **登出的帳號是 `null`**：目錄名只解得出 localpart 與 host，組不出可靠的 mxid，🚫 不自己拼一個 | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
 | `account switch <user>` | 只改 `current`，不連 server。印 switch 提示（§3.1.1）。指到沒登入的帳號會警告但照切（下一個要連線的命令才會失敗） | `{ "ok": true, "current", "switched_from" }` |
-| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`matrix/`、**`room-keys/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`matrix/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門兩關**（local-cache-db §10.7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才是真的。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著） | `{ "ok": true, "user" }` |
+| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`m/`、**`k/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門兩關**（local-cache-db §10.7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才確認得了「刪完之後這裡還有東西打得開那份備份」。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著） | `{ "ok": true, "user" }` |
 | `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
 | `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
-| `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `matrix/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
+| `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `m/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
 | `remove-passphrase` | 拿掉 passphrase，`local.key` 回到 `plain` | `{ "ok": true, "mode": "plain" }` |
 
 ⚠️ 舊名 `accounts` 與 `forget-account` **移除**（維護者 2026-09-09）：碰到就報錯並指向新名字，不留別名。
@@ -181,7 +181,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 ### 3.4 房間（第 3 步，2026-09-06 做了第一版）
 
-從第 3 步起 `login` 走 matrix-sdk（拿到有裝置金鑰的 session，E2EE 房間才解得開），store 放資料目錄的 `matrix/`（§7）。
+從第 3 步起 `login` 走 matrix-sdk（拿到有裝置金鑰的 session，E2EE 房間才解得開），store 放帳號目錄的 `m/`（§7）。
 這些命令都先做一次增量 sync（timeout 0）再動作，所以看到的是現況。
 
 | 命令 | 做什麼 |
@@ -241,7 +241,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 ### 3.5 本地快取（local-cache-db.md §6，2026-09-07）
 
-`cache.db` 在 `servers/<host>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：server 不符、schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
+`cache.db` 在 `s/<b58>_<b58>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：server 不符、schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
 
 多帳號混存怎麼不漏（維護者 2026-09-07 定，細節在 local-cache-db.md §6）：
 
@@ -253,29 +253,29 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 |---|---|---|
 | `recent [--limit <n>] [--window <n>] [--batch <n>] [--from-scratch]` | `Event/Recent`（只走 WS；`--transport http` 會拿到 `Unsupported`）。三層（維護者 2026-09-08 定）：`--limit` 是**這一輪總共要幾則**（預設 10000，0 = 拉到追平），底層拆成一次 `Recent` 一窗 `--window` 則（預設 320、server 上限 500 先 clamp），server 每 `--batch` 則回一個 Batch（預設 10、上限 100）；要 1000 就是 320、320、320、40 四窗。每個 Batch 寫一次快取；一窗 `tc == 要的` 就帶 `before = 最後的 ls` 再一窗，`tc < 要的` 是追平（`caught_up`）；湊滿 `--limit` 也停（stderr 說更舊的還沒進快取）。水位一律是第一窗第一個 Batch 的 `fs`（比它新的全拿到了），中途斷線或 server 回錯就 exit、已寫的有效、水位不動。等待：第一窗每個 Batch 之間 60 秒、之後 10 秒。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "windows", "batches", "caught_up", "cg_seq_before", "cg_seq_after" }` |
 | `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的。排序照 `r_seq`（沒有 `r_seq` 的房間退到時間）。`--before` 這時是 **r_seq 的數字**（上一頁印的 `next`），不是 server 的翻頁 token；沒有 `r_seq` 的房間 `next` 是 null、翻不了頁 | 與不帶時同形 |
-| `account destroy <user> [--yes]` | 忘掉鏈（裝置層那一半在 §3.1）：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**這個帳號的 `room-keys/` 也一起刪**（它就是「摧毀本機紀錄」，跟 `logout` 一致，local-cache-db §10.7）；沒 `--yes` 的確認提示要把這件事講出來 | 見 §3.1 |
+| `account destroy <user> [--yes]` | 忘掉鏈（裝置層那一半在 §3.1）：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**這個帳號的 `k/` 也一起刪**（它就是「摧毀本機紀錄」，跟 `logout` 一致，local-cache-db §10.7）；沒 `--yes` 的確認提示要把這件事講出來 | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
 | `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 local-cache-db.md §8.5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
 
 寫穿：`rooms` 把房間列表、`read`／`files`／`watch` 把印過的事件順手寫進快取（帶著這個帳號的 mxid）。**寫穿失敗只在 stderr 說一聲，命令照樣成功**（快取壞了的代價是重拉）。`--token` 模式沒有 vault 也沒有帳號目錄，沒有快取：`--from-cache` 與 `recent` 會 exit 1。
 
-### 3.6 房間金鑰備份（local-cache-db.md §10，2026-09-09 定，還沒實作）
+### 3.6 房間金鑰備份（local-cache-db.md §10，2026-09-09 定，PR #19 已實作）
 
-房間金鑰有兩份備份：server 端的標準 Matrix key backup，與本地 `accounts/<localpart>/room-keys/` 的加密金鑰池。
+房間金鑰有兩份備份：server 端的標準 Matrix key backup，與本地帳號目錄 `k/` 的加密快照。
 兩個開關都在 conf 的 `[backup]`（§10），預設都是 `on`。
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `key-backup status` | server 上有沒有 backup、本機有沒有在上傳、有沒有 recovery key（只認 `RecoveryState::Enabled`）、本地快照存在嗎／多大／什麼時候存的。⚠️ 「幾把金鑰」印不出來：上游的匯出是不透明的全量檔（local-cache-db §10.4） | `{ "server_backup_exists", "uploading_locally", "has_recovery_key", "recovery_state", "local_snapshot", "local_snapshot_bytes", "local_snapshot_saved_at" }` |
-| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。順手也跑一次 `save`（local-cache-db §10.5） | `{ "ok": true, "server_backup_exists", "has_recovery_key", "local_snapshot_bytes" }` |
-| `key-backup save` | 把 crypto store 裡的**全部**房間金鑰倒進 `room-keys/snapshot`（全量覆蓋，先寫 `.tmp` 再 rename）。一輪 PBKDF2 500k 約半秒，所以是命令觸發的（local-cache-db §10.5） | `{ "ok": true, "bytes" }` |
-| `key-backup import` | 把 `room-keys/snapshot` 餵回 crypto store（重新 `login`、或刪過 `matrix/` 之後用） | `{ "ok": true, "imported", "total" }` |
-| `key-backup restore` | 用 `<data dir>/recovery/` 保管的那把 key 恢復**這台裝置**（解 SSSS、拿回 backup 的解密金鑰）。⚠️ **重新 `login` 之後一定要跑**：新裝置的 crypto store 沒有 SSSS 的 secrets，`RecoveryState` 會是 `Incomplete`，server 上那份備份解不開（2026-09-09 對真 server 驗證時發現的缺口） | `{ "ok": true, "recovery_enabled", "recovery_state" }` |
-| `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**。⚠️ 印完拿不回來，只能 reset。🚫 不寫進任何檔、不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
+| `key-backup status` | server 上有沒有 backup、本機有沒有在上傳、secret storage 設好了沒（`recovery_enabled`，只認 `RecoveryState::Enabled`；⚠️ 它說不出那串 key 在誰手上）、本地快照存在嗎／多大／什麼時候存的。⚠️ 「幾把金鑰」印不出來：上游的匯出是不透明的全量檔（local-cache-db §10.4） | `{ "server_backup_exists", "uploading_locally", "recovery_enabled", "recovery_state", "local_snapshot", "local_snapshot_bytes", "local_snapshot_saved_at" }` |
+| `key-backup upload` | 把 store 裡的金鑰推上 server，走上游的 `wait_for_steady_state()`，**傳完才 exit**（每個命令都等會太慢，所以獨立成一個命令，維護者 2026-09-09 定）。順手也跑一次 `save`（local-cache-db §10.5） | `{ "ok": true, "server_backup_exists", "recovery_enabled", "local_snapshot_bytes" }` |
+| `key-backup save` | 把 crypto store 裡的**全部**房間金鑰倒進 `k/snapshot`（全量覆蓋，先寫 `.tmp` 再 rename）。一輪 PBKDF2 500k 約半秒，所以是命令觸發的（local-cache-db §10.5） | `{ "ok": true, "bytes" }` |
+| `key-backup import` | 把 `k/snapshot` 餵回 crypto store（重新 `login`、或刪過 `m/` 之後用） | `{ "ok": true, "imported", "total" }` |
+| `key-backup restore` | 用 `<data dir>/r/` 保管的那把 key 恢復**這台裝置**（解 SSSS、拿回 backup 的解密金鑰）。⚠️ **重新 `login` 之後一定要跑**：新裝置的 crypto store 沒有 SSSS 的 secrets，`RecoveryState` 會是 `Incomplete`，server 上那份備份解不開（2026-09-09 對真 server 驗證時發現的缺口） | `{ "ok": true, "recovery_enabled", "recovery_state" }` |
+| `key-backup recovery` | 產生 recovery key（上游 `recovery().enable()`），**印一次**，同時封進 `<data dir>/r/`（§3.6.1）。⚠️ 印完 server 那邊拿不回來，只能 reset。🚫 不進 conf、不進 log | `{ "recovery_key": "…" }`（唯一會印秘密的命令，而且只印這一次） |
 
 #### 3.6.1 `recovery`：這台機器保管著誰的 recovery key
 
-`key-backup recovery` 產生的那串 key 會封進 `<data dir>/recovery/`（local-cache-db §10.8），
+`key-backup recovery` 產生的那串 key 會封進 `<data dir>/r/`（local-cache-db §10.8），
 **`logout` 不碰那個目錄**——它是清完帳號目錄之後唯一回得去 server 備份的路。
 
 | 命令 | 做什麼 | stdout |
@@ -297,7 +297,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
            Run `wbf-cli key-backup recovery` once to create a recovery key and keep it somewhere safe;
            the server-side backup then works on any device.
            Until then the only copy that can restore your history is local:
-           <data dir>/servers/<host>/accounts/<localpart>/room-keys/
+           <data dir>/s/<b58>_<b58>/a/<b58>_<b58>/k/
   ```
 
 - `SERVER_BACKUP=off` 時，任何會拿到房間金鑰的命令印一次：
@@ -305,7 +305,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
   ```
   warning: server-side room key backup is off ([backup] SERVER_BACKUP=off in wbf.conf).
            Your room keys stay on this machine only:
-           <data dir>/servers/<host>/accounts/<localpart>/room-keys/
+           <data dir>/s/<b58>_<b58>/a/<b58>_<b58>/k/
   ```
 
 - `LOCAL_ROOM_KEYS=off` 且 `SERVER_BACKUP=off`：兩份都關，改印
@@ -318,7 +318,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 - `logout` 的閘門（local-cache-db §10.7）擋下來時，exit 1 並印：
 
   ```
-  error: this would delete the room keys on this machine (matrix/ and room-keys/), and the
+  error: this would delete the room keys on this machine (m/ and k/), and the
          server-side backup cannot be decrypted yet — its key lives in the crypto store that is
          about to be deleted. Logging out like this makes @alice:localhost's history unreadable.
          Run `wbf-cli key-backup recovery` first to create a recovery key (printed once, keep it
@@ -446,7 +446,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 - 沒有互動模式、沒有進度條以外的 UI。
 - 不存密碼，只存 token。
 - 第 3 步還沒做的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載（chat-model §6）。
-- 🚫 `key-backup` 不做「刪掉 server 上的 backup version」（不可逆，而且會連帶其他裝置，local-cache-db.md §10.8）。
+- 🚫 `key-backup` 不做「刪掉 server 上的 backup version」（不可逆，而且會連帶其他裝置，local-cache-db.md §10.9）。
 - 🚫 conf 不改寫已經存在的檔、不寫秘密（§10.3、§10.5）。
 - 🚫 不把目錄名的對照表落地成明文索引（local-cache-db.md §11.5）：那等於把剛加密的東西再寫一次明文。
 - 🚫 不把 `--password-file` 也改成原始 bytes（local-cache-db.md §12.4）：password 要送給 server，它本來就是字串。

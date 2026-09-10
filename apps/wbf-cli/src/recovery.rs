@@ -1,11 +1,11 @@
-//! recovery key 的本機保管（local-cache-db.md §10.9；維護者 2026-09-09 定）：
+//! recovery key 的本機保管（local-cache-db.md §10.8；維護者 2026-09-09 定）：
 //!
 //! ```text
 //! <data dir>/r/<b58>_<b58>             檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
 //! ```
 //!
 //! **為什麼不放在帳號目錄底下**：`logout`／`account del` 要把帳號目錄整個清乾淨
-//! （`session.sealed`、`matrix/`、`room-keys/`），而 recovery key 正好是**清完之後唯一回得去的路**——
+//! （`session.sealed`、`m/`、`k/`），而 recovery key 正好是**清完之後唯一回得去的路**——
 //! 它是「回到 server 備份的鑰匙」，不是「這台機器上的裝置狀態」。放在一起就會一起被刪，
 //! 那等於備份也沒了。
 //!
@@ -55,32 +55,44 @@ pub fn path_of(data_dir: &Path, vault: &Vault, user_id: &str) -> Result<PathBuf,
     Ok(dir(data_dir).join(name))
 }
 
-/// 這台機器保管著誰的 recovery key（`recovery list`）。
+/// 掃 `<data dir>/r/`，回「明文的 mxid → 磁碟上那個（加密的）檔名」。
 ///
-/// 掃 `<data dir>/r/` 解密**檔名**——🚫 不開檔、不解內容：列清單不需要看到金鑰本身。
-/// 解不開的檔一律跳過（別把 `local.key` 建的，fail closed）。
+/// 🚫 不開檔、不解內容：這一層只需要看得懂檔名。解不開的檔一律跳過（別把 `local.key`
+/// 建的，fail closed）。⚠️ 這是**當下**的磁碟狀態，不是快取——見 `accounts::refresh_data_dir_map`。
 ///
 /// Return:
-///     Ok(Vec<String>)   完整 mxid，排序過；一個都沒有就是空的
-pub fn list_users(data_dir: &Path, vault: &Vault) -> Result<Vec<String>, SdkError> {
+///     Ok(Vec<(String, String)>)   (完整 mxid, 檔名)；一個都沒有就是空的
+pub fn list_kept(data_dir: &Path, vault: &Vault) -> Result<Vec<(String, String)>, SdkError> {
     let key = vault.account_dir_key();
-    let mut users = Vec::new();
+    let mut kept = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir(data_dir)) else {
-        return Ok(users);
+        return Ok(kept);
     };
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(plaintext) = find_dir_name_plaintext(&key, DirScope::Recovery, &name) else {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(plaintext) = find_dir_name_plaintext(&key, DirScope::Recovery, &file_name) else {
             continue;
         };
         if let Some(user_id) = plaintext.strip_prefix(NAME_PREFIX) {
-            users.push(user_id.to_string());
+            kept.push((user_id.to_string(), file_name));
         }
     }
+    Ok(kept)
+}
+
+/// 這台機器保管著誰的 recovery key（`recovery list`）。
+///
+/// Return:
+///     Ok(Vec<String>)   完整 mxid，排序過；一個都沒有就是空的
+pub fn list_users(data_dir: &Path, vault: &Vault) -> Result<Vec<String>, SdkError> {
+    let mut users: Vec<String> = list_kept(data_dir, vault)?
+        .into_iter()
+        .map(|(user_id, _)| user_id)
+        .collect();
     users.sort();
     Ok(users)
 }
@@ -117,6 +129,9 @@ pub fn find(
 ///
 /// ⚠️ 不可逆：刪掉之後 server 上那份備份就再也解不開了。
 /// 🚫 `logout`／`account del` 不准叫這個——它們留著 recovery key 正是為了讓歷史救得回來。
+///
+/// ⚠️ 只認**精確**的 mxid（檔名是它加密出來的）。使用者打的字串要先過
+/// `accounts::DataDirMap::find_recovery_key_user_id`。
 ///
 /// Return:
 ///     Ok(true)    刪掉了
