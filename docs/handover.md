@@ -81,7 +81,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 - wbfuwunel 對 `Create` 的回應標頭 `id` 是新上傳 id，不是線上規格說的抄回 0；SDK 兩種都收，只對 `Create` 放寬。
 - `watch` 對齊「現在」要一次 sync，debug build 啟動超過一秒；測時序要留餘裕。
 - Windows 主執行緒棧只有 1 MB，debug build 的 `send` 會爆棧；`main.rs` 把 runtime 跑在 64 MiB 棧的執行緒上。新增大的 async 路徑如果又爆，先懷疑這個。
-- `logout` 一定要連 `matrix/` 一起刪：Matrix logout 讓裝置失效，留著的 crypto store 會擋下一次 `login`（"account in the store doesn't match"）。`cache.db` 反過來要留（維護者定），只有這個 server 最後一個帳號登出才刪。
+- `logout` 一定要連 `m/`（matrix-sdk 的 crypto store）一起刪：Matrix logout 讓裝置失效，留著的 crypto store 會擋下一次 `login`（"account in the store doesn't match"）。`cache.db` 反過來要留（維護者定），只有這個 server 最後一個帳號登出才刪。
 - 快取讀寫都要帶「我是誰」（mxid）：`Context::cache()` 回 `(Cache, me)`；漏帶就變成別人的視角。SDK 端沒有預設值可以偷懶。
 - 編 SQLCipher（`cache` feature，wbf-cli 預設帶）在 Windows 要 Strawberry Perl 在 PATH 前面，不然 openssl-sys 的 build script 掛在 `Configure`。
 
@@ -102,7 +102,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
 還沒做的：
 
 0. **房間金鑰備份與周邊**（維護者 2026-09-09 提）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10。
-   ✅ **PR #19 合併了大半**：兩層路徑加密、`account` 一族、CLI 輸出英文、金鑰備份（server 端 backup、本地全量快照、`key-backup` 五個子命令、`logout` 的兩關閘門、`r/` 獨立保管與 `recovery list`／`show`）。
+   ✅ **PR #19 合併了大半**：兩層路徑加密、`account` 一族、CLI 輸出英文、金鑰備份（server 端 backup、本地全量快照、`key-backup` 六個子命令（status／upload／save／import／restore／recovery）、`logout` 的兩關閘門、`r/` 獨立保管與 `recovery list`／`show`）。
    ⚠️ **還沒做的**（這一項要收掉就剩這兩塊）：conf 檔（CLI 規格 §10）、passphrase 改吃原始 bytes（local-cache-db §12）。
    ⚠️ PR #19 是 **breaking 的**：舊的 data dir（明文目錄名）一律**砍掉重來，🚫 不寫遷移**。本機測試環境要重新 `login`。
    ✅ **2026-09-09 對真 server 跑過全流**（步驟見 §4 的 9b），含 principal 修正的迴歸（current=alice 刪 bob 時看的是 bob 的狀態）。

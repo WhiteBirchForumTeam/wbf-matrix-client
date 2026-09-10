@@ -889,7 +889,9 @@ async fn destroy_account_command(
         return Err(SdkError::Usage("cancelled".into()));
     }
     // 先裝置層（logout、session.sealed、m/）再資料層：反過來的話 logout 要用的 session 已經被刪了。
-    log_out_account(context, &account, accept_history_loss).await?;
+    // 回顯用 logout 那邊的權威描述，🚫 不是使用者打進來的字串——`account del` 印的就是這個，
+    // 兩個命令對同一個帳號要印同一件事（PR #21 審查 rumia🟢2）。
+    let described = log_out_account(context, &account, accept_history_loss).await?;
     // ⚠️ destroy 的語意是「什麼都不留」，所以連 recovery key 也摧毀（維護者 2026-09-09）。
     // 🚫 `logout`／`account del` 不做這件事——它們留著它正是為了讓歷史救得回來。
     // 這一步之後，server 上那份備份就永遠解不開了。
@@ -925,7 +927,7 @@ async fn destroy_account_command(
         }
     }
     print_json(&json!({
-        "ok": true, "user": user,
+        "ok": true, "user": described,
         "events_removed": report.events_removed, "media_removed": report.media_removed,
         "pool_files_removed": files_removed,
     }))
