@@ -391,7 +391,7 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 | 流 | 現況 |
 |---|---|
 | 房間事件 | ✅ `Event/Recent` 已經是拉窗＋水位（`cg_seq`） |
-| **to-device（金鑰）** | ❌ 還沒有。設計時要**跟 `Recent` 同構**：拉窗＋游標＋ack |
+| **to-device（金鑰）** | ❌ 還沒有。提案寫好了：[`to-device-push-proposal.md`](to-device-push-proposal.md)（`0x16 Device`，**推送為主、`Fetch` 補洞、`Ack` 才刪**），四個問題等 wbfuwunel 拍板 |
 
 📎 好消息：wbfuwunel 那邊 `get_to_device_events(user, device, since, to)` **本來就吃游標**，
 `remove_to_device_events(user, device, until)` 就是 ack 之後的清理。所以 server 端要加的是**一個新的 opcode**，
