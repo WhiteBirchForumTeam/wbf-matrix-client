@@ -30,6 +30,7 @@ pub(crate) async fn backend(context: &Context) -> Result<MatrixBackend, SdkError
         &session,
         &context.account()?.matrix_store_dir(),
         &context.vault()?.matrix_store_key(),
+        context.server_backup,
     )
     .await?;
     backend.sync_once(None, Duration::ZERO).await?;

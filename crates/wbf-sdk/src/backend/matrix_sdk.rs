@@ -66,8 +66,9 @@ impl MatrixBackend {
         device_name: &str,
         store_dir: &Path,
         store_key: &Key32,
+        server_backup: bool,
     ) -> Result<(MatrixBackend, Session), SdkError> {
-        let client = build_client(server, store_dir, store_key).await?;
+        let client = build_client(server, store_dir, store_key, server_backup).await?;
         let response = client
             .matrix_auth()
             .login_username(user, password)
@@ -91,8 +92,9 @@ impl MatrixBackend {
         session: &Session,
         store_dir: &Path,
         store_key: &Key32,
+        server_backup: bool,
     ) -> Result<MatrixBackend, SdkError> {
-        let client = build_client(&session.server, store_dir, store_key).await?;
+        let client = build_client(&session.server, store_dir, store_key, server_backup).await?;
         let user_id = UserId::parse(&session.user_id)
             .map_err(|error| SdkError::Usage(format!("session user_id: {error}")))?;
         client
@@ -348,10 +350,19 @@ impl ChatBackend for MatrixBackend {
 /// 不是換裝置）。這句話要出現在警告與 `logout` 的閘門裡。
 ///
 /// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，🚫 不一開機就全下載。
-fn backup_encryption_settings() -> EncryptionSettings {
+///
+/// Args:
+///     server_backup: conf 的 `SERVER_BACKUP`（CLI 規格 §10）, example: true
+/// Return:
+///     EncryptionSettings   `server_backup` 是 false 時只有 `auto_enable_backups` 關掉
+fn backup_encryption_settings(server_backup: bool) -> EncryptionSettings {
     EncryptionSettings {
-        auto_enable_backups: true,
+        auto_enable_backups: server_backup,
+        // ⚠️ cross-signing 不跟著關：`SERVER_BACKUP=off` 說的是「不要上傳房間金鑰」，
+        // 不是「不要驗裝置」。把兩件事綁在一起會讓關掉備份的人連裝置驗證都沒了。
         auto_enable_cross_signing: true,
+        // 🚫 下載策略也不跟著關：server 上**已經有**的 backup（之前開著時傳的、或別台傳的）
+        // 仍然該在解不開訊息時派上用場。關掉的是「往上傳」，不是「往下拿」。
         backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
     }
 }
@@ -521,6 +532,7 @@ async fn build_client(
     server: &str,
     store_dir: &Path,
     store_key: &Key32,
+    server_backup: bool,
 ) -> Result<Client, SdkError> {
     std::fs::create_dir_all(store_dir)?;
     // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
@@ -529,7 +541,7 @@ async fn build_client(
     Client::builder()
         .homeserver_url(server)
         .request_config(RequestConfig::new().timeout(crate::channel::REQUEST_TIMEOUT))
-        .with_encryption_settings(backup_encryption_settings())
+        .with_encryption_settings(backup_encryption_settings(server_backup))
         .sqlite_store_with_config_and_cache_path(store_config, None::<&Path>)
         .build()
         .await
