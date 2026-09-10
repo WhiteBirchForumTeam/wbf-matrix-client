@@ -65,7 +65,7 @@ to-device 的游標前進表示「可以刪了」，**錯了就沒了**。要讓
 | `0x01 Fetch` | client → server | `{ "limit": 100?, "cd_seq": <count>?, "to": <count>? }`，`id` 由 client 選 | 無 | 無序 |
 | `0x02 Batch` | **server → client** | `{ "tc", "bc", "oldest", "newest", "counts": [...], "r" }`；`id` 抄 `Fetch`，`seq` 從 0 嚴格 +1 | `bc` 則事件，u32 大端長度 ＋ JSON | 有序 |
 | `0x03 Ack` | client → server | `{ "until": <count> }` | 無 | 無序 |
-| `0x04 Subscribe` | client → server | `{ "cd_seq": <count>? }`，`id` 由 client 選 | 無 | 無序 |
+| `0x04 Subscribe` | client → server | `{ "device_id": "…", "cd_seq": <count>? }`，`id` 由 client 選（§5） | 無 | 無序 |
 | `0x05 Unsubscribe` | client → server | `{}` | 無 | 無序 |
 | `0x06 Push` | **server → client** | `{ "bc", "oldest", "newest", "counts": [...], "gap": bool }`；`id` 抄 `Subscribe`，`seq` 每推一次 +1 | 同 `Batch` 的切法 | 事件驅動 |
 
@@ -104,28 +104,39 @@ to-device 沒有這個位置，所以 meta 要帶 `counts: [c1, c2, …]`（`bc`
 - **`seq` 只是這條連線的推送序號**，🚫 client 不要拿跳號算少了幾則；水位只認 `newest`。
 - **`gap` 只對「下一個 `Push`」有意義**：重連、切回前景，一律 `Fetch` 對一次。
 
-## 5. ⚠️ 訂閱者的身分：這裡跟 `Event` 打架
+## 5. 訂閱時要帶 `device_id`（維護者 2026-09-10 定的做法）
 
-`wbf-event-push.md` §1 定的是：**訂閱者的識別碼是連線（`connection_id`），刻意不是
-`(user, device)`**，理由是「一個裝置會開多條連線，哪條處理事件是 client 的事」。
+⚠️ 先更正一個我一開始想錯的方向：`wbf-event-push.md` §1 定「訂閱者的識別碼是連線
+（`connection_id`）」**沒有問題**——那是**協議層**，協議層只認連線是對的。
+🚫 這件事不該去動 WS 那一層。
 
-那個理由對房間事件成立，因為推送是**非破壞性**的：兩條連線各收一份，重複了 client 自己去重。
-
-**to-device 不成立**：`Ack` 會刪。同一個裝置開兩條連線都訂閱：
+問題在**登記的時候**。`Ack` 是破壞性的，同一個裝置開兩條連線都訂閱 to-device：
 
 ```
 連線 A 收到 count=500 的 m.room_key，匯入成功，Ack{until:500}
-連線 B 也收到了，但還在處理 → server 已經刪了 → B 那邊如果失敗，救不回來
+連線 B 也收到了，但還在處理 → server 已經刪了 → B 那邊失敗就救不回來
 ```
 
-📎 好消息是 server 已經有這個資訊：`Subscriber` 結構裡就存著 `user` 與 `device`
-（PR #36 說「訂閱者的 `device` 不存在 registry 裡（`Session` 有）」——`Session` 有就夠了）。
+**做法**（維護者 2026-09-10）：`Device/Subscribe` 的 meta **帶 `device_id`**，
+server 用它判斷是不是重複訂閱，並把那條 `connection_id` **綁定到該裝置**。
 
-**提案：一個 `(user, device)` 同時只准一條連線訂閱 to-device。** 第二條來訂就回
-`Error(Conflict)`，訊息說已經有另一條連線在收。⚠️ fail closed：寧可拒絕第二條，
-也不要兩條各自 ack 把對方的金鑰刪掉。
+```jsonc
+{ "device_id": "ABCDEFG", "cd_seq": 12345 }
+```
 
-🚫 不要「後來的踢掉先來的」：那會讓一個手滑開兩個 rpc-cli 的人靜默地換掉正在同步的那條。
+- server 端多一張 `device → connection_id` 的表；已經有人在訂就回 `Error(Conflict)`，
+  訊息說已經有另一條連線在收。
+- 連線斷掉（`ConnectionGuard` drop）時解除綁定，下一條連得上。
+- 🚫 **不要「後來的踢掉先來的」**：那會讓一個手滑開兩個 rpc-cli 的人靜默地換掉正在同步的那條。
+
+⚠️ **`device_id` 必須跟 session 的對得上，對不上就拒絕。** 連線是 `Session/Login` 換來的，
+session 裡那個才是權威；client 帶進來的只是**明示意圖**，不是身分來源。
+🚫 不驗的話，裝置 A 可以訂閱裝置 B 的 to-device，然後 `Ack` 把 B 的金鑰刪光——
+那是同一個帳號底下的橫向破壞，而 to-device 正是「刪了就救不回來」的東西。
+
+📎 為什麼還要帶（既然 session 已經知道）：`Subscribe` 是**登記**的動作，把鍵明寫在請求裡，
+server 端那張表要用哪個鍵、client 端在訂什麼，兩邊都不必從 session 推。
+出錯時錯誤訊息也講得出「你用 `ABCDEFG` 訂，但這條連線的 session 是 `HIJKLMN`」。
 
 ## 6. 保留期：`Ack` 是唯一的刪除入口
 
@@ -142,8 +153,8 @@ to-device 沒有這個位置，所以 meta 要帶 `counts: [c1, c2, …]`（`bc`
 1. **ack 的語意**：`Ack{until}` 表示「收到」還是「處理完」？
    client 這邊想要的是**後者**（匯進 crypto store 成功才 ack），
    因為前者一失敗就永遠救不回來。代價是 server 要留久一點。
-2. **同一裝置多條連線**（§5）：接受「一個 `(user, device)` 只准一條訂閱」嗎？
-   還是有別的想法（例如 ack 要帶 `connection_id`、server 記每條連線各自的進度）？
+2. **同一裝置多條連線**（§5）：`Subscribe` 帶 `device_id`、server 綁 `connection_id`、
+   重複訂閱回 `Error(Conflict)`——這個做法可以嗎？綁定的表放哪（`channels` service 旁邊？）？
 3. **保留上限**（§6）：沒 ack 的 to-device 留多久？有沒有筆數上限？滿了丟最舊的還是拒收？
 4. **`limit` 的上界**：跟 `Recent` 一樣由 `Hello` 的 features 宣告嗎？
    `wbf_push_max_events_per_pack`（現在是 10）要不要有 to-device 自己的一個？
@@ -151,7 +162,7 @@ to-device 沒有這個位置，所以 meta 要帶 `counts: [c1, c2, …]`（`bc`
 ## 8. client 端會怎麼用它（給 server 端理解脈絡）
 
 ```
-daemon 啟動、Login → Subscribe{cd_seq: 上次存的}   ← 先登記，再補洞
+daemon 啟動、Login → Subscribe{device_id, cd_seq: 上次存的}   ← 先登記，再補洞
                   → Device/Fetch(cd_seq) 補一窗    ← 離線期間漏的
                   → 逐則匯進 crypto store（OlmMachine::receive_sync_changes）
                   → Ack{until: 最後一則成功的 count}
