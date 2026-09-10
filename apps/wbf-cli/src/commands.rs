@@ -21,8 +21,8 @@ use wbf_sdk::{
 use wbf_sdk::vault::write_private;
 
 use crate::unlock::{
-    default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_password_file,
-    UnlockOptions,
+    default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_passphrase_file,
+    read_password_file, UnlockOptions,
 };
 use crate::{AccountAction, Cli, Command, KeyBackupAction, LoginArgs, RecoveryAction, UploadArgs};
 
@@ -56,7 +56,7 @@ pub async fn run(cli: Cli) -> Result<(), SdkError> {
         } => {
             let mut vault = context.unlock.open_vault()?;
             let passphrase = match new_passphrase_file {
-                Some(path) => read_password_file(&path)?,
+                Some(path) => read_passphrase_file(&path)?,
                 None => prompt_new_passphrase()?,
             };
             vault.set_unlock(&wbf_sdk::Unlock::Passphrase(passphrase))?;

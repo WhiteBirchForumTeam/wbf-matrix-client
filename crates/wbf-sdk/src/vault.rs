@@ -77,7 +77,10 @@ impl std::fmt::Debug for Key32 {
 pub enum Unlock {
     NoPassphrase,
     /// 🚫 不接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
-    Passphrase(Zeroizing<String>),
+    /// ⚠️ **原始 bytes，不是字串**（local-cache-db.md §12）：passphrase 只餵給本機的
+    /// Argon2id，永遠不出這台機器，所以它可以是 UTF-8 的中文、可以是一個 mp3。
+    /// 🚫 不驗 UTF-8、🚫 不去尾換行——那是 `--password-file`（要送給 homeserver）的規則。
+    Passphrase(Zeroizing<Vec<u8>>),
 }
 
 /// `local.key` 現在是哪一種鎖法。
@@ -157,7 +160,7 @@ impl Vault {
     ///
     /// Args:
     ///     dir: example: "<data dir>/wbf-cli"
-    ///     unlock: example: Unlock::Passphrase("hunter2".to_string().into())
+    ///     unlock: example: Unlock::Passphrase(b"hunter2".to_vec().into())
     /// Return:
     ///     Ok(Vault)
     ///     Err(Usage)   沒有 local.key、檔案壞了、模式與 unlock 配不上、passphrase 錯
@@ -528,7 +531,7 @@ impl Vault {
 }
 
 /// Argon2id 從 passphrase 導 KEK。參數從檔裡來，所以舊檔用舊參數解得開。
-fn derive_kek(passphrase: &str, kdf: &KdfParams) -> Result<Key32, SdkError> {
+fn derive_kek(passphrase: &[u8], kdf: &KdfParams) -> Result<Key32, SdkError> {
     if kdf.name != "argon2id" {
         return Err(SdkError::Usage(format!(
             "key file uses kdf {:?}, which this build does not know",
@@ -546,7 +549,7 @@ fn derive_kek(passphrase: &str, kdf: &KdfParams) -> Result<Key32, SdkError> {
         .map_err(|error| SdkError::Usage(format!("key file kdf params: {error}")))?;
     let mut kek = Key32([0u8; 32]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut kek.0)
+        .hash_password_into(passphrase, &salt, &mut kek.0)
         .map_err(|error| SdkError::Usage(format!("argon2: {error}")))?;
     Ok(kek)
 }
@@ -676,7 +679,7 @@ mod tests {
     #[test]
     fn passphrase_mode_needs_the_right_passphrase() {
         let dir = scratch_dir("passphrase");
-        let passphrase = Unlock::Passphrase("hunter2".to_string().into());
+        let passphrase = Unlock::Passphrase(b"hunter2".to_vec().into());
         let created = Vault::create(&dir, &passphrase).unwrap();
         assert_eq!(created.mode(), KeyMode::Passphrase);
         let opened = Vault::open(&dir, &passphrase).unwrap();
@@ -684,7 +687,7 @@ mod tests {
             created.master_key().as_bytes(),
             opened.master_key().as_bytes()
         );
-        assert!(Vault::open(&dir, &Unlock::Passphrase("hunter3".to_string().into())).is_err());
+        assert!(Vault::open(&dir, &Unlock::Passphrase(b"hunter3".to_vec().into())).is_err());
         assert!(Vault::open(&dir, &Unlock::NoPassphrase).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -693,9 +696,9 @@ mod tests {
     fn plain_mode_rejects_a_passphrase_and_empty_passphrase_is_not_a_passphrase() {
         let dir = scratch_dir("mismatch");
         Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
-        assert!(Vault::open(&dir, &Unlock::Passphrase("x".to_string().into())).is_err());
+        assert!(Vault::open(&dir, &Unlock::Passphrase(b"x".to_vec().into())).is_err());
         let dir2 = scratch_dir("empty");
-        assert!(Vault::create(&dir2, &Unlock::Passphrase(String::new().into())).is_err());
+        assert!(Vault::create(&dir2, &Unlock::Passphrase(Vec::new().into())).is_err());
         assert!(!dir2.join(KEY_FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -709,9 +712,9 @@ mod tests {
         let sealed = dir.join(SEALED_SESSION_FILE_NAME);
         vault.seal_session(&sealed, &sample_session()).unwrap();
         vault
-            .set_unlock(&Unlock::Passphrase("pw".to_string().into()))
+            .set_unlock(&Unlock::Passphrase(b"pw".to_vec().into()))
             .unwrap();
-        let reopened = Vault::open(&dir, &Unlock::Passphrase("pw".to_string().into())).unwrap();
+        let reopened = Vault::open(&dir, &Unlock::Passphrase(b"pw".to_vec().into())).unwrap();
         assert_eq!(before.as_bytes(), reopened.master_key().as_bytes());
         // session.sealed 沒動，還解得開。
         assert_eq!(
@@ -786,14 +789,14 @@ mod tests {
     #[test]
     fn oversized_argon2_params_in_key_file_are_refused() {
         let dir = scratch_dir("argon2-limit");
-        Vault::create(&dir, &Unlock::Passphrase("pw".to_string().into())).unwrap();
+        Vault::create(&dir, &Unlock::Passphrase(b"pw".to_vec().into())).unwrap();
         let path = dir.join(KEY_FILE_NAME);
         let text = std::fs::read_to_string(&path)
             .unwrap()
             .replace("\"m_kib\": 65536", "\"m_kib\": 2000000");
         assert!(text.contains("2000000"), "fixture did not rewrite m_kib");
         std::fs::write(&path, text).unwrap();
-        let error = match Vault::open(&dir, &Unlock::Passphrase("pw".to_string().into())) {
+        let error = match Vault::open(&dir, &Unlock::Passphrase(b"pw".to_vec().into())) {
             Ok(_) => panic!("oversized argon2 params were accepted"),
             Err(error) => error,
         };

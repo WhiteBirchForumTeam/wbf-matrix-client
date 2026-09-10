@@ -79,13 +79,13 @@ impl UnlockOptions {
         if Vault::read_mode(&self.data_dir)? == KeyMode::Plain {
             // Plain 模式不看 ticket：給了 passphrase 檔就讓 Vault::open 用「配不上」拒絕，不靜默忽略。
             let unlock = match &self.passphrase_file {
-                Some(path) => Unlock::Passphrase(read_password_file(path)?),
+                Some(path) => Unlock::Passphrase(read_passphrase_file(path)?),
                 None => Unlock::NoPassphrase,
             };
             return Vault::open(&self.data_dir, &unlock);
         }
         if let Some(path) = &self.passphrase_file {
-            let passphrase = read_password_file(path)?;
+            let passphrase = read_passphrase_file(path)?;
             let vault = Vault::open(&self.data_dir, &Unlock::Passphrase(passphrase))?;
             self.write_ticket(&vault)?;
             return Ok(vault);
@@ -97,7 +97,7 @@ impl UnlockOptions {
                 KeyMode::Passphrase,
             ));
         }
-        let passphrase = prompt_password_on_terminal("passphrase: ")?;
+        let passphrase = prompt_passphrase_on_terminal("passphrase: ")?;
         let vault = Vault::open(&self.data_dir, &Unlock::Passphrase(passphrase))?;
         self.write_ticket(&vault)?;
         Ok(vault)
@@ -110,7 +110,7 @@ impl UnlockOptions {
             return self.open_vault();
         }
         let unlock = match &self.passphrase_file {
-            Some(path) => Unlock::Passphrase(read_password_file(path)?),
+            Some(path) => Unlock::Passphrase(read_passphrase_file(path)?),
             None => Unlock::NoPassphrase,
         };
         let vault = Vault::create(&self.data_dir, &unlock)?;
@@ -226,7 +226,26 @@ fn is_private_mode(_path: &Path) -> Result<bool, SdkError> {
     Ok(true)
 }
 
-/// `--password-file`／`--passphrase-file` 的規則（CLI 規格 §3.1）：整檔就是那句話，去掉結尾一個換行。
+/// `--passphrase-file` 的規則（local-cache-db.md §12）：**整檔原始 bytes**。
+///
+/// 🚫 不去尾換行、🚫 不驗 UTF-8、🚫 不 trim：passphrase 只餵給本機的 Argon2id，永遠不出這台
+/// 機器，所以它可以是中文、可以是一個 mp3。⚠️ 這代表 `echo hunter2 > pw`（結尾有 `\n`）跟
+/// `printf hunter2 > pw` 是**兩個不同的 passphrase**——檔案就是檔案，🚫 我們不替使用者猜
+/// 哪個 byte 不算數。
+///
+/// 🚫 `--password-file` 不走這個（§12.4）：那句話要送給 homeserver，Matrix 規定它是 JSON
+/// 字串，塞不進任意 bytes。兩者長得像，但一個是本機的鑰匙、一個是要上線的憑證。
+///
+/// Args:
+///     path: example: "/tmp/pw"
+/// Return:
+///     Ok(Zeroizing<Vec<u8>>)   整檔，一個 byte 都不動
+///     Err(Io)                  讀不到
+pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+    Ok(Zeroizing::new(std::fs::read(path)?))
+}
+
+/// `--password-file` 的規則（CLI 規格 §3.1）：整檔就是那句話，去掉結尾一個換行。
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>, SdkError> {
     let text = Zeroizing::new(std::fs::read_to_string(path)?);
     let trimmed = text
@@ -255,12 +274,22 @@ pub fn prompt_password_on_terminal(label: &str) -> Result<Zeroizing<String>, Sdk
     Ok(Zeroizing::new(rpassword::prompt_password(label)?))
 }
 
+/// 從終端讀 passphrase：那一行的 UTF-8 bytes，不含結尾換行。
+///
+/// ⚠️ 終端只打得出字，所以這是 §12 那個「任意 bytes」的天然子集——同一句話從終端打
+/// 與用 `printf` 寫進檔案是**同一個** passphrase，用 `echo` 寫的（多一個 `\n`）不是。
+pub fn prompt_passphrase_on_terminal(label: &str) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+    Ok(Zeroizing::new(
+        prompt_password_on_terminal(label)?.as_bytes().to_vec(),
+    ))
+}
+
 /// 問兩次、要一樣（設新的 passphrase 用）。
-pub fn prompt_new_passphrase() -> Result<Zeroizing<String>, SdkError> {
-    let first = prompt_password_on_terminal("new passphrase: ")?;
-    let second = prompt_password_on_terminal("again: ")?;
+pub fn prompt_new_passphrase() -> Result<Zeroizing<Vec<u8>>, SdkError> {
+    let first = prompt_passphrase_on_terminal("new passphrase: ")?;
+    let second = prompt_passphrase_on_terminal("again: ")?;
     if *first != *second {
-        return Err(SdkError::Usage("the two passwords differ".into()));
+        return Err(SdkError::Usage("the two passphrases differ".into()));
     }
     Ok(first)
 }
@@ -340,6 +369,55 @@ mod tests {
         with_pw.passphrase_file = Some(password_file(&with_pw.data_dir, "x"));
         assert!(with_pw.open_vault().is_err());
         let _ = std::fs::remove_dir_all(&with_pw.data_dir);
+    }
+
+    #[test]
+    fn a_passphrase_file_is_taken_byte_for_byte() {
+        // §12：檔案就是檔案。`echo` 寫的（結尾 \n）與 `printf` 寫的是兩個不同的 passphrase，
+        // 🚫 不替使用者猜哪個 byte 不算數——猜錯的那天是 local.key 打不開。
+        let dir = std::env::temp_dir().join(format!("wbf-pp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let with_newline = dir.join("echo");
+        std::fs::write(&with_newline, b"hunter2\n").unwrap();
+        assert_eq!(
+            &**read_passphrase_file(&with_newline).unwrap(),
+            b"hunter2\n"
+        );
+
+        let without = dir.join("printf");
+        std::fs::write(&without, b"hunter2").unwrap();
+        assert_eq!(&**read_passphrase_file(&without).unwrap(), b"hunter2");
+
+        // 不是合法 UTF-8 也照讀（維護者：可以是一個 mp3）。
+        let binary = dir.join("mp3");
+        std::fs::write(&binary, [0xffu8, 0xfe, 0x00, 0x80]).unwrap();
+        assert_eq!(
+            &**read_passphrase_file(&binary).unwrap(),
+            &[0xffu8, 0xfe, 0x00, 0x80]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_binary_passphrase_opens_the_vault_it_created() {
+        let mut options = scratch_options("binary-pp", 0);
+        let path = options.data_dir.join("pp");
+        std::fs::create_dir_all(&options.data_dir).unwrap();
+        // 中文加一個 0x00：兩者以前都過不了 `read_to_string`。
+        std::fs::write(&path, "早安\u{0}世界".as_bytes()).unwrap();
+        options.passphrase_file = Some(path.clone());
+        assert_eq!(
+            options.open_or_create_vault().unwrap().mode(),
+            KeyMode::Passphrase
+        );
+        assert!(options.open_vault().is_ok());
+
+        // 少一個 byte 就是另一句話。
+        std::fs::write(&path, "早安\u{0}世界\n".as_bytes()).unwrap();
+        assert!(options.open_vault().is_err(), "多一個換行不該還開得起來");
+        let _ = std::fs::remove_dir_all(&options.data_dir);
     }
 
     #[test]
