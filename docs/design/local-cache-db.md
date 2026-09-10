@@ -324,7 +324,7 @@ CREATE INDEX event_media_by_media ON event_media (media);
 ### 8.2 磁碟上
 
 ```
-servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3，32 位小寫 hex；原檔名、mimetype、mxc 只在 cache.db
+s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3，32 位小寫 hex；原檔名、mimetype、mxc 只在 cache.db
 ```
 
 - **檔名是明文的 hash**（維護者 2026-09-07 定，取代草稿的隨機 id）：同內容不同 mxc 只存一份；`media.pool_file` 指過來，`media_by_pool_file` 索引回答「這個檔被幾個 mxc 指著」，清檔前要問。下載中還算不出 hash，先用 `media.id` 當暫存名，完成算完 hash 再 rename、寫回 `pool_file`。
@@ -454,7 +454,7 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 
 ### 10.1 為什麼要有這一章
 
-在這一章之前，房間金鑰（Megolm inbound session）**只活在一個地方**：`accounts/<localpart>/matrix/crypto.db`。
+在這一章之前，房間金鑰（Megolm inbound session）**只活在一個地方**：帳號目錄底下的 `m/crypto.db`（那時還叫 `matrix/`）。
 整個 repo 沒有任何一行碰 `/room_keys`、backup、recovery。這代表：
 
 - 換一台機器、重灌、`logout`，**歷史訊息永久解不開**。事件本身還在 server 上，但沒有鑰匙。
@@ -470,7 +470,7 @@ servers/<server host>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3�
 
 | | server 端（標準 Matrix key backup） | 本地端（我們自己的加密金鑰池） |
 |---|---|---|
-| 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | `accounts/<localpart>/room-keys/`（§10.4） |
+| 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | 帳號目錄的 `k/`（§10.4） |
 | 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §10.3） | 意外：`crypto.db` 壞掉、`matrix/` 被刪掉重 `login`、server 端資料沒了 |
 | 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，§4） |
 | 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§10.6） | **命令觸發**：`key-backup save`，`upload` 時順手一起（§10.5） |
@@ -494,9 +494,10 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
 
   這句話要出現在警告裡（警告的原文在 CLI 規格 §3.6），不能只說「你還沒設 recovery key」。
 - **recovery key 不自動印**（維護者定）。顯式入口是 `key-backup recovery`（CLI 規格 §3.6）：走上游的 `recovery().enable()`，
-  把 recovery key 印**一次**並說明拿不回來（只能 reset）。🚫 不寫進任何檔、不進 conf、不進 log。
+  把 recovery key 印**一次**並說明拿不回來（只能 reset）。同一個命令會把它封進 `<data dir>/r/`（§10.8）——
+  🚫 但仍然不進 conf、不進 log，而且那份保管**不算「使用者擁有」**（同一台機器，一起被拿走就一起沒了）。
 - 關掉（`SERVER_BACKUP=off`）就是 `auto_enable_backups: false` 且不跑上傳；**已經在 server 上的 version 不動、不刪**
-  （刪 server 端備份是不可逆的，要顯式命令，見 §10.8）。
+  （刪 server 端備份是不可逆的，要顯式命令，見 §10.9）。
 
 ### 10.4 本地端：一個全量快照檔（2026-09-09 實作時改的）
 
@@ -554,15 +555,18 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 
 - `key-backup upload` 走上游的 `backups().wait_for_steady_state()`，印上傳進度與結果，完成才 exit。
 - 代價老實寫：**server 那份會長期落後**，落後多少由使用者跑不跑這個命令決定。
-  這個代價可以接受，是因為本地那份是同步寫的 —— 最壞情況是「server 落後」，不是「金鑰消失」。
-- `key-backup status` 印：本地池有幾把、crypto store 有幾把、server 上的 version 與 count、是否落後、有沒有 recovery key。
-  🚫 不印任何金鑰內容。
+  ⚠️ 🚫 這個代價**不是**靠本地那份補起來的——本地那份同樣是命令觸發的（§10.5），兩者會一起落後。
+  真正的保險是 §10.3 的 server 端 backup 加 recovery key。
+- `key-backup status` 印這幾個欄位（🚫 不印任何金鑰內容）：
+  `server_backup_exists`、`uploading_locally`、`recovery_enabled`、`recovery_state`、
+  `local_snapshot`、`local_snapshot_bytes`、`local_snapshot_saved_at`。
+  ⚠️ 逐把的計數印不出來：上游只給整包匯出，沒有「crypto store 裡有幾把」這種問法（§10.4）。
 
-### 10.7 誰刪 `room-keys/`：意外留門，離開就清乾淨
+### 10.7 誰刪 `k/`：意外留門，離開就清乾淨
 
 分界是**這次是意外還是有意的**（維護者 2026-09-09 定）：
 
-| 情形 | `matrix/` | `room-keys/` | 怎麼把歷史找回來 |
+| 情形 | `m/` | `k/` | 怎麼把歷史找回來 |
 |---|---|---|---|
 | **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
 | **有意**：`logout`／`account del <user>`（同一件事，CLI 規格 §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
@@ -579,7 +583,7 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 所以 `logout` 前面加一道閘門，寫成**正面認得**的形式：
 
 ```
-准走（照常 logout，room-keys/ 一起刪）  ⟸  ① server 上有 backup ＆ recovery().state() == Enabled
+准走（照常 logout，k/ 一起刪）  ⟸  ① server 上有 backup ＆ recovery().state() == Enabled
                                           ＆ ② 這台機器保管著這個帳號的 recovery key（§10.8）
 其他任何狀態                            ⟹  exit 1，要 --accept-history-loss 才走
 ```
@@ -587,8 +591,8 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 ⚠️ **兩關都要過，而且第二關才是真的**（維護者 2026-09-09）：`RecoveryState::Enabled` 的上游定義是
 「secret storage is set up and we have all the secrets locally」——它說得出 SSSS 設好了，
 **說不出那串 recovery key 在誰手上**。跑過 `key-backup recovery`、印出來、沒抄就關掉終端的人，
-第一關照樣過。第二關看的是 `<data dir>/recovery/` 有沒有封著這個帳號的 key，
-而那個目錄 `logout` 不碰——所以刪完 `matrix/` 與 `room-keys/` 之後它還在，歷史真的救得回來。
+第一關照樣過。第二關看的是 `<data dir>/r/` 有沒有封著這個帳號的 key，
+而那個目錄 `logout` 不碰——所以刪完 `m/` 與 `k/` 之後它還在，歷史真的救得回來。
 
 🚫 **不問使用者手打 recovery key**（維護者 2026-09-09 定）：既然我們自己就保管著，問他等於刁難。
 
@@ -605,11 +609,11 @@ server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損
 ### 10.8 recovery key 存哪：獨立的資料夾，`logout` 不碰（維護者 2026-09-09 定）
 
 ```
-<data dir>/recovery/<b58>_<b58>      檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
+<data dir>/r/<b58>_<b58>            檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
 ```
 
 **為什麼不放在帳號目錄底下**：`logout`／`account del` 要把帳號目錄整個清乾淨
-（`session.sealed`、`matrix/`、`room-keys/`），而 recovery key 正好是**清完之後唯一回得去的路**。
+（`session.sealed`、`m/`、`k/`），而 recovery key 正好是**清完之後唯一回得去的路**。
 放在一起就會一起被刪，那等於 server 上的備份也沒了——閘門（§10.7）就變成在檢查一個馬上要被自己刪掉的東西。
 
 | 誰 | 對 recovery key 做什麼 |
