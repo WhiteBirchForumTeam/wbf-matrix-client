@@ -113,7 +113,7 @@ pub enum RecoveryAction {
 /// 房間金鑰備份（local-cache-db.md §10）。
 #[derive(Subcommand)]
 pub enum KeyBackupAction {
-    /// server 上的 backup version、有沒有 recovery key、本機備份幾把金鑰
+    /// server 上的 backup、secret storage 設好了沒、本地快照存在嗎／多大／什麼時候存的
     Status,
     /// 把 crypto store 裡的金鑰推上 server，傳完才 exit（上游的上傳是背景 task，命令 exit 就被 abort）
     Upload,

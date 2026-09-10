@@ -282,18 +282,23 @@ impl DataDirMap {
                 &self.servers,
                 |entry| &entry.server.plaintext,
                 &server_host_of(server),
-            )
+                "server",
+            )?
             .into_iter()
             .collect(),
             None => self.servers.iter().collect(),
         };
-        let matches: Vec<(&ServerEntry, &Mapping)> = servers
-            .into_iter()
-            .filter_map(|entry| {
-                find_one(&entry.accounts, |account| &account.plaintext, localpart)
-                    .map(|account| (entry, account))
-            })
-            .collect();
+        let mut matches: Vec<(&ServerEntry, &Mapping)> = Vec::new();
+        for entry in servers {
+            if let Some(account) = find_one(
+                &entry.accounts,
+                |account| &account.plaintext,
+                localpart,
+                "account",
+            )? {
+                matches.push((entry, account));
+            }
+        }
         match matches.as_slice() {
             [] => Err(SdkError::Usage(format!(
                 "no account {user}{} in {}; run `login` first",
@@ -322,11 +327,17 @@ impl DataDirMap {
     /// Args:
     ///     user_id: 使用者打的 mxid, example: "@BOB:matrix.org"
     /// Return:
-    ///     Some(&str)   這台機器實際保管的那串, example: "@bob:matrix.org"
-    ///     None         沒保管、或大小寫對到不只一個
-    pub fn find_recovery_key_user_id(&self, user_id: &str) -> Option<&str> {
-        find_one(&self.recovery_keys, |entry| &entry.plaintext, user_id)
-            .map(|entry| entry.plaintext.as_str())
+    ///     Ok(Some(&str))   這台機器實際保管的那串, example: "@bob:matrix.org"
+    ///     Ok(None)         沒保管
+    ///     Err(Usage)       只差大小寫的保管著好幾把——🚫 不猜，要精確的那串
+    pub fn find_recovery_key_user_id(&self, user_id: &str) -> Result<Option<&str>, SdkError> {
+        Ok(find_one(
+            &self.recovery_keys,
+            |entry| &entry.plaintext,
+            user_id,
+            "recovery key",
+        )?
+        .map(|entry| entry.plaintext.as_str()))
     }
 
     /// 這台機器上的每個帳號（`account status`）。
@@ -406,23 +417,61 @@ impl DataDirMap {
 
 /// 明文比對的**唯一**規則，整個資料目錄共用：先精確，再大小寫不敏感。
 ///
-/// ⚠️ 大小寫不敏感那一輪對到兩個以上就回 None —— 這些名字決定的是刪哪個目錄，
-/// 寧可說「沒有」，也不要挑一個最像的（fail closed）。
+/// ⚠️ 大小寫那一輪對到兩個以上就 `Err`，🚫 不挑一個最像的 —— 這些名字決定的是刪哪個
+/// 目錄。而且**不是靜默的 None**：`destroy` 說的是「什麼都不留」，它自己不知道有沒有
+/// 留乾淨，對呼叫者就是另一種謊（PR #21 審查 rumia🟡2a）。
+///
+/// Args:
+///     wanted: 使用者打的那串, example: "@BOB:matrix.org"
+///     what: 講給人聽的名稱, example: "account"
+/// Return:
+///     Ok(Some(&T))   正面認得一個
+///     Ok(None)       沒有
+///     Err(Usage)     只差大小寫的有好幾個，訊息列出候選
 fn find_one<'a, T>(
     entries: &'a [T],
     plaintext_of: impl Fn(&T) -> &str,
     wanted: &str,
-) -> Option<&'a T> {
+    what: &str,
+) -> Result<Option<&'a T>, SdkError> {
     if let Some(exact) = entries.iter().find(|entry| plaintext_of(entry) == wanted) {
-        return Some(exact);
+        return Ok(Some(exact));
     }
-    let mut insensitive = entries
+    let insensitive: Vec<&T> = entries
         .iter()
-        .filter(|entry| plaintext_of(entry).eq_ignore_ascii_case(wanted));
-    match (insensitive.next(), insensitive.next()) {
-        (Some(only), None) => Some(only),
-        _ => None,
+        .filter(|entry| plaintext_of(entry).eq_ignore_ascii_case(wanted))
+        .collect();
+    match insensitive.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only)),
+        many => Err(SdkError::Usage(format!(
+            "\"{wanted}\" matches {} {what}s that differ only in case ({}); pass the exact one",
+            many.len(),
+            many.iter()
+                .map(|entry| plaintext_of(entry))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
+}
+
+/// `find_one` 的公開版，給資料目錄以外、但同樣要「使用者打的字串 → 權威值」的地方用
+/// （例如 `cache.db` 的 `users` 列）。比對規則只有這一份，🚫 不要在別的模組再寫一次。
+///
+/// Args:
+///     candidates: 權威值, example: &["@alice:localhost".to_string()]
+///     wanted: 使用者打的那串, example: "@ALICE:LocalHost"
+///     what: 講給人聽的名稱, example: "cached account"
+/// Return:
+///     Ok(Some(&str))   權威值本身
+///     Ok(None)         沒有
+///     Err(Usage)       只差大小寫的有好幾個
+pub fn find_matching_plaintext<'a>(
+    candidates: &'a [String],
+    wanted: &str,
+    what: &str,
+) -> Result<Option<&'a str>, SdkError> {
+    Ok(find_one(candidates, |candidate| candidate.as_str(), wanted, what)?.map(String::as_str))
 }
 
 /// 這個 server 底下還有沒有任何登入中的帳號（`logout` 用：都沒有就把 `cache.db` 一起刪）。
@@ -753,7 +802,7 @@ mod tests {
             alice
         );
         assert_eq!(
-            map.find_recovery_key_user_id("@alice:localhost"),
+            map.find_recovery_key_user_id("@alice:localhost").unwrap(),
             Some("@alice:localhost")
         );
         // 打成大寫也要對上——不然 `account del` 說找不到、`account destroy` 宣稱
@@ -763,7 +812,7 @@ mod tests {
             alice
         );
         assert_eq!(
-            map.find_recovery_key_user_id("@ALICE:LocalHost"),
+            map.find_recovery_key_user_id("@ALICE:LocalHost").unwrap(),
             Some("@alice:localhost")
         );
         // server 那一段同樣不敏感（大小寫在 URL 裡很常見）。
@@ -773,7 +822,33 @@ mod tests {
             alice
         );
         // 🚫 沒保管的就是沒有，不要挑一個最像的。
-        assert_eq!(map.find_recovery_key_user_id("@bob:localhost"), None);
+        assert_eq!(
+            map.find_recovery_key_user_id("@bob:localhost").unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn two_names_differing_only_in_case_are_refused_not_guessed() {
+        let (data_dir, vault) = scratch_dir_with_vault("ambiguous-case");
+        crate::recovery::save(&data_dir, &vault, "@alice:localhost", "EsTc 1").unwrap();
+        crate::recovery::save(&data_dir, &vault, "@Alice:localhost", "EsTc 2").unwrap();
+
+        let map = refresh_data_dir_map(&data_dir, &vault).unwrap();
+        // 精確打得出來的照樣認得。
+        assert_eq!(
+            map.find_recovery_key_user_id("@Alice:localhost").unwrap(),
+            Some("@Alice:localhost")
+        );
+        // 🚫 只差大小寫的有兩把時不挑——而且要說出來，不是靜默當作「沒有」：
+        // `destroy` 說的是「什麼都不留」，它得知道自己沒留乾淨。
+        let error = map
+            .find_recovery_key_user_id("@ALICE:localhost")
+            .unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("differ only in case"), "{message}");
+        assert!(message.contains("@alice:localhost") && message.contains("@Alice:localhost"));
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

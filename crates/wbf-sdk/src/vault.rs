@@ -306,7 +306,7 @@ impl Vault {
     }
 
     /// 資料目錄裡兩層目錄名的加密（`account_dir`；local-cache-db.md §11.2）。
-    /// `servers/` 與 `accounts/` 共用這一把，靠 aad 分。
+    /// `s/` 與 `a/` 共用這一把，靠 aad 分。
     pub fn account_dir_key(&self) -> Key32 {
         self.derive(ACCOUNT_DIR_KEY_CONTEXT)
     }
@@ -322,7 +322,7 @@ impl Vault {
     /// 把 session（含 access_token）封進 `path`（CLI 放帳號目錄的 `session.sealed`）。
     ///
     /// Args:
-    ///     path: example: "<data dir>/servers/localhost_6167/accounts/alice/session.sealed"
+    ///     path: example: "<data dir>/s/<b58>_<b58>/a/<b58>_<b58>/session.sealed"
     pub fn seal_session(&self, path: &Path, session: &Session) -> Result<(), SdkError> {
         let plaintext = Zeroizing::new(serde_json::to_vec(session).expect("Session serializes"));
         let nonce = random_nonce()?;

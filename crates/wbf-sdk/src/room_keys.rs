@@ -34,9 +34,9 @@ const SNAPSHOT_TEMP_FILE_NAME: &str = "snapshot.tmp";
 /// 這個帳號的快照檔在哪。
 ///
 /// Args:
-///     account_dir: example: "<data dir>/servers/<b58>_<b58>/accounts/<b58>_<b58>"
+///     account_dir: example: "<data dir>/s/<b58>_<b58>/a/<b58>_<b58>"
 /// Return:
-///     PathBuf   example: "<account dir>/room-keys/snapshot"
+///     PathBuf   example: "<account dir>/k/snapshot"
 pub fn snapshot_path(account_dir: &Path) -> PathBuf {
     account_dir
         .join(ROOM_KEYS_DIR_NAME)
@@ -73,7 +73,7 @@ pub struct SnapshotStatus {
 }
 
 /// Args:
-///     account_dir: example: "<data dir>/servers/<b58>_<b58>/accounts/<b58>_<b58>"
+///     account_dir: example: "<data dir>/s/<b58>_<b58>/a/<b58>_<b58>"
 /// Return:
 ///     SnapshotStatus   沒有檔案時 `exists` 是 false，其他欄位是 0／None
 pub fn get_snapshot_status(account_dir: &Path) -> SnapshotStatus {
@@ -91,7 +91,7 @@ pub fn get_snapshot_status(account_dir: &Path) -> SnapshotStatus {
     }
 }
 
-/// 建好 `room-keys/` 並把權限收成只有自己（Unix 0700）。
+/// 建好 `k/` 並把權限收成只有自己（Unix 0700）。
 ///
 /// ⚠️ 上游的 `export_room_keys` 用 `File::create` 寫檔，那走 umask 預設（多半是 0644），
 /// 而這個檔是**全部房間金鑰的密文**。內容層有 PBKDF2-500k 加 32 byte 隨機 passphrase 頂著，
@@ -99,7 +99,7 @@ pub fn get_snapshot_status(account_dir: &Path) -> SnapshotStatus {
 /// 所以：目錄先收成 0700，寫完的檔再收成 0600（`set_snapshot_permissions`）。
 ///
 /// Args:
-///     dir: **`room-keys/` 本身**, example: snapshot_path(&account.dir).parent()
+///     dir: **`k/` 本身**, example: snapshot_path(&account.dir).parent()
 /// Return:
 ///     Ok(())   目錄在，權限也對了
 ///     Err(Io)  建不起來

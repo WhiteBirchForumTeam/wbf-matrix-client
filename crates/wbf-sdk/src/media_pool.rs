@@ -55,7 +55,7 @@ struct Header {
 
 impl MediaPool {
     /// Args:
-    ///     server_dir: example: "<data dir>/servers/localhost_6167"（池在它底下的 media/）
+    ///     server_dir: example: "<data dir>/s/<b58>_<b58>"（池在它底下的 media/）
     ///     key: example: vault.media_store_key()
     pub fn open(server_dir: &Path, key: Key32) -> Result<MediaPool, SdkError> {
         let dir = server_dir.join(POOL_DIR_NAME);

@@ -548,13 +548,19 @@ fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), Sdk
             print_json(&json!({ "users": users }))
         }
         RecoveryAction::Show { user } => {
-            match crate::recovery::find(&context.unlock.data_dir, vault, &user)? {
-                // 會印秘密的第二個命令（另一個是 `key-backup recovery`）。
-                Some(key) => print_json(&json!({ "user": user, "recovery_key": key.as_str() })),
-                None => Err(SdkError::Usage(format!(
+            // 跟 `destroy` 走同一條：`list` 印得出 `@alice:localhost`，打 `@ALICE:LocalHost`
+            // 卻說沒有，是同一個命令家族內的兩套規則（PR #21 審查 salvia🟢）。
+            let map = accounts::refresh_data_dir_map(&context.unlock.data_dir, vault)?;
+            let missing = || {
+                SdkError::Usage(format!(
                     "no recovery key is kept here for {user}; run `key-backup recovery` while logged in as them"
-                ))),
-            }
+                ))
+            };
+            let user_id = map.find_recovery_key_user_id(&user)?.ok_or_else(missing)?;
+            let key = crate::recovery::find(&context.unlock.data_dir, vault, user_id)?
+                .ok_or_else(missing)?;
+            // 會印秘密的第二個命令（另一個是 `key-backup recovery`）。
+            print_json(&json!({ "user": user_id, "recovery_key": key.as_str() }))
         }
     }
 }
@@ -861,7 +867,7 @@ async fn destroy_account_command(
     let account = find_account_by_full_mxid(context, &map, user)?;
     // 🚫 在 logout 之前先問：`del` 只認精確的 mxid，而使用者打的那串大小寫可能跟
     // 封存時用的權威 mxid 不同（PR #19 審查 rumia🟡1／salvia）。
-    let kept_recovery_key_user_id = map.find_recovery_key_user_id(user).map(str::to_string);
+    let kept_recovery_key_user_id = map.find_recovery_key_user_id(user)?.map(str::to_string);
     let server = match &context.server_override {
         Some(server) => server.clone(),
         None => context
@@ -900,7 +906,15 @@ async fn destroy_account_command(
         &context.vault()?.cache_key(),
         &identity,
     )?;
-    let report = cache.forget_account(user)?;
+    // 🚫 不拿使用者打的 `user` 去查 `users` 列：那裡存的是權威 mxid，精確比對差一個大小寫
+    // 就查不到，然後 destroy 會印 `events_removed: 0`，看起來像「本來就沒有」，其實是全部
+    // 殘留（PR #21 審查 salvia🔴——跟 recovery key 那條是同一個形狀）。
+    let cached_mxids = cache.list_account_mxids()?;
+    let report = match accounts::find_matching_plaintext(&cached_mxids, user, "cached account")? {
+        Some(cached_mxid) => cache.forget_account(cached_mxid)?,
+        // 真的沒有這個帳號的快取列（`login` 之後還沒 `recent` 過就是這樣）。
+        None => Default::default(),
+    };
     // DB 先、檔案後（local-cache-db.md §6 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。刪不掉只說一聲，下次 media-gc 的 sweep 會再收。
     let pool = MediaPool::open(&account.server_dir(), context.vault()?.media_store_key())?;
     let mut files_removed = 0u64;

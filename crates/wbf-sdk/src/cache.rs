@@ -647,8 +647,30 @@ impl Cache {
 
     // ---- forget ----
 
+    /// 這份 `cache.db` 認得哪些帳號（`users` 列裡的權威 mxid）。
+    ///
+    /// 🚫 這裡只給資料，比對規則不在這一層：使用者打的字串怎麼對到這些值（大小寫、歧義
+    /// 怎麼辦）是 CLI 的政策，不是快取的（PR #21 審查 salvia🔴）。
+    ///
+    /// Return:
+    ///     Ok(Vec<String>)   完整 mxid，排序過；空的 DB 就是空的
+    pub fn list_account_mxids(&self) -> Result<Vec<String>, SdkError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT mxid FROM users ORDER BY mxid")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.collect::<Result<Vec<String>, _>>().map_err(db_error)
+    }
+
     /// 摧毀這個帳號的本機紀錄（UI 的選項；`logout` 不叫它）。🚫 不刪 `users` 列：他可能是別人事件的 sender。
     /// 一個 transaction：刪他的關聯列 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。
+    ///
+    /// ⚠️ `user_id` 要是 `users` 列裡那串**權威** mxid（精確比對）。使用者打進來的字串
+    /// 先過 `list_account_mxids` 加 `accounts::find_matching_plaintext`——不然大小寫差一個字
+    /// 就查不到，這個函數會老實回全零，而呼叫者會以為「本來就沒有」（PR #21 審查 salvia🔴）。
     ///
     /// Return:
     ///     Ok(ForgetReport)   `orphan_pool_files` 給呼叫者去刪池裡的檔（DB 先、檔案後）；沒見過的帳號回全零
@@ -1467,6 +1489,17 @@ mod tests {
             cache.forget_account("@nobody:localhost").unwrap(),
             ForgetReport::default()
         );
+        // ⚠️ 大小寫差一個字也是「沒見過」——這裡是精確比對，所以呼叫端要先把使用者打的
+        // 字串換成 users 列裡那串（`list_account_mxids` 加 `accounts::find_matching_plaintext`）。
+        // 少了那一步，`account destroy` 會回全零、看起來像「本來就沒有」（PR #21 審查 salvia🔴）。
+        assert_eq!(
+            cache.forget_account("@ALICE:LocalHost").unwrap(),
+            ForgetReport::default()
+        );
+        assert!(cache
+            .list_account_mxids()
+            .unwrap()
+            .contains(&ALICE.to_string()));
 
         // 同 hash 兩個 mxc：只 forget 到其中一個 mxc 的事件時，池檔不回傳。
         let dup1 = file("!s", "$d1", 1, "mxc://localhost/c1");
