@@ -18,6 +18,7 @@ PR #1–#24 全部合併。**沒有 UI、還沒有 daemon、還沒有 RPC。**
 |---|---|---|
 | 1 | [`README.md`](../README.md) | 佈局、狀態表、怎麼跑測試、貢獻規則 |
 | 1.5 | [`design/architecture-v2.md`](design/architecture-v2.md) | **daemon／RPC／四個前端的分層**（維護者 2026-09-09 定的方向）。要動介面之前先看這份 |
+| 1.55 | [`design/rpc-spec.md`](design/rpc-spec.md) | **前端 ↔ daemon 的逐條訊息**：method 表、`params`／`result`、code 表（`CoreErrorKind` 的號碼在這）、推播、資料平面的 HTTP。2026-09-12 第一版，daemon 開工的前提 |
 | 1.6 | [`design/to-device-client.md`](design/to-device-client.md) | **client 端怎麼接 `0x16 Device`**（to-device：金鑰、驗證、SSSS）。⚠️ 線上格式的權威在 wbfuwunel 的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`，這份只寫我們最容易寫錯的地方與待辦 |
 | 2 | [`design/plan-v1.md`](design/plan-v1.md) | 範圍、順序、進度；**§7.1**（本地不存）與 **§7.2**（耦合方向：上游 SDK 是可拆的零件）是所有程式的前提 |
 | 3 | [`design/wbf-client-convention-for-chunk.md`](design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、seek；**§5.2 送事件要宣告附件**（等 server 定案） |
@@ -128,8 +129,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    ✅ **兩個「未定的決策」也不擋了**：fork 已建並成為 submodule（#23）；server 的 to-device
    已由 wbfuwunel PR #43 實作（`0x16 Device`，權威在那邊的 `wbf-to-device.md`）。
    還沒做的三塊，**建議順序**：
-   1. **`rpc-spec.md`**——它是下一個真正的前提。`CoreErrorKind` 的號碼**刻意留空等它**
-      （PR #24 的決定：現在配號等於兌現一個之後不能改的承諾）。
+   1. ✅ **`rpc-spec.md`**（2026-09-12 第一版）：method 表、code 表（`CoreErrorKind` 配號在 §5.2）、推播、資料平面。
+      §8 列了 daemon PR 要順手補進 core 的五樣（`lock`、建檔與送事件拆開、`PoolReader` 接 Range、
+      結構化事件、配號）。
    2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
    3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。

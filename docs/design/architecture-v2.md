@@ -2,7 +2,7 @@
 
 > 維護者 2026-09-09 定的方向。這份文件講**分層與介面**，不講功能——功能在
 > [`plan-v1.md`](plan-v1.md)、[`chat-model.md`](chat-model.md)、[`local-cache-db.md`](local-cache-db.md)、
-> [`wbf-cli-spec.md`](wbf-cli-spec.md)。RPC 的逐條訊息在 [`rpc-spec.md`](rpc-spec.md)（還沒寫）。
+> [`wbf-cli-spec.md`](wbf-cli-spec.md)。RPC 的逐條訊息在 [`rpc-spec.md`](rpc-spec.md)（2026-09-12 第一版）。
 
 ## 0. 一句話
 
