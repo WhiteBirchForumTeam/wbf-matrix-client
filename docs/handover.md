@@ -18,7 +18,7 @@ PR #1–#24 全部合併。**沒有 UI、還沒有 daemon、還沒有 RPC。**
 |---|---|---|
 | 1 | [`README.md`](../README.md) | 佈局、狀態表、怎麼跑測試、貢獻規則 |
 | 1.5 | [`design/architecture-v2.md`](design/architecture-v2.md) | **daemon／RPC／四個前端的分層**（維護者 2026-09-09 定的方向）。要動介面之前先看這份 |
-| 1.6 | [`design/to-device-push-proposal.md`](design/to-device-push-proposal.md) | 給 wbfuwunel 的 `0x16 Device` 提案（to-device 的訂閱／推送／補齊）。**還沒定案**，四個問題等 server 端拍板 |
+| 1.6 | [`design/to-device-client.md`](design/to-device-client.md) | **client 端怎麼接 `0x16 Device`**（to-device：金鑰、驗證、SSSS）。⚠️ 線上格式的權威在 wbfuwunel 的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`，這份只寫我們最容易寫錯的地方與待辦 |
 | 2 | [`design/plan-v1.md`](design/plan-v1.md) | 範圍、順序、進度；**§7.1**（本地不存）與 **§7.2**（耦合方向：上游 SDK 是可拆的零件）是所有程式的前提 |
 | 3 | [`design/wbf-client-convention-for-chunk.md`](design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、seek；**§5.2 送事件要宣告附件**（等 server 定案） |
 | 4 | [`design/chat-model.md`](design/chat-model.md) | 聊天模型（Conversation／Message）、怎麼接 Matrix、Telegram 有 Matrix 沒有的逐列定案、`r_seq`／`g_seq`、§6 第 3 步範圍與差異 |
@@ -132,9 +132,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
       （PR #24 的決定：現在配號等於兌現一個之後不能改的承諾）。
    2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面。
    3. **`apps/wbf-cli` → rpc-cli**：改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
-   ⚠️ 還有一個 client 端的欠債：**接 `0x16 Device`**（訂閱帶 `device_id`、`Fetch` 補洞、
-   `Ack` 才刪、收到 `Superseded`(1505) 要當成「被接手」而🚫 不是斷線重連）。
-   我們的提案在 `design/to-device-push-proposal.md`，已照 server 落地的版本改過。
+   ⚠️ 還有一個 client 端的欠債：**接 `0x16 Device`**（server 那邊 2026-09-12 全做完了，
+   我們一個字都沒寫）。五件事、為什麼要排在 daemon 之後，在 `design/to-device-client.md`。
 4. UI 框架比較文件。UI 的同步流程已經有 SDK 介面可接：開一個 task 跑 `recent_sync`，callback 把每個 Batch 丟 channel 給寫 DB 的 task（chat-model §4.3）；媒體用 `media::fetch` 加 `PoolReader`。
 5. 串流／seek 對著媒體池讀（local-cache-db §8.6）：`seek` 命令現在仍直接打 server。
 6. ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補（PR #16 審查記錄）。

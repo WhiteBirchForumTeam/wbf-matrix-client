@@ -392,11 +392,28 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 | 流 | 現況 |
 |---|---|
 | 房間事件 | ✅ `Event/Recent` 已經是拉窗＋水位（`cg_seq`） |
-| **to-device（金鑰）** | 🔁 **server 端 2026-09-12 實作了**（wbfuwunel PR #43，權威在那邊的 `wbf-to-device.md`）：`0x16 Device`，推送為主、`Fetch` 補洞、`Ack` 才刪。⚠️ **client 端還沒接**。我們的提案是 [`to-device-push-proposal.md`](to-device-push-proposal.md)，其中「重複訂閱」那條被維護者反轉成「後來的接手」（見該檔 §5） |
+| **to-device（金鑰）** | 🔁 **server 端 2026-09-12 實作完了**（wbfuwunel #41 提案 → #42 共用核心 → #43 實作 → #44 文件）：`0x16 Device` 七個 subtype，推送為主、`Fetch` 補洞、**`ItemsDestroy` 才刪**。線上格式的權威在那邊的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`。⚠️ **client 端還一個字都沒寫**——要做什麼、哪三處跟 `Event` 相反、為什麼要等 daemon，在 [`to-device-client.md`](to-device-client.md) |
 
-📎 好消息：wbfuwunel 那邊 `get_to_device_events(user, device, since, to)` **本來就吃游標**，
-`remove_to_device_events(user, device, until)` 就是 ack 之後的清理。所以 server 端要加的是**一個新的 opcode**，
-不是一套新機制——它對 to-device 的內容本來就是瞎的（`add_to_device_event` 只存 `type` 字串與不透明的 `content`）。
+📎 當初判斷「server 端要加的是**一個新的 opcode**，不是一套新機制」——那個判斷成立了：
+`get_to_device_events` 本來就吃游標、`remove_to_device_events` 就是刪除，wbfuwunel 這三支
+做的是**把它們接到通道上**，外加一個「銷毀是帶結果的命令」的閉環。它對 to-device 的內容
+從頭到尾都是瞎的（只存 `type`／`sender`／`content`），這套沒有改變那件事。
+
+### 6.1 一條連線上會有好幾段會話——`seq` 屬於會話（wbfuwunel #42／#44 定）
+
+daemon 只開**一條** WS，而它同時要背房間推送（`Event/Push`）與 to-device 推送（`Device/Push`）。
+wbfuwunel 為此定了一條規則，對我們是直接的約束：
+
+> ⭐ **`id` 是一段會話的名字，`seq` 是那段會話裡的計數。** 換一個 `id` 就是新會話，`seq` 歸零。
+
+| 🚫 daemon 不能這樣寫 | 會壞成什麼 |
+|---|---|
+| 連線層一個 `next_seq` | 兩種推送互相看起來像對方漏號，`gap` 的判斷全毀 |
+| 每個 kind 一個 `next_seq` | 同 kind 兩段會話交錯（兩個上傳）就分不出哪包是誰的 |
+
+⚠️ 這條**現在就要記住**，因為它決定了 daemon 裡連線那一層的資料結構：
+收到的包要先照 `id` 分派到會話，才輪到 `seq`。📎 而 `seq` 🚫 不是重送機制——
+WS 不會掉單一 frame，跳號只代表 server 故意丟了一包（佇列滿），補救是帶游標重新要。
 
 ## 7. 現有 crate 怎麼重組
 

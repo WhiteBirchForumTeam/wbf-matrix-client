@@ -248,6 +248,8 @@ CREATE TABLE room_list (
   PRIMARY KEY (user, room)) WITHOUT ROWID;
 
 -- 每個帳號的 Recent 水位線（cg_seq 是 per user 的：server 依 user 的可見範圍算）。
+-- 🚫 to-device 的水位（cd_seq）不進這張表，也不進這個 db：它說的是「crypto store 收到哪」，
+--    而這個 db 是可以被重建的（§6.1 的 Rebuilt）。理由與建議放哪在 to-device-client.md §2.1。
 CREATE TABLE sync_state (
   user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   cg_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL) WITHOUT ROWID;
