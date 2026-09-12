@@ -224,11 +224,11 @@ aad     = "wbf-rpc v1"
 - **加密本身就是認證**：沒有 token 就送不出解得開的包，第一包就驗不過 → 關連線。
   ⚠️ 但**關之前先送一包 `type = 0x01`（明文）講原因**（`BAD_TOKEN` 之類，rpc-spec §1.4）——
   不然 token 錯的人只看到斷線，什麼提示都沒有。`0x01` 在預設狀態下**只有這一種用途**，
-  而且一定緊接著關連線，所以前端不會把它誤當正常回應。
+  而且它的 JSON **跟正常回應同一個形狀**（`code` 9xxx、`result.close`），前端的 frame 翻譯器只有一條路。
 - **加密是 daemon 的全局狀態 `encryption_enforced`，預設開**：開著時 client 送 `0x01` 一律拒絕；
   只有走密文呼叫 `daemon.set_encryption { enforced: false }` 才降級（除錯用，rpc-spec §1.1）。
   🚫 所以 `hello` **不必再帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
-  （正式名稱、`wbf-matrix` 開頭）與 `msg` 的語言（rpc-spec §1.3）。
+  （正式名稱、`wbf-matrix` 開頭，rpc-spec §1.3）。
 - frame 上限 **1 MiB**：超過就關連線（🚫 不讓對方用一個巨大 frame 把記憶體吃光）；
   這個數字跟 §4.8「超過就走資料平面」是同一個。
 
