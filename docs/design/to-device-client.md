@@ -55,21 +55,33 @@ server 的 `add_to_device_event` 用的是 `globals.next_count()`——**跟 PDU
 ⚠️ **to-device 的 count 沒有地方放在事件裡**（它不是 PDU，存的就是 `{type, sender, content}`），
 所以每一則的 count 由 pack 的 meta 用 `counts` 陣列帶——這也是為什麼下一節那三件事很重要。
 
-### 2.1 🔲 `cd_seq` 存哪裡（client 端的決定，還沒定）
+### 2.1 `cd_seq` 寫進 `m/` 裡面（維護者 2026-09-12 定）
 
-**建議：存在帳號目錄的 `m/` 旁邊，🚫 不要放進 `cache.db`。**
+⭐ **跟房間金鑰同一個資料夾** —— 維護者的一句話就是判準：
+**「你同步到哪，就應該寫到哪。」**
 
-理由是**失效模式要跟它描述的東西綁在一起**：`cd_seq` 說的是「crypto store 已經收到哪」，
-而 `cache.db` 是**可以被重建的**（`Cache::open` 的 `OpenOutcome::Rebuilt`，local-cache-db §6.1）。
-⚠️ 重建一次 `cache.db`，`cd_seq` 就跟著歸零或消失，而 crypto store 沒事——
-於是 client 會**重拉一批已經匯過的**（無害，冪等）或**以為自己落後**。反過來更糟：
-`cache.db` 活著但 `m/` 被刪掉重登入（我們自己的 `key-backup import` 流程就會遇到），
-`cd_seq` 卻還停在舊的高水位，那段區間**永遠不會再拉**——而那些是金鑰。
+🚫 **不進 `cache.db`**，理由是**失效模式要跟它描述的東西綁在一起**。`cd_seq` 說的是
+「crypto store 已經收到哪」，而那個 store 就在 `m/`：
 
-⭐ **fail closed 的形狀**：水位跟它保護的 store 同生共死。`m/` 沒了，水位就該沒了。
+| 發生什麼 | `m/`（含 `cd_seq`） | 後果 |
+|---|---|---|
+| `logout`／`account destroy` | 一起沒 | ✅ 下次 `login` 從頭拉，正確 |
+| store 壞掉、照 §4.1 手動刪 `m/` 重來 | 一起沒 | ✅ 同上 |
+| `cache.db` 被重建（`OpenOutcome::Rebuilt`） | **不受影響** | ✅ 水位還在，🚫 不會重拉一批已經匯過的 |
 
-🔲 這條要維護者點頭，而且它會動到 local-cache-db §6 的 `sync_state`（那張表是 `cg_seq` 的家，
-`cd_seq` **不進那張表**）。
+⚠️ **放進 `cache.db` 的話這三列全錯**，而錯得最重的是第二列：`cache.db` 活著、`m/` 被刪掉
+重登入（**我們自己的 `key-backup import` 流程就會走到**），`cd_seq` 卻還停在舊的高水位——
+那段區間**永遠不會再拉**，而那些是金鑰。
+
+⭐ **fail closed 的形狀**：水位跟它保護的 store 同生共死。`m/` 沒了，水位就該沒了；
+而把它寫在 `m/` 裡面，那件事**不需要任何人記得去做**——🚫 不是「刪 store 時順手也刪水位」
+那種散在各處的承諾（全域 A6：漏掉的那個不會 fail closed）。
+
+📎 `sync_state` 那張表是 `cg_seq` 的家，`cd_seq` 不進去；local-cache-db §6 的 schema
+旁邊有一行註記說明它為什麼不在那裡。
+
+🔲 **還沒定的只剩落地格式**：`m/` 裡面是 matrix-sdk 自己的 store（我們🚫 不動它的 schema），
+所以是同目錄下的一個小檔（一個數字 ＋ 待銷毀清單，§4）還是別的，等實作那支決定。
 
 ## 3. 三件跟 `Event` 相反的事（照 `Event` 的直覺寫一定錯）
 
@@ -204,7 +216,7 @@ Session/Login
 |---|---|---|
 | 1 | `Kind::Device = 0x16` 進 pack 的 kind 表 | `crates/wbf-wire/src/pack.rs`（現在只有 `Event = 0x14`） |
 | 2 | 七個 subtype 的 meta 型別與 `counts`／`tc × 8 byte` 的編解碼 | `wbf-sdk`，跟 `Event` 那組放一起 |
-| 3 | `cd_seq` 與待銷毀清單的落地（§2.1 待定） | 帳號目錄，🚫 不進 `cache.db` |
+| 3 | `cd_seq` 與待銷毀清單的落地 | **帳號目錄的 `m/` 裡面**（§2.1），🚫 不進 `cache.db` |
 | 4 | 訂閱／補洞／匯入／銷毀的狀態機 | ⚠️ **daemon 才有意義**——「一個命令一個程序」的東西沒有人在線上收（architecture-v2 §1） |
 | 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表要跟上 server 的 §3.4 |
 

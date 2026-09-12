@@ -249,7 +249,8 @@ CREATE TABLE room_list (
 
 -- 每個帳號的 Recent 水位線（cg_seq 是 per user 的：server 依 user 的可見範圍算）。
 -- 🚫 to-device 的水位（cd_seq）不進這張表，也不進這個 db：它說的是「crypto store 收到哪」，
---    而這個 db 是可以被重建的（§6.1 的 Rebuilt）。理由與建議放哪在 to-device-client.md §2.1。
+--    所以它寫在 m/ 裡面，跟 store 同生共死（維護者 2026-09-12：你同步到哪就寫到哪）。
+--    這個 db 是可以被重建的（§6.1 的 Rebuilt），兩者的失效模式不一樣。理由在 to-device-client.md §2.1。
 CREATE TABLE sync_state (
   user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   cg_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL) WITHOUT ROWID;
@@ -573,6 +574,10 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 | **意外**：store 壞掉、金鑰對不上，照 §4.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
 | **有意**：`logout`／`account del <user>`（同一件事，CLI 規格 §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
 | **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
+
+📎 **to-device 的水位（`cd_seq`）住在 `m/` 裡面，所以這張表的每一列它都自動跟著對**
+（維護者 2026-09-12）：`m/` 被刪 → 水位一起沒 → 下次從頭拉。🚫 不需要有人記得另外去清它，
+理由在 [to-device-client.md](to-device-client.md) §2.1。
 
 為什麼 `logout`（即 `account del`）連著刪（維護者 2026-09-09）：它在心智上是「我離開這台機器」，
 留一個能解開全部歷史的檔案在磁碟上是驚嚇，而且跟「crypto store 一定會被刪」不一致。
