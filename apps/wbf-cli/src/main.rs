@@ -3,7 +3,6 @@
 //! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §7）。
 
 mod commands;
-mod conf;
 mod recent;
 mod rooms;
 mod unlock;

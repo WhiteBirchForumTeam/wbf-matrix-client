@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::conf::{Conf, Entry};
+use wbf_core::conf::{Conf, Entry};
 use wbf_core::Core;
 use wbf_core::UploadRequest;
 use wbf_core::{CoreError, CoreErrorKind};
@@ -235,7 +235,7 @@ pub struct Context {
     /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 §10.4）。同樣落到 `true`。
     pub local_room_keys: bool,
     /// 這次實際生效的值，給自動生成用（§10.3）。🚫 裡面沒有秘密。
-    effective: Vec<crate::conf::Entry>,
+    effective: Vec<wbf_core::conf::Entry>,
     /// `--data-dir`／`WBF_DATA_DIR` 有給嗎——自動生成的三個條件之一。
     data_dir_was_given: bool,
     /// 備份關掉的警告一個命令只印一次（`rooms::backend` 可能被叫不只一次）。
@@ -271,7 +271,7 @@ impl Context {
             Some(path) => path.clone(),
             None => default_data_dir()?,
         };
-        let conf = crate::conf::load(cli.config.as_deref(), &data_dir)?;
+        let conf = wbf_core::conf::load(cli.config.as_deref(), &data_dir)?;
         let mut warnings = conf.warnings().to_vec();
         warnings.extend(conf.warn_about_unknown_keys(KNOWN_CONF_KEYS));
         let server = cli
@@ -306,13 +306,16 @@ impl Context {
                 section: "general",
                 key: "SERVER",
                 value: server.clone().unwrap_or_default(),
-                origin: crate::conf::origin_of(cli.server.is_some(), conf.find("SERVER").is_some()),
+                origin: wbf_core::conf::origin_of(
+                    cli.server.is_some(),
+                    conf.find("SERVER").is_some(),
+                ),
             },
             Entry {
                 section: "general",
                 key: "TRANSPORT",
                 value: transport_name.clone(),
-                origin: crate::conf::origin_of(
+                origin: wbf_core::conf::origin_of(
                     cli.transport.is_some(),
                     conf.find("TRANSPORT").is_some(),
                 ),
@@ -321,7 +324,7 @@ impl Context {
                 section: "general",
                 key: "UNLOCK_TTL",
                 value: unlock_ttl.to_string(),
-                origin: crate::conf::origin_of(
+                origin: wbf_core::conf::origin_of(
                     cli.unlock_ttl.is_some(),
                     conf.find("UNLOCK_TTL").is_some(),
                 ),
@@ -330,13 +333,13 @@ impl Context {
                 section: "backup",
                 key: "SERVER_BACKUP",
                 value: on_off(server_backup),
-                origin: crate::conf::origin_of(false, conf.find("SERVER_BACKUP").is_some()),
+                origin: wbf_core::conf::origin_of(false, conf.find("SERVER_BACKUP").is_some()),
             },
             Entry {
                 section: "backup",
                 key: "LOCAL_ROOM_KEYS",
                 value: on_off(local_room_keys),
-                origin: crate::conf::origin_of(false, conf.find("LOCAL_ROOM_KEYS").is_some()),
+                origin: wbf_core::conf::origin_of(false, conf.find("LOCAL_ROOM_KEYS").is_some()),
             },
         ]
         .into_iter()
@@ -481,10 +484,10 @@ impl Context {
         if !self.data_dir_was_given {
             return Ok(());
         }
-        if crate::conf::write_if_absent(&self.unlock.data_dir, &self.effective)? {
+        if wbf_core::conf::write_if_absent(&self.unlock.data_dir, &self.effective)? {
             self.progress(format!(
                 "wrote {} with the values this run used; edit it or delete it, it will not be rewritten",
-                self.unlock.data_dir.join(crate::conf::CONF_FILE_NAME).display()
+                self.unlock.data_dir.join(wbf_core::conf::CONF_FILE_NAME).display()
             ));
         }
         Ok(())
@@ -1044,7 +1047,7 @@ mod conf_precedence_tests {
     fn conf_fills_in_what_the_flags_did_not_give() {
         let dir = scratch("conf");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
             "[general]\nSERVER=http://from-conf:6167\nACCOUNT=@alice:localhost\nUNLOCK_TTL=60\nTRANSPORT=http\n[backup]\nSERVER_BACKUP=off\n",
         )
         .unwrap();
@@ -1071,7 +1074,7 @@ mod conf_precedence_tests {
     fn a_flag_beats_the_conf_file() {
         let dir = scratch("flag");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
             "[general]\nSERVER=http://from-conf:6167\nUNLOCK_TTL=60\n",
         )
         .unwrap();
@@ -1114,7 +1117,7 @@ mod conf_precedence_tests {
         // ⚠️ 進 conf 的是**路徑**不是秘密（§10.5）——秘密是那個檔的內容，它從來不進 conf。
         let dir = scratch("pwfile");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
             "[general]
 PASSWORD_FILE=/tmp/from-conf
 ",
@@ -1143,7 +1146,7 @@ PASSWORD_FILE=/tmp/from-conf
     fn a_secret_in_the_conf_file_is_not_used() {
         let dir = scratch("secret");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
             "[general]\nACCESS_TOKEN=syt_nope\n",
         )
         .unwrap();
@@ -1163,7 +1166,7 @@ PASSWORD_FILE=/tmp/from-conf
         let context = Context::from(&cli).unwrap();
         context.write_conf_if_asked_for().unwrap();
 
-        let written = std::fs::read_to_string(dir.join(crate::conf::CONF_FILE_NAME)).unwrap();
+        let written = std::fs::read_to_string(dir.join(wbf_core::conf::CONF_FILE_NAME)).unwrap();
         assert!(
             written.contains("SERVER=http://from-flag:6167"),
             "{written}"
@@ -1185,7 +1188,7 @@ PASSWORD_FILE=/tmp/from-conf
     #[test]
     fn an_existing_conf_is_never_rewritten() {
         let dir = scratch("keep");
-        let path = dir.join(crate::conf::CONF_FILE_NAME);
+        let path = dir.join(wbf_core::conf::CONF_FILE_NAME);
         std::fs::write(&path, "[general]\nSERVER=http://mine:6167\n").unwrap();
         let context = Context::from(&cli_with(&dir)).unwrap();
         context.write_conf_if_asked_for().unwrap();
@@ -1206,7 +1209,7 @@ PASSWORD_FILE=/tmp/from-conf
         let mut context = Context::from(&cli_with(&dir)).unwrap();
         context.data_dir_was_given = false;
         context.write_conf_if_asked_for().unwrap();
-        assert!(!dir.join(crate::conf::CONF_FILE_NAME).exists());
+        assert!(!dir.join(wbf_core::conf::CONF_FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

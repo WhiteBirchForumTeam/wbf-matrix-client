@@ -26,12 +26,16 @@ pub const MIN_PACK_LEN: usize = 32;
 #[repr(u8)]
 pub enum Kind {
     Control = 0x01,
+    /// 串流訊息的草稿（wire-format §3）：`Draft`、`Keypoint`、`Append`……client 這邊還沒用，先認得它才能解 server 的向量。
+    Stream = 0x02,
     Upload = 0x03,
     Download = 0x04,
     /// 連線背後的 session（wire-format §6.3）：`Login`、`Refresh`、`Logout`。client 這邊還沒用，先認得它才能解 server 的向量。
     Session = 0x10,
     /// 房間事件的領域（wire-format §3.3）：`Recent`、`Send`、`Batch`。
     Event = 0x14,
+    /// to-device（wire-format §3.2；to-device-client.md）：`Fetch`、`Batch`、`ItemsDestroy`、`Subscribe`……client 這邊還沒接。
+    Device = 0x16,
 }
 
 impl Kind {
@@ -43,12 +47,64 @@ impl Kind {
     pub fn from_byte(byte: u8) -> Option<Kind> {
         match byte {
             0x01 => Some(Kind::Control),
+            0x02 => Some(Kind::Stream),
             0x03 => Some(Kind::Upload),
             0x04 => Some(Kind::Download),
             0x10 => Some(Kind::Session),
             0x14 => Some(Kind::Event),
+            0x16 => Some(Kind::Device),
             _ => None,
         }
+    }
+}
+
+/// `id` 欄位（wire-format §2.2，wbfuwunel PR #46）：`[id_type 1 byte] ‖ [值 7 byte 大端]`。
+///
+/// 一個 id 自己就說得出它是什麼。server 驗型別跟 `(kind, subtype)` 對不對得上，不符 → `InvalidRequest`；
+/// 需要會話的包（`Event/Recent`、`Subscribe`、`Device/*`）填 0 也是 `InvalidRequest`。
+/// server 鑄的 id（上傳 id、`g_seq`）回來時已經組好，client 原樣抄回去；**只有 client 自己鑄的會話號要經過 [`id::compose`]**。
+pub mod id {
+    /// 沒有會話：整個 id 必須是 0（`Hello`、`Ping`、`Download/*`、`Upload/Create`）。
+    pub const NONE: u8 = 0x00;
+    /// client 自己挑的會話號（`Event/Recent`、`Event/Subscribe`、`Device/*`）。
+    pub const SESSION: u8 = 0x01;
+    /// 事件位置 `g_seq`（`Stream/*` 草稿的錨）。
+    pub const G_SEQ: u8 = 0x02;
+    /// 上傳 id（`Upload/Chunk`／`Status`／`Seal`／`Abort`）。去掉型別 byte 就是 mxc 的 media id。
+    pub const UPLOAD: u8 = 0x03;
+
+    /// 值只有 56 bit。
+    pub const MAX_VALUE: u64 = (1 << 56) - 1;
+
+    /// 組一個 id。
+    ///
+    /// Args:
+    ///     id_type: example: id::SESSION
+    ///     value: example: 20
+    /// Return:
+    ///     Some(u64)  `0x01_00000000000014`
+    ///     None       值超過 56 bit（拒絕，🚫 不截斷）
+    pub fn compose(id_type: u8, value: u64) -> Option<u64> {
+        if value > MAX_VALUE {
+            return None;
+        }
+        Some(((id_type as u64) << 56) | value)
+    }
+
+    /// Args:
+    ///     id: 線上的 id, example: 0x0322334455667788
+    /// Return:
+    ///     u8  型別 byte, example: 0x03
+    pub fn type_of(id: u64) -> u8 {
+        (id >> 56) as u8
+    }
+
+    /// Args:
+    ///     id: example: 0x0322334455667788
+    /// Return:
+    ///     u64  去掉型別 byte 的值, example: 0x22334455667788
+    pub fn value_of(id: u64) -> u64 {
+        id & MAX_VALUE
     }
 }
 
@@ -318,4 +374,25 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
 fn read_len(bytes: &[u8], at: usize) -> usize {
     // u32 → usize 在 32-bit 目標上也不會截斷。
     read_u32(bytes, at) as usize
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::id;
+
+    #[test]
+    fn a_typed_id_composes_and_splits_back_to_the_same_parts() {
+        let upload = id::compose(id::UPLOAD, 0x22334455667788).unwrap();
+        assert_eq!(upload, 0x0322334455667788);
+        assert_eq!(id::type_of(upload), id::UPLOAD);
+        assert_eq!(id::value_of(upload), 0x22334455667788);
+        assert_eq!(id::compose(id::SESSION, 20).unwrap(), 0x0100000000000014);
+        assert_eq!(id::type_of(0), id::NONE);
+    }
+
+    #[test]
+    fn a_value_over_56_bits_is_refused_not_truncated() {
+        assert!(id::compose(id::SESSION, id::MAX_VALUE).is_some());
+        assert!(id::compose(id::SESSION, id::MAX_VALUE + 1).is_none());
+    }
 }

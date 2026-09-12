@@ -68,7 +68,7 @@ impl<C: PackChannel> WbfClient<C> {
         &mut self,
         manifest: &Manifest,
         out: &mut W,
-        on_progress: &mut dyn FnMut(u32, u32),
+        on_progress: &mut (dyn FnMut(u32, u32) + Send),
     ) -> Result<DownloadReport, SdkError> {
         let target = self.verify_target(manifest).await?;
         let expected_sha256 = parse_sha256_field(&manifest.block)?;

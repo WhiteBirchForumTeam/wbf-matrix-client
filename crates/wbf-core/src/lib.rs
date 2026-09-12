@@ -39,6 +39,7 @@
 mod account_ops;
 mod accounts;
 mod backup_ops;
+pub mod conf;
 mod error;
 pub mod event;
 mod handles;

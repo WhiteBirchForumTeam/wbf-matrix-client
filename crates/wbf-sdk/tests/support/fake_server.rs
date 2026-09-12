@@ -443,7 +443,7 @@ impl PackChannel for FakeServer {
         &mut self,
         pack: Pack,
         _per_pack_timeout: std::time::Duration,
-        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+        on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
         let bytes = pack.encode()?;
         let decoded = Pack::decode(&bytes)?;
@@ -490,7 +490,7 @@ impl PackChannel for &mut FakeServer {
         &mut self,
         pack: Pack,
         per_pack_timeout: std::time::Duration,
-        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+        on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
         (**self)
             .request_stream(pack, per_pack_timeout, on_pack)

@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use wbf_core::{CoreError, CoreErrorKind};
+use crate::{CoreError, CoreErrorKind};
 
 pub const CONF_FILE_NAME: &str = "wbf.conf";
 
