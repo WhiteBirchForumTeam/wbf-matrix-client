@@ -44,6 +44,11 @@ pub struct UploadRequest {
 pub struct SendFileResult {
     pub event_id: String,
     pub mxc: String,
+    /// 這次上傳封出來的 manifest。⚠️ **含金鑰**——呼叫端要嘛用 0600 寫檔，要嘛別留。
+    /// 📎 它在這裡是因為 `send --file --manifest <path>` 要把它存下來
+    /// （2026-09-12 真 server 驗證抓到：重構時這一步掉了，而且是靜默的）。
+    #[serde(skip)]
+    pub manifest: Manifest,
     /// ⚠️ 附件**有沒有向 server 宣告**（約定 §5.2）。現在一律是 `false`：
     /// matrix-sdk 的 `Room::send` 不能加 header、server 的 `Event/Send` 還是提案。
     /// 🚫 沒宣告的上傳過了保護期會被掃掉——這個欄位就是讓前端講得出這件事。
@@ -94,7 +99,8 @@ impl Core {
         let event_id = backend.send_file(room, &attachment, caption).await?;
         Ok(SendFileResult {
             event_id,
-            mxc: manifest.mxc,
+            mxc: manifest.mxc.clone(),
+            manifest,
             attachment_declared: false,
         })
     }

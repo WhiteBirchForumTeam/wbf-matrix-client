@@ -76,6 +76,10 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
             &target,
         )
         .await?;
+    // ⚠️ manifest 含金鑰：給了路徑就用**私有權限**寫（CLI 規格 §5）。
+    if let Some(path) = &args.manifest {
+        write_private(path, &result.manifest.to_json())?;
+    }
     print_json(&json!({ "event_id": result.event_id, "mxc": result.mxc }))
 }
 

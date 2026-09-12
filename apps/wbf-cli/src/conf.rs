@@ -301,13 +301,19 @@ pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, CoreE
     if path.exists() {
         return Ok(false);
     }
-    let mut text = String::from(
+    // ⚠️ 用 concat! 而不是字串的 `\` 續行：`cargo fmt` 會把續行縮排，而 Rust 的 `\`
+    // 只吃掉換行**不吃**後面的空白——結果是我們自己寫給人看的檔長出一排怪縮排
+    // （2026-09-12 真 server 驗證時看到的）。
+    let mut text = String::from(concat!(
         "; wbf.conf —— wbf-cli 自動生成的一份起手式（CLI 規格 §10.3）
-         ; 每個值後面註明它這次是哪來的。改這個檔不影響已經登入的帳號。
-         ; 🚫 這裡不放秘密：token、password、passphrase 一律不從這裡讀。
-         ; 已經存在的 wbf.conf 永遠不會被改寫——要重生成就先自己刪掉。
 ",
-    );
+        "; 每個值後面註明它這次是哪來的。改這個檔不影響已經登入的帳號。
+",
+        "; 🚫 這裡不放秘密：token、password、passphrase 一律不從這裡讀。
+",
+        "; 已經存在的 wbf.conf 永遠不會被改寫——要重生成就先自己刪掉。
+",
+    ));
     let mut sections: Vec<&str> = Vec::new();
     for entry in entries {
         if !sections.contains(&entry.section) {
