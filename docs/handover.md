@@ -101,11 +101,15 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 5. 坑（都踩過）
 
-- **wbfuwunel 的 `id` 第一個 byte 是型別**（wire-format §2.2，那邊 `dc4e590f7`，2026-09-12 BREAKING）：`Event/Recent`
+- **wbfuwunel 的 `id` 第一個 byte 是型別**（wire-format §2.2，2026-09-12 BREAKING）：`Event/Recent`
   這種 client 自己鑄會話號的包要用 `wbf_wire::pack::id::compose(id::SESSION, n)`，填裸的 `n` server 回
   `InvalidRequest: this kind takes a conversation the client named in its id, and this one carries none`。
-  server 鑄的（上傳 id、`g_seq`）回來已經組好，原樣抄回去就對。⚠️ 那邊的向量檔 `recent_*` 的 id **沒帶型別 byte**
-  （codec 測試不驗語意，所以沒紅）——向量綠不代表 runtime 過；對真 server 跑一次才看得到。
+  server 鑄的（上傳 id、`g_seq`）回來已經組好，原樣抄回去就對。
+  ⚠️ **那邊還沒合併**：實作在 wbfuwunel PR #47（分支 `wbf/id-type`，`dc4e590f7`），本專案 issue #29 第 1 項是同一件事。
+  我們是照那條分支的行為寫的、也是對那條分支編出來的 server 測的 —— server main 合併前，拿 main 編的 server 會對不上。
+  ⚠️ 而 `dc4e590f7` 當下的向量檔 `recent_*` 的 id **還沒帶型別 byte**（`subscribe_*` 已經帶了），我們抄過來的就是那一版；
+  那邊的工作區已經在補。**#47 合併後要重抄一次向量**，屆時 `recent_*` 的 id 會從 `10` 變成 `0x01` 開頭的組合值。
+  📎 codec 測試不驗語意，所以向量綠不代表 runtime 過；對真 server 跑一次才看得到。
 - **`cargo test --workspace` 綠不代表 SDK 對得上 server**：黃金向量是整份複製的，server 加了 kind（`0x02 Stream`、
   `0x16 Device`）我們的 `Kind` 表沒有，`vectors.rs` 才會紅；漏抄向量就什麼都不會紅。每次 server 那邊改 wire 就重抄一次。
 - **core 的長工作 future 要 `Send`**：daemon 把每個請求 `tokio::spawn`，wbf-sdk 的回呼型別一律是
