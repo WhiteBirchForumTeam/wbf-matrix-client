@@ -207,10 +207,12 @@ Kotlin 的 OkHttp 內建，JS 原生。
 
 ### 4.4 每則控制訊息都加密（token 就是金鑰材料）
 
-明文 JSON 序列化成 bytes，加密之後放進 **WS binary frame**：
+**WS 上一律 binary frame**，每個 frame 是 RPC 自己的極簡 pack：`ver(1) ‖ type(1) ‖ data`
+（維護者 2026-09-12 定；欄位與兩個階段的規則在 rpc-spec §1，這裡只放密碼學的部分）。
+`type = 0x02` 時 `data` 是密文：
 
 ```
-frame   = nonce(24) ‖ XChaCha20-Poly1305(key, nonce, aad, JSON bytes)
+data    = nonce(24) ‖ XChaCha20-Poly1305(key, nonce, aad, JSON bytes)
 key_c2k = BLAKE3 derive_key("wbf-matrix-client rpc client-to-daemon v1", token)
 key_k2c = BLAKE3 derive_key("wbf-matrix-client rpc daemon-to-client v1", token)
 aad     = "wbf-rpc v1"
@@ -219,11 +221,14 @@ aad     = "wbf-rpc v1"
 - **兩個方向不同金鑰**：不然攻擊者可以把 daemon 的回應原封送回去當請求（反射）。導兩把是免費的。
 - **nonce 每則隨機 24 byte**：XChaCha 的 nonce 夠長，隨機碰撞機率可忽略，不必維護計數器
   （計數器碰到重連就要處理狀態）。
-- **加密本身就是認證**：沒有 token 就送不出解得開的 frame，第一則就驗不過 → 關連線。
-  ⚠️ 但**關之前先送一則明文 text frame 講原因**（`BAD_TOKEN` 之類，rpc-spec §1.2）——
-  不然 token 錯的人只看到斷線，什麼提示都沒有（維護者 2026-09-12 指出）。
-  🚫 所以 `hello` **不必再帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）與報上 client 名字
-  （正式名稱、`wbf-matrix` 開頭，rpc-spec §1.1）。
+- **加密本身就是認證**：沒有 token 就送不出解得開的包，第一包就驗不過 → 關連線。
+  ⚠️ 但**關之前先送一包 `type = 0x01`（明文）講原因**（`BAD_TOKEN` 之類，rpc-spec §1.4）——
+  不然 token 錯的人只看到斷線，什麼提示都沒有。`0x01` 在預設狀態下**只有這一種用途**，
+  而且一定緊接著關連線，所以前端不會把它誤當正常回應。
+- **加密是 daemon 的全局狀態 `encryption_enforced`，預設開**：開著時 client 送 `0x01` 一律拒絕；
+  只有走密文呼叫 `daemon.set_encryption { enforced: false }` 才降級（除錯用，rpc-spec §1.1）。
+  🚫 所以 `hello` **不必再帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
+  （正式名稱、`wbf-matrix` 開頭）與 `msg` 的語言（rpc-spec §1.3）。
 - frame 上限 **1 MiB**：超過就關連線（🚫 不讓對方用一個巨大 frame 把記憶體吃光）；
   這個數字跟 §4.8「超過就走資料平面」是同一個。
 

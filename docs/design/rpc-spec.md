@@ -18,76 +18,121 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 
 一條連線、任意多個未完成的 `id`、每個 `id` 一個回應；長工作的中途狀態用推播帶著那個 `id` 回來。
 
-## 1. 連線的生命週期
+## 1. 線上封裝：RPC 自己的極簡 pack（維護者 2026-09-12 定）
 
-1. 前端連上 `ws://127.0.0.1:<rpc port>`（port 在 `<data dir>/daemon.json`，§4.3）。
+**WS 上一律 binary frame**，🚫 沒有 text frame。每一個 frame 就是一個 pack：
+
+```
+pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
+```
+
+| 欄位 | 值 | 意思 |
+|---|---|---|
+| `ver` | `0x01` | pack 格式的版本。起始值 1。⚠️ 這是**封裝**的版本，🚫 不是 `hello` 談的 `protocol`（那是訊息內容的版本） |
+| `type` | `0x00` | 未定。🚫 不能送，收到就是 `BAD_FRAME` |
+| | `0x01` | **明文**：`data` 就是 JSON bytes |
+| | `0x02` | **密文**：`data = nonce(24) ‖ XChaCha20-Poly1305(key, nonce, aad, JSON bytes)`（金鑰與 aad 在 architecture-v2 §4.4） |
+| `data` | | **沒有長度欄位**——長度由 WS frame 給 |
+
+- ⭐ **`type` 只回答一件事：這包是明文還是密文。** 它🚫 不表示種類、不表示方向、不表示成敗——那些都在 JSON 裡。
+- 📎 這跟 homeserver 那套 `wbf-pack`（`wbf-wire`）**無關**，只是借它「極簡二進位前綴」的做法。🚫 不共用 codec。
+- **daemon 送出去的每一則都經過同一個封裝器**：`pack(type, json) -> bytes`／`unpack(bytes) -> (type, json)`，
+  🚫 不要在每個 method 各自組 bytes——「哪些該加密」的判斷只能有一個地方（§1.1）。
+- frame 上限 1 MiB（含前綴）。超過 → `BAD_FRAME`。
+- `ver` 認不得 → `BAD_FRAME`。第一版只認 `0x01`。
+
+### 1.1 兩個階段：明文階段、密文階段
+
+```
+連上 ──> [密文階段]  client 送 0x02（含 hello）、daemon 回 0x02
+                │
+                └── 協議層錯誤 ──> daemon 送 0x01 的 close 通知 ──> WS close
+```
+
+- **client 預設永遠送 `0x02`，包括 `hello`。** 沒有 token 就送不出解得開的包，第一包就驗不過（architecture-v2 §4.4）。
+- daemon 有一個**全局狀態 `encryption_enforced`，預設開**。開著的時候：client 送來 `0x01` → `BAD_FRAME`（🚫 不接受降級）；
+  daemon 的正常回應與推播一律 `0x02`。
+- **`0x01` 在 enforce 開著時只有一種用途：協議層錯誤的 close 通知（§1.4）。** 那是唯一一種「對方可能沒有金鑰」的情況，
+  用密文告知等於沒告知；而且**它一定緊接著關連線**，所以不存在「UI 收到一包明文卻以為是正常回應」的問題——
+  前端收到 `0x01` 就當「連線要斷了」處理。
+- **手動降級**：`daemon.set_encryption { enforced: false }`（本身要走 `0x02` 送）把全局狀態關掉。之後 daemon 接受 `0x01` 的請求、
+  對 `0x01` 的請求用 `0x01` 回、推播用那條連線最後一次請求的 type。開回去用同一個 method。
+  ⚠️ 這是**除錯用**（抓包看明文），🚫 不是給前端省事的：Desktop／Android 永遠送 `0x02`。
+  📎 `daemon.info` 回 `encryption_enforced` 讓人看得到現在是哪一種。
+
+### 1.2 連線的生命週期
+
+1. 前端連上 `ws://127.0.0.1:<rpc port>`（port 在 `<data dir>/daemon.json`，architecture-v2 §4.3）。
 2. **第一則必須是 `hello`**。它之前送任何別的 method → `103`，關連線。
-3. `hello` 要過兩關（§1.1）：**client 名字**要以 `wbf-matrix` 開頭；**protocol** 要在 daemon 支援的那組裡。任一不過 → 關連線。
-4. 解不開的 frame（token 不對）、不是 binary frame、超過 1 MiB → 關連線。
-5. **關連線之前一定先送一則明文**（§1.2）——不然 token 錯的人只看到連線斷掉，什麼提示都沒有。
+3. `hello` 要過兩關（§1.3）：**client 名字**要以 `wbf-matrix` 開頭；**protocol** 要在 daemon 支援的那組裡。任一不過 → 關連線。
+4. 解不開的包（token 不對）、`ver`／`type` 不對、超過 1 MiB → 關連線。
+5. **關連線之前一定先送一則 `0x01` 的 close 通知**（§1.4）——不然 token 錯的人只看到連線斷掉，什麼提示都沒有。
 6. 之後任意順序、任意並行。前端關掉連線＝它所有訂閱作廢、所有未完成的長工作**繼續跑**
    （上傳到一半不會因為 Desktop 關掉而中斷；要停要明講 `cancel`）。
 
-### 1.1 `hello`
+### 1.3 `hello`
 
 ```jsonc
-{ "method": "hello", "params": { "protocols": [2, 1], "client": "wbf-matrix-rpc-cli 0.1.0" }, "id": 0 }
+{ "method": "hello", "params": { "protocols": [2, 1], "client": "wbf-matrix-rpc-cli 0.1.0", "lang": "zh-TW" }, "id": 0 }
 { "code": 0, "msg": "ok", "id": 0, "result": {
     "protocol": 2,                    // 談定的那一個
     "daemon": "wbf-matrix-client-daemon 0.1.0",
     "data_dir": "C:/Users/me/AppData/Roaming/wbf-matrix-client",
     "unlocked": false,
-    "key_mode": "passphrase"          // "plain" | "passphrase" | null（還沒有 local.key）
+    "key_mode": "passphrase",         // "plain" | "passphrase" | null（還沒有 local.key）
+    "encryption_enforced": true
 } }
 ```
 
-**`client`：正式名稱，`wbf-matrix` 開頭**（維護者 2026-09-12 定）。
+**`client`：正式名稱，`wbf-matrix` 開頭**。
 
 - 格式 `<正式名稱> <版本>`：`wbf-matrix-rpc-cli 0.1.0`、`wbf-matrix-desktop 0.3.0`、`wbf-matrix-android 0.1.0`。
   🚫 不是簡稱（`rpc-cli`）——簡稱是文件裡的寫法（architecture-v2 §0.1），不是線上的識別。
-- daemon 做**基礎檢查**：不以 `wbf-matrix` 開頭 → `BAD_CLIENT`（§1.2），關連線，**跟 protocol 不對一樣拒絕**。
+- daemon 做**基礎檢查**：不以 `wbf-matrix` 開頭 → `BAD_CLIENT`（§1.4），關連線，**跟 protocol 不對一樣拒絕**。
   這不是安全機制（token 才是），是擋掉「有人拿別的東西亂連」與「寫錯名字」的第一道門。
 - 之後只進 log。
 
-**`protocols`：一個協商表，不是一個數字**（維護者 2026-09-12 定）。
+**`protocols`：一個協商表，不是一個數字**。
 
 - 前端送**它會講的全部版本**，新的在前。daemon 也有一組**它支援的**，取交集裡最大的那個回在 `result.protocol`。
-  沒有交集 → `PROTOCOL_MISMATCH`（§1.2），關連線。
+  沒有交集 → `PROTOCOL_MISMATCH`（§1.4），關連線。
 - ⭐ **常態是 daemon 升級、前端沒升**：daemon 版本往上走的時候**維持能講舊協議**，舊前端照用。
   只有 **breaking**（舊協議真的沒辦法再服務）才把那個版本從表裡拿掉——那時候舊前端一連上來就被**明確拒絕**，
   🚫 不是連上了之後某個 method 突然壞掉。
 - 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2, 1]`）→ 談成 `2`，前端自己降級。
 - 第一版：雙方都只有 `[1]`。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
 
-`hello` 與 `vault.*`、`daemon.*` 是**未解鎖時也接受**的全部（§4.5）；其他一律 `1001`。
+**`lang`：`msg` 用什麼語言**。`hello` 帶進來，套用到這條連線之後每一則的 `msg`（BCP 47：`en`、`zh-TW`）。
+沒帶或不支援 → `en`。⚠️ 只影響 `msg`（給人看的那句），🚫 不影響 `code`、欄位名、任何邏輯。
+中途要換就再送一次 `hello`（daemon 接受重複的 `hello`，只更新 `lang`，🚫 不重談 `protocol`）。
+📎 第一版 daemon 只會 `en`；`zh-TW` 等 `msg` 的字串表出來再加，🚫 不是現在。
 
-### 1.2 關連線前的明文告知
+`hello` 與 `vault.*`、`daemon.*` 是**未解鎖時也接受**的全部（architecture-v2 §4.5）；其他一律 `1001`。
 
-🚨 daemon **關掉一條連線之前一定先送一則 WS text frame，明文、不加密**，內容：
+### 1.4 協議層錯誤：`0x01` 的 close 通知，然後關連線
+
+🚨 daemon **關掉一條連線之前一定先送一包 `type = 0x01`（明文）**，內容：
 
 ```json
 { "close": "BAD_TOKEN", "msg": "could not decrypt the first frame; the daemon token does not match" }
 ```
 
-為什麼明文：**會走到這裡的情況，多半就是對方沒有正確的金鑰**（token 錯、根本沒 token、或協議版本對不上
-加密方式）。用加密的訊息告知等於沒告知——對方解不開，看到的只有「連線斷了」。
-
 | `close` | 什麼時候 |
 |---|---|
-| `BAD_TOKEN` | frame 解不開（AEAD 標籤驗不過） |
-| `BAD_FRAME` | 不是 binary frame、超過 1 MiB、解開之後不是 JSON |
-| `HELLO_REQUIRED` | 第一則不是 `hello`（同 `103`） |
+| `BAD_TOKEN` | `0x02` 的包解不開（AEAD 標籤驗不過） |
+| `BAD_FRAME` | 不是 binary frame、`ver` 認不得、`type` 是 `0x00`、enforce 開著卻收到 `0x01`、超過 1 MiB、解開之後不是 JSON |
+| `HELLO_REQUIRED` | 第一則不是 `hello` |
 | `BAD_CLIENT` | `client` 不以 `wbf-matrix` 開頭 |
-| `PROTOCOL_MISMATCH` | `protocols` 跟 daemon 的沒有交集（同 `104`） |
+| `PROTOCOL_MISMATCH` | `protocols` 跟 daemon 的沒有交集 |
 | `SHUTTING_DOWN` | daemon 要關了 |
 
-- `close` 是**大寫底線**的字串，🚫 不是 `code` 那套數字：兩者分屬不同層（一個是「這條連線為什麼死」，
-  一個是「這個請求為什麼失敗」），長得不一樣才不會拿錯。`msg` 英文、給人看。
+- 這六種是**協議層**的：連線本身出了問題。**其餘一切**——房間操作失敗、衝突、上游 homeserver 的錯誤、
+  vault 鎖著——都是**請求層**的，走正常的 `{ code, msg, result, id }` 回應，**用當時的加密狀態送**（enforce 開著就是 `0x02`）。
+  判準：**連線還能不能用**。能用 → 請求層、密文；不能用 → 協議層、明文、關。
+- `close` 是**大寫底線**的字串，🚫 不是 `code` 那套數字：兩者分屬不同層，長得不一樣才不會拿錯。`msg` 給人看，語言照 `hello` 的 `lang`（還沒 `hello` 就 `en`）。
 - 這則之後緊接 WS close frame（status 1008 policy violation；`SHUTTING_DOWN` 用 1001 going away）。
-- ⚠️ 明文 frame **只出現在關連線前**，而且**內容裡永遠沒有秘密**（不回 token、不回解出來的東西）。
-  正常訊息一律加密（§4.4）。前端收到 text frame 就當成「連線要斷了」處理，不要試著解密它。
-- `HELLO_REQUIRED` 與 `PROTOCOL_MISMATCH` 同時也回加密的 `103`／`104`（對方**有**金鑰時看得到）：
-  先加密的回應、再明文的 close、再 close frame。
+- ⚠️ 明文包**只出現在關連線前**，而且**內容裡永遠沒有秘密**（不回 token、不回解出來的東西）。
+- 🚫 不再另外回加密的 `103`／`104`：一種情況一包，前端收到 `0x01` 就知道要斷了。`103`／`104`／`108` 留在 code 表只是給 rpc-cli 對 exit code 用。
 
 ## 2. 共同的 params 欄位
 
@@ -111,8 +156,9 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 
 | method | params | result | core |
 |---|---|---|---|
-| `hello` | §1.1 | §1.1 | — |
-| `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, rpc_port, data_port, uptime_seconds, connections }` | `key_mode`、`is_unlocked` |
+| `hello` | §1.3 | §1.3 | — |
+| `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections }` | `key_mode`、`is_unlocked` |
+| `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
 | `vault.lock` | — | `{ ok: true }` | ⚠️ core 沒有——`Core` 是解鎖一次就活著；daemon 這邊 lock ＝ 丟掉 `Core` 重開一個。**沒有 ticket 可刪**（§1 那個妥協消失了） |
@@ -240,9 +286,11 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 | 100 | `bad_request` | 解出來不是 JSON 物件、沒有 `method`、`id` 不是整數 |
 | 101 | `unknown_method` | 沒這個 method |
 | 102 | `invalid_params` | 缺必填、型別不對、base64 解不開、路徑不是絕對路徑 |
-| 103 | `hello_required` | 第一則不是 `hello`。**回完關連線**（§1.2） |
-| 104 | `protocol_mismatch` | `hello.protocols` 跟 daemon 沒有交集。**回完關連線**（§1.2） |
-| 108 | `bad_client` | `hello.client` 不以 `wbf-matrix` 開頭。**回完關連線**（§1.2） |
+| 103 | `hello_required` | 第一則不是 `hello`。⚠️ 線上不回這個號碼，回的是 `0x01` 的 `HELLO_REQUIRED`（§1.4）；號碼給 rpc-cli 對 exit code |
+| 104 | `protocol_mismatch` | 同上，對應 `PROTOCOL_MISMATCH` |
+| 108 | `bad_client` | 同上，對應 `BAD_CLIENT` |
+| 109 | `bad_token` | 同上，對應 `BAD_TOKEN` |
+| 110 | `bad_frame` | 同上，對應 `BAD_FRAME` |
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
 | 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
@@ -342,5 +390,6 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 - 🚫 沒有批次請求（JSON-RPC 的陣列形式）：一條連線本來就能並行。
 - 🚫 沒有「哪個前端是主」：§4.7。
 - 🚫 沒有壓縮：frame 上限 1 MiB，大的走資料平面。
+- 🚫 沒有 WS text frame、🚫 pack 裡沒有長度欄位、🚫 `type` 不表示種類：一包一則、長度由 WS 給、種類在 JSON 裡（§1）。
 - 🚫 daemon 不問終端、不彈視窗、不讀 passphrase 檔：全部從 RPC 進來（§4.5）。
 - 🚫 `msg` 不當邏輯用、🚫 `code` 不重排、🚫 `method` 不改名——改名等於新 method 加舊的廢棄，廢棄的回 `101` 前先活一個版本。
