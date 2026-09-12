@@ -22,8 +22,7 @@ pub async fn recent_command(
             from_scratch,
             context.transport,
             crate::commands::CLIENT_NAME,
-            context.account_user(),
-            context.server_override.as_deref(),
+            &context.target(),
         )
         .await?;
     crate::rooms::print_json(&serde_json::to_value(summary).expect("serializes"))

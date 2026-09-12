@@ -9,7 +9,7 @@ use std::path::Path;
 use serde_json::json;
 use wbf_core::{
     cipher_for_plaintext_room, watch_mode_from_name, CoreError, CoreErrorKind, CoreEvent,
-    HistorySource, UploadRequest,
+    HistoryQuery, HistorySource, UploadRequest,
 };
 use wbf_sdk::vault::write_private;
 use wbf_sdk::Message;
@@ -21,11 +21,7 @@ pub async fn rooms_command(context: &Context) -> Result<(), CoreError> {
     context.warn_if_backups_are_off();
     let conversations = context
         .core()?
-        .list_conversations(
-            context.account_user(),
-            context.server_override.as_deref(),
-            context.server_backup,
-        )
+        .list_conversations(&context.target())
         .await?;
     print_json(&serde_json::to_value(conversations).expect("serializes"))
 }
@@ -33,11 +29,9 @@ pub async fn rooms_command(context: &Context) -> Result<(), CoreError> {
 pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), CoreError> {
     context.warn_if_backups_are_off();
     let core = context.core()?;
-    let (user, server) = (context.account_user(), context.server_override.as_deref());
+    let target = context.target();
     if let Some(text) = &args.text {
-        let event_id = core
-            .send_text(&args.room, text, user, server, context.server_backup)
-            .await?;
+        let event_id = core.send_text(&args.room, text, &target).await?;
         return print_json(&json!({ "event_id": event_id }));
     }
     let Some(file) = &args.file else {
@@ -49,9 +43,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
 
     // 約定 §5.1：沒 E2EE 的房間走明文模式，送之前**警告並要求確認**。
     // 🚫 這個確認是前端的事，core 不問（architecture-v2 §3）。
-    let conversation = core
-        .conversation(&args.room, user, server, context.server_backup)
-        .await?;
+    let conversation = core.conversation(&args.room, &target).await?;
     let cipher = if conversation.encrypted {
         args.cipher.clone()
     } else {
@@ -81,9 +73,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
             &request,
             args.caption.as_deref(),
             context.transport,
-            user,
-            server,
-            context.server_backup,
+            &target,
         )
         .await?;
     print_json(&json!({ "event_id": result.event_id, "mxc": result.mxc }))
@@ -106,14 +96,7 @@ pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), Co
     let started = std::time::Instant::now();
     let summary = context
         .core()?
-        .watch(
-            &args.room,
-            mode,
-            args.since.as_deref(),
-            context.account_user(),
-            context.server_override.as_deref(),
-            context.server_backup,
-        )
+        .watch(&args.room, mode, args.since.as_deref(), &context.target())
         .await;
     printer.abort();
     let summary = summary?;
@@ -143,15 +126,15 @@ pub async fn read_command(
     let page = context
         .core()?
         .history(
-            room,
-            limit,
-            before,
-            source_of(from_cache),
-            types,
-            sender,
-            context.account_user(),
-            context.server_override.as_deref(),
-            context.server_backup,
+            &HistoryQuery {
+                room: room.to_string(),
+                limit,
+                before: before.map(str::to_string),
+                source: source_of(from_cache),
+                types: types.to_vec(),
+                sender: sender.map(str::to_string),
+            },
+            &context.target(),
         )
         .await?;
     print_json(&serde_json::to_value(page).expect("serializes"))
@@ -173,9 +156,7 @@ pub async fn files_command(
             before,
             source_of(from_cache),
             save,
-            context.account_user(),
-            context.server_override.as_deref(),
-            context.server_backup,
+            &context.target(),
         )
         .await?;
     print_json(&serde_json::to_value(page).expect("serializes"))

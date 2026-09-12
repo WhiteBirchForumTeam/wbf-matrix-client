@@ -80,19 +80,14 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
                         server: session.server,
                     }
                 }
-                None => context.core()?.whoami(context.account_user()).await?,
+                None => context.core()?.whoami(&context.target()).await?,
             };
             print_json(&serde_json::to_value(who).expect("serializes"))
         }
         Command::Ping => {
             let hello = context
                 .core()?
-                .ping(
-                    context.transport,
-                    CLIENT_NAME,
-                    context.account_user(),
-                    context.server_override.as_deref(),
-                )
+                .ping(context.transport, CLIENT_NAME, &context.target())
                 .await?;
             print_json(&serde_json::to_value(hello).expect("serializes"))
         }
@@ -100,12 +95,7 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
         Command::Status { upload_id } => {
             let status = context
                 .core()?
-                .upload_status(
-                    upload_id,
-                    context.transport,
-                    context.account_user(),
-                    context.server_override.as_deref(),
-                )
+                .upload_status(upload_id, context.transport, &context.target())
                 .await?;
             print_json(&serde_json::to_value(status).expect("serializes"))
         }
@@ -116,8 +106,7 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
                     upload_id,
                     file.as_deref(),
                     context.transport,
-                    context.account_user(),
-                    context.server_override.as_deref(),
+                    &context.target(),
                 )
                 .await?;
             print_json(&json!({ "ok": true }))
@@ -424,10 +413,15 @@ impl Context {
 
     /// 這個命令要對哪個帳號動作：`--account`（配 `--server` 消歧），沒給就是 `current`。
     ///
-    /// ⚠️ 回的是**字串**不是 `AccountDir`——帳號在 core 的邊界上就是一串 mxid
-    /// （PR #24 審查 cirno🔴）。`None` 表示「用 current」，由 core 自己解析。
-    pub fn account_user(&self) -> Option<&str> {
-        self.account_override.as_deref()
+    /// 這次命令要對誰、哪台 server、備份開著嗎——core 幾乎每個方法都要這三件事。
+    ///
+    /// 📎 `server_backup` 是 conf 的值：**前端的決定**，core 不讀 conf（§3）。
+    pub fn target(&self) -> wbf_core::Target {
+        wbf_core::Target {
+            user: self.account_override.clone(),
+            server: self.server_override.clone(),
+            server_backup: self.server_backup,
+        }
     }
 
     /// 這個命令的常駐狀態，**保證已經解鎖**。
@@ -675,13 +669,11 @@ fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), Cor
 /// ⚠️ conf 的兩個開關在**這一層**判斷：core 被叫到就做，「要不要叫它」是前端的決定（§3）。
 async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Result<(), CoreError> {
     let core = context.core()?;
-    let (user, server) = (context.account_user(), context.server_override.as_deref());
+    let target = context.target();
     context.warn_if_backups_are_off();
     match action {
         KeyBackupAction::Status => {
-            let status = core
-                .backup_status(user, server, context.server_backup)
-                .await?;
+            let status = core.backup_status(&target).await?;
             let mut output = serde_json::to_value(status).expect("serializes");
             // conf 的兩個開關是**前端的值**，core 不知道有 conf 這種東西——所以在這裡加。
             output["server_backup_setting"] = json!(on_off(context.server_backup));
@@ -697,7 +689,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
                     .progress("LOCAL_ROOM_KEYS=off, so the local snapshot was not updated".into());
             }
             let result = core
-                .upload_room_keys(user, server, context.local_room_keys, context.server_backup)
+                .upload_room_keys(&target, context.local_room_keys)
                 .await?;
             print_json(&serde_json::to_value(result).expect("serializes"))
         }
@@ -709,36 +701,30 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
                     "write a local snapshot",
                 ));
             }
-            let bytes = core
-                .save_room_key_snapshot(user, server, context.server_backup)
-                .await?;
+            let bytes = core.save_room_key_snapshot(&target).await?;
             print_json(&json!({ "ok": true, "bytes": bytes }))
         }
         KeyBackupAction::Import => {
-            let result = core
-                .import_room_key_snapshot(user, server, context.server_backup)
-                .await?;
+            let result = core.import_room_key_snapshot(&target).await?;
             print_json(&serde_json::to_value(result).expect("serializes"))
         }
         KeyBackupAction::Restore => {
-            let result = core
-                .restore_from_recovery_key(user, server, context.server_backup)
-                .await
-                .map_err(|error| match error.kind {
-                    wbf_core::CoreErrorKind::NoRecoveryKeyHere => CoreError::new(
-                        CoreErrorKind::Usage,
-                        format!("{error}; run `wbf-cli key-backup recovery` first"),
-                    ),
-                    _ => error.into(),
-                })?;
+            let result =
+                core.restore_from_recovery_key(&target)
+                    .await
+                    .map_err(|error| match error.kind {
+                        wbf_core::CoreErrorKind::NoRecoveryKeyHere => CoreError::new(
+                            CoreErrorKind::Usage,
+                            format!("{error}; run `wbf-cli key-backup recovery` first"),
+                        ),
+                        _ => error,
+                    })?;
             let mut output = serde_json::to_value(result).expect("serializes");
             output["ok"] = json!(true);
             print_json(&output)
         }
         KeyBackupAction::Recovery => {
-            let recovery_key = core
-                .create_recovery_key(user, server, context.server_backup)
-                .await?;
+            let recovery_key = core.create_recovery_key(&target).await?;
             context.progress(
                 "this recovery key is now sealed under <data dir>/r/, which survives logout,\n       \
                  so you will not be asked to type it on this machine.\n       \
@@ -780,7 +766,7 @@ async fn destroy_account_command(
             "destroy {user}? this logs the device out and deletes its session, crypto store, recovery key, and the cached events only this account has"
         ))?
     {
-        return Err(CoreError::new(CoreErrorKind::Usage, format!("{}", "cancelled")));
+        return Err(CoreError::new(CoreErrorKind::Usage, "cancelled"));
     }
     let result = context
         .core()?
@@ -845,8 +831,7 @@ async fn upload_command(context: &Context, args: &UploadArgs) -> Result<(), Core
                 &request,
                 args.link == "wifi",
                 context.transport,
-                context.account_user(),
-                context.server_override.as_deref(),
+                &context.target(),
             )
             .await?;
         return crate::rooms::emit_manifest(&manifest, args.manifest.as_deref());
@@ -859,12 +844,7 @@ async fn upload_command(context: &Context, args: &UploadArgs) -> Result<(), Core
     }
     let manifest = context
         .core()?
-        .upload_file(
-            &request,
-            context.transport,
-            context.account_user(),
-            context.server_override.as_deref(),
-        )
+        .upload_file(&request, context.transport, &context.target())
         .await?;
     crate::rooms::emit_manifest(&manifest, args.manifest.as_deref())
 }
@@ -875,7 +855,7 @@ async fn read_manifest(context: &Context, path: &Path) -> Result<Manifest, CoreE
     let manifest = Manifest::from_json(&std::fs::read(path)?)?;
     let session_server = match context.token_session().await {
         Some(session) => session?.server,
-        None => context.core()?.current_server(context.account_user())?,
+        None => context.core()?.current_server(&context.target())?,
     };
     if manifest.server.trim_end_matches('/') != session_server.trim_end_matches('/') {
         return Err(CoreError::new(
@@ -917,13 +897,7 @@ async fn info_command(
     };
     let info = context
         .core()?
-        .media_info(
-            mxc,
-            manifest.as_ref(),
-            context.transport,
-            context.account_user(),
-            context.server_override.as_deref(),
-        )
+        .media_info(mxc, manifest.as_ref(), context.transport, &context.target())
         .await?;
     print_json(&serde_json::to_value(info).expect("serializes"))
 }
@@ -939,13 +913,13 @@ async fn download_command(
         Some(out) => out,
         None => output_path_from_name(manifest.block.name.as_deref())?,
     };
-    let (user, server) = (context.account_user(), context.server_override.as_deref());
+    let target = context.target();
     // 登入中且沒說 `--no-cache`：走媒體快取（池裡有就不連 server；沒有就邊下邊進池、
     // 可續傳），再從池複製到 `--out`（local-cache-db.md §8.7）。
     if !no_cache && context.token_override.is_none() {
         let result = context
             .core()?
-            .download_to(&manifest, &out, context.transport, user, server)
+            .download_to(&manifest, &out, context.transport, &target)
             .await?;
         return print_json(&serde_json::to_value(result).expect("serializes"));
     }
@@ -954,7 +928,7 @@ async fn download_command(
     }
     let result = context
         .core()?
-        .download_direct(&manifest, &out, context.transport, user, server)
+        .download_direct(&manifest, &out, context.transport, &target)
         .await?;
     print_json(&serde_json::to_value(result).expect("serializes"))
 }
@@ -989,9 +963,7 @@ async fn download_with_raw_client(
 }
 
 async fn media_stats_command(context: &Context) -> Result<(), CoreError> {
-    let stats = context
-        .core()?
-        .media_stats(context.account_user(), context.server_override.as_deref())?;
+    let stats = context.core()?.media_stats(&context.target())?;
     print_json(&serde_json::to_value(stats).expect("serializes"))
 }
 
@@ -1000,12 +972,10 @@ async fn media_gc_command(
     quota_mib: u64,
     protect_days: u64,
 ) -> Result<(), CoreError> {
-    let report = context.core()?.collect_media_garbage(
-        quota_mib,
-        protect_days,
-        context.account_user(),
-        context.server_override.as_deref(),
-    )?;
+    let report =
+        context
+            .core()?
+            .collect_media_garbage(quota_mib, protect_days, &context.target())?;
     print_json(&serde_json::to_value(report).expect("serializes"))
 }
 
@@ -1018,14 +988,7 @@ async fn seek_command(
     let manifest = read_manifest(context, manifest_path).await?;
     let result = context
         .core()?
-        .seek_read(
-            &manifest,
-            at,
-            len,
-            context.transport,
-            context.account_user(),
-            context.server_override.as_deref(),
-        )
+        .seek_read(&manifest, at, len, context.transport, &context.target())
         .await?;
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&result.bytes)?;

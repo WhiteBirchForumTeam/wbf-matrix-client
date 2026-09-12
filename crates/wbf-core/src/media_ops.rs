@@ -20,7 +20,7 @@ use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
-use crate::Core;
+use crate::{Core, Target};
 
 /// `media-stats`。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -75,12 +75,8 @@ pub struct DownloadResult {
 
 impl Core {
     /// 媒體池現在多大、有幾個半成品。
-    pub fn media_stats(
-        &self,
-        user: Option<&str>,
-        server: Option<&str>,
-    ) -> Result<MediaStats, CoreError> {
-        let account = self.account_or_current(user, server)?;
+    pub fn media_stats(&self, target: &Target) -> Result<MediaStats, CoreError> {
+        let account = self.account_or_current(target)?;
         let (cache, _me) = self.cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
         let complete = cache.list_media_by_last_used()?;
@@ -104,10 +100,9 @@ impl Core {
         &self,
         quota_mib: u64,
         protect_days: u64,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<MediaGcReport, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let (mut cache, _me) = self.cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
         let protect = std::time::Duration::from_secs(protect_days * 24 * 3600);
@@ -143,10 +138,9 @@ impl Core {
         manifest: &Manifest,
         out: &Path,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<DownloadResult, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let (mut cache, _me) = self.cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
         let mut client = self.client_of(&account, transport).await?;
@@ -198,10 +192,9 @@ impl Core {
         manifest: &Manifest,
         out: &Path,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<DirectDownloadResult, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let mut client = self.client_of(&account, transport).await?;
         let mut file = std::fs::File::create(out)?;
         let result = client

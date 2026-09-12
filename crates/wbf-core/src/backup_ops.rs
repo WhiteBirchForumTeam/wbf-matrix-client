@@ -13,7 +13,7 @@ use wbf_sdk::room_keys;
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::recovery;
-use crate::Core;
+use crate::{Core, Target};
 
 /// `key-backup status`。
 ///
@@ -58,14 +58,9 @@ pub struct RecoveryStateReport {
 
 impl Core {
     /// server 上有沒有備份、本機有沒有在上傳、本地快照多大。
-    pub async fn backup_status(
-        &self,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
-    ) -> Result<BackupStatusReport, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.backend_of(&account, server_backup).await?;
+    pub async fn backup_status(&self, target: &Target) -> Result<BackupStatusReport, CoreError> {
+        let account = self.account_or_current(target)?;
+        let backend = self.backend_of(&account, target.server_backup).await?;
         backend.sync_once(None, std::time::Duration::ZERO).await?;
         let status = backend.backup_status().await?;
         let snapshot = room_keys::get_snapshot_status(&account.dir);
@@ -87,13 +82,11 @@ impl Core {
     ///         不同，但沒有理由讓使用者記得跑兩個命令）。呼叫端把本地那份關掉時傳 `false`
     pub async fn upload_room_keys(
         &self,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
         also_save_snapshot: bool,
-        server_backup: bool,
     ) -> Result<UploadResult, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self.backend_of(&account, target.server_backup).await?;
         backend.sync_once(None, std::time::Duration::ZERO).await?;
         self.events
             .progress("uploading room keys to the server backup...");
@@ -114,26 +107,19 @@ impl Core {
     ///
     /// 🚫 `login` 之後**不要**叫它：剛登入的 crypto store 幾乎沒有金鑰，存了也是空的
     /// （PR #19 審查 rumia🟡3／salvia🟡2）。
-    pub async fn save_room_key_snapshot(
-        &self,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
-    ) -> Result<u64, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.backend_of(&account, server_backup).await?;
+    pub async fn save_room_key_snapshot(&self, target: &Target) -> Result<u64, CoreError> {
+        let account = self.account_or_current(target)?;
+        let backend = self.backend_of(&account, target.server_backup).await?;
         self.save_snapshot_of(&account, &backend).await
     }
 
     /// 把本地快照餵回 crypto store（重新 `login`、或刪過 `m/` 之後用）。
     pub async fn import_room_key_snapshot(
         &self,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<ImportResult, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self.backend_of(&account, target.server_backup).await?;
         let key = self.vault()?.room_key_backup_key();
         let (imported, total) = backend
             .import_room_key_snapshot(
@@ -151,12 +137,10 @@ impl Core {
     /// （2026-09-09 對真 server 驗證時發現的缺口）。
     pub async fn restore_from_recovery_key(
         &self,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<RecoveryStateReport, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self.backend_of(&account, target.server_backup).await?;
         backend.sync_once(None, std::time::Duration::ZERO).await?;
         let user_id = self.session_of(&account)?.user_id;
         let key = recovery::find(&self.data_dir, self.vault()?, &user_id)?.ok_or_else(|| {
@@ -182,12 +166,10 @@ impl Core {
     /// 機器沒了就兩份都沒了。
     pub async fn create_recovery_key(
         &self,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<Zeroizing<String>, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self.backend_of(&account, target.server_backup).await?;
         backend.sync_once(None, std::time::Duration::ZERO).await?;
         let recovery_key = backend.enable_recovery().await?;
         let user_id = self.session_of(&account)?.user_id;
@@ -196,13 +178,9 @@ impl Core {
     }
 
     /// 沒給 `user` 就用 `current`。
-    pub(crate) fn account_or_current(
-        &self,
-        user: Option<&str>,
-        server: Option<&str>,
-    ) -> Result<AccountDir, CoreError> {
-        match user {
-            Some(user) => self.find_account(user, server),
+    pub(crate) fn account_or_current(&self, target: &Target) -> Result<AccountDir, CoreError> {
+        match target.user() {
+            Some(user) => self.find_account(user, target.server()),
             None => self.current_account(),
         }
     }

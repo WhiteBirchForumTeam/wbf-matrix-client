@@ -18,7 +18,7 @@ use wbf_sdk::{FileCipher, UploadState};
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
-use crate::Core;
+use crate::{Core, Target};
 
 /// 要上傳什麼、怎麼切、怎麼加密。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,10 +56,9 @@ impl Core {
         &self,
         request: &UploadRequest,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<Manifest, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         self.upload_with_account(&account, request, transport).await
     }
 
@@ -73,12 +72,12 @@ impl Core {
         request: &UploadRequest,
         caption: Option<&str>,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<SendFileResult, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.synced_backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self
+            .synced_backend_of(&account, target.server_backup)
+            .await?;
         let manifest = self
             .upload_with_account(&account, request, transport)
             .await?;

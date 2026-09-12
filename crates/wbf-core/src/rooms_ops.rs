@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use wbf_sdk::chat::{ChatBackend, Conversation, Message, MessageKind};
 use wbf_sdk::manifest::Manifest;
@@ -18,7 +18,7 @@ use wbf_sdk::Cipher;
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
-use crate::Core;
+use crate::{Core, Target};
 
 /// 一頁訊息。`next` 是下一頁的游標；⚠️ 過濾之後 `events` 可能是空的但 `next` 還在，
 /// 呼叫端要照 `next` 判斷有沒有下一頁，🚫 不要看 `events` 空不空。
@@ -46,8 +46,27 @@ pub struct FilePage {
     pub next: Option<String>,
 }
 
+/// 讀一頁歷史要什麼。
+///
+/// 📎 併成一個型別的理由跟 [`crate::Target`] 一樣：**RPC 的 `params` 就是這個形狀**。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryQuery {
+    pub room: String,
+    pub limit: u32,
+    /// `Server` 時是 server 的翻頁 token；`Cache` 時是 `r_seq` 的數字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    pub source: HistorySource,
+    /// 空的就不濾。⚠️ 過濾在**這一層**做（CLI 規格 §3.4.1）：server 不知道我們的 kind 名字。
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+}
+
 /// 讀歷史要從哪拿。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HistorySource {
     /// 打 server，順手寫穿快取。
     Server,
@@ -59,12 +78,12 @@ impl Core {
     /// 加入的房間。順手寫穿快取。
     pub async fn list_conversations(
         &self,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<Vec<Conversation>, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.synced_backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self
+            .synced_backend_of(&account, target.server_backup)
+            .await?;
         let conversations = backend.conversations().await?;
         if let Ok((mut cache, me)) = self.cache_and_me(&account) {
             self.write_through(cache.upsert_conversations(&me, &conversations));
@@ -76,12 +95,12 @@ impl Core {
     pub async fn conversation(
         &self,
         room: &str,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<Conversation, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.synced_backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self
+            .synced_backend_of(&account, target.server_backup)
+            .await?;
         Ok(backend.conversation(room).await?)
     }
 
@@ -90,12 +109,12 @@ impl Core {
         &self,
         room: &str,
         body: &str,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<String, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.synced_backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self
+            .synced_backend_of(&account, target.server_backup)
+            .await?;
         Ok(backend.send_text(room, body).await?)
     }
 
@@ -107,19 +126,21 @@ impl Core {
     ///     sender: example: Some("@bob:localhost")
     pub async fn history(
         &self,
-        room: &str,
-        limit: u32,
-        before: Option<&str>,
-        source: HistorySource,
-        types: &[String],
-        sender: Option<&str>,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        query: &HistoryQuery,
+        target: &Target,
     ) -> Result<MessagePage, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let (room, limit, before) = (query.room.as_str(), query.limit, query.before.as_deref());
+        let (types, sender) = (&query.types, query.sender.as_deref());
+        let account = self.account_or_current(target)?;
         let (events, next) = self
-            .page_of(&account, room, limit, before, source, server_backup)
+            .page_of(
+                &account,
+                room,
+                limit,
+                before,
+                query.source,
+                target.server_backup,
+            )
             .await?;
         // 過濾在這一層（CLI 規格 §3.4.1）：server 不知道我們的 kind 名字。
         let events = events
@@ -143,14 +164,12 @@ impl Core {
         before: Option<&str>,
         source: HistorySource,
         save_to: Option<&Path>,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<FilePage, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let session_server = self.session_of(&account)?.server;
         let (events, next) = self
-            .page_of(&account, room, limit, before, source, server_backup)
+            .page_of(&account, room, limit, before, source, target.server_backup)
             .await?;
         let mut files = Vec::new();
         for message in &events {

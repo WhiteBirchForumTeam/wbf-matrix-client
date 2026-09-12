@@ -11,7 +11,7 @@ use wbf_sdk::event_json::messages_from_json;
 use wbf_sdk::{RecentPlan, Transport};
 
 use crate::error::{CoreError, CoreErrorKind};
-use crate::{Core, CoreEvent};
+use crate::{Core, CoreEvent, Target};
 
 /// `watch` 要等多久、等到什麼為止。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,12 +62,12 @@ impl Core {
         room: &str,
         mode: WatchMode,
         since: Option<&str>,
-        user: Option<&str>,
-        server: Option<&str>,
-        server_backup: bool,
+        target: &Target,
     ) -> Result<WatchSummary, CoreError> {
-        let account = self.account_or_current(user, server)?;
-        let backend = self.synced_backend_of(&account, server_backup).await?;
+        let account = self.account_or_current(target)?;
+        let backend = self
+            .synced_backend_of(&account, target.server_backup)
+            .await?;
         let me = self.session_of(&account)?.user_id;
         let deadline = match mode {
             WatchMode::Tail => None,
@@ -122,10 +122,9 @@ impl Core {
         from_scratch: bool,
         transport: Transport,
         client_name: &str,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<RecentSummary, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let (mut cache, me) = self.cache_and_me(&account)?;
         let mut client = self.client_of(&account, transport).await?;
         client.hello(client_name).await?;

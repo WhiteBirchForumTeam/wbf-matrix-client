@@ -66,10 +66,52 @@ pub use event::{CoreEvent, EventSink};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
-pub use rooms_ops::{cipher_for_plaintext_room, FileEntry, FilePage, HistorySource, MessagePage};
+pub use rooms_ops::{
+    cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, HistorySource, MessagePage,
+};
 pub use session_ops::{DestroyResult, LogoutResult};
 pub use sync_ops::{watch_mode_from_name, RecentSummary, WatchMode, WatchSummary};
 pub use upload_ops::{SendFileResult, UploadRequest};
+
+/// 幾乎每個操作都要回答的三件事。
+///
+/// 📎 把它們綁成一個型別不只是為了少打字：**RPC 的 `params` 就是這個形狀**
+/// （§4.6），所以 daemon 那邊直接反序列化成它，🚫 不必再拆成一串位置參數。
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Target {
+    /// 對哪個帳號動作。**`None` = 用 `current`**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// 哪台 server：同名 localpart 在多個 server 時消歧，或覆蓋 session 裡那個。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// conf 的 `SERVER_BACKUP`（CLI 規格 §10）。
+    ///
+    /// ⚠️ 由**呼叫端**帶進來：core 不讀 conf，那是「代前端做決定」（§3）。
+    /// 🚫 預設是 `false`，但那只是 `Default` 的值——真正的預設（開著）在前端那邊，
+    /// 因為「認不得的值落到安全值」是 §10.4 的規矩，不是這一層的。
+    #[serde(default)]
+    pub server_backup: bool,
+}
+
+impl Target {
+    /// `current` 帳號、不覆蓋 server。
+    pub fn current(server_backup: bool) -> Target {
+        Target {
+            user: None,
+            server: None,
+            server_backup,
+        }
+    }
+
+    pub(crate) fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    pub(crate) fn server(&self) -> Option<&str> {
+        self.server.as_deref()
+    }
+}
 
 /// 一個資料目錄的常駐狀態。
 ///

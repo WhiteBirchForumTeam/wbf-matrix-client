@@ -45,7 +45,7 @@ pub fn default_data_dir() -> Result<PathBuf, CoreError> {
     let base = base.ok_or_else(|| {
         CoreError::new(
             CoreErrorKind::Usage,
-            format!("{}", "cannot find a data directory; pass --data-dir"),
+            "cannot find a data directory; pass --data-dir",
         )
     })?;
     Ok(base.join("wbf-cli"))
@@ -293,7 +293,7 @@ pub fn prompt_new_passphrase() -> Result<Zeroizing<Vec<u8>>, CoreError> {
     if *first != *second {
         return Err(CoreError::new(
             CoreErrorKind::Usage,
-            format!("{}", "the two passphrases differ"),
+            "the two passphrases differ",
         ));
     }
     Ok(first)

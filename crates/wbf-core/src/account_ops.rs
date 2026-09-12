@@ -13,7 +13,7 @@ use wbf_sdk::vault::KeyMode;
 
 use crate::accounts::{self, AccountDir};
 use crate::recovery;
-use crate::Core;
+use crate::{Core, Target};
 
 /// 「我是誰」。🚫 刻意**沒有** `access_token`：那是秘密，不過邊界（`handles` 模組註解）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -94,8 +94,8 @@ impl Core {
 
     /// 「我是誰」。⚠️ 這是**問過 server** 的答案，不是本地那份的複述——
     /// `--token` 之外的路徑本地就有，但 `whoami` 的語意是「server 認為我是誰」。
-    pub async fn whoami(&self, user: Option<&str>) -> Result<WhoAmI, CoreError> {
-        let account = self.account_or_current(user, None)?;
+    pub async fn whoami(&self, target: &Target) -> Result<WhoAmI, CoreError> {
+        let account = self.account_or_current(target)?;
         let session = self.session_of(&account)?;
         let who = wbf_sdk::login::whoami(&session).await?;
         Ok(WhoAmI {
@@ -136,8 +136,8 @@ impl Core {
     /// 這個帳號的 homeserver URL（`session.sealed` 裡那個，權威）。
     ///
     /// 📎 給「這份 manifest 是不是這台 server 的」那種核對用。
-    pub fn current_server(&self, user: Option<&str>) -> Result<String, CoreError> {
-        let account = self.account_or_current(user, None)?;
+    pub fn current_server(&self, target: &Target) -> Result<String, CoreError> {
+        let account = self.account_or_current(target)?;
         Ok(self.session_of(&account)?.server)
     }
 

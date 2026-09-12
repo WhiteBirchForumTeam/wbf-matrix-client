@@ -11,7 +11,7 @@ use wbf_sdk::{ChunkedBlock, FileCipher, Transport};
 
 use crate::error::{CoreError, CoreErrorKind};
 use crate::upload_ops::UploadRequest;
-use crate::Core;
+use crate::{Core, Target};
 
 /// `info`：server 上那份上傳長什麼樣。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -80,10 +80,9 @@ impl Core {
         mxc: &str,
         manifest: Option<&Manifest>,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<MediaInfo, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let mut client = self.client_of(&account, transport).await?;
         let (info, description_data) = client.fetch_info(mxc).await?;
         let mut result = MediaInfo {
@@ -129,10 +128,9 @@ impl Core {
         at: u64,
         len: Option<u64>,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<SeekResult, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let mut client = self.client_of(&account, transport).await?;
         let result = client.seek_read(manifest, at, len).await?;
         Ok(SeekResult {
@@ -158,10 +156,9 @@ impl Core {
         request: &UploadRequest,
         wifi: bool,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<Manifest, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let session = self.session_of(&account)?;
         let mut client = self.client_of(&account, transport).await?;
         let cipher = crate::upload_ops::parse_cipher(request.cipher.as_deref())?;
@@ -253,10 +250,9 @@ impl Core {
         &self,
         transport: Transport,
         client_name: &str,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<ServerHello, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let mut client = self.client_of(&account, transport).await?;
         let hello = client.hello(client_name).await?;
         client.ping().await?;
@@ -275,10 +271,9 @@ impl Core {
         &self,
         upload_id: u64,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<UploadStatusReport, CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let mut client = self.client_of(&account, transport).await?;
         let status = client.upload_status(upload_id).await?;
         Ok(UploadStatusReport {
@@ -301,10 +296,9 @@ impl Core {
         upload_id: u64,
         file: Option<&std::path::Path>,
         transport: Transport,
-        user: Option<&str>,
-        server: Option<&str>,
+        target: &Target,
     ) -> Result<(), CoreError> {
-        let account = self.account_or_current(user, server)?;
+        let account = self.account_or_current(target)?;
         let mut client = self.client_of(&account, transport).await?;
         client.abort_upload(upload_id).await?;
         if let Some(file) = file {
