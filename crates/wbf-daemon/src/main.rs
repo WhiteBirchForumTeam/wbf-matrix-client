@@ -1,0 +1,92 @@
+//! `wbf-matrix-client-daemon`：這一版只有 `-s`（常駐）。單發命令（`daemon <命令>`，architecture-v2 §0.2）
+//! 與資料平面在下一支 PR。
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use clap::Parser;
+use wbf_daemon::connection::EncryptionPolicy;
+use wbf_daemon::handle::Handle;
+use wbf_daemon::pack::RpcKeys;
+use wbf_daemon::server::RpcServer;
+use zeroize::Zeroizing;
+
+#[derive(Parser)]
+#[command(
+    name = "wbf-matrix-client-daemon",
+    version,
+    about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端"
+)]
+struct Cli {
+    /// 常駐：開本地 RPC 的 WS，等前端來連
+    #[arg(short = 's', long = "server")]
+    serve: bool,
+    /// 資料目錄
+    #[arg(long, env = "WBF_DATA_DIR")]
+    data_dir: PathBuf,
+    /// `daemon.token` 的路徑（前端產生的 256 byte 隨機檔，architecture-v2 §4.3）。預設 <data dir>/daemon.token
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+    /// RPC 的 port；0 就隨機，寫進 <data dir>/daemon.json
+    #[arg(long, default_value_t = 0)]
+    rpc_port: u16,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if !cli.serve {
+        eprintln!(
+            "only `-s` (serve) is implemented in this version; single-shot commands come next"
+        );
+        return ExitCode::from(1);
+    }
+    let token_path = cli
+        .token_file
+        .unwrap_or_else(|| cli.data_dir.join("daemon.token"));
+    let token = match std::fs::read(&token_path) {
+        Ok(bytes) => Zeroizing::new(bytes),
+        Err(error) => {
+            eprintln!(
+                "cannot read the daemon token at {}: {error}",
+                token_path.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if token.len() < 32 {
+        eprintln!(
+            "the daemon token at {} is too short ({} bytes; expected 256)",
+            token_path.display(),
+            token.len()
+        );
+        return ExitCode::from(1);
+    }
+    let keys = Arc::new(RpcKeys::from_token(&token));
+    drop(token);
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async move {
+        let policy = EncryptionPolicy::enforced();
+        let handle = Handle::new(&cli.data_dir, policy.clone());
+        let server = match RpcServer::bind(cli.rpc_port, keys, policy, handle.clone()).await {
+            Ok(server) => server,
+            Err(error) => {
+                eprintln!("cannot bind the RPC port: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let rpc_port = server.local_addr().map(|addr| addr.port()).unwrap_or(0);
+        // 資料平面還沒有：data_port 先 0。
+        handle.set_ports(rpc_port, 0).await;
+        let info = serde_json::json!({ "rpc_port": rpc_port, "data_port": 0 });
+        if let Err(error) = std::fs::write(cli.data_dir.join("daemon.json"), info.to_string()) {
+            eprintln!("cannot write daemon.json: {error}");
+            return ExitCode::from(1);
+        }
+        eprintln!("listening on ws://127.0.0.1:{rpc_port}");
+        server.run().await;
+        let _ = std::fs::remove_file(cli.data_dir.join("daemon.json"));
+        ExitCode::SUCCESS
+    })
+}

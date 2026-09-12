@@ -4241,6 +4241,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wbf-daemon"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "chacha20poly1305 0.10.1",
+ "clap",
+ "futures-util",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "wbf-core",
+ "wbf-sdk",
+ "zeroize",
+]
+
+[[package]]
 name = "wbf-sdk"
 version = "0.1.0"
 dependencies = [
