@@ -88,7 +88,7 @@ store，結果不是鎖住就是壞資料。規則：
 
 | 痛 | 現在 | daemon 之後 |
 |---|---|---|
-| **每個命令都要解鎖** | 所以有了 `unlock.ticket`：**明文主金鑰落地** 15 分鐘。local-cache-db §4 自己標記這是妥協，接受它只因為「CLI 不是產品面」 | 解鎖一次，主金鑰只在 daemon 的記憶體裡。**那個妥協整個消失** |
+| **每個命令都要解鎖** | 以前靠 `unlock.ticket` 省打字：**明文主金鑰落地** 15 分鐘。2026-09-13 連它一起拿掉了（local-cache-db §4） | 解鎖一次，主金鑰只在 daemon 的記憶體裡。**那個妥協整個消失** |
 | **matrix-sdk 的 store 是獨佔的** | Desktop 開著就不能同時用 CLI（`crypto.db` 被鎖）。上游為此有 `enable_cross_process_store_lock`，但那是 iOS notification extension 的權宜之計，代價是每次操作搶鎖 | 一個程序持有 store，問題不存在 |
 | **收不了推送** | roadmap 要把 event（含金鑰的 to-device）改走 WS 推送，而一命令一程序的東西**沒有人在線上收**，斷開的期間就是漏 | daemon 常駐，連線與游標由它維護 |
 
@@ -197,13 +197,46 @@ Kotlin 的 OkHttp 內建，JS 原生。
 ### 4.3 token：前端產生，前端叫起 daemon
 
 **前端與 daemon 必然成對出現**（維護者 2026-09-09）——有 rpc-cli 就有 daemon，有 Desktop 就有 daemon。
-所以 token 由**前端**產生，不是 daemon：
+所以 token 由**前端**產生，不是 daemon。⭐ 而它落在磁碟上**只是為了交給一個還沒啟動的程序**，
+所以那段落地時間要盡量短（維護者 2026-09-13 定的五步）：
 
-1. 前端產生 **256 byte 隨機檔**（`<data dir>/daemon.token`，Unix 0600），或用既有的那份。
-2. 前端 spawn daemon，把 token 的**路徑**用參數傳進去（🚫 不用命令列傳內容：那會進 `ps` 輸出）。
-3. daemon 讀它、導出金鑰（§4.4）、開兩個 port，把 port 寫進 `<data dir>/daemon.json`。
+| 步 | 誰 | 做什麼 |
+|---|---|---|
+| 1 | 前端 | 產生 **256 byte 隨機檔**（例如 `<data dir>/daemon.token`，Unix **0600**） |
+| 2 | 前端 | spawn `daemon -s --token-file <路徑>`。🚫 **不用命令列傳內容**：那會進 `ps` 輸出 |
+| 3 | daemon | 讀它、導出金鑰（§4.4）、開 port、**宣告 ready** |
+| 4 | 前端 | 收到 ready（或自己 `hello` 成功）之後**抹掉**那個檔 |
+| 5 | — | 此後 token 只活在兩個程序的記憶體裡，**磁碟上沒有** |
 
-📎 這比「daemon 產生、前端去讀」好的地方：**web 前端不必去讀檔案**——token 本來就是它給的。
+- ⚠️ **daemon 讀完就不再回頭讀那個路徑**，所以第 4 步刪掉它不會讓任何東西壞掉（`loopback.rs`
+  有一條測這件事）。反過來說，🚫 **不要設計「重讀 token」**——那會把第 5 步整個推翻。
+- ⚠️ **抹掉的是前端不是 daemon**：daemon 不知道前端有沒有收到 ready。
+  ⭐ 代價寫明：前端在第 3、4 步之間死掉，那個檔會留在磁碟上 —— 那時下一次啟動前**重新產生一把**
+  （token 不重用，見下），舊的那個檔照第 4 步抹掉。
+- 🚫 **不重用既有的 token**：抹掉之後就沒有既有的那份了；重連就重產生。一把 token 活得越久，
+  它落在磁碟上的那幾秒就越不只是那幾秒（備份、快照、同步資料夾都會抄走它）。
+- **daemon 的 token 檔權限是 fail closed 的**：Unix 上 group／other 有任何讀取位元就**拒絕啟動**，
+  🚫 不是印個警告照跑。
+- 📎 這比「daemon 產生、前端去讀」好的地方：**web 前端不必去讀檔案**——token 本來就是它給的。
+
+**第 3 步的 ready 是一個「邊緣」，不是一個狀態**（不然前端會把上一次殘留的 port 當成這一次的）：
+
+1. daemon 綁定**之前**先刪掉舊的 `<data dir>/daemon.json`（刪不掉就不啟動）。
+2. 綁好之後才 **temp＋rename** 寫進去（`{ "rpc_port", "data_port", "pid" }`）——前端 watch 到它出現時，
+   port 一定已經在聽，而且一定不是上一次的。
+3. 同時 **stdout 印一行 JSON**：`{"ready":true,"rpc_port":…,"data_port":…}`。spawn daemon 的那個程序
+   手上有 pipe，這樣它不必去 watch 檔案。🚫 stdout 只有這一行，其餘訊息一律 stderr。
+4. daemon 結束時刪掉 `daemon.json`。
+
+**第 4 步的「抹掉」有規定的做法**（`wbf_daemon::token::shred`，維護者 2026-09-13 指定）：
+**隨機 bytes → 填滿 `0xFF` → 填滿 `0x00`，每遍都 flush＋sync，最後才 `remove_file`**。
+
+- 順序的理由：隨機那遍是唯一「連舊值的統計痕跡都蓋掉」的一遍；後兩遍讓人**看得出這個檔被故意清過**。
+- 先 sync 再解除連結：反過來的話目錄項先消失，覆蓋就寫進一個沒有名字的檔。
+- ⚠️ **覆蓋是盡力不是保證**：SSD 的抹寫層與 CoW 檔案系統（APFS、Btrfs、ZFS、VSS 快照）可能把舊內容
+  留在別處，那不是使用者空間管得到的。🚫 所以別把它當成「這個 token 從此不可能被撿回來」——
+  真正的防線是**它只有幾秒鐘在磁碟上**加上 0600。📎 但盡力仍然值得：它擋掉最廉價的那一類
+  （`undelete`、目錄項還在的救援工具、被抄走的備份）。
 
 ### 4.4 每則控制訊息都加密（token 就是金鑰材料）
 
@@ -262,7 +295,11 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 - **passphrase 只留在 daemon 的記憶體裡，直到 daemon 關閉**（維護者 2026-09-09）。
   ⚠️ 所以 `unlock.ticket`（明文主金鑰落地 15 分鐘，local-cache-db §4 自己標記為妥協）**整個消失**——
-  這是 daemon 最直接的安全收穫。
+  這是 daemon 最直接的安全收穫。📎 2026-09-13 起連 CLI 那一側也沒有了（同 §4）：那個痛點不存在了。
+- 🚫 **沒有「鎖回去」**：`Core` 解鎖一次就活到程序結束，daemon 沒有 `vault.lock`（rpc-spec §3.1）。
+  UI 的 lock／unlock 是 **UI 自己那一層**的事 —— daemon 照樣連著、照樣寫 DB、照樣發通知，
+  ⭐ 因為使用者按 lock 通常只是暫時離開，回來要看到這段時間的訊息。真的要讓金鑰離開記憶體
+  就是 `daemon.shutdown` 再 `daemon -s`。
 - 🚫 daemon **不自己去問終端**：那樣 Desktop 與 Android 沒辦法解鎖。passphrase 一律從 RPC 進來。
 - 未解鎖時資料平面回 **503 而不是 404**：媒體確實存在，只是現在打不開——這個區別對前端有意義。
 
@@ -564,7 +601,7 @@ apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出�
 CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印一個 JSON 物件）都建立在
 「它是開發與除錯工具，不是產品面」上。變成 rpc-cli 之後：
 
-- `unlock.ticket` **可以拿掉**（§1）：解鎖狀態在 daemon 裡。
+- ~~`unlock.ticket` 可以拿掉~~ ✅ 2026-09-13 拿掉了（§1、local-cache-db §4）。
 - `--token` 模式要重想：那是「不碰 vault、不碰帳號目錄」的路徑，在 daemon 模型下是什麼意思？
 - stdout「只印一個 JSON 物件」對 `watch` 這種串流命令本來就有例外（JSON Lines），RPC 的推播會讓這種情況變多。
 

@@ -66,7 +66,7 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
   main.rs                只有 `-s`（讀 daemon.token、conf、寫 daemon.json）；單發命令、資料平面還沒有
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
   tests/real_server.rs   `--ignored`：對真 wbfuwunel 走 account.add→whoami→ping→room.list→sync.recent→backup.status→account.del
-apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源、unlock ticket）、
+apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源：檔案或終端，🚫 沒有 ticket 了）、
                          commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）；conf 的解析已搬到 wbf_core::conf
                          ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑

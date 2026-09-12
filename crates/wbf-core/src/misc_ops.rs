@@ -142,7 +142,7 @@ impl Core {
 
     /// 串流上傳：邊讀邊傳，**事先不知道總長**。
     ///
-    /// ⚠️ **這個方法是過渡的**，跟 [`Core::unlock_with_master_key`] 同一類。它收一個
+    /// ⚠️ **這個方法是過渡的**。它收一個
     /// `&mut dyn Read`，而那是 trait object——architecture-v2 §7 明文說公開介面上
     /// 🚫 不要有 trait object（過不了 FFI、序列化不了）。
     ///

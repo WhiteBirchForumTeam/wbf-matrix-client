@@ -32,12 +32,9 @@ pub struct Cli {
     /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（CLI 規格 §10.1）
     #[arg(long, global = true, env = "WBF_CONFIG")]
     pub config: Option<PathBuf>,
-    /// 整檔就是 passphrase（解 local.key 的那句話，不是 Matrix 帳號密碼）；沒給就看 unlock ticket，再沒有就從終端讀
+    /// 整檔就是 passphrase（解 local.key 的那句話，不是 Matrix 帳號密碼）；沒給就從終端讀（不回顯）
     #[arg(long, global = true, env = "WBF_PASSPHRASE_FILE")]
     pub passphrase_file: Option<PathBuf>,
-    /// passphrase 解鎖成功後 unlock ticket 的有效秒數；0 就不寫 ticket。預設 900，可用 conf 的 UNLOCK_TTL 改
-    #[arg(long, global = true)]
-    pub unlock_ttl: Option<u64>,
     /// stdout 只印 JSON（預設就是；現在是刻意的 no-op，留著是為了之後加人類可讀模式時介面不變，CLI 規格 §2）
     #[arg(long, global = true)]
     pub json: bool,
@@ -153,8 +150,6 @@ pub enum Command {
         #[command(subcommand)]
         action: RecoveryAction,
     },
-    /// 刪 unlock ticket；下一個命令會再問 passphrase
-    Lock,
     /// 給 local.key 設（或改）passphrase；沒給檔就從終端讀兩次
     SetPassphrase {
         #[arg(long)]

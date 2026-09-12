@@ -1,5 +1,10 @@
 //! `wbf-matrix-client-daemon`：這一版只有 `-s`（常駐）。單發命令（`daemon <命令>`，architecture-v2 §0.2）
 //! 與資料平面在下一支 PR。
+//!
+//! 起動的順序照 architecture-v2 §4.3 的五步（前端寫 token → spawn → **daemon 宣告 ready** →
+//! 前端抹掉 token 檔 → 之後只在記憶體裡）。⭐ 這支負責的是第 3 步，而「宣告 ready」是**一個邊緣**，
+//! 不是一個狀態：所以 `daemon.json` 在綁定**之前**先刪掉，綁好之後才 temp＋rename 寫進去 ——
+//! 前端等的那個檔出現的瞬間，port 一定已經在聽了，而且它一定不是上一次留下來的。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,6 +32,8 @@ struct Cli {
     #[arg(long, env = "WBF_DATA_DIR")]
     data_dir: PathBuf,
     /// `daemon.token` 的路徑（前端產生的 256 byte 隨機檔，architecture-v2 §4.3）。預設 <data dir>/daemon.token
+    ///
+    /// ⚠️ daemon 讀完就不再回頭讀它：前端該在 ready 之後把它抹掉（`wbf_daemon::token::shred`）
     #[arg(long)]
     token_file: Option<PathBuf>,
     /// RPC 的 port；0 就隨機，寫進 <data dir>/daemon.json
@@ -48,6 +55,24 @@ fn main() -> ExitCode {
     let token_path = cli
         .token_file
         .unwrap_or_else(|| cli.data_dir.join("daemon.token"));
+    // Unix 上別人讀得到就拒絕跑：token ＝ 整個 RPC 的憑證，fail closed（🚫 不只印警告）。
+    match wbf_daemon::token::is_private(&token_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "the daemon token at {} is readable by other users; make it 0600",
+                token_path.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!(
+                "cannot stat the daemon token at {}: {error}",
+                token_path.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
     let token = match std::fs::read(&token_path) {
         Ok(bytes) => Zeroizing::new(bytes),
         Err(error) => {
@@ -70,6 +95,18 @@ fn main() -> ExitCode {
         }
     };
     drop(token);
+
+    // ⚠️ 先刪掉上一次留下的：它的 port 可能是別人的，而前端把「這個檔出現」當成 ready。
+    // 刪不掉就不要跑——那代表前端會拿到一份我們沒寫過的 port（fail closed）。
+    let ready_path = cli.data_dir.join("daemon.json");
+    match std::fs::remove_file(&ready_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!("cannot remove the stale {}: {error}", ready_path.display());
+            return ExitCode::from(1);
+        }
+    }
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async move {
@@ -95,14 +132,30 @@ fn main() -> ExitCode {
         let rpc_port = server.local_addr().map(|addr| addr.port()).unwrap_or(0);
         // 資料平面還沒有：data_port 先 0。
         handle.set_ports(rpc_port, 0).await;
-        let info = serde_json::json!({ "rpc_port": rpc_port, "data_port": 0 });
-        if let Err(error) = std::fs::write(cli.data_dir.join("daemon.json"), info.to_string()) {
+        let info = serde_json::json!({
+            "rpc_port": rpc_port,
+            "data_port": 0,
+            "pid": std::process::id(),
+        });
+        // temp＋rename：前端可能正在 watch 這個檔，🚫 不讓它讀到寫一半的。
+        if let Err(error) = wbf_sdk::vault::write_private(&ready_path, info.to_string().as_bytes())
+        {
             eprintln!("cannot write daemon.json: {error}");
             return ExitCode::from(1);
         }
+        // 第 3 步的 ready 訊號。stdout 一行 JSON 給 spawn 我們的那個程序（它拿得到 pipe，
+        // 不必去 watch 檔案）；stderr 那行是給人看的。🚫 stdout 只有這一行，別的都走 stderr。
+        println!(
+            "{}",
+            serde_json::json!({ "ready": true, "rpc_port": rpc_port, "data_port": 0 })
+        );
         eprintln!("listening on ws://127.0.0.1:{rpc_port}");
+        eprintln!(
+            "ready; now shred {} (the daemon will not read it again)",
+            token_path.display()
+        );
         server.run().await;
-        let _ = std::fs::remove_file(cli.data_dir.join("daemon.json"));
+        let _ = std::fs::remove_file(&ready_path);
         ExitCode::SUCCESS
     })
 }

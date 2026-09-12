@@ -173,16 +173,24 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
-| `vault.lock` | — | `{ ok: true }`；還有請求握著解鎖的 `Core` → **`106`，而且維持解鎖** | ⚠️ core 沒有——`Core` 是解鎖一次就活著；daemon 這邊 lock ＝ 丟掉 `Core` 重開一個。**沒有 ticket 可刪**（§1 那個妥協消失了） |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
 | `vault.remove_passphrase` | — | `{ ok: true, key_mode: "plain" }` | `set_passphrase(None)` |
 
-🚨 **`vault.lock` 只換指標不算鎖上。** 請求是各自跑的，`call()` 一進來就先拿一份 `Core`；換掉指標之後，
-**已經拿到舊的那些長工作會繼續用解鎖狀態跑完**（`sync.recent`、`upload.file`、`media.save_to`…），
-那時回 `{ok: true}` 是在說謊。所以邊界是 fail closed 的：daemon 等在跑的那些放手（新請求此時擋著，
-🚫 不會再拿到舊的那份），等到了才換、才回成功；**等不到就回 `106` 並且維持解鎖**。
-⭐ 寧可叫呼叫者重試，也不要回報一個沒有成立的鎖。📎「叫停正在跑的那些」要等 `cancel`（§3.9）；
-在那之前重試是唯一的路。（PR #31 審查 cirno🔴、rumia🔴）
+🚨 **沒有 `vault.lock`**（維護者 2026-09-13 定）。**daemon 不提供「鎖上」這個 feature**，
+`Core` 的生命週期就是「啟動時解鎖一次、活到程序結束」。
+
+| 想要的 | 怎麼做 |
+|---|---|
+| **UI 的 lock／unlock**（暫時離開、閒置） | **UI 自己那一層**鎖畫面。🚫 不動 daemon：daemon 照樣連著 server、照樣寫 DB、照樣發通知——⭐ 使用者離開時收到訊息，回來就該看到它，而不是一段空白 |
+| **真的鎖上**（金鑰離開記憶體） | `daemon.shutdown`，要用再 `daemon -s` 起一次。⭐ 這才是「鎖 vault」的真正意思：停掉所有訂閱、關掉所有連線、程序結束、`Vault` 在 drop 時被 zeroize |
+
+為什麼不做一個 `vault.lock`：**它做不到它名字承諾的事。** 請求各自跑，`call()` 一進來就先拿一份
+`Arc<Core>`，所以「把 `Handle.core` 換成一個沒解鎖的」只換得掉**之後**進來的請求 —— 已經拿到舊那份的
+長工作（`sync.recent`、`upload.file`、`media.save_to`…）會繼續用解鎖狀態跑完，而金鑰要等**最後一個**
+持有者放手才會被抹掉。那時回 `{ok: true}` 是在說謊，而一個回報成功、邊界卻沒成立的安全操作
+**比明確失敗危險得多**。⭐ 與其做一個「盡量鎖」，不如只留一條真的做得到的路（shutdown）。
+📎 這條在 PR #30 進來、PR #31 的審查（cirno🔴、rumia🔴）發現它擋不住 in-flight 請求，
+維護者 2026-09-13 決定整條拿掉。
 
 ⚠️ passphrase 用 base64 而不是字串：它是任意 bytes（可以是一個 mp3）。🚫 不提供 `passphrase_file`
 ——那是「daemon 替前端讀檔」，web 前端根本給不出檔案路徑，而 rpc-cli 自己讀了再送不多一行。
@@ -307,7 +315,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | 101 | `unknown_method` | 沒這個 method |
 | 102 | `invalid_params` | 缺必填、型別不對、base64 解不開、路徑不是絕對路徑 |
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
-| 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定。也是 `vault.lock` 等不到在跑的請求放手時的回答（§3.1） |
+| 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
 | 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。🚫 不是前端的錯，所以🚫 不關連線 |
 
@@ -369,7 +377,7 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 
 - 進度走 RPC 的 `progress`，`id` 是 `media.create` 那一則的 `id`——所以前端要留著那個 `id`。
 - 中途斷線：daemon 保留狀態檔（CLI 規格 §6），同一個 token **重新 PUT 可以續傳**，daemon 從 `Status` 問到收了幾塊、回 `100 Continue` 之前先跳過那些 bytes。⚠️ 續傳的細節（怎麼告訴前端從第幾 byte 送）第一版不做，先整個重送。
-- token TTL 與撤銷（architecture-v2 §8 第 5 點）**第一版**：TTL 1 小時、`account.del`／`vault.lock` 時全部作廢。
+- token TTL 與撤銷（architecture-v2 §8 第 5 點）**第一版**：TTL 1 小時、`account.del` 時全部作廢（🚫 沒有 `vault.lock` 可以掛，§3.1）。
 
 ## 7. 一次完整的例子：Desktop 送一個 2 GB 的影片進 E2EE 房
 
@@ -396,7 +404,6 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 
 | 缺什麼 | 給誰用 |
 |---|---|
-| `Core::lock()`（或 daemon 丟掉重開） | `vault.lock` |
 | 「建檔 → 拿 reader 邊收邊傳」的拆分：`send_file` 現在是一條龍 | `media.create`、`room.send_attachment`、`PUT /upload` |
 | `PoolReader` 接到 HTTP Range：`download_to` 只會寫檔 | `GET /media` |
 | `CoreEvent` 補 `SyncState` 與結構化的 `Progress { id, done, total }` | §4 |
@@ -421,7 +428,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 
 | method | core | 底層 | 判定 |
 |---|---|---|---|
-| `hello`、`daemon.info`／`set_encryption`／`shutdown`、`vault.lock` | ✅ daemon 層 | 本機 | ✅ |
+| `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |

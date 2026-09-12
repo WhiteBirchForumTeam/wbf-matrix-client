@@ -29,8 +29,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `--token <access_token>` | `WBF_ACCESS_TOKEN` | 直接給 token，跳過 session 檔。🚫 不印、不寫進任何輸出 |
 | `--data-dir <dir>` | `WBF_DATA_DIR` | 資料目錄（`local.key`、`wbf.conf`、`current`、`s/<b58>_<b58>/cache.db`、`…/a/<b58>_<b58>/`），預設見 §7 |
 | `--account <mxid 或 localpart>` | `WBF_ACCOUNT` | 用哪個帳號，**就這一次**（要改預設用 `account switch`，§3.1）；沒給就是 `current`。同名 localpart 在多個 server 都有時要配 `--server`（§7） |
-| `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔的**原始 bytes** 就是 passphrase（解 `local.key` 用）。🚫 不去尾換行、🚫 不驗 UTF-8：可以是中文、可以是一個 mp3（local-cache-db.md §12）。沒給就看 unlock ticket，再沒有就從終端讀（不回顯）。🚫 沒有 `--passphrase <pw>`、🚫 不接受環境變數給 passphrase 本身 |
-| `--unlock-ttl <秒>` | | 密碼解鎖成功後 unlock ticket 的有效期，預設 900；0 就不寫 ticket（§7.1） |
+| `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔的**原始 bytes** 就是 passphrase（解 `local.key` 用）。🚫 不去尾換行、🚫 不驗 UTF-8：可以是中文、可以是一個 mp3（local-cache-db.md §12）。沒給就從終端讀（不回顯）。🚫 沒有 `--passphrase <pw>`、🚫 不接受環境變數給 passphrase 本身 |
 | `--config <path>` | `WBF_CONFIG` | conf 檔的位置（§10）。沒給就看 `<data dir>/wbf.conf`；明指了卻找不到就報錯，🚫 不默默 fallback |
 | `--json` | | stdout 只印 JSON（預設就是；留這個旗標是為了之後加人類可讀模式時介面不變） |
 | `--quiet` | | stderr 不印進度 |
@@ -49,10 +48,9 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 | `login --user <mxid> [--password-file <path>] [--device-name <name>]`<br>`account add …`（同一件事的另一個名字） | 登入、把 session 封進這個帳號目錄的 `session.sealed`，**登入成功自動切成 `current`** 並印一行 switch 提示（§3.1.1）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server", "switched_from" }` |
 | `account status` | 列本機所有帳號：**掃雙層**（`s/` 再 `a/`）逐一解密目錄名（local-cache-db.md §11.5）。⚠️ **要解鎖**（`passphrase` 模式會問或吃 ticket），因為目錄名是加密的；這跟 2026-09-09 之前的「不開 vault」不一樣。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy`。⚠️ **登出的帳號是 `null`**：目錄名只解得出 localpart 與 host，組不出可靠的 mxid，🚫 不自己拼一個 | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
 | `account switch <user>` | 只改 `current`，不連 server。印 switch 提示（§3.1.1）。指到沒登入的帳號會警告但照切（下一個要連線的命令才會失敗） | `{ "ok": true, "current", "switched_from" }` |
-| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`m/`、**`k/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）與 unlock ticket；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門兩關**（local-cache-db §10.7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才確認得了「刪完之後這裡還有東西打得開那份備份」。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著） | `{ "ok": true, "user" }` |
+| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`m/`、**`k/`**（維護者 2026-09-09：離開這台機器就清乾淨，local-cache-db §10.7）；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門兩關**（local-cache-db §10.7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才確認得了「刪完之後這裡還有東西打得開那份備份」。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著） | `{ "ok": true, "user" }` |
 | `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed" }` |
 | `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
-| `lock` | 刪 unlock ticket；下一個命令會再問 passphrase | `{ "ok": true, "had_ticket": bool }` |
 | `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `m/` 不動；舊 ticket 作廢 | `{ "ok": true, "mode": "passphrase" }` |
 | `remove-passphrase` | 拿掉 passphrase，`local.key` 回到 `plain` | `{ "ok": true, "mode": "plain" }` |
 
@@ -392,7 +390,6 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 <data dir>/
   local.key                      32 byte 主金鑰，一台機器一把（local-cache-db.md §4）；所有帳號共用
   wbf.conf                       設定檔（§10）；指定了 --data-dir 而這裡還沒有時自動生成一份
-  unlock.ticket                  只有 passphrase 模式會有（§7.1）
   r/<b58>_<b58>                  recovery key（local-cache-db.md §10.8）；🚫 logout 不碰它
   current                        目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"；沒有這個檔 = 沒登入過。🚫 兩層都不寫明文（寫了等於把剛加密的名字再漏一次）
   s/<b58>_<b58>/                 **server host 加密後的名字**（local-cache-db.md §11.2）：外面看不出這台機器連過哪家
@@ -415,14 +412,19 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 🚫 任何命令的輸出、log、錯誤訊息都不印 `access_token`、主金鑰、子金鑰、passphrase、password。
 
-### 7.1 unlock ticket（`passphrase` 模式的 CLI 專用）
+### 7.1 🚫 沒有 unlock ticket（2026-09-13 拿掉）
 
-`local.key` 是 `passphrase` 模式時，每個命令都要 passphrase。CLI 仿 `sudo`：passphrase（檔案或終端）解鎖成功後把**明文主金鑰**加 `expires_at` 寫到 `unlock.ticket`（Unix 0600），有效期 `--unlock-ttl`（預設 900 秒）；期內的命令直接用它。
+`local.key` 是 `passphrase` 模式時，**每個命令都要 passphrase**：`--passphrase-file` → 問終端（不回顯）。
 
-- 來源順序：`--passphrase-file` → 有效的 ticket → 問終端。`plain` 模式不看 ticket。
-- 過期、壞掉的 ticket 讀到就刪；Unix 上 group／other 有任何位元就不認（印一行提示，要人 `lock`）。
-- `lock` 刪它；`logout`、`set-passphrase`、`remove-passphrase` 也順便刪。
-- ⚠️ ticket 存在的那幾分鐘安全性等於 `plain` 模式。維護者 2026-09-05 明說接受：CLI 是開發與除錯工具，不是產品面。**UI 沒有這個東西**，UI 解鎖一次主金鑰只在記憶體。
+以前這裡有一張仿 `sudo` 的 **unlock ticket**（解鎖成功後把明文主金鑰加 `expires_at` 寫進
+`<data dir>/unlock.ticket` 15 分鐘，期內的命令不再問）。維護者 2026-09-13 拿掉它：
+
+- ⭐ **那個痛點沒有了**：daemon 常駐、解鎖一次（architecture-v2 §1），而 daemon 起著的時候單發命令
+  本來就不准碰資料庫（§0.2）—— 所以單發只剩 debug／test 的用途、一次一個，省下的那幾次打字
+  **換不到「明文主金鑰落地 15 分鐘」**。
+- 跟著消失的：`lock` 命令、`--unlock-ttl`、conf 的 `UNLOCK_TTL`、`<data dir>/unlock.ticket`。
+- 📎 **UI 的 lock 不是這個東西**：UI 有自己的 lock／unlock，但它鎖的是 UI 那一層，🚫 不動 daemon
+  （rpc-spec §3.1）。真正要讓金鑰離開記憶體就是 `daemon.shutdown`。
 
 ## 8. 驗收腳本（第 2 步交付的一部分）
 
@@ -469,7 +471,6 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 SERVER=http://localhost:6167
 ACCOUNT=@alice:localhost
 TRANSPORT=ws
-UNLOCK_TTL=900
 
 [backup]
 SERVER_BACKUP=on          ; 標準 Matrix key backup（local-cache-db.md §10.3）
@@ -511,7 +512,7 @@ WINDOW=500
 - **認得的鍵、認不得的值**：⚠️ 開關型的鍵（`SERVER_BACKUP`、`LOCAL_ROOM_KEYS`）**只正面認得 `on` 與 `off`**（不分大小寫）；
   其他任何值（`true`、`1`、`yes`、拼錯的 `of`）一律警告並落到**安全值**，也就是 `on`。
   判斷一律寫成「**正面認得 `off` 才關**」，🚫 不寫成「不等於 `on` 就關」—— 壞掉的時候要壞在「備份還開著」那一邊，不是「以為開著、其實沒開」。
-- **數值型的鍵**（`UNLOCK_TTL`、`QUOTA_MIB`…）：parse 不出來就警告並用內建預設，不用半套的值。
+- **數值型的鍵**（`QUOTA_MIB`、`MAX_EVENTS`…）：parse 不出來就警告並用內建預設，不用半套的值。
 - conf 檔本身壞掉（不是 UTF-8、區段語法錯）：**報錯 exit**，不當作沒有這個檔。設定檔讀一半比讀不到危險。
 
 ### 10.5 conf 不放什麼
