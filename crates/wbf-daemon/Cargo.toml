@@ -1,0 +1,29 @@
+[package]
+name = "wbf-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "client 本體：core ＋ RPC 服務（加密的 JSON over loopback WS）。介面見 docs/design/rpc-spec.md、分層見 architecture-v2.md。"
+
+[[bin]]
+name = "wbf-matrix-client-daemon"
+path = "src/main.rs"
+
+[dependencies]
+wbf-core = { path = "../wbf-core" }
+wbf-sdk = { path = "../wbf-sdk", features = ["matrix", "cache"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chacha20poly1305 = "0.10"
+blake3 = "1"
+getrandom = "0.2"
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3"

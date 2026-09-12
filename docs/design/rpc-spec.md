@@ -402,11 +402,13 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 ## 10. 每個 method 的實作現況（2026-09-12；判準見檔頭）
 
 「底層」是它最後跟 homeserver 講話走哪條。✅ 只給 **WS**；matrix-sdk 的 HTTP 與 HTTP fallback 都是 🔁「能動、要遷」；
-core 沒有的是 ❌。**daemon 那一層（pack、加密、hello、訂閱、資料平面 HTTP）全部 ❌**，這張表只看 core 以下。
+core 沒有的是 ❌。daemon 那一層：pack、加密、hello、連線狀態機、WS listener ✅（`crates/wbf-daemon` 第一版）；
+訂閱／推播／cancel、資料平面 HTTP ❌。這張表其餘只看 core 以下。
 
 | method | core | 底層 | 判定 |
 |---|---|---|---|
-| `hello`、`daemon.*`、`vault.lock`、`subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
+| `hello`、`daemon.info`／`set_encryption`／`shutdown`、`vault.lock` | ✅ daemon 層 | 本機 | ✅ |
+| `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
 | `vault.unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |

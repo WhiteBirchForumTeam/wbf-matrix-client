@@ -62,6 +62,35 @@ pub enum CoreErrorKind {
     Timeout,
 }
 
+impl CoreErrorKind {
+    /// RPC 的 `code`（rpc-spec §5.2）。**號碼定了就不改**；同族留了縫給之後拆出來的 variant。
+    ///
+    /// ⚠️ 這張表只能在這裡：daemon 那層🚫 不要另外維護一份對照——兩份就會漂。
+    ///
+    /// Return:
+    ///     u32  example: `Locked` → 1001、`Server` → 1400
+    pub fn rpc_code(self) -> u32 {
+        match self {
+            CoreErrorKind::Locked => 1001,
+            CoreErrorKind::NoKeyFile => 1002,
+            CoreErrorKind::NeedPassphrase => 1003,
+            CoreErrorKind::UnexpectedPassphrase => 1004,
+            CoreErrorKind::WrongPassphrase => 1005,
+            CoreErrorKind::NoSuchAccount => 1010,
+            CoreErrorKind::AmbiguousAccount => 1011,
+            CoreErrorKind::NotLoggedIn => 1012,
+            CoreErrorKind::NoRecoveryKeyHere => 1020,
+            CoreErrorKind::HistoryWouldBeLost => 1021,
+            CoreErrorKind::Usage => 1100,
+            CoreErrorKind::Io => 1200,
+            CoreErrorKind::Network => 1300,
+            CoreErrorKind::Server => 1400,
+            CoreErrorKind::Integrity => 1500,
+            CoreErrorKind::Timeout => 1600,
+        }
+    }
+}
+
 /// core 吐出去的錯誤：**種類**給程式判斷，**訊息**給人看。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CoreError {
@@ -134,6 +163,38 @@ mod tests {
         assert_eq!(json["kind"], "need_passphrase");
         // Display 只給人話，🚫 不夾 kind。
         assert_eq!(format!("{error}"), "this key file needs one");
+    }
+
+    #[test]
+    fn rpc_codes_are_the_ones_in_rpc_spec_section_5_2() {
+        // 逐字對 rpc-spec §5.2：這裡改了就是規格改了，反過來也一樣。
+        let table = [
+            (CoreErrorKind::Locked, 1001),
+            (CoreErrorKind::NoKeyFile, 1002),
+            (CoreErrorKind::NeedPassphrase, 1003),
+            (CoreErrorKind::UnexpectedPassphrase, 1004),
+            (CoreErrorKind::WrongPassphrase, 1005),
+            (CoreErrorKind::NoSuchAccount, 1010),
+            (CoreErrorKind::AmbiguousAccount, 1011),
+            (CoreErrorKind::NotLoggedIn, 1012),
+            (CoreErrorKind::NoRecoveryKeyHere, 1020),
+            (CoreErrorKind::HistoryWouldBeLost, 1021),
+            (CoreErrorKind::Usage, 1100),
+            (CoreErrorKind::Io, 1200),
+            (CoreErrorKind::Network, 1300),
+            (CoreErrorKind::Server, 1400),
+            (CoreErrorKind::Integrity, 1500),
+            (CoreErrorKind::Timeout, 1600),
+        ];
+        for (kind, code) in table {
+            assert_eq!(kind.rpc_code(), code, "{kind:?}");
+        }
+        // 全部落在 core 那一段（1000–1999），而且沒有兩個一樣。
+        let mut codes: Vec<u32> = table.iter().map(|(kind, _)| kind.rpc_code()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), table.len());
+        assert!(codes.iter().all(|code| (1000..2000).contains(code)));
     }
 
     #[test]

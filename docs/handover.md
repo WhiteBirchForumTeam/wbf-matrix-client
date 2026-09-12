@@ -53,6 +53,15 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
                          ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、可序列化的型別、事件走 channel、
                          🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
+crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。第一版只有控制平面的基底：
+  pack.rs                ver‖type‖data 的編解碼與 XChaCha20-Poly1305（token 導兩把鑰）；純函數
+  message.rs             Request／Response、請求層 code（1xx）、協議層 CloseReason（9xxx）
+  protocol.rs            hello 的兩關：client 名字前綴、protocol 交集
+  connection.rs          一條連線的狀態機；⚠️ **出去的包該不該加密只在這裡判**（EncryptionPolicy 是全局）
+  handle.rs              method → core。這一版只接 daemon.*、vault.*、account.list／switch、media.stats／gc、recovery.*
+  server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
+  main.rs                只有 `-s`；單發命令、資料平面、conf 都還沒搬進來
+  tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
 apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源、unlock ticket）、
                          conf.rs（wbf.conf 的解析與自動生成）、commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）
                          ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
@@ -132,7 +141,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    1. ✅ **`rpc-spec.md`**（2026-09-12 第一版）：method 表、code 表（`CoreErrorKind` 配號在 §5.2）、推播、資料平面。
       §8 列了 daemon PR 要順手補進 core 的五樣（`lock`、建檔與送事件拆開、`PoolReader` 接 Range、
       結構化事件、配號）。
-   2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
+   2. 🔁 **`crates/wbf-daemon`**：第一塊落地（pack、訊息、hello、連線狀態機、本機型 method、WS listener、`-s`）。
+      還沒：網路型 method（房間／上傳／備份）、推播與 cancel、資料平面 HTTP、conf 搬進來、單發命令列。
+      原定義：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
    3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。
       改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
