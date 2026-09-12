@@ -1,0 +1,198 @@
+//! 登入：建 `local.key`（如果還沒有）、走 matrix-sdk 登入、封 session、切成 current。
+
+use serde::Serialize;
+
+use wbf_sdk::backend::matrix_sdk::MatrixBackend;
+use wbf_sdk::vault::{KeyMode, Vault};
+use wbf_sdk::Unlock;
+
+use crate::accounts::AccountDir;
+use crate::error::{CoreError, CoreErrorKind};
+use crate::Core;
+
+/// `login`／`account add` 的結果。
+///
+/// 🚫 刻意**沒有** `access_token`：那是秘密，不過邊界（`handles` 模組註解）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoginResult {
+    pub user_id: String,
+    pub device_id: String,
+    pub server: String,
+    /// 登入成功自動切成 current（CLI 規格 §3.1.1）；換掉的是誰。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switched_from: Option<String>,
+}
+
+impl Core {
+    /// 建這個資料目錄的 `local.key`。
+    ///
+    /// ⚠️ 「要不要設 passphrase」是**前端的決定**（§3），所以它在這裡就是一個參數：
+    /// 給 `Some(bytes)` 就是 passphrase 模式，`None` 就是 plain。🚫 core 不問、不猜。
+    ///
+    /// Return:
+    ///     Ok(KeyMode)   建好了，回它是哪種模式
+    ///     Err(Usage)    已經有一把了（🚫 不覆蓋：那會把既有的帳號全部鎖在外面）
+    pub fn create_vault(&self, passphrase: Option<&[u8]>) -> Result<KeyMode, CoreError> {
+        if self.key_mode()?.is_some() {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "{} already has a key file; it will not be overwritten",
+                    self.data_dir.display()
+                ),
+            ));
+        }
+        let unlock = match passphrase {
+            Some(bytes) => Unlock::Passphrase(zeroize::Zeroizing::new(bytes.to_vec())),
+            None => Unlock::NoPassphrase,
+        };
+        let vault = Vault::create(&self.data_dir, &unlock)?;
+        let mode = vault.mode();
+        self.adopt_unlocked_vault(vault);
+        Ok(mode)
+    }
+
+    /// ⚠️ **過渡用，只給 rpc-cli 的 `unlock.ticket`**：從落地的主金鑰直接組 vault，
+    /// 沒有 passphrase 可餵。
+    ///
+    /// 🚫 daemon **不要**把這個開成 RPC method：ticket 那個妥協（明文主金鑰落地 15 分鐘，
+    /// local-cache-db §4 自己標記過）在常駐之後**整條消失**（architecture-v2 §1），
+    /// 這個方法會跟著消失。
+    pub fn unlock_with_master_key(&self, master: [u8; 32], mode: KeyMode) -> Result<(), CoreError> {
+        self.adopt_unlocked_vault(Vault::from_master(
+            &self.data_dir,
+            wbf_sdk::vault::Key32(master),
+            mode,
+        ));
+        Ok(())
+    }
+
+    /// ⚠️ **過渡用，只給 rpc-cli 的 `unlock.ticket`**：把主金鑰交出去寫進 ticket。
+    ///
+    /// 🚫 **daemon 不要把這個開成 RPC method**。它跟 [`Core::unlock_with_master_key`]
+    /// 是成對的：ticket 要讀也要寫，只開一半會逼呼叫端繞路（而繞路的版本通常更糟）。
+    /// 兩個都在 ticket 消失時一起消失（architecture-v2 §1）。
+    ///
+    /// ⚠️ 回傳的是**主金鑰本身**。呼叫端要用 0600 寫、要有 TTL——那些條件
+    /// local-cache-db §4 已經寫死了，🚫 不要在別的地方重新發明。
+    pub fn export_master_key_for_ticket(&self) -> Result<([u8; 32], KeyMode), CoreError> {
+        let vault = self.vault()?;
+        Ok((vault.master_key().as_bytes().to_owned(), vault.mode()))
+    }
+
+    /// 登入一個帳號。**要先解鎖或先 [`Core::create_vault`]**：store 的金鑰與
+    /// `session.sealed` 都從 vault 來。
+    ///
+    /// Args:
+    ///     user: mxid 或 localpart, example: "@alice:localhost"
+    ///     password: 🚫 不印、不 log；⚠️ 它要送給 homeserver，所以是**字串**不是任意
+    ///         bytes（local-cache-db §12.4：跟 passphrase 分家的理由）
+    ///     device_name: example: "wbf-cli"
+    pub async fn log_in(
+        &self,
+        server: &str,
+        user: &str,
+        password: &str,
+        device_name: &str,
+        server_backup: bool,
+    ) -> Result<LoginResult, CoreError> {
+        let vault = self.vault()?;
+        let dir_key = vault.account_dir_key();
+        // 帳號目錄由 server host 加 localpart 決定（store 在 login 前就要有路徑）。
+        let account = AccountDir::locate(&self.data_dir, &dir_key, server, user)?;
+        // 沒有 session 卻留著 `m/`：上次沒走 logout（或舊版的 logout 沒刪），那個 store
+        // 綁著已經失效的裝置。消費端自己再清一次。
+        if !account.is_logged_in() && account.matrix_store_dir().exists() {
+            self.events
+                .progress("removing a matrix store left over from a previous device");
+            account.delete_matrix_store()?;
+        }
+        let (_backend, session) = MatrixBackend::login(
+            server,
+            user,
+            password,
+            device_name,
+            &account.matrix_store_dir(),
+            &vault.matrix_store_key(),
+            server_backup,
+        )
+        .await?;
+        // ⚠️ server 回的 `user_id` 才是**權威**（大小寫、localpart 正規化可能跟打的不一樣）：
+        // 目錄名對不上就搬過去。
+        let account = self.move_to_canonical_dir(account, &dir_key, server, &session.user_id)?;
+        vault.seal_session(&account.session_path(), &session)?;
+        let switched_from = self.switch_current_to(&account)?;
+        Ok(LoginResult {
+            user_id: session.user_id,
+            device_id: session.device_id,
+            server: session.server,
+            switched_from,
+        })
+    }
+
+    /// 目錄名是拿 `--user` 打的那串算的，但權威是 server 回的 mxid。對不上就搬。
+    ///
+    /// 🚫 目標已經存在就**拒絕**，不合併、不覆蓋：那是兩個帳號的資料撞在一起。
+    fn move_to_canonical_dir(
+        &self,
+        account: AccountDir,
+        dir_key: &wbf_sdk::vault::Key32,
+        server: &str,
+        canonical_user_id: &str,
+    ) -> Result<AccountDir, CoreError> {
+        let canonical = AccountDir::locate(&self.data_dir, dir_key, server, canonical_user_id)?;
+        if canonical.dir == account.dir {
+            return Ok(account);
+        }
+        if canonical.dir.exists() {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "server says you are {canonical_user_id} but {} already exists; log that account out first",
+                    canonical.dir.display()
+                ),
+            ));
+        }
+        std::fs::create_dir_all(canonical.dir.parent().expect("account dir has a parent"))
+            .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
+        std::fs::rename(&account.dir, &canonical.dir)
+            .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
+        Ok(canonical)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wbf-core-login-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn creating_a_vault_is_the_callers_passphrase_decision() {
+        let dir = scratch("create");
+        let core = Core::open(&dir);
+        // 🚫 core 不問要不要 passphrase——`None` 就是 plain。
+        assert_eq!(core.create_vault(None).unwrap(), KeyMode::Plain);
+        assert!(core.is_unlocked(), "建完就是解開的");
+        // 🚫 已經有一把就拒絕：覆蓋等於把既有的帳號全鎖在外面。
+        assert_eq!(
+            core.create_vault(None).unwrap_err().kind,
+            CoreErrorKind::Usage
+        );
+
+        let with_passphrase = scratch("create-pp");
+        let core = Core::open(&with_passphrase);
+        assert_eq!(
+            core.create_vault(Some(b"hunter2")).unwrap(),
+            KeyMode::Passphrase
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&with_passphrase);
+    }
+}

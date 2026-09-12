@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use wbf_sdk::SdkError;
+use wbf_core::{CoreError, CoreErrorKind};
 
 pub const CONF_FILE_NAME: &str = "wbf.conf";
 
@@ -51,14 +51,14 @@ const KNOWN_SECTIONS: &[&str] = &["GENERAL", "BACKUP", "MEDIA", "RECENT"];
 /// Return:
 ///     Ok(Conf)     讀到的鍵值；兩個位置都沒有檔就是空的一份
 ///     Err(Usage)   `--config` 明指的檔不在、或檔案語法壞了
-pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, SdkError> {
+pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, CoreError> {
     if let Some(path) = explicit {
         // 🚫 明指了就不 fallback：讀到別的檔比讀不到更糟（§10.1）。
         if !path.exists() {
-            return Err(SdkError::Usage(format!(
-                "no config file at {} (--config)",
-                path.display()
-            )));
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!("no config file at {} (--config)", path.display()),
+            ));
         }
         return parse_file(path);
     }
@@ -70,12 +70,12 @@ pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, SdkError> 
 }
 
 /// ⚠️ 讀壞掉的設定檔一律**報錯 exit**，🚫 不當作沒有這個檔：讀一半比讀不到危險（§10.4）。
-fn parse_file(path: &Path) -> Result<Conf, SdkError> {
+fn parse_file(path: &Path) -> Result<Conf, CoreError> {
     let text = std::fs::read_to_string(path).map_err(|error| {
-        SdkError::Usage(format!(
-            "{}: {error} (a config file must be UTF-8)",
-            path.display()
-        ))
+        CoreError::new(
+            CoreErrorKind::Usage,
+            format!("{}: {error} (a config file must be UTF-8)", path.display()),
+        )
     })?;
     parse(&text, &path.display().to_string())
 }
@@ -88,7 +88,7 @@ fn parse_file(path: &Path) -> Result<Conf, SdkError> {
 /// Return:
 ///     Ok(Conf)     `warnings` 是認不得的區段／鍵、重複的鍵、被拒的秘密鍵
 ///     Err(Usage)   哪一行不成句子
-pub fn parse(text: &str, source: &str) -> Result<Conf, SdkError> {
+pub fn parse(text: &str, source: &str) -> Result<Conf, CoreError> {
     let mut conf = Conf::default();
     for (index, raw_line) in text.lines().enumerate() {
         let line_number = index + 1;
@@ -98,9 +98,10 @@ pub fn parse(text: &str, source: &str) -> Result<Conf, SdkError> {
         }
         if let Some(name) = line.strip_prefix('[') {
             let Some(name) = name.strip_suffix(']') else {
-                return Err(SdkError::Usage(format!(
-                    "{source}:{line_number}: a section header must end with ']'"
-                )));
+                return Err(CoreError::new(
+                    CoreErrorKind::Usage,
+                    format!("{source}:{line_number}: a section header must end with ']'"),
+                ));
             };
             let section = name.trim().to_ascii_uppercase();
             if !KNOWN_SECTIONS.contains(&section.as_str()) {
@@ -111,16 +112,18 @@ pub fn parse(text: &str, source: &str) -> Result<Conf, SdkError> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Err(SdkError::Usage(format!(
-                "{source}:{line_number}: expected KEY=value or [section]"
-            )));
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!("{source}:{line_number}: expected KEY=value or [section]"),
+            ));
         };
         let key = key.trim().to_ascii_uppercase();
         let value = unquote(value.trim());
         if key.is_empty() {
-            return Err(SdkError::Usage(format!(
-                "{source}:{line_number}: the key is empty"
-            )));
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!("{source}:{line_number}: the key is empty"),
+            ));
         }
         // 空值當作沒寫，🚫 不是空字串（全域慣例：佔位值不用空字串）。
         if value.is_empty() {
@@ -293,7 +296,7 @@ pub fn origin_of(from_flag_or_env: bool, from_conf: bool) -> &'static str {
 /// Return:
 ///     Ok(true)    寫了
 ///     Ok(false)   已經有一份了，什麼都沒做
-pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, SdkError> {
+pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, CoreError> {
     let path: PathBuf = data_dir.join(CONF_FILE_NAME);
     if path.exists() {
         return Ok(false);

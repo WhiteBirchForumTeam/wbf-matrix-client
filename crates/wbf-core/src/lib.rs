@@ -33,16 +33,43 @@
 //!   標記過），常駐之後**整個消失**（§1）。ticket 留在 rpc-cli 那邊，直到 daemon 接手。
 //! - 🚫 **不管 UI 狀態、不管顯示格式、不代前端做決定**（§3）。
 
-pub mod accounts;
-pub mod recovery;
+// ⚠️ 這兩個是**內部**：它們的型別（`DataDirMap`、`AccountDir`）帶著路徑與 `Vault`，
+// 跨不了 RPC 也綁不了 uniffi。公開面只走 `Core` 的方法與可序列化的 DTO
+//（PR #24 審查 cirno🔴）。
+mod account_ops;
+mod accounts;
+mod backup_ops;
+mod error;
+pub mod event;
+mod handles;
+mod login_ops;
+mod media_ops;
+mod misc_ops;
+mod recovery;
+mod rooms_ops;
+mod session_ops;
+mod sync_ops;
+mod upload_ops;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use wbf_sdk::vault::{KeyMode, Vault};
-use wbf_sdk::{SdkError, Unlock};
+use wbf_sdk::Unlock;
 
-pub use accounts::{AccountDir, AccountSummary, DataDirMap};
+pub use account_ops::{AccountStatus, SwitchResult, WhoAmI};
+pub use accounts::AccountSummary;
+use accounts::{AccountDir, DataDirMap};
+pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
+pub use error::{CoreError, CoreErrorKind};
+pub use event::{CoreEvent, EventSink};
+pub use login_ops::LoginResult;
+pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
+pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
+pub use rooms_ops::{cipher_for_plaintext_room, FileEntry, FilePage, HistorySource, MessagePage};
+pub use session_ops::{DestroyResult, LogoutResult};
+pub use sync_ops::{watch_mode_from_name, RecentSummary, WatchMode, WatchSummary};
+pub use upload_ops::{SendFileResult, UploadRequest};
 
 /// 一個資料目錄的常駐狀態。
 ///
@@ -55,6 +82,8 @@ pub struct Core {
     data_dir: PathBuf,
     /// 解一次就留著。`OnceLock` 讓 `unlock` 收 `&self`（§7 的紀律）。
     vault: OnceLock<Vault>,
+    /// core 往外講話的唯一管道（§7：事件用 channel）。🚫 core 不印東西。
+    pub(crate) events: EventSink,
 }
 
 impl Core {
@@ -69,11 +98,17 @@ impl Core {
         Core {
             data_dir: data_dir.to_path_buf(),
             vault: OnceLock::new(),
+            events: EventSink::new(),
         }
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// 訂閱 core 的事件（進度之類）。⚠️ 訂閱**之前**發生的收不到。
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CoreEvent> {
+        self.events.subscribe()
     }
 
     /// 這個資料目錄的 `local.key` 要不要 passphrase。
@@ -82,11 +117,14 @@ impl Core {
     ///     Ok(Some(KeyMode))   有 `local.key`：`Plain` 不用問，`Passphrase` 要
     ///     Ok(None)            還沒有 `local.key`（沒 `login` 過）
     ///     Err(Usage)          有檔但讀不懂
-    pub fn key_mode(&self) -> Result<Option<KeyMode>, SdkError> {
+    ///
+    /// ⚠️ 「在不在」與「讀它」是兩步，中間檔案被刪掉會走到 `Err` 而不是 `Ok(None)`
+    /// （rumia🟢3）。這種 race 消不掉，而且落在**拒絕**那一邊，可以接受。
+    pub fn key_mode(&self) -> Result<Option<KeyMode>, CoreError> {
         if !self.data_dir.join(wbf_sdk::vault::KEY_FILE_NAME).exists() {
             return Ok(None);
         }
-        Vault::read_mode(&self.data_dir).map(Some)
+        Ok(Vault::read_mode(&self.data_dir).map(Some)?)
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -102,23 +140,52 @@ impl Core {
     /// Args:
     ///     passphrase: `Plain` 模式傳 `None`, example: Some(b"hunter2".as_slice())
     /// Return:
-    ///     Ok(())       解開了，或本來就開著
-    ///     Err(Usage)   沒有 `local.key`、passphrase 錯、或模式配不上（`Plain` 卻給了 passphrase）
-    pub fn unlock(&self, passphrase: Option<&[u8]>) -> Result<(), SdkError> {
+    ///     Ok(())                     解開了，或本來就開著
+    ///     Err(NoKeyFile)             這個資料目錄沒登入過
+    ///     Err(NeedPassphrase)        要 passphrase 但沒給
+    ///     Err(UnexpectedPassphrase)  是 plain 模式卻給了
+    ///     Err(WrongPassphrase)       打錯了
+    ///
+    /// ⚠️ 這四種**分得出來**是刻意的（PR #24 審查 rumia🟡）：前端要據此決定「跳輸入框」
+    /// 還是「說打錯了」，而 daemon 的 `vault.unlock`（§4.5）要回結構化的錯誤。
+    /// 🚫 不要讓呼叫端去 parse 人話。
+    pub fn unlock(&self, passphrase: Option<&[u8]>) -> Result<(), CoreError> {
         if self.is_unlocked() {
             return Ok(());
         }
-        if self.key_mode()?.is_none() {
-            return Err(SdkError::Usage(format!(
-                "no key file in {}; log in first",
-                self.data_dir.display()
-            )));
+        let Some(mode) = self.key_mode()? else {
+            return Err(CoreError::new(
+                CoreErrorKind::NoKeyFile,
+                format!("no key file in {}; log in first", self.data_dir.display()),
+            ));
+        };
+        // 模式先比對，🚫 不丟給 `Vault::open` 用「配不上」拒絕——那樣吐的是 vault 層的
+        // 人話，分不出「要問使用者」與「他打錯了」。
+        match (mode, passphrase) {
+            (KeyMode::Passphrase, None) => {
+                return Err(CoreError::new(
+                    CoreErrorKind::NeedPassphrase,
+                    format!("{} is passphrase-protected", self.data_dir.display()),
+                ))
+            }
+            (KeyMode::Plain, Some(_)) => {
+                return Err(CoreError::new(
+                    CoreErrorKind::UnexpectedPassphrase,
+                    format!(
+                        "{} has no passphrase; do not pass one",
+                        self.data_dir.display()
+                    ),
+                ))
+            }
+            _ => {}
         }
         let unlock = match passphrase {
             Some(bytes) => Unlock::Passphrase(zeroize::Zeroizing::new(bytes.to_vec())),
             None => Unlock::NoPassphrase,
         };
-        let vault = Vault::open(&self.data_dir, &unlock)?;
+        // 模式對得上還開不了，就只剩「打錯了」這一種。
+        let vault = Vault::open(&self.data_dir, &unlock)
+            .map_err(|error| CoreError::new(CoreErrorKind::WrongPassphrase, format!("{error}")))?;
         let _ = self.vault.set(vault);
         Ok(())
     }
@@ -127,14 +194,11 @@ impl Core {
     ///
     /// Return:
     ///     Ok(&Vault)
-    ///     Err(Usage)   還沒解鎖——呼叫端要先叫 `unlock`（RPC 那邊回 `locked`，§4.5）
-    pub fn vault(&self) -> Result<&Vault, SdkError> {
-        self.vault.get().ok_or_else(|| {
-            SdkError::Usage(format!(
-                "the vault in {} is locked; unlock it first",
-                self.data_dir.display()
-            ))
-        })
+    ///     Err(Locked)   還沒解鎖——呼叫端要先叫 `unlock`（RPC 那邊回 `locked`，§4.5）
+    pub(crate) fn vault(&self) -> Result<&Vault, CoreError> {
+        self.vault
+            .get()
+            .ok_or_else(|| CoreError::locked(&self.data_dir))
     }
 
     /// 把一把**已經開好**的 vault 放進來，回傳最後裝在裡面的那把。
@@ -148,20 +212,27 @@ impl Core {
     ///
     /// **冪等**，跟 [`Core::unlock`] 一樣：已經有一把就把傳進來的丟掉、回原本那把。
     /// 📎 兩把都來自同一個資料目錄，所以是同一把主金鑰——丟掉的那把沒有資訊。
-    pub fn adopt_unlocked_vault(&self, vault: Vault) -> &Vault {
+    pub(crate) fn adopt_unlocked_vault(&self, vault: Vault) -> &Vault {
         let _ = self.vault.set(vault);
-        self.vault.get().expect("just set, or already there")
+        // 📎 `OnceLock::set` 只有兩種結果：裝進去了，或本來就有一個。兩種之後 `get()`
+        // 都是 `Some`，而 `OnceLock` 自己保證這件事沒有 race（rumia🟢1 要的那行註解）。
+        self.vault
+            .get()
+            .expect("set() either stored ours or found one already there")
     }
 
     /// 資料目錄現在有什麼（`s/*/a/*` 兩層與 `r/`）。⚠️ **快照，不是快取**：
     /// 會刪檔的命令要當場刷新（accounts 模組的模組註解寫了為什麼）。
-    pub fn refresh_data_dir_map(&self) -> Result<DataDirMap, SdkError> {
-        accounts::refresh_data_dir_map(&self.data_dir, self.vault()?)
+    pub(crate) fn refresh_data_dir_map(&self) -> Result<DataDirMap, CoreError> {
+        Ok(accounts::refresh_data_dir_map(
+            &self.data_dir,
+            self.vault()?,
+        )?)
     }
 
     /// 這台機器上的每個帳號。
-    pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, SdkError> {
-        self.refresh_data_dir_map()?.list_accounts(self.vault()?)
+    pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, CoreError> {
+        Ok(self.refresh_data_dir_map()?.list_accounts(self.vault()?)?)
     }
 
     /// 使用者打的那串 → 帳號目錄。當場刷新一次再比對（大小寫不敏感）。
@@ -169,8 +240,14 @@ impl Core {
     /// Args:
     ///     user: mxid 或 localpart, example: "@alice:localhost"
     ///     server: example: Some("http://localhost:6167")
-    pub fn find_account(&self, user: &str, server: Option<&str>) -> Result<AccountDir, SdkError> {
-        self.refresh_data_dir_map()?.find_account_dir(user, server)
+    pub(crate) fn find_account(
+        &self,
+        user: &str,
+        server: Option<&str>,
+    ) -> Result<AccountDir, CoreError> {
+        Ok(self
+            .refresh_data_dir_map()?
+            .find_account_dir(user, server)?)
     }
 
     /// `current` 指到的那個帳號。
@@ -178,25 +255,31 @@ impl Core {
     /// Return:
     ///     Ok(AccountDir)
     ///     Err(Usage)   沒登入過、或 `current` 指到的目錄解不開
-    pub fn current_account(&self) -> Result<AccountDir, SdkError> {
+    pub(crate) fn current_account(&self) -> Result<AccountDir, CoreError> {
         let current = accounts::read_current(&self.data_dir)?.ok_or_else(|| {
-            SdkError::Usage(format!(
-                "no current account in {}; log in first",
-                self.data_dir.display()
-            ))
+            CoreError::new(
+                CoreErrorKind::NoSuchAccount,
+                format!(
+                    "no current account in {}; log in first",
+                    self.data_dir.display()
+                ),
+            )
         })?;
         let key = self.vault()?.account_dir_key();
         accounts::find_account_of_current(&self.data_dir, &key, &current).ok_or_else(|| {
-            SdkError::Usage(format!(
-                "the current account has no readable directory in {}; log in again",
-                self.data_dir.display()
-            ))
+            CoreError::new(
+                CoreErrorKind::NoSuchAccount,
+                format!(
+                    "the current account has no readable directory in {}; log in again",
+                    self.data_dir.display()
+                ),
+            )
         })
     }
 
     /// 這台機器保管著誰的 recovery key（`r/`，logout 不碰它）。
-    pub fn list_recovery_key_users(&self) -> Result<Vec<String>, SdkError> {
-        recovery::list_users(&self.data_dir, self.vault()?)
+    pub fn list_recovery_key_users(&self) -> Result<Vec<String>, CoreError> {
+        Ok(recovery::list_users(&self.data_dir, self.vault()?)?)
     }
 }
 
@@ -261,6 +344,45 @@ mod tests {
         core.unlock(Some(passphrase)).unwrap();
         assert!(core.is_unlocked());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_three_ways_unlocking_can_fail_are_told_apart() {
+        // ⚠️ 這是 daemon 的 `vault.unlock`（§4.5）要回結構化錯誤的前提：前端得知道
+        // 該「跳輸入框」還是該說「打錯了」，🚫 不能靠 parse 人話（PR #24 審查 rumia🟡）。
+        let dir = scratch("unlock-kinds");
+        assert_eq!(
+            Core::open(&dir).unlock(None).unwrap_err().kind,
+            CoreErrorKind::NoKeyFile
+        );
+
+        Vault::create(
+            &dir,
+            &Unlock::Passphrase(zeroize::Zeroizing::new(b"pw".to_vec())),
+        )
+        .unwrap();
+        let core = Core::open(&dir);
+        assert_eq!(
+            core.unlock(None).unwrap_err().kind,
+            CoreErrorKind::NeedPassphrase,
+            "要 passphrase 卻沒給 ≠ 打錯了"
+        );
+        assert_eq!(
+            core.unlock(Some(b"nope")).unwrap_err().kind,
+            CoreErrorKind::WrongPassphrase
+        );
+        assert!(!core.is_unlocked(), "失敗不該留下半開的狀態");
+        core.unlock(Some(b"pw")).unwrap();
+
+        // plain 模式卻給了 passphrase：🚫 不靜默忽略。
+        let plain = scratch("unlock-plain");
+        Vault::create(&plain, &Unlock::NoPassphrase).unwrap();
+        assert_eq!(
+            Core::open(&plain).unlock(Some(b"pw")).unwrap_err().kind,
+            CoreErrorKind::UnexpectedPassphrase
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     #[test]
