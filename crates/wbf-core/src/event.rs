@@ -19,7 +19,10 @@ const EVENT_QUEUE: usize = 256;
 /// ⚠️ 每個 variant 的欄位都要是**可序列化的簡單型別**：它們會變成 RPC 的推播訊息
 /// （§4.6 的「沒有 `id` 的請求」）。🚫 不要在這裡放 handle、路徑以外的 `PathBuf`、
 /// 或任何帶秘密的東西。
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// 📎 有 `Serialize`／`Deserialize`：daemon 那層要把它原樣送過 RPC，而**現在**補比
+/// 之後補便宜（PR #24 審查 rumia🟡2／salvia🟡2）。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CoreEvent {
     /// 一句給人看的話。⚠️ 措辭是**給人看的**，🚫 前端不要拿它做邏輯判斷
     /// （要判斷就等 method 的回傳值，或之後補一個有型別的 variant）。
@@ -31,14 +34,18 @@ pub enum CoreEvent {
 
 /// core 內部拿來發事件的那一端。
 ///
+/// 🚫 **crate 內部限定**：`progress` 收 `impl Into<String>`，而 §7 明文說公開介面上
+/// 不要有 `impl Trait`。前端要聽事件走 [`Core::subscribe`]，拿到的是 receiver
+/// ——那個形狀跨得過 RPC 與 uniffi（PR #24 審查 rumia🟡1／salvia🟡1）。
+///
 /// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（§4.7「允許多條連線，每條都平等」），
 /// 而且**沒有訂閱者時發送是零成本的**——rpc-cli 在 `--quiet` 下就是這種情況。
-pub struct EventSink {
+pub(crate) struct EventSink {
     sender: broadcast::Sender<CoreEvent>,
 }
 
 impl EventSink {
-    pub fn new() -> EventSink {
+    pub(crate) fn new() -> EventSink {
         EventSink {
             sender: broadcast::channel(EVENT_QUEUE).0,
         }
@@ -46,17 +53,17 @@ impl EventSink {
 
     /// 訂閱之後的事件。⚠️ 訂閱**之前**發生的收不到——這跟 server 的推送同一條規矩：
     /// 推送是「不用輪詢」，不是「保證看得到全部」。
-    pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
         self.sender.subscribe()
     }
 
     /// 發一個事件。沒有訂閱者就是 no-op，🚫 不當成錯誤。
-    pub fn emit(&self, event: CoreEvent) {
+    pub(crate) fn emit(&self, event: CoreEvent) {
         let _ = self.sender.send(event);
     }
 
     /// `emit(CoreEvent::Progress(..))` 的簡寫——core 裡面最常發的就是這個。
-    pub fn progress(&self, message: impl Into<String>) {
+    pub(crate) fn progress(&self, message: impl Into<String>) {
         self.emit(CoreEvent::Progress(message.into()));
     }
 }
