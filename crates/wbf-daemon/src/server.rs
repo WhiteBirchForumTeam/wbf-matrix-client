@@ -153,6 +153,12 @@ async fn serve_connection(
                 let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, reason)).await;
                 break;
             }
+            Inbound::Reply(response) => {
+                let bytes = connection.lock().await.seal_response(&response);
+                if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
+                    break;
+                }
+            }
             Inbound::HelloAccepted { id, protocol } => {
                 let result = handle.hello_result(protocol).await;
                 let bytes = connection

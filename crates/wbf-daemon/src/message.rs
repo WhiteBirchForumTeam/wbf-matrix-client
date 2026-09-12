@@ -83,6 +83,8 @@ pub mod code {
     pub const CANCELLED: u32 = 105;
     pub const BUSY: u32 = 106;
     pub const DAEMON_SHUTTING_DOWN: u32 = 107;
+    /// daemon 自己組不出回應（它的 bug）。🚫 不是前端的錯，所以🚫 不關連線。
+    pub const INTERNAL: u32 = 108;
 }
 
 /// 協議層：這條連線本身出了問題，回完就關（rpc-spec §1.4）。

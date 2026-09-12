@@ -36,7 +36,6 @@ crates/wbf-sdk/src/
   cipher.rs chunk_block.rs chunk_crypto.rs   密碼層（約定 §2–§4、§7）；tests/client_vectors.rs 產生並比對 wbf-client-vectors.json
   protocol.rs channel.rs client.rs upload.rs download.rs manifest.rs login.rs error.rs   通道與上傳／下載（線上規格）
   chat.rs                聊天模型與 ChatBackend trait，沒有 Matrix 型別
-  conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   vault.rs               local.key、六把子金鑰、session.sealed、封 recovery key（local-cache-db §4）；沒有 SQLite、沒有 matrix-sdk
   account_dir.rs         資料目錄名的確定性加密（`<b58 nonce>_<b58 密文>`，local-cache-db §11）；沒有 IO
   room_keys.rs           本地金鑰快照放哪、用什麼 passphrase、權限（local-cache-db §10.4）；不碰 matrix-sdk
@@ -47,7 +46,8 @@ crates/wbf-sdk/src/
   backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
 crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
   lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
-  error.rs               `CoreError { kind, message }`、`CoreErrorKind`。⚠️ **號碼還沒配**——等 `rpc-spec.md`
+  error.rs               `CoreError { kind, message }`、`CoreErrorKind`、`rpc_code()`（rpc-spec §5.2 的號碼）
+  conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   event.rs               `CoreEvent` 與 broadcast channel。🚫 core 不印任何東西
   handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate
   accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部

@@ -38,6 +38,31 @@ use crate::message::{code, Request, Response};
 use crate::settings::Settings;
 
 pub const DAEMON_NAME: &str = "wbf-matrix-client-daemon";
+
+/// 除了 `vault.lock` 自己，還有幾個人握著這份 `Core`。
+///
+/// Args:
+///     current: `Handle.core` 現在指的那一份（呼叫者拿著寫鎖）
+///     dispatching_with: `call()` 為這個請求 clone 的那一份, example: 同一個 Arc
+/// Return:
+///     usize  0 表示沒有別人在用了，> 0 是還在跑的請求數
+///
+/// `Arc::strong_count` 數的是所有持有者，所以要扣掉兩個**不算別人**的：`Handle.core` 自己那份，
+/// 以及 `call()` 為這個 `vault.lock` clone 的那份。⚠️ 兩者不是同一個 Arc 時（別人已經換過了）
+/// 只扣前者 —— 這時我們手上那份是舊的，不該拿它去抵扣現在這份的持有者。
+fn count_other_holders(current: &Arc<Core>, dispatching_with: &Arc<Core>) -> usize {
+    let mine = if Arc::ptr_eq(current, dispatching_with) {
+        2
+    } else {
+        1
+    };
+    Arc::strong_count(current).saturating_sub(mine)
+}
+
+/// `vault.lock` 最多等在跑的請求放手多久：`LOCK_WAIT_POLLS` × `LOCK_WAIT_POLL_EVERY`。
+/// 短的請求（`daemon.info` 之類）這樣就等到了；長工作等不到 —— 那本來就該回 `BUSY`。
+const LOCK_WAIT_POLLS: u32 = 10;
+const LOCK_WAIT_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 未解鎖時也接受的 method（architecture-v2 §4.5）。其他一律 `1001`。
@@ -164,13 +189,13 @@ impl Handle {
 
     /// ⚠️ 每個分支都 `Box::pin`：matrix-sdk 的 future 很深，整個 match 當一個 future 讓編譯器推
     /// `Send` 會撞 E0275（遞迴上限）。裝箱把推導鏈在這裡切斷；代價是一次堆配置，可忽略。
-    async fn dispatch(&self, core: &Core, method: &str, params: Value) -> Outcome {
+    async fn dispatch(&self, core: &Arc<Core>, method: &str, params: Value) -> Outcome {
         let future: Pin<Box<dyn Future<Output = Outcome> + Send + '_>> = match method {
             "daemon.info" => Box::pin(self.daemon_info(core)),
             "daemon.set_encryption" => Box::pin(async { self.daemon_set_encryption(params) }),
             "daemon.shutdown" => Box::pin(async { self.daemon_shutdown() }),
             "vault.unlock" => Box::pin(async { local::vault_unlock(core, params) }),
-            "vault.lock" => Box::pin(self.vault_lock()),
+            "vault.lock" => Box::pin(self.vault_lock(core)),
             "vault.set_passphrase" => Box::pin(async { local::vault_set_passphrase(core, params) }),
             "vault.remove_passphrase" => Box::pin(async { local::vault_remove_passphrase(core) }),
             "account.list" => Box::pin(async { local::account_list(core) }),
@@ -248,8 +273,36 @@ impl Handle {
         Ok(json!({ "ok": true }))
     }
 
-    async fn vault_lock(&self) -> Outcome {
-        *self.core.write().await = Arc::new(Core::open(&self.data_dir));
+    /// 鎖上：把 `Core` 換成一個沒解鎖的新的。**還在跑的請求沒放手就不換，回 `BUSY`。**
+    ///
+    /// ⚠️ 只換指標不算鎖上：請求是各自 `tokio::spawn` 的，`call()` 進來就先 clone 一份
+    /// `Arc<Core>`，所以換指標之後，已經拿到舊的那些長工作（`sync.recent`、`upload.file`、
+    /// `media.save_to`…）會繼續用**解鎖狀態**跑完 —— 那時回 `{ok: true}` 是在說謊
+    /// （PR #31 審查 cirno🔴、rumia🔴）。
+    ///
+    /// 這裡的邊界是 fail closed 的：拿著寫鎖等在跑的那些放手（此時新請求卡在讀鎖，
+    /// 🚫 不會再拿到舊的那份），等到了才換、才回成功；等不到就回 `BUSY` 並且**維持解鎖**。
+    /// ⭐ 寧可叫呼叫者重試，也不要回報一個沒有成立的鎖。
+    /// 📎 「叫停正在跑的那些」要等 cancel（rpc-spec §10，下一支）；在那之前重試是唯一的路。
+    async fn vault_lock(&self, dispatching_with: &Arc<Core>) -> Outcome {
+        let mut core = self.core.write().await;
+        for _ in 0..LOCK_WAIT_POLLS {
+            if count_other_holders(&core, dispatching_with) == 0 {
+                break;
+            }
+            tokio::time::sleep(LOCK_WAIT_POLL_EVERY).await;
+        }
+        // 寫鎖在手，所以這個數字不會再往上。
+        let still_running = count_other_holders(&core, dispatching_with);
+        if still_running > 0 {
+            return Err(Fail::Rpc(
+                code::BUSY,
+                format!(
+                    "{still_running} request(s) are still using the unlocked vault;                      the vault is still unlocked, try again when they finish"
+                ),
+            ));
+        }
+        *core = Arc::new(Core::open(&self.data_dir));
         Ok(json!({ "ok": true }))
     }
 
@@ -300,7 +353,7 @@ impl From<CoreError> for Fail {
 
 impl From<serde_json::Error> for Fail {
     fn from(error: serde_json::Error) -> Fail {
-        Fail::Rpc(code::BAD_REQUEST, format!("serialise result: {error}"))
+        Fail::Rpc(code::INTERNAL, format!("serialise result: {error}"))
     }
 }
 
@@ -431,6 +484,39 @@ mod tests {
         assert_eq!(response.code, 0);
         let response = handle.call(request("account.list", json!({}))).await;
         assert_eq!(response.code, 1001);
+    }
+
+    #[tokio::test]
+    async fn locking_refuses_while_a_request_still_holds_the_unlocked_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        handle.core().await.create_vault(None).unwrap();
+        assert_eq!(
+            handle.call(request("vault.unlock", json!({}))).await.code,
+            0
+        );
+
+        // `call()` 一進來就是這樣 clone 一份的（mod.rs 的 `let core = self.core().await`），
+        // 所以握著這一份就是「有一個請求還在跑」。
+        let in_flight_core = handle.core().await;
+        let response = handle.call(request("vault.lock", Value::Null)).await;
+        assert_eq!(response.code, code::BUSY, "{}", response.msg);
+        // 🔴 這條才是重點：回了 BUSY 就必須**還是解鎖的**，🚫 不可以換掉指標又說沒鎖上。
+        assert!(in_flight_core.is_unlocked());
+        assert!(handle.core().await.is_unlocked());
+        assert_eq!(
+            handle.call(request("account.list", json!({}))).await.code,
+            0
+        );
+
+        // 那個請求放手之後，鎖得上。
+        drop(in_flight_core);
+        let response = handle.call(request("vault.lock", Value::Null)).await;
+        assert_eq!(response.code, 0, "{}", response.msg);
+        assert_eq!(
+            handle.call(request("account.list", json!({}))).await.code,
+            1001
+        );
     }
 
     #[tokio::test]

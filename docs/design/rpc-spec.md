@@ -129,7 +129,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 |---|---|---|
 | 9001 | `BAD_TOKEN` | `0x02` 的包解不開（AEAD 標籤驗不過） |
 | 9002 | `BAD_FRAME` | 不是 binary frame、`ver` 認不得、`type` 是 `0x00`、enforce 開著卻收到 `0x01`、超過 1 MiB、解開之後不是 JSON |
-| 9003 | `HELLO_REQUIRED` | 第一則不是 `hello` |
+| 9003 | `HELLO_REQUIRED` | 第一則不是 `hello`（**含 `hello` 之前送來一則寫壞的請求**：還沒談成協議，fail closed） |
 | 9004 | `BAD_CLIENT` | `client` 不以 `wbf-matrix` 開頭 |
 | 9005 | `PROTOCOL_MISMATCH` | `protocols` 跟 daemon 的沒有交集 |
 | 9006 | `SHUTTING_DOWN` | daemon 要關了 |
@@ -137,7 +137,11 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - **`9000–9099` 是協議層**：這條連線本身出了問題，回完就關。**其餘一切**——房間操作失敗、衝突、上游 homeserver 的錯誤、
   vault 鎖著——都是**請求層**的，用當時的加密狀態送（enforce 開著就是 `0x02`）。
   判準：**連線還能不能用**。能用 → 請求層、密文；不能用 → 協議層、明文、關。
+- ⚠️ **「解開之後是 JSON、但不是一個請求」不是協議層的事**：那是 `100`（§5.1），回完**連線照用**。
+  判準還是同一條 —— 封裝壞了（解不開、不是 JSON）連線就沒救了；一則寫壞的請求只是那一則壞了。
+  📎 例外是 `hello` 之前：還沒談成協議，所以寫壞的請求一律 `9003` 關掉。
 - `id`：對得上某個請求（`hello` 被拒）就帶那個 `id`；對不上（解不開、shutdown）就 `null`。🚫 不省略欄位。
+  📎 `100` 的 `id`：JSON 裡的 `id` 剛好是整數就帶著它回（`method` 壞掉時前端還配得起來），否則 `null`。
 - `result.close` 是**大寫底線**的字串，跟 `code` 一對一——留著是給人讀 log 用，前端判斷用 `code`。
 - 這則之後緊接 WS close frame（status 1008 policy violation；`SHUTTING_DOWN` 用 1001 going away）。
 - ⚠️ 明文包**只出現在關連線前**，而且**內容裡永遠沒有秘密**（不回 token、不回解出來的東西）。
@@ -165,13 +169,20 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | method | params | result | core |
 |---|---|---|---|
 | `hello` | §1.3 | §1.3 | — |
-| `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections }` | `key_mode`、`is_unlocked` |
+| `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
-| `vault.lock` | — | `{ ok: true }` | ⚠️ core 沒有——`Core` 是解鎖一次就活著；daemon 這邊 lock ＝ 丟掉 `Core` 重開一個。**沒有 ticket 可刪**（§1 那個妥協消失了） |
+| `vault.lock` | — | `{ ok: true }`；還有請求握著解鎖的 `Core` → **`106`，而且維持解鎖** | ⚠️ core 沒有——`Core` 是解鎖一次就活著；daemon 這邊 lock ＝ 丟掉 `Core` 重開一個。**沒有 ticket 可刪**（§1 那個妥協消失了） |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
 | `vault.remove_passphrase` | — | `{ ok: true, key_mode: "plain" }` | `set_passphrase(None)` |
+
+🚨 **`vault.lock` 只換指標不算鎖上。** 請求是各自跑的，`call()` 一進來就先拿一份 `Core`；換掉指標之後，
+**已經拿到舊的那些長工作會繼續用解鎖狀態跑完**（`sync.recent`、`upload.file`、`media.save_to`…），
+那時回 `{ok: true}` 是在說謊。所以邊界是 fail closed 的：daemon 等在跑的那些放手（新請求此時擋著，
+🚫 不會再拿到舊的那份），等到了才換、才回成功；**等不到就回 `106` 並且維持解鎖**。
+⭐ 寧可叫呼叫者重試，也不要回報一個沒有成立的鎖。📎「叫停正在跑的那些」要等 `cancel`（§3.9）；
+在那之前重試是唯一的路。（PR #31 審查 cirno🔴、rumia🔴）
 
 ⚠️ passphrase 用 base64 而不是字串：它是任意 bytes（可以是一個 mp3）。🚫 不提供 `passphrase_file`
 ——那是「daemon 替前端讀檔」，web 前端根本給不出檔案路徑，而 rpc-cli 自己讀了再送不多一行。
@@ -296,8 +307,9 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | 101 | `unknown_method` | 沒這個 method |
 | 102 | `invalid_params` | 缺必填、型別不對、base64 解不開、路徑不是絕對路徑 |
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
-| 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
+| 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定。也是 `vault.lock` 等不到在跑的請求放手時的回答（§3.1） |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
+| 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。🚫 不是前端的錯，所以🚫 不關連線 |
 
 ### 5.2 core 層 ＝ `CoreErrorKind` 的號碼
 
