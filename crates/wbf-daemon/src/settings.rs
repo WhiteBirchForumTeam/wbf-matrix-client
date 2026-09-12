@@ -3,6 +3,11 @@
 //! ⚠️ **這些不在 RPC 上**：`server_backup`、`local_room_keys` 是使用者對這台機器的設定，
 //! 前端不該替使用者決定；daemon 是 conf 的主人（architecture-v2 §0.2），讀一次、填進每個 `Target`。
 //! 解析在 `wbf_core::conf`（跟 rpc-cli 共用同一份，🚫 不各寫一套）。
+//!
+//! **優先序是旗標 > 環境變數 > conf > 內建預設**（CLI 規格 §10.2）。⚠️ 這個檔🚫 **不讀環境變數**：
+//! daemon 的兩個（`WBF_DATA_DIR`、`WBF_CONFIG`）掛在 `main.rs` 的 clap `env = …` 上，旗標壓環境
+//! 由 clap 負責。要給這裡的鍵加環境變數就加在那邊，🚫 不要在這裡自己讀 `std::env` ——
+//! 那會繞過旗標，也會讓同一條優先序有兩個實作。
 
 use std::path::Path;
 
