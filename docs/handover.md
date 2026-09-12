@@ -1,6 +1,6 @@
 # 交接：現在在哪、怎麼跑、下一步
 
-> 給下一個接手的人（人或 agent）。2026-09-06 寫、2026-09-10 更新，每次交接更新。設計理由不在這裡，在 `docs/design/`；這裡只講**現況、怎麼跑、坑、下一步**。
+> 給下一個接手的人（人或 agent）。2026-09-06 寫、2026-09-12 更新，每次交接更新。設計理由不在這裡，在 `docs/design/`；這裡只講**現況、怎麼跑、坑、下一步**。
 
 ## 1. 現況一句話
 
@@ -8,14 +8,17 @@
 第 3 步（接 matrix-sdk 做房間）第一版做完：`rooms`、`send --text|--file`、`watch`、`read`、`files` 對本機 wbfuwunel 全走過。
 本地資料庫三步都合併了：vault 與金鑰（#11）、`cache.db` 多帳號混存（#13）、媒體儲存池（#14）。`Event/Recent` 跟上 server 的拉窗＋`Batch` 串流（#16）。
 PR #19 做完資料目錄的兩層路徑加密、`account` 一族與房間金鑰備份；PR #20 定了架構 v2 的形狀。
-PR #1–#20 全部合併。**沒有 UI。**
+**架構 v2 的第一塊落地了**：命令的「做什麼」全部搬進 `crates/wbf-core`（#24），
+`apps/wbf-cli` 只剩「解析參數 → 叫一個 core 方法 → 印 JSON」。
+PR #1–#24 全部合併。**沒有 UI、還沒有 daemon、還沒有 RPC。**
 
 ## 2. 讀哪些文件、什麼順序
 
 | 順序 | 檔 | 講什麼 |
 |---|---|---|
 | 1 | [`README.md`](../README.md) | 佈局、狀態表、怎麼跑測試、貢獻規則 |
-| 1.5 | [`design/architecture-v2.md`](design/architecture-v2.md) | **kernel／RPC／四個前端的分層**（維護者 2026-09-09 定的方向）。要動介面之前先看這份 |
+| 1.5 | [`design/architecture-v2.md`](design/architecture-v2.md) | **daemon／RPC／四個前端的分層**（維護者 2026-09-09 定的方向）。要動介面之前先看這份 |
+| 1.6 | [`design/to-device-client.md`](design/to-device-client.md) | **client 端怎麼接 `0x16 Device`**（to-device：金鑰、驗證、SSSS）。⚠️ 線上格式的權威在 wbfuwunel 的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`，這份只寫我們最容易寫錯的地方與待辦 |
 | 2 | [`design/plan-v1.md`](design/plan-v1.md) | 範圍、順序、進度；**§7.1**（本地不存）與 **§7.2**（耦合方向：上游 SDK 是可拆的零件）是所有程式的前提 |
 | 3 | [`design/wbf-client-convention-for-chunk.md`](design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、seek；**§5.2 送事件要宣告附件**（等 server 定案） |
 | 4 | [`design/chat-model.md`](design/chat-model.md) | 聊天模型（Conversation／Message）、怎麼接 Matrix、Telegram 有 Matrix 沒有的逐列定案、`r_seq`／`g_seq`、§6 第 3 步範圍與差異 |
@@ -40,9 +43,18 @@ crates/wbf-sdk/src/
   media.rs               fetch／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
   event_json.rs          原始 Matrix 事件 JSON → Message；matrix backend 與 recent 共用，不掛 feature
   backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
-crates/wbf-core/src/     lib.rs（`Core`：解鎖一次的 vault、多帳號入口）、accounts.rs（資料目錄佈局、`DataDirMap`）、recovery.rs（`r/` 的 recovery key）
-                         ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、簡單型別、🚫 不問終端、🚫 不碰 ticket
-apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（passphrase 來源、unlock ticket）、conf.rs（wbf.conf 的解析與自動生成）、commands.rs（第 2 步命令、Context）、rooms.rs（第 3 步命令、寫穿快取）、recent.rs（Event/Recent 進料）
+crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
+  lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
+  error.rs               `CoreError { kind, message }`、`CoreErrorKind`。⚠️ **號碼還沒配**——等 `rpc-spec.md`
+  event.rs               `CoreEvent` 與 broadcast channel。🚫 core 不印任何東西
+  handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate
+  accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部
+  *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
+                         ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、可序列化的型別、事件走 channel、
+                         🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
+apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源、unlock ticket）、
+                         conf.rs（wbf.conf 的解析與自動生成）、commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）
+                         ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
 ```
@@ -53,8 +65,8 @@ vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/mat
 # Windows：先 export PATH="/c/Strawberry/perl/bin:$PATH"，不然 openssl-sys（SQLCipher 用）編不起來（local-cache-db §3）
 cargo test --workspace                       # 不含 matrix feature，快；含 cache feature 的測試要 --features cache
 cargo test -p wbf-sdk --features matrix      # 事件轉換、aggregate、錯密碼分類（起迷你 403 server）
-cargo clippy -p wbf-sdk -p wbf-cli --features wbf-sdk/matrix --all-targets -- -D warnings
-cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 submodule
+cargo clippy -p wbf-sdk -p wbf-core -p wbf-cli --features wbf-sdk/matrix --all-targets -- -D warnings
+cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：會格式化 submodule
 ```
 
 對真 server（本機 wbfuwunel，Windows）：
@@ -110,9 +122,18 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-cli  # 🚫 不要 --all：會格式化 
    ✅ **2026-09-09 對真 server 跑過全流**（步驟見 §4 的 9b），含 principal 修正的迴歸（current=alice 刪 bob 時看的是 bob 的狀態）。
    ✅ **Windows MAX_PATH 已解**：nonce 縮到 12 byte、目錄名縮成 `s`／`a`／`m`／`k`／`r`，最長路徑 230 → 184、餘裕 20 → 76；路徑太長時的錯誤訊息也不再誤導成「it was made with another key file」。前後對照與教訓在 local-cache-db §11.4.1。
 1. chat-model §6 剩的房間功能：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載。穿插。
-2. 附件宣告：等 server 定案（`media-attachments.md` 仍是提案）。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。**走 fork submodule 露出 `Room::encrypt`，還是走 `OlmMachine`，維護者還沒定**；建議後者（plan-v1 §7.2 的方向）。
-3. ⚠️ **架構 v2 的落地**（`design/architecture-v2.md`，2026-09-09 定形狀）：`wbf-kernel` crate、RPC 規格書（`rpc-spec.md` 還沒寫）、CLI 瘦身成前端。
-   排在這裡是因為它會改變所有介面，愈晚做代價愈大；但它依賴兩個未定的決策（fork submodule 的範圍、server 的 `Event/ToDevice`）。
+2. 附件宣告：等 server 定案（`media-attachments.md` 仍是提案）。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。✅ **2026-09-10 定了**：走 `OlmMachine::encrypt_room_event_raw`。⚠️ `Room` 上沒有 `encrypt`，所以那從來不是二選一；fork 已建、`base_client()` 改 `pub` 那一行也推上去了（architecture-v2 §8.3，#23）。
+3. ⚠️ **架構 v2 的落地**（`design/architecture-v2.md`，2026-09-09 定形狀、2026-09-10 定名字）。
+   ✅ **`wbf-core` 做完了**（#24）：命令本體全搬進去，公開面只剩可序列化的 DTO 與 `CoreError`。
+   ✅ **兩個「未定的決策」也不擋了**：fork 已建並成為 submodule（#23）；server 的 to-device
+   已由 wbfuwunel PR #43 實作（`0x16 Device`，權威在那邊的 `wbf-to-device.md`）。
+   還沒做的三塊，**建議順序**：
+   1. **`rpc-spec.md`**——它是下一個真正的前提。`CoreErrorKind` 的號碼**刻意留空等它**
+      （PR #24 的決定：現在配號等於兌現一個之後不能改的承諾）。
+   2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面。
+   3. **`apps/wbf-cli` → rpc-cli**：改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
+   ⚠️ 還有一個 client 端的欠債：**接 `0x16 Device`**（server 那邊 2026-09-12 全做完了，
+   我們一個字都沒寫）。五件事、為什麼要排在 daemon 之後，在 `design/to-device-client.md`。
 4. UI 框架比較文件。UI 的同步流程已經有 SDK 介面可接：開一個 task 跑 `recent_sync`，callback 把每個 Batch 丟 channel 給寫 DB 的 task（chat-model §4.3）；媒體用 `media::fetch` 加 `PoolReader`。
 5. 串流／seek 對著媒體池讀（local-cache-db §8.6）：`seek` 命令現在仍直接打 server。
 6. ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補（PR #16 審查記錄）。

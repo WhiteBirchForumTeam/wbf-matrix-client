@@ -313,7 +313,7 @@ pub enum Update {
 > - **`RoomCrypto` trait 這一版沒有**：加密完全在 matrix-sdk 的 `Room::send`／`TimelineEvent` 裡，我們沒碰 `OlmMachine`，沒東西可包；
 >   接管送訊息（附件宣告需要）那一版才會出現。空的 trait 是儀式，不先立。
 > - **附件宣告（約定 §5.2）帶不出去**：matrix-sdk 的 `Room::send` 不能加 header、server 的 `Event/Send` 還是提案；CLI 送檔案時印警告。
->   要帶就得自己 Megolm 加密再走 `Event/Send`，那需要 submodule 露出 `Room::encrypt` 這類的入口（小 patch，但是 fork）或直接拿 `OlmMachine`。等 server 定案再定。
+>   要帶就得自己 Megolm 加密再走 `Event/Send`，走的是 `OlmMachine::encrypt_room_event_raw`（那是 `pub`）。⚠️ `Room` 上沒有 `encrypt`，所以這裡不是「fork vs OlmMachine」的二選一——只差一行 `pub(crate) fn base_client()` → `pub` 就拿得到 `OlmMachine`（維護者 2026-09-10 建了 fork，architecture-v2 §8.3）。等 server 的 `Event/Send` 定案再做。
 > - 聚合（edit／reaction／redaction 折進目標）只在同一頁內；目標不在頁裡的關係事件照原樣留著。
 
 1. `Backend` trait 與 `matrix_sdk` adapter；`conversations`、`conversation`、`history`、`send_text`、`send_file`、`watch`。
