@@ -6,8 +6,14 @@
 > 它是 `crates/wbf-daemon` 與 rpc-cli 的前提（handover §7 第 3 項），也是
 > `wbf-core::CoreErrorKind` 配號的權威（PR #24 刻意留空等這份）。
 >
-> 🚫 **定了就不改的東西只有兩樣：`code` 的號碼、`method` 的名字。** 其餘（欄位可以加、
-> 推播可以加、新的 method 可以加）都是相容的變動，不動 `protocol` 版號。
+> 🚨 **狀態：草案**（維護者 2026-09-12）。這裡定得很完整，但 **daemon 一行都還沒有**，大部分 method 底下的東西
+> 也還沒有——只有 matrix-sdk 那一側是現成的。實作時撞到的每一個變數都可以改回這份文件；
+> **凍結的時點是 daemon 第一版合併**，那之後 `code` 的號碼與 `method` 的名字才**定了就不改**，
+> 其餘（欄位可以加、推播可以加、新的 method 可以加）永遠是相容的變動，不動 `protocol` 版號。
+>
+> ⭐ **「做完」的判準：底層走的是我們自己跟 homeserver 的 WS（wbf-pack）才算**。走 matrix-sdk 的 HTTP
+> 只是現在能動，未來要全面遷移到 WS（architecture-v2 §6.1 的四條線）；HTTP fallback 也一樣不算。
+> 每個 method 的現況在 §10。
 
 ## 0. 一句話
 
@@ -392,3 +398,36 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 - 🚫 沒有 WS text frame、🚫 pack 裡沒有長度欄位、🚫 `type` 不表示種類：一包一則、長度由 WS 給、種類在 JSON 裡（§1）。
 - 🚫 daemon 不問終端、不彈視窗、不讀 passphrase 檔：全部從 RPC 進來（§4.5）。
 - 🚫 `msg` 不當邏輯用、🚫 `code` 不重排、🚫 `method` 不改名——改名等於新 method 加舊的廢棄，廢棄的回 `101` 前先活一個版本。
+
+## 10. 每個 method 的實作現況（2026-09-12；判準見檔頭）
+
+「底層」是它最後跟 homeserver 講話走哪條。✅ 只給 **WS**；matrix-sdk 的 HTTP 與 HTTP fallback 都是 🔁「能動、要遷」；
+core 沒有的是 ❌。**daemon 那一層（pack、加密、hello、訂閱、資料平面 HTTP）全部 ❌**，這張表只看 core 以下。
+
+| method | core | 底層 | 判定 |
+|---|---|---|---|
+| `hello`、`daemon.*`、`vault.lock`、`subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
+| `vault.unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
+| `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
+| `account.list`／`switch` | ✅ | 本機 | ✅ |
+| `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |
+| `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | 🔁 |
+| `room.list`／`get` | ✅ | matrix-sdk `/sync` | 🔁 |
+| `room.send_text` | ✅ | matrix-sdk `Room::send` | 🔁 `Event/Send` 等附件宣告（約定 §5.2）一起做 |
+| `room.send_file` | ✅ | 上傳 **WS** ＋ 事件 matrix-sdk | 🔁 一半 |
+| `room.send_attachment`、`media.create` | ❌ | — | ❌ |
+| `room.history`（`source: server`） | ✅ | matrix-sdk `/messages` | 🔁 |
+| `room.history`／`room.files`（`source: cache`） | ✅ | 本機 `cache.db` | ✅ |
+| `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
+| `room.message` 推播 | ✅（`CoreEvent::Message`，來自 `watch`） | matrix-sdk `/sync` | 🔁 daemon 版要接 `Event/Subscribe`／`Push` |
+| `upload.file`／`status`／`abort` | ✅ | **WS**（`--transport http` 是 fallback） | ✅ |
+| `media.info` | ✅ | **WS** `Info` | ✅ |
+| `media.save_to` | ✅ | **WS** `Read`＋媒體池 | ✅ |
+| `media.open`（Range） | ❌ 缺 `PoolReader` 接口 | 池讀 ✅、缺塊補拉 **WS** | ❌ |
+| `media.stats`／`gc` | ✅ | 本機 | ✅ |
+| `backup.*`、`recovery.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP） | 🔁 而且金鑰的 to-device 收發要等 `0x16 Device`（to-device-client.md） |
+| `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
+| `sync.state`／`vault.state` 推播 | ❌ | — | ❌ |
+
+📎 讀法：✅ 那幾列是 wbf-sdk 第 2 步的產物（上傳／下載／`recent`／ping），它們從一開始就是 WS。
+🔁 那些全部掛在 matrix-sdk 上，遷移的順序跟 architecture-v2 §6.1 四條線一致：房間（`Subscribe`／`Push`）→ 金鑰（`Device`）→ session（`Session/*`）。
