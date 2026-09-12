@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 wbf-sdk = { path = "../../crates/wbf-sdk", features = ["matrix", "cache"] }
+wbf-core = { path = "../../crates/wbf-core" }
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
