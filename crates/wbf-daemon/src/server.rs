@@ -85,6 +85,7 @@ async fn serve_connection(
     let Ok(websocket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
+    let _counted = handle.connection_opened();
     let (mut sink, mut source) = websocket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Outgoing>(64);
     let mut shutdown = handle.shutdown_signal();
@@ -170,6 +171,8 @@ async fn serve_connection(
                     let response = handle.call(request).await;
                     let bytes = connection.lock().await.seal_response(&response);
                     let _ = outgoing_tx.send(Outgoing::Frame(bytes)).await;
+                    // 回應已經排進 writer 了，這時才廣播 shutdown：close 通知一定排在它後面。
+                    handle.begin_shutdown_if_requested();
                 });
             }
         }

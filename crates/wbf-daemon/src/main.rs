@@ -54,15 +54,17 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if token.len() < 32 {
-        eprintln!(
-            "the daemon token at {} is too short ({} bytes; expected 256)",
-            token_path.display(),
-            token.len()
-        );
-        return ExitCode::from(1);
-    }
-    let keys = Arc::new(RpcKeys::from_token(&token));
+    let keys = match RpcKeys::from_token_file(&token) {
+        Ok(keys) => Arc::new(keys),
+        Err(actual) => {
+            eprintln!(
+                "the daemon token at {} is {actual} bytes; it must be exactly {} (architecture-v2 §4.3)",
+                token_path.display(),
+                wbf_daemon::pack::TOKEN_LEN
+            );
+            return ExitCode::from(1);
+        }
+    };
     drop(token);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");

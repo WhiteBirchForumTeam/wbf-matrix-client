@@ -8,6 +8,7 @@
 //! 房間、上傳、備份那些在下一支 PR。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,8 +37,13 @@ pub struct Handle {
     core: RwLock<Arc<Core>>,
     policy: EncryptionPolicy,
     started_at: Instant,
+    /// `daemon.shutdown` 只設這個；真正廣播（[`Handle::begin_shutdown_if_requested`]）由 server 在**送完那則回應之後**叫。
+    /// 不然 close 通知可能排在 `{ ok: true }` 前面（PR #30 審查 cirno🔴3）。
+    shutdown_requested: AtomicBool,
     shutdown: watch::Sender<bool>,
     ports: RwLock<Option<(u16, u16)>>,
+    /// 現在活著的 RPC 連線數（`daemon.info` 的 `connections`）。
+    connections: AtomicUsize,
 }
 
 impl Handle {
@@ -48,9 +54,28 @@ impl Handle {
             core: RwLock::new(Arc::new(Core::open(data_dir))),
             policy,
             started_at: Instant::now(),
+            shutdown_requested: AtomicBool::new(false),
             shutdown,
             ports: RwLock::new(None),
+            connections: AtomicUsize::new(0),
         })
+    }
+
+    /// 一條連線開了。回來的 guard 丟掉就是關了。
+    pub fn connection_opened(self: &Arc<Handle>) -> ConnectionGuard {
+        self.connections.fetch_add(1, Ordering::SeqCst);
+        ConnectionGuard(self.clone())
+    }
+
+    pub fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// `daemon.shutdown` 的回應已經送出去了嗎？是就真的開始關。server 在送完每一則回應後問一次。
+    pub fn begin_shutdown_if_requested(&self) {
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            let _ = self.shutdown.send(true);
+        }
     }
 
     /// server 起好 listener 之後回填，`daemon.info` 才報得出來。
@@ -63,8 +88,9 @@ impl Handle {
         self.shutdown.subscribe()
     }
 
+    /// 要不要拒絕新請求：`daemon.shutdown` 一回完就拒，不等廣播。
     pub fn is_shutting_down(&self) -> bool {
-        *self.shutdown.borrow()
+        self.shutdown_requested.load(Ordering::SeqCst) || *self.shutdown.borrow()
     }
 
     pub async fn core(&self) -> Arc<Core> {
@@ -137,6 +163,7 @@ impl Handle {
             "rpc_port": ports.map(|(rpc, _)| rpc),
             "data_port": ports.map(|(_, data)| data),
             "uptime_seconds": self.started_at.elapsed().as_secs(),
+            "connections": self.connection_count(),
         }))
     }
 
@@ -150,14 +177,24 @@ impl Handle {
         Ok(json!({ "encryption_enforced": self.policy.is_enforced() }))
     }
 
+    /// 只記下「要關了」；廣播等回應送出去之後（見 [`Handle::begin_shutdown_if_requested`]）。
     fn daemon_shutdown(&self) -> Outcome {
-        let _ = self.shutdown.send(true);
+        self.shutdown_requested.store(true, Ordering::SeqCst);
         Ok(json!({ "ok": true }))
     }
 
     async fn vault_lock(&self) -> Outcome {
         *self.core.write().await = Arc::new(Core::open(&self.data_dir));
         Ok(json!({ "ok": true }))
+    }
+}
+
+/// 丟掉就把連線數減一。
+pub struct ConnectionGuard(Arc<Handle>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -395,10 +432,29 @@ mod tests {
             .await;
         assert_eq!(response.result["encryption_enforced"], false);
         assert!(!policy.is_enforced());
-        let mut signal = handle.shutdown_signal();
-        handle.call(request("daemon.shutdown", Value::Null)).await;
-        assert!(signal.changed().await.is_ok() || *signal.borrow());
+        let signal = handle.shutdown_signal();
+        let response = handle.call(request("daemon.shutdown", Value::Null)).await;
+        assert_eq!(response.code, 0);
+        // 回完之前不廣播：server 送完回應才叫 begin_shutdown_if_requested。
+        assert!(!*signal.borrow());
+        assert!(handle.is_shutting_down());
         let response = handle.call(request("daemon.info", Value::Null)).await;
         assert_eq!(response.code, code::DAEMON_SHUTTING_DOWN);
+        handle.begin_shutdown_if_requested();
+        assert!(*signal.borrow());
+    }
+
+    #[tokio::test]
+    async fn connections_are_counted_by_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = Handle::new(dir.path(), EncryptionPolicy::enforced());
+        let first = handle.connection_opened();
+        let second = handle.connection_opened();
+        assert_eq!(handle.connection_count(), 2);
+        drop(first);
+        let response = handle.call(request("daemon.info", Value::Null)).await;
+        assert_eq!(response.result["connections"], 1);
+        drop(second);
+        assert_eq!(handle.connection_count(), 0);
     }
 }

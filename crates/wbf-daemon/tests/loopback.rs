@@ -112,6 +112,32 @@ async fn hello_then_a_request_over_ciphertext() {
     assert_eq!(reply["id"], 7);
     assert_eq!(reply["result"]["rpc_port"], daemon.port);
     assert_eq!(reply["result"]["protocols"], json!([1]));
+    assert_eq!(reply["result"]["connections"], 1);
+    // 第二條連線進來，數字跟著變；它關掉之後回到 1。
+    let mut other = connect(daemon.port).await;
+    send(&mut other, &keys, PackType::Cipher, hello()).await;
+    receive(&mut other, &keys).await;
+    send(
+        &mut other,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 1 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut other, &keys).await;
+    assert_eq!(reply["result"]["connections"], 2);
+    other.close(None).await.unwrap();
+    drop(other);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 2 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["result"]["connections"], 1);
 
     // 沒解鎖：帳號那些是 1001，而且連線還活著（請求層錯誤不關連線）。
     send(
