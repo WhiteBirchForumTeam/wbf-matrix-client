@@ -197,7 +197,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `room.list` | `{ user?, server? }` | `[Conversation]`（chat-model §2.1） | `list_conversations` |
 | `room.get` | `{ room, user?, server? }` | `Conversation` | `conversation` |
 | `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
-| `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared }` | `send_file`。長工作：推 `progress` |
+| `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
 | `room.history` | `HistoryQuery` 加 `user?`／`server?`：`{ room, limit, before?, source: "server"\|"cache", types?, sender? }` | `MessagePage`：`{ events: [Message], next? }` | `history` |
 | `room.files` | `{ room, limit, before?, source, user?, server? }` | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
@@ -399,16 +399,19 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 - 🚫 daemon 不問終端、不彈視窗、不讀 passphrase 檔：全部從 RPC 進來（§4.5）。
 - 🚫 `msg` 不當邏輯用、🚫 `code` 不重排、🚫 `method` 不改名——改名等於新 method 加舊的廢棄，廢棄的回 `101` 前先活一個版本。
 
-## 10. 每個 method 的實作現況（2026-09-12；判準見檔頭）
+## 10. 每個 method 的實作現況（2026-09-13；判準見檔頭）
 
 「底層」是它最後跟 homeserver 講話走哪條。✅ 只給 **WS**；matrix-sdk 的 HTTP 與 HTTP fallback 都是 🔁「能動、要遷」；
-core 沒有的是 ❌。daemon 那一層：pack、加密、hello、連線狀態機、WS listener ✅（`crates/wbf-daemon` 第一版）；
-訂閱／推播／cancel、資料平面 HTTP ❌。這張表其餘只看 core 以下。
+core 沒有的是 ❌。daemon 那一層：pack、加密、hello、連線狀態機、WS listener、conf（`Settings`）、
+**下表有 core 對應的 method 全部接上了**（`crates/wbf-daemon` 第二版）；訂閱／推播／cancel、資料平面 HTTP ❌。
+這張表的「底層」只看 core 以下。📎 2026-09-13 對真 wbfuwunel 走過 `account.add → whoami → server.ping → room.list → sync.recent →
+backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 
 | method | core | 底層 | 判定 |
 |---|---|---|---|
 | `hello`、`daemon.info`／`set_encryption`／`shutdown`、`vault.lock` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
+| `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |

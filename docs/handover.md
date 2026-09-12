@@ -36,6 +36,7 @@ crates/wbf-sdk/src/
   cipher.rs chunk_block.rs chunk_crypto.rs   密碼層（約定 §2–§4、§7）；tests/client_vectors.rs 產生並比對 wbf-client-vectors.json
   protocol.rs channel.rs client.rs upload.rs download.rs manifest.rs login.rs error.rs   通道與上傳／下載（線上規格）
   chat.rs                聊天模型與 ChatBackend trait，沒有 Matrix 型別
+  conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   vault.rs               local.key、六把子金鑰、session.sealed、封 recovery key（local-cache-db §4）；沒有 SQLite、沒有 matrix-sdk
   account_dir.rs         資料目錄名的確定性加密（`<b58 nonce>_<b58 密文>`，local-cache-db §11）；沒有 IO
   room_keys.rs           本地金鑰快照放哪、用什麼 passphrase、權限（local-cache-db §10.4）；不碰 matrix-sdk
@@ -53,17 +54,20 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
                          ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、可序列化的型別、事件走 channel、
                          🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
-crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。第一版只有控制平面的基底：
+crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底與全部有 core 對應的 method：
   pack.rs                ver‖type‖data 的編解碼與 XChaCha20-Poly1305（token 導兩把鑰）；純函數
   message.rs             Request／Response、請求層 code（1xx）、協議層 CloseReason（9xxx）
   protocol.rs            hello 的兩關：client 名字前綴、protocol 交集
   connection.rs          一條連線的狀態機；⚠️ **出去的包該不該加密只在這裡判**（EncryptionPolicy 是全局）
-  handle.rs              method → core。這一版只接 daemon.*、vault.*、account.list／switch、media.stats／gc、recovery.*
+  handle/                method → core。mod.rs 是分派與共同欄位（Target／transport）；local／accounts／rooms／media／backup 一模組一族。
+                         ⚠️ dispatch 每個分支 Box::pin（E0275）；第一次登入（沒 local.key）account.add 不被 1001 擋
+  settings.rs            從 wbf.conf 讀 SERVER_BACKUP／LOCAL_ROOM_KEYS／TRANSPORT（解析在 wbf_core::conf，跟 CLI 共用）
   server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
-  main.rs                只有 `-s`；單發命令、資料平面、conf 都還沒搬進來
+  main.rs                只有 `-s`（讀 daemon.token、conf、寫 daemon.json）；單發命令、資料平面還沒有
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
+  tests/real_server.rs   `--ignored`：對真 wbfuwunel 走 account.add→whoami→ping→room.list→sync.recent→backup.status→account.del
 apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源、unlock ticket）、
-                         conf.rs（wbf.conf 的解析與自動生成）、commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）
+                         commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）；conf 的解析已搬到 wbf_core::conf
                          ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
@@ -96,6 +100,17 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 6. 測完 `taskkill //F //IM <複本名>.exe`。
 
 ## 5. 坑（都踩過）
+
+- **wbfuwunel 的 `id` 第一個 byte 是型別**（wire-format §2.2，那邊 `dc4e590f7`，2026-09-12 BREAKING）：`Event/Recent`
+  這種 client 自己鑄會話號的包要用 `wbf_wire::pack::id::compose(id::SESSION, n)`，填裸的 `n` server 回
+  `InvalidRequest: this kind takes a conversation the client named in its id, and this one carries none`。
+  server 鑄的（上傳 id、`g_seq`）回來已經組好，原樣抄回去就對。⚠️ 那邊的向量檔 `recent_*` 的 id **沒帶型別 byte**
+  （codec 測試不驗語意，所以沒紅）——向量綠不代表 runtime 過；對真 server 跑一次才看得到。
+- **`cargo test --workspace` 綠不代表 SDK 對得上 server**：黃金向量是整份複製的，server 加了 kind（`0x02 Stream`、
+  `0x16 Device`）我們的 `Kind` 表沒有，`vectors.rs` 才會紅；漏抄向量就什麼都不會紅。每次 server 那邊改 wire 就重抄一次。
+- **core 的長工作 future 要 `Send`**：daemon 把每個請求 `tokio::spawn`，wbf-sdk 的回呼型別一律是
+  `&mut (dyn FnMut(…) + Send)`。新加回呼型別漏了 `+ Send`，錯會在 daemon 的 `dispatch` 那一行爆，不在 sdk。
+  📎 同一行還會撞 E0275（matrix-sdk 的 future 太深、推 `Send` 爆遞迴上限）：`dispatch` 每個分支 `Box::pin` 就是為了這個。
 
 - `cargo fmt --all` 會格式化 `vendor/matrix-rust-sdk`（path dependency）。用 `-p`。commit 前看 `git -C vendor/matrix-rust-sdk status` 是空的。
 - 帶 `--features matrix` 的第一次編譯很久（matrix-sdk 全家）；放背景。
@@ -141,8 +156,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    1. ✅ **`rpc-spec.md`**（2026-09-12 第一版）：method 表、code 表（`CoreErrorKind` 配號在 §5.2）、推播、資料平面。
       §8 列了 daemon PR 要順手補進 core 的五樣（`lock`、建檔與送事件拆開、`PoolReader` 接 Range、
       結構化事件、配號）。
-   2. 🔁 **`crates/wbf-daemon`**：第一塊落地（pack、訊息、hello、連線狀態機、本機型 method、WS listener、`-s`）。
-      還沒：網路型 method（房間／上傳／備份）、推播與 cancel、資料平面 HTTP、conf 搬進來、單發命令列。
+   2. 🔁 **`crates/wbf-daemon`**：第一塊（#30）pack、訊息、hello、連線狀態機、WS listener、`-s`；
+      第二塊全部有 core 對應的 method（帳號／房間／上傳／媒體／備份／sync.recent）與 conf 搬進 daemon。
+      還沒：推播與 cancel（要 core 的結構化事件）、資料平面 HTTP（media.open／create、send_attachment）、單發命令列。
       原定義：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
    3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。

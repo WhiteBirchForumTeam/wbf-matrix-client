@@ -14,6 +14,7 @@
 //! | `connection` | 一條連線的狀態機；**出去的包該不該加密只在這裡判斷** |
 //! | `handle` | method → core |
 //! | `server` | loopback 的 WS listener |
+//! | `settings` | 從 `wbf.conf` 讀進來、要填進 `Target` 的那幾個值 |
 //!
 //! 🚫 這個 crate 不印任何東西到 stdout／stderr（`main.rs` 例外）。
 
@@ -23,3 +24,4 @@ pub mod message;
 pub mod pack;
 pub mod protocol;
 pub mod server;
+pub mod settings;

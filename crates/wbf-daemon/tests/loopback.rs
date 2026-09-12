@@ -11,6 +11,7 @@ use wbf_daemon::connection::EncryptionPolicy;
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
 use wbf_daemon::server::RpcServer;
+use wbf_daemon::settings::Settings;
 
 const TOKEN: [u8; 256] = [42u8; 256];
 
@@ -23,7 +24,7 @@ struct Daemon {
 async fn start_daemon() -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let policy = EncryptionPolicy::enforced();
-    let handle = Handle::new(dir.path(), policy.clone());
+    let handle = Handle::new(dir.path(), policy.clone(), Settings::default());
     let server = RpcServer::bind(
         0,
         Arc::new(RpcKeys::from_token(&TOKEN)),

@@ -10,6 +10,7 @@ use wbf_daemon::connection::EncryptionPolicy;
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::RpcKeys;
 use wbf_daemon::server::RpcServer;
+use wbf_daemon::settings::Settings;
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -31,6 +32,9 @@ struct Cli {
     /// RPC 的 port；0 就隨機，寫進 <data dir>/daemon.json
     #[arg(long, default_value_t = 0)]
     rpc_port: u16,
+    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（CLI 規格 §10.1）
+    #[arg(long, env = "WBF_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -69,8 +73,18 @@ fn main() -> ExitCode {
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async move {
+        let settings = match Settings::load(cli.config.as_deref(), &cli.data_dir) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(1);
+            }
+        };
+        for warning in &settings.warnings {
+            eprintln!("{warning}");
+        }
         let policy = EncryptionPolicy::enforced();
-        let handle = Handle::new(&cli.data_dir, policy.clone());
+        let handle = Handle::new(&cli.data_dir, policy.clone(), settings);
         let server = match RpcServer::bind(cli.rpc_port, keys, policy, handle.clone()).await {
             Ok(server) => server,
             Err(error) => {
