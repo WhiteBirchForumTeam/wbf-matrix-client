@@ -4224,6 +4224,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wbf-core",
+ "wbf-sdk",
+ "zeroize",
+]
+
+[[package]]
+name = "wbf-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
  "wbf-sdk",
  "zeroize",
 ]

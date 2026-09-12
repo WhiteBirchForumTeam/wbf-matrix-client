@@ -1,12 +1,10 @@
 //! wbf-cli：介面照 `docs/design/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
 //! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
-//! 每個帳號的資料放哪在 `accounts.rs`。
+//! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §7）。
 
-mod accounts;
 mod commands;
 mod conf;
 mod recent;
-mod recovery;
 mod rooms;
 mod unlock;
 
@@ -14,7 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use wbf_sdk::SdkError;
+use wbf_core::{CoreError, CoreErrorKind};
 
 /// CLI 規格 §2 的全域參數。
 #[derive(Parser)]
@@ -370,18 +368,25 @@ fn main() -> ExitCode {
     }
 }
 
-/// CLI 規格 §4。
+/// CLI 規格 §4 的 exit code。
+///
+/// ⚠️ 對的是 **`CoreErrorKind`** 而不是訊息：那正是 core 把錯誤結構化的理由
+/// （PR #24 審查 salvia／rumia）。daemon 那邊同一張表會變成 §4.6 的 `code` 整數。
 ///
 /// Args:
-///     error: example: SdkError::Integrity("...".into())
+///     error: example: CoreError::new(CoreErrorKind::Integrity, "...")
 /// Return:
-///     u8  1 用法／IO、2 server 拒絕或不講協議、3 完整性、4 網路
-fn exit_code(error: &SdkError) -> u8 {
-    match error {
-        SdkError::Usage(_) | SdkError::Io(_) => 1,
-        SdkError::Server { .. } | SdkError::Protocol(_) => 2,
-        SdkError::Integrity(_) => 3,
-        SdkError::Network(_) => 4,
-        SdkError::Timeout(_) => 5,
+///     u8  1 用法／IO、2 server 拒絕或不講協議、3 完整性、4 網路、5 逾時
+fn exit_code(error: &CoreError) -> u8 {
+    use CoreErrorKind::*;
+    match error.kind {
+        // 🚫 「還沒解鎖」「要 passphrase」這些都是用法問題，跟打錯字同一級。
+        Usage | Io | Locked | NoKeyFile | NeedPassphrase | UnexpectedPassphrase
+        | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | NoRecoveryKeyHere
+        | HistoryWouldBeLost => 1,
+        Server => 2,
+        Integrity => 3,
+        Network => 4,
+        Timeout => 5,
     }
 }

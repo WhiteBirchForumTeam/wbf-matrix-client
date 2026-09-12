@@ -41,7 +41,9 @@ crates/wbf-sdk/src/
   media.rs               fetch／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
   event_json.rs          原始 Matrix 事件 JSON → Message；matrix backend 與 recent 共用，不掛 feature
   backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
-apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（passphrase 來源、unlock ticket）、accounts.rs（每個帳號的資料放哪、current、--account 解析）、conf.rs（wbf.conf 的解析與自動生成）、recovery.rs（`r/` 的 recovery key 保管，logout 不碰它）、commands.rs（第 2 步命令、Context）、rooms.rs（第 3 步命令、寫穿快取）、recent.rs（Event/Recent 進料）
+crates/wbf-core/src/     lib.rs（`Core`：解鎖一次的 vault、多帳號入口）、accounts.rs（資料目錄佈局、`DataDirMap`）、recovery.rs（`r/` 的 recovery key）
+                         ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、簡單型別、🚫 不問終端、🚫 不碰 ticket
+apps/wbf-cli/src/        main.rs（參數、exit code）、unlock.rs（passphrase 來源、unlock ticket）、conf.rs（wbf.conf 的解析與自動生成）、commands.rs（第 2 步命令、Context）、rooms.rs（第 3 步命令、寫穿快取）、recent.rs（Event/Recent 進料）
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
 ```

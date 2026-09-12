@@ -547,25 +547,6 @@ pub fn find_account_of_current(data_dir: &Path, key: &Key32, current: &str) -> O
     })
 }
 
-/// `--account <mxid 或 localpart>` 解析：當場刷新一次，再從 map 比對（大小寫不敏感）。
-///
-/// Args:
-///     data_dir: example: "<data dir>"
-///     vault: example: context.vault()?
-///     user: example: "@alice:localhost"
-///     server: example: Some("http://localhost:6167")
-/// Return:
-///     Ok(AccountDir)   剛好一個、或 `server` 有給且找得到
-///     Err(Usage)       零個；或多個 server 都有這個 localpart 而 `server` 沒給
-pub fn find_account(
-    data_dir: &Path,
-    vault: &Vault,
-    user: &str,
-    server: Option<&str>,
-) -> Result<AccountDir, SdkError> {
-    refresh_data_dir_map(data_dir, vault)?.find_account_dir(user, server)
-}
-
 /// `http://localhost:6167` → `localhost:6167`；`https://matrix.example.org` → `matrix.example.org`（預設 port 不帶）。
 ///
 /// ⚠️ 這是**加密的輸入**（§11.3），不是檔名了：所以要正規化到底（小寫），
@@ -887,9 +868,12 @@ mod tests {
             .unwrap();
             std::fs::create_dir_all(&account.dir).unwrap();
         }
-        let error = find_account(&data_dir, &vault, "alice", None).unwrap_err();
+        let map = refresh_data_dir_map(&data_dir, &vault).unwrap();
+        let error = map.find_account_dir("alice", None).unwrap_err();
         assert!(format!("{error}").contains("2 servers"), "{error}");
-        assert!(find_account(&data_dir, &vault, "alice", Some("http://localhost:6167")).is_ok());
+        assert!(map
+            .find_account_dir("alice", Some("http://localhost:6167"))
+            .is_ok());
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
