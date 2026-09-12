@@ -130,7 +130,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    還沒做的三塊，**建議順序**：
    1. **`rpc-spec.md`**——它是下一個真正的前提。`CoreErrorKind` 的號碼**刻意留空等它**
       （PR #24 的決定：現在配號等於兌現一個之後不能改的承諾）。
-   2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發、
+   2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
    3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。
       改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
