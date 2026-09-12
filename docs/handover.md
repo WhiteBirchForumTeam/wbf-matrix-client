@@ -130,8 +130,11 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    還沒做的三塊，**建議順序**：
    1. **`rpc-spec.md`**——它是下一個真正的前提。`CoreErrorKind` 的號碼**刻意留空等它**
       （PR #24 的決定：現在配號等於兌現一個之後不能改的承諾）。
-   2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面。
-   3. **`apps/wbf-cli` → rpc-cli**：改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
+   2. **`crates/wbf-daemon`**：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
+      `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
+   3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。
+      改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
+   📎 附件訊息的完整流程（建檔拿 URL → 發訊息 ＆ PUT bytes 並行 → 進度）與閘門鏈在 architecture-v2 §4.9。
    ⚠️ 還有一個 client 端的欠債：**接 `0x16 Device`**（server 那邊 2026-09-12 全做完了，
    我們一個字都沒寫）。五件事、為什麼要排在 daemon 之後，在 `design/to-device-client.md`。
 4. UI 框架比較文件。UI 的同步流程已經有 SDK 介面可接：開一個 task 跑 `recent_sync`，callback 把每個 Batch 丟 channel 給寫 DB 的 task（chat-model §4.3）；媒體用 `media::fetch` 加 `PoolReader`。
