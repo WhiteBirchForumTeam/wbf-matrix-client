@@ -29,8 +29,8 @@
 //!
 //! - 🚫 **不問終端**：passphrase 一律由呼叫端餵進來（§4.5——那樣 Desktop 與 Android
 //!   才解得開）。⚠️ 所以 `unlock` 吃的是 bytes，不是「檔案路徑」也不是「去問使用者」。
-//! - 🚫 **不碰 `unlock.ticket`**：那是「一個命令一個程序」的妥協（local-cache-db §4 自己
-//!   標記過），常駐之後**整個消失**（§1）。ticket 留在 rpc-cli 那邊，直到 daemon 接手。
+//! - 🚫 **不寫任何「解鎖狀態」到磁碟**：以前 CLI 有一張 `unlock.ticket`（明文主金鑰落地 15 分鐘），
+//!   2026-09-13 整條拿掉了（local-cache-db §4）。解鎖狀態只活在這個物件裡。
 //! - 🚫 **不管 UI 狀態、不管顯示格式、不代前端做決定**（§3）。
 
 // ⚠️ 這兩個是**內部**：它們的型別（`DataDirMap`、`AccountDir`）帶著路徑與 `Vault`，
@@ -118,10 +118,10 @@ impl Target {
 /// 一個資料目錄的常駐狀態。
 ///
 /// **解鎖一次**：`unlock` 成功之後主金鑰活在這個物件裡，直到它被丟掉。
-/// ⚠️ 這正是 `unlock.ticket`（明文主金鑰落地 15 分鐘）消失的原因——
-/// 常駐之後沒有人需要把它寫到磁碟上。
+/// ⚠️ 這正是 `unlock.ticket`（明文主金鑰落地 15 分鐘）不再存在的原因——
+/// 常駐之後沒有人需要把它寫到磁碟上（local-cache-db §4，2026-09-13 拿掉）。
 ///
-/// 🚫 `Core` 自己**不會**去問終端、不讀 passphrase 檔、不寫 ticket。那些是前端的事。
+/// 🚫 `Core` 自己**不會**去問終端、不讀 passphrase 檔。那些是前端的事。
 pub struct Core {
     data_dir: PathBuf,
     /// 解一次就留著。`OnceLock` 讓 `unlock` 收 `&self`（§7 的紀律）。
@@ -251,8 +251,8 @@ impl Core {
     ///
     /// - **`login`**：`local.key` 還不存在，vault 是**建**出來的。🚫 `Core` 不長出「建」
     ///   的那半——那需要「要不要設 passphrase」的政策，是前端的決定（§3）。
-    /// - **rpc-cli 的 `unlock.ticket`**：從落地的主金鑰直接組 vault，沒有 passphrase 可餵。
-    ///   ⚠️ 那是「一個命令一個程序」的妥協，daemon 接手之後整條消失。
+    /// - **daemon 的 `vault.create`**（rpc-spec §3.1）：同一件事走 RPC 進來，「要不要 passphrase」
+    ///   由前端在那一步決定。
     ///
     /// **冪等**，跟 [`Core::unlock`] 一樣：已經有一把就把傳進來的丟掉、回原本那把。
     /// 📎 兩把都來自同一個資料目錄，所以是同一把主金鑰——丟掉的那把沒有資訊。

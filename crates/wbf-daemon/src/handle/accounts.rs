@@ -24,11 +24,9 @@ pub(super) async fn account_add(handle: &Handle, core: &Core, params: Value) -> 
     }
     let params: Params = parse_params(params)?;
     let password = Zeroizing::new(params.password);
-    // 第一次登入：還沒有 local.key 就建一把 plain 的（rpc-spec §3.2）。要 passphrase 模式的
-    // 前端先叫 vault.set_passphrase。建了就是解鎖狀態。
-    if core.key_mode()?.is_none() {
-        core.create_vault(None)?;
-    }
+    // 🚫 這裡不替前端建 vault（rpc-spec §3.2）：那把只能是 plain 的，於是想要 passphrase 的前端
+    // 被迫「先落一份 plain 再重包」，中間那段磁碟狀態沒有 passphrase 保護。fresh 資料目錄的起手式
+    // 是 `vault.create`（一步建成要的模式）；沒建就被 `call()` 的閘門用 `1002` 擋下來。
     to_result(
         core.log_in(
             &params.server,

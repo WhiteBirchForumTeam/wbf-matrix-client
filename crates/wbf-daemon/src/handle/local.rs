@@ -20,6 +20,23 @@ fn decode_passphrase(field: Option<String>) -> Result<Option<Zeroizing<Vec<u8>>>
     }
 }
 
+/// 建這個資料目錄的 `local.key`（rpc-spec §3.1）。**要 passphrase 模式就在這一步給**。
+///
+/// ⭐ 這條是 fresh 資料目錄唯一的起手式，🚫 `account.add` 不替前端偷建一把 plain 的 ——
+/// 那會逼想要 passphrase 的前端「先落一份 plain 再重包」，中間那段磁碟上就是沒有 passphrase 保護的
+/// （PR #31 審查 rumia🔴、salvia🔴）。已經有 `local.key` 就 `1100`，🚫 不覆蓋。
+pub(super) fn vault_create(core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(default)]
+        passphrase_base64: Option<String>,
+    }
+    let params: Params = parse_params(params)?;
+    let passphrase = decode_passphrase(params.passphrase_base64)?;
+    let mode = core.create_vault(passphrase.as_deref().map(|bytes| bytes.as_slice()))?;
+    Ok(json!({ "ok": true, "key_mode": mode }))
+}
+
 pub(super) fn vault_unlock(core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {

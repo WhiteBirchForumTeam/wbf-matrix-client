@@ -140,7 +140,8 @@ async fn hello_then_a_request_over_ciphertext() {
     let (_, reply) = receive(&mut socket, &keys).await;
     assert_eq!(reply["result"]["connections"], 1);
 
-    // 沒解鎖：帳號那些是 1001，而且連線還活著（請求層錯誤不關連線）。
+    // 這個資料目錄還沒有 local.key：帳號那些是 1002（訊息指向 vault.create），
+    // 而且連線還活著（請求層錯誤不關連線）。
     send(
         &mut socket,
         &keys,
@@ -149,7 +150,7 @@ async fn hello_then_a_request_over_ciphertext() {
     )
     .await;
     let (_, reply) = receive(&mut socket, &keys).await;
-    assert_eq!(reply["code"], 1001);
+    assert_eq!(reply["code"], 1002, "{reply}");
     assert_eq!(reply["result"], Value::Null);
     send(
         &mut socket,

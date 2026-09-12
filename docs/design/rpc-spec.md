@@ -172,6 +172,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
+| `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
 | `vault.remove_passphrase` | — | `{ ok: true, key_mode: "plain" }` | `set_passphrase(None)` |
@@ -192,6 +193,16 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 📎 這條在 PR #30 進來、PR #31 的審查（cirno🔴、rumia🔴）發現它擋不住 in-flight 請求，
 維護者 2026-09-13 決定整條拿掉。
 
+🚨 **fresh 資料目錄的起手式是 `vault.create`，🚫 不是 `account.add`**（維護者定調前的第一版讓
+`account.add` 自己偷建一把 plain 的，PR #31 審查 rumia🔴、salvia🔴 指出那是能力退化）：
+
+- 那把偷建的只能是 **plain**，所以想要 passphrase 的前端被迫「先落一份 plain `local.key` → 再
+  `vault.set_passphrase` 重包」。⭐ 中間那段時間磁碟上的主金鑰**沒有 passphrase 保護**，
+  而 `vault.set_passphrase` 又要求 vault 已經解鎖 —— fresh 狀態下那條路根本走不到。
+- 所以「要不要 passphrase」在**建的那一步**就要決定，跟 CLI 的 `login` 一樣一步到位。
+- 沒建就去叫別的 method：閘門回 **`1002`**（不是 `1001`）——⭐ 「還沒有 vault」與「有但鎖著」的
+  下一步不同（`vault.create` vs `vault.unlock`），所以🚫 不共用一個 code；`msg` 裡直接寫下一步。
+
 ⚠️ passphrase 用 base64 而不是字串：它是任意 bytes（可以是一個 mp3）。🚫 不提供 `passphrase_file`
 ——那是「daemon 替前端讀檔」，web 前端根本給不出檔案路徑，而 rpc-cli 自己讀了再送不多一行。
 
@@ -199,7 +210,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。沒 `local.key` 就先 `create_vault(None)`（plain）——要 passphrase 模式先 `vault.set_passphrase` |
+| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。⚠️ **要先 `vault.create`**：🚫 它不替前端建 vault |
 | `account.list` | — | `AccountStatus`：`{ accounts: [{ user_id?, server, localpart, logged_in, current }], undecryptable_hint? }` | `account_status` |
 | `account.switch` | `{ user, server? }` | `SwitchResult`：`{ current, switched_from?, logged_in }` | `switch_current` |
 | `account.whoami` | `{ user?, server? }` | `{ user_id, device_id, server }` | `whoami` |
@@ -431,7 +442,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
-| `vault.unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
+| `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |
 | `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |

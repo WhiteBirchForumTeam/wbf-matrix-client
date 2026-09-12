@@ -213,7 +213,7 @@ pub struct Context {
     /// 常駐狀態（architecture-v2 §7）。⚠️ 現在一個命令建一個、命令結束就丟；
     /// daemon 接手之後它會活過整個程序，而這裡的程式碼不必改——這正是先做 `wbf-core` 的理由。
     ///
-    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次、ticket 寫兩次。
+    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次。
     core: Core,
     pub account_override: Option<String>,
     pub server_override: Option<String>,
@@ -406,7 +406,7 @@ impl Context {
 
     /// 這個命令的常駐狀態，**保證已經解鎖**。
     ///
-    /// ⚠️ 「怎麼拿到 passphrase」是 rpc-cli 這一側的責任（旗標的檔、ticket、問終端），
+    /// ⚠️ 「怎麼拿到 passphrase」是 rpc-cli 這一側的責任（旗標的檔、問終端），
     /// 所以每次交出 `Core` 之前先在這裡把它解開——這樣底下的程式碼不必各自記得。
     /// daemon 那邊沒有這一步：解鎖是一次性的 RPC（`vault.unlock`），不是每個命令做一次。
     pub fn core(&self) -> Result<&Core, CoreError> {
@@ -1016,7 +1016,7 @@ mod conf_precedence_tests {
         let dir = scratch("conf");
         std::fs::write(
             dir.join(wbf_core::conf::CONF_FILE_NAME),
-            "[general]\nSERVER=http://from-conf:6167\nACCOUNT=@alice:localhost\nUNLOCK_TTL=60\nTRANSPORT=http\n[backup]\nSERVER_BACKUP=off\n",
+            "[general]\nSERVER=http://from-conf:6167\nACCOUNT=@alice:localhost\nTRANSPORT=http\n[backup]\nSERVER_BACKUP=off\n",
         )
         .unwrap();
         let context = Context::from(&cli_with(&dir)).unwrap();

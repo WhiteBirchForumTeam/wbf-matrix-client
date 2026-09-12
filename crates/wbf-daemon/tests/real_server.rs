@@ -5,8 +5,8 @@
 //!   WBF_E2E_USER          example: @alice:localhost
 //!   WBF_E2E_PASSWORD_FILE 整檔就是密碼（去掉結尾一個換行）
 //!
-//! 流程：account.add → account.whoami → server.ping（WS）→ room.list → sync.recent（WS）
-//! → backup.status → account.del。每一步看 code，🚫 不看 msg。
+//! 流程：vault.create → account.add → account.whoami → server.ping（WS）→ room.list
+//! → sync.recent（WS）→ backup.status → account.del。每一步看 code，🚫 不看 msg。
 
 use std::sync::Arc;
 
@@ -109,6 +109,12 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
     let mut client = Client::connect(port).await;
 
+    // fresh 資料目錄的起手式（rpc-spec §3.1）：🚫 account.add 不替前端建 vault。
+    // 這裡用 plain（e2e 不需要 passphrase）；要 passphrase 就在這一步帶 passphrase_base64。
+    let reply = client.call("vault.create", json!({})).await;
+    assert_eq!(reply["code"], 0, "vault.create: {reply}");
+    assert_eq!(reply["result"]["key_mode"], "plain");
+
     let reply = client
         .call(
             "account.add",
@@ -117,7 +123,6 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         .await;
     assert_eq!(reply["code"], 0, "account.add: {reply}");
     assert_eq!(reply["result"]["user_id"], user);
-    // 第一次登入建了 local.key（plain）。
     let info = client.call("daemon.info", Value::Null).await;
     assert_eq!(info["result"]["unlocked"], true);
     assert_eq!(info["result"]["key_mode"], "plain");

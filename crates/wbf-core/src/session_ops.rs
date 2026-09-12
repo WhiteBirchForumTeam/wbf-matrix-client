@@ -45,7 +45,6 @@ impl Core {
     /// store 會擋登入（"account in the store doesn't match"，2026-09-07 實跑踩到）。
     ///
     /// 🚫 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（§10.8）。
-    /// 🚫 也不碰 rpc-cli 的 `unlock.ticket`——core 不知道有那種東西，呼叫端自己清。
     ///
     /// Args:
     ///     user: 完整 mxid, example: "@bob:matrix.org"

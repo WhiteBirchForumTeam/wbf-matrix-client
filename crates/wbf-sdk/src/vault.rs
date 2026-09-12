@@ -254,7 +254,8 @@ impl Vault {
         })
     }
 
-    /// 用已經解開的主金鑰接回去（CLI 的 unlock ticket）。不驗證它是不是這個目錄的：ticket 的信任等於 `Plain` 模式。
+    /// 用已經解開的主金鑰接回去（`set_passphrase` 重包 `local.key` 時用）。
+    /// ⚠️ 不驗證那把金鑰是不是這個目錄的——呼叫端必須是從同一個 `Vault` 拿到它的。
     pub fn from_master(dir: &Path, master: Key32, mode: KeyMode) -> Vault {
         Vault {
             dir: dir.to_path_buf(),
@@ -283,7 +284,7 @@ impl Vault {
         self.mode
     }
 
-    /// 給 CLI 寫 unlock ticket 用。🚫 除此之外不要拿它做別的事。
+    /// 給 `set_passphrase` 重包用（同一個目錄、同一把主金鑰）。🚫 除此之外不要拿它做別的事。
     pub fn master_key(&self) -> &Key32 {
         &self.master
     }

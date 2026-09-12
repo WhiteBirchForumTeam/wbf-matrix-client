@@ -49,7 +49,7 @@ fn is_allowed_while_locked(method: &str) -> bool {
 pub struct Handle {
     data_dir: PathBuf,
     /// 解鎖一次就活著（`Core` 沒有 lock，daemon 也沒有 `vault.lock`——rpc-spec §3.1）。
-    /// 還是 `RwLock`：`account.add` 第一次登入會在裡面建 vault，而讀的人是每一個請求。
+    /// 還是 `RwLock`：`vault.create`／`unlock` 會換掉裡面的狀態，而讀的人是每一個請求。
     core: RwLock<Arc<Core>>,
     policy: EncryptionPolicy,
     settings: Settings,
@@ -111,6 +111,10 @@ impl Handle {
         self.shutdown_requested.load(Ordering::SeqCst) || *self.shutdown.borrow()
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub async fn core(&self) -> Arc<Core> {
         self.core.read().await.clone()
     }
@@ -143,11 +147,8 @@ impl Handle {
             );
         }
         let core = self.core().await;
-        if !core.is_unlocked()
-            && !self.is_first_login(&core, &request.method)
-            && !is_allowed_while_locked(&request.method)
-        {
-            return Response::from_core_error(id, &CoreError::locked(&self.data_dir));
+        if !core.is_unlocked() && !is_allowed_while_locked(&request.method) {
+            return Response::from_core_error(id, &self.why_it_is_shut(&core));
         }
         let params = params_or_empty_object(&request.params);
         let outcome = self.dispatch(&core, &request.method, params).await;
@@ -158,10 +159,21 @@ impl Handle {
         }
     }
 
-    /// 這個資料目錄還沒有 `local.key`：`account.add` 要能進來建它（rpc-spec §3.2），
-    /// 不然第一次登入永遠被 `1001` 擋在外面。**有** `local.key` 但鎖著的時候不算。
-    fn is_first_login(&self, core: &Core, method: &str) -> bool {
-        method == "account.add" && matches!(core.key_mode(), Ok(None))
+    /// 擋下來的時候是「還沒有 vault」還是「有但鎖著」？兩者的下一步完全不同，所以🚫 不共用一個
+    /// `1001`：沒有 `local.key` 回 `1002` 並指向 `vault.create`（fresh 資料目錄的起手式，
+    /// rpc-spec §3.1），有但鎖著才是 `1001`（去 `vault.unlock`）。
+    /// 📎 讀不到 `local.key` 的狀態（IO 壞了）也當成鎖著：不確定就拒絕。
+    fn why_it_is_shut(&self, core: &Core) -> CoreError {
+        match core.key_mode() {
+            Ok(None) => CoreError::new(
+                CoreErrorKind::NoKeyFile,
+                format!(
+                    "{} has no key file yet; call vault.create first (with passphrase_base64 if you want passphrase mode)",
+                    self.data_dir.display()
+                ),
+            ),
+            _ => CoreError::locked(&self.data_dir),
+        }
     }
 
     /// ⚠️ 每個分支都 `Box::pin`：matrix-sdk 的 future 很深，整個 match 當一個 future 讓編譯器推
@@ -171,6 +183,7 @@ impl Handle {
             "daemon.info" => Box::pin(self.daemon_info(core)),
             "daemon.set_encryption" => Box::pin(async { self.daemon_set_encryption(params) }),
             "daemon.shutdown" => Box::pin(async { self.daemon_shutdown() }),
+            "vault.create" => Box::pin(async { local::vault_create(core, params) }),
             "vault.unlock" => Box::pin(async { local::vault_unlock(core, params) }),
             "vault.set_passphrase" => Box::pin(async { local::vault_set_passphrase(core, params) }),
             "vault.remove_passphrase" => Box::pin(async { local::vault_remove_passphrase(core) }),
@@ -369,14 +382,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_data_dir_reports_no_key_file_on_unlock_and_locked_elsewhere() {
+    async fn an_empty_data_dir_reports_no_key_file_everywhere_and_points_at_vault_create() {
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
         let response = handle.call(request("vault.unlock", json!({}))).await;
         assert_eq!(response.code, 1002, "{}", response.msg);
-        // 沒解鎖：任何非 daemon.*／vault.* 的 method 都是 1001。
+        // 沒有 local.key：擋下來的理由是 1002（不是「鎖著」——還沒有東西可以鎖），
+        // 而且訊息要指向下一步。
         let response = handle.call(request("account.list", json!({}))).await;
-        assert_eq!(response.code, 1001);
+        assert_eq!(response.code, 1002, "{}", response.msg);
+        assert!(response.msg.contains("vault.create"), "{}", response.msg);
         // daemon.info 未解鎖也接受。
         let response = handle.call(request("daemon.info", Value::Null)).await;
         assert_eq!(response.code, 0, "{}", response.msg);
@@ -387,21 +402,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_login_gets_past_the_lock_but_a_vault_that_exists_and_is_shut_does_not() {
+    async fn a_fresh_data_dir_needs_vault_create_first_and_it_can_be_passphrase_mode() {
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
-        // 沒 local.key：account.add 進得來（然後因為連不上 server 而失敗，不是 1001）。
+        // 🚫 account.add 不替前端建 vault：fresh 資料目錄先 1002，訊息指向 vault.create。
+        let add = request(
+            "account.add",
+            json!({ "server": "http://127.0.0.1:9", "user": "@a:localhost", "password": "x" }),
+        );
+        let response = handle.call(add).await;
+        assert_eq!(response.code, 1002, "{}", response.msg);
+        assert!(response.msg.contains("vault.create"), "{}", response.msg);
+
+        // ⭐ 想要 passphrase 模式的前端**一步**就建得成，🚫 不必先落一份 plain 再重包。
+        let response = handle
+            .call(request(
+                "vault.create",
+                json!({ "passphrase_base64": "aHVudGVyMg==" }),
+            ))
+            .await;
+        assert_eq!(response.code, 0, "{}", response.msg);
+        assert_eq!(response.result["key_mode"], "passphrase");
+        // 建完就是解鎖狀態：account.add 進得去（然後因為連不上 server 而失敗，不是 1001／1002）。
         let response = handle
             .call(request(
                 "account.add",
                 json!({ "server": "http://127.0.0.1:9", "user": "@a:localhost", "password": "x" }),
             ))
             .await;
-        assert_ne!(response.code, 1001, "{}", response.msg);
-        assert!(response.code >= 1000, "{}", response.msg);
-        // 現在 local.key 有了（account.add 建的）。同一個資料目錄換一個 Handle ＝ daemon 重開，
-        // 那是**唯一**回到未解鎖的路（沒有 vault.lock）——這時 account.add 就是 1001。
-        assert!(handle.core().await.key_mode().unwrap().is_some());
+        assert!(response.code >= 1300, "{}", response.msg);
+
+        // 🚫 不覆蓋既有的 local.key（覆蓋＝把所有帳號鎖在門外）。
+        let response = handle.call(request("vault.create", json!({}))).await;
+        assert_eq!(response.code, 1100, "{}", response.msg);
+
+        // daemon 重開 ＝ 回到未解鎖：這時 account.add 是 1001，🚫 不是「再建一把」。
         let restarted = Handle::new(
             dir.path(),
             EncryptionPolicy::enforced(),
@@ -413,7 +448,7 @@ mod tests {
                 json!({ "server": "http://127.0.0.1:9", "user": "@a:localhost", "password": "x" }),
             ))
             .await;
-        assert_eq!(response.code, 1001);
+        assert_eq!(response.code, 1001, "{}", response.msg);
     }
 
     #[tokio::test]
