@@ -32,6 +32,40 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 `apps/wbf-cli` 只剩「解析參數 → 叫一個 core 方法 → 印 JSON」。⚠️ **目錄名還叫 `wbf-cli`**：
 改名留到它真的變成 RPC 前端的那支 PR，🚫 現在改只會製造一次沒有內容的大 diff。
 
+## 0.2 daemon 的命令列就是 RPC 的內部入口（維護者 2026-09-12 定）
+
+**daemon 就是 client 本體**，而且**真的能用命令列操作**。它有兩種起法：
+
+| 起法 | 做什麼 |
+|---|---|
+| `daemon <命令> <參數>` | 執行那一個命令就結束（除錯、腳本、驗收） |
+| `daemon -s` | 常駐：開本地 RPC 的 WS（§4）與資料平面，等前端來連。**大多數時候是這個** |
+
+⭐ **兩種起法走同一條路**：命令列的參數**先轉成 RPC 格式的訊息**，再丟給內部的 handle 執行。
+🚫 不要有「命令列直接叫 core」與「RPC 叫 core」兩套分派——那是同一個問題的兩份實作，
+遲早漂移（全域 A4）。判準：`daemon rooms --account a` 與 WS 上收到
+`{"method":"rooms","params":{"account":"a"}}` 進到 handle 的時候**長得一模一樣**。
+
+```
+命令列 arg ──解析──> RPC 訊息 ──┐
+                                ├──> daemon handle ──> core ──> wbf-sdk ──> server
+本地 WS 收到的 RPC 訊息 ──解密──┘
+```
+
+**rpc-cli 為什麼送 RPC 訊息、🚫 不送命令列參數**：
+
+- RPC 的 WS 才是**通用標準**——不是每個前端都跟著 daemon 的 binary 走（web、Android、Python 都不會），
+  把「參數格式」當成介面，每個前端都要再包一次 daemon 的命令列，不優雅也不好管。
+- 統一走 RPC，之後**Rust 端要用 RPC 的時候接口直接重用**（例如 Desktop 若用 Rust 原生，或第二個 Rust 工具）。
+- 所以 rpc-cli 的定位收窄成：**真的從另一個程序丟 RPC 進來，測整條路有沒有通**。
+  它的命令列只是 RPC 訊息的薄封裝，🚫 不長自己的邏輯。
+
+📎 這也回答了「要不要單獨一支 rpc-cli」：日常操作用 daemon 自己的命令列就夠；rpc-cli 留著是
+因為「同程序內轉一圈」證明不了 WS、加密、token 那一段真的通。它可以很小。
+
+⚠️ 對 §0.1 表的修正：daemon 那一列「只有講除錯那一面才寫 `daemon-cli`」仍然成立，
+但**日常操作也是它**，不是 rpc-cli。
+
 ## 1. 為什麼要這一層（三個現在就在痛的點）
 
 不是為了架構美感。現在的 CLI 是「一個命令一個程序」，這件事撞到三面牆：
@@ -366,11 +400,46 @@ http://127.0.0.1:<data port>/media/<resource token>
 現在是「解密→socket→播放器」），還不用清暫存檔。控制平面那邊一趟往返 < 0.1 ms，
 比它後面接的 SQLite 查詢與 AEAD 解密都便宜——**不是瓶頸**。
 
+### 4.9 閘門鏈，與一則附件訊息的完整流程（維護者 2026-09-12 定）
+
+**理想狀態：資料庫只有 daemon 碰。** daemon 是後端，UI 只是 RPC call；
+誰解密由 daemon 決定（matrix-sdk 的 Megolm、我們的 chunk 解密），解完存進 `cache.db`，
+**前端看到的一律是明文**。反過來，前端送出的也是明文，要不要加密是 daemon 依房間狀態決定。
+
+整條閘門鏈，從外到內：
+
+```
+homeserver  <=>  daemon 的 WS 協議層（wire、四條連線 §6.1）
+            <=>  daemon handle（命令本體：core）
+            <=>  RPC 轉換（JSON ↔ handle 的型別；命令列 arg 也在這裡轉，§0.2）
+            <=>  本地 WS（加密的 JSON，開給前端）
+```
+
+每一層只跟隔壁講話：前端不知道 wire，wire 不知道 RPC。
+
+**上傳一個大檔當附件**（走我們自己的分片協議）會拆成兩三個來回，這是複雜化的地方，寫清楚：
+
+| # | 誰 | 做什麼 |
+|---|---|---|
+| 1 | 前端 → daemon | RPC `media.create`（§4.8）：檔名、大小、目標房間 |
+| 2 | daemon → server | 去 server **建檔**（`Upload/Create`），拿回檔案的 URL／id |
+| 3 | daemon → 前端 | RPC 回 result：server 的 URL ＋ 資料平面的 PUT URL |
+| 4 | 前端 → daemon | 以那個 URL 為基礎**發一則附件訊息**（RPC `room.send`，內容是明文） |
+| 5 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（約定 §5.2）在這一步帶 |
+| 6 | 前端 → daemon | **同時**開始 PUT bytes 到資料平面的 URL（一個 HTTP 連線，不斷送） |
+| 7 | daemon → server | 邊收邊做 chunk 加密、邊走 `Upload/*` 上傳到 homeserver |
+| 8 | daemon → 前端 | 不斷回 `progress`（§4.8） |
+
+⚠️ 第 4 與第 6 步**並行**：訊息不必等檔案傳完才發（訊息裡只有 URL 與描述），
+接收端拿到訊息時檔案可能還在傳——這正是分片協議與 `seek` 存在的原因（約定 §7）。
+⚠️ 第 5 步失敗與第 7 步失敗是**兩件事**，各自回錯誤、各自可重試，🚫 不要綁成一個交易。
+
 ## 5. 四個前端怎麼接
 
 | 前端 | 怎麼啟動 daemon | 怎麼講話 |
 |---|---|---|
-| **rpc-cli** | 連不到就自己 spawn 一個（使用者無感）。開發時不必先手動起 daemon | 同一份 RPC |
+| **daemon 自己的命令列** | 就是它自己：`daemon <命令>` 單發、`daemon -s` 常駐（§0.2） | arg → RPC 訊息 → handle，不經 socket |
+| **rpc-cli** | 連不到就自己 spawn 一個（使用者無感）。定位是**從外部程序丟 RPC 測整條路**（§0.2） | 同一份 RPC |
 
 📎 ⚠️ **RPC vs uniffi 這個決策還沒定**：如果不要程序隔離，Desktop 與 Android 也可以用 uniffi 直接綁 library（matrix-rust-sdk 自己就是這樣給 Element X 用的），完全不需要 RPC。兩條路的取捨是**安全隔離 vs 簡單**，不是工作量——見 §8 第 7 點。
 | **Desktop** | 可能先用 **web** 當速成框架試 RPC（維護者 2026-09-09 改變主意），之後再看要不要原生 Rust。內嵌或 spawn 都行 | 同一份 RPC |
@@ -441,8 +510,9 @@ WS 不會掉單一 frame，跳號只代表 server 故意丟了一包（佇列滿
 crates/wbf-wire     不動：pack 的 codec
 crates/wbf-sdk      不動：協議、chunk 加解密、cache.db、媒體池、vault、matrix backend
 crates/wbf-core     ✅ 做了（#24）：常駐狀態（多帳號 session、解鎖一次）、事件分發、命令本體。**沒有 RPC**
-crates/wbf-daemon   還沒有：core ＋ RPC 服務 ＋ 資料平面。library ＋ binary
-apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出。⚠️ 還沒變成 RPC 前端（那時才改名 rpc-cli）
+crates/wbf-daemon   還沒有：core ＋ RPC 服務 ＋ 資料平面。library ＋ binary。**自己的命令列**也在這裡（§0.2：arg → RPC 訊息 → handle）
+apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出。⚠️ 下一步它的參數解析搬進 daemon 的命令列，
+                    剩下的殼變成 rpc-cli（只封裝 RPC 訊息、丟到本地 WS；§0.2）——那時才改名
 ```
 
 **`core` 與 `daemon` 刻意分開**，因為它們的命運不同：
