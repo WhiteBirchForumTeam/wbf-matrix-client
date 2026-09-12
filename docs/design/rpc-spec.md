@@ -21,17 +21,19 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 ## 1. 連線的生命週期
 
 1. 前端連上 `ws://127.0.0.1:<rpc port>`（port 在 `<data dir>/daemon.json`，§4.3）。
-2. **第一則必須是 `hello`**。它之前送任何別的 method → daemon 回 `103` 然後**關連線**。
-3. 解不開的 frame（token 不對）、超過 1 MiB 的 frame → **不回、直接關**（§4.4）。
-4. 之後任意順序、任意並行。前端關掉連線＝它所有訂閱作廢、所有未完成的長工作**繼續跑**
+2. **第一則必須是 `hello`**。它之前送任何別的 method → `103`，關連線。
+3. `hello` 要過兩關（§1.1）：**client 名字**要以 `wbf-matrix` 開頭；**protocol** 要在 daemon 支援的那組裡。任一不過 → 關連線。
+4. 解不開的 frame（token 不對）、不是 binary frame、超過 1 MiB → 關連線。
+5. **關連線之前一定先送一則明文**（§1.2）——不然 token 錯的人只看到連線斷掉，什麼提示都沒有。
+6. 之後任意順序、任意並行。前端關掉連線＝它所有訂閱作廢、所有未完成的長工作**繼續跑**
    （上傳到一半不會因為 Desktop 關掉而中斷；要停要明講 `cancel`）。
 
 ### 1.1 `hello`
 
 ```jsonc
-{ "method": "hello", "params": { "protocol": 1, "client": "rpc-cli 0.1.0" }, "id": 0 }
+{ "method": "hello", "params": { "protocols": [2, 1], "client": "wbf-matrix-rpc-cli 0.1.0" }, "id": 0 }
 { "code": 0, "msg": "ok", "id": 0, "result": {
-    "protocol": 1,
+    "protocol": 2,                    // 談定的那一個
     "daemon": "wbf-matrix-client-daemon 0.1.0",
     "data_dir": "C:/Users/me/AppData/Roaming/wbf-matrix-client",
     "unlocked": false,
@@ -39,9 +41,53 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 } }
 ```
 
-- `protocol` 不相等 → `104`，關連線。第一版是 `1`。
-- `client` 只進 log，給人看的。
-- `hello` 與 `vault.*`、`daemon.*` 是**未解鎖時也接受**的全部（§4.5）；其他一律 `1001`。
+**`client`：正式名稱，`wbf-matrix` 開頭**（維護者 2026-09-12 定）。
+
+- 格式 `<正式名稱> <版本>`：`wbf-matrix-rpc-cli 0.1.0`、`wbf-matrix-desktop 0.3.0`、`wbf-matrix-android 0.1.0`。
+  🚫 不是簡稱（`rpc-cli`）——簡稱是文件裡的寫法（architecture-v2 §0.1），不是線上的識別。
+- daemon 做**基礎檢查**：不以 `wbf-matrix` 開頭 → `BAD_CLIENT`（§1.2），關連線，**跟 protocol 不對一樣拒絕**。
+  這不是安全機制（token 才是），是擋掉「有人拿別的東西亂連」與「寫錯名字」的第一道門。
+- 之後只進 log。
+
+**`protocols`：一個協商表，不是一個數字**（維護者 2026-09-12 定）。
+
+- 前端送**它會講的全部版本**，新的在前。daemon 也有一組**它支援的**，取交集裡最大的那個回在 `result.protocol`。
+  沒有交集 → `PROTOCOL_MISMATCH`（§1.2），關連線。
+- ⭐ **常態是 daemon 升級、前端沒升**：daemon 版本往上走的時候**維持能講舊協議**，舊前端照用。
+  只有 **breaking**（舊協議真的沒辦法再服務）才把那個版本從表裡拿掉——那時候舊前端一連上來就被**明確拒絕**，
+  🚫 不是連上了之後某個 method 突然壞掉。
+- 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2, 1]`）→ 談成 `2`，前端自己降級。
+- 第一版：雙方都只有 `[1]`。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
+
+`hello` 與 `vault.*`、`daemon.*` 是**未解鎖時也接受**的全部（§4.5）；其他一律 `1001`。
+
+### 1.2 關連線前的明文告知
+
+🚨 daemon **關掉一條連線之前一定先送一則 WS text frame，明文、不加密**，內容：
+
+```json
+{ "close": "BAD_TOKEN", "msg": "could not decrypt the first frame; the daemon token does not match" }
+```
+
+為什麼明文：**會走到這裡的情況，多半就是對方沒有正確的金鑰**（token 錯、根本沒 token、或協議版本對不上
+加密方式）。用加密的訊息告知等於沒告知——對方解不開，看到的只有「連線斷了」。
+
+| `close` | 什麼時候 |
+|---|---|
+| `BAD_TOKEN` | frame 解不開（AEAD 標籤驗不過） |
+| `BAD_FRAME` | 不是 binary frame、超過 1 MiB、解開之後不是 JSON |
+| `HELLO_REQUIRED` | 第一則不是 `hello`（同 `103`） |
+| `BAD_CLIENT` | `client` 不以 `wbf-matrix` 開頭 |
+| `PROTOCOL_MISMATCH` | `protocols` 跟 daemon 的沒有交集（同 `104`） |
+| `SHUTTING_DOWN` | daemon 要關了 |
+
+- `close` 是**大寫底線**的字串，🚫 不是 `code` 那套數字：兩者分屬不同層（一個是「這條連線為什麼死」，
+  一個是「這個請求為什麼失敗」），長得不一樣才不會拿錯。`msg` 英文、給人看。
+- 這則之後緊接 WS close frame（status 1008 policy violation；`SHUTTING_DOWN` 用 1001 going away）。
+- ⚠️ 明文 frame **只出現在關連線前**，而且**內容裡永遠沒有秘密**（不回 token、不回解出來的東西）。
+  正常訊息一律加密（§4.4）。前端收到 text frame 就當成「連線要斷了」處理，不要試著解密它。
+- `HELLO_REQUIRED` 與 `PROTOCOL_MISMATCH` 同時也回加密的 `103`／`104`（對方**有**金鑰時看得到）：
+  先加密的回應、再明文的 close、再 close frame。
 
 ## 2. 共同的 params 欄位
 
@@ -194,8 +240,9 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 | 100 | `bad_request` | 解出來不是 JSON 物件、沒有 `method`、`id` 不是整數 |
 | 101 | `unknown_method` | 沒這個 method |
 | 102 | `invalid_params` | 缺必填、型別不對、base64 解不開、路徑不是絕對路徑 |
-| 103 | `hello_required` | 第一則不是 `hello`。**回完關連線** |
-| 104 | `protocol_mismatch` | `hello.protocol` 不對。**回完關連線** |
+| 103 | `hello_required` | 第一則不是 `hello`。**回完關連線**（§1.2） |
+| 104 | `protocol_mismatch` | `hello.protocols` 跟 daemon 沒有交集。**回完關連線**（§1.2） |
+| 108 | `bad_client` | `hello.client` 不以 `wbf-matrix` 開頭。**回完關連線**（§1.2） |
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
 | 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
