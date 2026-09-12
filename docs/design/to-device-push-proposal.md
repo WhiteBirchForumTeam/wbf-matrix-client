@@ -6,6 +6,15 @@
 > `wbf-event-push.md`（PR #36 已實作的訂閱與推送）、`room-seq-and-recent.md`（`Recent` 的拉窗）。
 >
 > ⚠️ 這份是**提案**，不是定案。§7 列的四件事要 wbfuwunel 那邊拍板。
+>
+> 🔁 **2026-09-12 更新：server 端已經實作了（wbfuwunel PR #43），這份不再是權威。**
+> 權威是 wbfuwunel 的 `docs/design/wbf-to-device.md`。落地版**改掉了本文五處**——
+> 其中兩處是形狀的改變（`Ack{until}` 前綴刪除 → `ItemsDestroy` 明列 count；訂閱衝突
+> 從「拒絕後來的」→「**後來的接手**」）。**差異與 client 端因此要做什麼列在 §9**，
+> §5 與 §7 已照落地版改過（PR #23 審查 rumia🟡1）。
+>
+> 📎 這份留著不是因為還有效力，而是因為**理由留在這裡**：為什麼不併進 `Recent`（§1）、
+> 為什麼要 ack 才刪（§4）。落地版只寫結論。
 
 ## 0. 一句話
 
@@ -56,6 +65,8 @@ to-device 的游標前進表示「可以刪了」，**錯了就沒了**。要讓
 的 **meta 帶**（§3）。
 
 ## 3. pack：`0x16 Device` 的六個 subtype
+
+🔁 落地版是**七個**：多一個 `0x07 ItemsDestroyed`（§9）。
 
 `wbf-wire-format.md` §3.3 早就把 `0x16` 留給「devices、to-device、dehydrated」，
 底下一個 subtype 都還沒分配。編號照 `0x14 Event` 那套排，好對照：
@@ -124,10 +135,22 @@ server 用它判斷是不是重複訂閱，並把那條 `connection_id` **綁定
 { "device_id": "ABCDEFG", "cd_seq": 12345 }
 ```
 
-- server 端多一張 `device → connection_id` 的表；已經有人在訂就回 `Error(Conflict)`，
-  訊息說已經有另一條連線在收。
-- 連線斷掉（`ConnectionGuard` drop）時解除綁定，下一條連得上。
-- 🚫 **不要「後來的踢掉先來的」**：那會讓一個手滑開兩個 rpc-cli 的人靜默地換掉正在同步的那條。
+- server 端把那條 `connection_id` 綁到該裝置（實作上是串流註冊表裡這個裝置的 topic，
+  🚫 不另外開一張表）。
+- 連線斷掉（`ConnectionGuard` drop）、`Unsubscribe`、或在同一條連線上換身分，都解除綁定。
+- 🔁 **後來的接手先來的**，被接手的那條收到 `Control/Error` `Superseded`(1505)、`IS_LAST`，
+  **用它自己當初 `Subscribe` 的 id**（所以 client 不必為這件事準備第二套解析），
+  ⚠️ 而且**連線本身不關**——它的房間訂閱照常，只有 to-device 這一路被接手。
+
+  ⚠️ **這裡本來寫的是相反的規則**（第二條回 `Conflict`、先來的不動），理由是「不要讓手滑
+  開兩個 rpc-cli 的人靜默換掉正在同步的那條」。維護者 2026-09-12 推翻了它，理由是**卡死的
+  代價不對稱**：搶佔最壞是重推一次**還在佇列裡**的東西（那些項目沒被銷毀），拒絕最壞是
+  **先來的那條其實已經死了**，於是到 idle timeout（300 秒）為止這個裝置根本訂不進來——
+  卡死不動的話⛔ 永久廢掉。手機換網路就會踩到。⭐ 而「靜默」那個顧慮由 `Superseded` 通知解掉：
+  被接手的一方**知道**自己死了，不是一直以為還在收金鑰。
+
+  📎 **client 端因此要處理 `Superseded`**：收到就是「另一條連線接手了」，🚫 不要當成
+  斷線去重連——重連只會把對方也踢掉，兩條互踢。
 
 ⚠️ **`device_id` 必須跟 session 的對得上，對不上就拒絕。** 連線是 `Session/Login` 換來的，
 session 裡那個才是權威；client 帶進來的只是**明示意圖**，不是身分來源。
@@ -138,7 +161,9 @@ session 裡那個才是權威；client 帶進來的只是**明示意圖**，不�
 server 端那張表要用哪個鍵、client 端在訂什麼，兩邊都不必從 session 推。
 出錯時錯誤訊息也講得出「你用 `ABCDEFG` 訂，但這條連線的 session 是 `HIJKLMN`」。
 
-## 6. 保留期：`Ack` 是唯一的刪除入口
+## 6. 保留期：刪除只有一個入口
+
+🔁 落地版把那個入口從 `Ack` 換成 `ItemsDestroy`，保留期定為**無窮 TTL**（§7 第 3 點、§9）。
 
 `remove_to_device_events(user, device, until)` 已經在了，`Ack` 就是叫它。
 
@@ -148,16 +173,20 @@ server 端那張表要用哪個鍵、client 端在訂什麼，兩邊都不必從
 
 這是 §7 要 wbfuwunel 定的其中一條。
 
-## 7. ⚠️ 要 wbfuwunel 拍板的四件事
+## 7. ✅ 四件事都有答案了（wbfuwunel 2026-09-11／09-12 定）
 
-1. **ack 的語意**：`Ack{until}` 表示「收到」還是「處理完」？
-   client 這邊想要的是**後者**（匯進 crypto store 成功才 ack），
-   因為前者一失敗就永遠救不回來。代價是 server 要留久一點。
-2. **同一裝置多條連線**（§5）：`Subscribe` 帶 `device_id`、server 綁 `connection_id`、
-   重複訂閱回 `Error(Conflict)`——這個做法可以嗎？綁定的表放哪（`channels` service 旁邊？）？
-3. **保留上限**（§6）：沒 ack 的 to-device 留多久？有沒有筆數上限？滿了丟最舊的還是拒收？
-4. **`limit` 的上界**：跟 `Recent` 一樣由 `Hello` 的 features 宣告嗎？
-   `wbf_push_max_events_per_pack`（現在是 10）要不要有 to-device 自己的一個？
+本節原本是「要 wbfuwunel 拍板的四件事」。四件都拍了，答案抄在這裡，**權威在那邊的
+`wbf-to-device.md`**：
+
+1. **ack 的語意** → 🔁 **整個形狀換掉了**：不是 `Ack{until}`。刪除是**命令**（`ItemsDestroy`
+   明列每一則的 count），`Ack` 只表示「命令收到」，刪掉了哪些由 `ItemsDestroyed` 帶回。
+   ⭐ 我們要的東西拿到了（匯進 crypto store 成功才刪），而且比提案的前綴刪除更嚴謹——
+   前綴會把「我處理到哪」跟「可以刪哪些」綁成同一個數字，那兩件事不一樣。
+2. **同一裝置多條連線** → **後來的接手**，被接手的收 `Superseded`(1505)。詳見 §5。
+3. **保留上限** → **無窮 TTL**，`ItemsDestroy` 是唯一的刪除入口。理由是「靜默丟掉金鑰＝那些
+   訊息永遠解不開」的代價遠大於佔磁碟。配套：刪裝置清佇列、admin 看得到佇列大小。
+4. **`limit` 的上界** → to-device 有自己的旋鈕：`wbf_device_fetch_default_limit` 與
+   `wbf_device_fetch_max_limit` 都是 **1000**（`Recent` 那組不動）。包數不是旋鈕，是算出來的。
 
 ## 8. client 端會怎麼用它（給 server 端理解脈絡）
 
@@ -172,3 +201,17 @@ daemon 啟動、Login → Subscribe{device_id, cd_seq: 上次存的}   ← 先�
 📎 `OlmMachine::receive_sync_changes` 是 matrix-sdk 的公開 API，吃的就是一串 to-device
 事件；client 這邊不需要 server 對內容做任何理解——**server 對 to-device 的內容本來就是瞎的**
 （`add_to_device_event` 只存 `type`／`sender`／`content`），這個提案不改變那件事。
+
+## 9. 落地版跟這份的五處不同，以及 client 端要做什麼
+
+⚠️ **照落地版寫程式，不要照這份。** 五處差異（來源：`wbf-to-device.md` §9）：
+
+| 這份提案 | 落地的 | client 端要做的 |
+|---|---|---|
+| `0x03 Ack { until }`，前綴刪除 | **`0x03 ItemsDestroy { tc }` ＋ data**（`tc` × 8 byte，每個是一則的 count） | 送的是**清單**不是水位；要收 `0x07 ItemsDestroyed` 才知道真的刪了 |
+| `Ack` 之後就算刪了 | **`Ack` 只表示收到命令** | 🚫 不要在收到 `Ack` 就把本地的「待刪」清掉 |
+| `oldest` / `newest` | **`ot` / `nt`** | 欄位名 |
+| 重複訂閱回 `Conflict` | **後來的接手**，前者收 `Superseded`(1505) | 收到 `Superseded` ＝「另一條連線接手了」，🚫 不要當斷線去重連（會互踢） |
+| `Fetch { to }` | **拿掉** | 少一個欄位 |
+
+📎 這五條合起來就是 client 端接 `0x16 Device` 的工作清單（handover §7 第 3 項的那條欠債）。

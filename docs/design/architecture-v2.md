@@ -28,8 +28,9 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 拿去當 binary 的名字之後，「RPC 掛了」就分不出是協議還是那支程式——正是這一節要根除的那種語病。
 📎 `server` 這個字在這個 repo 已經指過 homeserver 與 wbfuwunel，🚫 不要再拿它指這裡的任何東西。
 
-⚠️ 現在的 `apps/wbf-cli` **不是**上面任何一個：它是還沒拆開的兩者。拆的時候它變成 rpc-cli，
-而它今天做的事搬進 `wbf-core`——目錄名要在那個 PR 一起改掉，不然過渡期會有三個 cli。
+✅ **2026-09-12（PR #24）：搬完了。** 命令的「做什麼」全部在 `crates/wbf-core`，
+`apps/wbf-cli` 只剩「解析參數 → 叫一個 core 方法 → 印 JSON」。⚠️ **目錄名還叫 `wbf-cli`**：
+改名留到它真的變成 RPC 前端的那支 PR，🚫 現在改只會製造一次沒有內容的大 diff。
 
 ## 1. 為什麼要這一層（三個現在就在痛的點）
 
@@ -391,7 +392,7 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 | 流 | 現況 |
 |---|---|
 | 房間事件 | ✅ `Event/Recent` 已經是拉窗＋水位（`cg_seq`） |
-| **to-device（金鑰）** | ❌ 還沒有。提案寫好了：[`to-device-push-proposal.md`](to-device-push-proposal.md)（`0x16 Device`，**推送為主、`Fetch` 補洞、`Ack` 才刪**），四個問題等 wbfuwunel 拍板 |
+| **to-device（金鑰）** | 🔁 **server 端 2026-09-12 實作了**（wbfuwunel PR #43，權威在那邊的 `wbf-to-device.md`）：`0x16 Device`，推送為主、`Fetch` 補洞、`Ack` 才刪。⚠️ **client 端還沒接**。我們的提案是 [`to-device-push-proposal.md`](to-device-push-proposal.md)，其中「重複訂閱」那條被維護者反轉成「後來的接手」（見該檔 §5） |
 
 📎 好消息：wbfuwunel 那邊 `get_to_device_events(user, device, since, to)` **本來就吃游標**，
 `remove_to_device_events(user, device, until)` 就是 ack 之後的清理。所以 server 端要加的是**一個新的 opcode**，
@@ -402,9 +403,9 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 ```
 crates/wbf-wire     不動：pack 的 codec
 crates/wbf-sdk      不動：協議、chunk 加解密、cache.db、媒體池、vault、matrix backend
-crates/wbf-core     新：常駐狀態（多帳號 session、解鎖一次）、事件分發。**沒有 RPC**
-crates/wbf-daemon   新：core ＋ RPC 服務 ＋ 資料平面。library ＋ binary
-apps/wbf-cli        瘦身：變成 RPC 的一個前端；命令的「做什麼」搬進 core
+crates/wbf-core     ✅ 做了（#24）：常駐狀態（多帳號 session、解鎖一次）、事件分發、命令本體。**沒有 RPC**
+crates/wbf-daemon   還沒有：core ＋ RPC 服務 ＋ 資料平面。library ＋ binary
+apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出。⚠️ 還沒變成 RPC 前端（那時才改名 rpc-cli）
 ```
 
 **`core` 與 `daemon` 刻意分開**，因為它們的命運不同：
@@ -415,6 +416,7 @@ apps/wbf-cli        瘦身：變成 RPC 的一個前端；命令的「做什麼�
 | `wbf-daemon` | 把 core 開一扇門出去 | 用 | 不需要 |
 
 所以那個還沒定的決策**不會擋住開工**：先做 `wbf-core`，它兩條路都要。
+✅ **2026-09-12 做完了**（#24），而 RPC vs uniffi 仍然沒定——這正是「先做 core」想買到的東西。
 
 - **`wbf-sdk` 保持是純 library**（plan-v1 §7.2 的方向不變）：core 是它的使用者，不是它的一部分。
 - **`wbf-daemon` 同時是 library 與 binary**：Desktop 內嵌用 library，其他人 spawn binary。
@@ -422,6 +424,9 @@ apps/wbf-cli        瘦身：變成 RPC 的一個前端；命令的「做什麼�
   事件用 channel 而不是回呼引用、自己持有 tokio runtime 不要求宿主提供。
   🚫 公開介面上不要出現複雜生命週期、trait object、`impl Trait`。
   這樣它之後包 RPC 或包 uniffi 都不用改——**這是現在唯一要守的紀律**。
+  ✅ #24 三位審查者逐條核實過公開面：60+ 個 `pub fn` 全數回傳可序列化 DTO，唯一的 `&`
+  回傳是 `data_dir() -> &Path`，錯誤是有 `Serialize` 的 `CoreError { kind, message }`。
+  ⚠️ **紀律不會因為做完就失效**：之後往 core 加方法一樣要過這一條。
 
 ### 7.1 現在那支 CLI 的假設要重新檢視
 
