@@ -55,7 +55,8 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
   job.rs                 「現在跑的是哪個請求」：tokio task-local，讓事件說得出屬於誰。⚠️ 不跟著 `tokio::spawn`（有測試釘住）
   server_cache.rs        `cache.db` 的**單一寫入者**：一個 server dir 一條 OS 執行緒＋無上限 queue；`post`（commit 之後才發事件）／
-                         `run`（等它落地）＋一條重用的讀連線。⚠️ 媒體那幾條是刻意的例外（daemon-runtime §2.3.1）
+                         `run`（等它落地）＋一條重用的讀連線。⚠️ 媒體那幾條是刻意的例外（daemon-runtime §2.3.1）。
+                         🚨 刪 cache.db 之前要 `Core::close_server_cache`（等 queue 寫完、執行緒結束），不然 Windows 刪不掉、Linux 寫進已刪的檔
   backend_choice.rs      `transport` → backend：`ws`＝wbf-sdk、`http`＝matrix-sdk。探測 `get_backend_kind`（key 是**帳號**、
                          只記 server 回答過的）、規則 `get_backend_for`、閘門 `client_of`、`MethodHome` 暫時清單
   handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate。
@@ -164,7 +165,6 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 | ~~房間金鑰沒有任何備份~~ | ✅ PR #19 做了：server 端標準 backup、本地全量快照、`logout` 的兩關閘門、`r/` 獨立保管 | — |
 | `Session/*`（WS 上的 Login／Refresh／Logout）只加了 wire 常數 | client 登入仍走 HTTP `/login` 加 matrix-sdk | 沒影響；要把登入搬到 WS 時再做 |
 | 斷線後 `recent` 不自動續 | 命令 exit、下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪；UI 那版做自動從最後的 `ls` 續 |
-| **房間歷史只有 matrix-sdk 那條路** | wbf 的房間歷史＝ wbfuwunel **PR #51**（`Event/Recent` 點名房間＋`before`），還 open | `room.*` 標 `MethodHome::StillOnMatrixSdk`；`sync=both` 不收 `before`（權宜守門 `before_for_upstream_page`）。⚠️ #51 翻頁用 **`g_seq`**，接上時 `before` 的座標要從 `r_seq` 換成 `g_seq` |
 | **沒有假的 wbf server 可以在 core 層測「成功」路徑** | 還沒做 | 探測成功、`watch`、`log_in` 的探測接點都只有 `--ignored` 的真 server 測試走得到。#32／#33 的審查每一輪都碰到這個缺口 |
 
 ## 7. 下一步（維護者 2026-09-06 同意的順序，2026-09-10 更新）
@@ -175,11 +175,11 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 📍 **2026-09-14 的建議順序**（下面 0–6 是更早的清單，保留當歷史）：
 
-1. **假的 wbf server 測試工具** —— 不用等任何人，而且下一項一定要有它（見 §6 最後一列）。
-2. **房間歷史改走 wbf**（wbfuwunel #51 合併後才合）：sdk `RecentRequest` 加 `rooms` → core 加 wbf 那條路 →
-   `room.history` 從 `StillOnMatrixSdk` 改 `BothSides` → 拿掉 `before_for_upstream_page` → 翻頁座標換成 `g_seq`。
-   可以像當初 #47 那樣先對 #51 的分支編 server 開工，合併後重抄向量檔。
-3. **階段 4 訂閱／推播** —— 先跟維護者討論。
+1. ✅ **房間歷史走 wbf**（2026-09-14）：`Event/Recent{rooms}`、翻頁一律 `event_id`、matrix 走 `/context`、
+   一般 Matrix 房本地不答。順帶修掉「最後一個帳號登出時 cache.db 還被註冊表握著」（真 server 測試抓到的）。
+2. **假的 wbf server 測試工具** —— 這支靠 `--ignored` 的真 server 測試才驗到兩條上游路線，缺口還在。
+3. **「沒洞就不問上游」**：記 server 保證過的範圍（按帳號、用 `g_seq`），🚫 不從本地 `r_seq` 連不連號推。等 server 推送再確認。
+4. **階段 4 訂閱／推播** —— 先跟維護者討論。
 
 0. ✅ **房間金鑰備份與周邊**（維護者 2026-09-09 提；2026-09-10 全部做完）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10。
    ✅ **PR #19 合併了大半**：兩層路徑加密、`account` 一族、CLI 輸出英文、金鑰備份（server 端 backup、本地全量快照、`key-backup` 六個子命令（status／upload／save／import／restore／recovery）、`logout` 的兩關閘門、`r/` 獨立保管與 `recovery list`／`show`）。

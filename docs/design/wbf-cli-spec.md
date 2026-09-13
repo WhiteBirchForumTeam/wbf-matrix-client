@@ -214,7 +214,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 規則：
 
 - **解不開不是錯誤。** 加密房間裡拿不到 key 的事件照印，`decrypted: false` 帶原因，exit 仍是 0。用 exit 3 只會讓一整頁因為一則舊訊息全掛。
-- **翻頁 token 不落地。** `next` 只印在 stdout，不寫狀態檔；要接著翻是呼叫者的事。session 檔的 SDK store 另有它自己的 sync 位置，跟這個無關。
+- **`next` 是 `event_id`（這一頁最舊那則），不落地。** 只印在 stdout，不寫狀態檔；要接著翻是呼叫者的事。🚫 不是 server 的翻頁 token（rpc-spec §3.3）。session 檔的 SDK store 另有它自己的 sync 位置，跟這個無關。
 - **`--type`、`--sender` 在 client 端濾**：Matrix 的 `filter` 參數各 server 支援程度不一，而且只是省流量，結果一樣。過濾後一頁可能是空的但 `next` 不是 null，呼叫者要照 `next` 判斷有沒有到頭，不是照 `events` 長度。
 - **`files` 不驗完整性**：它只解區塊、印 manifest，不碰 `Info`。核對是 `info`／`download` 的事（約定 §3.1）。
 - 不加 `search`：server 端全文搜尋對加密房間無效，要做也是 client 端掃 `read` 的輸出，那是腳本一行 `jq` 的事。
@@ -250,7 +250,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `recent [--limit <n>] [--window <n>] [--batch <n>] [--from-scratch]` | `Event/Recent`（只走 WS；`--transport http` 會拿到 `Unsupported`）。三層（維護者 2026-09-08 定）：`--limit` 是**這一輪總共要幾則**（預設 10000，0 = 拉到追平），底層拆成一次 `Recent` 一窗 `--window` 則（預設 320、server 上限 500 先 clamp），server 每 `--batch` 則回一個 Batch（預設 10、上限 100）；要 1000 就是 320、320、320、40 四窗。每個 Batch 寫一次快取；一窗 `tc == 要的` 就帶 `before = 最後的 ls` 再一窗，`tc < 要的` 是追平（`caught_up`）；湊滿 `--limit` 也停（stderr 說更舊的還沒進快取）。水位一律是第一窗第一個 Batch 的 `fs`（比它新的全拿到了），中途斷線或 server 回錯就 exit、已寫的有效、水位不動。等待：第一窗每個 Batch 之間 60 秒、之後 10 秒。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "windows", "batches", "caught_up", "cg_seq_before", "cg_seq_after" }` |
-| `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的。排序照 `r_seq`（沒有 `r_seq` 的房間退到時間）。`--before` 這時是 **r_seq 的數字**（上一頁印的 `next`），不是 server 的翻頁 token；沒有 `r_seq` 的房間 `next` 是 null、翻不了頁 | 與不帶時同形 |
+| `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的，排序照 `r_seq`。`--before` 跟不帶時一樣是**上一頁印的 `next`（那頁最舊那則的 `event_id`）**。🚫 **沒有 `r_seq` 的房間（一般 Matrix server）不答**、錨點不在快取也不答（exit 2）：那種房不從快取回答，拿掉 `--from-cache` 去問 server（rpc-spec §3.3） | 與不帶時同形 |
 | `account destroy <user> [--yes]` | 忘掉鏈（裝置層那一半在 §3.1）：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**這個帳號的 `k/` 也一起刪**（它就是「摧毀本機紀錄」，跟 `logout` 一致，local-cache-db §10.7）；沒 `--yes` 的確認提示要把這件事講出來 | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
 | `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 local-cache-db.md §8.5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |

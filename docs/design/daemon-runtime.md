@@ -303,17 +303,10 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 - 有沒有洞是**看得出來的**：`cache.db` 的 `events` 有 `r_seq`（房內序號），
   一段連續的 `r_seq` 中間缺號就是洞（local-cache-db §6）。有洞才發第二個 `sync: "both"`。
 - 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 daemon 自己的事（§4.3）。
-- 🚨 **`both` 現在只用在「最新的一頁」，🚫 不吃 `before`**（PR #32 審查 cirno🔴）——
-  ⚠️ **這是權宜的**：問題不在 `both`，在**現在只有 matrix-sdk 那個 backend 拿得到歷史**，
-  而它的翻頁位置是**不透明 token**，跟本地的 `r_seq` 之間沒有翻譯。
-  最危險的不是報錯，是「token 剛好長得像數字」：那會**指到本地一個不相干的位置**，
-  然後看起來像成功。所以那個組合在打上游**之前**就被擋掉（`before_for_upstream_page`），
-  🚫 不是抓完寫完才失敗。
-  ⭐ **出口**：wbf 的房間歷史 ＝ `Event/Recent` 點名一個房 ＋ `before`（wbfuwunel PR #51）。
-  🚨 **它翻頁用的是 `g_seq`，🚫 不是 `r_seq`**：`g_seq` 翻頁、`r_seq` 判斷有沒有洞。
-  所以接上的時候本地翻頁也要換成 `g_seq`，兩半才真的是同一套 —— 那時這個守門整個拿掉。
-  📎 更正：這裡之前寫過「上下兩半講的都是 `r_seq`」，那是 #51 公開之前的猜測，錯的。
-  在那之前往回翻一律 `local` —— 反正資料已經在庫裡了。
+- 🚨 **往回翻一律拿 `event_id`**（維護者 2026-09-14）：UI 拿手上最舊那則當 `before`，`both` **永遠問上游**、
+  寫進去、照上游順序從本地讀回。daemon 換算：wbf 查本地 `g_seq` → `Recent{rooms, before}`；matrix `/context` → `/messages`。
+  🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 rpc-spec §3.3「往回翻」。
+  📎 #32 的權宜守門 `before_for_upstream_page` 拿掉了：三種 `sync` 同一種座標，它沒有存在的理由。
 
 ### 3.5 ⚠️ 現況與這個模型的落差
 
@@ -322,7 +315,7 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 | `room.list`／`room.get` 預設 `local` | ✅ 改好了。⚠️ **CLI 那一側刻意維持舊行為**：`--from-cache` → `Local`，沒帶 → **`Both`**（它本來就是「打上游＋寫穿快取」），🚫 不偷偷改掉它 |
 | 參數叫 `sync`，三個值 | ✅ 改好了（`HistorySource` → `SyncMode`，預設 `Local`） |
 | 帳號列表永遠本地 | ✅ 已經是了 |
-| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🟡 **一半**：探測與 transport 規則做好了（`backend_choice`），但**房間那條線還沒有 wbf 實作可以分派**。見下 |
+| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🟡 **歷史做了**：`room.history`／`files` 照探測走 wbf `Recent{rooms}` 或 matrix（`BothSides`）；`room.list`／`get`／`send_text` 還在暫時清單上。見下 |
 
 🟡 **backend 這條線挖到一半**（維護者 2026-09-13 定案）。
 
@@ -386,14 +379,12 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
    （探測不能走閘門，不然它會叫到自己）。
 
 **🚧 那份會縮短的清單**：每個呼叫點自己用 `MethodHome` 說出它住在哪一邊 ——
-🚫 不是一串字串比對（名字跟實際走哪條會漂移）。現在在清單上的是 `room.*`、`account.*`、
-`backup.*`、`recovery.*`；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfOnly`。
+🚫 不是一串字串比對（名字跟實際走哪條會漂移）。現在在清單上的是 `room.list`／`get`／`send_text`、`account.*`、
+`backup.*`、`recovery.*`（`room.history`／`files` 已經是 `BothSides`）；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfOnly`。
 
-**還沒做的**：房間那條線**沒有第二條路可以分派** —— wbf 協議的 `Event` 底下只有
-`Recent`／`Send`／`Batch`，🚫 沒有「拿房間歷史」的定義。⭐ server 端正在補那塊 API
-（維護者 2026-09-13）；補上之後把那幾個呼叫點從 `StillOnMatrixSdk` 改成 `BothSides` 就搬過去了，
-**rpc-spec 那一層一個字都不用改** —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，
-🚫 不是「用哪個協議去問」。
+**還沒做的**：`room.list`／`room.get`／`room.send_text` 還是只有 matrix-sdk（`StillOnMatrixSdk`）。
+房間歷史已經搬過去了（wbfuwunel #51，`Recent` 點名房間；`MethodHome::BothSides`）。
+**rpc-spec 那一層一個字都沒改** —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
 
 📎 **代價講在前面**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）。
 **探到答案就是每個帳號在一個 daemon 生命週期裡一次**，🚫 不是每個請求一次。
