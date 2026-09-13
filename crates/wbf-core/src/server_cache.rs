@@ -36,7 +36,7 @@
 //! - **事件由寫入者發**：`post` 帶著「commit 成功之後要發什麼」。🚫 呼叫端自己在 `post` 之後發
 //!   會跑在 commit 前面 —— 前端收到推播去查，查到的是還沒有那筆的資料庫。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -60,6 +60,31 @@ pub(crate) struct ServerCache {
     /// 📎 用 `Mutex` 是因為 `Connection` 不是 `Sync`：讀因此是排隊的，
     /// 而我們的讀都是短查詢。哪天出現慢查詢再換成連線池。
     reader: Mutex<Cache>,
+}
+
+/// 哪個 server dir 起過幾條寫入執行緒。⭐ 只為了讓「一個 server dir 只有一個寫入者」
+/// **驗得出來** —— 🚫 比 `Arc` 的位址證明不了：多開一份再丟掉的話，兩邊拿到的還是
+/// 同一個 `Arc`，位址照樣相等（PR #32 審查 cirno🔴）。
+///
+/// ⚠️ 按目錄分開記，🚫 不是一個總數：同一個 test binary 裡別的測試也在開快取，
+/// 總數會被他們抬高，那種測試會隨機紅。
+// ⚠️ 這裡的 `Mutex` 寫全名：這個檔導進來的 `Mutex` 是 **tokio** 的（要 `.await`）。
+static WRITERS_STARTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Args:
+///     server_dir: 要問的那個目錄, example: `<data dir>/s/<加密的 server 名>`
+/// Return:
+///     usize  這個目錄上 `ServerCache::open` 成功起過的寫入執行緒數；0 = 從來沒開過
+#[cfg(test)]
+pub(crate) fn get_writers_started_for(server_dir: &Path) -> usize {
+    WRITERS_STARTED
+        .lock()
+        .expect("the writer counter is never poisoned")
+        .get(server_dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 impl ServerCache {
@@ -107,6 +132,11 @@ impl ServerCache {
                     format!("cannot start the cache writer thread: {error}"),
                 )
             })?;
+        *WRITERS_STARTED
+            .lock()
+            .expect("the writer counter is never poisoned")
+            .entry(server_dir.to_path_buf())
+            .or_insert(0) += 1;
         Ok((
             ServerCache {
                 to_writer,

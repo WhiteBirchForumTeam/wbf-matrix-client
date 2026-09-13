@@ -96,6 +96,14 @@ impl Core {
     /// ⭐ **一個 server dir 一份，開了就留著**：多個寫入者就沒有順序可言（水位會倒退），
     /// 而且每次重開都要付一次 SQLCipher 導金鑰。
     ///
+    /// ⚠️ **註冊表的鎖握滿「查、開、放進去」整段**，🚫 不是查完就放掉 —— 放掉的話兩個
+    /// 呼叫端會同時看到 miss、同時 `Cache::open` 同一個檔（重建那條路會刪檔重造），
+    /// 而且兩個寫入者是真的都起來了，只是後到的那個馬上被丟掉。⭐ **「一個 server dir
+    /// 只有一個寫入者」要靠結構成立，不能靠時序恰好沒撞上**（PR #32 審查 cirno🔴）。
+    ///
+    /// 📎 代價是開庫期間別的呼叫端（含 `cache_queue_len`）會等 —— 那正是要的：
+    /// 它們等的就是同一份東西。🚫 這中間沒有 `await`，所以不會跨 await 持鎖。
+    ///
     /// Args:
     ///     account: 哪個帳號（它決定 server dir）
     ///     server: 這個庫是哪個 server 的, example: "http://localhost:6167"
@@ -108,12 +116,11 @@ impl Core {
         server: &str,
     ) -> Result<std::sync::Arc<crate::server_cache::ServerCache>, CoreError> {
         let dir = account.server_dir();
-        if let Some(existing) = self
+        let mut registry = self
             .server_caches
             .lock()
-            .expect("the server-cache registry is never poisoned")
-            .get(&dir)
-        {
+            .expect("the server-cache registry is never poisoned");
+        if let Some(existing) = registry.get(&dir) {
             return Ok(existing.clone());
         }
         let identity = CacheIdentity {
@@ -136,15 +143,8 @@ impl Core {
             )),
         }
         let cache = std::sync::Arc::new(cache);
-        // ⚠️ 兩個 task 同時開的話，後到的那個把自己的丟掉、用先到的那份
-        // —— 🚫 一個 server dir 只能有一個寫入者。
-        Ok(self
-            .server_caches
-            .lock()
-            .expect("the server-cache registry is never poisoned")
-            .entry(dir)
-            .or_insert(cache)
-            .clone())
+        registry.insert(dir, cache.clone());
+        Ok(cache)
     }
 
     /// 這個帳號所屬 server 的媒體儲存池（local-cache-db.md §8），跟 `cache.db` 同層。
@@ -153,5 +153,87 @@ impl Core {
             &account.server_dir(),
             self.vault()?.media_store_key(),
         )?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wbf_sdk::vault::Vault;
+    use wbf_sdk::Unlock;
+
+    const SERVER: &str = "http://localhost:6167";
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wbf-core-h-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn unlocked(dir: &std::path::Path) -> Core {
+        Vault::create(dir, &Unlock::NoPassphrase).unwrap();
+        let core = Core::open(dir);
+        core.unlock(None).unwrap();
+        core
+    }
+
+    /// 🚨 八條執行緒同時要同一個 server 的快取 —— **只准起一條寫入者**
+    /// （PR #32 審查 cirno🔴）。
+    ///
+    /// ⚠️ 這條測試在「查完就放掉鎖、開完再 `or_insert`」的舊寫法上是**紅的**——
+    /// 實測過三次三次都紅（2026-09-13），而且壞得比預期重：
+    ///
+    /// - 每個看到 miss 的呼叫端都真的開了一次庫、起了一條寫入者；
+    /// - 🚨 更糟的是**大部分呼叫端直接失敗**：`io: cache.db: database is locked`。
+    ///   八條同時第一次開同一個檔，建表那段是排他的，`busy_timeout` 也救不了。
+    ///   ⭐ 所以那不只是「多一條孤兒寫入者」，是**開不起來**。
+    ///
+    /// 🚫 光比 `Arc::ptr_eq` 抓不到多開這件事：輸家拿到的就是贏家那一份，位址本來就相等。
+    #[test]
+    fn eight_threads_asking_for_one_server_cache_start_exactly_one_writer() {
+        let dir = scratch("one-writer");
+        let core = unlocked(&dir);
+        let key = core.vault().unwrap().account_dir_key();
+        let account = AccountDir::locate(&dir, &key, SERVER, "@alice:localhost").unwrap();
+        std::fs::create_dir_all(&account.dir).unwrap();
+        let server_dir = account.server_dir();
+        assert_eq!(
+            crate::server_cache::get_writers_started_for(&server_dir),
+            0,
+            "還沒有人要過"
+        );
+
+        let caches: Vec<_> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| core.server_cache_of(&account, SERVER).unwrap()))
+                .collect();
+            racers
+                .into_iter()
+                .map(|racer| racer.join().expect("沒有一條該 panic"))
+                .collect()
+        });
+
+        assert_eq!(
+            crate::server_cache::get_writers_started_for(&server_dir),
+            1,
+            "一個 server dir 只准有一個寫入者，多起的那些會讓順序失去意義"
+        );
+        for cache in &caches {
+            assert!(
+                std::sync::Arc::ptr_eq(&caches[0], cache),
+                "八條拿到的要是同一份"
+            );
+        }
+        // 而且那一份是活的：寫進去、再讀回來。
+        caches[0]
+            .run_blocking(|cache| cache.set_cg_seq("@alice:localhost", 7))
+            .expect("寫入者要收得到工作");
+        let seq = caches[0]
+            .run_blocking(|cache| cache.get_cg_seq("@alice:localhost"))
+            .expect("讀得回來");
+        assert_eq!(seq, Some(7), "寫進去的要真的落地");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
