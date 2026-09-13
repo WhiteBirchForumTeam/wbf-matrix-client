@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::message::{CloseReason, Request, Response};
+use crate::message::{code, CloseReason, Request, Response};
 use crate::pack::{self, PackError, PackType, RpcKeys, Side};
 use crate::protocol;
 
@@ -42,6 +42,8 @@ pub enum Inbound {
     Request(Request),
     /// 協議層錯誤：先送這個 `Response`（明文），再關連線。
     Close(Response),
+    /// 一則請求層的錯誤（寫壞的請求）：回完**連線照用**（rpc-spec §5.1 的 `100`）。
+    Reply(Response),
 }
 
 #[derive(Deserialize)]
@@ -107,14 +109,36 @@ impl Connection {
             ));
         }
         self.last_inbound = pack_type;
-        let request: Request = match serde_json::from_slice(&json_bytes) {
-            Ok(request) => request,
+        // 解得開但不是 JSON → 協議層（§1.4 的 BAD_FRAME）：這條連線的封裝壞了。
+        let value: Value = match serde_json::from_slice(&json_bytes) {
+            Ok(value) => value,
             Err(error) => {
                 return Inbound::Close(Response::close(
                     None,
                     CloseReason::BadFrame,
-                    format!("frame is not a request object: {error}"),
+                    format!("frame is not JSON: {error}"),
                 ))
+            }
+        };
+        // 是 JSON 但不是一個請求（沒有 `method`、`id` 不是整數…）→ **請求層的 100**，
+        // 連線照用（rpc-spec §5.1）。🚫 不因為一則寫壞的請求就關掉整條連線。
+        let request: Request = match serde_json::from_value(value.clone()) {
+            Ok(request) => request,
+            Err(error) => {
+                // hello 之前一律 fail closed：還沒談成協議，連「照用」的前提都不成立。
+                if self.protocol.is_none() {
+                    return Inbound::Close(Response::close(
+                        None,
+                        CloseReason::HelloRequired,
+                        "the first request on a connection must be hello",
+                    ));
+                }
+                return Inbound::Reply(Response::error(
+                    // 對得上就帶：`method` 壞掉但 `id` 是整數的時候前端還配得起來。
+                    value.get("id").and_then(Value::as_u64),
+                    code::BAD_REQUEST,
+                    format!("not a request object: {error}"),
+                ));
             }
         };
         if request.method == "hello" {
@@ -340,13 +364,50 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_that_is_not_a_request_object_is_bad_frame() {
+    fn a_frame_that_is_not_json_is_bad_frame_but_a_written_wrong_request_is_only_a_100() {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "[1,2,3]"));
-        assert_eq!(close_code(&inbound), Some(9002));
+        // 解得開但不是 JSON：封裝壞了 → 協議層，關連線。
         let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "not json"));
         assert_eq!(close_code(&inbound), Some(9002));
+
+        // hello 之前寫壞的請求：還沒談成協議，fail closed 關掉。
+        let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
+        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "[1,2,3]"));
+        assert_eq!(close_code(&inbound), Some(9003));
+
+        // hello 之後寫壞的請求：回 100，🚫 連線不關（rpc-spec §5.1）。
+        let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
+        connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
+        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "[1,2,3]"));
+        // 🚫 不斷言 serde 的字（它會隨版本變）；斷言的是 code 與 id。
+        match inbound {
+            Inbound::Reply(response) => {
+                assert_eq!(response.code, code::BAD_REQUEST, "{}", response.msg);
+                assert_eq!(response.id, None);
+            }
+            other => panic!("expected a 100 reply, got {other:?}"),
+        }
+        // `method` 壞了但 `id` 是整數：帶著那個 id 回，前端配得起來。
+        let inbound = connection.receive(&client_frame(
+            &keys,
+            PackType::Cipher,
+            r#"{"id": 9, "params": {}}"#,
+        ));
+        match inbound {
+            Inbound::Reply(response) => {
+                assert_eq!(response.code, code::BAD_REQUEST);
+                assert_eq!(response.id, Some(9));
+            }
+            other => panic!("expected a 100 reply, got {other:?}"),
+        }
+        // 連線還活著：下一則正常的請求照樣過。
+        let inbound = connection.receive(&client_frame(
+            &keys,
+            PackType::Cipher,
+            r#"{"method": "daemon.info", "id": 10}"#,
+        ));
+        assert!(matches!(inbound, Inbound::Request(_)), "{inbound:?}");
     }
 
     #[test]

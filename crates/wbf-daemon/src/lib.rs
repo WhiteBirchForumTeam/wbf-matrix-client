@@ -14,12 +14,18 @@
 //! | `connection` | 一條連線的狀態機；**出去的包該不該加密只在這裡判斷** |
 //! | `handle` | method → core |
 //! | `server` | loopback 的 WS listener |
+//! | `settings` | 從 `wbf.conf` 讀進來、要填進 `Target` 的那幾個值 |
+//! | `token` | `daemon.token` 的生命週期：權限、三遍覆蓋之後抹掉 |
+//! | `lock` | 資料目錄的獨佔：OS 層排他鎖，拿不到就不啟動 |
 //!
 //! 🚫 這個 crate 不印任何東西到 stdout／stderr（`main.rs` 例外）。
 
 pub mod connection;
 pub mod handle;
+pub mod lock;
 pub mod message;
 pub mod pack;
 pub mod protocol;
 pub mod server;
+pub mod settings;
+pub mod token;

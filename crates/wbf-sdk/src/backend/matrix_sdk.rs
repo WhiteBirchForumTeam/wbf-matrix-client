@@ -274,7 +274,7 @@ impl ChatBackend for MatrixBackend {
         &self,
         since: Option<&str>,
         deadline: Option<Duration>,
-        on_update: &mut dyn FnMut(Update) -> WatchControl,
+        on_update: &mut (dyn FnMut(Update) -> WatchControl + Send),
     ) -> Result<WatchEnd, SdkError> {
         // 沒給 since 就先對齊到「現在」：timeout 0 的一次 sync，事件全部丟掉。
         let mut token = match since {

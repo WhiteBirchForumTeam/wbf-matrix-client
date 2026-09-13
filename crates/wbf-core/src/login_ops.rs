@@ -52,34 +52,6 @@ impl Core {
         Ok(mode)
     }
 
-    /// ⚠️ **過渡用，只給 rpc-cli 的 `unlock.ticket`**：從落地的主金鑰直接組 vault，
-    /// 沒有 passphrase 可餵。
-    ///
-    /// 🚫 daemon **不要**把這個開成 RPC method：ticket 那個妥協（明文主金鑰落地 15 分鐘，
-    /// local-cache-db §4 自己標記過）在常駐之後**整條消失**（architecture-v2 §1），
-    /// 這個方法會跟著消失。
-    pub fn unlock_with_master_key(&self, master: [u8; 32], mode: KeyMode) -> Result<(), CoreError> {
-        self.adopt_unlocked_vault(Vault::from_master(
-            &self.data_dir,
-            wbf_sdk::vault::Key32(master),
-            mode,
-        ));
-        Ok(())
-    }
-
-    /// ⚠️ **過渡用，只給 rpc-cli 的 `unlock.ticket`**：把主金鑰交出去寫進 ticket。
-    ///
-    /// 🚫 **daemon 不要把這個開成 RPC method**。它跟 [`Core::unlock_with_master_key`]
-    /// 是成對的：ticket 要讀也要寫，只開一半會逼呼叫端繞路（而繞路的版本通常更糟）。
-    /// 兩個都在 ticket 消失時一起消失（architecture-v2 §1）。
-    ///
-    /// ⚠️ 回傳的是**主金鑰本身**。呼叫端要用 0600 寫、要有 TTL——那些條件
-    /// local-cache-db §4 已經寫死了，🚫 不要在別的地方重新發明。
-    pub fn export_master_key_for_ticket(&self) -> Result<([u8; 32], KeyMode), CoreError> {
-        let vault = self.vault()?;
-        Ok((vault.master_key().as_bytes().to_owned(), vault.mode()))
-    }
-
     /// 登入一個帳號。**要先解鎖或先 [`Core::create_vault`]**：store 的金鑰與
     /// `session.sealed` 都從 vault 來。
     ///

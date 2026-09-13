@@ -11,6 +11,7 @@ use wbf_daemon::connection::EncryptionPolicy;
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
 use wbf_daemon::server::RpcServer;
+use wbf_daemon::settings::Settings;
 
 const TOKEN: [u8; 256] = [42u8; 256];
 
@@ -23,7 +24,7 @@ struct Daemon {
 async fn start_daemon() -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let policy = EncryptionPolicy::enforced();
-    let handle = Handle::new(dir.path(), policy.clone());
+    let handle = Handle::new(dir.path(), policy.clone(), Settings::default());
     let server = RpcServer::bind(
         0,
         Arc::new(RpcKeys::from_token(&TOKEN)),
@@ -139,7 +140,8 @@ async fn hello_then_a_request_over_ciphertext() {
     let (_, reply) = receive(&mut socket, &keys).await;
     assert_eq!(reply["result"]["connections"], 1);
 
-    // 沒解鎖：帳號那些是 1001，而且連線還活著（請求層錯誤不關連線）。
+    // 這個資料目錄還沒有 local.key：帳號那些是 1002（訊息指向 vault.create），
+    // 而且連線還活著（請求層錯誤不關連線）。
     send(
         &mut socket,
         &keys,
@@ -148,7 +150,7 @@ async fn hello_then_a_request_over_ciphertext() {
     )
     .await;
     let (_, reply) = receive(&mut socket, &keys).await;
-    assert_eq!(reply["code"], 1001);
+    assert_eq!(reply["code"], 1002, "{reply}");
     assert_eq!(reply["result"], Value::Null);
     send(
         &mut socket,
@@ -229,4 +231,49 @@ async fn shutdown_notifies_open_connections_and_stops_accepting() {
             .await
             .is_err()
     );
+}
+
+/// architecture-v2 §4.3 的第 4、5 步：前端在 ready 之後**抹掉** token 檔，而 daemon 照樣服務。
+///
+/// ⭐ 這條釘住的是「daemon 讀完就不再回頭讀那個路徑」—— 哪天有人加了一段「重讀 token」
+/// （例如想支援換 token），這裡會紅，而那正是要停下來想的時候。
+#[tokio::test]
+async fn the_daemon_keeps_serving_after_the_frontend_shreds_the_token_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("daemon.token");
+    // 第 1 步：前端寫 256 byte。
+    std::fs::write(&token_path, TOKEN).unwrap();
+
+    // 第 2、3 步：daemon 從那個檔導金鑰、開 port。
+    let token = std::fs::read(&token_path).unwrap();
+    let keys = wbf_daemon::pack::RpcKeys::from_token_file(&token).expect("256 bytes");
+    let policy = EncryptionPolicy::enforced();
+    let handle = Handle::new(dir.path(), policy.clone(), Settings::default());
+    let server = RpcServer::bind(0, Arc::new(keys), policy, handle.clone())
+        .await
+        .unwrap();
+    let port = server.local_addr().unwrap().port();
+    tokio::spawn(server.run());
+
+    // 第 4 步：前端抹掉它。
+    assert!(wbf_daemon::token::shred(&token_path).unwrap(), "本來有");
+    assert!(!token_path.exists());
+
+    // 第 5 步：token 只在記憶體裡——新連線照樣談得成、請求照樣回。
+    let client_keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(port).await;
+    send(&mut socket, &client_keys, PackType::Cipher, hello()).await;
+    let (pack_type, reply) = receive(&mut socket, &client_keys).await;
+    assert_eq!(pack_type, PackType::Cipher);
+    assert_eq!(reply["code"], 0, "{reply}");
+    send(
+        &mut socket,
+        &client_keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 1 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &client_keys).await;
+    assert_eq!(reply["code"], 0, "{reply}");
+    assert_eq!(reply["result"]["unlocked"], false);
 }

@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use wbf_core::{CoreError, CoreErrorKind};
+use crate::{CoreError, CoreErrorKind};
 
 pub const CONF_FILE_NAME: &str = "wbf.conf";
 
@@ -439,8 +439,8 @@ mod tests {
     #[test]
     fn a_number_that_does_not_parse_falls_back_to_the_default() {
         let mut warnings = Vec::new();
-        let conf = parse("UNLOCK_TTL=abc\nQUOTA_MIB=2048\n", "t").unwrap();
-        assert_eq!(conf.get_number("UNLOCK_TTL", 900u64, &mut warnings), 900);
+        let conf = parse("PROTECT_DAYS=abc\nQUOTA_MIB=2048\n", "t").unwrap();
+        assert_eq!(conf.get_number("PROTECT_DAYS", 7u64, &mut warnings), 7);
         assert_eq!(conf.get_number("QUOTA_MIB", 1u64, &mut warnings), 2048);
         assert_eq!(warnings.len(), 1);
     }

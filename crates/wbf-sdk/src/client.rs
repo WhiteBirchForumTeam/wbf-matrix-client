@@ -23,7 +23,7 @@ pub struct WbfClient<C: PackChannel> {
 
 /// `recent_window`／`recent_sync` 每收到一個 Batch 叫一次：meta 加這批的事件（新到舊）。回 `Err` 就中止。
 pub type OnBatch<'a> =
-    &'a mut dyn FnMut(&BatchMeta, Vec<serde_json::Value>) -> Result<(), SdkError>;
+    &'a mut (dyn FnMut(&BatchMeta, Vec<serde_json::Value>) -> Result<(), SdkError> + Send);
 
 /// `Recent` 一窗的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -217,8 +217,14 @@ impl<C: PackChannel> WbfClient<C> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         // id 由 client 選（回應是一串 Batch，不能靠 seq 對）；從 1 起，永遠不是 0。
-        self.next_stream_id = self.next_stream_id.wrapping_add(1).max(1);
-        let pack = protocol::recent(request, self.next_stream_id, seq);
+        // 型別 byte 是 SESSION（wire-format §2.2）：沒帶 server 回 InvalidRequest「carries none」
+        // （2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
+        self.next_stream_id =
+            self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
+        let session_id =
+            wbf_wire::pack::id::compose(wbf_wire::pack::id::SESSION, self.next_stream_id)
+                .expect("masked to 56 bits above");
+        let pack = protocol::recent(request, session_id, seq);
         let mut window = RecentWindow::default();
         let mut expected_seq = 0u32;
         let mut sent = 0u32;

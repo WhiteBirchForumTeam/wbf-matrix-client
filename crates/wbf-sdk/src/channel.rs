@@ -37,7 +37,7 @@ pub trait PackChannel {
         &mut self,
         pack: Pack,
         per_pack_timeout: Duration,
-        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+        on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError>;
 }
 
@@ -102,7 +102,7 @@ impl PackChannel for Channel {
         &mut self,
         pack: Pack,
         per_pack_timeout: Duration,
-        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+        on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
         match self {
             Channel::WebSocket(channel) => {
@@ -202,7 +202,7 @@ impl PackChannel for WsChannel {
         &mut self,
         pack: Pack,
         per_pack_timeout: Duration,
-        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+        on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
         self.send_pack(pack).await?;
         loop {
@@ -242,7 +242,7 @@ impl PackChannel for HttpChannel {
         &mut self,
         pack: Pack,
         _per_pack_timeout: Duration,
-        on_pack: &mut dyn FnMut(Pack) -> Result<bool, SdkError>,
+        on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
         let response = self.request(pack).await?;
         if on_pack(response)? {

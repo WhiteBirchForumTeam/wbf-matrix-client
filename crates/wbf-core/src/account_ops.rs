@@ -113,7 +113,6 @@ impl Core {
 
     /// 設或拿掉 `local.key` 的 passphrase。**只重包主金鑰**，其他檔案不動。
     ///
-    /// ⚠️ 呼叫端要記得作廢舊的 ticket——它是用舊 passphrase 換來的。
     ///
     /// Args:
     ///     passphrase: `None` 就是拿掉（變成 plain 模式）

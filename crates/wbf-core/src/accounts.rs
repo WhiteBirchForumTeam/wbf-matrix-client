@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! <data dir>/
-//!   local.key、unlock.ticket            一台機器一把主金鑰（vault）
+//!   local.key                          一台機器一把主金鑰（vault）
 //!   current                             目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"
 //!   r/<b58>_<b58>                       recovery key（recovery.rs）；🚫 logout 不碰
 //!   s/<b58>_<b58>/                      正規化過的 server host，加密（§11.2）
@@ -128,12 +128,24 @@ impl AccountDir {
     }
 
     /// 裝置層的狀態：matrix-sdk 的 store（綁 device_id）。logout 或換裝置時丟；`cache.db`（綁 server）與 `local.key` 不動。
+    ///
+    /// ⚠️ Windows 上剛用完的 SQLite store **有時還被握著**（`os error 32`：檔案正由另一個程序使用）——
+    /// 登出的閘門才剛開過一次 backend 去問 recovery 狀態，那個 handle 關掉與 OS 真的放手之間有延遲。
+    /// 所以這裡**重試幾次**（2026-09-13 對真 server 跑 daemon e2e 時遇到，第二次跑就過了 —— 典型的 race）。
+    /// 🚫 重試完還是不行就回錯，不吞掉：那時多半是**別的程序**開著同一個 store（例如一個常駐的
+    /// daemon 加一個單發命令，architecture-v2 §0.2），而那件事必須讓呼叫端知道。
     pub fn delete_matrix_store(&self) -> Result<(), SdkError> {
-        match std::fs::remove_dir_all(self.matrix_store_dir()) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        const TRIES: u32 = 10;
+        const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+        for remaining in (0..TRIES).rev() {
+            match std::fs::remove_dir_all(self.matrix_store_dir()) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if remaining == 0 => return Err(error.into()),
+                Err(_) => std::thread::sleep(WAIT),
+            }
         }
+        unreachable!("the loop returns on the last try")
     }
 }
 

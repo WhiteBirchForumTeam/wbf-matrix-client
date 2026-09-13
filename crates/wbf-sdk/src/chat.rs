@@ -172,6 +172,6 @@ pub trait ChatBackend {
         &self,
         since: Option<&str>,
         deadline: Option<Duration>,
-        on_update: &mut dyn FnMut(Update) -> WatchControl,
+        on_update: &mut (dyn FnMut(Update) -> WatchControl + Send),
     ) -> Result<WatchEnd, SdkError>;
 }

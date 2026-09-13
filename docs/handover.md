@@ -46,24 +46,33 @@ crates/wbf-sdk/src/
   backend/matrix_sdk.rs  唯一 `use matrix_sdk` 的檔（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
 crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
   lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
-  error.rs               `CoreError { kind, message }`、`CoreErrorKind`。⚠️ **號碼還沒配**——等 `rpc-spec.md`
+  error.rs               `CoreError { kind, message }`、`CoreErrorKind`、`rpc_code()`（rpc-spec §5.2 的號碼）
+  conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   event.rs               `CoreEvent` 與 broadcast channel。🚫 core 不印任何東西
   handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate
   accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部
   *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
                          ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、可序列化的型別、事件走 channel、
                          🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
-crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。第一版只有控制平面的基底：
+crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底與全部有 core 對應的 method：
   pack.rs                ver‖type‖data 的編解碼與 XChaCha20-Poly1305（token 導兩把鑰）；純函數
   message.rs             Request／Response、請求層 code（1xx）、協議層 CloseReason（9xxx）
   protocol.rs            hello 的兩關：client 名字前綴、protocol 交集
   connection.rs          一條連線的狀態機；⚠️ **出去的包該不該加密只在這裡判**（EncryptionPolicy 是全局）
-  handle.rs              method → core。這一版只接 daemon.*、vault.*、account.list／switch、media.stats／gc、recovery.*
+  handle/                method → core。mod.rs 是分派與共同欄位（Target／transport）；local／accounts／rooms／media／backup 一模組一族。
+                         ⚠️ dispatch 每個分支 Box::pin（E0275）；fresh 資料目錄的起手式是 vault.create，🚫 account.add 不偷建 vault
+  lock.rs                資料目錄的獨佔：寫排他／讀共享（std 的 File::try_lock）＋ `WriteAccess`
+                         全局能力（起手 false，要寫才拿；`call()` 是唯一檢查點）
+  settings.rs            從 wbf.conf 讀 SERVER_BACKUP／LOCAL_ROOM_KEYS／TRANSPORT（解析在 wbf_core::conf，跟 CLI 共用）
   server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
-  main.rs                只有 `-s`；單發命令、資料平面、conf 都還沒搬進來
+  main.rs                只有 `-s`（讀 daemon.token、conf、寫 daemon.json）；單發命令、資料平面還沒有
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
-apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源、unlock ticket）、
-                         conf.rs（wbf.conf 的解析與自動生成）、commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）
+  tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、
+                         token 檔 daemon 不動、shutdown 之後程序結束並收走 daemon.json
+  tests/real_server.rs   `--ignored`：對真 wbfuwunel 走 vault.create（passphrase）→account.add→whoami→ping→
+                         room.list→sync.recent→backup.status→**停掉 daemon 再起**→unlock→whoami→account.del
+apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源：檔案或終端，🚫 沒有 ticket 了）、
+                         commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）；conf 的解析已搬到 wbf_core::conf
                          ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
 scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
@@ -92,10 +101,35 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    ⚠️ 閘門的 principal 迴歸：`account switch @alice`（有 recovery key）後 `account del @bob:localhost`（沒有）**必須被擋** —— 擋不住就是又用了 current 的狀態（PR #19 審查 rumia／salvia 🔴1）。
    ⚠️ data dir 用短路徑（例如 `C:/Users/<you>/AppData/Local/Temp/wt`）：加密過的目錄名很長，scratchpad 那種深路徑在 Windows 會撞 MAX_PATH（餘裕算法見 local-cache-db §11.4.1）。
 9. 多帳號混存（兩個帳號 alice、bob，同一個 `--data-dir`）。（PR #19 起是 `account` 一族：`account status`／`switch`／`del`／`destroy`；下面的舊命令名要照著換）：alice `login` → 建只有 alice 的房 A 與邀 bob 的房 C，各送幾則 → `recent` → bob `login`（alice 不 logout）→ `accounts` 兩個、current 是 bob → `rooms` 只有 C → `read A --from-cache` 0 則、`read C --from-cache` 0 則（bob 還沒親自拿過）→ `recent` → `read C --from-cache` 有了，而且 alice 解過的那幾則是明文 → `--account alice read A --from-cache` 仍有 → alice `logout`（`cache.db` 還在）→ bob `logout`（`cache.db` 被刪）。`forget-account @alice:localhost --yes` 後 alice 的 `--from-cache` 全空、bob 的不受影響。2026-09-07 跑過一次全對。
-7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms`（走 ticket，不問）→ `lock` → `rooms`（問 passphrase；非互動就 exit 1）→ `remove-passphrase` → `rooms`（不問）。
+7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms --passphrase-file pw`（過）→ `rooms`（**問 passphrase**；非互動就 exit 1）→ `remove-passphrase --passphrase-file pw` → `rooms`（不問）。⚠️ 2026-09-13 起**每個命令都要 passphrase**：`unlock.ticket` 與 `lock` 都沒了（CLI 規格 §7.1）。
 6. 測完 `taskkill //F //IM <複本名>.exe`。
 
 ## 5. 坑（都踩過）
+
+- **wbfuwunel 的 `id` 第一個 byte 是型別**（wire-format §2.2，2026-09-12 BREAKING）：`Event/Recent`
+  這種 client 自己鑄會話號的包要用 `wbf_wire::pack::id::compose(id::SESSION, n)`，填裸的 `n` server 回
+  `InvalidRequest: this kind takes a conversation the client named in its id, and this one carries none`。
+  server 鑄的（上傳 id、`g_seq`）回來已經組好，原樣抄回去就對。
+  來源是 wbfuwunel PR #47（2026-09-13 合併，`e36b136cc`）；本專案 issue #29 第 1 項是同一件事。
+  📎 向量檔已經照合併後的 main 重抄（`recent_*`／`batch_*`／`subscribe_rooms`／`error_unsupported` 九個包的 id
+  從裸值變成 `0x01` 開頭的組合值，`ack_draft_open` 的 meta 錨改成 `g_seq` 4711）。
+  ⚠️ codec 不驗語意 —— 裸的 `10` 跟組好的 `0x01…0a` 對它一樣好，所以那段期間向量整片綠。
+  現在有 `every_vector_id_carries_a_type_byte_we_know` 釘住「非零的 id 一定帶得出型別」，重抄到沒組型別的向量會當場紅。
+- **`cargo test --workspace` 綠不代表 SDK 對得上 server**：黃金向量是整份複製的，server 加了 kind（`0x02 Stream`、
+  `0x16 Device`）我們的 `Kind` 表沒有，`vectors.rs` 才會紅；漏抄向量就什麼都不會紅。每次 server 那邊改 wire 就重抄一次。
+- 🚨 **我們只在 Windows 上跑測試，而有些檢查在 Windows 上是 no-op**：`token::is_private`
+  在非 Unix 一律回 `true`（靠目錄 ACL）。所以「測試自己用 `std::fs::write` 寫 token 檔」
+  在這裡全綠，到 Unix 上卻會被 daemon fail closed 擋掉、每個 process 測試都死在啟動
+  （PR #31 審查 cirno🔴 抓到）。⭐ 寫測試用的私密檔一律走 `wbf_sdk::vault::write_private`，
+  🚫 不要 `std::fs::write` 之後再 chmod。📎 同一類的還有檔案鎖與權限位元 —— 平台差異的地方，
+  **綠燈只代表這個平台綠**。
+- **Windows 上剛關掉的 SQLite store 還會被握著幾百毫秒**：登出刪 `m/` 會撞 `os error 32`
+  （`AccountDir::delete_matrix_store` 因此重試 10 × 100 ms）。⚠️ 它是**間歇的** —— 2026-09-13 對真
+  server 跑 daemon e2e 第一次紅、第二次就過。📎 重試完仍失敗就回錯，🚫 不吞：那時多半是別的程序
+  開著同一個 store。
+- **core 的長工作 future 要 `Send`**：daemon 把每個請求 `tokio::spawn`，wbf-sdk 的回呼型別一律是
+  `&mut (dyn FnMut(…) + Send)`。新加回呼型別漏了 `+ Send`，錯會在 daemon 的 `dispatch` 那一行爆，不在 sdk。
+  📎 同一行還會撞 E0275（matrix-sdk 的 future 太深、推 `Send` 爆遞迴上限）：`dispatch` 每個分支 `Box::pin` 就是為了這個。
 
 - `cargo fmt --all` 會格式化 `vendor/matrix-rust-sdk`（path dependency）。用 `-p`。commit 前看 `git -C vendor/matrix-rust-sdk status` 是空的。
 - 帶 `--features matrix` 的第一次編譯很久（matrix-sdk 全家）；放背景。
@@ -139,10 +173,13 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    已由 wbfuwunel PR #43 實作（`0x16 Device`，權威在那邊的 `wbf-to-device.md`）。
    還沒做的三塊，**建議順序**：
    1. ✅ **`rpc-spec.md`**（2026-09-12 第一版）：method 表、code 表（`CoreErrorKind` 配號在 §5.2）、推播、資料平面。
-      §8 列了 daemon PR 要順手補進 core 的五樣（`lock`、建檔與送事件拆開、`PoolReader` 接 Range、
-      結構化事件、配號）。
-   2. 🔁 **`crates/wbf-daemon`**：第一塊落地（pack、訊息、hello、連線狀態機、本機型 method、WS listener、`-s`）。
-      還沒：網路型 method（房間／上傳／備份）、推播與 cancel、資料平面 HTTP、conf 搬進來、單發命令列。
+      §8 列了 daemon PR 要順手補進 core 的四樣（建檔與送事件拆開、`PoolReader` 接 Range、
+      結構化事件、配號）。📎 本來還有第五樣 `Core::lock()`，2026-09-13 連 `vault.lock` 一起取消了
+      （rpc-spec §3.1：daemon 沒有「鎖上」這個 feature，真正的 lock 是 `daemon.shutdown`）。
+   2. 🔁 **`crates/wbf-daemon`**：第一塊（#30）pack、訊息、hello、連線狀態機、WS listener、`-s`；
+      第二塊全部有 core 對應的 method（帳號／房間／上傳／媒體／備份／sync.recent）與 conf 搬進 daemon。
+      還沒：推播與 cancel（要 core 的結構化事件）、資料平面 HTTP（media.open／create、send_attachment）、單發命令列。
+      📎 起手式是 `vault.create`（fresh 資料目錄）：🚫 `account.add` 不替前端建 vault（rpc-spec §3.1）。
       原定義：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
    3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。

@@ -17,7 +17,7 @@ use crate::manifest::{Manifest, UploadState};
 use crate::protocol::{self, ChunkAck, CreateAck, SealAck};
 
 /// 進度回呼：(已送的塊數, 總塊數；串流模式 None)。
-pub type ProgressFn<'a> = &'a mut dyn FnMut(u32, Option<u32>);
+pub type ProgressFn<'a> = &'a mut (dyn FnMut(u32, Option<u32>) + Send);
 
 /// `send_chunks`／`send_stream` 回的事實。
 #[derive(Clone, Debug, PartialEq, Eq)]

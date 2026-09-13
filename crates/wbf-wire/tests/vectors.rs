@@ -170,3 +170,30 @@ fn encode_rejects_reserved_flags() {
     };
     assert_eq!(pack.encode(), Err(EncodeError::ReservedFlags(0x80)));
 }
+
+/// 向量檔的每個 id 都要說得出自己是什麼型別（wire-format §2.2）。
+///
+/// ⚠️ 這條補的是 `packs_decode_and_re_encode_identically` 看不見的洞：codec 只搬 8 個 byte，
+/// 裸的 `10`（型別 0x00、值 10）跟組好的 `0x01…0a` 對它一樣好，所以 server 那邊漏組型別時
+/// 這裡整片綠，只有對真 server 跑才會收到 `InvalidRequest`（handover §5）。
+#[test]
+fn every_vector_id_carries_a_type_byte_we_know() {
+    use wbf_wire::pack::id;
+
+    let vectors = load_vectors();
+    for vector in &vectors.packs {
+        match id::type_of(vector.id) {
+            // 沒有會話：型別 0x00 的話整個 id 必須是 0。非零就是「有值卻沒說是什麼」。
+            id::NONE => assert_eq!(
+                vector.id, 0,
+                "{}: id 型別是 0x00（沒有會話）卻帶了值 {}",
+                vector.name, vector.id
+            ),
+            id::SESSION | id::G_SEQ | id::UPLOAD => {}
+            unknown => panic!(
+                "{}: id 型別 {unknown:#04x} 不在表上；先進 wbf_wire::pack::id 才能用",
+                vector.name
+            ),
+        }
+    }
+}

@@ -5,7 +5,7 @@
 >
 > | 段 | 狀態 |
 > |---|---|
-> | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed`、CLI 的 unlock ticket | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
+> | §4 主金鑰、兩種鎖法、三把子金鑰、`session.sealed` | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 §4.1 |
 > | §5.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
 > | §3、§6 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§6 的 schema 就是實作的（v2）；建置需求見 §3 |
 > | §10 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。§10.4 的本地格式實作時改成全量快照（原因寫在那一節）。✅ 2026-09-10 補上 conf 的兩個開關（`SERVER_BACKUP`／`LOCAL_ROOM_KEYS`）與關掉時的警告 |
@@ -93,10 +93,15 @@ local.key（0600）
   | | 做法 |
   |---|---|
   | UI | 解鎖一次，主金鑰只在記憶體；UI runtime 與 wbf-sdk 是同一個程序，關掉就沒了 |
-  | CLI（只在開發與 debug 用） | 仿 `sudo`：解鎖成功後寫一張 **unlock ticket**（`<data dir>/unlock.ticket`，0600，內容是主金鑰加 `expires_at`），有效期預設 15 分鐘、`--unlock-ttl <秒>` 可調；期內的命令不再問 passphrase。`lock` 命令刪掉它。過期的 ticket 讀到就刪，Unix 上模式不是 0600 就拒用 |
+  | CLI（只在開發與 debug 用） | **每次都重新解鎖**，主金鑰只在那個程序的記憶體裡、命令結束就沒了 |
 
-  CLI passphrase 的來源與 `login` 的 password 同一套：`--passphrase-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 有效的 ticket → 問終端。
-  ticket 是明文主金鑰落地，安全性等於 `Plain` 模式那 15 分鐘；維護者明說接受（CLI 不是產品面）。這一項不進 UI。
+  CLI passphrase 的來源與 `login` 的 password 同一套：`--passphrase-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 問終端。
+
+  🚫 **沒有 `unlock.ticket`**（維護者 2026-09-13 拿掉）。它原本仿 `sudo`：解鎖成功後把**明文主金鑰**
+  加 `expires_at` 寫進 `<data dir>/unlock.ticket` 15 分鐘，省掉「每個命令都要再問一次 passphrase」。
+  ⭐ 拿掉的理由是**那個痛點沒有了**：daemon 常駐、解鎖一次（architecture-v2 §1），而單發命令在 daemon
+  起著的時候本來就不准碰資料庫（§0.2），所以它退化成只在 debug／test 用、一次一個的工具 ——
+  省那幾次打字換不到「明文主金鑰落地 15 分鐘」。
 
 ### 4.1 實作與上面的差異（第一個 PR，2026-09-06）
 
@@ -104,9 +109,9 @@ local.key（0600）
 - 包主金鑰與封 session 都帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。
 - 多一個 `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問 passphrase，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
 - `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空字串 passphrase 在這裡被拒。
-- `Vault::from_master(dir, master, mode)` 給 CLI 的 ticket 用；它不驗證主金鑰是不是這個目錄的，信任等於 `Plain`。
+- `Vault::from_master(dir, master, mode)` 只給 `set_passphrase` 重包 `local.key` 用（同一個目錄、同一把主金鑰）；⚠️ 它不驗證那把金鑰是不是這個目錄的，所以🚫 除此之外不要拿它做別的事。
 - 第四把子金鑰 `media store v1` 已經導出來（`media_store_key`），還沒有人用；先把 context 字串一次定完。
-- 寫 `local.key`／`session.sealed`／ticket 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
+- 寫 `local.key`／`session.sealed` 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
 - 既有的 store 用別把金鑰開會失敗：訊息叫人刪 `matrix/` 重新 `login`，不遷移（§1 的政策）。
   ⚠️ 這裡原本寫的理由是「store 只是裝置狀態」——**那句話對 `crypto.db` 是錯的**，它裝著解開全部歷史的房間金鑰。
   政策本身維護者 2026-09-09 決定不改，但它站得住的前提是 §10 的本地金鑰池（不跟著被刪、`key-backup import` 讀得回來）。
@@ -172,7 +177,6 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 ```
 <data dir>/
   local.key                      主金鑰（§4），一台機器一把，所有帳號共用
-  unlock.ticket                  CLI 的 unlock ticket（§4）
   current                        CLI 的目前帳號
   r/<b58>_<b58>                  recovery key（§10.8）：檔名是 `recovery-key@mxid` 加密後的樣子。
                                  🚫 logout 不碰它——那是它不放在帳號目錄底下的全部理由
@@ -448,7 +452,7 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3，32 位
 
 ## 9. 還開著的
 
-1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，`session.sealed`（§4）。~~CLI 每個命令輸密碼的體感~~ 定了：仿 sudo 的 unlock ticket（§4）。
+1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，`session.sealed`（§4）。~~CLI 每個命令輸密碼的體感~~ 定了：每次重新解鎖（2026-09-13 把 unlock ticket 拿掉，§4）。
 2. ~~媒體內容快取另議~~ 定了：§8（2026-09-07 重寫成儲存池）。
 3. ~~媒體配額的數字~~ 定了：2 GiB best effort、保護期 7 天（§8.5）。事件快取不設上限；同步視窗 500 則／房、初開全域 10000 則是預設值，可調。
 4. ~~房間金鑰只在 `crypto.db`，刪了就沒~~ 定了：§10（維護者 2026-09-09），server 一份標準 backup、本地一份加密金鑰池。
@@ -781,7 +785,7 @@ account destroy @BOB:matrix.org
 原本 `account status`（舊名 `accounts`）明說「掃目錄，不開 vault、不問 passphrase」——
 兩層都加密之後做不到了：不解密就不知道有哪些 server、哪些帳號。
 
-- `passphrase` 模式下 `account status` 會問 passphrase（或吃 unlock ticket）。
+- `passphrase` 模式下 `account status` 會問 passphrase。
 - 🚫 不做「列出 Base58 但不解密」的半套輸出：那對使用者沒有意義，只會讓人以為壞了。
 - 本來就要開帳號目錄的命令沒有變差（它們早就要解鎖才讀得到 `session.sealed`）。
 

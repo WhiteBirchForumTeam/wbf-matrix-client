@@ -82,12 +82,25 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 { "code": 0, "msg": "ok", "id": 0, "result": {
     "protocol": 2,                    // 談定的那一個
     "daemon": "wbf-matrix-client-daemon 0.1.0",
+    "instance": "3f2b1c4a-5d6e-4f80-9a1b-2c3d4e5f6071",  // 這次啟動的 UUID
+    "pid": 4242,
+    "uptime_seconds": 12,
     "data_dir": "C:/Users/me/AppData/Roaming/wbf-matrix-client",
     "unlocked": false,
     "key_mode": "passphrase",         // "plain" | "passphrase" | null（還沒有 local.key）
     "encryption_enforced": true
 } }
 ```
+
+**`instance`：這次啟動的身分**（維護者 2026-09-13）。daemon 起來時鑄一個 UUID v4，活著的期間不變。
+
+- ⭐ 它回答的是前端唯一問得出口的那個問題：**「我現在講話的還是剛才那一個 daemon 嗎？」**
+  🚫 port 答不了（會被重複使用）、🚫 pid 也答不了（會被回收）。同一個 `instance` ＝ 同一個實例，
+  所以前端手上的所有狀態（訂閱、進行中的 `id`、解鎖與否）都還算數；換了就是全部重來。
+- 同一個值同時出現在**四個地方**：stdout 的 ready 那行、`<data dir>/daemon.json`、`hello` 的
+  result、`daemon.info` 的 result —— ⭐ 一個值一個來源，🚫 不各鑄一個。
+- `pid` 與 `uptime_seconds` 一起回：`pid` 給人（去 kill 它、去看 log），`uptime_seconds` 讓前端
+  一眼看出「它是不是剛剛才重開過」。⚠️ **判斷同不同一個實例只准用 `instance`**，🚫 不要用 pid。
 
 **`client`：正式名稱，`wbf-matrix` 開頭**。
 
@@ -129,7 +142,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 |---|---|---|
 | 9001 | `BAD_TOKEN` | `0x02` 的包解不開（AEAD 標籤驗不過） |
 | 9002 | `BAD_FRAME` | 不是 binary frame、`ver` 認不得、`type` 是 `0x00`、enforce 開著卻收到 `0x01`、超過 1 MiB、解開之後不是 JSON |
-| 9003 | `HELLO_REQUIRED` | 第一則不是 `hello` |
+| 9003 | `HELLO_REQUIRED` | 第一則不是 `hello`（**含 `hello` 之前送來一則寫壞的請求**：還沒談成協議，fail closed） |
 | 9004 | `BAD_CLIENT` | `client` 不以 `wbf-matrix` 開頭 |
 | 9005 | `PROTOCOL_MISMATCH` | `protocols` 跟 daemon 的沒有交集 |
 | 9006 | `SHUTTING_DOWN` | daemon 要關了 |
@@ -137,7 +150,11 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - **`9000–9099` 是協議層**：這條連線本身出了問題，回完就關。**其餘一切**——房間操作失敗、衝突、上游 homeserver 的錯誤、
   vault 鎖著——都是**請求層**的，用當時的加密狀態送（enforce 開著就是 `0x02`）。
   判準：**連線還能不能用**。能用 → 請求層、密文；不能用 → 協議層、明文、關。
+- ⚠️ **「解開之後是 JSON、但不是一個請求」不是協議層的事**：那是 `100`（§5.1），回完**連線照用**。
+  判準還是同一條 —— 封裝壞了（解不開、不是 JSON）連線就沒救了；一則寫壞的請求只是那一則壞了。
+  📎 例外是 `hello` 之前：還沒談成協議，所以寫壞的請求一律 `9003` 關掉。
 - `id`：對得上某個請求（`hello` 被拒）就帶那個 `id`；對不上（解不開、shutdown）就 `null`。🚫 不省略欄位。
+  📎 `100` 的 `id`：JSON 裡的 `id` 剛好是整數就帶著它回（`method` 壞掉時前端還配得起來），否則 `null`。
 - `result.close` 是**大寫底線**的字串，跟 `code` 一對一——留著是給人讀 log 用，前端判斷用 `code`。
 - 這則之後緊接 WS close frame（status 1008 policy violation；`SHUTTING_DOWN` 用 1001 going away）。
 - ⚠️ 明文包**只出現在關連線前**，而且**內容裡永遠沒有秘密**（不回 token、不回解出來的東西）。
@@ -165,13 +182,39 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | method | params | result | core |
 |---|---|---|---|
 | `hello` | §1.3 | §1.3 | — |
-| `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections }` | `key_mode`、`is_unlocked` |
+| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
+| `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
-| `vault.lock` | — | `{ ok: true }` | ⚠️ core 沒有——`Core` 是解鎖一次就活著；daemon 這邊 lock ＝ 丟掉 `Core` 重開一個。**沒有 ticket 可刪**（§1 那個妥協消失了） |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
 | `vault.remove_passphrase` | — | `{ ok: true, key_mode: "plain" }` | `set_passphrase(None)` |
+
+🚨 **沒有 `vault.lock`**（維護者 2026-09-13 定）。**daemon 不提供「鎖上」這個 feature**，
+`Core` 的生命週期就是「啟動時解鎖一次、活到程序結束」。
+
+| 想要的 | 怎麼做 |
+|---|---|
+| **UI 的 lock／unlock**（暫時離開、閒置） | **UI 自己那一層**鎖畫面。🚫 不動 daemon：daemon 照樣連著 server、照樣寫 DB、照樣發通知——⭐ 使用者離開時收到訊息，回來就該看到它，而不是一段空白 |
+| **真的鎖上**（金鑰離開記憶體） | `daemon.shutdown`，要用再 `daemon -s` 起一次。⭐ 這才是「鎖 vault」的真正意思：停掉所有訂閱、關掉所有連線、程序結束、`Vault` 在 drop 時被 zeroize |
+
+為什麼不做一個 `vault.lock`：**它做不到它名字承諾的事。** 請求各自跑，`call()` 一進來就先拿一份
+`Arc<Core>`，所以「把 `Handle.core` 換成一個沒解鎖的」只換得掉**之後**進來的請求 —— 已經拿到舊那份的
+長工作（`sync.recent`、`upload.file`、`media.save_to`…）會繼續用解鎖狀態跑完，而金鑰要等**最後一個**
+持有者放手才會被抹掉。那時回 `{ok: true}` 是在說謊，而一個回報成功、邊界卻沒成立的安全操作
+**比明確失敗危險得多**。⭐ 與其做一個「盡量鎖」，不如只留一條真的做得到的路（shutdown）。
+📎 這條在 PR #30 進來、PR #31 的審查（cirno🔴、rumia🔴）發現它擋不住 in-flight 請求，
+維護者 2026-09-13 決定整條拿掉。
+
+🚨 **fresh 資料目錄的起手式是 `vault.create`，🚫 不是 `account.add`**（維護者定調前的第一版讓
+`account.add` 自己偷建一把 plain 的，PR #31 審查 rumia🔴、salvia🔴 指出那是能力退化）：
+
+- 那把偷建的只能是 **plain**，所以想要 passphrase 的前端被迫「先落一份 plain `local.key` → 再
+  `vault.set_passphrase` 重包」。⭐ 中間那段時間磁碟上的主金鑰**沒有 passphrase 保護**，
+  而 `vault.set_passphrase` 又要求 vault 已經解鎖 —— fresh 狀態下那條路根本走不到。
+- 所以「要不要 passphrase」在**建的那一步**就要決定，跟 CLI 的 `login` 一樣一步到位。
+- 沒建就去叫別的 method：閘門回 **`1002`**（不是 `1001`）——⭐ 「還沒有 vault」與「有但鎖著」的
+  下一步不同（`vault.create` vs `vault.unlock`），所以🚫 不共用一個 code；`msg` 裡直接寫下一步。
 
 ⚠️ passphrase 用 base64 而不是字串：它是任意 bytes（可以是一個 mp3）。🚫 不提供 `passphrase_file`
 ——那是「daemon 替前端讀檔」，web 前端根本給不出檔案路徑，而 rpc-cli 自己讀了再送不多一行。
@@ -180,7 +223,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。沒 `local.key` 就先 `create_vault(None)`（plain）——要 passphrase 模式先 `vault.set_passphrase` |
+| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。⚠️ **要先 `vault.create`**：🚫 它不替前端建 vault |
 | `account.list` | — | `AccountStatus`：`{ accounts: [{ user_id?, server, localpart, logged_in, current }], undecryptable_hint? }` | `account_status` |
 | `account.switch` | `{ user, server? }` | `SwitchResult`：`{ current, switched_from?, logged_in }` | `switch_current` |
 | `account.whoami` | `{ user?, server? }` | `{ user_id, device_id, server }` | `whoami` |
@@ -197,7 +240,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `room.list` | `{ user?, server? }` | `[Conversation]`（chat-model §2.1） | `list_conversations` |
 | `room.get` | `{ room, user?, server? }` | `Conversation` | `conversation` |
 | `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
-| `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared }` | `send_file`。長工作：推 `progress` |
+| `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
 | `room.history` | `HistoryQuery` 加 `user?`／`server?`：`{ room, limit, before?, source: "server"\|"cache", types?, sender? }` | `MessagePage`：`{ events: [Message], next? }` | `history` |
 | `room.files` | `{ room, limit, before?, source, user?, server? }` | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
@@ -298,6 +341,8 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
 | 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
+| 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。🚫 不是前端的錯，所以🚫 不關連線 |
+| 109 | `no_write_access` | 這個 daemon **沒有寫這個資料目錄的權**：別人握著排他鎖（architecture-v2 §0.2）。⚠️ 跟 `1001`（vault 鎖著）不是同一件事 —— 那是「還沒解鎖」，這是「這個目錄現在是別人的」。前端該做的是去連**那一個** daemon，🚫 不是重試 |
 
 ### 5.2 core 層 ＝ `CoreErrorKind` 的號碼
 
@@ -357,7 +402,7 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 
 - 進度走 RPC 的 `progress`，`id` 是 `media.create` 那一則的 `id`——所以前端要留著那個 `id`。
 - 中途斷線：daemon 保留狀態檔（CLI 規格 §6），同一個 token **重新 PUT 可以續傳**，daemon 從 `Status` 問到收了幾塊、回 `100 Continue` 之前先跳過那些 bytes。⚠️ 續傳的細節（怎麼告訴前端從第幾 byte 送）第一版不做，先整個重送。
-- token TTL 與撤銷（architecture-v2 §8 第 5 點）**第一版**：TTL 1 小時、`account.del`／`vault.lock` 時全部作廢。
+- token TTL 與撤銷（architecture-v2 §8 第 5 點）**第一版**：TTL 1 小時、`account.del` 時全部作廢（🚫 沒有 `vault.lock` 可以掛，§3.1）。
 
 ## 7. 一次完整的例子：Desktop 送一個 2 GB 的影片進 E2EE 房
 
@@ -384,7 +429,6 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 
 | 缺什麼 | 給誰用 |
 |---|---|
-| `Core::lock()`（或 daemon 丟掉重開） | `vault.lock` |
 | 「建檔 → 拿 reader 邊收邊傳」的拆分：`send_file` 現在是一條龍 | `media.create`、`room.send_attachment`、`PUT /upload` |
 | `PoolReader` 接到 HTTP Range：`download_to` 只會寫檔 | `GET /media` |
 | `CoreEvent` 補 `SyncState` 與結構化的 `Progress { id, done, total }` | §4 |
@@ -399,17 +443,20 @@ daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進�
 - 🚫 daemon 不問終端、不彈視窗、不讀 passphrase 檔：全部從 RPC 進來（§4.5）。
 - 🚫 `msg` 不當邏輯用、🚫 `code` 不重排、🚫 `method` 不改名——改名等於新 method 加舊的廢棄，廢棄的回 `101` 前先活一個版本。
 
-## 10. 每個 method 的實作現況（2026-09-12；判準見檔頭）
+## 10. 每個 method 的實作現況（2026-09-13；判準見檔頭）
 
 「底層」是它最後跟 homeserver 講話走哪條。✅ 只給 **WS**；matrix-sdk 的 HTTP 與 HTTP fallback 都是 🔁「能動、要遷」；
-core 沒有的是 ❌。daemon 那一層：pack、加密、hello、連線狀態機、WS listener ✅（`crates/wbf-daemon` 第一版）；
-訂閱／推播／cancel、資料平面 HTTP ❌。這張表其餘只看 core 以下。
+core 沒有的是 ❌。daemon 那一層：pack、加密、hello、連線狀態機、WS listener、conf（`Settings`）、
+**下表有 core 對應的 method 全部接上了**（`crates/wbf-daemon` 第二版）；訂閱／推播／cancel、資料平面 HTTP ❌。
+這張表的「底層」只看 core 以下。📎 2026-09-13 對真 wbfuwunel 走過 `account.add → whoami → server.ping → room.list → sync.recent →
+backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 
 | method | core | 底層 | 判定 |
 |---|---|---|---|
-| `hello`、`daemon.info`／`set_encryption`／`shutdown`、`vault.lock` | ✅ daemon 層 | 本機 | ✅ |
+| `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
-| `vault.unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
+| `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
+| `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |
 | `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |

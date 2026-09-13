@@ -52,7 +52,7 @@ pub async fn fetch<C: PackChannel>(
     manifest: &Manifest,
     cache: &mut Cache,
     pool: &MediaPool,
-    on_progress: &mut dyn FnMut(u32, u32),
+    on_progress: &mut (dyn FnMut(u32, u32) + Send),
 ) -> Result<Fetched, SdkError> {
     let block = &manifest.block;
     let entry = cache.media_begin(

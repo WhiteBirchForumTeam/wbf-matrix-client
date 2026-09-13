@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::conf::{Conf, Entry};
+use wbf_core::conf::{Conf, Entry};
 use wbf_core::Core;
 use wbf_core::UploadRequest;
 use wbf_core::{CoreError, CoreErrorKind};
@@ -43,16 +43,12 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
             }
             // `logout` 就是 `account del <current 帳號>`（CLI 規格 §3.1）。
             let current = context.core()?.current_user_id()?;
-            let result = log_out_and_clear_ticket(context, &current, accept_history_loss).await?;
+            let result = log_out(context, &current, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": result.user }))
         }
         Command::Account { action } => account_command(context, action).await,
         Command::KeyBackup { action } => key_backup_command(context, action).await,
         Command::Recovery { action } => recovery_command(context, action),
-        Command::Lock => {
-            let removed = context.unlock.delete_ticket()?;
-            print_json(&json!({ "ok": true, "had_ticket": removed }))
-        }
         Command::SetPassphrase {
             new_passphrase_file,
         } => {
@@ -61,13 +57,10 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
                 None => prompt_new_passphrase()?,
             };
             let mode = context.core()?.set_passphrase(Some(&passphrase))?;
-            // 舊 ticket 是用舊 passphrase 換來的；換了就作廢，下一個命令要用新的。
-            context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "mode": mode }))
         }
         Command::RemovePassphrase => {
             let mode = context.core()?.set_passphrase(None)?;
-            context.unlock.delete_ticket()?;
             print_json(&json!({ "ok": true, "mode": mode }))
         }
         Command::Whoami => {
@@ -220,7 +213,7 @@ pub struct Context {
     /// 常駐狀態（architecture-v2 §7）。⚠️ 現在一個命令建一個、命令結束就丟；
     /// daemon 接手之後它會活過整個程序，而這裡的程式碼不必改——這正是先做 `wbf-core` 的理由。
     ///
-    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次、ticket 寫兩次。
+    /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次。
     core: Core,
     pub account_override: Option<String>,
     pub server_override: Option<String>,
@@ -235,7 +228,7 @@ pub struct Context {
     /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 §10.4）。同樣落到 `true`。
     pub local_room_keys: bool,
     /// 這次實際生效的值，給自動生成用（§10.3）。🚫 裡面沒有秘密。
-    effective: Vec<crate::conf::Entry>,
+    effective: Vec<wbf_core::conf::Entry>,
     /// `--data-dir`／`WBF_DATA_DIR` 有給嗎——自動生成的三個條件之一。
     data_dir_was_given: bool,
     /// 備份關掉的警告一個命令只印一次（`rooms::backend` 可能被叫不只一次）。
@@ -248,7 +241,6 @@ const KNOWN_CONF_KEYS: &[&str] = &[
     "SERVER",
     "ACCOUNT",
     "TRANSPORT",
-    "UNLOCK_TTL",
     "PASSPHRASE_FILE",
     "PASSWORD_FILE",
     "SERVER_BACKUP",
@@ -271,7 +263,7 @@ impl Context {
             Some(path) => path.clone(),
             None => default_data_dir()?,
         };
-        let conf = crate::conf::load(cli.config.as_deref(), &data_dir)?;
+        let conf = wbf_core::conf::load(cli.config.as_deref(), &data_dir)?;
         let mut warnings = conf.warnings().to_vec();
         warnings.extend(conf.warn_about_unknown_keys(KNOWN_CONF_KEYS));
         let server = cli
@@ -280,10 +272,6 @@ impl Context {
             .or_else(|| conf.find("SERVER").map(str::to_string));
         let server_backup = conf.is_on("SERVER_BACKUP", true, &mut warnings);
         let local_room_keys = conf.is_on("LOCAL_ROOM_KEYS", true, &mut warnings);
-        let unlock_ttl = match cli.unlock_ttl {
-            Some(seconds) => seconds,
-            None => conf.get_number("UNLOCK_TTL", 900, &mut warnings),
-        };
         let transport_name = cli
             .transport
             .clone()
@@ -306,37 +294,31 @@ impl Context {
                 section: "general",
                 key: "SERVER",
                 value: server.clone().unwrap_or_default(),
-                origin: crate::conf::origin_of(cli.server.is_some(), conf.find("SERVER").is_some()),
+                origin: wbf_core::conf::origin_of(
+                    cli.server.is_some(),
+                    conf.find("SERVER").is_some(),
+                ),
             },
             Entry {
                 section: "general",
                 key: "TRANSPORT",
                 value: transport_name.clone(),
-                origin: crate::conf::origin_of(
+                origin: wbf_core::conf::origin_of(
                     cli.transport.is_some(),
                     conf.find("TRANSPORT").is_some(),
-                ),
-            },
-            Entry {
-                section: "general",
-                key: "UNLOCK_TTL",
-                value: unlock_ttl.to_string(),
-                origin: crate::conf::origin_of(
-                    cli.unlock_ttl.is_some(),
-                    conf.find("UNLOCK_TTL").is_some(),
                 ),
             },
             Entry {
                 section: "backup",
                 key: "SERVER_BACKUP",
                 value: on_off(server_backup),
-                origin: crate::conf::origin_of(false, conf.find("SERVER_BACKUP").is_some()),
+                origin: wbf_core::conf::origin_of(false, conf.find("SERVER_BACKUP").is_some()),
             },
             Entry {
                 section: "backup",
                 key: "LOCAL_ROOM_KEYS",
                 value: on_off(local_room_keys),
-                origin: crate::conf::origin_of(false, conf.find("LOCAL_ROOM_KEYS").is_some()),
+                origin: wbf_core::conf::origin_of(false, conf.find("LOCAL_ROOM_KEYS").is_some()),
             },
         ]
         .into_iter()
@@ -356,8 +338,6 @@ impl Context {
                     .passphrase_file
                     .clone()
                     .or_else(|| conf.find("PASSPHRASE_FILE").map(PathBuf::from)),
-                unlock_ttl: std::time::Duration::from_secs(unlock_ttl),
-                quiet: cli.quiet,
             },
             server_override: server.clone(),
             // 🚫 token 不從 conf 來（§10.5）：秘密不落地在明文檔裡。
@@ -426,7 +406,7 @@ impl Context {
 
     /// 這個命令的常駐狀態，**保證已經解鎖**。
     ///
-    /// ⚠️ 「怎麼拿到 passphrase」是 rpc-cli 這一側的責任（旗標的檔、ticket、問終端），
+    /// ⚠️ 「怎麼拿到 passphrase」是 rpc-cli 這一側的責任（旗標的檔、問終端），
     /// 所以每次交出 `Core` 之前先在這裡把它解開——這樣底下的程式碼不必各自記得。
     /// daemon 那邊沒有這一步：解鎖是一次性的 RPC（`vault.unlock`），不是每個命令做一次。
     pub fn core(&self) -> Result<&Core, CoreError> {
@@ -461,9 +441,6 @@ impl Context {
                 wbf_sdk::vault::KeyMode::Passphrase => "passphrase",
             }
         ));
-        if mode == wbf_sdk::vault::KeyMode::Passphrase {
-            self.unlock.write_ticket_for(&self.core)?;
-        }
         Ok(())
     }
 
@@ -481,10 +458,10 @@ impl Context {
         if !self.data_dir_was_given {
             return Ok(());
         }
-        if crate::conf::write_if_absent(&self.unlock.data_dir, &self.effective)? {
+        if wbf_core::conf::write_if_absent(&self.unlock.data_dir, &self.effective)? {
             self.progress(format!(
                 "wrote {} with the values this run used; edit it or delete it, it will not be rewritten",
-                self.unlock.data_dir.join(crate::conf::CONF_FILE_NAME).display()
+                self.unlock.data_dir.join(wbf_core::conf::CONF_FILE_NAME).display()
             ));
         }
         Ok(())
@@ -593,7 +570,7 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
             user,
             accept_history_loss,
         } => {
-            let result = log_out_and_clear_ticket(context, &user, accept_history_loss).await?;
+            let result = log_out(context, &user, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": result.user }))
         }
         AccountAction::Destroy {
@@ -604,11 +581,8 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
     }
 }
 
-/// `logout`／`account del` 共用：登出之後**清掉 rpc-cli 自己的 ticket**。
-///
-/// 🚫 ticket 不在 `Core` 裡（它是「一個命令一個程序」的妥協，daemon 接手就消失），
-/// 所以清它是這一側的責任。
-async fn log_out_and_clear_ticket(
+/// `logout`／`account del` 共用。
+async fn log_out(
     context: &Context,
     user: &str,
     accept_history_loss: bool,
@@ -623,7 +597,6 @@ async fn log_out_and_clear_ticket(
         )
         .await
         .map_err(with_recovery_hint)?;
-    context.unlock.delete_ticket()?;
     Ok(result)
 }
 
@@ -773,7 +746,6 @@ async fn destroy_account_command(
         .destroy_account(user, server, accept_history_loss, context.server_backup)
         .await
         .map_err(with_recovery_hint)?;
-    context.unlock.delete_ticket()?;
     let mut output = serde_json::to_value(result).expect("serializes");
     output["ok"] = json!(true);
     print_json(&output)
@@ -1025,7 +997,6 @@ mod conf_precedence_tests {
             account: None,
             config: None,
             passphrase_file: None,
-            unlock_ttl: None,
             json: false,
             quiet: true,
             transport: None,
@@ -1044,8 +1015,8 @@ mod conf_precedence_tests {
     fn conf_fills_in_what_the_flags_did_not_give() {
         let dir = scratch("conf");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
-            "[general]\nSERVER=http://from-conf:6167\nACCOUNT=@alice:localhost\nUNLOCK_TTL=60\nTRANSPORT=http\n[backup]\nSERVER_BACKUP=off\n",
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
+            "[general]\nSERVER=http://from-conf:6167\nACCOUNT=@alice:localhost\nTRANSPORT=http\n[backup]\nSERVER_BACKUP=off\n",
         )
         .unwrap();
         let context = Context::from(&cli_with(&dir)).unwrap();
@@ -1057,10 +1028,7 @@ mod conf_precedence_tests {
             context.account_override.as_deref(),
             Some("@alice:localhost")
         );
-        assert_eq!(
-            context.unlock.unlock_ttl,
-            std::time::Duration::from_secs(60)
-        );
+        assert_eq!(context.transport, Transport::Http);
         assert!(!context.server_backup);
         // 🚫 沒寫的鍵落到安全值，不是落到 false。
         assert!(context.local_room_keys);
@@ -1071,19 +1039,20 @@ mod conf_precedence_tests {
     fn a_flag_beats_the_conf_file() {
         let dir = scratch("flag");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
-            "[general]\nSERVER=http://from-conf:6167\nUNLOCK_TTL=60\n",
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
+            "[general]\nSERVER=http://from-conf:6167\nTRANSPORT=http\n",
         )
         .unwrap();
         let mut cli = cli_with(&dir);
         cli.server = Some("http://from-flag:6167".into());
-        cli.unlock_ttl = Some(5);
+        cli.transport = Some("ws".to_string());
         let context = Context::from(&cli).unwrap();
         assert_eq!(
             context.server_override.as_deref(),
             Some("http://from-flag:6167")
         );
-        assert_eq!(context.unlock.unlock_ttl, std::time::Duration::from_secs(5));
+        // conf 說 http、旗標說 ws → 旗標贏。
+        assert_eq!(context.transport, Transport::WebSocket);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1092,10 +1061,7 @@ mod conf_precedence_tests {
         let dir = scratch("none");
         let context = Context::from(&cli_with(&dir)).unwrap();
         assert_eq!(context.server_override, None);
-        assert_eq!(
-            context.unlock.unlock_ttl,
-            std::time::Duration::from_secs(900)
-        );
+        assert_eq!(context.transport, Transport::WebSocket);
         // 兩個開關的安全值都是「開著」。
         assert!(context.server_backup && context.local_room_keys);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1114,7 +1080,7 @@ mod conf_precedence_tests {
         // ⚠️ 進 conf 的是**路徑**不是秘密（§10.5）——秘密是那個檔的內容，它從來不進 conf。
         let dir = scratch("pwfile");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
             "[general]
 PASSWORD_FILE=/tmp/from-conf
 ",
@@ -1143,7 +1109,7 @@ PASSWORD_FILE=/tmp/from-conf
     fn a_secret_in_the_conf_file_is_not_used() {
         let dir = scratch("secret");
         std::fs::write(
-            dir.join(crate::conf::CONF_FILE_NAME),
+            dir.join(wbf_core::conf::CONF_FILE_NAME),
             "[general]\nACCESS_TOKEN=syt_nope\n",
         )
         .unwrap();
@@ -1163,7 +1129,7 @@ PASSWORD_FILE=/tmp/from-conf
         let context = Context::from(&cli).unwrap();
         context.write_conf_if_asked_for().unwrap();
 
-        let written = std::fs::read_to_string(dir.join(crate::conf::CONF_FILE_NAME)).unwrap();
+        let written = std::fs::read_to_string(dir.join(wbf_core::conf::CONF_FILE_NAME)).unwrap();
         assert!(
             written.contains("SERVER=http://from-flag:6167"),
             "{written}"
@@ -1185,7 +1151,7 @@ PASSWORD_FILE=/tmp/from-conf
     #[test]
     fn an_existing_conf_is_never_rewritten() {
         let dir = scratch("keep");
-        let path = dir.join(crate::conf::CONF_FILE_NAME);
+        let path = dir.join(wbf_core::conf::CONF_FILE_NAME);
         std::fs::write(&path, "[general]\nSERVER=http://mine:6167\n").unwrap();
         let context = Context::from(&cli_with(&dir)).unwrap();
         context.write_conf_if_asked_for().unwrap();
@@ -1206,7 +1172,7 @@ PASSWORD_FILE=/tmp/from-conf
         let mut context = Context::from(&cli_with(&dir)).unwrap();
         context.data_dir_was_given = false;
         context.write_conf_if_asked_for().unwrap();
-        assert!(!dir.join(crate::conf::CONF_FILE_NAME).exists());
+        assert!(!dir.join(wbf_core::conf::CONF_FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
