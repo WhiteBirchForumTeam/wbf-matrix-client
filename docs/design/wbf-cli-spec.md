@@ -476,6 +476,9 @@ TRANSPORT=ws
 SERVER_BACKUP=on          ; 標準 Matrix key backup（local-cache-db.md §10.3）
 LOCAL_ROOM_KEYS=on        ; 本地加密金鑰池（同 §10.4）
 
+[read]
+READ_RECEIPTS=private     ; 已讀回執送上游時公不公開；private（預設）／public（daemon-runtime.md §6.3）
+
 [media]
 QUOTA_MIB=2048
 PROTECT_DAYS=7
@@ -519,6 +522,9 @@ clap 免費給），🚫 不要在 `Settings::load` 裡自己讀 `std::env` —�
 ### 10.4 認不得的東西怎麼辦：不是正面認得就落到安全值
 
 - **認不得的區段或鍵**：印一行警告到 stderr，忽略它，命令照跑。（conf 要往前相容：舊版 CLI 讀到新版寫的鍵不該整個掛掉。）
+- ⚠️ **`READ_RECEIPTS` 的安全值是 `private`**：只正面認得 `public` 才公開，其餘一律 private
+  （拼錯、空的、認不得的值都是）。⭐ 壞在「別人看不到你已讀」，🚫 不壞在「你被看見了」——
+  後者不可回收（daemon-runtime.md §6.3）。
 - **認得的鍵、認不得的值**：⚠️ 開關型的鍵（`SERVER_BACKUP`、`LOCAL_ROOM_KEYS`）**只正面認得 `on` 與 `off`**（不分大小寫）；
   其他任何值（`true`、`1`、`yes`、拼錯的 `of`）一律警告並落到**安全值**，也就是 `on`。
   判斷一律寫成「**正面認得 `off` 才關**」，🚫 不寫成「不等於 `on` 就關」—— 壞掉的時候要壞在「備份還開著」那一邊，不是「以為開著、其實沒開」。

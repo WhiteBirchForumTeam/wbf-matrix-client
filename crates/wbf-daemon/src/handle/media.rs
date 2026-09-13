@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use wbf_core::{Core, UploadRequest};
+use wbf_core::{Core, SyncMode, UploadRequest};
 use wbf_sdk::Manifest;
 
 use super::{
@@ -108,6 +108,9 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
         mxc: String,
         #[serde(default)]
         manifest: Option<Value>,
+        /// 沒帶就是 `local`（rpc-spec §2）。⭐ 媒體不可變，本地那份就是同一份事實。
+        #[serde(default)]
+        sync: SyncMode,
         #[serde(flatten)]
         transport: TransportParam,
         #[serde(flatten)]
@@ -123,6 +126,7 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
         core.media_info(
             &params.mxc,
             manifest.as_ref(),
+            params.sync,
             transport,
             &handle.target(&params.target),
         )

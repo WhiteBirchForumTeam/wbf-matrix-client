@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-use wbf_sdk::chat::{ChatBackend, Message, Update, WatchControl};
+use wbf_sdk::chat::{ChatBackend, Update, WatchControl};
 use wbf_sdk::event_json::messages_from_json;
 use wbf_sdk::{RecentPlan, Transport};
 
@@ -56,7 +56,15 @@ pub struct RecentSummary {
 impl Core {
     /// 等這個房間的新事件。**每一則發一個 [`CoreEvent::Message`]**。
     ///
-    /// 收尾時把印過的寫穿快取（callback 是同步的，所以收在外面一次寫）。
+    /// 🚨 **每一則都是「進 queue，由寫入者 commit 之後才發事件」**，🚫 不是「先發、
+    /// 最後再一次寫」（PR #32 審查 cirno🔴）。原本那樣有兩個洞：
+    ///
+    /// - 訂閱者收到通知馬上去讀本地 —— **讀不到那一則**（還沒寫）；寫失敗的話更是
+    ///   通知發了、快取裡永遠沒有。
+    /// - `Tail` 根本不會回來，所以「收尾時寫」＝ **一則都不會落地**，全積在記憶體裡。
+    ///
+    /// 📎 回來之前會等 queue 排空（一張空回執），所以 `watch` 一回來，它看到的都已經在庫裡
+    /// —— 單發命令那種「印完就結束程序」才不會把還沒寫的丟掉。
     pub async fn watch(
         &self,
         room: &str,
@@ -77,7 +85,9 @@ impl Core {
             }
         };
         let once = matches!(mode, WatchMode::Once { .. });
-        let mut seen: Vec<Message> = Vec::new();
+        // ⚠️ 寫入者先拿到手：拿不到就**現在**失敗，🚫 不要一路 watch 完才發現一則都沒寫進去。
+        let (cache, _) = self.server_cache_and_me(&account)?;
+        let mut seen = 0usize;
         let mut on_update = |update: Update| -> WatchControl {
             let Update::NewMessage(message) = &update else {
                 return WatchControl::Continue;
@@ -87,22 +97,33 @@ impl Core {
             }
             // 自己送的也發出去（呼叫端自己濾），但 `once` 不把自己的算「第一則」。
             let own = message.sender == me;
-            self.events.emit(CoreEvent::Message(message.clone()));
-            seen.push((**message).clone());
+            // 🚨 寫跟事件**一起**進 queue：事件由寫入者在 commit 之後發，
+            // 所以收到通知的人去讀本地一定讀得到（daemon-runtime §2.3）。
+            let stored = (**message).clone();
+            let writer_me = me.clone();
+            cache.post(
+                move |cache| {
+                    cache
+                        .upsert_messages(&writer_me, std::slice::from_ref(&stored))
+                        .map(|_| ())
+                },
+                vec![CoreEvent::Message {
+                    user: me.clone(),
+                    message: message.clone(),
+                }],
+            );
+            seen += 1;
             match once && !own {
                 true => WatchControl::Stop,
                 false => WatchControl::Continue,
             }
         };
         let end = backend.watch(since, deadline, &mut on_update).await?;
-        if !seen.is_empty() {
-            if let Ok((mut cache, me)) = self.cache_and_me(&account) {
-                self.write_through(cache.upsert_messages(&me, &seen));
-            }
-        }
+        // 空回執：等前面那些都 commit 完才回。🚫 不然單發命令會在寫完之前就結束程序。
+        cache.run(|_| Ok(())).await?;
         Ok(WatchSummary {
             since: end.since,
-            seen: seen.len(),
+            seen,
             stopped_by_message: end.stopped_by_callback,
         })
     }
@@ -125,12 +146,12 @@ impl Core {
         target: &Target,
     ) -> Result<RecentSummary, CoreError> {
         let account = self.account_or_current(target)?;
-        let (mut cache, me) = self.cache_and_me(&account)?;
+        let (cache, me) = self.server_cache_and_me(&account)?;
         let mut client = self.client_of(&account, transport).await?;
         client.hello(client_name).await?;
         let cg_seq = match from_scratch {
             true => None,
-            false => cache.get_cg_seq(&me)?,
+            false => cache.read().await.get_cg_seq(&me)?,
         };
         let mut pulled = 0usize;
         let mut written = 0usize;
@@ -150,7 +171,13 @@ impl Core {
             });
             skipped_without_room += without_room.len();
             let messages = messages_from_json("unknown", &with_room);
-            written += cache.upsert_messages(&me, &messages)?;
+            // ⚠️ 這個回呼是**同步**的（SDK 的收批介面），而 `written` 要的是真的寫進去幾則，
+            // 所以走 `run_blocking`：排進同一條 queue、等它 commit。
+            // ⭐ 阻塞的程度跟以前一樣（以前也是在這裡同步寫），換到的是「順序與水位由一個地方管」。
+            let me_here = me.clone();
+            written += cache
+                .run_blocking(move |cache| cache.upsert_messages(&me_here, &messages))
+                .map_err(|error| wbf_sdk::SdkError::Usage(error.message))?;
             self.events.progress(format!(
                 "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",
                 meta.bc, meta.tc, meta.r, meta.fs, meta.ls
@@ -164,7 +191,12 @@ impl Core {
             ));
         }
         if let Some(new_cg_seq) = summary.new_cg_seq {
-            cache.set_cg_seq(&me, new_cg_seq)?;
+            // 🚨 水位最後才推進，而且**跟事件走同一條 queue** —— 這樣「事件還沒寫進去、
+            // 水位卻前進了」不可能發生（daemon-runtime §2.3）。
+            let me_here = me.clone();
+            cache
+                .run(move |cache| cache.set_cg_seq(&me_here, new_cg_seq))
+                .await?;
         }
         if !summary.caught_up {
             self.events.progress(format!(

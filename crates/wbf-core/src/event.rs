@@ -25,11 +25,49 @@ const EVENT_QUEUE: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CoreEvent {
     /// 一句給人看的話。⚠️ 措辭是**給人看的**，🚫 前端不要拿它做邏輯判斷
-    /// （要判斷就等 method 的回傳值，或之後補一個有型別的 variant）。
-    Progress(String),
-    /// `watch` 收到的一則訊息。串流的東西走事件，🚫 不等收齊再一次回
-    /// ——`watch tail` 永遠不會「收齊」。
-    Message(Box<wbf_sdk::chat::Message>),
+    /// （要判斷就看 [`CoreEvent::Progress`] 的數字，或 method 的回傳值）。
+    Note {
+        /// 哪一個工作發的（[`crate::job::run_as_job`] 標的）。`None` ＝ 不在任何工作裡。
+        job: Option<u64>,
+        text: String,
+    },
+    /// 長工作的進度。⭐ 有數字，前端可以畫進度條，🚫 不必去 parse 一句話。
+    Progress {
+        job: Option<u64>,
+        /// 已經完成多少（單位由那個工作決定：塊、byte、事件…；`note` 講得出是什麼）。
+        done: u64,
+        /// 總共多少。**串流的時候不知道，就是 `None`**，🚫 不要填 0 假裝知道。
+        total: Option<u64>,
+        /// 給人看的一句話，例如 "chunk 3/10"。
+        text: String,
+    },
+    /// 收到一則訊息（`watch`、或 daemon 的上游會話，architecture-v2 §6.1）。
+    /// 串流的東西走事件，🚫 不等收齊再一次回 ——`watch tail` 永遠不會「收齊」。
+    Message {
+        /// **哪個帳號的**。⚠️ 事件是每個帳號一組的（architecture-v2 §6.1），
+        /// 所以每個帳號相關的事件都要說得出是誰的，🚫 不能讓前端猜。
+        user: String,
+        message: Box<wbf_sdk::chat::Message>,
+    },
+    /// 這個帳號跟它的 homeserver 之間的狀態變了（architecture-v2 §6.1）。
+    SyncState {
+        user: String,
+        state: SyncState,
+        /// 房間事件的水位；不知道就 `None`。
+        cg_seq: Option<i64>,
+    },
+}
+
+/// 一個帳號跟它的 homeserver 之間現在是什麼狀態（rpc-spec §4 的 `sync.state`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncState {
+    /// 連上了，但還在追歷史（`Recent` 還沒拉完）。
+    CatchingUp,
+    /// 追平了：現在收到的都是新的。
+    CaughtUp,
+    /// 斷了。⚠️ 這是**那一個帳號**的連線斷了，🚫 不代表 daemon 有問題。
+    Disconnected,
 }
 
 /// core 內部拿來發事件的那一端。
@@ -40,6 +78,7 @@ pub enum CoreEvent {
 ///
 /// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（§4.7「允許多條連線，每條都平等」），
 /// 而且**沒有訂閱者時發送是零成本的**——rpc-cli 在 `--quiet` 下就是這種情況。
+#[derive(Clone)]
 pub(crate) struct EventSink {
     sender: broadcast::Sender<CoreEvent>,
 }
@@ -62,9 +101,30 @@ impl EventSink {
         let _ = self.sender.send(event);
     }
 
-    /// `emit(CoreEvent::Progress(..))` 的簡寫——core 裡面最常發的就是這個。
+    /// 發一句給人看的話。core 裡面最常發的就是這個。
+    ///
+    /// ⚠️ `job` 是**自動**填的（[`crate::job::current`]）：呼叫端🚫 不用管，也不該管 ——
+    /// 它是「現在這個 async 工作是誰」的答案，而那個答案只有跑它的人（daemon）知道。
     pub(crate) fn progress(&self, message: impl Into<String>) {
-        self.emit(CoreEvent::Progress(message.into()));
+        self.emit(CoreEvent::Note {
+            job: crate::job::current(),
+            text: message.into(),
+        });
+    }
+
+    /// 發一個有數字的進度。
+    ///
+    /// Args:
+    ///     done: 已完成, example: 3
+    ///     total: 總數；不知道就 None, example: Some(10)
+    ///     text: 給人看的一句話, example: "chunk 3/10"
+    pub(crate) fn progress_of(&self, done: u64, total: Option<u64>, text: impl Into<String>) {
+        self.emit(CoreEvent::Progress {
+            job: crate::job::current(),
+            done,
+            total,
+            text: text.into(),
+        });
     }
 }
 
@@ -87,7 +147,10 @@ mod tests {
         sink.progress("after");
         assert_eq!(
             rx.recv().await.unwrap(),
-            CoreEvent::Progress("after".into())
+            CoreEvent::Note {
+                job: None,
+                text: "after".into()
+            }
         );
     }
 
@@ -100,7 +163,10 @@ mod tests {
         sink.progress("now someone is here");
         assert_eq!(
             rx.recv().await.unwrap(),
-            CoreEvent::Progress("now someone is here".into())
+            CoreEvent::Note {
+                job: None,
+                text: "now someone is here".into()
+            }
         );
     }
 }

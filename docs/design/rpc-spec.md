@@ -166,6 +166,35 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `user` | string? | 對哪個帳號動作，mxid 或 localpart。**沒給 = `current`**。＝ `wbf-core::Target.user` |
 | `server` | string? | 同名 localpart 在多個 server 時消歧。＝ `Target.server` |
 | `transport` | `"ws"` \| `"http"` | 跟 wbfuwunel 講話走哪條。**預設 `ws`**。只有標了「有 `transport`」的 method 認得它 |
+| `sync` | `"local"` \| `"server"` \| `"both"` | **要本地的還是上游的**。**預設 `local`**。只有標了「有 `sync`」的 method 認得它 |
+
+🚨 **`sync`：RPC 大部分是對本地資料庫的呼叫**（維護者 2026-09-13 定；執行期細節在
+[`daemon-runtime.md`](daemon-runtime.md) §3）。UI 顯示東西走本地，要打上游得**明講**：
+
+| 值 | daemon 做什麼 | 寫 `cache.db` |
+|---|---|---|
+| **`local`（預設）** | 只讀 `cache.db` | ❌ |
+| `server` | 打上游、拿到什麼就回什麼 | 🚫 **不寫**（這是「看一眼」，不是同步） |
+| `both` | 打上游 → 寫進 `cache.db` → **再從本地讀一次**回傳 | ✅ |
+
+- ⭐ `both` 回的是**本地讀的結果**，形狀跟 `local` 一模一樣 —— UI 🚫 不必為兩種模式寫兩套解析。
+- 🚫 **沒有 `auto`**：延遲從毫秒跳到秒這件事，要由呼叫者決定，🚫 不是 daemon 猜。
+- 判準：**本地快取有那份東西的 method 才有這個參數**。帳號列表、recovery key 那些是這台機器的檔案
+  （沒有「上游版本」），`sync.recent`／`server.ping`／`backup.*` 本來就是上游的。
+- ⚠️ 回傳的型別裡**只有 server 知道的欄位**，`local` 時就讓它們**不在**，🚫 不編造
+  （`media.info` 的 `total_len`／`truncated`／`verified` 就是）。⭐ 少一個欄位是誠實，填一個假數字不是。
+
+🚨 **認得 `sync` 的 method，回應要回報這次用的是哪一種**（維護者 2026-09-13）：
+
+```jsonc
+{ "code": 0, "msg": "ok", "id": 1, "sync": "local", "result": [ … ] }
+```
+
+- **只要那個 method 認得 `sync` 就帶，不管請求有沒有帶** —— ⭐ 這樣前端知道「沒帶時預設是什麼」，
+  🚫 不必去記規格，也不必猜這份資料是本地的還是剛從上游拿的。
+- ⚠️ **失敗的回應也帶**：「我去打了上游然後失敗」跟「我只讀本地然後沒有」是兩件事。
+- 🚫 **值認不得（`102`）時不帶**：那次它一種都沒用，宣稱用了哪一種是說謊。
+- 不認得 `sync` 的 method **沒有這個欄位**（🚫 不是 `null`）。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（CLI 規格 §10），**由 daemon 讀 conf 填進 `Target`**。
   前端不該替使用者決定要不要備份，而 daemon 就是 conf 的主人（它是 client 本體，architecture-v2 §0.2）。
@@ -185,6 +214,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
+| `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：🚫 不斷上游會話、🚫 不掉連線）。⭐ 前端改設定（例如已讀要不要公開，daemon-runtime §6.3）之後叫它，🚫 不必重開 daemon |
 | `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
@@ -237,13 +267,40 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `room.list` | `{ user?, server? }` | `[Conversation]`（chat-model §2.1） | `list_conversations` |
-| `room.get` | `{ room, user?, server? }` | `Conversation` | `conversation` |
+| `room.list` | `{ user?, server?, sync? }`。**有 `sync`**（§2） | `[Conversation]`（chat-model §2.1） | `list_conversations`。⚠️ core 現在只有「先跟上游 sync 一輪」那條，`local` 要接 `cache.db` 的 `room_list` |
+| `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation` | `conversation`。同上 |
 | `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
-| `room.history` | `HistoryQuery` 加 `user?`／`server?`：`{ room, limit, before?, source: "server"\|"cache", types?, sender? }` | `MessagePage`：`{ events: [Message], next? }` | `history` |
-| `room.files` | `{ room, limit, before?, source, user?, server? }` | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
+| `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「`before` 是哪一套座標」 |
+| `room.files` | `{ room, limit, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
+| `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（daemon-runtime §6） |
+
+🚨 **`before` 是哪一套座標，看 `sync`**（`room.history`／`room.files`；PR #32 審查 cirno🔴）：
+
+| `sync` | `before` 收什麼 | 回應的 `next` 是什麼 |
+|---|---|---|
+| `local`（預設） | 本地 `r_seq` 的**數字** | 本地 `r_seq` |
+| `server` | server 的**翻頁 token** | server 的翻頁 token |
+| `both` | 🚫 **不接受 `before`**（帶了就是 `1100`＝`CoreErrorKind::Usage`） | 本地 `r_seq` |
+
+🚨 **`both` 那一格是權宜的，它會消失**。問題不在 `both`，在**現在只有一個 backend 拿得到歷史**：
+
+| backend | 上游怎麼定位 | 本地怎麼定位 | 對得上嗎 |
+|---|---|---|---|
+| matrix-sdk `/messages`（現在唯一有歷史的） | 不透明 token | `r_seq` | ❌ 沒有翻譯 |
+| **wbf**（`Event/*`） | `r_seq`／`g_seq`（server 自己塞的） | `r_seq` | ✅ **同一套** |
+
+⚠️ 所以在 matrix backend 上，`both` 帶一個 token 進來，好一點是解析失敗（而且是在**已經抓完、
+已經寫進庫之後**才失敗）；🚨 壞的是那個 token 剛好長得像數字 —— 它會指到本地一個不相干的位置，
+然後**看起來像成功**。協議上 token 就是不透明字串，🚫 不該賭它的長相。
+
+⭐ **出口**：wbf 那條線的房間歷史 API 正在 server 端開發中（維護者 2026-09-13）。接上之後上下兩半
+講同一種 `r_seq`，這一格就該改回「本地 `r_seq`」—— ⚠️ **前端的介面不會因此改**：`sync` 三個值、
+`before` 一個欄位，變的只是「`both` 也收得下 `before`」。
+
+📎 在那之前也不擋路：**點開房間 = 不帶 `before` 的 `both`**（拉最新的一頁順便入庫），
+**往回翻 = `local`**（資料已經在庫裡了，翻頁很便宜）。要一頁頁跟 server 翻就整條都用 `server`。
 
 🚫 **沒有 `room.watch`**。CLI 的 `watch tail|wait|once` 是「一個命令一個程序」的產物；daemon 常駐，
 新訊息走**訂閱＋推播**（§4）。rpc-cli 要模擬 `watch once --timeout` 就是「訂閱、等第一則、退訂」。
@@ -271,7 +328,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `media.info` | `{ mxc, manifest?, transport?, user?, server? }` | `MediaInfo` | `media_info` |
+| `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 答得出 `file_size`／`chunk_size`／`content_type`，加上上游答不出來的 `cached: { complete, chunks_written, bytes_on_disk }`。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
 | `media.open` | `{ manifest, user?, server? }` 或 `{ event_id, room, user?, server? }`（daemon 從快取找 manifest） | `{ url, mimetype?, size, expires_in }`。`url` 是資料平面的 capability URL（§6.1） | ⚠️ core 缺「給一個 reader」的形狀：現在 `download_to` 直接寫檔、`seek_read` 一次回整段 bytes。daemon 要的是 `PoolReader`（local-cache-db §8.6）接到 HTTP Range 上 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, sha256?, user?, server? }` | `{ upload_id, mxc, url, expires_in }`。`url` 是資料平面的 PUT URL（§6.2）。`mxc` 在這一步就有（server 的 `Create` 就配好 id）——所以 `room.send_attachment` 不必等傳完 | ⚠️ core 缺（同 `room.send_attachment`） |
 | `media.save_to` | `{ manifest, out: path, no_cache?: bool, transport?, user?, server? }` | `DownloadResult` 或（`no_cache`）`DirectDownloadResult` | `download_to`／`download_direct`。長工作。**明文落地是使用者要的**（§4.8） |
@@ -319,9 +376,16 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `room.message` | `{ user, room, message: Message }`（chat-model §2.2，含 `decrypted`／`undecryptable_reason`） | 這個帳號收到一則新訊息（sync 或 `Event/Push` 進來、解完密、寫進快取**之後**） |
 | `sync.state` | `{ user, state: "connected"\|"disconnected"\|"catching_up"\|"caught_up", cg_seq? }` | 跟 server 的連線狀態變了 |
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
+| `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事 |
 
 - 推播**要先 `subscribe`**（§4.6）。`progress` 例外：**發出長工作的那條連線自動收到自己請求的 `progress`**，不必訂——不然每個前端都要多寫一步。
 - 推播是「不用輪詢」，🚫 不是「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
+  🚨 **但掉了一定要發 `desync`**：不講的話 UI 永遠不會去重查（它以為自己收齊了）。
+- 🚨 **媒體的進度🚫 不走這裡**（維護者 2026-09-13）：UI 的上傳／下載是**資料平面的 HTTP**（§6），
+  進度就是那個 HTTP 傳輸自己的進度。⭐ 所以 RPC 通道上🚫 沒有 bytes、🚫 沒有每塊一則的進度，
+  它基本上永遠是暢通的。
+  📎 `progress` 只給**daemon 自己在跑的長工作**：路徑版的 `room.send_file`／`upload.file`／
+  `media.save_to`（daemon 讀本機檔，UI 沒有 HTTP 可看）、`sync.recent`、`backup.*`——都是低頻的。
 - ⚠️ core 現在的 `CoreEvent::Progress` 是一句字串，`room.message` 對得上 `CoreEvent::Message`；
   `sync.state` 與結構化的 `progress` 是 **core 要補的 variant**（daemon PR 順手做，🚫 不在 daemon 裡 parse 那句字串）。
 
@@ -389,6 +453,16 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進記憶體。同一個 token 可以重複 GET（播放器 seek）。
 
+🚨 **上游慢下來的時候：停止送 bytes，但連線開著**（維護者 2026-09-13 定）。
+homeserver 給不出下一塊，daemon 就**卡在那裡**，等拿到了再繼續吐。
+
+- 🚫 **不要回一個空回應**（UI 會以為「傳完了」）、🚫 **不要斷線**（UI 會以為「失敗了」）——
+  事實是「還在等」，而 HTTP 表達「還在等」的方式就是**不送資料但不關連線**。
+- ⭐ **這也是進度的來源**：UI 的下載進度就是它那個 GET 收到多少 bytes，
+  🚫 不是 daemon 從 RPC 推回去的數字（§4）。上傳同理 —— 進度是它那個 PUT 送出去多少。
+- ⚠️ 真的失敗（`502`）跟「慢」要分得開：**拿不到**才斷，**還在拿**就等。
+  🚫 不要把逾時設得比 homeserver 的慢速還短，那會把「慢」誤判成「壞」。
+
 ### 6.2 寫：`PUT /upload/<token>`
 
 | | |
@@ -455,6 +529,9 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 |---|---|---|---|
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
+| `desync` 推播（§4） | ❌（daemon 層） | — | ❌ |
+| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`）＋回應回報用了哪一種 | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地 | 本機（`local`）／同下面那幾列 | ✅ |
+| `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |

@@ -27,6 +27,7 @@ UI 框架的選擇延後到 SDK 能用之後。規劃與進度看 [`docs/design/
 | [`local-cache-db.md`](docs/design/local-cache-db.md) | 本地資料庫：加密的暫存快取、主金鑰與 passphrase、與 matrix-sdk store 的分工。§4 vault（`wbf-sdk::vault`）、§6 `cache.db`（`wbf-sdk::cache`）、§8 媒體池（`wbf-sdk::media_pool`、`media`）都做了。Windows 編 SQLCipher 要 Strawberry Perl（§3） |
 | [`architecture-v2.md`](docs/design/architecture-v2.md) | daemon／RPC／四個前端的分層：兩個平面兩個 port、token 與加密、訊息形狀、daemon 的命令列就是 RPC 的內部入口 |
 | [`rpc-spec.md`](docs/design/rpc-spec.md) | 前端 ↔ daemon 的逐條訊息：method 表、code 表、推播、資料平面的 HTTP |
+| [`daemon-runtime.md`](docs/design/daemon-runtime.md) | daemon 跑起來之後：多帳號怎麼落到 `cache.db`（一個 server 一個寫入者）、UI 走本地讀還是上游拉、事件扇出與 `user`、`job` 與 `cancel` |
 | [`to-device-client.md`](docs/design/to-device-client.md) | client 端怎麼接 `0x16 Device`（to-device）：跟 `Event` 相反的三件事、銷毀是帶結果的命令、待辦 |
 | [`wbf-vectors.json`](docs/design/wbf-vectors.json) | 線上協議的黃金向量，從 wbfuwunel **整份複製**、不手改；server 規格改了就重新複製，測試紅了就是漂移 |
 

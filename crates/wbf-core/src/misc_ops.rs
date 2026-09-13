@@ -13,10 +13,18 @@ use crate::error::{CoreError, CoreErrorKind};
 use crate::upload_ops::UploadRequest;
 use crate::{Core, Target};
 
-/// `info`：server 上那份上傳長什麼樣。
+/// `info`：這份媒體長什麼樣。**本地與上游都答得出大部分**（daemon-runtime §3.1 的 `sync`）。
+///
+/// ⭐ 媒體是**不可變**的：`file_size`／`chunk_size`／`mimetype` 上傳完就不會變，所以本地那張
+/// `media` 表存的就是同一份事實 —— 🚫 沒有理由為了這些欄位跑一趟 server（維護者 2026-09-13）。
+/// ⚠️ 真正只有 server 知道的是 `total_len`（線上那份的總長）、`truncated`，
+/// 以及要拿 server 的描述才算得出來的 `description`／`verified` —— `sync=local` 時它們**不在**，
+/// 🚫 不編造。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MediaInfo {
-    pub total_len: u64,
+    /// ⚠️ **只有問過 server 才有**：線上那份的總長。`sync=local` 時不在。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_len: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_size: Option<u64>,
     /// ⚠️ 這三個是 `Option` **有語意**，不是圖方便：整檔媒體（舊上傳）沒有分塊，
@@ -37,6 +45,20 @@ pub struct MediaInfo {
     /// 🚫 不是 `false`——「沒驗」跟「驗過但不對」是兩件事。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// 這台機器上的狀態（下載到哪了）。⭐ 這是**上游答不出來**的那一半。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<CachedMedia>,
+}
+
+/// `media` 表那一列裡「本地才知道」的部分。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CachedMedia {
+    /// 整檔都在池裡了嗎。
+    pub complete: bool,
+    /// 已經收下幾塊（續傳點）。
+    pub chunks_written: u64,
+    /// 池裡那份佔多少磁碟（**加密後**的大小，🚫 不等於 `file_size`）。
+    pub bytes_on_disk: u64,
 }
 
 /// `seek` 的結果。**bytes 是明文**，由呼叫端決定要寫到哪（stdout、檔案、播放器）。
@@ -72,21 +94,52 @@ impl SeekResult {
 }
 
 impl Core {
-    /// 問 server：這個 mxc 的上傳有多大、切成幾塊。
+    /// 這個 mxc 的媒體有多大、切成幾塊、本地下載到哪了。
     ///
-    /// 給了 `manifest` 就多做一次**交叉核對**（約定 §3.1 第 2 條）並把描述解出來。
+    /// `sync` 決定去哪問（daemon-runtime §3.1）：
+    ///
+    /// | `sync` | 回什麼 |
+    /// |---|---|
+    /// | `Local`（預設） | 只讀 `media` 表：`file_size`／`chunk_size`／`content_type`／`cached`。⚠️ `total_len`／`truncated`／`description`／`verified` **不在**（只有 server 知道），🚫 不編造 |
+    /// | `Server` | 問 server，🚫 不寫庫、🚫 不附 `cached` |
+    /// | `Both` | 問 server ＋ 把它寫進 `media` 表 ＋ 附上 `cached` |
+    ///
+    /// 給了 `manifest` 就多做一次**交叉核對**（約定 §3.1 第 2 條）並把描述解出來 ——
+    /// ⚠️ 那需要 server 的描述，所以 `Local` 時🚫 不做（給了 manifest 也一樣）。
     pub async fn media_info(
         &self,
         mxc: &str,
         manifest: Option<&Manifest>,
+        sync: crate::SyncMode,
         transport: Transport,
         target: &Target,
     ) -> Result<MediaInfo, CoreError> {
         let account = self.account_or_current(target)?;
+        if sync == crate::SyncMode::Local {
+            return self.cached_media_info(&account, mxc).await;
+        }
         let mut client = self.client_of(&account, transport).await?;
         let (info, description_data) = client.fetch_info(mxc).await?;
+        if sync == crate::SyncMode::Both {
+            // 把 server 說的寫進 `media` 表（下次 `Local` 就答得出來）。
+            // ⚠️ 只有兩邊都知道的欄位才寫進去 —— `media_begin` 要的正好就是那些。
+            let (cache, _me) = self.server_cache_and_me(&account)?;
+            let (mxc_here, size, chunk) = (
+                mxc.to_string(),
+                info.file_size.unwrap_or(info.total_len),
+                info.chunk_size.unwrap_or(0),
+            );
+            let content_type = info.content_type.clone();
+            cache
+                .run(move |cache| {
+                    cache
+                        .media_begin(&mxc_here, None, content_type.as_deref(), None, size, chunk)
+                        .map(|_| ())
+                })
+                .await?;
+        }
         let mut result = MediaInfo {
-            total_len: info.total_len,
+            total_len: Some(info.total_len),
             file_size: info.file_size,
             chunk_size: info.chunk_size,
             chunk_count: info.chunk_count,
@@ -94,6 +147,11 @@ impl Core {
             content_type: info.content_type,
             description: None,
             verified: None,
+            cached: match sync {
+                // `Server` 是「看一眼上游」：🚫 不順手提本地的事（對帳時要分得出來）。
+                crate::SyncMode::Server => None,
+                _ => self.cached_media_of(&account, mxc).await?,
+            },
         };
         let Some(manifest) = manifest else {
             return Ok(result);
@@ -119,6 +177,62 @@ impl Core {
         result.description = Some(serde_json::to_value(&description).expect("block serializes"));
         result.verified = Some(true);
         Ok(result)
+    }
+
+    /// 只讀本地那一列（`sync=local`）。
+    ///
+    /// Return:
+    ///     Ok(MediaInfo)  本地知道的那幾個欄位；只有 server 知道的那些**不在**
+    ///     Err(Usage)     這台機器沒有這份媒體的紀錄
+    async fn cached_media_info(
+        &self,
+        account: &crate::accounts::AccountDir,
+        mxc: &str,
+    ) -> Result<MediaInfo, CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let found = cache.read().await.find_media(mxc)?;
+        let entry = found.ok_or_else(|| {
+            CoreError::new(
+                CoreErrorKind::Usage,
+                format!("{mxc} is not in the local cache; ask the server with sync=server"),
+            )
+        })?;
+        Ok(MediaInfo {
+            // 🚫 本地不知道線上那份的總長與有沒有被截斷。
+            total_len: None,
+            truncated: None,
+            file_size: Some(entry.file_size),
+            chunk_size: Some(entry.chunk_size),
+            // ⚠️ 沒下完時「一共幾塊」是不知道的：`chunks_written` 是進度，🚫 不是總數。
+            chunk_count: match entry.complete {
+                true => u32::try_from(entry.chunks_written).ok(),
+                false => None,
+            },
+            content_type: entry.mimetype.clone(),
+            // 這兩個要 server 的描述才算得出來。
+            description: None,
+            verified: None,
+            cached: Some(CachedMedia {
+                complete: entry.complete,
+                chunks_written: entry.chunks_written,
+                bytes_on_disk: entry.bytes_on_disk,
+            }),
+        })
+    }
+
+    /// 本地那一列的「下載到哪了」；沒有那一列就是 `None`（🚫 不算錯）。
+    async fn cached_media_of(
+        &self,
+        account: &crate::accounts::AccountDir,
+        mxc: &str,
+    ) -> Result<Option<CachedMedia>, CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let found = cache.read().await.find_media(mxc)?;
+        Ok(found.map(|entry| CachedMedia {
+            complete: entry.complete,
+            chunks_written: entry.chunks_written,
+            bytes_on_disk: entry.bytes_on_disk,
+        }))
     }
 
     /// 只讀含 `at` 的那一段（約定 §7）。⚠️ 回的是**明文 bytes**。
@@ -180,8 +294,10 @@ impl Core {
             .create_upload(&session.server, &session.user_id, &file_cipher, &block)
             .await?;
         let summary = client
+            // ⚠️ 串流事先不知道總長：`total` 是 `None`，🚫 不填 0 假裝知道。
             .send_stream(&state, &mut source, &mut |done, _| {
-                self.events.progress(format!("chunk {done}"))
+                self.events
+                    .progress_of(done as u64, None, format!("chunk {done}"))
             })
             .await?;
         let mut final_block = state.block.clone();
@@ -204,7 +320,7 @@ mod tests {
     fn not_verified_and_verified_false_are_different_things() {
         // 沒給 manifest 就沒驗過——`verified` 不在，🚫 不是 `false`。
         let info = MediaInfo {
-            total_len: 10,
+            total_len: Some(10),
             file_size: Some(10),
             chunk_size: Some(4),
             chunk_count: Some(3),
@@ -212,10 +328,38 @@ mod tests {
             content_type: None,
             description: None,
             verified: None,
+            cached: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("verified").is_none(), "{json}");
         assert!(json.get("description").is_none());
+    }
+
+    /// `sync=local` 回的那份：**只有 server 知道的欄位不在**，🚫 不填假的
+    /// （daemon-runtime §3.2）。
+    #[test]
+    fn a_local_answer_leaves_out_what_only_the_server_knows() {
+        let local = MediaInfo {
+            total_len: None,
+            truncated: None,
+            file_size: Some(10),
+            chunk_size: Some(4),
+            chunk_count: Some(3),
+            content_type: Some("video/mp4".to_string()),
+            description: None,
+            verified: None,
+            cached: Some(CachedMedia {
+                complete: true,
+                chunks_written: 3,
+                bytes_on_disk: 1234,
+            }),
+        };
+        let json = serde_json::to_value(&local).unwrap();
+        assert!(json.get("total_len").is_none(), "{json}");
+        assert!(json.get("truncated").is_none(), "{json}");
+        // 反過來，本地才知道的那一半要在。
+        assert_eq!(json["cached"]["complete"], true);
+        assert_eq!(json["cached"]["bytes_on_disk"], 1234);
     }
 }
 

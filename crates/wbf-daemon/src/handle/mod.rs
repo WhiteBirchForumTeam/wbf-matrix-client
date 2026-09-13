@@ -64,6 +64,36 @@ fn is_read_only(method: &str) -> bool {
     )
 }
 
+/// 這個 method 認得 `sync` 嗎？認得的話，這次用的是哪一種？
+///
+/// Args:
+///     method: example: "room.list"
+///     params: 已經正規化成物件的 params
+/// Return:
+///     Some(SyncMode)  這個 method 有 `sync`；值是**這次實際會用的**（沒帶就是預設）
+///     None            這個 method 沒有 `sync`（回應就🚫 不帶那個欄位），或帶的值認不得
+///
+/// ⚠️ 值認不得時回 `None`：那次請求會被 handler 用 `102` 擋下來，而回應🚫 不該宣稱
+/// 「我用了某一種」—— 它一種都沒用。
+/// 📎 名單跟 handler 各自解析同一個欄位，看起來像重複；但 handler 要的是**型別化的參數**，
+/// 這裡要的是**回應要不要帶**。⭐ 兩者都少不了，而漏掉這裡只會少一個資訊欄位，🚫 不會做錯事。
+fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
+    const WITH_SYNC: &[&str] = &[
+        "room.list",
+        "room.get",
+        "room.history",
+        "room.files",
+        "media.info",
+    ];
+    if !WITH_SYNC.contains(&method) {
+        return None;
+    }
+    match params.get("sync") {
+        None | Some(Value::Null) => Some(wbf_core::SyncMode::default()),
+        Some(value) => serde_json::from_value(value.clone()).ok(),
+    }
+}
+
 fn is_allowed_while_locked(method: &str) -> bool {
     method == "hello" || method.starts_with("daemon.") || method.starts_with("vault.")
 }
@@ -225,11 +255,18 @@ impl Handle {
             return Response::from_core_error(id, &self.why_it_is_shut(&core));
         }
         let params = params_or_empty_object(&request.params);
+        // 這個 method 認得 `sync` 的話，回應要說出**這次實際用的是哪一種**（rpc-spec §2）——
+        // ⭐ 包括「沒帶所以是預設」那種情況，這樣前端🚫 不必去記規格。
+        let sync = sync_of_request(&request.method, &params);
         let outcome = self.dispatch(&core, &request.method, params).await;
-        match outcome {
+        let response = match outcome {
             Ok(result) => Response::ok(id, result),
             Err(Fail::Rpc(code, msg)) => Response::error(id, code, msg),
             Err(Fail::Core(error)) => Response::from_core_error(id, &error),
+        };
+        match sync {
+            Some(sync) => response.with_sync(sync),
+            None => response,
         }
     }
 
@@ -317,6 +354,8 @@ impl Handle {
             "data_port": ports.map(|(_, data)| data),
             "uptime_seconds": self.uptime_seconds(),
             "connections": self.connection_count(),
+            // 寫入者還有幾件在排隊（daemon-runtime §2.2）。⚠️ 一直漲＝寫得比收得慢。
+            "cache_queue": core.cache_queue_len(),
             "server_backup_setting": on_off(self.settings.server_backup),
             "local_room_keys_setting": on_off(self.settings.local_room_keys),
         }))
@@ -586,6 +625,58 @@ mod tests {
         assert!(handle.can_write());
     }
 
+    /// `sync` 沒帶就是 `local`，而 `local` **不連網**（rpc-spec §2、daemon-runtime §3.1）。
+    ///
+    /// ⭐ 這條測得出「預設值對不對」：`local` 讀空的快取會**成功回一個空列表**，
+    /// 而打上游會失敗（測試裡沒有帳號、也沒有 server）。🚫 不必真的架一台 server 來分辨。
+    #[tokio::test]
+    async fn sync_defaults_to_local_and_local_does_not_touch_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        handle.core().await.create_vault(None).unwrap();
+
+        // 沒有帳號：`local` 走到「哪個帳號？」就停了，🚫 不會是網路錯。
+        let response = handle.call(request("room.list", json!({}))).await;
+        assert_eq!(response.code, 1010, "{}", response.msg);
+        let with_sync = handle
+            .call(request("room.list", json!({ "sync": "local" })))
+            .await;
+        assert_eq!(with_sync.code, response.code, "沒帶 sync ＝ local");
+
+        // 認不得的值要被擋下來（102），🚫 不要默默當成某一種。
+        let response = handle
+            .call(request("room.list", json!({ "sync": "sometimes" })))
+            .await;
+        assert_eq!(response.code, code::INVALID_PARAMS, "{}", response.msg);
+        // ⚠️ 而且這種時候🚫 不該宣稱用了某一種 —— 它一種都沒用。
+        assert_eq!(response.sync, None, "{response:?}");
+    }
+
+    /// 認得 `sync` 的 method，**回應要說出這次用的是哪一種**（維護者 2026-09-13）——
+    /// 包括「沒帶所以是預設」。不認得的 method 則🚫 不帶那個欄位。
+    #[tokio::test]
+    async fn the_response_says_which_sync_it_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        handle.core().await.create_vault(None).unwrap();
+
+        // 沒帶 → 回應說 local（前端因此🚫 不必去記預設是什麼）。
+        let response = handle.call(request("room.list", json!({}))).await;
+        assert_eq!(response.sync, Some(wbf_core::SyncMode::Local));
+        // 帶了 → 原樣回報。⚠️ 連失敗的回應也要帶：「打了上游然後失敗」跟「只讀本地然後沒有」
+        // 是兩件事。
+        let response = handle
+            .call(request("room.list", json!({ "sync": "server" })))
+            .await;
+        assert_ne!(response.code, 0, "沒有帳號，本來就會失敗");
+        assert_eq!(response.sync, Some(wbf_core::SyncMode::Server));
+        // 不認得 `sync` 的 method：欄位不在，🚫 不是 null。
+        let response = handle.call(request("daemon.info", Value::Null)).await;
+        assert_eq!(response.sync, None);
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("sync").is_none(), "{json}");
+    }
+
     #[tokio::test]
     async fn every_network_method_parses_its_params_and_reaches_core() {
         // 解鎖了但沒有帳號：每個 method 都該走到 core 然後被 core 拒絕（1000+），
@@ -611,11 +702,11 @@ mod tests {
             ),
             (
                 "room.history",
-                json!({ "room": "!r:localhost", "limit": 10, "source": "cache" }),
+                json!({ "room": "!r:localhost", "limit": 10, "sync": "server" }),
             ),
             (
                 "room.files",
-                json!({ "room": "!r:localhost", "limit": 10, "source": "cache" }),
+                json!({ "room": "!r:localhost", "limit": 10, "sync": "server" }),
             ),
             ("sync.recent", json!({})),
             (
@@ -657,7 +748,7 @@ mod tests {
             ("room.send_text", json!({ "room": "!r:localhost" })),
             (
                 "room.history",
-                json!({ "room": "!r:localhost", "limit": 10, "source": "elsewhere" }),
+                json!({ "room": "!r:localhost", "limit": 10, "sync": "elsewhere" }),
             ),
             ("server.ping", json!({ "transport": "carrier-pigeon" })),
             ("upload.status", json!({ "upload_id": "one" })),

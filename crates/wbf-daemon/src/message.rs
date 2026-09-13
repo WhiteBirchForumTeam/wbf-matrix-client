@@ -37,6 +37,12 @@ pub struct Response {
     pub result: Value,
     /// 對得上請求就帶；對不上（解不開、shutdown）是 `null`。🚫 不省略。
     pub id: Option<u64>,
+    /// **這次實際用的 `sync`**（維護者 2026-09-13）。
+    ///
+    /// ⭐ 只要那個 method 認得 `sync` 就帶，**不管請求有沒有帶** —— 這樣前端才知道
+    /// 「沒帶的時候預設是什麼」，🚫 不必去記規格。不認得 `sync` 的 method 這個欄位**不在**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<wbf_core::SyncMode>,
 }
 
 impl Response {
@@ -46,7 +52,15 @@ impl Response {
             msg: "ok".to_string(),
             result,
             id,
+            sync: None,
         }
+    }
+
+    /// 記下這次用的是哪一種 `sync`。⚠️ 連**錯誤回應**也要帶 ——
+    /// 「我去打了上游然後失敗了」跟「我只讀本地然後沒有」是兩件事。
+    pub fn with_sync(mut self, sync: wbf_core::SyncMode) -> Response {
+        self.sync = Some(sync);
+        self
     }
 
     pub fn error(id: Option<u64>, code: u32, msg: impl Into<String>) -> Response {
@@ -55,6 +69,7 @@ impl Response {
             msg: msg.into(),
             result: Value::Null,
             id,
+            sync: None,
         }
     }
 
@@ -70,6 +85,7 @@ impl Response {
             msg: msg.into(),
             result: serde_json::json!({ "close": reason.name() }),
             id,
+            sync: None,
         }
     }
 }

@@ -263,8 +263,8 @@ mod tests {
         assert!(second.switched_from.unwrap().contains("alice"));
 
         // 事件走 channel，🚫 core 不印東西。
-        let crate::CoreEvent::Progress(line) = events.try_recv().unwrap() else {
-            panic!("switch 發的是 Progress，不是別的");
+        let crate::CoreEvent::Note { text: line, .. } = events.try_recv().unwrap() else {
+            panic!("switch 發的是 Note，不是別的");
         };
         assert!(line.contains("switched to"), "{line}");
         let _ = std::fs::remove_dir_all(&dir);

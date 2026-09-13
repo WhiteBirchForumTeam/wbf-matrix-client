@@ -149,7 +149,13 @@ impl Core {
             manifest,
             &mut cache,
             &pool,
-            &mut |done, total| self.events.progress(format!("chunk {done}/{total}")),
+            &mut |done, total| {
+                self.events.progress_of(
+                    done as u64,
+                    Some(total as u64),
+                    format!("chunk {done}/{total}"),
+                )
+            },
         )
         .await?;
         let pool_file =
@@ -199,7 +205,11 @@ impl Core {
         let mut file = std::fs::File::create(out)?;
         let result = client
             .download(manifest, &mut file, &mut |done, total| {
-                self.events.progress(format!("chunk {done}/{total}"))
+                self.events.progress_of(
+                    done as u64,
+                    Some(total as u64),
+                    format!("chunk {done}/{total}"),
+                )
             })
             .await;
         let report = match result {
