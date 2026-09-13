@@ -36,7 +36,7 @@ impl Default for Settings {
         Settings {
             server_backup: true,
             local_room_keys: true,
-            transport: Transport::WebSocket,
+            transport: Transport::default(),
             warnings: Vec::new(),
         }
     }
@@ -55,13 +55,14 @@ impl Settings {
         warnings.extend(conf.warn_about_unknown_keys(KNOWN_CONF_KEYS));
         let server_backup = conf.is_on("SERVER_BACKUP", true, &mut warnings);
         let local_room_keys = conf.is_on("LOCAL_ROOM_KEYS", true, &mut warnings);
+        // ⭐ 預設來自 `Transport::default()`（`wbf-sdk`），🚫 不在這裡再寫死一次。
         let transport = match conf.find("TRANSPORT") {
-            None => Transport::WebSocket,
+            None => Transport::default(),
             Some(name) => Transport::from_name(name).unwrap_or_else(|| {
                 warnings.push(format!(
                     "warning: TRANSPORT={name:?} is not `ws` or `http`; using ws"
                 ));
-                Transport::WebSocket
+                Transport::default()
             }),
         };
         Ok(Settings {

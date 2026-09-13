@@ -11,7 +11,7 @@ use wbf_sdk::event_json::messages_from_json;
 use wbf_sdk::{RecentPlan, Transport};
 
 use crate::error::{CoreError, CoreErrorKind};
-use crate::backend_choice::TransportNeed;
+use crate::backend_choice::MethodHome;
 use crate::{Core, CoreEvent, Target};
 
 /// `watch` 要等多久、等到什麼為止。
@@ -148,10 +148,10 @@ impl Core {
     ) -> Result<RecentSummary, CoreError> {
         let account = self.account_or_current(target)?;
         let (cache, me) = self.server_cache_and_me(&account)?;
-        // 🚨 `Recent` 的回應是**一串** `Batch`（pack-pipeline §6），而 HTTP 一請求只回一個 pack
-        // —— 所以它只有 WS 那條路（`TransportNeed::WebSocketOnly`）。
+        // 🚨 `Recent` 只有 wbf 講得出來（回應是一串 `Batch`，pack-pipeline §6）——
+        // 走 `http` 或對方不是 wbf 的話，這個功能就是**關的**，而閘門會說出是哪一個理由。
         let mut client = self
-            .client_of(&account, Some(transport), TransportNeed::WebSocketOnly)
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
             .await?;
         client.hello(client_name).await?;
         let cg_seq = match from_scratch {

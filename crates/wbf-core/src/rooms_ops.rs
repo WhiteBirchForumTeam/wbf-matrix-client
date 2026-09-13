@@ -297,6 +297,15 @@ impl Core {
     }
 
     /// 開 backend 並做一次增量 sync（timeout 0）：房間列表與新事件到 store，之後才看得到現況。
+    ///
+    /// 🚧 **這是 matrix-sdk 那一套，而房間那條線目前全在「還沒有 ws」的清單上**
+    /// （`backend_choice::MethodHome::StillOnMatrixSdk`）：wbf 協議的 `Event` 底下只有
+    /// `Recent`／`Send`／`Batch`，🚫 **沒有「拿房間歷史」的定義**，所以不管 `transport` 是什麼、
+    /// 不管對方是不是 wbf，房間都走這裡。⭐ 清單上的東西**沒有選擇**，所以這裡刻意不看
+    /// `transport` —— 🚫 不是忘了。
+    ///
+    /// 📎 server 端正在補那塊 API（維護者 2026-09-13）。補上之後這裡就要分派：
+    /// 探到 wbf 就走 wbf，否則走這條。**rpc-spec 那一層一個字都不用改。**
     pub(crate) async fn synced_backend_of(
         &self,
         account: &AccountDir,

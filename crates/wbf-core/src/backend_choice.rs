@@ -1,104 +1,121 @@
-//! 「這台 homeserver 要用哪一套協議講話，走哪條管子？」
+//! 「這個呼叫要用哪一套協議跟 homeserver 講話？」
 //!
-//! ## 兩個軸，🚫 不要混
+//! ## 一個軸，🚫 不是兩個（維護者 2026-09-13 簡化）
 //!
-//! | | 意思 | 值 |
+//! `transport` 有兩個值，而**它們各自就是一個 backend**：
+//!
+//! | `transport` | 協議 | 誰實作 |
 //! |---|---|---|
-//! | **backend** | 用哪一套**協議** | matrix-sdk（標準 Matrix）／wbf 的 pack 協議 |
-//! | **transport** | wbf 協議走哪條**管子** | `ws`（預設）／`http` |
+//! | **`ws`**（預設） | wbf 客製協議 | `wbf-sdk` 的 pack over WebSocket |
+//! | **`http`** | 原生 Matrix HTTP | `matrix-sdk` |
 //!
-//! 🚫 `--transport http` **不是**「退回標準 Matrix」，是「wbf 協議走 HTTP」。這兩個正交，
-//! 而它們在文件與程式裡被混用過（daemon-runtime §3.5）。
+//! 🚫 **wbf 底下不再細分 ws／http —— wbf 協議一律 WS。** pack-over-HTTP（`channel.rs` 的
+//! `HttpChannel`）只剩 **debug** 用途：⚠️ 它不是「wbf 的 HTTP 模式」，🚫 不該當成正式路徑。
+//! 📎 之前的設計在 wbf 底下又分了一層管子 —— 那是多的一層，拿掉了。
 //!
-//! ## 誰決定 backend
+//! ## 所以解析很短
 //!
-//! **探測，🚫 不是設定**（architecture-v2 §6.1）：問一次 `Hello`，對方講得出 wbf 的
-//! features 就是 wbf，否則是一般 homeserver。⭐ 不確定一律落到 matrix-sdk ——
-//! 壞在「用了比較慢但一定能動的那條」，🚫 不壞在「以為對方懂我們的協議」。
+//! ```text
+//! http ─────────────────────────> matrix-sdk（永遠）
+//! ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 不報錯，那是 no-op）
+//!      ├── 這個方法還沒有 ws ───> matrix-sdk（🚧 暫時）
+//!      └── 其他 ────────────────> wbf
+//! ```
 //!
-//! ## 誰決定 transport
+//! ⚠️ 只有一種情況**報錯**：這個功能**只有 wbf 講得出來**，而這條路到不了 wbf ——
+//! 那時它就是**關的**（維護者 2026-09-13：「萬一 ui 遇到 feature 需要用到 ws，那就是關掉」）。
+//! ⭐ 講出來比默默給一個空答案好。
 //!
-//! [`get_transport_plan`]。⚠️ 它是**純函數**，所以那張規則表測得到 ——
-//! 這種「哪個組合該報錯」的判斷散在呼叫點上，遲早有一格漏掉，而漏掉的那格是放行。
+//! ## 🚧 那份「還沒有 ws」的清單
+//!
+//! wbf 還沒把原生 HTTP 全部取代掉，所以有些方法**就算走 ws 也得先用 matrix-sdk**，
+//! 等 server 端補上 ws 的定義再搬過去。
+//!
+//! 🚫 清單**不是一串字串**：每個呼叫點自己用 [`MethodHome`] 說出它住在哪一邊 ——
+//! ⭐ 那樣「名字」跟「實際走哪條」不可能漂移（原則 A4），而 `MethodHome::StillOnMatrixSdk`
+//! 的呼叫點就是那份清單。📎 給人看的版本是 rpc-spec §10「底層」那一欄。
 
 use wbf_sdk::Transport;
 
 use crate::error::{CoreError, CoreErrorKind};
 
-/// 用哪一套協議跟 homeserver 講話。
+/// 用哪一套協議跟 homeserver 講話。⚠️ 這是**結果**，🚫 不是呼叫端給的參數。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
-    /// 一般 Matrix（Synapse、Dendrite……）。⭐ 探不出來就是這個。
+    /// 原生 Matrix HTTP（`matrix-sdk`）。
     MatrixSdk,
-    /// wbfuwunel：講 wbf-pack。
-    Wbf,
+    /// wbf 客製協議（pack over WebSocket）。
+    WbfSdk,
 }
 
-/// 一個方法對管子的要求。
+/// 一個方法現在**住在哪一邊**。
+///
+/// ⭐ 每個呼叫點自己講，所以這個 enum 的用法**就是**那份清單。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportNeed {
-    /// 兩條都行（一問一答）。
-    Either,
-    /// 🚨 **只有 WS**：回應不只一個 pack（`Event/Recent` 的一串 `Batch`），
-    /// 或根本是 server 主動推的（`Subscribe`／`Push`／`Device/*`）。
-    /// HTTP 一請求只回一個 pack（`channel.rs` 的 `HttpChannel::request_stream`）。
-    WebSocketOnly,
+pub enum MethodHome {
+    /// **只有 wbf 講得出來**：上傳、媒體、`Recent`、`Hello`／`Ping`。
+    /// ⚠️ 走 `http`、或這台不是 wbf → 這個功能是**關的**（報錯，🚫 不裝作沒事）。
+    WbfSdkOnly,
+    /// 兩邊都有定義：`ws` 走 wbf，`http` 走 matrix-sdk。
+    BothSides,
+    /// 🚧 **暫時**：wbf 那邊還沒有定義，所以**連 `ws` 也先走 matrix-sdk**。
+    /// ⭐ server 端補上之後，把呼叫點改成 [`MethodHome::BothSides`] 就搬過去了 ——
+    /// 🚫 不必動 rpc-spec，前端看不到這件事。
+    StillOnMatrixSdk,
 }
 
-/// 這次實際要走哪條管子。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportPlan {
-    /// 🚫 **這個 backend 沒有管子可選**（matrix-sdk 只有一種講法）。
-    /// ⭐ 呼叫端指定了什麼都**照樣做事、不報錯** —— 那是個 no-op，不是錯誤。
-    NotApplicable,
-    /// 用這一條。
-    Use(Transport),
-}
-
-/// 這次要走哪條管子 —— 順便把「問不出東西的組合」擋掉。
+/// 這次用哪一套協議 —— 順便把「這個功能在這條路上是關的」講出來。
 ///
-/// | backend | 顯式 `ws` | 顯式 `http` | 沒指定 |
-/// |---|---|---|---|
-/// | matrix-sdk | `NotApplicable` | `NotApplicable` | `NotApplicable` |
-/// | wbf | `Use(WebSocket)` | `Use(Http)` | `Use(WebSocket)` |
-/// | wbf ＋ `WebSocketOnly` | `Use(WebSocket)` | **`Err(Usage)`** | `Use(WebSocket)` |
+/// | `transport` | 這台講 wbf | `WbfSdkOnly` | `BothSides` | `StillOnMatrixSdk` |
+/// |---|---|---|---|---|
+/// | `http` | 不管 | **`Err`**（feature 關掉） | `MatrixSdk` | `MatrixSdk` |
+/// | `ws` | ❌ | **`Err`**（這台不講 wbf） | `MatrixSdk`（no-op） | `MatrixSdk` |
+/// | `ws` | ✅ | `Wbf` | `Wbf` | `MatrixSdk`（🚧 暫時） |
 ///
-/// ⚠️ **matrix-sdk 那一列不看 `requested`**（維護者 2026-09-13：「顯式調用 ws no op 不報錯，
-/// 它就只有一種」）。📎 `http` 也一樣 no-op：同一個理由 —— 那個 backend 根本沒有這個維度，
-/// 🚫 為一個不存在的選擇報錯只是讓前端得先知道對方是誰才敢送參數。
+/// ⭐ **`ws` 打到一般 homeserver 不是錯**，是 no-op —— 前端不必先知道對方是誰才敢送參數
+/// （維護者 2026-09-13：「如果 server 是 old style matrix 那套，就走 matrix sdk backend，no op」）。
 ///
-/// 🚨 **`WebSocketOnly` ＋ 顯式 `http` 是報錯，🚫 不是默默改用 WS**：呼叫端說 http 通常是有
-/// 理由的（除錯、環境擋 WS），偷偷換掉會讓它以為驗過的是 http 那條路（原則 A5 fail closed）。
+/// 🚨 **沒帶 `transport` 就是 `ws`**（維護者 2026-09-13），所以**預設會落到上面那兩列 `ws`**：
+/// 對方講 wbf 就用 wbf，不講就 **fallback 到 matrix-sdk**，⚠️ 兩種都🚫 不報錯。
+/// 📎 這個函數收的是**已經定好**的 `transport`；「沒帶」在外面就變成 `ws` 了，
+/// 而那份預設只有一個地方寫著 —— `Transport::default()`（`wbf-sdk` 的 `channel.rs`）。
 ///
 /// Args:
-///     backend: 探測的結果, example: BackendKind::Wbf
-///     requested: 呼叫端顯式指定的；`None` = 沒指定, example: Some(Transport::Http)
-///     need: 這個方法撐不撐得住 HTTP, example: TransportNeed::WebSocketOnly
+///     transport: 呼叫端要的那條, example: Transport::WebSocket
+///     server_speaks_wbf: 探測的結果（[`crate::Core::get_backend_kind`]）, example: true
+///     home: 這個方法住在哪一邊, example: MethodHome::WbfSdkOnly
 /// Return:
-///     Ok(NotApplicable)  matrix-sdk：沒有這個維度，指定了也不算錯
-///     Ok(Use(t))         wbf：走這一條
-///     Err(Usage)         wbf ＋ 只支援 WS 的方法 ＋ 呼叫端硬要 http
-pub fn get_transport_plan(
-    backend: BackendKind,
-    requested: Option<Transport>,
-    need: TransportNeed,
-) -> Result<TransportPlan, CoreError> {
-    if backend == BackendKind::MatrixSdk {
-        return Ok(TransportPlan::NotApplicable);
+///     Ok(BackendKind)  用這一套
+///     Err(Usage)       只有 wbf 有這個功能，而這條路到不了 wbf —— 它是關的
+pub fn get_backend_for(
+    transport: Transport,
+    server_speaks_wbf: bool,
+    home: MethodHome,
+) -> Result<BackendKind, CoreError> {
+    // 🚧 這一格優先：wbf 那邊還沒有定義，所以連 `ws` 也到不了它。
+    if home == MethodHome::StillOnMatrixSdk {
+        return Ok(BackendKind::MatrixSdk);
     }
-    match (requested, need) {
-        (Some(Transport::Http), TransportNeed::WebSocketOnly) => Err(CoreError::new(
+    let reaches_wbf = transport == Transport::WebSocket && server_speaks_wbf;
+    match (reaches_wbf, home) {
+        (true, _) => Ok(BackendKind::WbfSdk),
+        (false, MethodHome::BothSides) => Ok(BackendKind::MatrixSdk),
+        // ⚠️ 兩種「到不了 wbf」的理由要分開講：一個是呼叫端自己選的，一個是對方的事實。
+        (false, MethodHome::WbfSdkOnly) => Err(CoreError::new(
             CoreErrorKind::Usage,
-            "this method needs the WebSocket transport: its answer is more than one pack \
-             (or the server pushes it), and one HTTP request carries exactly one pack. \
-             Drop `transport` to use the default (ws).",
+            match transport {
+                Transport::Http => {
+                    "this feature only exists in the wbf protocol, which runs over the ws \
+                     transport: over http it is off"
+                }
+                Transport::WebSocket => {
+                    "this homeserver does not speak the wbf protocol, and this feature only \
+                     exists there"
+                }
+            },
         )),
-        // 沒指定就是 ws（維護者 2026-09-13）。⚠️ 「沒指定」與「指定 ws」走同一格是刻意的：
-        // 🚫 不要讓「沒說」比「說了」拿到不一樣的東西。
-        (None, _) | (Some(Transport::WebSocket), _) => {
-            Ok(TransportPlan::Use(Transport::WebSocket))
-        }
-        (Some(Transport::Http), TransportNeed::Either) => Ok(TransportPlan::Use(Transport::Http)),
+        // `StillOnMatrixSdk` 在函數開頭就回掉了。
+        (false, MethodHome::StillOnMatrixSdk) => Ok(BackendKind::MatrixSdk),
     }
 }
 
@@ -106,7 +123,7 @@ pub fn get_transport_plan(
 const PROBE_CLIENT_NAME: &str = "wbf-client probe";
 
 impl crate::Core {
-    /// 這台 homeserver 講不講 wbf-pack。**探測，🚫 不是設定**（architecture-v2 §6.1）。
+    /// 這台 homeserver 講不講 wbf 協議。**探測，🚫 不是設定**（architecture-v2 §6.1）。
     ///
     /// ⭐ **不確定一律回 [`BackendKind::MatrixSdk`]**：連不上、`Hello` 不回、token 被拒、
     /// 回來的東西看不懂 —— 全部當成一般 homeserver。壞在「用了比較慢但一定能動的那條」，
@@ -130,14 +147,14 @@ impl crate::Core {
             return *known;
         }
         let found = match self.probe_wbf(account).await {
-            Ok(true) => BackendKind::Wbf,
+            Ok(true) => BackendKind::WbfSdk,
             Ok(false) | Err(_) => BackendKind::MatrixSdk,
         };
         self.events.progress(format!(
             "{} speaks {}",
             account.server_host,
             match found {
-                BackendKind::Wbf => "wbf-pack",
+                BackendKind::WbfSdk => "the wbf protocol",
                 BackendKind::MatrixSdk => "plain Matrix",
             }
         ));
@@ -162,53 +179,51 @@ impl crate::Core {
             .is_some()
     }
 
-    /// 🚨 **探測一律走 WS**：wbf backend 的預設就是 WS，而「HTTP 連得上」證明不了對方講 wbf
-    /// （任何 HTTP server 都會回東西）。⚠️ 這裡🚫 不看 conf 的 `TRANSPORT` ——
-    /// 那是「之後怎麼講話」的上限，不是「怎麼問你是誰」。
+    /// 🚨 **探測一律走 WS**：wbf 協議就是 WS，而「HTTP 連得上」證明不了對方講 wbf
+    /// （任何 HTTP server 都會回東西）。
     ///
     /// Return:
     ///     Ok(true)   `Hello` 回了、協議版本認得
     ///     Ok(false)  接得上但講的不是我們認得的協議版本
     ///     Err(...)   連不上、token 被拒、逾時 —— 呼叫端一律當成「不是 wbf」
     async fn probe_wbf(&self, account: &crate::accounts::AccountDir) -> Result<bool, CoreError> {
-        let mut client = self
-            .connect_wbf_client(account, Transport::WebSocket)
-            .await?;
+        let mut client = self.connect_wbf_client(account).await?;
         let hello = client.hello(PROBE_CLIENT_NAME).await?;
         Ok(hello.protocol == wbf_sdk::protocol::PROTOCOL_VERSION)
     }
 
-    /// 🚨 **wbf-pack 通道的唯一閘門**：探 backend、按規則挑管子、再開。
+    /// 🚨 **wbf 通道的唯一閘門**：探 backend、照 [`get_backend_for`] 判、再開。
     ///
-    /// ⭐ 「哪個組合可以、哪個要報錯」只有這一個地方在判斷（原則 A4 的接縫）——
+    /// ⭐ 「哪條路到得了 wbf、哪條是關的」只有這一個地方在判斷（原則 A4 的接縫）——
     /// 🚫 散在十個呼叫點上遲早漏掉一格，而漏掉的那格是放行。
+    ///
+    /// ⚠️ 回得到東西就一定是 **wbf over WS**。要 matrix-sdk 的呼叫端走
+    /// [`crate::Core::synced_backend_of`]，🚫 不是這裡。
     ///
     /// Args:
     ///     account: 哪個帳號
-    ///     requested: 呼叫端顯式指定的管子；`None` = 沒指定（就是預設的 ws）
-    ///     need: 這個方法撐不撐得住 HTTP, example: TransportNeed::WebSocketOnly
+    ///     transport: 呼叫端要的那條, example: Transport::WebSocket
+    ///     home: 這個方法住在哪一邊, example: MethodHome::WbfSdkOnly
     /// Return:
-    ///     Ok(WbfClient)  開好了
-    ///     Err(Usage)     這台不講 wbf-pack；或只支援 WS 的方法被指定了 http
-    ///     Err(Network)   探到是 wbf，但那條管子開不起來（維護者 2026-09-13：ws 開失敗要報錯，
-    ///                    http 出錯也一樣）
+    ///     Ok(WbfClient)  開好了（WS）
+    ///     Err(Usage)     這條路到不了 wbf，而這個功能只有它有 —— 它是關的
+    ///     Err(Network)   到得了，但 WS 開不起來（維護者 2026-09-13：開失敗要報錯）
     pub(crate) async fn client_of(
         &self,
         account: &crate::accounts::AccountDir,
-        requested: Option<Transport>,
-        need: TransportNeed,
+        transport: Transport,
+        home: MethodHome,
     ) -> Result<wbf_sdk::client::WbfClient<wbf_sdk::channel::Channel>, CoreError> {
-        let backend = self.get_backend_kind(account).await;
-        match get_transport_plan(backend, requested, need)? {
-            TransportPlan::Use(transport) => self.connect_wbf_client(account, transport).await,
-            // ⚠️ 探到不是 wbf，而這條路只有 wbf 講得出來 —— 🚫 不要連上去讓它在更深的地方
-            // 用一個看不懂的錯誤失敗。⭐ 這是「這台 server 沒有這個能力」，不是傳輸的問題。
-            TransportPlan::NotApplicable => Err(CoreError::new(
+        let speaks_wbf = self.get_backend_kind(account).await == BackendKind::WbfSdk;
+        match get_backend_for(transport, speaks_wbf, home)? {
+            BackendKind::WbfSdk => self.connect_wbf_client(account).await,
+            // ⚠️ `BothSides`／`StillOnMatrixSdk` 落到這裡：這個呼叫該走 matrix-sdk，而它
+            // 🚫 不該來要 wbf 的 client。⭐ 這是程式接錯線，不是使用者填錯參數 ——
+            // 所以訊息講「你要錯東西了」，而不是「你的參數不對」。
+            BackendKind::MatrixSdk => Err(CoreError::new(
                 CoreErrorKind::Usage,
-                format!(
-                    "{} does not speak wbf-pack, and this method has no plain-Matrix path yet",
-                    account.server_host
-                ),
+                "this call resolves to the matrix-sdk backend, so it must not ask for a wbf \
+                 client: use the matrix backend instead",
             )),
         }
     }
@@ -218,55 +233,93 @@ impl crate::Core {
 mod tests {
     use super::*;
 
-    /// matrix-sdk 只有一種講法：指定什麼都是 no-op，🚫 一個都不該報錯。
+    /// `http` 永遠是 matrix-sdk —— 🚫 沒有「wbf over http」這種東西了。
     #[test]
-    fn the_matrix_backend_ignores_transport_instead_of_refusing_it() {
-        for requested in [None, Some(Transport::WebSocket), Some(Transport::Http)] {
-            for need in [TransportNeed::Either, TransportNeed::WebSocketOnly] {
+    fn http_always_means_the_matrix_backend() {
+        for speaks_wbf in [true, false] {
+            for home in [MethodHome::BothSides, MethodHome::StillOnMatrixSdk] {
                 assert_eq!(
-                    get_transport_plan(BackendKind::MatrixSdk, requested, need).unwrap(),
-                    TransportPlan::NotApplicable,
-                    "requested={requested:?} need={need:?}"
+                    get_backend_for(Transport::Http, speaks_wbf, home).unwrap(),
+                    BackendKind::MatrixSdk,
+                    "speaks_wbf={speaks_wbf} home={home:?}"
                 );
             }
         }
     }
 
-    /// wbf 沒指定就是 ws —— 而且跟「明說 ws」是同一個答案。
+    /// ⭐ `ws` 打到一般 homeserver **不是錯**，是 no-op：照樣用 matrix-sdk 做事。
     #[test]
-    fn wbf_defaults_to_the_websocket_and_saying_so_changes_nothing() {
-        for need in [TransportNeed::Either, TransportNeed::WebSocketOnly] {
-            assert_eq!(
-                get_transport_plan(BackendKind::Wbf, None, need).unwrap(),
-                TransportPlan::Use(Transport::WebSocket)
-            );
-            assert_eq!(
-                get_transport_plan(BackendKind::Wbf, Some(Transport::WebSocket), need).unwrap(),
-                TransportPlan::Use(Transport::WebSocket)
-            );
-        }
-    }
-
-    #[test]
-    fn wbf_takes_http_when_the_method_can_answer_in_one_pack() {
+    fn asking_for_ws_on_a_plain_homeserver_is_a_no_op_not_an_error() {
         assert_eq!(
-            get_transport_plan(BackendKind::Wbf, Some(Transport::Http), TransportNeed::Either)
-                .unwrap(),
-            TransportPlan::Use(Transport::Http)
+            get_backend_for(Transport::WebSocket, false, MethodHome::BothSides).unwrap(),
+            BackendKind::MatrixSdk
         );
     }
 
-    /// 🚨 只支援 WS 的方法被硬指定 http：報錯，🚫 不是默默改用 WS
-    /// ——偷偷換掉會讓呼叫端以為它驗過的是 http 那條路。
     #[test]
-    fn asking_for_http_on_a_websocket_only_method_is_refused_not_quietly_upgraded() {
-        let error = get_transport_plan(
-            BackendKind::Wbf,
-            Some(Transport::Http),
-            TransportNeed::WebSocketOnly,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind, CoreErrorKind::Usage);
-        assert!(error.message.contains("one pack"), "要說出為什麼");
+    fn ws_on_a_wbf_homeserver_uses_the_wbf_protocol() {
+        assert_eq!(
+            get_backend_for(Transport::WebSocket, true, MethodHome::BothSides).unwrap(),
+            BackendKind::WbfSdk
+        );
+        assert_eq!(
+            get_backend_for(Transport::WebSocket, true, MethodHome::WbfSdkOnly).unwrap(),
+            BackendKind::WbfSdk
+        );
+    }
+
+    /// 🚨 **預設那條路**：沒帶 `transport` ＝ `ws`（`Settings::transport` 的預設），
+    /// 所以預設行為就是「對方講 wbf 就用 wbf，不講就 fallback 到 matrix-sdk」——
+    /// ⚠️ 兩種都🚫 **不報錯**。這條測試釘的是那個預設，🚫 不是某個特例。
+    #[test]
+    fn the_default_path_is_ws_and_it_falls_back_instead_of_failing() {
+        // ⭐ 問的是**那一份預設**（`Transport::default()`），🚫 不是這裡抄一個值來比 ——
+        // 抄一份就變成「WebSocket == WebSocket」，那證明不了任何事。
+        assert_eq!(Transport::default(), Transport::WebSocket, "預設是 ws");
+        assert_eq!(
+            get_backend_for(Transport::default(), true, MethodHome::BothSides).unwrap(),
+            BackendKind::WbfSdk,
+            "對方講 wbf：用 wbf"
+        );
+        assert_eq!(
+            get_backend_for(Transport::default(), false, MethodHome::BothSides).unwrap(),
+            BackendKind::MatrixSdk,
+            "對方不講：fallback，🚫 不是報錯"
+        );
+    }
+
+    /// 🚧 還沒有 ws 定義的方法**先走 matrix-sdk**，不管走哪條、不管對方是誰。
+    #[test]
+    fn a_method_without_a_ws_definition_yet_stays_on_matrix_sdk() {
+        for transport in [Transport::WebSocket, Transport::Http] {
+            for speaks_wbf in [true, false] {
+                assert_eq!(
+                    get_backend_for(transport, speaks_wbf, MethodHome::StillOnMatrixSdk).unwrap(),
+                    BackendKind::MatrixSdk
+                );
+            }
+        }
+    }
+
+    /// 只有 wbf 有的功能，在到不了 wbf 的路上就是**關的** —— ⚠️ 而兩種理由要分開講。
+    #[test]
+    fn a_wbf_only_feature_is_off_and_says_which_reason() {
+        let over_http = get_backend_for(Transport::Http, true, MethodHome::WbfSdkOnly).unwrap_err();
+        assert_eq!(over_http.kind, CoreErrorKind::Usage);
+        assert!(
+            over_http.message.contains("over http it is off"),
+            "{}",
+            over_http.message
+        );
+
+        let plain_server =
+            get_backend_for(Transport::WebSocket, false, MethodHome::WbfSdkOnly).unwrap_err();
+        assert!(
+            plain_server
+                .message
+                .contains("does not speak the wbf protocol"),
+            "{}",
+            plain_server.message
+        );
     }
 }

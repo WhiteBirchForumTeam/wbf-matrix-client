@@ -196,35 +196,38 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - 🚫 **值認不得（`102`）時不帶**：那次它一種都沒用，宣稱用了哪一種是說謊。
 - 不認得 `sync` 的 method **沒有這個欄位**（🚫 不是 `null`）。
 
-🚨 **backend 與 transport 是兩個軸，🚫 不要混**（維護者 2026-09-13 定）：
+🚨 **`transport` 就是選 backend**（維護者 2026-09-13 定案）：
 
-| | 意思 | 誰決定 | 值 |
-|---|---|---|---|
-| **backend** | 用哪一套**協議**跟 homeserver 講話 | **daemon 探測**，🚫 前端不指定 | matrix-sdk（標準 Matrix）／wbf pack |
-| **transport** | wbf 協議走哪條**管子** | 前端的 `transport` 參數 | `ws`（預設）／`http` |
+| `transport` | 協議 | 誰實作 |
+|---|---|---|
+| **`ws`**（**沒帶就是它**） | **wbf 客製協議** | `wbf-sdk`（`BackendKind::WbfSdk`） |
+| **`http`** | **原生 Matrix HTTP** | `matrix-sdk`（`BackendKind::MatrixSdk`） |
 
-🚫 `transport: "http"` **不是**「用標準 Matrix」，是「wbf 協議走 HTTP」。
+🚫 **wbf 底下不再細分 ws／http —— wbf 協議一律 WS。** pack-over-HTTP 只剩 **debug** 用途，
+⚠️ 它不是「wbf 的 HTTP 模式」，🚫 前端碰不到它。
 
-**backend 怎麼定**：探測（architecture-v2 §6.1）——問一次 `Hello`，講得出 wbf 協議版本就是 wbf。
-⭐ 連不上、不回、看不懂，一律當一般 homeserver。🚫 不寫進設定檔：那是 server 那邊的事實，它會變。
+**怎麼解析**（daemon 探測「這台講不講 wbf」，🚫 前端不指定 backend）：
 
-**`transport` 這個參數怎麼被解讀**：
+```text
+http ─────────────────────────> matrix-sdk（永遠）
+ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 不報錯，那是 no-op）
+     ├── 這個 method 還沒有 ws ─> matrix-sdk（🚧 暫時）
+     └── 其他 ────────────────> wbf
+```
 
-| backend | 顯式 `ws` | 顯式 `http` | 沒帶 |
-|---|---|---|---|
-| **matrix-sdk** | 🟢 **no-op，不報錯** | 🟢 **no-op，不報錯** | — |
-| **wbf** | 走 ws；開不起來 → 報錯 | 走 http；開不起來 → 報錯 | **ws** |
-| **wbf**，而那個 method 只有 WS 撐得住 | 走 ws | 🔴 **報錯**（`1100`） | ws |
-
-- ⭐ **matrix-sdk 那一列整列忽略 `transport`**：那個 backend 根本沒有這個維度，
-  🚫 為一個不存在的選擇報錯，只會逼前端「先知道對方是誰才敢送參數」。
-- 🚨 **只支援 WS 的 method 被指定 `http` 是報錯，🚫 不是默默改用 WS**：呼叫端說 http 通常有理由
-  （除錯、環境擋 WS），偷偷換掉會讓它以為驗過的是 http 那條路。
-- ⚠️ 目前「只支援 WS」的是 **`sync.recent`**：它的回應是一串 `Batch`，而**一個 HTTP 請求只回一個 pack**。
-  之後的 `Event/Subscribe`／`Push`、`Device/*` 也會是這一類（server 主動推的東西 HTTP 給不出來）。
-- ⚠️ 探到不是 wbf、而那個 method 只有 wbf 講得出來（`sync.recent`、`upload.*`、`media.*`、`server.ping`）
-  → `1100`，訊息說「這台不講 wbf-pack，而這條路還沒有標準 Matrix 的走法」。
-  🚫 不要連上去讓它在更深的地方用一個看不懂的錯誤失敗。
+- 🚨 **沒帶 `transport` 就是 `ws`**，所以預設就是「對方講 wbf 用 wbf，不講就 fallback 到 matrix-sdk」。
+  ⚠️ 那份預設只有一個地方寫著：`Transport::default()`（`wbf-sdk` 的 `channel.rs`），🚫 各層不再自己寫死一份。
+- ⭐ **`ws` 打到一般 homeserver 不是錯，是 no-op**：前端不必先知道對方是誰才敢送參數。
+- ⚠️ **只有一種情況報錯**：那個 feature **只有 wbf 講得出來**（`sync.recent`、`upload.*`、
+  `media.*`、`server.ping`），而這條路到不了 wbf —— 那時它就是**關的**（`1100`）。
+  兩種理由訊息分開講：**走 `http`** vs **對方不是 wbf**。⭐ 講出來比默默給一個空答案好。
+- 🚧 **「還沒有 ws」是一份會縮短的清單**：wbf 還沒把原生 HTTP 全部取代掉，所以有些 method
+  就算走 `ws` 也先用 matrix-sdk（現在是 `room.*`、`account.*`、`backup.*`、`recovery.*`）。
+  ⭐ server 端補上 ws 的定義就搬過去，**這一層一個字都不用改**。
+  📎 哪些在清單上，看 §10 的「底層」那一欄；程式裡是每個呼叫點自己標
+  `MethodHome::StillOnMatrixSdk`（🚫 不是一串字串比對——名字跟實際走哪條會漂移）。
+- **backend 怎麼探**：一次 WS `Hello`，講得出協議版本就是 wbf（architecture-v2 §6.1）。
+  ⭐ 連不上、不回、看不懂 → 一般 homeserver。🚫 不寫進設定檔：那是 server 那邊的事實，它會變。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（CLI 規格 §10），**由 daemon 讀 conf 填進 `Target`**。
   前端不該替使用者決定要不要備份，而 daemon 就是 conf 的主人（它是 client 本體，architecture-v2 §0.2）。

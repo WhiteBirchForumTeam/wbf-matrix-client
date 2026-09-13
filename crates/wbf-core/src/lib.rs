@@ -64,7 +64,7 @@ use wbf_sdk::Unlock;
 
 pub use account_ops::{AccountStatus, SwitchResult, WhoAmI};
 pub use accounts::AccountSummary;
-pub use backend_choice::{get_transport_plan, BackendKind, TransportNeed, TransportPlan};
+pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 use accounts::{AccountDir, DataDirMap};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};

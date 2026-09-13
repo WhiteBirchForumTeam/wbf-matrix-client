@@ -322,33 +322,52 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 | 帳號列表永遠本地 | ✅ 已經是了 |
 | `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🟡 **一半**：探測與 transport 規則做好了（`backend_choice`），但**房間那條線還沒有 wbf 實作可以分派**。見下 |
 
-🟡 **backend 這條線挖到一半**（維護者 2026-09-13 指定）。⚠️ 先把兩個軸分開，它們一直被混用：
+🟡 **backend 這條線挖到一半**（維護者 2026-09-13 定案）。
 
-| | 意思 | 值 |
+🚨 **`transport` 就是選 backend，🚫 不是「wbf 底下再挑一條管子」**：
+
+| `transport` | 協議 | 誰實作 |
 |---|---|---|
-| **backend** | 用哪一套**協議**跟 homeserver 講話 | matrix-sdk（標準 Matrix）／wbf 的 pack 協議 |
-| **transport** | wbf 協議走哪條**管子** | `ws`（預設）／`http`（fallback） |
+| **`ws`**（**沒帶就是它**） | wbf 客製協議 | `wbf-sdk`（`BackendKind::WbfSdk`） |
+| **`http`** | 原生 Matrix HTTP | `matrix-sdk`（`BackendKind::MatrixSdk`） |
 
-🚫 `--transport http` **不是**「退回標準 Matrix」，是「wbf 協議走 HTTP」。這兩個正交。
+🚫 **wbf 協議一律 WS**，底下不再分。pack-over-HTTP 只剩 debug 用途 ——
+⚠️ 這份文件之前把它當成「wbf 的 HTTP 模式」，那是多的一層，拿掉了。
+
+```text
+http ─────────────────────────> matrix-sdk（永遠）
+ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 不報錯，那是 no-op）
+     ├── 這個 method 還沒有 ws ─> matrix-sdk（🚧 暫時清單）
+     └── 其他 ────────────────> wbf
+```
+
+🚨 **沒帶 `transport` 就是 `ws`**，所以**預設走的就是那條分岔**：對方講 wbf 就用 wbf，
+不講就 **fallback 到 matrix-sdk** —— ⚠️ 兩種都🚫 不報錯。
+📎 那份預設只有一個地方寫著：`Transport::default()`（`wbf-sdk` 的 `channel.rs`）。
+🚫 daemon 的 `Settings` 不再自己寫死一份 —— ⭐ 同一個預設有兩個地方決定，遲早只有一邊被改到。
 
 **已經做好的（`wbf_core::backend_choice`）**：
 
-1. **探測**：`Core::get_backend_kind` —— 一個 WS `Hello`，講得出協議版本就是 wbf。
+1. **探測** `Core::get_backend_kind` —— 一個 WS `Hello`，講得出協議版本就是 wbf。
    ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。
    一個 server dir 記一格，🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
-   會話重連時要重探 —— `Core::forget_backend_probe`，接會話監督者（階段 8）時叫它。
-2. **transport 規則**：`get_transport_plan`，純函數所以那張表測得到 ——
-   matrix-sdk 整列 no-op、wbf 預設 ws、**只支援 WS 的 method 被指定 http 是報錯**
-   （🚫 不默默升級成 WS）。規則表在 rpc-spec §2。
-3. **唯一的閘門**：`Core::client_of` —— 探測＋規則＋開通道都在這一個地方。
-   底下那半是 `connect_wbf_client`（指定什麼就開什麼），🚫 只留給閘門自己與探測用
+   會話重連要重探 —— `Core::forget_backend_probe`，接會話監督者（階段 8）時叫它。
+2. **規則** `get_backend_for(transport, server_speaks_wbf, home)` —— 純函數，所以上面那張表
+   逐格測得到。⚠️ 只有一種情況報錯：那個 feature 只有 wbf 有，而這條路到不了它 ——
+   它就是**關的**，而「因為你選了 http」跟「因為對方不是 wbf」訊息分開講。
+3. **唯一的閘門** `Core::client_of(account, transport, home)` —— 探測＋規則＋開通道都在這裡。
+   底下那半是 `connect_wbf_client`（一律 WS），🚫 只留給閘門自己與探測用
    （探測不能走閘門，不然它會叫到自己）。
 
-**還沒做的**：房間那條線**只有 matrix-sdk 一條路**（`room.list`／`get`／`history`／`send_text`），
-而 wbf 協議的 `Event` 底下只有 `Recent`／`Send`／`Batch` —— 🚫 **沒有「拿房間歷史」這個 call**，
-所以現在也**沒有第二條路可以分派**。⭐ server 端正在補這塊 API（維護者 2026-09-13）；
-接上之後 `room.*` 照探測結果分派，**rpc-spec 那一層一個字都不用改**
-—— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
+**🚧 那份會縮短的清單**：每個呼叫點自己用 `MethodHome` 說出它住在哪一邊 ——
+🚫 不是一串字串比對（名字跟實際走哪條會漂移）。現在在清單上的是 `room.*`、`account.*`、
+`backup.*`、`recovery.*`；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfOnly`。
+
+**還沒做的**：房間那條線**沒有第二條路可以分派** —— wbf 協議的 `Event` 底下只有
+`Recent`／`Send`／`Batch`，🚫 沒有「拿房間歷史」的定義。⭐ server 端正在補那塊 API
+（維護者 2026-09-13）；補上之後把那幾個呼叫點從 `StillOnMatrixSdk` 改成 `BothSides` 就搬過去了，
+**rpc-spec 那一層一個字都不用改** —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，
+🚫 不是「用哪個協議去問」。
 
 📎 **代價講在前面**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）。
 一個 daemon 生命週期一次，🚫 不是每個請求一次。
