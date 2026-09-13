@@ -7,7 +7,8 @@
 > 🚫 不重複分層（[`architecture-v2.md`](architecture-v2.md)）、逐條訊息（[`rpc-spec.md`](rpc-spec.md)）、
 > 資料庫 schema（[`local-cache-db.md`](local-cache-db.md) §6）。
 >
-> 🚨 **狀態：草案**，而且**這份裡有幾條跟現況不符**（§3.4 列出來了）——那些是要改的方向，不是現狀。
+> 🚨 **狀態：草案**。⚠️ §3 的 `sync` 參數、§6 的已讀三層是維護者 2026-09-13 當場定的方向，
+> **本分支預設同意、照著做**；跟現況的落差在 §3.5 列著。
 
 ## 0. 先把三個字分開
 
@@ -76,9 +77,12 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 UI 觸發的寫（已讀…）─┘
 ```
 
-- **每個 server dir 一個 `Cache` 寫入 handle**，daemon 內部共用（`Mutex` 或一個寫入 task 收 channel
-  —— 兩種都行，選哪個在實作時定，判準是「批次寫要不要合併」）。
+- **每個 server dir 一個寫入 task**，前面掛一條 **queue**（維護者 2026-09-13：「一樣 db queue 的概念，
+  **無限長，沒有 limit**」）。要寫的人把工作丟進去就走，🚫 不必等別人寫完。
   ⭐ 重點是**寫入者只有一個**，🚫 不是「大家各開一條連線然後靠 SQLite 去擋」。
+- ⚠️ **無上限的 queue 要有代價的自覺**：寫得比收得慢的時候，那些工作會累積在記憶體裡。
+  🚫 不加上限是刻意的（丟掉一則已經收到的事件比慢更糟），但**要看得見** ——
+  queue 長度應該進 `daemon.info`，長到不像話時發一則 `Note` 說出來。
 - **讀不走那個寫入者**：讀各自開唯讀連線，WAL 本來就允許「一個寫、多個讀」。
   ⚠️ 讀連線也要付 SQLCipher 的開檔成本，所以要**留著重用**，🚫 不要每個請求開一次。
 - **仍然設 `busy_timeout`**（例如 5 秒）當保險：跨程序的情況（單發命令、未來的唯讀工具）
@@ -100,56 +104,87 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一個上游�
 - 一邊寫一邊讀（UI 在捲歷史、上游在寫新事件）：讀不能被餓死，也不能讀到半個交易。
 - 殺掉 daemon（`kill -9`）之後重開：WAL 要能自己回復，🚫 不能留下壞掉的 `cache.db`。
 
-## 3. UI 拿東西走哪條路
+## 3. UI 拿東西走哪條路：`sync` 這個參數
 
-### 3.1 三種命令，走的路完全不同
+### 3.1 大方向：RPC 是對**本地資料庫**的呼叫（維護者 2026-09-13 定）
 
-| 類別 | 例子 | 碰上游嗎 | 典型延遲 |
+> **「rpc 呼叫大部分都是對 local db 的呼叫，是更加抽象、更加高階的。
+> rpc-server 收到 UI 來的 sync，其實就是需要 UI 說明白，是什麼的 sync？」**
+
+所以🚫 **不改語意、也不砍掉上游那條路**，而是**補一個參數**讓呼叫者說清楚要哪一種：
+
+```jsonc
+{ "method": "room.list", "params": { "user": "@a:localhost", "sync": "local" }, "id": 1 }
+```
+
+| `sync` | daemon 做什麼 | 寫 `cache.db` 嗎 | 什麼時候用 |
 |---|---|---|---|
-| **本地讀** | 房間列表、歷史、附件列表、未讀數、媒體資訊 | ❌ 只讀 `cache.db` | 毫秒 |
-| **上游拉** | `sync.recent`（補洞）、進房的 backfill | ✅ | 秒級 |
-| **寫入／動作** | 送訊息、送檔、已讀、建房、登入登出 | ✅ | 看網路 |
+| **`local`（預設，沒帶就是它）** | 只讀 `cache.db` | ❌ | **常態**。UI 顯示東西都走這個 |
+| `server` | 打上游，拿到最新結果**直接回傳** | 🚫 **不寫** | 「我要看 server 現在到底怎麼說」——除錯、對帳 |
+| `both` | 打上游 → **寫進 `cache.db`** → 再從本地讀一次 → 回傳 | ✅ | 使用者按「重新整理」、或 UI 知道本地那段有洞 |
 
-⭐ **UI 的常態是第一類。** 第二類是「補洞」，第三類是使用者主動做的事。
-🚫 UI 🚫 不該為了顯示一個列表去打 homeserver。
+- ⭐ `both` 回傳的是**本地讀的結果**，不是上游的原始回應 —— 這樣它跟 `local` 的形狀一模一樣，
+  UI 🚫 不需要為兩種模式寫兩套解析。
+- ⚠️ `server` **刻意不寫庫**：它是「看一眼」，🚫 不是「同步」。要同步就用 `both`。
+  📎 分開的理由：對帳的時候你要看得到「上游說 A、本地存的是 B」，如果 `server` 順手把 B 改成 A，
+  那個差異就永遠看不到了。
+- 🚫 **不做 `sync: "auto"`**（「本地有就本地、沒有就上游」）：那會讓同一個呼叫的延遲從毫秒跳到秒
+  而 UI 無從預期。要不要打上游是**呼叫者的決定**。
 
-### 3.2 UI 的每一個動作實際發生什麼
+### 3.2 哪些 method 要補這個參數
 
-| UI 做什麼 | RPC | daemon 做什麼 | 上游 |
-|---|---|---|---|
-| 開 app、顯示帳號列表 | `account.list` | 讀帳號目錄 | ❌ |
-| 顯示房間列表（全部帳號） | `room.list`（每個帳號一次，或不帶 `user` 拿全部） | 讀 `cache.db` 的 `room_list` | ❌ |
-| **點開一個房間** | `room.history { source: cache }` | 讀 `events`＋`events_synced_log` | ❌ |
-| 房間內往上捲，捲到快取的盡頭 | `room.history { source: server, before }` | 逐房 backfill（`/messages` 或 `Recent` 窗），寫回 `cache.db` | ✅ |
-| 收到新訊息 | —（推播 `room.message`） | 上游會話已經寫進 `cache.db` 才發推播 | ✅（背景） |
-| 送一則訊息 | `room.send_text` | 送上游，成功後寫回 `cache.db` | ✅ |
-| 標記已讀 | （還沒有 method，§6） | 寫 `read_positions`，並送上游的 read receipt | ✅ |
-| 下載附件 | `media.save_to`／`media.open` | 媒體池命中就本地給，沒有才拉 | 🟡 看有沒有命中 |
-| 切換「現在看哪個帳號」 | **不用 RPC** | —— | ❌ |
+判準（維護者 2026-09-13）：**本地快取有的都要這個模式**。
+
+| method | 補嗎 | 為什麼 |
+|---|---|---|
+| `room.list`、`room.get` | ✅ | `room_list` 表就是它的本地版 |
+| `room.history`、`room.files` | ✅ | ⚠️ 它們現在的參數叫 `source: server\|cache` —— **改名成 `sync`、值改成三種**，🚫 不要兩個名字講同一件事 |
+| `media.info` | ✅ | `media` 表有 |
+| 讀已讀位置（§7） | ✅ | `read_positions` 有 |
+| `account.list`、`recovery.list`／`show` | ❌ | **已登入的帳號 always local**：那是這台機器的檔案，不是快取，🚫 沒有「上游版本」可言 |
+| `sync.recent` | ❌ | 它**本身就是**上游拉。加 `sync=local` 沒有意義 |
+| `server.ping`、`backup.*` | ❌ | server 端狀態，本地沒有那份東西 |
+| `room.send_*`、`upload.*`、`account.add`／`del` | ❌ | 動作不是查詢 |
+
+### 3.3 UI 的每一個動作實際發生什麼
+
+| UI 做什麼 | RPC | 上游 |
+|---|---|---|
+| 開 app、顯示帳號列表 | `account.list` | ❌ |
+| 顯示房間列表（全部帳號） | `room.list`（每個帳號一次） | ❌ `sync=local` |
+| **點開一個房間** | `room.history { sync: "local" }` | ❌ |
+| 使用者按「重新整理」 | `room.list { sync: "both" }` | ✅ |
+| 房間內往上捲，捲到快取的盡頭 | `room.history { sync: "both", before }` | ✅ 逐房 backfill，寫回庫 |
+| 收到新訊息 | —（推播 `room.message`） | ✅（背景，上游會話） |
+| 送一則訊息 | `room.send_text` | ✅ |
+| 標記已讀 | `room.read`（§7） | 🟡 看 `sync` |
+| 下載附件 | `media.save_to`／`media.open` | 🟡 命中媒體池就不用 |
+| 切換「現在看哪個帳號」 | **不用 RPC** | ❌ |
 
 🚨 最後一列是重點：**「UI 現在在看哪個帳號」是 UI 自己的狀態**，🚫 不是 daemon 的。
 daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰」，
 而多帳號的 UI **每個命令都該明確帶 `user`**，🚫 不要依賴那個預設。
 
-### 3.3 「點開房間才 sync」怎麼落地
+### 3.4 「點開房間才 sync」怎麼落地
 
 維護者 2026-09-13：*「等點開房間才會去跑 sync 和拿房間資訊。」*
 
-- **點開房間 = 先讀本地**（立刻有東西看），**同時**如果本地那一段有洞，才去補。
+- **點開房間 = 先 `sync: "local"`**（立刻有東西看），**之後**才視情況補洞。
   🚫 不要「先去 server 拉完再顯示」——那是把毫秒變成秒。
 - 有沒有洞是**看得出來的**：`cache.db` 的 `events` 有 `r_seq`（房內序號），
-  一段連續的 `r_seq` 中間缺號就是洞（local-cache-db §6）。
-- 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 daemon 自己的事（§4.2）。
+  一段連續的 `r_seq` 中間缺號就是洞（local-cache-db §6）。有洞才發第二個 `sync: "both"`。
+- 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 daemon 自己的事（§4.3）。
 
-### 3.4 ⚠️ 現況跟這份文件不一致的地方
+### 3.5 ⚠️ 現況與這個模型的落差
 
-| 這份說 | 現在的程式 | 要怎麼改 |
-|---|---|---|
-| `room.list` 是本地讀 | `list_conversations` 走 `synced_backend_of`，**每次都先跟上游 sync 一輪** | 改成讀 `cache.db` 的 `room_list`；上游那條變成 daemon 的背景更新 |
-| `room.get` 是本地讀 | 同上 | 同上 |
-| UI 不需要為了顯示打上游 | CLI 現在就是「每個命令自己去 sync」 | 那是「一個命令一個程序」的遺產，daemon 常駐之後不該保留 |
+| 這份說 | 現在的程式 |
+|---|---|
+| `room.list`／`room.get` 預設 `local` | `list_conversations` 走 `synced_backend_of`，**每次都先跟上游 sync 一輪**（等於永遠是 `both`） |
+| 參數叫 `sync`，三個值 | `room.history`／`files` 叫 `source`，兩個值（`server`／`cache`） |
+| 帳號列表永遠本地 | ✅ 已經是了 |
 
-⭐ 這三條是**這一支要修的**，不是既有設計。📎 CLI 那樣寫沒有錯 —— 它沒有常駐的東西可以依賴。
+⭐ **這是補參數、不是改方向**：上游那條路一行都不會少，只是從「唯一的路」變成「說出來才走的那條」。
+📎 CLI 現在那樣寫沒有錯 —— 它沒有常駐的東西可以依賴，每個命令自己去 sync 是唯一選擇。
 
 ## 4. 上游會話：多帳號怎麼落到資料庫
 
@@ -209,16 +244,65 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 - 🚫 **daemon 不替 UI 決定「哪些值得看」**：它只送「發生了什麼」，
   要不要響、要不要跳紅點、要不要靜音某個帳號 —— 那是 UI 的事（§7）。
 
-## 6. 未讀與「有新房間」
+## 6. 已讀有三層（維護者 2026-09-13 給的草案方向）
 
-維護者 2026-09-13：*「有新房間，還沒已讀時，早就被 daemon 寫入了，剩下的只是 event 通知前端。」*
+「已讀」在這個系統裡指過三件**不同**的事，混在一起講是下一個 bug 的溫床：
 
-- **未讀是算出來的，🚫 不是一個推播欄位**：`read_positions`（每帳號每房間一列）對上
-  `events` 的 `r_seq`，「比它新的有幾則」就是未讀數。
-- 所以 UI 收到 `room.message` 之後要做的是**重新讀那個房間的未讀**（本地讀，毫秒），
-  🚫 不是自己 +1（自己加會在多裝置、多前端的情況下漂掉）。
-- **新房間**：上游會話寫進 `rooms`／`room_list` 之後發一則 `room.message`（那則邀請或第一則訊息）。
-  ⚠️ 「房間列表變了」值不值得一個獨立的推播（`room.list_changed`），這一版**先不加** ——
+| 層 | 存在哪 | 誰改它 | 意思 |
+|---|---|---|---|
+| **1. 快取水位** | `sync_state.cg_seq`（每帳號） | daemon 的上游會話 | 「這個帳號的事件我抓到哪裡了」。🚫 **跟人有沒有看過完全無關** |
+| **2. 本地已讀** | `read_positions`（每帳號每房間） | **只有 UI 明講才會改** | 「這台機器上的這個人看到哪裡了」 |
+| **3. 遠端已讀** | homeserver 的 read receipt | UI 明講、而且要求送上游時 | 「其他裝置／其他人看得到的已讀」，又分 **private／public** |
+
+### 6.1 預設是「沒有讀」
+
+🚨 **daemon 把事件寫進 `cache.db` ≠ 已讀。** 第 1 層前進的時候，第 2、3 層**一動也不動**：
+`read_positions` 沒有那一列就是沒讀過，遠端也是未讀。
+
+📎 為什麼要特別寫這一條：`read_positions` 當初是配著 CLI 設計的（那時候「印出來」約等於「看過了」）。
+UI 分離之後那個等式不成立了 —— **只有 UI 說看過了才算看過**。
+
+### 6.2 UI 怎麼標已讀：`room.read`
+
+```jsonc
+{ "method": "room.read",
+  "params": { "room": "!r:localhost", "user": "@a:localhost",
+              "g_seq": 123, "sync": "local" }, "id": 7 }
+```
+
+| `sync` | 效果 |
+|---|---|
+| `local`（預設） | 只寫 `read_positions`。**本地已讀、遠端仍未讀** |
+| `server` | 只送上游的 read receipt，🚫 不寫本地（對帳用，跟 §3.1 同一套語意） |
+| `both` | 送上游 ＋ 寫本地 |
+
+- **位置怎麼指**：`event_id` 是權威，`g_seq`／`r_seq` 是算術用的捷徑（local-cache-db §6）。
+  三個至少要給一個；給 seq 的時候 daemon 自己去查那一則的 `event_id` 再送上游
+  —— ⚠️ Matrix 的 read receipt 吃的是 `event_id`，🚫 沒有序號這種東西。
+- **未讀數還是算出來的**（`read_positions` 對 `events`），🚫 不是一個推播欄位。
+  UI 收到 `room.message` 之後**重新讀一次未讀**（本地讀，毫秒），🚫 不要自己 +1
+  —— 自己加會在多裝置、多前端的情況下漂掉。
+
+### 6.3 private 還是 public：conf 決定，🚫 不是每次呼叫決定
+
+Matrix 有兩種 receipt：`m.read`（**public**，同房間的人看得到）與 `m.read.private`（只有自己的其他裝置看得到）。
+
+- **預設 private。** 送 `sync: "server"`／`"both"` 的已讀，daemon 一律送 private。
+- 要公開：**UI 把設定寫進 `wbf.conf`**（例如 `READ_RECEIPTS=public`），然後叫一個
+  **`daemon.reload_conf`** 讓 daemon graceful reload；之後的已讀才會是 public。
+- ⭐ 為什麼是 conf 而不是每次呼叫帶一個 `public: true`：**這是使用者對「我要不要被看見」的長期偏好**，
+  🚫 不是某一次操作的選項。放在呼叫上，第一個忘了帶的地方就會把使用者曝光出去
+  —— 而那種錯誤是**不可回收的**（別人已經看到了）。
+- ⚠️ 因此 `daemon.reload_conf` 這個 method 是這條的一部分，🚫 不是附帶：
+  沒有它，改設定就要重開 daemon（斷掉所有上游會話）。
+
+⚠️ 這一節是**方向草案**（維護者原話：「執行上有沒有問題我不確定」）。實作時要回頭確認兩件事：
+matrix-sdk 送 private receipt 的介面長什麼樣、以及 wbfuwunel 那邊對兩種 receipt 的支援。
+
+### 6.4 新房間
+
+- 上游會話寫進 `rooms`／`room_list` 之後發一則 `room.message`（那則邀請或第一則訊息）。
+- ⚠️ 「房間列表變了」值不值得一個獨立的推播（`room.list_changed`），這一版**先不加** ——
   先看 `room.message` 夠不夠用，🚫 不預先發明。
 
 ## 7. 通知（notification）不在 rpc-spec 裡
@@ -289,15 +373,17 @@ let response = tokio::select! {
 | 階段 | 內容 | 狀態 |
 |---|---|---|
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ 這支分支做了 |
-| 2 | **`cache.db` 的單一寫入者＋連線重用＋`busy_timeout`**（§2.2），含併發壓力測試（§2.4） | ❌ |
-| 3 | daemon 的訂閱、推播封裝、`progress` 自動路由 | ❌ |
-| 4 | `cancel`（§9） | ❌ |
-| 5 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ❌ 向量已經有，codec 還沒寫 |
-| 6 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | ❌ |
-| 7 | 監督者：跟著解鎖／登入／登出起停，退避重連 | ❌ |
-| 8 | **`room.list`／`room.get` 改成本地讀**（§3.4） | ❌ |
+| 2 | **`cache.db` 的單一寫入者**：一個 server 一個寫入 task ＋無上限 queue ＋連線重用 ＋ `busy_timeout`（§2.2），含併發壓力測試（§2.4） | ❌ |
+| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` 改名，預設 `local` | ❌ |
+| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由 | ❌ |
+| 5 | `cancel`（§9） | ❌ |
+| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ❌ 向量已經有，codec 還沒寫 |
+| 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | ❌ |
+| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | ❌ |
+| 9 | **已讀三層**（§6）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | ❌ |
 
-⚠️ 階段 2 排在推播前面是刻意的：**先確定兩個帳號一起寫不會炸**，再談把事件送出去。
+⚠️ 順序有兩條刻意的：**階段 2 排在推播前面**（先確定兩個帳號一起寫不會炸，再談把事件送出去）；
+**階段 3 排在上游會話前面**（`sync` 參數定了「誰負責去打上游」，會話那層才知道自己要不要主動拉）。
 
 ## 12. 明確不做的
 

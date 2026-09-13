@@ -166,6 +166,21 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `user` | string? | 對哪個帳號動作，mxid 或 localpart。**沒給 = `current`**。＝ `wbf-core::Target.user` |
 | `server` | string? | 同名 localpart 在多個 server 時消歧。＝ `Target.server` |
 | `transport` | `"ws"` \| `"http"` | 跟 wbfuwunel 講話走哪條。**預設 `ws`**。只有標了「有 `transport`」的 method 認得它 |
+| `sync` | `"local"` \| `"server"` \| `"both"` | **要本地的還是上游的**。**預設 `local`**。只有標了「有 `sync`」的 method 認得它 |
+
+🚨 **`sync`：RPC 大部分是對本地資料庫的呼叫**（維護者 2026-09-13 定；執行期細節在
+[`daemon-runtime.md`](daemon-runtime.md) §3）。UI 顯示東西走本地，要打上游得**明講**：
+
+| 值 | daemon 做什麼 | 寫 `cache.db` |
+|---|---|---|
+| **`local`（預設）** | 只讀 `cache.db` | ❌ |
+| `server` | 打上游、拿到什麼就回什麼 | 🚫 **不寫**（這是「看一眼」，不是同步） |
+| `both` | 打上游 → 寫進 `cache.db` → **再從本地讀一次**回傳 | ✅ |
+
+- ⭐ `both` 回的是**本地讀的結果**，形狀跟 `local` 一模一樣 —— UI 🚫 不必為兩種模式寫兩套解析。
+- 🚫 **沒有 `auto`**：延遲從毫秒跳到秒這件事，要由呼叫者決定，🚫 不是 daemon 猜。
+- 判準：**本地快取有那份東西的 method 才有這個參數**。帳號列表、recovery key 那些是這台機器的檔案
+  （沒有「上游版本」），`sync.recent`／`server.ping`／`backup.*` 本來就是上游的。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（CLI 規格 §10），**由 daemon 讀 conf 填進 `Target`**。
   前端不該替使用者決定要不要備份，而 daemon 就是 conf 的主人（它是 client 本體，architecture-v2 §0.2）。
@@ -185,6 +200,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
+| `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：🚫 不斷上游會話、🚫 不掉連線）。⭐ 前端改設定（例如已讀要不要公開，daemon-runtime §6.3）之後叫它，🚫 不必重開 daemon |
 | `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
@@ -237,13 +253,14 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `room.list` | `{ user?, server? }` | `[Conversation]`（chat-model §2.1） | `list_conversations` |
-| `room.get` | `{ room, user?, server? }` | `Conversation` | `conversation` |
+| `room.list` | `{ user?, server?, sync? }`。**有 `sync`**（§2） | `[Conversation]`（chat-model §2.1） | `list_conversations`。⚠️ core 現在只有「先跟上游 sync 一輪」那條，`local` 要接 `cache.db` 的 `room_list` |
+| `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation` | `conversation`。同上 |
 | `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
-| `room.history` | `HistoryQuery` 加 `user?`／`server?`：`{ room, limit, before?, source: "server"\|"cache", types?, sender? }` | `MessagePage`：`{ events: [Message], next? }` | `history` |
-| `room.files` | `{ room, limit, before?, source, user?, server? }` | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
+| `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | `history`。⚠️ core 那邊的參數現在叫 `source: server\|cache`（兩個值）——**RPC 上統一叫 `sync`、三個值**，🚫 不要兩個名字講同一件事 |
+| `room.files` | `{ room, limit, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
+| `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（daemon-runtime §6） |
 
 🚫 **沒有 `room.watch`**。CLI 的 `watch tail|wait|once` 是「一個命令一個程序」的產物；daemon 常駐，
 新訊息走**訂閱＋推播**（§4）。rpc-cli 要模擬 `watch once --timeout` 就是「訂閱、等第一則、退訂」。
@@ -271,7 +288,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `media.info` | `{ mxc, manifest?, transport?, user?, server? }` | `MediaInfo` | `media_info` |
+| `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo` | `media_info` |
 | `media.open` | `{ manifest, user?, server? }` 或 `{ event_id, room, user?, server? }`（daemon 從快取找 manifest） | `{ url, mimetype?, size, expires_in }`。`url` 是資料平面的 capability URL（§6.1） | ⚠️ core 缺「給一個 reader」的形狀：現在 `download_to` 直接寫檔、`seek_read` 一次回整段 bytes。daemon 要的是 `PoolReader`（local-cache-db §8.6）接到 HTTP Range 上 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, sha256?, user?, server? }` | `{ upload_id, mxc, url, expires_in }`。`url` 是資料平面的 PUT URL（§6.2）。`mxc` 在這一步就有（server 的 `Create` 就配好 id）——所以 `room.send_attachment` 不必等傳完 | ⚠️ core 缺（同 `room.send_attachment`） |
 | `media.save_to` | `{ manifest, out: path, no_cache?: bool, transport?, user?, server? }` | `DownloadResult` 或（`no_cache`）`DirectDownloadResult` | `download_to`／`download_direct`。長工作。**明文落地是使用者要的**（§4.8） |
@@ -455,6 +472,8 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 |---|---|---|---|
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
+| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`） | 🔁 core 只有上游那條；`local` 要接 `cache.db` | 本機 | ❌ |
+| `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
