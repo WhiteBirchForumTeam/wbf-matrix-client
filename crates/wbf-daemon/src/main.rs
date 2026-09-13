@@ -42,15 +42,58 @@ struct Cli {
     /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（CLI 規格 §10.1）
     #[arg(long, env = "WBF_CONFIG")]
     config: Option<PathBuf>,
+    /// 單發命令：`daemon <命令> [參數…]`（architecture-v2 §0.2）。⚠️ 還沒實作
+    #[arg(trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+/// **啟動路徑只有兩種**（維護者 2026-09-13）：常駐，或單發。
+///
+/// ⭐ 它們是兩種**不同的起法**，不是一個旗標加一個選項 —— 所以兩個都帶不是「以某一邊為準」，
+/// 是使用者搞錯了，🚫 我們不替他猜（A5：不確定就拒絕）。
+#[derive(Debug)]
+enum StartMode {
+    /// `-s`：常駐、開 RPC、**會寫**（所以啟動時就要拿寫權）。
+    Serve,
+    /// 沒有 `-s`：跑一個命令就結束。⚠️ 還沒實作。
+    OneShot(Vec<String>),
+}
+
+/// Args:
+///     serve: 有沒有 `-s`, example: true
+///     command: 尾巴的單發命令, example: vec!["account".into(), "list".into()]
+/// Return:
+///     Ok(StartMode)   兩種起法之一
+///     Err(String)     兩個都帶、或兩個都沒帶；字串就是要印給使用者的那句
+fn start_mode(serve: bool, command: Vec<String>) -> Result<StartMode, String> {
+    match (serve, command.is_empty()) {
+        (true, true) => Ok(StartMode::Serve),
+        (false, false) => Ok(StartMode::OneShot(command)),
+        (true, false) => Err(format!(
+            "-s starts the daemon and a command runs one-shot;              these are the two ways to start it, so pass one or the other (got both: {})",
+            command.join(" ")
+        )),
+        (false, true) => Err(
+            "nothing to do: pass -s to serve, or a command to run one-shot".to_string(),
+        ),
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if !cli.serve {
-        eprintln!(
-            "only `-s` (serve) is implemented in this version; single-shot commands come next"
-        );
-        return ExitCode::from(1);
+    match start_mode(cli.serve, cli.command) {
+        Ok(StartMode::Serve) => {}
+        Ok(StartMode::OneShot(command)) => {
+            eprintln!(
+                "single-shot commands are not implemented yet (got: {}); only `-s` works today",
+                command.join(" ")
+            );
+            return ExitCode::from(1);
+        }
+        Err(complaint) => {
+            eprintln!("{complaint}");
+            return ExitCode::from(1);
+        }
     }
     let token_path = cli
         .token_file
@@ -177,4 +220,36 @@ fn main() -> ExitCode {
         let _ = std::fs::remove_file(&ready_path);
         ExitCode::SUCCESS
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 啟動路徑只有兩種，而且**互斥**（architecture-v2 §0.2）。
+    #[test]
+    fn there_are_exactly_two_ways_to_start_and_they_are_mutually_exclusive() {
+        assert!(matches!(start_mode(true, Vec::new()), Ok(StartMode::Serve)));
+        match start_mode(false, vec!["account".to_string(), "list".to_string()]) {
+            Ok(StartMode::OneShot(command)) => assert_eq!(command, ["account", "list"]),
+            other => panic!("沒有 -s 就是單發：{}", describe(&other)),
+        }
+        // 🚫 兩個都帶不猜：那是使用者搞錯了。
+        let both = start_mode(true, vec!["account".to_string()]);
+        assert!(both.is_err(), "-s 加命令應該報錯");
+        assert!(
+            both.unwrap_err().contains("one or the other"),
+            "錯誤訊息要講得出怎麼改"
+        );
+        // 什麼都沒帶也不猜。
+        assert!(start_mode(false, Vec::new()).is_err());
+    }
+
+    fn describe(mode: &Result<StartMode, String>) -> String {
+        match mode {
+            Ok(StartMode::Serve) => "serve".to_string(),
+            Ok(StartMode::OneShot(command)) => format!("one-shot {command:?}"),
+            Err(complaint) => complaint.clone(),
+        }
+    }
 }

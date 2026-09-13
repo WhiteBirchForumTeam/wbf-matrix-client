@@ -273,3 +273,29 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
     let _ = third.kill();
     let _ = third.wait();
 }
+
+/// `-s` 與單發是**兩種起法**，兩個都帶就報錯（architecture-v2 §0.2，維護者 2026-09-13）。
+#[test]
+fn serving_and_a_one_shot_command_at_the_same_time_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("daemon.token");
+    std::fs::write(&token_file, TOKEN).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
+        .arg("-s")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--token-file")
+        .arg(&token_file)
+        .arg("account")
+        .arg("list")
+        .output()
+        .expect("the daemon binary runs");
+    assert!(!output.status.success(), "-s 加命令不該跑起來");
+    assert!(output.stdout.is_empty(), "🚫 不該印 ready");
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(complaint.contains("one or the other"), "{complaint}");
+    // 🚫 連資料目錄都不該碰：沒有鎖檔、沒有 daemon.json。
+    assert!(!dir.path().join("daemon.json").exists());
+    assert!(!dir.path().join(wbf_daemon::lock::LOCK_FILE_NAME).exists());
+}
