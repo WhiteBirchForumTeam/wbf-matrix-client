@@ -117,6 +117,12 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
   現在有 `every_vector_id_carries_a_type_byte_we_know` 釘住「非零的 id 一定帶得出型別」，重抄到沒組型別的向量會當場紅。
 - **`cargo test --workspace` 綠不代表 SDK 對得上 server**：黃金向量是整份複製的，server 加了 kind（`0x02 Stream`、
   `0x16 Device`）我們的 `Kind` 表沒有，`vectors.rs` 才會紅；漏抄向量就什麼都不會紅。每次 server 那邊改 wire 就重抄一次。
+- 🚨 **我們只在 Windows 上跑測試，而有些檢查在 Windows 上是 no-op**：`token::is_private`
+  在非 Unix 一律回 `true`（靠目錄 ACL）。所以「測試自己用 `std::fs::write` 寫 token 檔」
+  在這裡全綠，到 Unix 上卻會被 daemon fail closed 擋掉、每個 process 測試都死在啟動
+  （PR #31 審查 cirno🔴 抓到）。⭐ 寫測試用的私密檔一律走 `wbf_sdk::vault::write_private`，
+  🚫 不要 `std::fs::write` 之後再 chmod。📎 同一類的還有檔案鎖與權限位元 —— 平台差異的地方，
+  **綠燈只代表這個平台綠**。
 - **Windows 上剛關掉的 SQLite store 還會被握著幾百毫秒**：登出刪 `m/` 會撞 `os error 32`
   （`AccountDir::delete_matrix_store` 因此重試 10 × 100 ms）。⚠️ 它是**間歇的** —— 2026-09-13 對真
   server 跑 daemon e2e 第一次紅、第二次就過。📎 重試完仍失敗就回錯，🚫 不吞：那時多半是別的程序

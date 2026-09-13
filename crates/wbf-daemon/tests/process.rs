@@ -24,7 +24,26 @@ struct Ready {
     pid: u32,
 }
 
+/// 像前端那樣放一個 token 檔：**Unix 0600**（architecture-v2 §4.3 的第 1 步）。
+///
+/// 🚨 🚫 不要用 `std::fs::write`：那會套 umask（常見 0644），而 daemon 對別人讀得到的 token 檔是
+/// **fail closed** 的 —— 於是 Unix 上每個 process 測試都會在 `spawn_daemon` 就死掉，
+/// 而 Windows 上（看 ACL、不看模式位元）卻全綠。⭐ 這正是「綠燈不代表沒壞」的那種洞
+/// （PR #31 審查 cirno🔴 —— 我在 Windows 上跑，所以自己看不到）。
+///
+/// 📎 用 `wbf_sdk::vault::write_private`：跟 `local.key` 同一支，**建立時**就是 0600
+/// （🚫 不是先寫再 chmod —— 那中間有一段別人讀得到的時間）。
+fn write_token_like_a_frontend(path: &Path) {
+    wbf_sdk::vault::write_private(path, &TOKEN).expect("寫 token 檔");
+}
+
 fn spawn_daemon(data_dir: &Path, token_file: &Path) -> (Child, Ready) {
+    // ⚠️ 先確認**測試自己**把 token 檔弄對了：不然 Unix 上 daemon 會 fail closed 地拒絕啟動，
+    // 而我們只會看到「ready 那行不是 JSON」這種查不出原因的 panic。
+    assert!(
+        wbf_daemon::token::is_private(token_file).expect("token 檔在"),
+        "測試要先把 token 檔寫成私有的（write_token_like_a_frontend）"
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
         .arg("-s")
         .arg("--data-dir")
@@ -32,13 +51,21 @@ fn spawn_daemon(data_dir: &Path, token_file: &Path) -> (Child, Ready) {
         .arg("--token-file")
         .arg(token_file)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // ⚠️ 留著 stderr：起不來的時候，原因只在那裡。🚫 不要丟到 null 然後對著空的 stdout 猜。
+        .stderr(Stdio::piped())
         .spawn()
         .expect("the daemon binary runs");
     let mut line = String::new();
     BufReader::new(child.stdout.as_mut().expect("piped stdout"))
         .read_line(&mut line)
-        .expect("the daemon says ready on stdout");
+        .expect("讀 daemon 的 stdout");
+    if line.trim().is_empty() {
+        // 沒說 ready 就是根本沒起來 —— 把它的抱怨原樣印出來。
+        panic!(
+            "the daemon exited before saying ready: {}",
+            complaint_of(child)
+        );
+    }
     let ready: Value = serde_json::from_str(&line).unwrap_or_else(|error| {
         panic!("the ready line is not JSON ({error}): {line:?}");
     });
@@ -101,7 +128,7 @@ async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up
         .tempdir_in(std::env::temp_dir())
         .unwrap();
     let token_file = dir.path().join("daemon.token");
-    std::fs::write(&token_file, TOKEN).unwrap();
+    write_token_like_a_frontend(&token_file);
 
     // ⚠️ 上一次留下的 `daemon.json`：daemon 必須在綁定之前清掉它，
     // 否則前端會把這份殘留當成「這一次」的 ready 然後連到別人的 port。
@@ -167,6 +194,15 @@ async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up
     assert!(!ready_path.exists(), "daemon.json 應該被收掉");
 }
 
+/// 起不來的時候它到底說了什麼。
+fn complaint_of(mut child: Child) -> String {
+    let _ = child.kill();
+    match child.wait_with_output() {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        Err(error) => format!("(stderr 讀不到：{error})"),
+    }
+}
+
 /// 等程序結束，最多 10 秒。⚠️ 不用 `wait()` 直接擋著：卡住的時候要看得出是「沒結束」，
 /// 而不是整個測試 hang 到 CI 逾時。
 fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
@@ -192,7 +228,8 @@ fn a_world_readable_token_file_stops_the_daemon_from_starting() {
 
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("daemon.token");
-    std::fs::write(&token_file, TOKEN).unwrap();
+    // 這條**故意**放寬：驗的就是「別人讀得到就不准啟動」。
+    write_token_like_a_frontend(&token_file);
     std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
@@ -218,7 +255,7 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
         .tempdir_in(std::env::temp_dir())
         .unwrap();
     let token_file = dir.path().join("daemon.token");
-    std::fs::write(&token_file, TOKEN).unwrap();
+    write_token_like_a_frontend(&token_file);
 
     let (mut first, ready) = spawn_daemon(dir.path(), &token_file);
     let ready_path = dir.path().join("daemon.json");
@@ -279,7 +316,7 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
 fn serving_and_a_one_shot_command_at_the_same_time_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("daemon.token");
-    std::fs::write(&token_file, TOKEN).unwrap();
+    write_token_like_a_frontend(&token_file);
 
     let output = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
         .arg("-s")
@@ -298,4 +335,31 @@ fn serving_and_a_one_shot_command_at_the_same_time_is_refused() {
     // 🚫 連資料目錄都不該碰：沒有鎖檔、沒有 daemon.json。
     assert!(!dir.path().join("daemon.json").exists());
     assert!(!dir.path().join(wbf_daemon::lock::LOCK_FILE_NAME).exists());
+}
+
+/// token 檔長度不對就不啟動，而且**講得出原因**（`TOKEN_LEN`，architecture-v2 §4.3）。
+///
+/// 📎 這條同時是 `spawn_daemon` 那個診斷路徑的實跑：daemon 起不來的時候，
+/// 測試要看得到它的抱怨，🚫 不是對著一行空的 stdout 猜。
+#[test]
+fn a_token_file_of_the_wrong_length_stops_the_daemon_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("daemon.token");
+    wbf_sdk::vault::write_private(&token_file, &[7u8; 255]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
+        .arg("-s")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--token-file")
+        .arg(&token_file)
+        .output()
+        .expect("the daemon binary runs");
+    assert!(!output.status.success(), "255 byte 的 token 不該啟動得起來");
+    assert!(output.stdout.is_empty(), "🚫 不該印 ready");
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(complaint.contains("255 bytes"), "{complaint}");
+    assert!(complaint.contains("256"), "要說出正確的長度：{complaint}");
+    // 起不來就🚫 不該在那個目錄留下東西。
+    assert!(!dir.path().join("daemon.json").exists());
 }
