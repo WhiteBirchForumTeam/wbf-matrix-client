@@ -20,6 +20,7 @@ use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
+use crate::backend_choice::TransportNeed;
 use crate::{Core, Target};
 
 /// `media-stats`。
@@ -143,7 +144,9 @@ impl Core {
         let account = self.account_or_current(target)?;
         let (mut cache, _me) = self.cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, Some(transport), TransportNeed::Either)
+            .await?;
         let fetched = media::fetch(
             &mut client,
             manifest,
@@ -201,7 +204,9 @@ impl Core {
         target: &Target,
     ) -> Result<DirectDownloadResult, CoreError> {
         let account = self.account_or_current(target)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, Some(transport), TransportNeed::Either)
+            .await?;
         let mut file = std::fs::File::create(out)?;
         let result = client
             .download(manifest, &mut file, &mut |done, total| {
@@ -229,10 +234,14 @@ impl Core {
         })
     }
 
-    /// 這個帳號跟 server 的 wbf-pack 通道。
+    /// 這個帳號跟 server 的 wbf-pack 通道，**指定哪條管子就開哪條**。
+    ///
+    /// 🚫 **一般的呼叫端不要用這個，用 [`Core::client_of`]** —— 那裡才有「這台是不是 wbf」
+    /// 與「這個方法撐不撐得住 HTTP」的判斷（`backend_choice`）。這條是**底下那半**，
+    /// 留給兩種人：閘門自己，以及**探測**（探測不能走閘門，不然它會叫到自己）。
     ///
     /// 🚫 **回傳值不准離開這個 crate**：它握著 `access_token`。
-    pub(crate) async fn client_of(
+    pub(crate) async fn connect_wbf_client(
         &self,
         account: &AccountDir,
         transport: Transport,

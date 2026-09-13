@@ -165,7 +165,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 |---|---|---|
 | `user` | string? | 對哪個帳號動作，mxid 或 localpart。**沒給 = `current`**。＝ `wbf-core::Target.user` |
 | `server` | string? | 同名 localpart 在多個 server 時消歧。＝ `Target.server` |
-| `transport` | `"ws"` \| `"http"` | 跟 wbfuwunel 講話走哪條。**預設 `ws`**。只有標了「有 `transport`」的 method 認得它 |
+| `transport` | `"ws"` \| `"http"` | **wbf 協議走哪條管子**。預設 `ws`。只有標了「有 `transport`」的 method 認得它。⚠️ 語意見下面「backend 與 transport」 |
 | `sync` | `"local"` \| `"server"` \| `"both"` | **要本地的還是上游的**。**預設 `local`**。只有標了「有 `sync`」的 method 認得它 |
 
 🚨 **`sync`：RPC 大部分是對本地資料庫的呼叫**（維護者 2026-09-13 定；執行期細節在
@@ -195,6 +195,36 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - ⚠️ **失敗的回應也帶**：「我去打了上游然後失敗」跟「我只讀本地然後沒有」是兩件事。
 - 🚫 **值認不得（`102`）時不帶**：那次它一種都沒用，宣稱用了哪一種是說謊。
 - 不認得 `sync` 的 method **沒有這個欄位**（🚫 不是 `null`）。
+
+🚨 **backend 與 transport 是兩個軸，🚫 不要混**（維護者 2026-09-13 定）：
+
+| | 意思 | 誰決定 | 值 |
+|---|---|---|---|
+| **backend** | 用哪一套**協議**跟 homeserver 講話 | **daemon 探測**，🚫 前端不指定 | matrix-sdk（標準 Matrix）／wbf pack |
+| **transport** | wbf 協議走哪條**管子** | 前端的 `transport` 參數 | `ws`（預設）／`http` |
+
+🚫 `transport: "http"` **不是**「用標準 Matrix」，是「wbf 協議走 HTTP」。
+
+**backend 怎麼定**：探測（architecture-v2 §6.1）——問一次 `Hello`，講得出 wbf 協議版本就是 wbf。
+⭐ 連不上、不回、看不懂，一律當一般 homeserver。🚫 不寫進設定檔：那是 server 那邊的事實，它會變。
+
+**`transport` 這個參數怎麼被解讀**：
+
+| backend | 顯式 `ws` | 顯式 `http` | 沒帶 |
+|---|---|---|---|
+| **matrix-sdk** | 🟢 **no-op，不報錯** | 🟢 **no-op，不報錯** | — |
+| **wbf** | 走 ws；開不起來 → 報錯 | 走 http；開不起來 → 報錯 | **ws** |
+| **wbf**，而那個 method 只有 WS 撐得住 | 走 ws | 🔴 **報錯**（`1100`） | ws |
+
+- ⭐ **matrix-sdk 那一列整列忽略 `transport`**：那個 backend 根本沒有這個維度，
+  🚫 為一個不存在的選擇報錯，只會逼前端「先知道對方是誰才敢送參數」。
+- 🚨 **只支援 WS 的 method 被指定 `http` 是報錯，🚫 不是默默改用 WS**：呼叫端說 http 通常有理由
+  （除錯、環境擋 WS），偷偷換掉會讓它以為驗過的是 http 那條路。
+- ⚠️ 目前「只支援 WS」的是 **`sync.recent`**：它的回應是一串 `Batch`，而**一個 HTTP 請求只回一個 pack**。
+  之後的 `Event/Subscribe`／`Push`、`Device/*` 也會是這一類（server 主動推的東西 HTTP 給不出來）。
+- ⚠️ 探到不是 wbf、而那個 method 只有 wbf 講得出來（`sync.recent`、`upload.*`、`media.*`、`server.ping`）
+  → `1100`，訊息說「這台不講 wbf-pack，而這條路還沒有標準 Matrix 的走法」。
+  🚫 不要連上去讓它在更深的地方用一個看不懂的錯誤失敗。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（CLI 規格 §10），**由 daemon 讀 conf 填進 `Target`**。
   前端不該替使用者決定要不要備份，而 daemon 就是 conf 的主人（它是 client 本體，architecture-v2 §0.2）。

@@ -320,9 +320,9 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 | `room.list`／`room.get` 預設 `local` | ✅ 改好了。⚠️ **CLI 那一側刻意維持舊行為**：`--from-cache` → `Local`，沒帶 → **`Both`**（它本來就是「打上游＋寫穿快取」），🚫 不偷偷改掉它 |
 | 參數叫 `sync`，三個值 | ✅ 改好了（`HistorySource` → `SyncMode`，預設 `Local`） |
 | 帳號列表永遠本地 | ✅ 已經是了 |
-| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🚨 **還沒有這個接縫**：`synced_backend_of` 一律回 matrix-sdk。見下 |
+| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🟡 **一半**：探測與 transport 規則做好了（`backend_choice`），但**房間那條線還沒有 wbf 實作可以分派**。見下 |
 
-🚨 **backend 分派這條線還沒挖**（維護者 2026-09-13 指出）。⚠️ 先把兩個軸分開，它們一直被混用：
+🟡 **backend 這條線挖到一半**（維護者 2026-09-13 指定）。⚠️ 先把兩個軸分開，它們一直被混用：
 
 | | 意思 | 值 |
 |---|---|---|
@@ -331,11 +331,27 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 
 🚫 `--transport http` **不是**「退回標準 Matrix」，是「wbf 協議走 HTTP」。這兩個正交。
 
-現在房間那條線**只有 matrix-sdk 一條路**（`room.list`／`get`／`history`／`send_text` 都是），
+**已經做好的（`wbf_core::backend_choice`）**：
+
+1. **探測**：`Core::get_backend_kind` —— 一個 WS `Hello`，講得出協議版本就是 wbf。
+   ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。
+   一個 server dir 記一格，🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
+   會話重連時要重探 —— `Core::forget_backend_probe`，接會話監督者（階段 8）時叫它。
+2. **transport 規則**：`get_transport_plan`，純函數所以那張表測得到 ——
+   matrix-sdk 整列 no-op、wbf 預設 ws、**只支援 WS 的 method 被指定 http 是報錯**
+   （🚫 不默默升級成 WS）。規則表在 rpc-spec §2。
+3. **唯一的閘門**：`Core::client_of` —— 探測＋規則＋開通道都在這一個地方。
+   底下那半是 `connect_wbf_client`（指定什麼就開什麼），🚫 只留給閘門自己與探測用
+   （探測不能走閘門，不然它會叫到自己）。
+
+**還沒做的**：房間那條線**只有 matrix-sdk 一條路**（`room.list`／`get`／`history`／`send_text`），
 而 wbf 協議的 `Event` 底下只有 `Recent`／`Send`／`Batch` —— 🚫 **沒有「拿房間歷史」這個 call**，
-所以現在也沒有第二條路可以分派。⭐ server 端正在補這塊 API（維護者 2026-09-13）；
-接上之後 `room.*` 要照 architecture-v2 §6.1 的探測結果分派，**rpc-spec 那一層一個字都不用改**
+所以現在也**沒有第二條路可以分派**。⭐ server 端正在補這塊 API（維護者 2026-09-13）；
+接上之後 `room.*` 照探測結果分派，**rpc-spec 那一層一個字都不用改**
 —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
+
+📎 **代價講在前面**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）。
+一個 daemon 生命週期一次，🚫 不是每個請求一次。
 
 ⭐ **這是補參數、不是改方向**：上游那條路一行都不會少，只是從「唯一的路」變成「說出來才走的那條」。
 📎 CLI 現在那樣寫沒有錯 —— 它沒有常駐的東西可以依賴，每個命令自己去 sync 是唯一選擇。
