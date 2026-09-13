@@ -181,8 +181,20 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - 🚫 **沒有 `auto`**：延遲從毫秒跳到秒這件事，要由呼叫者決定，🚫 不是 daemon 猜。
 - 判準：**本地快取有那份東西的 method 才有這個參數**。帳號列表、recovery key 那些是這台機器的檔案
   （沒有「上游版本」），`sync.recent`／`server.ping`／`backup.*` 本來就是上游的。
-- ⚠️ **回傳的型別定義上就是上游的東西也不補**（`media.info`）：強推一個 `local` 只會逼它編造
-  server 才知道的欄位。⭐ 那種時候要的是**另一個 method**，🚫 不是同一個加一個旗標。
+- ⚠️ 回傳的型別裡**只有 server 知道的欄位**，`local` 時就讓它們**不在**，🚫 不編造
+  （`media.info` 的 `total_len`／`truncated`／`verified` 就是）。⭐ 少一個欄位是誠實，填一個假數字不是。
+
+🚨 **認得 `sync` 的 method，回應要回報這次用的是哪一種**（維護者 2026-09-13）：
+
+```jsonc
+{ "code": 0, "msg": "ok", "id": 1, "sync": "local", "result": [ … ] }
+```
+
+- **只要那個 method 認得 `sync` 就帶，不管請求有沒有帶** —— ⭐ 這樣前端知道「沒帶時預設是什麼」，
+  🚫 不必去記規格，也不必猜這份資料是本地的還是剛從上游拿的。
+- ⚠️ **失敗的回應也帶**：「我去打了上游然後失敗」跟「我只讀本地然後沒有」是兩件事。
+- 🚫 **值認不得（`102`）時不帶**：那次它一種都沒用，宣稱用了哪一種是說謊。
+- 不認得 `sync` 的 method **沒有這個欄位**（🚫 不是 `null`）。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（CLI 規格 §10），**由 daemon 讀 conf 填進 `Target`**。
   前端不該替使用者決定要不要備份，而 daemon 就是 conf 的主人（它是 client 本體，architecture-v2 §0.2）。
@@ -290,7 +302,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `media.info` | `{ mxc, manifest?, transport?, user?, server? }`。🚫 **沒有 `sync`** | `MediaInfo` | `media_info`。⚠️ 它的欄位（`total_len`／`truncated`／`verified`）定義上就是「server 上那份長什麼樣」，`local` 只能編造它們 —— 本地的那份是 `media.stats`（daemon-runtime §3.2） |
+| `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 答得出 `file_size`／`chunk_size`／`content_type`，加上上游答不出來的 `cached: { complete, chunks_written, bytes_on_disk }`。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
 | `media.open` | `{ manifest, user?, server? }` 或 `{ event_id, room, user?, server? }`（daemon 從快取找 manifest） | `{ url, mimetype?, size, expires_in }`。`url` 是資料平面的 capability URL（§6.1） | ⚠️ core 缺「給一個 reader」的形狀：現在 `download_to` 直接寫檔、`seek_read` 一次回整段 bytes。daemon 要的是 `PoolReader`（local-cache-db §8.6）接到 HTTP Range 上 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, sha256?, user?, server? }` | `{ upload_id, mxc, url, expires_in }`。`url` 是資料平面的 PUT URL（§6.2）。`mxc` 在這一步就有（server 的 `Create` 就配好 id）——所以 `room.send_attachment` 不必等傳完 | ⚠️ core 缺（同 `room.send_attachment`） |
 | `media.save_to` | `{ manifest, out: path, no_cache?: bool, transport?, user?, server? }` | `DownloadResult` 或（`no_cache`）`DirectDownloadResult` | `download_to`／`download_direct`。長工作。**明文落地是使用者要的**（§4.8） |
@@ -492,7 +504,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
 | `desync` 推播（§4） | ❌（daemon 層） | — | ❌ |
-| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`） | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地 | 本機（`local`）／同下面那幾列 | ✅ |
+| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`）＋回應回報用了哪一種 | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地 | 本機（`local`）／同下面那幾列 | ✅ |
 | `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |

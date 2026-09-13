@@ -867,9 +867,17 @@ async fn info_command(
         Some(path) => Some(read_manifest(context, path).await?),
         None => None,
     };
+    // CLI 的 `info` 問的一直是「server 上那份長什麼樣」，所以它一律 `Server`
+    // ——⚠️ 🚫 不要偷偷改成 `Local`：那會變成另一個問題的答案。
     let info = context
         .core()?
-        .media_info(mxc, manifest.as_ref(), context.transport, &context.target())
+        .media_info(
+            mxc,
+            manifest.as_ref(),
+            wbf_core::SyncMode::Server,
+            context.transport,
+            &context.target(),
+        )
         .await?;
     print_json(&serde_json::to_value(info).expect("serializes"))
 }

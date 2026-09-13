@@ -254,7 +254,7 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一個上游�
 |---|---|---|
 | `room.list`、`room.get` | ✅ | `room_list` 表就是它的本地版 |
 | `room.history`、`room.files` | ✅ | ⚠️ 它們現在的參數叫 `source: server\|cache` —— **改名成 `sync`、值改成三種**，🚫 不要兩個名字講同一件事 |
-| `media.info` | ❌ **改判**（2026-09-13 看了型別）| 它的欄位（`total_len`／`truncated`／`verified`）**定義上就是「server 上那份長什麼樣」**。本地版是另一種東西（池裡有幾塊、佔多少磁碟）——⭐ 硬掛 `sync` 只會逼它在 `local` 時**編造** server 欄位。本地的那份是 `media.stats`，要更細就開一個新 method，🚫 不是同一個 |
+| `media.info` | ✅ | ⭐ **媒體不可變**：`file_size`／`chunk_size`／`mimetype` 上傳完就不會變，本地 `media` 表存的就是同一份事實 —— 🚫 沒理由為這些跑一趟 server（維護者 2026-09-13；我本來判錯了）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**讓它們不在**，🚫 不編造；反過來 `cached`（下載到哪了）是**上游答不出來**的 |
 | 讀已讀位置（§7） | ✅ | `read_positions` 有 |
 | `account.list`、`recovery.list`／`show` | ❌ | **已登入的帳號 always local**：那是這台機器的檔案，不是快取，🚫 沒有「上游版本」可言 |
 | `sync.recent` | ❌ | 它**本身就是**上游拉。加 `sync=local` 沒有意義 |
@@ -556,7 +556,7 @@ let response = tokio::select! {
 |---|---|---|
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ 這支分支做了 |
 | 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 這支分支做了（媒體那幾條是刻意的例外，§2.3.1） |
-| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files` 補上，`source` → `sync`、預設 `local`（`media.info` 改判為不補） | ✅ 這支分支做了 |
+| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` → `sync`、預設 `local`，**回應回報這次用了哪一種** | ✅ 這支分支做了 |
 | 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ❌ |
 | 5 | `cancel`（§9） | ❌ |
 | 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ❌ 向量已經有，codec 還沒寫 |
