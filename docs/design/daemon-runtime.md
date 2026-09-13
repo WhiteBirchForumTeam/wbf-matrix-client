@@ -351,7 +351,10 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 1. **探測** `Core::get_backend_kind` —— 一個 WS `Hello`，講得出協議版本就是 wbf。
    ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。
    一個 server dir 記一格，🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
-   會話重連要重探 —— `Core::forget_backend_probe`，接會話監督者（階段 8）時叫它。
+   🚨 **session 一換，舊結論就不算數**（PR #33 審查 rumia 第三輪🟡）：探測是拿 session 裡的 token 問的，
+   所以 `Core::forget_backend_probe` 接在**所有動 session 的地方** —— `log_in` 封新 session 之後、
+   `log_out_account`（logout 與 destroy 共用）刪掉之後。🚧 階段 8 的會話監督者重連時也要叫它。
+   ⚠️ 新增任何封／刪／換 session 的路徑都要接上，🚫 不然下一次拿到的是舊 token 探到的答案。
 
    🚨 **一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
 

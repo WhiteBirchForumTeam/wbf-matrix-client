@@ -93,6 +93,9 @@ impl Core {
         // 目錄名對不上就搬過去。
         let account = self.move_to_canonical_dir(account, &dir_key, server, &session.user_id)?;
         vault.seal_session(&account.session_path(), &session)?;
+        // 🚨 session 換了，拿舊 token 探到的 backend 就不算數了（PR #33 審查 rumia🟡）。
+        // ⚠️ 這是兩個「session 被替換」的地方之一，另一個是 `log_out_account`。
+        self.forget_backend_probe(&account);
         let switched_from = self.switch_current_to(&account)?;
         Ok(LoginResult {
             user_id: session.user_id,

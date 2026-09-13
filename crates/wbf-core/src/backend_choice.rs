@@ -211,6 +211,25 @@ impl crate::Core {
             .len()
     }
 
+    /// 直接替這個帳號記一個探測結果。⚠️ 只給測試用：成功的探測要一台真的 wbf server，
+    /// 而「session 換掉之後舊結論要被清掉」那條測試需要**先有一個結論**。
+    ///
+    /// Args:
+    ///     account: 哪個帳號
+    ///     kind: 假裝探到的結果, example: BackendKind::WbfSdk
+    #[cfg(test)]
+    pub(crate) fn set_remembered_backend(
+        &self,
+        account: &crate::accounts::AccountDir,
+        kind: BackendKind,
+    ) {
+        let cell = tokio::sync::OnceCell::new_with(Some(kind));
+        self.backends
+            .lock()
+            .expect("the backend registry is never poisoned")
+            .insert(account.dir.clone(), std::sync::Arc::new(cell));
+    }
+
     /// 這個帳號**現在記住了什麼**。⚠️ 只給測試用：唯一能分辨「記住了」與「只是回了一次」
     /// 的方式就是問它 —— 而那個分辨正是 rumia🔴1 要的（PR #33）。
     ///
@@ -231,7 +250,19 @@ impl crate::Core {
             .and_then(|cell| cell.get().copied())
     }
 
-    /// 🚫 **只有階段 7／8 的會話監督者該叫它**：連線重起時，「這台是不是 wbf」要重問一次。
+    /// 忘掉這個帳號探到的 backend —— **session 一換，舊結論就不算數**（PR #33 審查 rumia🟡）。
+    ///
+    /// ⚠️ 探測是拿 session 裡的 token 問的，所以結論屬於**那一個 session**。現在的呼叫點：
+    ///
+    /// | 誰 | 為什麼 |
+    /// |---|---|
+    /// | `Core::log_in`（封新 session 之後） | token 換了 |
+    /// | `Core::log_out_account`（logout 與 destroy 共用） | session 沒了 |
+    /// | 🚧 階段 8 的會話監督者（還沒寫） | 重連時要重問一次 |
+    ///
+    /// 🚨 **新增任何會封、刪、換 session 的路徑，都要叫它** —— 🚫 不然下一次拿到的是舊 token
+    /// 探到的答案。📎 現在只有上面兩個地方動 session（grep `seal_session`／
+    /// `delete_sealed_session` 驗得到），`logging_out_forgets_what_that_session_probed` 釘住 logout 那個。
     ///
     /// Args:
     ///     account: 哪個帳號
@@ -467,6 +498,39 @@ mod tests {
                 "🚫 失敗不留下結論"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 **session 沒了，舊的探測結論也要跟著走**（PR #33 審查 rumia 第三輪🟡）。
+    ///
+    /// ⚠️ 探測是拿 session 裡的 token 問的，所以結論是**那一個 session** 的。
+    /// 登出之後還留著，下次登入（換了 token）會直接拿到**舊 token 探到的**答案 ——
+    /// 舊的探到 wbf、新的其實不行，就會選 `WbfSdk` 然後在更深的地方才失敗。
+    ///
+    /// ⭐ 這條**真的跑 `Core::log_out`**（production 的接點），🚫 不是直接叫 `forget_backend_probe`
+    /// —— 要驗的是「接點有接上」，而光叫那個函數本身證明不了這件事。
+    /// 📎 另一個接點（`log_in` 封新 session 之後）要真的 server 才走得到，這裡沒涵蓋。
+    #[tokio::test]
+    async fn logging_out_forgets_what_that_session_probed() {
+        let dir = scratch("logout-forgets");
+        let core = unlocked(&dir);
+        let key = core.vault().unwrap().account_dir_key();
+        let account = crate::accounts::AccountDir::locate(&dir, &key, DEAD, "@a:dead").unwrap();
+        std::fs::create_dir_all(&account.dir).unwrap();
+        // 🚫 不封 session：`is_logged_in()` 是 false，logout 不必連網路就會走到本地清理。
+        core.set_remembered_backend(&account, BackendKind::WbfSdk);
+        assert_eq!(core.get_remembered_backend(&account), Some(BackendKind::WbfSdk));
+
+        core.log_out("@a:dead", None, true, false)
+            .await
+            .expect("沒有 session 的帳號，登出只是清本地");
+
+        assert_eq!(
+            core.get_remembered_backend(&account),
+            None,
+            "🚨 session 沒了，拿它探到的結論不准留著"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
