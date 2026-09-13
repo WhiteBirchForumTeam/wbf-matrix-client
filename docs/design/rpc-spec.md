@@ -342,6 +342,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
 | 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。🚫 不是前端的錯，所以🚫 不關連線 |
+| 109 | `no_write_access` | 這個 daemon **沒有寫這個資料目錄的權**：別人握著排他鎖（architecture-v2 §0.2）。⚠️ 跟 `1001`（vault 鎖著）不是同一件事 —— 那是「還沒解鎖」，這是「這個目錄現在是別人的」。前端該做的是去連**那一個** daemon，🚫 不是重試 |
 
 ### 5.2 core 層 ＝ `CoreErrorKind` 的號碼
 

@@ -85,6 +85,9 @@ pub mod code {
     pub const DAEMON_SHUTTING_DOWN: u32 = 107;
     /// daemon 自己組不出回應（它的 bug）。🚫 不是前端的錯，所以🚫 不關連線。
     pub const INTERNAL: u32 = 108;
+    /// 這個 daemon 沒有寫這個資料目錄的權（別人握著排他鎖，architecture-v2 §0.2）。
+    /// ⚠️ 這**不是**「vault 鎖著」（那是 1001）：它是「這個目錄現在是別人的」。
+    pub const NO_WRITE_ACCESS: u32 = 109;
 }
 
 /// 協議層：這條連線本身出了問題，回完就關（rpc-spec §1.4）。

@@ -96,30 +96,7 @@ fn main() -> ExitCode {
     };
     drop(token);
 
-    // 🚨 **寫鎖先拿**（architecture-v2 §0.2）：daemon 是**會寫**的那個，所以拿排他；
-    // 唯讀的工具走 `lock_for_reading`（共享）。在動這個目錄的任何東西之前 —— 尤其是下面那個
-    // 「刪掉舊的 daemon.json」—— 因為沒拿到鎖就動，等於去動另一個 daemon 正在用的檔。
-    // ⚠️ 這個值要一路活到程序結束（鎖綁在它身上），所以 🚫 不可以 `let _ =`。
-    let _data_dir_lock = match wbf_daemon::lock::lock_for_writing(&cli.data_dir) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // ⚠️ 先刪掉上一次留下的：它的 port 可能是別人的，而前端把「這個檔出現」當成 ready。
-    // 刪不掉就不要跑——那代表前端會拿到一份我們沒寫過的 port（fail closed）。
     let ready_path = cli.data_dir.join("daemon.json");
-    match std::fs::remove_file(&ready_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            eprintln!("cannot remove the stale {}: {error}", ready_path.display());
-            return ExitCode::from(1);
-        }
-    }
-
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async move {
         let settings = match Settings::load(cli.config.as_deref(), &cli.data_dir) {
@@ -134,6 +111,27 @@ fn main() -> ExitCode {
         }
         let policy = EncryptionPolicy::enforced();
         let handle = Handle::new(&cli.data_dir, policy.clone(), settings);
+
+        // 🚨 **`-s` 的第一件事：拿寫權**（architecture-v2 §0.2）。`-s` 就是「我要寫」的意思，
+        // 所以🚫 不等到第一個寫請求才拿 —— 拿不到就不該啟動（fail closed）。
+        // ⚠️ 寫權活在 `handle` 裡，所以它要一路拿到程序結束。
+        if let Err(error) = handle.grant_write_access() {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+
+        // ⚠️ 這一步**在拿到寫權之後**：舊的 `daemon.json` 也是這個目錄的檔，沒有寫權就去刪它，
+        // 刪的可能是另一個 daemon 正在用的那份。
+        // 刪不掉就不要跑 —— 那代表前端會拿到一份我們沒寫過的 port（fail closed）。
+        match std::fs::remove_file(&ready_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("cannot remove the stale {}: {error}", ready_path.display());
+                return ExitCode::from(1);
+            }
+        }
+
         let server = match RpcServer::bind(cli.rpc_port, keys, policy, handle.clone()).await {
             Ok(server) => server,
             Err(error) => {

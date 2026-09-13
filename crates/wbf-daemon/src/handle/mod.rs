@@ -34,6 +34,7 @@ use wbf_core::{Core, CoreError, CoreErrorKind, Target};
 use wbf_sdk::Transport;
 
 use crate::connection::{params_or_empty_object, EncryptionPolicy};
+use crate::lock::WriteAccess;
 use crate::message::{code, Request, Response};
 use crate::settings::Settings;
 
@@ -42,6 +43,27 @@ pub const DAEMON_NAME: &str = "wbf-matrix-client-daemon";
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 未解鎖時也接受的 method（architecture-v2 §4.5）。其他一律 `1001`。
+/// 這個 method **保證不碰資料目錄**嗎？
+///
+/// Args:
+///     method: example: "daemon.info"
+/// Return:
+///     bool  true 只給「正面認得、確定只在記憶體裡動」的那幾個；其餘一律當成會寫
+///
+/// 🚨 **判準是反過來寫的**：不是「列出會寫的」，而是「列出確定不寫的」，其餘落到**要寫權**那一邊
+/// （A5 的 fail closed）。⭐ 這樣新加一個 method 而忘了想它的人，得到的是「被要求拿鎖」，
+/// 🚫 不是「靜靜地寫進別人的資料庫」。
+///
+/// 📎 名單很短是刻意的：`vault.*`／`account.*`／`room.*` 這些**看起來像唯讀的也會寫** ——
+/// `account.list` 要開 vault 解目錄名、`room.list` 會讓 matrix-sdk 的 store 寫東西。
+/// 真正的唯讀命令（單發的 `--version` 那一類）根本不會走到這裡。
+fn is_read_only(method: &str) -> bool {
+    matches!(
+        method,
+        "hello" | "daemon.info" | "daemon.set_encryption" | "daemon.shutdown"
+    )
+}
+
 fn is_allowed_while_locked(method: &str) -> bool {
     method == "hello" || method.starts_with("daemon.") || method.starts_with("vault.")
 }
@@ -72,6 +94,8 @@ pub struct Handle {
     ports: RwLock<Option<(u16, u16)>>,
     /// 現在活著的 RPC 連線數（`daemon.info` 的 `connections`）。
     connections: AtomicUsize,
+    /// 「我有沒有寫這個資料目錄的能力」（維護者 2026-09-13）。🚨 預設**沒有**。
+    write_access: WriteAccess,
     /// 這個 daemon 實例的身分（維護者 2026-09-13）：起來時鑄一次，活著的期間**不變**。
     /// 生產環境一個程序就是一個 `Handle`（`main.rs` 只建一個），所以它也就是那個程序的身分。
     instance: String,
@@ -90,6 +114,7 @@ impl Handle {
             shutdown,
             ports: RwLock::new(None),
             connections: AtomicUsize::new(0),
+            write_access: WriteAccess::none(),
             instance: new_instance_id(),
         })
     }
@@ -124,6 +149,19 @@ impl Handle {
     /// 要不要拒絕新請求：`daemon.shutdown` 一回完就拒，不等廣播。
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst) || *self.shutdown.borrow()
+    }
+
+    /// 拿下這個資料目錄的寫權。**`-s` 起來的第一件事**（architecture-v2 §0.2）：拿不到就不要啟動。
+    ///
+    /// Return:
+    ///     Ok(())      有寫的能力了
+    ///     Err(...)    別人在用這個目錄；呼叫端該印出來然後結束
+    pub fn grant_write_access(&self) -> Result<(), crate::lock::LockError> {
+        self.write_access.grant(&self.data_dir)
+    }
+
+    pub fn can_write(&self) -> bool {
+        self.write_access.is_granted()
     }
 
     /// 這個實例的 UUID。⭐ 前端用它回答「我現在講話的還是剛才那一個嗎」——
@@ -173,6 +211,14 @@ impl Handle {
                 code::DAEMON_SHUTTING_DOWN,
                 "the daemon is shutting down",
             );
+        }
+        // 🚨 **要寫就要先有寫的能力**（architecture-v2 §0.2）。這是全 daemon 唯一檢查它的地方。
+        // `-s` 在啟動時就拿到了，所以這裡是一個 atomic 讀；單發命令則是**第一個要寫的命令**
+        // 觸發去拿鎖。拿不到就回「我沒有寫的權限」，🚫 不重試、🚫 不降級成唯讀跑一半。
+        if !is_read_only(&request.method) {
+            if let Err(error) = self.grant_write_access() {
+                return Response::error(id, code::NO_WRITE_ACCESS, error.to_string());
+            }
         }
         let core = self.core().await;
         if !core.is_unlocked() && !is_allowed_while_locked(&request.method) {
@@ -467,6 +513,9 @@ mod tests {
         assert_eq!(response.code, 1100, "{}", response.msg);
 
         // daemon 重開 ＝ 回到未解鎖：這時 account.add 是 1001，🚫 不是「再建一把」。
+        // ⚠️ **先把第一個丟掉**：重開的意思是舊的沒了。不丟的話新的拿不到寫權（109）——
+        // 那是對的行為，但測的就不是「重開」了。
+        drop(handle);
         let restarted = Handle::new(
             dir.path(),
             EncryptionPolicy::enforced(),
@@ -496,6 +545,7 @@ mod tests {
         // 真正的「鎖上」是 daemon.shutdown 再重開 —— 換一個 Handle 就是那條路。
         let response = handle.call(request("vault.lock", Value::Null)).await;
         assert_eq!(response.code, code::UNKNOWN_METHOD, "{}", response.msg);
+        drop(handle);
         let restarted = Handle::new(
             dir.path(),
             EncryptionPolicy::enforced(),
@@ -503,6 +553,37 @@ mod tests {
         );
         let response = restarted.call(request("account.list", json!({}))).await;
         assert_eq!(response.code, 1001);
+    }
+
+    /// 別人握著這個資料目錄的時候，**會寫的 method 一律 109**，而純 daemon 層的照常。
+    #[tokio::test]
+    async fn without_write_access_the_writing_methods_are_refused_but_daemon_info_still_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let squatter = crate::lock::lock_for_writing(dir.path()).unwrap();
+        let handle = handle(dir.path());
+        assert!(!handle.can_write(), "🚨 起手沒有寫的能力");
+
+        for method in ["vault.create", "account.list", "room.list", "sync.recent"] {
+            let response = handle.call(request(method, json!({}))).await;
+            assert_eq!(
+                response.code,
+                code::NO_WRITE_ACCESS,
+                "{method}: {}",
+                response.msg
+            );
+        }
+        // 🚫 失敗不會讓它以為自己有能力。
+        assert!(!handle.can_write());
+
+        // 不碰資料目錄的照常回答。
+        let response = handle.call(request("daemon.info", Value::Null)).await;
+        assert_eq!(response.code, 0, "{}", response.msg);
+
+        // 對方放手之後，下一個要寫的請求自己就拿到了（單發命令就是這樣運作的）。
+        drop(squatter);
+        let response = handle.call(request("vault.create", json!({}))).await;
+        assert_eq!(response.code, 0, "{}", response.msg);
+        assert!(handle.can_write());
     }
 
     #[tokio::test]

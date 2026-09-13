@@ -61,6 +61,8 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
   connection.rs          一條連線的狀態機；⚠️ **出去的包該不該加密只在這裡判**（EncryptionPolicy 是全局）
   handle/                method → core。mod.rs 是分派與共同欄位（Target／transport）；local／accounts／rooms／media／backup 一模組一族。
                          ⚠️ dispatch 每個分支 Box::pin（E0275）；fresh 資料目錄的起手式是 vault.create，🚫 account.add 不偷建 vault
+  lock.rs                資料目錄的獨佔：寫排他／讀共享（std 的 File::try_lock）＋ `WriteAccess`
+                         全局能力（起手 false，要寫才拿；`call()` 是唯一檢查點）
   settings.rs            從 wbf.conf 讀 SERVER_BACKUP／LOCAL_ROOM_KEYS／TRANSPORT（解析在 wbf_core::conf，跟 CLI 共用）
   server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
   main.rs                只有 `-s`（讀 daemon.token、conf、寫 daemon.json）；單發命令、資料平面還沒有
