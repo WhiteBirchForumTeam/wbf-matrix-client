@@ -78,6 +78,7 @@ pub enum SyncState {
 ///
 /// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（§4.7「允許多條連線，每條都平等」），
 /// 而且**沒有訂閱者時發送是零成本的**——rpc-cli 在 `--quiet` 下就是這種情況。
+#[derive(Clone)]
 pub(crate) struct EventSink {
     sender: broadcast::Sender<CoreEvent>,
 }

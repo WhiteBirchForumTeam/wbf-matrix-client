@@ -91,6 +91,62 @@ impl Core {
         Ok(cache)
     }
 
+    /// 這個帳號所屬 server 的 `cache.db` 的**寫入者＋讀連線**（daemon-runtime §2）。
+    ///
+    /// ⭐ **一個 server dir 一份，開了就留著**：多個寫入者就沒有順序可言（水位會倒退），
+    /// 而且每次重開都要付一次 SQLCipher 導金鑰。
+    ///
+    /// Args:
+    ///     account: 哪個帳號（它決定 server dir）
+    ///     server: 這個庫是哪個 server 的, example: "http://localhost:6167"
+    /// Return:
+    ///     Ok(Arc<ServerCache>)   共用的那一份
+    ///     Err(...)               開不了（磁碟、金鑰）
+    pub(crate) fn server_cache_of(
+        &self,
+        account: &AccountDir,
+        server: &str,
+    ) -> Result<std::sync::Arc<crate::server_cache::ServerCache>, CoreError> {
+        let dir = account.server_dir();
+        if let Some(existing) = self
+            .server_caches
+            .lock()
+            .expect("the server-cache registry is never poisoned")
+            .get(&dir)
+        {
+            return Ok(existing.clone());
+        }
+        let identity = CacheIdentity {
+            server: server.to_string(),
+        };
+        let (cache, outcome) = crate::server_cache::ServerCache::open(
+            &dir,
+            &self.vault()?.cache_key(),
+            &identity,
+            self.events.clone(),
+        )?;
+        match outcome {
+            OpenOutcome::Reused => {}
+            OpenOutcome::Created => self
+                .events
+                .progress(format!("created {}", dir.join("cache.db").display())),
+            OpenOutcome::Rebuilt => self.events.progress(format!(
+                "rebuilt {} (it was for another server, or could not be opened)",
+                dir.join("cache.db").display()
+            )),
+        }
+        let cache = std::sync::Arc::new(cache);
+        // ⚠️ 兩個 task 同時開的話，後到的那個把自己的丟掉、用先到的那份
+        // —— 🚫 一個 server dir 只能有一個寫入者。
+        Ok(self
+            .server_caches
+            .lock()
+            .expect("the server-cache registry is never poisoned")
+            .entry(dir)
+            .or_insert(cache)
+            .clone())
+    }
+
     /// 這個帳號所屬 server 的媒體儲存池（local-cache-db.md §8），跟 `cache.db` 同層。
     pub(crate) fn pool_of(&self, account: &AccountDir) -> Result<MediaPool, CoreError> {
         Ok(MediaPool::open(

@@ -85,8 +85,14 @@ impl Core {
             .synced_backend_of(&account, target.server_backup)
             .await?;
         let conversations = backend.conversations().await?;
-        if let Ok((mut cache, me)) = self.cache_and_me(&account) {
-            self.write_through(cache.upsert_conversations(&me, &conversations));
+        // 寫穿快取：丟給那個 server 的寫入者（daemon-runtime §2.3）。
+        // 🚫 不等它 —— 回應的內容來自上游那一輪，不取決於這次寫入。
+        if let Ok((cache, me)) = self.server_cache_and_me(&account) {
+            let rows = conversations.clone();
+            cache.post(
+                move |cache| cache.upsert_conversations(&me, &rows).map(|_| ()),
+                Vec::new(),
+            );
         }
         Ok(conversations)
     }
@@ -215,15 +221,20 @@ impl Core {
     ) -> Result<(Vec<Message>, Option<String>), CoreError> {
         match source {
             HistorySource::Cache => {
-                let (cache, me) = self.cache_and_me(account)?;
-                let messages = cache.history(&me, room, parse_before_r_seq(before)?, limit)?;
+                let (cache, me) = self.server_cache_and_me(account)?;
+                let before = parse_before_r_seq(before)?;
+                let messages = cache.read().await.history(&me, room, before, limit)?;
                 Ok(cached_page(messages))
             }
             HistorySource::Server => {
                 let backend = self.synced_backend_of(account, server_backup).await?;
                 let page = backend.history(room, before, limit).await?;
-                if let Ok((mut cache, me)) = self.cache_and_me(account) {
-                    self.write_through(cache.upsert_messages(&me, &page.events));
+                if let Ok((cache, me)) = self.server_cache_and_me(account) {
+                    let events = page.events.clone();
+                    cache.post(
+                        move |cache| cache.upsert_messages(&me, &events).map(|_| ()),
+                        Vec::new(),
+                    );
                 }
                 Ok((page.events, page.next))
             }
@@ -242,6 +253,19 @@ impl Core {
     }
 
     /// 這個帳號的 `cache.db` 與「我是誰」（讀寫快取都要帶 mxid）。
+    /// 那個 server 的快取（寫入者＋讀連線）與「我是誰」。**新的路徑都走這個**。
+    ///
+    /// 📎 舊的 [`Core::cache_and_me`] 還在：媒體那幾條會抓著 `&mut Cache` 跨越網路 I/O
+    /// （邊下載邊寫），塞不進「一個工作 = 一個交易」，所以它們維持自己的連線（daemon-runtime §2.2）。
+    pub(crate) fn server_cache_and_me(
+        &self,
+        account: &AccountDir,
+    ) -> Result<(std::sync::Arc<crate::server_cache::ServerCache>, String), CoreError> {
+        let session = self.session_of(account)?;
+        let cache = self.server_cache_of(account, &session.server)?;
+        Ok((cache, session.user_id))
+    }
+
     pub(crate) fn cache_and_me(
         &self,
         account: &AccountDir,
@@ -249,14 +273,6 @@ impl Core {
         let session = self.session_of(account)?;
         let cache = self.cache_of(account, &session.server)?;
         Ok((cache, session.user_id))
-    }
-
-    /// 寫穿快取的錯誤**只報不擋**（§1：快取壞了的代價是重拉，不是命令失敗）。
-    pub(crate) fn write_through<T>(&self, result: Result<T, wbf_sdk::SdkError>) {
-        if let Err(error) = result {
-            self.events
-                .progress(format!("cache write failed (ignored): {error}"));
-        }
     }
 }
 

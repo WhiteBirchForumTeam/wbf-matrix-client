@@ -42,14 +42,15 @@ mod backup_ops;
 pub mod conf;
 mod error;
 pub mod event;
+mod handles;
 /// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
 pub mod job;
-mod handles;
 mod login_ops;
 mod media_ops;
 mod misc_ops;
 mod recovery;
 mod rooms_ops;
+mod server_cache;
 mod session_ops;
 mod sync_ops;
 mod upload_ops;
@@ -65,8 +66,8 @@ pub use accounts::AccountSummary;
 use accounts::{AccountDir, DataDirMap};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};
-pub use event::{CoreEvent, SyncState};
 use event::EventSink;
+pub use event::{CoreEvent, SyncState};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
@@ -130,6 +131,12 @@ pub struct Core {
     vault: OnceLock<Vault>,
     /// core 往外講話的唯一管道（§7：事件用 channel）。🚫 core 不印東西。
     pub(crate) events: EventSink,
+    /// 一個 server dir 一份：那個 `cache.db` 的**唯一寫入者**與讀連線
+    /// （`server_cache`、daemon-runtime §2）。⚠️ 開一次就留著 ——
+    /// 每次重開要付 SQLCipher 導金鑰的成本，而且**多個寫入者就沒有順序可言**。
+    pub(crate) server_caches: std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<crate::server_cache::ServerCache>>,
+    >,
 }
 
 impl Core {
@@ -145,11 +152,28 @@ impl Core {
             data_dir: data_dir.to_path_buf(),
             vault: OnceLock::new(),
             events: EventSink::new(),
+            server_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// 所有 `cache.db` 寫入者加起來還有幾件在排隊。
+    ///
+    /// Return:
+    ///     usize  0 = 都寫完了；⚠️ 一直漲就是**寫得比收得慢**（daemon-runtime §2.2）
+    ///
+    /// ⭐ queue 沒有上限是刻意的（丟掉已經收到的事件比慢更糟），所以它**必須看得見** ——
+    /// daemon 把這個數字放進 `daemon.info`。
+    pub fn cache_queue_len(&self) -> usize {
+        self.server_caches
+            .lock()
+            .expect("the server-cache registry is never poisoned")
+            .values()
+            .map(|cache| cache.queued())
+            .sum()
     }
 
     /// 訂閱 core 的事件（進度之類）。⚠️ 訂閱**之前**發生的收不到。

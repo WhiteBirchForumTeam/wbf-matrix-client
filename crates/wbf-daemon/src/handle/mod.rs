@@ -317,6 +317,8 @@ impl Handle {
             "data_port": ports.map(|(_, data)| data),
             "uptime_seconds": self.uptime_seconds(),
             "connections": self.connection_count(),
+            // 寫入者還有幾件在排隊（daemon-runtime §2.2）。⚠️ 一直漲＝寫得比收得慢。
+            "cache_queue": core.cache_queue_len(),
             "server_backup_setting": on_off(self.settings.server_backup),
             "local_room_keys_setting": on_off(self.settings.local_room_keys),
         }))

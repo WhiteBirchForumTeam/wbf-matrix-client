@@ -99,8 +99,12 @@ impl Core {
         };
         let end = backend.watch(since, deadline, &mut on_update).await?;
         if !seen.is_empty() {
-            if let Ok((mut cache, me)) = self.cache_and_me(&account) {
-                self.write_through(cache.upsert_messages(&me, &seen));
+            if let Ok((cache, me)) = self.server_cache_and_me(&account) {
+                let messages = seen.clone();
+                cache.post(
+                    move |cache| cache.upsert_messages(&me, &messages).map(|_| ()),
+                    Vec::new(),
+                );
             }
         }
         Ok(WatchSummary {
@@ -128,12 +132,12 @@ impl Core {
         target: &Target,
     ) -> Result<RecentSummary, CoreError> {
         let account = self.account_or_current(target)?;
-        let (mut cache, me) = self.cache_and_me(&account)?;
+        let (cache, me) = self.server_cache_and_me(&account)?;
         let mut client = self.client_of(&account, transport).await?;
         client.hello(client_name).await?;
         let cg_seq = match from_scratch {
             true => None,
-            false => cache.get_cg_seq(&me)?,
+            false => cache.read().await.get_cg_seq(&me)?,
         };
         let mut pulled = 0usize;
         let mut written = 0usize;
@@ -153,7 +157,13 @@ impl Core {
             });
             skipped_without_room += without_room.len();
             let messages = messages_from_json("unknown", &with_room);
-            written += cache.upsert_messages(&me, &messages)?;
+            // ⚠️ 這個回呼是**同步**的（SDK 的收批介面），而 `written` 要的是真的寫進去幾則，
+            // 所以走 `run_blocking`：排進同一條 queue、等它 commit。
+            // ⭐ 阻塞的程度跟以前一樣（以前也是在這裡同步寫），換到的是「順序與水位由一個地方管」。
+            let me_here = me.clone();
+            written += cache
+                .run_blocking(move |cache| cache.upsert_messages(&me_here, &messages))
+                .map_err(|error| wbf_sdk::SdkError::Usage(error.message))?;
             self.events.progress(format!(
                 "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",
                 meta.bc, meta.tc, meta.r, meta.fs, meta.ls
@@ -167,7 +177,12 @@ impl Core {
             ));
         }
         if let Some(new_cg_seq) = summary.new_cg_seq {
-            cache.set_cg_seq(&me, new_cg_seq)?;
+            // 🚨 水位最後才推進，而且**跟事件走同一條 queue** —— 這樣「事件還沒寫進去、
+            // 水位卻前進了」不可能發生（daemon-runtime §2.3）。
+            let me_here = me.clone();
+            cache
+                .run(move |cache| cache.set_cg_seq(&me_here, new_cg_seq))
+                .await?;
         }
         if !summary.caught_up {
             self.events.progress(format!(
