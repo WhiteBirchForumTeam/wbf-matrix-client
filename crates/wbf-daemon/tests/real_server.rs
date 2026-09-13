@@ -28,16 +28,43 @@ const TOKEN: [u8; 256] = [7u8; 256];
 /// base64("hunter2")。passphrase 是任意 bytes（local-cache-db §12），RPC 上一律 base64。
 const PASSPHRASE_BASE64: &str = "aHVudGVyMg==";
 
-/// 在這個資料目錄上起一個 daemon，回它的 port。**叫兩次就是「重開一次」**。
-async fn start_daemon(data_dir: &std::path::Path) -> u16 {
+/// 一個跑著的 daemon。⚠️ 拿著 `task` 才停得掉它 —— 「重開」必須是**真的停掉再起**，
+/// 🚫 不是「再起一個」：兩個 daemon 同時開同一個資料目錄正是 architecture-v2 §0.2 禁止的事
+/// （PR #31 審查 cirno🔴）。
+struct Daemon {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_daemon(data_dir: &std::path::Path) -> Daemon {
     let policy = EncryptionPolicy::enforced();
     let handle = Handle::new(data_dir, policy.clone(), Settings::default());
     let rpc = RpcServer::bind(0, Arc::new(RpcKeys::from_token(&TOKEN)), policy, handle)
         .await
         .unwrap();
     let port = rpc.local_addr().unwrap().port();
-    tokio::spawn(rpc.run());
-    port
+    let task = tokio::spawn(rpc.run());
+    Daemon { port, task }
+}
+
+/// 停掉一個 daemon：走**真的那條路**（`daemon.shutdown`），關掉連線，等 server 收攤，
+/// 然後確認舊 port 真的不收連線了。
+///
+/// ⭐ 這裡刻意不用「丟掉 task」那種便宜作法：那樣就算 shutdown 整條壞掉測試也會綠。
+async fn stop_daemon(daemon: Daemon, mut client: Client) {
+    let reply = client.call("daemon.shutdown", Value::Null).await;
+    assert_eq!(reply["code"], 0, "daemon.shutdown: {reply}");
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(10), daemon.task)
+        .await
+        .expect("the daemon stopped within 10 s")
+        .expect("the daemon task did not panic");
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", daemon.port))
+            .await
+            .is_err(),
+        "舊 port 停掉之後不該還收連線"
+    );
 }
 
 type Socket =
@@ -113,8 +140,8 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         .prefix("wd")
         .tempdir_in(std::env::temp_dir())
         .unwrap();
-    let port = start_daemon(dir.path()).await;
-    let mut client = Client::connect(port).await;
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
 
     // fresh 資料目錄的起手式（rpc-spec §3.1）：🚫 account.add 不替前端建 vault，
     // 而「要不要 passphrase」就在**建的這一步**決定，🚫 不是登入之後再重包。
@@ -163,10 +190,14 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "backup.status: {reply}");
     assert_eq!(reply["result"]["server_backup_setting"], "on");
 
-    // daemon 重開（真正的「鎖上」就是這條，rpc-spec §3.1）：同一個資料目錄、新的 Handle。
+    // daemon 重開（真正的「鎖上」就是這條，rpc-spec §3.1）。
+    // ⚠️ **先停掉第一個**：`daemon.shutdown` → 關連線 → 等它收攤 → 確認舊 port 不收連線了。
+    // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 §0.2 禁止的，而且那樣
+    // 就算 shutdown 壞掉這條測試也會綠（PR #31 審查 cirno🔴）。
+    stop_daemon(daemon, client).await;
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
     // ⭐ 驗的是登入寫出來的東西真的被那把 passphrase 包住的主金鑰保護著。
-    let port = start_daemon(dir.path()).await;
-    let mut client = Client::connect(port).await;
     let info = client.call("daemon.info", Value::Null).await;
     assert_eq!(info["result"]["unlocked"], false, "{info}");
     assert_eq!(info["result"]["key_mode"], "passphrase");
@@ -208,4 +239,8 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         accounts.iter().all(|account| account["logged_in"] == false),
         "{reply}"
     );
+
+    // 收攤：第二個也照同一條路停掉，🚫 不留一個還開著資料目錄的 daemon 給 tempdir 收
+    // （Windows 上那會讓刪除失敗，而且它掩蓋的正是「有東西還握著 store」這件事）。
+    stop_daemon(daemon, client).await;
 }
