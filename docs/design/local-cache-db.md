@@ -214,7 +214,15 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- 看過的任何 mxid（本機帳號、事件的 sender 都在這）。哪些是本機帳號由 CLI 的 accounts/ 目錄決定，不在表裡標。
 CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);
-CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);
+-- encrypted：這個房間開了 E2EE 沒有（schema v4，2026-09-14 維護者提）。
+--   NULL ＝ 不知道（只因為收到事件才建出來的列）、0 ＝ 明文、1 ＝ 加密。
+--   🚫 不是 NOT NULL DEFAULT 0：預設成 0 等於預設「明文」，那是最危險的預設。
+--   🚨 只准 0 → 1，不准 1 → 0：Matrix 房間一開加密就關不掉，所以一份過期的「沒加密」（別的帳號舊的、有 bug 的）
+--   不准把它蓋回明文 —— 蓋回去的下一步是送檔用 `cipher: none`，把區塊金鑰公開出去（約定 §5.1）。
+--   ⭐ 放 rooms 不放 room_list：加不加密是房間的性質、對每個帳號都一樣；room_list 是「這個帳號看到的樣子」。
+--   讀的時候（list_conversations）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
+CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
+  encrypted INTEGER CHECK (encrypted IN (0, 1)));
 
 -- 事件一份，解密後的明文放這裡，不記誰的。
 -- message_json 是 Message 去掉 id／conversation／sender／sent_at／r_seq／g_seq／decrypted 之後的剩餘（kind、reply_to、edited_by、
