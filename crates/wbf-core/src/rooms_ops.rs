@@ -138,10 +138,13 @@ impl Core {
                 .into_iter()
                 .find(|conversation| conversation.id == room);
             return found.ok_or_else(|| {
-                CoreError::new(
-                    CoreErrorKind::NoSuchAccount,
-                    format!("{room} is not in the local cache; try sync=both"),
-                )
+                // ⚠️ 兩種「找不到」講的不是同一件事，🚫 不要都叫人去 `sync=both`
+                //（`Both` 走到這裡，代表上游剛剛才問過）（PR #32 審查 salvia🟡1）。
+                let why = match sync {
+                    SyncMode::Both => "the homeserver does not list it either",
+                    _ => "it is not in the local cache; try sync=both",
+                };
+                CoreError::new(CoreErrorKind::NoSuchAccount, format!("{room}: {why}"))
             });
         }
         let backend = self
@@ -262,8 +265,10 @@ impl Core {
         if sync == SyncMode::Local {
             return self.cached_page_of(account, room, limit, before).await;
         }
+        // ⭐ 在打上游**之前**問，🚫 不要抓了一頁、寫進庫了，才發現這一頁答不出來。
+        let upstream_before = before_for_upstream_page(sync, before)?;
         let backend = self.synced_backend_of(account, server_backup).await?;
-        let page = backend.history(room, before, limit).await?;
+        let page = backend.history(room, upstream_before, limit).await?;
         if sync == SyncMode::Server {
             // 🚫 看一眼不寫庫。⚠️ 這時的 `next` 是 server 的翻頁 token。
             return Ok((page.events, page.next));
@@ -337,6 +342,53 @@ fn cached_page(messages: Vec<Message>) -> (Vec<Message>, Option<String>) {
     (messages, next)
 }
 
+/// 要餵給上游的翻頁位置 —— 順便擋掉「兩套座標一起用」那種問不出東西的組合。
+///
+/// 🚨 **這是權宜的，而且它會消失**（PR #32 審查 cirno🔴、salvia🟡2）。
+///
+/// 問題不在 `Both` 這個模式，在**現在只有一個 backend 拿得到歷史**：
+///
+/// | backend | 上游怎麼定位 | 本地怎麼定位 | 對得上嗎 |
+/// |---|---|---|---|
+/// | matrix-sdk `/messages`（現在唯一有歷史的） | 不透明 token | `r_seq` | ❌ 沒有翻譯 |
+/// | wbf（`Event/*`） | `r_seq`／`g_seq`（server 自己塞的） | `r_seq` | ✅ **同一套** |
+///
+/// ⚠️ 所以 `Both` 帶 `before` 在 matrix backend 上是壞的：
+///
+/// - 一般的 token 餵到本地會解析失敗 —— 而那時上游已經抓完、也寫進庫了；
+/// - 🚨 **剛好是數字的 token 更糟**：它會指到本地一個不相干的位置，然後看起來像成功。
+///   協議上 token 就是不透明字串，🚫 不該賭它的長相。
+///
+/// ⭐ **出口**：wbf 那條線的房間歷史 API 正在 server 端開發中（維護者 2026-09-13）。
+/// 接上之後兩半講同一種 `r_seq`，這個守門就該**整個拿掉** —— 🚫 它不是 `Both` 的固有性質，
+/// 介面（rpc-spec 的 `sync`）也不會因此改。
+///
+/// 📎 在那之前也不擋路：「點開房間」就是不帶 `before` 的 `Both`，之後往回翻用 `Local`
+/// （daemon-runtime §3.4）；要用 server 座標一頁頁翻用 `Server`。
+///
+/// Args:
+///     sync: 這一頁怎麼拿。🚫 `Local` 不會走到這裡（它不打上游）, example: SyncMode::Both
+///     before: 呼叫端給的翻頁位置, example: Some("t57-1234_0_0_0")
+/// Return:
+///     Ok(Some(token))  要餵給上游的 token
+///     Ok(None)         最新的一頁
+///     Err(Usage)       `Both` 帶了 `before`：兩套座標，這裡不假裝翻譯得了
+fn before_for_upstream_page(
+    sync: SyncMode,
+    before: Option<&str>,
+) -> Result<Option<&str>, CoreError> {
+    match (sync, before) {
+        (SyncMode::Both, Some(_)) => Err(CoreError::new(
+            CoreErrorKind::Usage,
+            "sync=both does not take `before`: that would mean two coordinate systems at once \
+             (a server pagination token upstream, a local r_seq in the answer). \
+             Use sync=both for the first page, then sync=local to page back \
+             (or sync=server to page with server tokens).",
+        )),
+        (_, before) => Ok(before),
+    }
+}
+
 /// ⚠️ `before` 在 `Cache` 來源時是 `r_seq` 的數字，**不是** server 的翻頁 token。
 fn parse_before_r_seq(before: Option<&str>) -> Result<Option<i64>, CoreError> {
     before
@@ -393,6 +445,38 @@ mod tests {
         // server 的翻頁 token 長這樣，拿來當 r_seq 用要報錯而不是默默當成 None。
         let error = parse_before_r_seq(Some("t57-1234_0_0_0")).unwrap_err();
         assert_eq!(error.kind, CoreErrorKind::Usage);
+    }
+
+    /// 🚨 `Both` 帶 `before` 是兩套座標一起用 —— 要在**打上游之前**就拒絕
+    /// （PR #32 審查 cirno🔴）。
+    #[test]
+    fn both_refuses_a_before_because_it_would_mean_two_coordinate_systems() {
+        // 第一頁：兩種都行。
+        assert_eq!(
+            before_for_upstream_page(SyncMode::Both, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            before_for_upstream_page(SyncMode::Server, None).unwrap(),
+            None
+        );
+        // `Server` 一路用 server 座標，翻頁 token 原樣往上游送。
+        assert_eq!(
+            before_for_upstream_page(SyncMode::Server, Some("t57-1234_0_0_0")).unwrap(),
+            Some("t57-1234_0_0_0")
+        );
+        // `Both` 帶 token：擋下來。
+        let error = before_for_upstream_page(SyncMode::Both, Some("t57-1234_0_0_0")).unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Usage);
+        assert!(error.message.contains("sync=local"), "要說怎麼做才對");
+        // ⚠️ 剛好是數字的 token 一樣擋：它解析得過，然後指到本地一個不相干的位置
+        // —— 🚫 那比報錯糟得多。
+        assert_eq!(
+            before_for_upstream_page(SyncMode::Both, Some("42"))
+                .unwrap_err()
+                .kind,
+            CoreErrorKind::Usage
+        );
     }
 
     #[test]

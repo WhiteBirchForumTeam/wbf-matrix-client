@@ -303,6 +303,15 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 - 有沒有洞是**看得出來的**：`cache.db` 的 `events` 有 `r_seq`（房內序號），
   一段連續的 `r_seq` 中間缺號就是洞（local-cache-db §6）。有洞才發第二個 `sync: "both"`。
 - 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 daemon 自己的事（§4.3）。
+- 🚨 **`both` 現在只用在「最新的一頁」，🚫 不吃 `before`**（PR #32 審查 cirno🔴）——
+  ⚠️ **這是權宜的**：問題不在 `both`，在**現在只有 matrix-sdk 那個 backend 拿得到歷史**，
+  而它的翻頁位置是**不透明 token**，跟本地的 `r_seq` 之間沒有翻譯。
+  最危險的不是報錯，是「token 剛好長得像數字」：那會**指到本地一個不相干的位置**，
+  然後看起來像成功。所以那個組合在打上游**之前**就被擋掉（`before_for_upstream_page`），
+  🚫 不是抓完寫完才失敗。
+  ⭐ **出口**：wbf 那條線的房間歷史 API 正在 server 端開發中（維護者 2026-09-13）。
+  wbf backend 上下兩半講的都是 `r_seq`，接上之後這個守門整個拿掉，**介面不用改**。
+  在那之前往回翻一律 `local` —— 反正資料已經在庫裡了。
 
 ### 3.5 ⚠️ 現況與這個模型的落差
 
@@ -311,6 +320,22 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 | `room.list`／`room.get` 預設 `local` | ✅ 改好了。⚠️ **CLI 那一側刻意維持舊行為**：`--from-cache` → `Local`，沒帶 → **`Both`**（它本來就是「打上游＋寫穿快取」），🚫 不偷偷改掉它 |
 | 參數叫 `sync`，三個值 | ✅ 改好了（`HistorySource` → `SyncMode`，預設 `Local`） |
 | 帳號列表永遠本地 | ✅ 已經是了 |
+| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🚨 **還沒有這個接縫**：`synced_backend_of` 一律回 matrix-sdk。見下 |
+
+🚨 **backend 分派這條線還沒挖**（維護者 2026-09-13 指出）。⚠️ 先把兩個軸分開，它們一直被混用：
+
+| | 意思 | 值 |
+|---|---|---|
+| **backend** | 用哪一套**協議**跟 homeserver 講話 | matrix-sdk（標準 Matrix）／wbf 的 pack 協議 |
+| **transport** | wbf 協議走哪條**管子** | `ws`（預設）／`http`（fallback） |
+
+🚫 `--transport http` **不是**「退回標準 Matrix」，是「wbf 協議走 HTTP」。這兩個正交。
+
+現在房間那條線**只有 matrix-sdk 一條路**（`room.list`／`get`／`history`／`send_text` 都是），
+而 wbf 協議的 `Event` 底下只有 `Recent`／`Send`／`Batch` —— 🚫 **沒有「拿房間歷史」這個 call**，
+所以現在也沒有第二條路可以分派。⭐ server 端正在補這塊 API（維護者 2026-09-13）；
+接上之後 `room.*` 要照 architecture-v2 §6.1 的探測結果分派，**rpc-spec 那一層一個字都不用改**
+—— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
 
 ⭐ **這是補參數、不是改方向**：上游那條路一行都不會少，只是從「唯一的路」變成「說出來才走的那條」。
 📎 CLI 現在那樣寫沒有錯 —— 它沒有常駐的東西可以依賴，每個命令自己去 sync 是唯一選擇。

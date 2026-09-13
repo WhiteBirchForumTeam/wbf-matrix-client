@@ -272,9 +272,35 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
-| `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | `history`。⚠️ core 那邊的參數現在叫 `source: server\|cache`（兩個值）——**RPC 上統一叫 `sync`、三個值**，🚫 不要兩個名字講同一件事 |
+| `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「`before` 是哪一套座標」 |
 | `room.files` | `{ room, limit, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
 | `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（daemon-runtime §6） |
+
+🚨 **`before` 是哪一套座標，看 `sync`**（`room.history`／`room.files`；PR #32 審查 cirno🔴）：
+
+| `sync` | `before` 收什麼 | 回應的 `next` 是什麼 |
+|---|---|---|
+| `local`（預設） | 本地 `r_seq` 的**數字** | 本地 `r_seq` |
+| `server` | server 的**翻頁 token** | server 的翻頁 token |
+| `both` | 🚫 **不接受 `before`**（帶了就是 `1100`＝`CoreErrorKind::Usage`） | 本地 `r_seq` |
+
+🚨 **`both` 那一格是權宜的，它會消失**。問題不在 `both`，在**現在只有一個 backend 拿得到歷史**：
+
+| backend | 上游怎麼定位 | 本地怎麼定位 | 對得上嗎 |
+|---|---|---|---|
+| matrix-sdk `/messages`（現在唯一有歷史的） | 不透明 token | `r_seq` | ❌ 沒有翻譯 |
+| **wbf**（`Event/*`） | `r_seq`／`g_seq`（server 自己塞的） | `r_seq` | ✅ **同一套** |
+
+⚠️ 所以在 matrix backend 上，`both` 帶一個 token 進來，好一點是解析失敗（而且是在**已經抓完、
+已經寫進庫之後**才失敗）；🚨 壞的是那個 token 剛好長得像數字 —— 它會指到本地一個不相干的位置，
+然後**看起來像成功**。協議上 token 就是不透明字串，🚫 不該賭它的長相。
+
+⭐ **出口**：wbf 那條線的房間歷史 API 正在 server 端開發中（維護者 2026-09-13）。接上之後上下兩半
+講同一種 `r_seq`，這一格就該改回「本地 `r_seq`」—— ⚠️ **前端的介面不會因此改**：`sync` 三個值、
+`before` 一個欄位，變的只是「`both` 也收得下 `before`」。
+
+📎 在那之前也不擋路：**點開房間 = 不帶 `before` 的 `both`**（拉最新的一頁順便入庫），
+**往回翻 = `local`**（資料已經在庫裡了，翻頁很便宜）。要一頁頁跟 server 翻就整條都用 `server`。
 
 🚫 **沒有 `room.watch`**。CLI 的 `watch tail|wait|once` 是「一個命令一個程序」的產物；daemon 常駐，
 新訊息走**訂閱＋推播**（§4）。rpc-cli 要模擬 `watch once --timeout` 就是「訂閱、等第一則、退訂」。
