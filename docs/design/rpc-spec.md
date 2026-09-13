@@ -181,6 +181,8 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - 🚫 **沒有 `auto`**：延遲從毫秒跳到秒這件事，要由呼叫者決定，🚫 不是 daemon 猜。
 - 判準：**本地快取有那份東西的 method 才有這個參數**。帳號列表、recovery key 那些是這台機器的檔案
   （沒有「上游版本」），`sync.recent`／`server.ping`／`backup.*` 本來就是上游的。
+- ⚠️ **回傳的型別定義上就是上游的東西也不補**（`media.info`）：強推一個 `local` 只會逼它編造
+  server 才知道的欄位。⭐ 那種時候要的是**另一個 method**，🚫 不是同一個加一個旗標。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（CLI 規格 §10），**由 daemon 讀 conf 填進 `Target`**。
   前端不該替使用者決定要不要備份，而 daemon 就是 conf 的主人（它是 client 本體，architecture-v2 §0.2）。
@@ -288,7 +290,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | method | params | result | core |
 |---|---|---|---|
-| `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo` | `media_info` |
+| `media.info` | `{ mxc, manifest?, transport?, user?, server? }`。🚫 **沒有 `sync`** | `MediaInfo` | `media_info`。⚠️ 它的欄位（`total_len`／`truncated`／`verified`）定義上就是「server 上那份長什麼樣」，`local` 只能編造它們 —— 本地的那份是 `media.stats`（daemon-runtime §3.2） |
 | `media.open` | `{ manifest, user?, server? }` 或 `{ event_id, room, user?, server? }`（daemon 從快取找 manifest） | `{ url, mimetype?, size, expires_in }`。`url` 是資料平面的 capability URL（§6.1） | ⚠️ core 缺「給一個 reader」的形狀：現在 `download_to` 直接寫檔、`seek_read` 一次回整段 bytes。daemon 要的是 `PoolReader`（local-cache-db §8.6）接到 HTTP Range 上 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, sha256?, user?, server? }` | `{ upload_id, mxc, url, expires_in }`。`url` 是資料平面的 PUT URL（§6.2）。`mxc` 在這一步就有（server 的 `Create` 就配好 id）——所以 `room.send_attachment` 不必等傳完 | ⚠️ core 缺（同 `room.send_attachment`） |
 | `media.save_to` | `{ manifest, out: path, no_cache?: bool, transport?, user?, server? }` | `DownloadResult` 或（`no_cache`）`DirectDownloadResult` | `download_to`／`download_direct`。長工作。**明文落地是使用者要的**（§4.8） |
@@ -490,7 +492,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
 | `desync` 推播（§4） | ❌（daemon 層） | — | ❌ |
-| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`） | 🔁 core 只有上游那條；`local` 要接 `cache.db` | 本機 | ❌ |
+| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`） | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地 | 本機（`local`）／同下面那幾列 | ✅ |
 | `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |

@@ -53,10 +53,11 @@ pub struct FilePage {
 pub struct HistoryQuery {
     pub room: String,
     pub limit: u32,
-    /// `Server` 時是 server 的翻頁 token；`Cache` 時是 `r_seq` 的數字。
+    /// 打上游時是 server 的翻頁 token；讀本地時是 `r_seq` 的數字。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
-    pub source: HistorySource,
+    #[serde(default)]
+    pub sync: SyncMode,
     /// 空的就不濾。⚠️ 過濾在**這一層**做（CLI 規格 §3.4.1）：server 不知道我們的 kind 名字。
     #[serde(default)]
     pub types: Vec<String>,
@@ -64,46 +65,85 @@ pub struct HistoryQuery {
     pub sender: Option<String>,
 }
 
-/// 讀歷史要從哪拿。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// 這次查詢要本地的、上游的、還是兩者（rpc-spec §2 的 `sync`；daemon-runtime §3.1）。
+///
+/// ⭐ **預設是 `Local`**：RPC 大部分是對本地資料庫的呼叫，要打上游得**明講**。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HistorySource {
-    /// 打 server，順手寫穿快取。
+pub enum SyncMode {
+    /// 只讀 `cache.db`，🚫 不連網。⚠️ 翻頁的 `before` 這時是 `r_seq` 的數字，不是 server 的 token。
+    #[default]
+    Local,
+    /// 打上游、拿到什麼回什麼。🚫 **不寫快取** —— 這是「看一眼」，不是同步。
+    /// 📎 分開的理由：對帳時要看得見「上游說 A、本地存的是 B」，順手寫回去那個差異就消失了。
     Server,
-    /// 只讀 `cache.db`，🚫 不連網。⚠️ `before` 這時是 `r_seq` 的數字，不是 server 的翻頁 token。
-    Cache,
+    /// 打上游 → 寫進 `cache.db` → **再從本地讀一次**回傳。
+    /// ⭐ 回的是本地讀的結果，所以形狀跟 `Local` 一模一樣，呼叫端🚫 不必寫兩套解析。
+    Both,
 }
 
 impl Core {
-    /// 加入的房間。順手寫穿快取。
+    /// 加入的房間。`sync` 決定要本地的還是上游的（daemon-runtime §3.1）。
     pub async fn list_conversations(
         &self,
+        sync: SyncMode,
         target: &Target,
     ) -> Result<Vec<Conversation>, CoreError> {
         let account = self.account_or_current(target)?;
+        if sync == SyncMode::Local {
+            let (cache, me) = self.server_cache_and_me(&account)?;
+            let rows = cache.read().await.list_conversations(&me)?;
+            return Ok(rows);
+        }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
             .await?;
         let conversations = backend.conversations().await?;
-        // 寫穿快取：丟給那個 server 的寫入者（daemon-runtime §2.3）。
-        // 🚫 不等它 —— 回應的內容來自上游那一輪，不取決於這次寫入。
-        if let Ok((cache, me)) = self.server_cache_and_me(&account) {
-            let rows = conversations.clone();
-            cache.post(
-                move |cache| cache.upsert_conversations(&me, &rows).map(|_| ()),
-                Vec::new(),
-            );
+        if sync == SyncMode::Server {
+            // 🚫 看一眼不寫庫。
+            return Ok(conversations);
         }
-        Ok(conversations)
+        // `Both`：寫進去**等它落地**，再從本地讀一次回傳 —— 這樣回的形狀跟 `Local` 一樣。
+        let (cache, me) = self.server_cache_and_me(&account)?;
+        let rows = conversations;
+        let me_here = me.clone();
+        cache
+            .run(move |cache| cache.upsert_conversations(&me_here, &rows).map(|_| ()))
+            .await?;
+        let rows = cache.read().await.list_conversations(&me)?;
+        Ok(rows)
     }
 
-    /// 一個房間本身（前端要問「加密了沒」就用它）。
+    /// 一個房間本身（前端要問「加密了沒」就用它）。`sync` 同 [`Core::list_conversations`]。
+    ///
+    /// 📎 本地那條是從房間列表裡挑 —— `cache.db` 存的就是整個 `Conversation`（`room_list` 表），
+    /// 🚫 沒有另一張「單一房間」的表。
     pub async fn conversation(
         &self,
         room: &str,
+        sync: SyncMode,
         target: &Target,
     ) -> Result<Conversation, CoreError> {
         let account = self.account_or_current(target)?;
+        if sync != SyncMode::Server {
+            if sync == SyncMode::Both {
+                // 先讓 `Both` 去上游更新一輪（它自己會寫進去）。
+                self.list_conversations(SyncMode::Both, target).await?;
+            }
+            let (cache, me) = self.server_cache_and_me(&account)?;
+            let found = cache
+                .read()
+                .await
+                .list_conversations(&me)?
+                .into_iter()
+                .find(|conversation| conversation.id == room);
+            return found.ok_or_else(|| {
+                CoreError::new(
+                    CoreErrorKind::NoSuchAccount,
+                    format!("{room} is not in the local cache; try sync=both"),
+                )
+            });
+        }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
             .await?;
@@ -144,7 +184,7 @@ impl Core {
                 room,
                 limit,
                 before,
-                query.source,
+                query.sync,
                 target.server_backup,
             )
             .await?;
@@ -168,14 +208,14 @@ impl Core {
         room: &str,
         limit: u32,
         before: Option<&str>,
-        source: HistorySource,
+        sync: SyncMode,
         save_to: Option<&Path>,
         target: &Target,
     ) -> Result<FilePage, CoreError> {
         let account = self.account_or_current(target)?;
         let session_server = self.session_of(&account)?.server;
         let (events, next) = self
-            .page_of(&account, room, limit, before, source, target.server_backup)
+            .page_of(&account, room, limit, before, sync, target.server_backup)
             .await?;
         let mut files = Vec::new();
         for message in &events {
@@ -209,36 +249,46 @@ impl Core {
         Ok(FilePage { files, next })
     }
 
-    /// `history` 與 `files` 共用的取頁：從 server 拿就順手寫穿快取。
+    /// `history` 與 `files` 共用的取頁（daemon-runtime §3.1 的三種 `sync`）。
     async fn page_of(
         &self,
         account: &AccountDir,
         room: &str,
         limit: u32,
         before: Option<&str>,
-        source: HistorySource,
+        sync: SyncMode,
         server_backup: bool,
     ) -> Result<(Vec<Message>, Option<String>), CoreError> {
-        match source {
-            HistorySource::Cache => {
-                let (cache, me) = self.server_cache_and_me(account)?;
-                let before = parse_before_r_seq(before)?;
-                let messages = cache.read().await.history(&me, room, before, limit)?;
-                Ok(cached_page(messages))
-            }
-            HistorySource::Server => {
-                let backend = self.synced_backend_of(account, server_backup).await?;
-                let page = backend.history(room, before, limit).await?;
-                if let Ok((cache, me)) = self.server_cache_and_me(account) {
-                    let events = page.events.clone();
-                    cache.post(
-                        move |cache| cache.upsert_messages(&me, &events).map(|_| ()),
-                        Vec::new(),
-                    );
-                }
-                Ok((page.events, page.next))
-            }
+        if sync == SyncMode::Local {
+            return self.cached_page_of(account, room, limit, before).await;
         }
+        let backend = self.synced_backend_of(account, server_backup).await?;
+        let page = backend.history(room, before, limit).await?;
+        if sync == SyncMode::Server {
+            // 🚫 看一眼不寫庫。⚠️ 這時的 `next` 是 server 的翻頁 token。
+            return Ok((page.events, page.next));
+        }
+        // `Both`：寫進去**等它落地**，再從本地讀同一頁 —— 回的形狀因此跟 `Local` 一樣。
+        let (cache, me) = self.server_cache_and_me(account)?;
+        let events = page.events;
+        cache
+            .run(move |cache| cache.upsert_messages(&me, &events).map(|_| ()))
+            .await?;
+        self.cached_page_of(account, room, limit, before).await
+    }
+
+    /// 純本地的一頁。⚠️ `before` 在這裡是 `r_seq` 的數字，🚫 不是 server 的翻頁 token。
+    async fn cached_page_of(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<(Vec<Message>, Option<String>), CoreError> {
+        let (cache, me) = self.server_cache_and_me(account)?;
+        let before = parse_before_r_seq(before)?;
+        let messages = cache.read().await.history(&me, room, before, limit)?;
+        Ok(cached_page(messages))
     }
 
     /// 開 backend 並做一次增量 sync（timeout 0）：房間列表與新事件到 store，之後才看得到現況。

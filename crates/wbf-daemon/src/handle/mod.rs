@@ -588,6 +588,31 @@ mod tests {
         assert!(handle.can_write());
     }
 
+    /// `sync` 沒帶就是 `local`，而 `local` **不連網**（rpc-spec §2、daemon-runtime §3.1）。
+    ///
+    /// ⭐ 這條測得出「預設值對不對」：`local` 讀空的快取會**成功回一個空列表**，
+    /// 而打上游會失敗（測試裡沒有帳號、也沒有 server）。🚫 不必真的架一台 server 來分辨。
+    #[tokio::test]
+    async fn sync_defaults_to_local_and_local_does_not_touch_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        handle.core().await.create_vault(None).unwrap();
+
+        // 沒有帳號：`local` 走到「哪個帳號？」就停了，🚫 不會是網路錯。
+        let response = handle.call(request("room.list", json!({}))).await;
+        assert_eq!(response.code, 1010, "{}", response.msg);
+        let with_sync = handle
+            .call(request("room.list", json!({ "sync": "local" })))
+            .await;
+        assert_eq!(with_sync.code, response.code, "沒帶 sync ＝ local");
+
+        // 認不得的值要被擋下來（102），🚫 不要默默當成某一種。
+        let response = handle
+            .call(request("room.list", json!({ "sync": "sometimes" })))
+            .await;
+        assert_eq!(response.code, code::INVALID_PARAMS, "{}", response.msg);
+    }
+
     #[tokio::test]
     async fn every_network_method_parses_its_params_and_reaches_core() {
         // 解鎖了但沒有帳號：每個 method 都該走到 core 然後被 core 拒絕（1000+），
@@ -613,11 +638,11 @@ mod tests {
             ),
             (
                 "room.history",
-                json!({ "room": "!r:localhost", "limit": 10, "source": "cache" }),
+                json!({ "room": "!r:localhost", "limit": 10, "sync": "server" }),
             ),
             (
                 "room.files",
-                json!({ "room": "!r:localhost", "limit": 10, "source": "cache" }),
+                json!({ "room": "!r:localhost", "limit": 10, "sync": "server" }),
             ),
             ("sync.recent", json!({})),
             (
@@ -659,7 +684,7 @@ mod tests {
             ("room.send_text", json!({ "room": "!r:localhost" })),
             (
                 "room.history",
-                json!({ "room": "!r:localhost", "limit": 10, "source": "elsewhere" }),
+                json!({ "room": "!r:localhost", "limit": 10, "sync": "elsewhere" }),
             ),
             ("server.ping", json!({ "transport": "carrier-pigeon" })),
             ("upload.status", json!({ "upload_id": "one" })),

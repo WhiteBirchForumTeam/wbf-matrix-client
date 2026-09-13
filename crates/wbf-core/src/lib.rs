@@ -72,7 +72,7 @@ pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
 pub use rooms_ops::{
-    cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, HistorySource, MessagePage,
+    cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, MessagePage, SyncMode,
 };
 pub use session_ops::{DestroyResult, LogoutResult};
 pub use sync_ops::{watch_mode_from_name, RecentSummary, WatchMode, WatchSummary};

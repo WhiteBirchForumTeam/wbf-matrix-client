@@ -254,7 +254,7 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一個上游�
 |---|---|---|
 | `room.list`、`room.get` | ✅ | `room_list` 表就是它的本地版 |
 | `room.history`、`room.files` | ✅ | ⚠️ 它們現在的參數叫 `source: server\|cache` —— **改名成 `sync`、值改成三種**，🚫 不要兩個名字講同一件事 |
-| `media.info` | ✅ | `media` 表有 |
+| `media.info` | ❌ **改判**（2026-09-13 看了型別）| 它的欄位（`total_len`／`truncated`／`verified`）**定義上就是「server 上那份長什麼樣」**。本地版是另一種東西（池裡有幾塊、佔多少磁碟）——⭐ 硬掛 `sync` 只會逼它在 `local` 時**編造** server 欄位。本地的那份是 `media.stats`，要更細就開一個新 method，🚫 不是同一個 |
 | 讀已讀位置（§7） | ✅ | `read_positions` 有 |
 | `account.list`、`recovery.list`／`show` | ❌ | **已登入的帳號 always local**：那是這台機器的檔案，不是快取，🚫 沒有「上游版本」可言 |
 | `sync.recent` | ❌ | 它**本身就是**上游拉。加 `sync=local` 沒有意義 |
@@ -294,8 +294,8 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 
 | 這份說 | 現在的程式 |
 |---|---|
-| `room.list`／`room.get` 預設 `local` | `list_conversations` 走 `synced_backend_of`，**每次都先跟上游 sync 一輪**（等於永遠是 `both`） |
-| 參數叫 `sync`，三個值 | `room.history`／`files` 叫 `source`，兩個值（`server`／`cache`） |
+| `room.list`／`room.get` 預設 `local` | ✅ 改好了。⚠️ **CLI 那一側刻意維持舊行為**：`--from-cache` → `Local`，沒帶 → **`Both`**（它本來就是「打上游＋寫穿快取」），🚫 不偷偷改掉它 |
+| 參數叫 `sync`，三個值 | ✅ 改好了（`HistorySource` → `SyncMode`，預設 `Local`） |
 | 帳號列表永遠本地 | ✅ 已經是了 |
 
 ⭐ **這是補參數、不是改方向**：上游那條路一行都不會少，只是從「唯一的路」變成「說出來才走的那條」。
@@ -555,8 +555,8 @@ let response = tokio::select! {
 | 階段 | 內容 | 狀態 |
 |---|---|---|
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ 這支分支做了 |
-| 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | 🔁 `ServerCache` 做了；還沒接上 core 的呼叫點 |
-| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` 改名，預設 `local` | ❌ |
+| 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 這支分支做了（媒體那幾條是刻意的例外，§2.3.1） |
+| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files` 補上，`source` → `sync`、預設 `local`（`media.info` 改判為不補） | ✅ 這支分支做了 |
 | 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ❌ |
 | 5 | `cancel`（§9） | ❌ |
 | 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ❌ 向量已經有，codec 還沒寫 |

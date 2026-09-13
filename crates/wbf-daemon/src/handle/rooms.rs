@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use wbf_core::{cipher_for_plaintext_room, Core, HistoryQuery, HistorySource, UploadRequest};
+use wbf_core::{cipher_for_plaintext_room, Core, HistoryQuery, SyncMode, UploadRequest};
 use wbf_sdk::RecentPlan;
 
 use super::{
@@ -19,19 +19,32 @@ use super::{
 #[derive(Deserialize)]
 struct RoomParams {
     room: String,
+    /// 沒帶就是 `local`（rpc-spec §2）。
+    #[serde(default)]
+    sync: SyncMode,
     #[serde(flatten)]
     target: TargetParams,
 }
 
 pub(super) async fn room_list(handle: &Handle, core: &Core, params: Value) -> Outcome {
-    let target: TargetParams = parse_params(params)?;
-    to_result(core.list_conversations(&handle.target(&target)).await?)
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(default)]
+        sync: SyncMode,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    to_result(
+        core.list_conversations(params.sync, &handle.target(&params.target))
+            .await?,
+    )
 }
 
 pub(super) async fn room_get(handle: &Handle, core: &Core, params: Value) -> Outcome {
     let params: RoomParams = parse_params(params)?;
     to_result(
-        core.conversation(&params.room, &handle.target(&params.target))
+        core.conversation(&params.room, params.sync, &handle.target(&params.target))
             .await?,
     )
 }
@@ -78,7 +91,11 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
     let params: Params = parse_params(params)?;
     let transport = handle.transport(&params.transport)?;
     let target = handle.target(&params.target);
-    let conversation = core.conversation(&params.room, &target).await?;
+    // ⚠️ 送檔前要知道這個房間**現在**加不加密：`Both` 去上游確認過再回答。
+    // 🚫 不能用 `Local` —— 快取裡的「沒加密」如果過期了，我們會把金鑰公開送出去。
+    let conversation = core
+        .conversation(&params.room, SyncMode::Both, &target)
+        .await?;
     let cipher = if conversation.encrypted {
         params.cipher
     } else {
@@ -121,7 +138,10 @@ struct PageParams {
     limit: u32,
     #[serde(default)]
     before: Option<String>,
-    source: HistorySource,
+    /// 沒帶就是 `local`（rpc-spec §2）。⚠️ `local` 時 `before` 是 `r_seq` 的數字，
+    /// 打上游時才是 server 的翻頁 token。
+    #[serde(default)]
+    sync: SyncMode,
     #[serde(flatten)]
     target: TargetParams,
 }
@@ -145,7 +165,7 @@ pub(super) async fn room_history(handle: &Handle, core: &Core, params: Value) ->
         room: params.page.room,
         limit: params.page.limit,
         before: params.page.before,
-        source: params.page.source,
+        sync: params.page.sync,
         types: params.types,
         sender: params.sender,
     };
@@ -163,7 +183,7 @@ pub(super) async fn room_files(handle: &Handle, core: &Core, params: Value) -> O
             &params.room,
             params.limit,
             params.before.as_deref(),
-            params.source,
+            params.sync,
             None,
             &handle.target(&params.target),
         )

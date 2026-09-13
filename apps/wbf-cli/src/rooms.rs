@@ -9,7 +9,7 @@ use std::path::Path;
 use serde_json::json;
 use wbf_core::{
     cipher_for_plaintext_room, watch_mode_from_name, CoreError, CoreErrorKind, CoreEvent,
-    HistoryQuery, HistorySource, UploadRequest,
+    HistoryQuery, SyncMode, UploadRequest,
 };
 use wbf_sdk::vault::write_private;
 use wbf_sdk::Message;
@@ -19,9 +19,11 @@ use crate::{SendArgs, WatchArgs};
 
 pub async fn rooms_command(context: &Context) -> Result<(), CoreError> {
     context.warn_if_backups_are_off();
+    // CLI 沒有常駐的上游會話可以依賴，所以它一律 `Both`：打上游、寫快取、回本地讀的那份。
+    // ⭐ 這跟它以前的行為一模一樣（以前就是「打上游＋寫穿快取」），🚫 不是新行為。
     let conversations = context
         .core()?
-        .list_conversations(&context.target())
+        .list_conversations(SyncMode::Both, &context.target())
         .await?;
     print_json(&serde_json::to_value(conversations).expect("serializes"))
 }
@@ -43,7 +45,9 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
 
     // 約定 §5.1：沒 E2EE 的房間走明文模式，送之前**警告並要求確認**。
     // 🚫 這個確認是前端的事，core 不問（architecture-v2 §3）。
-    let conversation = core.conversation(&args.room, &target).await?;
+    let conversation = core
+        .conversation(&args.room, SyncMode::Both, &target)
+        .await?;
     let cipher = if conversation.encrypted {
         args.cipher.clone()
     } else {
@@ -134,7 +138,7 @@ pub async fn read_command(
                 room: room.to_string(),
                 limit,
                 before: before.map(str::to_string),
-                source: source_of(from_cache),
+                sync: sync_of(from_cache),
                 types: types.to_vec(),
                 sender: sender.map(str::to_string),
             },
@@ -158,7 +162,7 @@ pub async fn files_command(
             room,
             limit,
             before,
-            source_of(from_cache),
+            sync_of(from_cache),
             save,
             &context.target(),
         )
@@ -166,10 +170,19 @@ pub async fn files_command(
     print_json(&serde_json::to_value(page).expect("serializes"))
 }
 
-fn source_of(from_cache: bool) -> HistorySource {
+/// CLI 的 `--from-cache` 對到新的三種 `sync`（daemon-runtime §3.1）。
+///
+/// Args:
+///     from_cache: 有沒有帶 `--from-cache`, example: true
+/// Return:
+///     SyncMode  true → `Local`；false → **`Both`**
+///
+/// ⚠️ 沒帶旗標對的是 `Both` 而不是 `Server`：**CLI 本來就是「打上游＋寫穿快取」**，
+/// 而 `Server` 是新的「看一眼不寫庫」語意 —— 🚫 不要悄悄改掉 CLI 的行為。
+fn sync_of(from_cache: bool) -> SyncMode {
     match from_cache {
-        true => HistorySource::Cache,
-        false => HistorySource::Server,
+        true => SyncMode::Local,
+        false => SyncMode::Both,
     }
 }
 
