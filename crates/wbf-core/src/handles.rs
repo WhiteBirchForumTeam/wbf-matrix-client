@@ -238,8 +238,13 @@ mod tests {
         let server_dir = account.server_dir();
 
         let cache = core.server_cache_of(&account, SERVER).unwrap();
+        // ⚠️ 這件工作**故意慢**：`close` 要是沒等寫入執行緒結束就回來，下面重新開庫讀的時候它還沒寫進去。
+        // 🚫 不慢的話，舊執行緒總是搶先寫完，這條測試就驗不到「close 會等」（變異驗證時抓到的）。
         cache.post(
-            |cache| cache.set_cg_seq("@alice:localhost", 42),
+            |cache| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                cache.set_cg_seq("@alice:localhost", 42)
+            },
             Vec::new(),
         );
 
