@@ -82,12 +82,25 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 { "code": 0, "msg": "ok", "id": 0, "result": {
     "protocol": 2,                    // 談定的那一個
     "daemon": "wbf-matrix-client-daemon 0.1.0",
+    "instance": "3f2b1c4a-5d6e-4f80-9a1b-2c3d4e5f6071",  // 這次啟動的 UUID
+    "pid": 4242,
+    "uptime_seconds": 12,
     "data_dir": "C:/Users/me/AppData/Roaming/wbf-matrix-client",
     "unlocked": false,
     "key_mode": "passphrase",         // "plain" | "passphrase" | null（還沒有 local.key）
     "encryption_enforced": true
 } }
 ```
+
+**`instance`：這次啟動的身分**（維護者 2026-09-13）。daemon 起來時鑄一個 UUID v4，活著的期間不變。
+
+- ⭐ 它回答的是前端唯一問得出口的那個問題：**「我現在講話的還是剛才那一個 daemon 嗎？」**
+  🚫 port 答不了（會被重複使用）、🚫 pid 也答不了（會被回收）。同一個 `instance` ＝ 同一個實例，
+  所以前端手上的所有狀態（訂閱、進行中的 `id`、解鎖與否）都還算數；換了就是全部重來。
+- 同一個值同時出現在**四個地方**：stdout 的 ready 那行、`<data dir>/daemon.json`、`hello` 的
+  result、`daemon.info` 的 result —— ⭐ 一個值一個來源，🚫 不各鑄一個。
+- `pid` 與 `uptime_seconds` 一起回：`pid` 給人（去 kill 它、去看 log），`uptime_seconds` 讓前端
+  一眼看出「它是不是剛剛才重開過」。⚠️ **判斷同不同一個實例只准用 `instance`**，🚫 不要用 pid。
 
 **`client`：正式名稱，`wbf-matrix` 開頭**。
 
@@ -169,7 +182,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | method | params | result | core |
 |---|---|---|---|
 | `hello` | §1.3 | §1.3 | — |
-| `daemon.info` | — | `{ version, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
+| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
 | `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |

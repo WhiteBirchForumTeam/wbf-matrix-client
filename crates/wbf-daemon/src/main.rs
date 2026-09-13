@@ -132,10 +132,13 @@ fn main() -> ExitCode {
         let rpc_port = server.local_addr().map(|addr| addr.port()).unwrap_or(0);
         // 資料平面還沒有：data_port 先 0。
         handle.set_ports(rpc_port, 0).await;
+        // `instance` 是這次啟動的 UUID：port 會被重複使用、pid 會被回收，**它不會** ——
+        // 前端拿它回答「我現在講話的還是剛才那一個 daemon 嗎」（維護者 2026-09-13）。
         let info = serde_json::json!({
             "rpc_port": rpc_port,
             "data_port": 0,
             "pid": std::process::id(),
+            "instance": handle.instance(),
         });
         // temp＋rename：前端可能正在 watch 這個檔，🚫 不讓它讀到寫一半的。
         if let Err(error) = wbf_sdk::vault::write_private(&ready_path, info.to_string().as_bytes())
@@ -147,7 +150,13 @@ fn main() -> ExitCode {
         // 不必去 watch 檔案）；stderr 那行是給人看的。🚫 stdout 只有這一行，別的都走 stderr。
         println!(
             "{}",
-            serde_json::json!({ "ready": true, "rpc_port": rpc_port, "data_port": 0 })
+            serde_json::json!({
+                "ready": true,
+                "rpc_port": rpc_port,
+                "data_port": 0,
+                "pid": std::process::id(),
+                "instance": handle.instance(),
+            })
         );
         eprintln!("listening on ws://127.0.0.1:{rpc_port}");
         eprintln!(

@@ -189,6 +189,10 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let reply = client.call("backup.status", json!({})).await;
     assert_eq!(reply["code"], 0, "backup.status: {reply}");
     assert_eq!(reply["result"]["server_backup_setting"], "on");
+    let before = info["result"]["instance"]
+        .as_str()
+        .expect("instance")
+        .to_string();
 
     // daemon 重開（真正的「鎖上」就是這條，rpc-spec §3.1）。
     // ⚠️ **先停掉第一個**：`daemon.shutdown` → 關連線 → 等它收攤 → 確認舊 port 不收連線了。
@@ -201,6 +205,8 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let info = client.call("daemon.info", Value::Null).await;
     assert_eq!(info["result"]["unlocked"], false, "{info}");
     assert_eq!(info["result"]["key_mode"], "passphrase");
+    // ⭐ 換了一個實例：instance 一定不同（port 會重用、pid 會回收，這個不會）。
+    assert_ne!(info["result"]["instance"], before.as_str(), "{info}");
     // 鎖著：帳號那些是 1001（有 local.key，所以🚫 不是 1002）。
     let reply = client.call("account.whoami", json!({})).await;
     assert_eq!(reply["code"], 1001, "{reply}");

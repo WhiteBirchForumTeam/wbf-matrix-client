@@ -225,10 +225,12 @@ Kotlin 的 OkHttp 內建，JS 原生。
 **第 3 步的 ready 是一個「邊緣」，不是一個狀態**（不然前端會把上一次殘留的 port 當成這一次的）：
 
 1. daemon 綁定**之前**先刪掉舊的 `<data dir>/daemon.json`（刪不掉就不啟動）。
-2. 綁好之後才 **temp＋rename** 寫進去（`{ "rpc_port", "data_port", "pid" }`）——前端 watch 到它出現時，
-   port 一定已經在聽，而且一定不是上一次的。
-3. 同時 **stdout 印一行 JSON**：`{"ready":true,"rpc_port":…,"data_port":…}`。spawn daemon 的那個程序
-   手上有 pipe，這樣它不必去 watch 檔案。🚫 stdout 只有這一行，其餘訊息一律 stderr。
+2. 綁好之後才 **temp＋rename** 寫進去（`{ "rpc_port", "data_port", "pid", "instance" }`）——前端 watch 到
+   它出現時，port 一定已經在聽，而且一定不是上一次的。
+3. 同時 **stdout 印一行 JSON**：`{"ready":true,"rpc_port":…,"data_port":…,"pid":…,"instance":"<uuid>"}`。
+   spawn daemon 的那個程序手上有 pipe，這樣它不必去 watch 檔案。🚫 stdout 只有這一行，其餘一律 stderr。
+   📎 `instance` 是這次啟動鑄的 UUID v4，`hello` 與 `daemon.info` 回的是**同一個**（rpc-spec §1.3）：
+   前端拿它判斷「還是剛才那一個 daemon 嗎」——⚠️ 🚫 不要拿 port 或 pid 判斷，那兩個都會被重複使用。
 4. daemon 結束時刪掉 `daemon.json`。
 
 **第 4 步的「抹掉」有規定的做法**（`wbf_daemon::token::shred`，維護者 2026-09-13 指定）：

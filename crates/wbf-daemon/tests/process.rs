@@ -20,6 +20,8 @@ const TOKEN: [u8; 256] = [9u8; 256];
 /// 起來之後 stdout 的第一行就是 ready；`main.rs` 保證 stdout 只有這一行。
 struct Ready {
     rpc_port: u16,
+    instance: String,
+    pid: u32,
 }
 
 fn spawn_daemon(data_dir: &Path, token_file: &Path) -> (Child, Ready) {
@@ -43,7 +45,23 @@ fn spawn_daemon(data_dir: &Path, token_file: &Path) -> (Child, Ready) {
     assert_eq!(ready["ready"], true, "{ready}");
     let rpc_port = ready["rpc_port"].as_u64().expect("rpc_port") as u16;
     assert_ne!(rpc_port, 0);
-    (child, Ready { rpc_port })
+    let instance = ready["instance"].as_str().expect("instance").to_string();
+    // UUID v4 的文字長相：8-4-4-4-12。🚫 不只檢查「有這個欄位」。
+    assert_eq!(instance.len(), 36, "{instance}");
+    assert_eq!(
+        instance.chars().filter(|c| *c == '-').count(),
+        4,
+        "{instance}"
+    );
+    let pid = ready["pid"].as_u64().expect("pid") as u32;
+    (
+        child,
+        Ready {
+            rpc_port,
+            instance,
+            pid,
+        },
+    )
 }
 
 async fn call(port: u16, keys: &RpcKeys, requests: &[Value]) -> Vec<Value> {
@@ -98,6 +116,9 @@ async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up
     assert_eq!(written["rpc_port"], ready.rpc_port);
     assert_ne!(written["rpc_port"], 1, "殘留的那份應該被蓋掉");
     assert_eq!(written["pid"], child.id());
+    // 三個管道講的是同一個實例：stdout 的 ready、daemon.json、以及等一下的 hello／daemon.info。
+    assert_eq!(ready.pid, child.id());
+    assert_eq!(written["instance"], ready.instance);
 
     // 🚨 誰起的誰動：daemon 讀完 token 檔之後**不碰它**（不抹、不刪、不改）。
     assert_eq!(
@@ -117,7 +138,14 @@ async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up
     )
     .await;
     assert_eq!(replies[0]["code"], 0, "{}", replies[0]);
+    assert_eq!(replies[0]["result"]["instance"], ready.instance, "hello");
+    assert_eq!(replies[0]["result"]["pid"], child.id());
     assert_eq!(replies[1]["result"]["rpc_port"], ready.rpc_port);
+    assert_eq!(
+        replies[1]["result"]["instance"], ready.instance,
+        "daemon.info"
+    );
+    assert!(replies[1]["result"]["uptime_seconds"].is_u64());
 
     // 前端做第 4 步：抹掉 token 檔。daemon 照樣服務（它不會回頭讀）。
     assert!(wbf_daemon::token::shred(&token_file).unwrap());

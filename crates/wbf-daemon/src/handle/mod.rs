@@ -46,6 +46,30 @@ fn is_allowed_while_locked(method: &str) -> bool {
     method == "hello" || method.starts_with("daemon.") || method.starts_with("vault.")
 }
 
+/// 鑄一個這次啟動的身分：RFC 4122 的 UUID v4 文字（隨機來自 OS）。
+///
+/// Return:
+///     String  example: "3f2b1c4a-5d6e-4f80-9a1b-2c3d4e5f6071"
+///
+/// 🚫 不引 uuid crate：這裡只要「夠亂、格式標準、印得出來」，122 bit 隨機的碰撞機率
+/// 遠低於任何我們會遇到的情況（維護者 2026-09-13）。
+fn new_instance_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS randomness");
+    // 版本 4（隨機）與 RFC 4122 的 variant 位元：不設的話它就不是一個合法的 UUID v4。
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 pub struct Handle {
     data_dir: PathBuf,
     /// 解鎖一次就活著（`Core` 沒有 lock，daemon 也沒有 `vault.lock`——rpc-spec §3.1）。
@@ -61,6 +85,9 @@ pub struct Handle {
     ports: RwLock<Option<(u16, u16)>>,
     /// 現在活著的 RPC 連線數（`daemon.info` 的 `connections`）。
     connections: AtomicUsize,
+    /// 這個 daemon 實例的身分（維護者 2026-09-13）：起來時鑄一次，活著的期間**不變**。
+    /// 生產環境一個程序就是一個 `Handle`（`main.rs` 只建一個），所以它也就是那個程序的身分。
+    instance: String,
 }
 
 impl Handle {
@@ -76,6 +103,7 @@ impl Handle {
             shutdown,
             ports: RwLock::new(None),
             connections: AtomicUsize::new(0),
+            instance: new_instance_id(),
         })
     }
 
@@ -111,6 +139,16 @@ impl Handle {
         self.shutdown_requested.load(Ordering::SeqCst) || *self.shutdown.borrow()
     }
 
+    /// 這個實例的 UUID。⭐ 前端用它回答「我現在講話的還是剛才那一個嗎」——
+    /// port 會重複使用、pid 會被回收，**這個不會**。
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -129,6 +167,9 @@ impl Handle {
         json!({
             "protocol": protocol,
             "daemon": format!("{DAEMON_NAME} {DAEMON_VERSION}"),
+            "instance": self.instance,
+            "pid": std::process::id(),
+            "uptime_seconds": self.uptime_seconds(),
             "data_dir": self.data_dir.display().to_string(),
             "unlocked": core.is_unlocked(),
             "key_mode": key_mode_json(&core),
@@ -232,6 +273,8 @@ impl Handle {
         let ports = *self.ports.read().await;
         Ok(json!({
             "version": format!("{DAEMON_NAME} {DAEMON_VERSION}"),
+            "instance": self.instance,
+            "pid": std::process::id(),
             "data_dir": self.data_dir.display().to_string(),
             "unlocked": core.is_unlocked(),
             "key_mode": key_mode_json(core),
@@ -239,7 +282,7 @@ impl Handle {
             "protocols": crate::protocol::SUPPORTED_PROTOCOLS,
             "rpc_port": ports.map(|(rpc, _)| rpc),
             "data_port": ports.map(|(_, data)| data),
-            "uptime_seconds": self.started_at.elapsed().as_secs(),
+            "uptime_seconds": self.uptime_seconds(),
             "connections": self.connection_count(),
             "server_backup_setting": on_off(self.settings.server_backup),
             "local_room_keys_setting": on_off(self.settings.local_room_keys),
