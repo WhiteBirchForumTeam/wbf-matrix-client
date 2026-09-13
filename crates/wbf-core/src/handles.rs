@@ -238,12 +238,17 @@ mod tests {
         let server_dir = account.server_dir();
 
         let cache = core.server_cache_of(&account, SERVER).unwrap();
-        // ⚠️ 這件工作**故意慢**：`close` 要是沒等寫入執行緒結束就回來，下面重新開庫讀的時候它還沒寫進去。
-        // 🚫 不慢的話，舊執行緒總是搶先寫完，這條測試就驗不到「close 會等」（變異驗證時抓到的）。
+        // ⚠️ 這件工作**故意慢**，寫完才立旗標。`close` 一回來就看旗標：有等寫入執行緒 → 一定立了；
+        // 沒等 → `close` 幾微秒就回來、工作還在睡。🚫 不靠「重新開庫讀讀看」——那要花的時間
+        // 可能比睡的還久，舊執行緒照樣來得及寫完，測試就驗不到「close 會等」（變異驗證時抓到兩次）。
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_in_job = finished.clone();
         cache.post(
-            |cache| {
+            move |cache| {
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                cache.set_cg_seq("@alice:localhost", 42)
+                let written = cache.set_cg_seq("@alice:localhost", 42);
+                finished_in_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                written
             },
             Vec::new(),
         );
@@ -254,6 +259,10 @@ mod tests {
 
         drop(cache);
         assert!(core.close_server_cache(&server_dir).unwrap(), "本來開著");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "🚨 close 回來時，queue 裡排著的那件要已經寫完"
+        );
         assert!(!is_registered(&core, &server_dir), "關完註冊表裡沒有它");
         assert!(!core.close_server_cache(&server_dir).unwrap(), "再關一次：本來就沒開");
 
