@@ -60,6 +60,10 @@ pub(crate) struct ServerCache {
     /// 📎 用 `Mutex` 是因為 `Connection` 不是 `Sync`：讀因此是排隊的，
     /// 而我們的讀都是短查詢。哪天出現慢查詢再換成連線池。
     reader: Mutex<Cache>,
+    /// 寫入執行緒。留著是為了 [`ServerCache::close`] 能**等它真的結束**：
+    /// 🚫 光丟掉送出端不夠 —— 執行緒還在把 queue 裡剩的寫完、還握著寫連線的時候就刪檔，
+    /// Windows 刪不掉，Linux 刪得掉但它接著寫進一個已經不存在的檔（房間歷史那支的真 server 測試抓到，2026-09-14）。
+    writer: std::thread::JoinHandle<()>,
 }
 
 /// 哪個 server dir 起過幾條寫入執行緒。⭐ 只為了讓「一個 server dir 只有一個寫入者」
@@ -116,7 +120,7 @@ impl ServerCache {
         let counter = queued.clone();
         // 🚨 自己的 OS 執行緒，🚫 不是 `tokio::spawn`：SQLite 的寫是**同步阻塞**的
         // （拿不到鎖會等，最壞 5 秒），擺在 runtime 的工作執行緒上就是卡住別人的 future。
-        std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name("wbf-cache-writer".to_string())
             .spawn(move || {
                 let mut writing = writing;
@@ -142,9 +146,29 @@ impl ServerCache {
                 to_writer,
                 queued,
                 reader: Mutex::new(reading),
+                writer,
             },
             outcome,
         ))
+    }
+
+    /// 關掉：**queue 裡剩的寫完**、寫入執行緒結束、兩條連線都放掉，才回來。
+    ///
+    /// ⭐ 回來之後這個 `cache.db` 就沒有任何 handle 了 —— 刪檔（最後一個帳號登出）要排在這之後。
+    /// ⚠️ 收 `self`：只有**唯一的擁有者**關得了（呼叫端先 `Arc::try_unwrap`），
+    /// 🚫 不能在別的請求還拿著它的時候從底下抽掉。
+    pub(crate) fn close(self) {
+        let ServerCache {
+            to_writer,
+            reader,
+            writer,
+            ..
+        } = self;
+        // 送出端一丟，`blocking_recv` 把剩下的收完就回 None，執行緒自己結束。
+        drop(to_writer);
+        // 寫入執行緒 panic 的話 join 會回 Err；那時連線也已經隨它的 stack 釋放了，沒有別的能做。
+        let _ = writer.join();
+        drop(reader);
     }
 
     /// 還有幾件在排隊。⚠️ 一直漲就是寫得比收得慢（daemon-runtime §2.2）。

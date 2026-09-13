@@ -185,13 +185,15 @@ impl Core {
         accounts::clear_current_if(&self.data_dir, account)?;
         // 這個 server 最後一個帳號登出：快取沒有主人了，整個丟。
         let server_dir = account.server_dir();
-        if !accounts::has_any_logged_in_account(&server_dir)
-            && wbf_sdk::cache::remove_cache(&server_dir)?
-        {
-            self.events.progress(format!(
-                "removed {} (no account on this server is logged in any more)",
-                server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).display()
-            ));
+        if !accounts::has_any_logged_in_account(&server_dir) {
+            // 🚨 **先關、再刪**：註冊表裡的寫入者與讀連線還握著 cache.db（`close_server_cache` 的表）。
+            self.close_server_cache(&server_dir)?;
+            if wbf_sdk::cache::remove_cache(&server_dir)? {
+                self.events.progress(format!(
+                    "removed {} (no account on this server is logged in any more)",
+                    server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).display()
+                ));
+            }
         }
         Ok(described)
     }

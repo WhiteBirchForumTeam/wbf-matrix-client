@@ -147,6 +147,48 @@ impl Core {
         Ok(cache)
     }
 
+    /// 關掉這個 server dir 的 `cache.db` 寫入者與讀連線，並從註冊表拿掉。
+    ///
+    /// 🚨 **刪 `cache.db` 之前一定要先叫它**（`log_out_account` 的「最後一個帳號登出就整個丟」）。
+    /// 註冊表的 `ServerCache` 開了就一直握著那個檔：
+    ///
+    /// | | 不先關就刪 |
+    /// |---|---|
+    /// | Windows | 刪不掉（`os error 32`），登出失敗 |
+    /// | Linux | 🚨 **刪得掉**，但寫入者與讀連線還握著已刪的檔；下次同一台 server 登入，註冊表交出的是那個舊 handle，寫進去的東西**消失** |
+    ///
+    /// ⚠️ **鎖握滿整段**（查、拿掉、關）：放掉的話，關的途中別人 `server_cache_of` 會開出第二個寫入者（#32 的教訓）。
+    /// 📎 關會等 queue 裡剩的寫完；那段時間別的 server 的 `server_cache_of` 也在等 —— 登出很少，可以接受。
+    ///
+    /// Args:
+    ///     server_dir: `<data dir>/s/<加密的 server 名>`
+    /// Return:
+    ///     Ok(true)    本來開著、現在關了
+    ///     Ok(false)   本來就沒開
+    ///     Err(Io)     還有別的請求拿著它 —— 🚫 不從它們底下抽掉，登出重試一次就好（清理是冪等的）
+    pub(crate) fn close_server_cache(&self, server_dir: &std::path::Path) -> Result<bool, CoreError> {
+        let mut registry = self
+            .server_caches
+            .lock()
+            .expect("the server-cache registry is never poisoned");
+        let Some(shared) = registry.remove(server_dir) else {
+            return Ok(false);
+        };
+        match std::sync::Arc::try_unwrap(shared) {
+            Ok(cache) => {
+                cache.close();
+                Ok(true)
+            }
+            Err(still_shared) => {
+                registry.insert(server_dir.to_path_buf(), still_shared);
+                Err(CoreError::new(
+                    CoreErrorKind::Io,
+                    "cache.db is still in use by another request, so it cannot be closed and removed yet; try again",
+                ))
+            }
+        }
+    }
+
     /// 這個帳號所屬 server 的媒體儲存池（local-cache-db.md §8），跟 `cache.db` 同層。
     pub(crate) fn pool_of(&self, account: &AccountDir) -> Result<MediaPool, CoreError> {
         Ok(MediaPool::open(
@@ -176,6 +218,79 @@ mod tests {
         let core = Core::open(dir);
         core.unlock(None).unwrap();
         core
+    }
+
+    fn is_registered(core: &Core, server_dir: &std::path::Path) -> bool {
+        core.server_caches
+            .lock()
+            .expect("registry")
+            .contains_key(server_dir)
+    }
+
+    /// 關掉之前 queue 裡剩的**要寫完**；關完註冊表裡**沒有它**；別人還拿著就**拒絕**。
+    #[test]
+    fn closing_a_server_cache_drains_the_queue_and_refuses_while_someone_still_holds_it() {
+        let dir = scratch("close");
+        let core = unlocked(&dir);
+        let key = core.vault().unwrap().account_dir_key();
+        let account = AccountDir::locate(&dir, &key, SERVER, "@alice:localhost").unwrap();
+        std::fs::create_dir_all(&account.dir).unwrap();
+        let server_dir = account.server_dir();
+
+        let cache = core.server_cache_of(&account, SERVER).unwrap();
+        cache.post(
+            |cache| cache.set_cg_seq("@alice:localhost", 42),
+            Vec::new(),
+        );
+
+        // 🚫 別人還拿著（這裡的 `cache`）：不准從它底下抽掉。
+        assert!(core.close_server_cache(&server_dir).is_err());
+        assert!(is_registered(&core, &server_dir), "拒絕時要原樣放回去");
+
+        drop(cache);
+        assert!(core.close_server_cache(&server_dir).unwrap(), "本來開著");
+        assert!(!is_registered(&core, &server_dir), "關完註冊表裡沒有它");
+        assert!(!core.close_server_cache(&server_dir).unwrap(), "再關一次：本來就沒開");
+
+        // queue 裡那件在關之前寫完了：重新開一份讀得到。
+        let reopened = core.server_cache_of(&account, SERVER).unwrap();
+        let seq = reopened
+            .run_blocking(|cache| cache.get_cg_seq("@alice:localhost"))
+            .unwrap();
+        assert_eq!(seq, Some(42), "關之前排著的寫入要落地");
+        drop(reopened);
+        core.close_server_cache(&server_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 **這台 server 的最後一個帳號登出：要先關 cache.db 再刪**（房間歷史那支的真 server 測試抓到）。
+    ///
+    /// 不先關的話：Windows 刪不掉（`os error 32`，登出失敗）；Linux 刪得掉，但註冊表還握著已刪的檔，
+    /// 下次同一台 server 登入交出的是舊 handle —— 寫進去的東西消失。所以斷言兩件事，**兩種 OS 都會紅**：
+    /// 登出成功、而且註冊表裡沒有它。
+    #[tokio::test]
+    async fn logging_out_the_last_account_closes_the_cache_before_removing_it() {
+        let dir = scratch("logout-closes-cache");
+        let core = unlocked(&dir);
+        let key = core.vault().unwrap().account_dir_key();
+        let account = AccountDir::locate(&dir, &key, SERVER, "@alice:localhost").unwrap();
+        std::fs::create_dir_all(&account.dir).unwrap();
+        let server_dir = account.server_dir();
+        // 有人讀過快取（daemon 裡任何一個 room.* 都會），然後不再拿著。
+        drop(core.server_cache_of(&account, SERVER).unwrap());
+        assert!(server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists());
+
+        // 🚫 不封 session：`is_logged_in()` 是 false，登出不必連網路就走到本地清理。
+        core.log_out("@alice:localhost", None, true, false)
+            .await
+            .expect("最後一個帳號登出要成功");
+
+        assert!(!is_registered(&core, &server_dir), "🚨 註冊表不准留著已刪的檔");
+        assert!(
+            !server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists(),
+            "cache.db 要真的刪掉"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 🚨 八條執行緒同時要同一個 server 的快取 —— **只准起一條寫入者**
