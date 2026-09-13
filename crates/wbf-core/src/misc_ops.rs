@@ -11,6 +11,7 @@ use wbf_sdk::{ChunkedBlock, FileCipher, Transport};
 
 use crate::error::{CoreError, CoreErrorKind};
 use crate::upload_ops::UploadRequest;
+use crate::backend_choice::MethodHome;
 use crate::{Core, Target};
 
 /// `info`：這份媒體長什麼樣。**本地與上游都答得出大部分**（daemon-runtime §3.1 的 `sync`）。
@@ -118,7 +119,9 @@ impl Core {
         if sync == crate::SyncMode::Local {
             return self.cached_media_info(&account, mxc).await;
         }
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         let (info, description_data) = client.fetch_info(mxc).await?;
         if sync == crate::SyncMode::Both {
             // 把 server 說的寫進 `media` 表（下次 `Local` 就答得出來）。
@@ -245,7 +248,9 @@ impl Core {
         target: &Target,
     ) -> Result<SeekResult, CoreError> {
         let account = self.account_or_current(target)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         let result = client.seek_read(manifest, at, len).await?;
         Ok(SeekResult {
             bytes: result.bytes,
@@ -274,7 +279,9 @@ impl Core {
     ) -> Result<Manifest, CoreError> {
         let account = self.account_or_current(target)?;
         let session = self.session_of(&account)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         let cipher = crate::upload_ops::parse_cipher(request.cipher.as_deref())?;
         let link = match wifi {
             true => Link::WifiOrWired,
@@ -397,7 +404,9 @@ impl Core {
         target: &Target,
     ) -> Result<ServerHello, CoreError> {
         let account = self.account_or_current(target)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         let hello = client.hello(client_name).await?;
         client.ping().await?;
         Ok(ServerHello {
@@ -418,7 +427,9 @@ impl Core {
         target: &Target,
     ) -> Result<UploadStatusReport, CoreError> {
         let account = self.account_or_current(target)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         let status = client.upload_status(upload_id).await?;
         Ok(UploadStatusReport {
             received: status.received,
@@ -443,7 +454,9 @@ impl Core {
         target: &Target,
     ) -> Result<(), CoreError> {
         let account = self.account_or_current(target)?;
-        let mut client = self.client_of(&account, transport).await?;
+        let mut client = self
+            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         client.abort_upload(upload_id).await?;
         if let Some(file) = file {
             crate::upload_ops::remove_resume_state(file)?;

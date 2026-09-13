@@ -18,6 +18,7 @@ use wbf_sdk::{FileCipher, UploadState};
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
+use crate::backend_choice::MethodHome;
 use crate::{Core, Target};
 
 /// 要上傳什麼、怎麼切、怎麼加密。
@@ -119,7 +120,9 @@ impl Core {
             .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?
             .len();
         let session = self.session_of(account)?;
-        let mut client = self.client_of(account, transport).await?;
+        let mut client = self
+            .client_of(account, transport, MethodHome::WbfSdkOnly)
+            .await?;
         let state_path = state_path_for(path);
 
         let (state, from_chunk) = match std::fs::read(&state_path) {

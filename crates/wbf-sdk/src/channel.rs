@@ -41,8 +41,12 @@ pub trait PackChannel {
     ) -> Result<(), SdkError>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
+    /// 🚨 **預設**：沒指定就是這條（維護者 2026-09-13）。⭐ 這個 `Default` 是
+    /// 「沒帶 transport 要用什麼」的**唯一一份答案** —— 🚫 不要在別的層再寫一次，
+    /// 同一個預設有兩個地方決定，遲早只有一邊被改到。
+    #[default]
     WebSocket,
     Http,
 }

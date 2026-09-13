@@ -38,6 +38,7 @@
 //（PR #24 審查 cirno🔴）。
 mod account_ops;
 mod accounts;
+mod backend_choice;
 mod backup_ops;
 pub mod conf;
 mod error;
@@ -63,6 +64,7 @@ use wbf_sdk::Unlock;
 
 pub use account_ops::{AccountStatus, SwitchResult, WhoAmI};
 pub use accounts::AccountSummary;
+pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 use accounts::{AccountDir, DataDirMap};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};
@@ -137,6 +139,27 @@ pub struct Core {
     pub(crate) server_caches: std::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<crate::server_cache::ServerCache>>,
     >,
+    /// **一個帳號一格**：那個帳號探到的 backend（architecture-v2 §6.1）。
+    ///
+    /// ⚠️ 只在記憶體裡，🚫 **不寫進設定檔** —— 「這台是不是 wbf」是 server 那邊的事實，
+    /// 它會變（升級、降級），而寫進檔案的那份不會有人通知你它過期了。
+    /// 📎 現在的作廢時機是 daemon 重開；會話重連時也該重探（階段 7／8 接上會話監督者時，
+    /// 用 [`Core::forget_backend_probe`]）。
+    ///
+    /// 🚨 **key 是帳號目錄，🚫 不是 server 目錄**（PR #33 審查 rumia🔴×2）：探測是拿
+    /// **某一個帳號的 token** 去問的，所以一台 server 共用一格會讓「A 帳號的狀態」
+    /// 變成「server 的事實」—— A 的 token 壞了，B 跟著被降級。⭐ key 就是 identity，
+    /// 那件事在結構上就不可能發生。
+    ///
+    /// 🚨 值是 `OnceCell` 而不是 `BackendKind`：**探測失敗不會留下結論**
+    /// （`get_or_try_init` 出錯時不寫進去，下次重探），而**同一個帳號**同時進來的呼叫
+    /// 共用同一次探測（🚫 不是各開一條 WS）。
+    pub(crate) backends: std::sync::Mutex<
+        std::collections::HashMap<
+            PathBuf,
+            std::sync::Arc<tokio::sync::OnceCell<crate::BackendKind>>,
+        >,
+    >,
 }
 
 impl Core {
@@ -153,6 +176,7 @@ impl Core {
             vault: OnceLock::new(),
             events: EventSink::new(),
             server_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            backends: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

@@ -320,22 +320,84 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 | `room.list`／`room.get` 預設 `local` | ✅ 改好了。⚠️ **CLI 那一側刻意維持舊行為**：`--from-cache` → `Local`，沒帶 → **`Both`**（它本來就是「打上游＋寫穿快取」），🚫 不偷偷改掉它 |
 | 參數叫 `sync`，三個值 | ✅ 改好了（`HistorySource` → `SyncMode`，預設 `Local`） |
 | 帳號列表永遠本地 | ✅ 已經是了 |
-| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🚨 **還沒有這個接縫**：`synced_backend_of` 一律回 matrix-sdk。見下 |
+| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🟡 **一半**：探測與 transport 規則做好了（`backend_choice`），但**房間那條線還沒有 wbf 實作可以分派**。見下 |
 
-🚨 **backend 分派這條線還沒挖**（維護者 2026-09-13 指出）。⚠️ 先把兩個軸分開，它們一直被混用：
+🟡 **backend 這條線挖到一半**（維護者 2026-09-13 定案）。
 
-| | 意思 | 值 |
+🚨 **`transport` 就是選 backend，🚫 不是「wbf 底下再挑一條管子」**：
+
+| `transport` | 協議 | 誰實作 |
 |---|---|---|
-| **backend** | 用哪一套**協議**跟 homeserver 講話 | matrix-sdk（標準 Matrix）／wbf 的 pack 協議 |
-| **transport** | wbf 協議走哪條**管子** | `ws`（預設）／`http`（fallback） |
+| **`ws`**（**沒帶就是它**） | wbf 客製協議 | `wbf-sdk`（`BackendKind::WbfSdk`） |
+| **`http`** | 原生 Matrix HTTP | `matrix-sdk`（`BackendKind::MatrixSdk`） |
 
-🚫 `--transport http` **不是**「退回標準 Matrix」，是「wbf 協議走 HTTP」。這兩個正交。
+🚫 **wbf 協議一律 WS**，底下不再分。pack-over-HTTP 只剩 debug 用途 ——
+⚠️ 這份文件之前把它當成「wbf 的 HTTP 模式」，那是多的一層，拿掉了。
 
-現在房間那條線**只有 matrix-sdk 一條路**（`room.list`／`get`／`history`／`send_text` 都是），
-而 wbf 協議的 `Event` 底下只有 `Recent`／`Send`／`Batch` —— 🚫 **沒有「拿房間歷史」這個 call**，
-所以現在也沒有第二條路可以分派。⭐ server 端正在補這塊 API（維護者 2026-09-13）；
-接上之後 `room.*` 要照 architecture-v2 §6.1 的探測結果分派，**rpc-spec 那一層一個字都不用改**
-—— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
+```text
+http ─────────────────────────> matrix-sdk（永遠）
+ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 不報錯，那是 no-op）
+     ├── 這個 method 還沒有 ws ─> matrix-sdk（🚧 暫時清單）
+     └── 其他 ────────────────> wbf
+```
+
+🚨 **沒帶 `transport` 就是 `ws`**，所以**預設走的就是那條分岔**：對方講 wbf 就用 wbf，
+不講就 **fallback 到 matrix-sdk** —— ⚠️ 兩種都🚫 不報錯。
+📎 那份預設只有一個地方寫著：`Transport::default()`（`wbf-sdk` 的 `channel.rs`）。
+🚫 daemon 的 `Settings` 不再自己寫死一份 —— ⭐ 同一個預設有兩個地方決定，遲早只有一邊被改到。
+
+**已經做好的（`wbf_core::backend_choice`）**：
+
+1. **探測** `Core::get_backend_kind` —— 一個 WS `Hello`，講得出協議版本就是 wbf。
+   ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。
+   一個 server dir 記一格，🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
+   🚨 **session 一換，舊結論就不算數**（PR #33 審查 rumia 第三輪🟡）：探測是拿 session 裡的 token 問的，
+   所以 `Core::forget_backend_probe` 接在**所有動 session 的地方** —— `log_in` 封新 session 之後、
+   `log_out_account`（logout 與 destroy 共用）刪掉之後。🚧 階段 8 的會話監督者重連時也要叫它。
+   ⚠️ 新增任何封／刪／換 session 的路徑都要接上，🚫 不然下一次拿到的是舊 token 探到的答案。
+
+   🚨 **一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
+
+   | 探測結果 | 這次回 | 記住嗎 |
+   |---|---|---|
+   | `Hello` 回了（不管版本認不認得） | 照答案 | ✅ |
+   | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記**（下次重探） |
+
+   ⚠️ **key 是帳號目錄，🚫 不是 server 目錄**。雖然「講不講 wbf」是 server 的性質，
+   但**探測是拿某一個帳號的 token 去問的**。一台 server 共用一格的話，有兩種方式出事：
+
+   - 記下失敗 → A 的 token 過期，同 server 上 token 好的 B **永久**被降級；
+   - 就算不記失敗 → **同時**第一次呼叫時 B 會去等 A 那一次 single-flight，
+     A 失敗 B 也跟著拿到 `MatrixSdk`，🚫 B 從來沒用自己的 token 問過。
+
+   ⭐ 兩個是同一個病：**用 A 的身分回答 B 的問題**。修法🚫 不是在 key 上補 identity，
+   而是讓 key **就是** identity —— 「A 影響 B」在結構上就不可能發生。
+   📎 代價：同 server 的 N 個帳號各探一次。一個帳號一次 WS handshake，而它們本來就各自要開連線。
+
+   作法：註冊表存 `Arc<OnceCell<BackendKind>>`，key 是帳號目錄。`get_or_try_init`
+   **出錯不寫進去**，順便讓**同一個帳號**同時進來的呼叫共用一次探測（🚫 不是各開一條 WS）。
+2. **規則** `get_backend_for(transport, server_speaks_wbf, home)` —— 純函數，所以上面那張表
+   逐格測得到。⚠️ 只有一種情況報錯：那個 feature 只有 wbf 有，而這條路到不了它 ——
+   它就是**關的**，而「因為你選了 http」跟「因為對方不是 wbf」訊息分開講。
+3. **唯一的閘門** `Core::client_of(account, transport, home)` —— 探測＋規則＋開通道都在這裡。
+   底下那半是 `connect_wbf_client`（一律 WS），🚫 只留給閘門自己與探測用
+   （探測不能走閘門，不然它會叫到自己）。
+
+**🚧 那份會縮短的清單**：每個呼叫點自己用 `MethodHome` 說出它住在哪一邊 ——
+🚫 不是一串字串比對（名字跟實際走哪條會漂移）。現在在清單上的是 `room.*`、`account.*`、
+`backup.*`、`recovery.*`；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfOnly`。
+
+**還沒做的**：房間那條線**沒有第二條路可以分派** —— wbf 協議的 `Event` 底下只有
+`Recent`／`Send`／`Batch`，🚫 沒有「拿房間歷史」的定義。⭐ server 端正在補那塊 API
+（維護者 2026-09-13）；補上之後把那幾個呼叫點從 `StillOnMatrixSdk` 改成 `BothSides` 就搬過去了，
+**rpc-spec 那一層一個字都不用改** —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，
+🚫 不是「用哪個協議去問」。
+
+📎 **代價講在前面**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）。
+**探到答案就是每個帳號在一個 daemon 生命週期裡一次**，🚫 不是每個請求一次。
+⚠️ 但**探不到**（一般 homeserver 沒有 WS 端點）那次不會被記住，所以之後每個用到 wbf-only 功能的
+呼叫都會再試一次 handshake。⭐ 可以接受 —— 那些呼叫本來就會失敗（那個功能在那台 server 上是關的），
+而記一個錯的結論會讓**能動的**帳號也不能動。
 
 ⭐ **這是補參數、不是改方向**：上游那條路一行都不會少，只是從「唯一的路」變成「說出來才走的那條」。
 📎 CLI 現在那樣寫沒有錯 —— 它沒有常駐的東西可以依賴，每個命令自己去 sync 是唯一選擇。
