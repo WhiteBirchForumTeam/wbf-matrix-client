@@ -353,19 +353,26 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
    一個 server dir 記一格，🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
    會話重連要重探 —— `Core::forget_backend_probe`，接會話監督者（階段 8）時叫它。
 
-   🚨 **只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴1）：
+   🚨 **一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
 
    | 探測結果 | 這次回 | 記住嗎 |
    |---|---|---|
-   | `Hello` 回了（不管版本認不認得） | 照答案 | ✅ 那是 server 的事實 |
-   | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記** |
+   | `Hello` 回了（不管版本認不認得） | 照答案 | ✅ |
+   | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記**（下次重探） |
 
-   ⚠️ 理由是**快取的 key 是 server dir，但探測是拿某一個帳號的 token 去問的**。
-   🚨 A 帳號 token 過期而把失敗記下來的話，同一台 server 上 token 好的 B 帳號會被
-   **永久降級**，wbf 的功能整個消失 —— ⭐ 那是把「帳號的狀態」寫進了「server 的事實」。
-   📎 成功可以共用（server 對誰都講同一套協議），失敗不行。
-   作法：註冊表存 `Arc<OnceCell<BackendKind>>`，`get_or_try_init` **出錯不寫進去**，
-   順便讓**同時進來的人共用同一次探測**（🚫 不是各開一條 WS）。
+   ⚠️ **key 是帳號目錄，🚫 不是 server 目錄**。雖然「講不講 wbf」是 server 的性質，
+   但**探測是拿某一個帳號的 token 去問的**。一台 server 共用一格的話，有兩種方式出事：
+
+   - 記下失敗 → A 的 token 過期，同 server 上 token 好的 B **永久**被降級；
+   - 就算不記失敗 → **同時**第一次呼叫時 B 會去等 A 那一次 single-flight，
+     A 失敗 B 也跟著拿到 `MatrixSdk`，🚫 B 從來沒用自己的 token 問過。
+
+   ⭐ 兩個是同一個病：**用 A 的身分回答 B 的問題**。修法🚫 不是在 key 上補 identity，
+   而是讓 key **就是** identity —— 「A 影響 B」在結構上就不可能發生。
+   📎 代價：同 server 的 N 個帳號各探一次。一個帳號一次 WS handshake，而它們本來就各自要開連線。
+
+   作法：註冊表存 `Arc<OnceCell<BackendKind>>`，key 是帳號目錄。`get_or_try_init`
+   **出錯不寫進去**，順便讓**同一個帳號**同時進來的呼叫共用一次探測（🚫 不是各開一條 WS）。
 2. **規則** `get_backend_for(transport, server_speaks_wbf, home)` —— 純函數，所以上面那張表
    逐格測得到。⚠️ 只有一種情況報錯：那個 feature 只有 wbf 有，而這條路到不了它 ——
    它就是**關的**，而「因為你選了 http」跟「因為對方不是 wbf」訊息分開講。
@@ -384,7 +391,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 🚫 不是「用哪個協議去問」。
 
 📎 **代價講在前面**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）。
-**探到答案就是一個 daemon 生命週期一次**，🚫 不是每個請求一次。
+**探到答案就是每個帳號在一個 daemon 生命週期裡一次**，🚫 不是每個請求一次。
 ⚠️ 但**探不到**（一般 homeserver 沒有 WS 端點）那次不會被記住，所以之後每個用到 wbf-only 功能的
 呼叫都會再試一次 handshake。⭐ 可以接受 —— 那些呼叫本來就會失敗（那個功能在那台 server 上是關的），
 而記一個錯的結論會讓**能動的**帳號也不能動。

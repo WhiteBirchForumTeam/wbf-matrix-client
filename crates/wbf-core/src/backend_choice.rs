@@ -130,29 +130,36 @@ impl crate::Core {
     /// 🚫 不壞在「以為對方懂我們的協議」。所以這個函數**不回 `Err`**：探測失敗不是錯誤，
     /// 是一個答案。
     ///
-    /// 🚨 **只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴1）：
+    /// 🚨 **一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
     ///
     /// | 探測結果 | 這次回 | 記住嗎 |
     /// |---|---|---|
-    /// | `Hello` 回了、版本認得 | `WbfSdk` | ✅ 那是 server 的事實 |
-    /// | `Hello` 回了、版本不認得 | `MatrixSdk` | ✅ 同上 |
-    /// | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記** |
+    /// | `Hello` 回了、版本認得 | `WbfSdk` | ✅ |
+    /// | `Hello` 回了、版本不認得 | `MatrixSdk` | ✅ |
+    /// | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記**（下次重探） |
     ///
-    /// ⚠️ 為什麼失敗不能記：這個快取的 key 是 **server dir**（一台 server 一格，因為
-    /// 「講不講 wbf」是 server 的性質），但探測是**拿某一個帳號的 token 去問的**。
-    /// 🚨 所以 A 帳號的 token 過期，如果把失敗記下來，同一台 server 上 token 好的 B 帳號
-    /// 會被**永久降級**成 `MatrixSdk`，wbf 的功能整個消失 —— ⭐ 那是把「帳號的狀態」
-    /// 寫進了「server 的事實」。📎 成功可以共用（server 對誰都講同一套協議），失敗不行。
+    /// ⚠️ **key 是帳號目錄，🚫 不是 server 目錄** —— 雖然「講不講 wbf」是 server 的性質，
+    /// 但**探測是拿某一個帳號的 token 去問的**，所以一格共用會讓「A 帳號的狀態」變成
+    /// 「server 的事實」：
     ///
-    /// 📎 代價：對一般 homeserver，每次用到 wbf-only 的功能都會再試一次 WS handshake。
-    /// ⭐ 可以接受 —— 那些呼叫本來就會失敗（那個功能在那台 server 上是關的），
-    /// 而多記一個錯的結論會讓**能動的**帳號也不能動。
+    /// - 記下失敗 → A 的 token 過期，同 server 上 token 好的 B **永久**被降級；
+    /// - 就算不記失敗，**同時**第一次呼叫時 B 會等 A 那一次 single-flight，
+    ///   A 失敗 B 也跟著拿到 `MatrixSdk` —— 🚫 B 從來沒用自己的 token 問過。
     ///
-    /// ⚠️ 一個 server dir 一個 [`tokio::sync::OnceCell`]，所以**同時進來的人共用同一次探測**，
+    /// ⭐ 兩個都是同一個病：**用 A 的身分回答 B 的問題**。所以不是在 key 上補 identity，
+    /// 而是讓 key **就是** identity —— 這樣「A 影響 B」在結構上不可能發生。
+    /// 📎 代價是同 server 的 N 個帳號各探一次（一個 daemon 生命週期 N 次 `Hello`）——
+    /// 一個帳號一次 WS handshake，⭐ 而它們本來就各自要開自己的連線。
+    ///
+    /// 📎 另一個代價：對一般 homeserver，每次用到 wbf-only 的功能都會再試一次 handshake
+    /// （失敗不記）。⭐ 可以接受 —— 那些呼叫本來就會失敗（那個功能在那台 server 上是關的），
+    /// 而記一個錯的結論會讓**能動的**帳號也不能動。
+    ///
+    /// ⚠️ 一個帳號一個 [`tokio::sync::OnceCell`]，所以**同一個帳號**同時進來的呼叫共用一次探測，
     /// 🚫 不是各探一次（審查 rumia🟡2）。只在記憶體裡，🚫 不寫進磁碟。
     ///
     /// Args:
-    ///     account: 哪個帳號（它決定 server dir，也決定拿誰的 token 去問）
+    ///     account: 哪個帳號 —— 它同時是**快取的 key** 與**拿誰的 token 去問**
     /// Return:
     ///     BackendKind  WbfSdk ＝ `Hello` 通了；MatrixSdk ＝ 其他所有情況
     pub async fn get_backend_kind(&self, account: &crate::accounts::AccountDir) -> BackendKind {
@@ -160,7 +167,8 @@ impl crate::Core {
             .backends
             .lock()
             .expect("the backend registry is never poisoned")
-            .entry(account.server_dir())
+            // 🚨 key 是**帳號**目錄：拿誰的 token 問，就記在誰名下。
+            .entry(account.dir.clone())
             .or_default()
             .clone();
         // ⭐ `get_or_try_init` 的兩個性質正好是要的：**失敗不寫進去**（所以下次會重探），
@@ -190,11 +198,24 @@ impl crate::Core {
         }
     }
 
-    /// 註冊表**現在記住了什麼**。⚠️ 只給測試用：唯一能分辨「記住了」與「只是回了一次」
+    /// 註冊表現在有幾格。⚠️ 只給測試用：「一個帳號一格」是這支修法的核心，
+    /// 而**格數**是唯一看得出它的地方 —— 共用一格就表示某個帳號在等別人用別人的 token 問。
+    ///
+    /// Return:
+    ///     usize  探過（或正在探）的帳號數
+    #[cfg(test)]
+    pub(crate) fn count_probe_cells(&self) -> usize {
+        self.backends
+            .lock()
+            .expect("the backend registry is never poisoned")
+            .len()
+    }
+
+    /// 這個帳號**現在記住了什麼**。⚠️ 只給測試用：唯一能分辨「記住了」與「只是回了一次」
     /// 的方式就是問它 —— 而那個分辨正是 rumia🔴1 要的（PR #33）。
     ///
     /// Args:
-    ///     account: 哪個帳號（它決定 server dir）
+    ///     account: 哪個帳號（它就是 key）
     /// Return:
     ///     Some(BackendKind)  探過而且 server 回答過
     ///     None               沒探過，或探了但**失敗**（🚫 失敗不留下結論）
@@ -206,7 +227,7 @@ impl crate::Core {
         self.backends
             .lock()
             .expect("the backend registry is never poisoned")
-            .get(&account.server_dir())
+            .get(&account.dir)
             .and_then(|cell| cell.get().copied())
     }
 
@@ -220,7 +241,7 @@ impl crate::Core {
         self.backends
             .lock()
             .expect("the backend registry is never poisoned")
-            .remove(&account.server_dir())
+            .remove(&account.dir)
             .is_some()
     }
 
@@ -394,6 +415,81 @@ mod tests {
         assert_eq!(core.get_remembered_backend(&account), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 **同一台 server 的兩個帳號，同時第一次呼叫 —— 各探各的**
+    /// （PR #33 審查 rumia 第二輪🔴）。
+    ///
+    /// ⚠️ 為什麼這條要存在：single-flight 如果 key 在 **server** 上，B 會去**等 A 那一次**，
+    /// 而那一次用的是 **A 的 token**。A 的 token 壞掉，B 就跟著被判成 `MatrixSdk`
+    /// —— 🚫 B 從頭到尾沒用自己的 token 問過。⭐ key 換成帳號之後，那件事在結構上不可能發生。
+    ///
+    /// 📎 「B 用自己的 token 成功」那半需要一台假的 wbf server，還沒有。所以這裡斷言的是
+    /// **結構事實**：兩個帳號 ⇒ 註冊表兩格 ⇒ 兩次獨立的探測。
+    /// ⚠️ 這條在「key 是 server dir」的舊寫法上會紅（那時只有一格）。
+    #[tokio::test]
+    async fn two_accounts_on_one_server_probe_separately_instead_of_sharing_one() {
+        let dir = scratch("two-accounts");
+        let core = unlocked(&dir);
+        let key = core.vault().unwrap().account_dir_key();
+        let accounts: Vec<_> = ["@a:dead", "@b:dead"]
+            .into_iter()
+            .map(|user| {
+                let account =
+                    crate::accounts::AccountDir::locate(&dir, &key, DEAD, user).unwrap();
+                std::fs::create_dir_all(&account.dir).unwrap();
+                seal_dead_session(&core, &account, user);
+                account
+            })
+            .collect();
+        assert_eq!(
+            accounts[0].server_dir(),
+            accounts[1].server_dir(),
+            "前提：兩個帳號在同一台 server 上"
+        );
+
+        // 同時第一次呼叫。
+        let (first, second) = tokio::join!(
+            core.get_backend_kind(&accounts[0]),
+            core.get_backend_kind(&accounts[1])
+        );
+        assert_eq!((first, second), (BackendKind::MatrixSdk, BackendKind::MatrixSdk));
+
+        assert_eq!(
+            core.count_probe_cells(),
+            2,
+            "🚨 一個帳號一格——共用一格就表示 B 是在等 A 用 A 的 token 問"
+        );
+        for account in &accounts {
+            assert_eq!(
+                core.get_remembered_backend(account),
+                None,
+                "🚫 失敗不留下結論"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把一個「指向沒人在聽的位址」的 session 封進這個帳號。
+    fn seal_dead_session(
+        core: &crate::Core,
+        account: &crate::accounts::AccountDir,
+        user: &str,
+    ) {
+        core.vault()
+            .unwrap()
+            .seal_session(
+                &account.session_path(),
+                &wbf_sdk::login::Session {
+                    server: DEAD.to_string(),
+                    user_id: user.to_string(),
+                    device_id: "DEV".to_string(),
+                    access_token: "syt_nobody_is_listening".to_string(),
+                    store_dir: None,
+                },
+            )
+            .unwrap();
     }
 
     /// ⚠️ 上面那條驗的是**失敗**那半（那是真的跑我們的 code）。成功那半沒有假的 wbf server
