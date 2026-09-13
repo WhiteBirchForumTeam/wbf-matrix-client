@@ -341,9 +341,11 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - 推播**要先 `subscribe`**（§4.6）。`progress` 例外：**發出長工作的那條連線自動收到自己請求的 `progress`**，不必訂——不然每個前端都要多寫一步。
 - 推播是「不用輪詢」，🚫 不是「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
   🚨 **但掉了一定要發 `desync`**：不講的話 UI 永遠不會去重查（它以為自己收齊了）。
-- ⚠️ **`progress` 要在源頭節流**（每 100 ms 或每 1%，最後一則一定發），而且跟房間事件**不走同一條佇列**
-  —— 不然一個大檔上傳會把 `room.message` 擠掉（daemon-runtime §5.4；跟 architecture-v2 §6.1.1
-  對上游連線立的是同一條規矩）。
+- 🚨 **媒體的進度🚫 不走這裡**（維護者 2026-09-13）：UI 的上傳／下載是**資料平面的 HTTP**（§6），
+  進度就是那個 HTTP 傳輸自己的進度。⭐ 所以 RPC 通道上🚫 沒有 bytes、🚫 沒有每塊一則的進度，
+  它基本上永遠是暢通的。
+  📎 `progress` 只給**daemon 自己在跑的長工作**：路徑版的 `room.send_file`／`upload.file`／
+  `media.save_to`（daemon 讀本機檔，UI 沒有 HTTP 可看）、`sync.recent`、`backup.*`——都是低頻的。
 - ⚠️ core 現在的 `CoreEvent::Progress` 是一句字串，`room.message` 對得上 `CoreEvent::Message`；
   `sync.state` 與結構化的 `progress` 是 **core 要補的 variant**（daemon PR 順手做，🚫 不在 daemon 裡 parse 那句字串）。
 
@@ -410,6 +412,16 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `502` | 從 server 拉塊失敗（快取沒有、server 又拿不到）。⚠️ 半途失敗時 HTTP 已經回 200 了，只能斷連線——這跟 `seek` 的「stdout 已印出去的不收回」是同一件事 |
 
 daemon 邊解密邊吐（媒體池 64 KiB 段各自 AEAD），🚫 不整檔進記憶體。同一個 token 可以重複 GET（播放器 seek）。
+
+🚨 **上游慢下來的時候：停止送 bytes，但連線開著**（維護者 2026-09-13 定）。
+homeserver 給不出下一塊，daemon 就**卡在那裡**，等拿到了再繼續吐。
+
+- 🚫 **不要回一個空回應**（UI 會以為「傳完了」）、🚫 **不要斷線**（UI 會以為「失敗了」）——
+  事實是「還在等」，而 HTTP 表達「還在等」的方式就是**不送資料但不關連線**。
+- ⭐ **這也是進度的來源**：UI 的下載進度就是它那個 GET 收到多少 bytes，
+  🚫 不是 daemon 從 RPC 推回去的數字（§4）。上傳同理 —— 進度是它那個 PUT 送出去多少。
+- ⚠️ 真的失敗（`502`）跟「慢」要分得開：**拿不到**才斷，**還在拿**就等。
+  🚫 不要把逾時設得比 homeserver 的慢速還短，那會把「慢」誤判成「壞」。
 
 ### 6.2 寫：`PUT /upload/<token>`
 
