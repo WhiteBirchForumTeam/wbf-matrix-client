@@ -96,7 +96,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    ⚠️ 閘門的 principal 迴歸：`account switch @alice`（有 recovery key）後 `account del @bob:localhost`（沒有）**必須被擋** —— 擋不住就是又用了 current 的狀態（PR #19 審查 rumia／salvia 🔴1）。
    ⚠️ data dir 用短路徑（例如 `C:/Users/<you>/AppData/Local/Temp/wt`）：加密過的目錄名很長，scratchpad 那種深路徑在 Windows 會撞 MAX_PATH（餘裕算法見 local-cache-db §11.4.1）。
 9. 多帳號混存（兩個帳號 alice、bob，同一個 `--data-dir`）。（PR #19 起是 `account` 一族：`account status`／`switch`／`del`／`destroy`；下面的舊命令名要照著換）：alice `login` → 建只有 alice 的房 A 與邀 bob 的房 C，各送幾則 → `recent` → bob `login`（alice 不 logout）→ `accounts` 兩個、current 是 bob → `rooms` 只有 C → `read A --from-cache` 0 則、`read C --from-cache` 0 則（bob 還沒親自拿過）→ `recent` → `read C --from-cache` 有了，而且 alice 解過的那幾則是明文 → `--account alice read A --from-cache` 仍有 → alice `logout`（`cache.db` 還在）→ bob `logout`（`cache.db` 被刪）。`forget-account @alice:localhost --yes` 後 alice 的 `--from-cache` 全空、bob 的不受影響。2026-09-07 跑過一次全對。
-7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms`（走 ticket，不問）→ `lock` → `rooms`（問 passphrase；非互動就 exit 1）→ `remove-passphrase` → `rooms`（不問）。
+7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms --passphrase-file pw`（過）→ `rooms`（**問 passphrase**；非互動就 exit 1）→ `remove-passphrase --passphrase-file pw` → `rooms`（不問）。⚠️ 2026-09-13 起**每個命令都要 passphrase**：`unlock.ticket` 與 `lock` 都沒了（CLI 規格 §7.1）。
 6. 測完 `taskkill //F //IM <複本名>.exe`。
 
 ## 5. 坑（都踩過）
@@ -162,11 +162,13 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    已由 wbfuwunel PR #43 實作（`0x16 Device`，權威在那邊的 `wbf-to-device.md`）。
    還沒做的三塊，**建議順序**：
    1. ✅ **`rpc-spec.md`**（2026-09-12 第一版）：method 表、code 表（`CoreErrorKind` 配號在 §5.2）、推播、資料平面。
-      §8 列了 daemon PR 要順手補進 core 的五樣（`lock`、建檔與送事件拆開、`PoolReader` 接 Range、
-      結構化事件、配號）。
+      §8 列了 daemon PR 要順手補進 core 的四樣（建檔與送事件拆開、`PoolReader` 接 Range、
+      結構化事件、配號）。📎 本來還有第五樣 `Core::lock()`，2026-09-13 連 `vault.lock` 一起取消了
+      （rpc-spec §3.1：daemon 沒有「鎖上」這個 feature，真正的 lock 是 `daemon.shutdown`）。
    2. 🔁 **`crates/wbf-daemon`**：第一塊（#30）pack、訊息、hello、連線狀態機、WS listener、`-s`；
       第二塊全部有 core 對應的 method（帳號／房間／上傳／媒體／備份／sync.recent）與 conf 搬進 daemon。
       還沒：推播與 cancel（要 core 的結構化事件）、資料平面 HTTP（media.open／create、send_attachment）、單發命令列。
+      📎 起手式是 `vault.create`（fresh 資料目錄）：🚫 `account.add` 不替前端建 vault（rpc-spec §3.1）。
       原定義：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
    3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。

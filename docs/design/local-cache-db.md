@@ -109,9 +109,9 @@ local.key（0600）
 - 包主金鑰與封 session 都帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。
 - 多一個 `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問 passphrase，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
 - `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空字串 passphrase 在這裡被拒。
-- `Vault::from_master(dir, master, mode)` 給 CLI 的 ticket 用；它不驗證主金鑰是不是這個目錄的，信任等於 `Plain`。
+- `Vault::from_master(dir, master, mode)` 只給 `set_passphrase` 重包 `local.key` 用（同一個目錄、同一把主金鑰）；⚠️ 它不驗證那把金鑰是不是這個目錄的，所以🚫 除此之外不要拿它做別的事。
 - 第四把子金鑰 `media store v1` 已經導出來（`media_store_key`），還沒有人用；先把 context 字串一次定完。
-- 寫 `local.key`／`session.sealed`／ticket 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
+- 寫 `local.key`／`session.sealed` 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
 - 既有的 store 用別把金鑰開會失敗：訊息叫人刪 `matrix/` 重新 `login`，不遷移（§1 的政策）。
   ⚠️ 這裡原本寫的理由是「store 只是裝置狀態」——**那句話對 `crypto.db` 是錯的**，它裝著解開全部歷史的房間金鑰。
   政策本身維護者 2026-09-09 決定不改，但它站得住的前提是 §10 的本地金鑰池（不跟著被刪、`key-backup import` 讀得回來）。
