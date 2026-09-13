@@ -1,6 +1,6 @@
 # 交接：現在在哪、怎麼跑、下一步
 
-> 給下一個接手的人（人或 agent）。2026-09-06 寫、2026-09-12 更新，每次交接更新。設計理由不在這裡，在 `docs/design/`；這裡只講**現況、怎麼跑、坑、下一步**。
+> 給下一個接手的人（人或 agent）。2026-09-06 寫、2026-09-14 更新，每次交接更新。設計理由不在這裡，在 `docs/design/`；這裡只講**現況、怎麼跑、坑、下一步**。
 
 ## 1. 現況一句話
 
@@ -10,7 +10,10 @@
 PR #19 做完資料目錄的兩層路徑加密、`account` 一族與房間金鑰備份；PR #20 定了架構 v2 的形狀。
 **架構 v2 的第一塊落地了**：命令的「做什麼」全部搬進 `crates/wbf-core`（#24），
 `apps/wbf-cli` 只剩「解析參數 → 叫一個 core 方法 → 印 JSON」。
-PR #1–#24 全部合併。**沒有 UI、還沒有 daemon、還沒有 RPC。**
+**架構 v2 的 daemon 也落地了**：`crates/wbf-daemon` 有加密的 RPC、資料目錄獨佔、token 生命週期，
+全部有 core 對應的 method 都接上了（#30、#31）。daemon 執行期前三階段（#32：事件帶 `user`／`job`、
+`cache.db` 單一寫入者、`sync=local|server|both`）與 backend 接縫（#33：`transport` 就是選 backend、探測決定用哪一套）也合了。
+PR #1–#34 全部合併。**還沒有 UI、推播／訂閱／cancel、資料平面 HTTP、單發命令列。**
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -19,7 +22,7 @@ PR #1–#24 全部合併。**沒有 UI、還沒有 daemon、還沒有 RPC。**
 | 1 | [`README.md`](../README.md) | 佈局、狀態表、怎麼跑測試、貢獻規則 |
 | 1.5 | [`design/architecture-v2.md`](design/architecture-v2.md) | **daemon／RPC／四個前端的分層**（維護者 2026-09-09 定的方向）。要動介面之前先看這份 |
 | 1.55 | [`design/rpc-spec.md`](design/rpc-spec.md) | **草案**——前端 ↔ daemon 的逐條訊息：method 表、`params`／`result`、code 表（`CoreErrorKind` 的號碼在這）、推播、資料平面的 HTTP。2026-09-12 第一版；§10 每個 method 的現況（判準：走我們自己的 WS 才算做完） |
-| 1.57 | [`design/daemon-runtime.md`](design/daemon-runtime.md) | **草案**——daemon 跑起來之後：多帳號怎麼落到 `cache.db`（§2 **一個 server 一個寫入者**，現況會撞鎖）、UI 的每個動作走本地讀還是上游拉（§3，含**三條跟現況不符、要改的**）、事件扇出與 `user` 規則（§5）、通知為什麼不在 rpc-spec（§7）、`job` 與 `cancel`。§11 分階段 |
+| 1.57 | [`design/daemon-runtime.md`](design/daemon-runtime.md) | daemon 跑起來之後：多帳號怎麼落到 `cache.db`（§2 **一個 server 一個寫入者**，#32 做了）、UI 的每個動作走本地讀還是上游拉（§3 `sync` 參數；§3.5 **backend 與 transport**，#33）、事件扇出與 `user` 規則（§5）、通知為什麼不在 rpc-spec（§7）、`job` 與 `cancel`。**§11 九階段**：1–3 ✅，4–9 還沒 |
 | 1.6 | [`design/to-device-client.md`](design/to-device-client.md) | **client 端怎麼接 `0x16 Device`**（to-device：金鑰、驗證、SSSS）。⚠️ 線上格式的權威在 wbfuwunel 的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`，這份只寫我們最容易寫錯的地方與待辦 |
 | 2 | [`design/plan-v1.md`](design/plan-v1.md) | 範圍、順序、進度；**§7.1**（本地不存）與 **§7.2**（耦合方向：上游 SDK 是可拆的零件）是所有程式的前提 |
 | 3 | [`design/wbf-client-convention-for-chunk.md`](design/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、seek；**§5.2 送事件要宣告附件**（等 server 定案） |
@@ -49,8 +52,14 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
   error.rs               `CoreError { kind, message }`、`CoreErrorKind`、`rpc_code()`（rpc-spec §5.2 的號碼）
   conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
-  event.rs               `CoreEvent` 與 broadcast channel。🚫 core 不印任何東西
-  handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate
+  event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
+  job.rs                 「現在跑的是哪個請求」：tokio task-local，讓事件說得出屬於誰。⚠️ 不跟著 `tokio::spawn`（有測試釘住）
+  server_cache.rs        `cache.db` 的**單一寫入者**：一個 server dir 一條 OS 執行緒＋無上限 queue；`post`（commit 之後才發事件）／
+                         `run`（等它落地）＋一條重用的讀連線。⚠️ 媒體那幾條是刻意的例外（daemon-runtime §2.3.1）
+  backend_choice.rs      `transport` → backend：`ws`＝wbf-sdk、`http`＝matrix-sdk。探測 `get_backend_kind`（key 是**帳號**、
+                         只記 server 回答過的）、規則 `get_backend_for`、閘門 `client_of`、`MethodHome` 暫時清單
+  handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate。
+                         `server_cache_of` 的註冊表鎖握滿「查、開、放」整段（#32：放掉會 `database is locked`）
   accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部
   *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
                          ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、可序列化的型別、事件走 channel、
@@ -66,7 +75,9 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
                          全局能力（起手 false，要寫才拿；`call()` 是唯一檢查點）
   settings.rs            從 wbf.conf 讀 SERVER_BACKUP／LOCAL_ROOM_KEYS／TRANSPORT（解析在 wbf_core::conf，跟 CLI 共用）
   server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
-  main.rs                只有 `-s`（讀 daemon.token、conf、寫 daemon.json）；單發命令、資料平面還沒有
+  token.rs               token 檔的三遍覆蓋抹除（隨機 → 0xFF → 0x00 → 刪）與權限檢查；⚠️ daemon 預設不動 token，誰起的誰動
+  main.rs                `-s` 常駐（先拿寫權、讀 token 與 conf、寫 daemon.json）。沒有 `-s` ＝單發，⚠️ **還沒實作**（會報錯講清楚）；
+                         兩個都帶也報錯。資料平面還沒有
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
   tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、
                          token 檔 daemon 不動、shutdown 之後程序結束並收走 daemon.json
@@ -153,12 +164,22 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 | ~~房間金鑰沒有任何備份~~ | ✅ PR #19 做了：server 端標準 backup、本地全量快照、`logout` 的兩關閘門、`r/` 獨立保管 | — |
 | `Session/*`（WS 上的 Login／Refresh／Logout）只加了 wire 常數 | client 登入仍走 HTTP `/login` 加 matrix-sdk | 沒影響；要把登入搬到 WS 時再做 |
 | 斷線後 `recent` 不自動續 | 命令 exit、下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪；UI 那版做自動從最後的 `ls` 續 |
+| **房間歷史只有 matrix-sdk 那條路** | wbf 的房間歷史＝ wbfuwunel **PR #51**（`Event/Recent` 點名房間＋`before`），還 open | `room.*` 標 `MethodHome::StillOnMatrixSdk`；`sync=both` 不收 `before`（權宜守門 `before_for_upstream_page`）。⚠️ #51 翻頁用 **`g_seq`**，接上時 `before` 的座標要從 `r_seq` 換成 `g_seq` |
+| **沒有假的 wbf server 可以在 core 層測「成功」路徑** | 還沒做 | 探測成功、`watch`、`log_in` 的探測接點都只有 `--ignored` 的真 server 測試走得到。#32／#33 的審查每一輪都碰到這個缺口 |
 
 ## 7. 下一步（維護者 2026-09-06 同意的順序，2026-09-10 更新）
 
 做完的（都合併了）：資料目錄兩層路徑加密＋`account` 一族＋房間金鑰備份（#19，設計在 #18）、架構 v2 的形狀（#20）、vault 與金鑰（#11）、`cache.db` 多帳號混存（#13；rusqlite 0.40 與 matrix-sdk 合得來，代價是 Windows 要 Strawberry Perl，local-cache-db §3）、媒體儲存池（#14）、`recent` 改成拉窗＋`Event/Batch` 串流與三層分工 `RecentPlan { max_events, window, batch }`（#16，issue #15）。
 
 還沒做的：
+
+📍 **2026-09-14 的建議順序**（下面 0–6 是更早的清單，保留當歷史）：
+
+1. **假的 wbf server 測試工具** —— 不用等任何人，而且下一項一定要有它（見 §6 最後一列）。
+2. **房間歷史改走 wbf**（wbfuwunel #51 合併後才合）：sdk `RecentRequest` 加 `rooms` → core 加 wbf 那條路 →
+   `room.history` 從 `StillOnMatrixSdk` 改 `BothSides` → 拿掉 `before_for_upstream_page` → 翻頁座標換成 `g_seq`。
+   可以像當初 #47 那樣先對 #51 的分支編 server 開工，合併後重抄向量檔。
+3. **階段 4 訂閱／推播** —— 先跟維護者討論。
 
 0. ✅ **房間金鑰備份與周邊**（維護者 2026-09-09 提；2026-09-10 全部做完）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10。
    ✅ **PR #19 合併了大半**：兩層路徑加密、`account` 一族、CLI 輸出英文、金鑰備份（server 端 backup、本地全量快照、`key-backup` 六個子命令（status／upload／save／import／restore／recovery）、`logout` 的兩關閘門、`r/` 獨立保管與 `recovery list`／`show`）。
@@ -178,8 +199,12 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
       結構化事件、配號）。📎 本來還有第五樣 `Core::lock()`，2026-09-13 連 `vault.lock` 一起取消了
       （rpc-spec §3.1：daemon 沒有「鎖上」這個 feature，真正的 lock 是 `daemon.shutdown`）。
    2. 🔁 **`crates/wbf-daemon`**：第一塊（#30）pack、訊息、hello、連線狀態機、WS listener、`-s`；
-      第二塊全部有 core 對應的 method（帳號／房間／上傳／媒體／備份／sync.recent）與 conf 搬進 daemon。
-      還沒：推播與 cancel（要 core 的結構化事件）、資料平面 HTTP（media.open／create、send_attachment）、單發命令列。
+      第二塊（#31）全部有 core 對應的 method 與 conf 搬進 daemon，外加寫權能力、token 五步、`vault.create`。
+      **執行期（daemon-runtime §11）**：階段 1–3 ✅（#32）、backend 接縫 ✅（#33）。
+      還沒：**階段 4 訂閱／推播**（⚠️ 維護者要先討論；wbfuwunel #51 也改了 `Subscribe` 補窗的語意）、
+      5 `cancel`、6 sdk 的 `0x04/05/06` codec、7 上游會話、8 監督者、9 已讀三層；
+      資料平面 HTTP（media.open／create、send_attachment）、單發命令列。
+      ⏳ 懸著等維護者：`media.db` 拆檔（維護者說「等要做的時候再討論，這點我有一些想說清楚」）。
       📎 起手式是 `vault.create`（fresh 資料目錄）：🚫 `account.add` 不替前端建 vault（rpc-spec §3.1）。
       原定義：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
       `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
