@@ -111,7 +111,7 @@ pub struct Message {
     pub g_seq: Option<i64>,
 }
 
-/// `history` 的一頁：`next` 是 None 表示到頭了（CLI 規格 §3.4.1）。
+/// `history` 的一頁：`next` 是這一頁最舊那則的 `event_id`；None 表示到頭了（CLI 規格 §3.4.1）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
     pub events: Vec<Message>,
@@ -151,6 +151,9 @@ pub trait ChatBackend {
     async fn conversation(&self, id: &str) -> Result<Conversation, SdkError>;
 
     /// 歷史，從最新往回；`before` 接上一頁的 `next`。過濾在呼叫者端（CLI 規格 §3.4.1）。
+    ///
+    /// 🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token ——
+    /// UI 不分 server 是誰，一律拿手上最舊那則往回問（chat-model §4.3、rpc-spec §3.3）。
     async fn history(&self, id: &str, before: Option<&str>, limit: u32) -> Result<Page, SdkError>;
 
     /// Return:

@@ -200,7 +200,7 @@ impl<C: PackChannel> WbfClient<C> {
     /// 每個 Batch 交給 `on_batch`（新到舊）；`Hello.features` 有 `recent` 才能用。
     ///
     /// Args:
-    ///     request: example: RecentRequest { limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
+    ///     request: example: RecentRequest { rooms: None, limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
     ///     per_pack_timeout: 兩個 Batch 之間最多等多久（第一窗 60 秒、之後 10 秒是 `recent_sync` 的約定）
     /// Return:
     ///     Ok(RecentWindow)   這窗的 `tc`、幾個 Batch、第一個 Batch 的 `fs`、最後一個的 `ls`
@@ -310,6 +310,7 @@ impl<C: PackChannel> WbfClient<C> {
         let window = window.clamp(1, max_limit);
         let batch = batch.map(|batch| batch.clamp(1, max_batch));
         let mut request = RecentRequest {
+            rooms: None,
             limit: window,
             cg_seq: cg_seq.filter(|seq| *seq > 0),
             before: None,

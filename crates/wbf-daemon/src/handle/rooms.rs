@@ -138,8 +138,7 @@ struct PageParams {
     limit: u32,
     #[serde(default)]
     before: Option<String>,
-    /// 沒帶就是 `local`（rpc-spec §2）。⚠️ `local` 時 `before` 是 `r_seq` 的數字，
-    /// 打上游時才是 server 的翻頁 token。
+    /// 沒帶就是 `local`（rpc-spec §2）。📎 `before` 三種 `sync` 都是 `event_id`（上一頁的 `next`）。
     #[serde(default)]
     sync: SyncMode,
     #[serde(flatten)]

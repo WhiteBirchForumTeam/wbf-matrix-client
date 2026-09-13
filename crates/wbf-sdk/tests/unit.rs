@@ -254,6 +254,7 @@ fn event_recent_and_batch_match_server_vectors() {
         (
             "recent_first_start",
             RecentRequest {
+                rooms: None,
                 limit: 2,
                 cg_seq: None,
                 before: None,
@@ -263,6 +264,7 @@ fn event_recent_and_batch_match_server_vectors() {
         (
             "recent_with_cached_g_seq",
             RecentRequest {
+                rooms: None,
                 limit: 320,
                 cg_seq: Some(4700),
                 before: None,
@@ -272,6 +274,7 @@ fn event_recent_and_batch_match_server_vectors() {
         (
             "recent_next_window",
             RecentRequest {
+                rooms: None,
                 limit: 320,
                 cg_seq: Some(4700),
                 before: Some(4711),
@@ -289,6 +292,31 @@ fn event_recent_and_batch_match_server_vectors() {
             "{name} bytes"
         );
     }
+
+    // 點名一個房間的歷史（wbfuwunel #51）。
+    // ⚠️ 這一筆**比語意、不比 byte**：server 的向量是手寫的 JSON 字串，這筆的 key 順序是
+    // `rooms, before, limit, batch`，而上面三筆是 `limit, cg_seq, before, batch` —— 一個 struct 的
+    // 序列化順序只能有一種，兩邊不可能同時逐 byte 對上。server 用 JSON 解析、不看順序，所以
+    // 線上是相容的；🚫 但不要因此把上面三筆也改成比語意 —— 它們對得上，就該繼續逐 byte 釘住。
+    let vector = pack_named("recent_one_room_history");
+    let ours = protocol::recent(
+        &RecentRequest {
+            rooms: Some(vec!["!r:localhost".to_string()]),
+            limit: 50,
+            cg_seq: None,
+            before: Some(4711),
+            batch: Some(10),
+        },
+        vector.id,
+        vector.seq,
+    );
+    let meta_of = |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
+    assert_eq!(meta_of(&ours), meta_of(&vector), "recent_one_room_history meta");
+    assert_eq!(
+        (ours.kind, ours.subtype, ours.flags, ours.id, ours.seq, &ours.data),
+        (vector.kind, vector.subtype, vector.flags, vector.id, vector.seq, &vector.data),
+        "recent_one_room_history 其他欄位逐一相等"
+    );
 
     // 一窗兩個 Batch：seq 0 的 r = 1，seq 1 的 r = 0；id 都抄請求的 10。
     let request = pack_named("recent_first_start");

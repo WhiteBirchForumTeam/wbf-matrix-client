@@ -290,6 +290,12 @@ pub const RECENT_MAX_BATCH: u32 = 100;
 /// `Event/Recent` 的請求 meta：**一窗**。欄位順序就是線上的 JSON 順序（向量檔逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RecentRequest {
+    /// 只讀這幾個房間；`None` ＝ 每個加入的房（wbfuwunel #51）。⭐ **一個房 ＋ `before` 就是那個房的歷史**。
+    /// ⚠️ 點名一個自己不在的房，整個請求回 `Forbidden`；`Some(vec![])` 是問零個房、拿空窗。
+    /// 📎 放在第一個欄位只是為了讓既有三筆向量的 byte 順序不變（`limit` 仍在 `cg_seq` 前面）；
+    /// server 用 JSON 解析，🚫 不看順序。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rooms: Option<Vec<String>>,
     /// 這一窗最多幾則；server 的 `wbf_recent_max_limit`（預設 500）以上會被 clamp，所以 client 也先 clamp（不然算不出「窗滿了沒」）。
     pub limit: u32,
     /// client 快取裡最新的 `g_seq`；None 或 0 = 沒有快取。
@@ -304,7 +310,7 @@ pub struct RecentRequest {
 }
 
 /// Args:
-///     request: example: RecentRequest { limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
+///     request: example: RecentRequest { rooms: None, limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
 ///     id: client 自己選的，回應（一串 `Batch`）抄它；不能是靠 seq 對回應的 0
 ///     seq: 請求號
 pub fn recent(request: &RecentRequest, id: u64, seq: u32) -> Pack {

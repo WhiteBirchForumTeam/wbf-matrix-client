@@ -581,6 +581,7 @@ async fn create_ack_header_id_variants() {
 async fn feature_gated_commands_refuse_without_advertised_feature() {
     use wbf_sdk::protocol::{RecentRequest, SendRequest};
     let request = RecentRequest {
+        rooms: None,
         limit: 10,
         cg_seq: None,
         before: None,
@@ -909,6 +910,7 @@ async fn recent_over_a_single_response_channel_is_unsupported() {
     // 直接打 request()（不是 request_stream）模擬 HTTP：fake 的 handle 對 Recent 回 Unsupported。
     let pack = wbf_sdk::protocol::recent(
         &wbf_sdk::protocol::RecentRequest {
+            rooms: None,
             limit: 10,
             cg_seq: None,
             before: None,

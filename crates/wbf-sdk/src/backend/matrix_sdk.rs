@@ -200,20 +200,52 @@ impl ChatBackend for MatrixBackend {
         self.describe(&room).await
     }
 
+    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（chat-model §4.3：`event_id` 是可攜的權威）。
+    /// 標準 Matrix 沒有「從某則事件往前翻」的 API，所以分兩步：
+    ///
+    /// 1. `/context/{event_id}` 拿到**那一則之前**的 token（`prev_batch_token`）；
+    /// 2. `/messages` 從那個 token 往回。
+    ///
+    /// ⭐ 所以**不必暫存 token**：任何一則事件都拿得到它的位置，代價是每頁多一次請求。
+    /// ⚠️ `/context` 的 `limit` 給 0，但有的 server 會把 0 當預設值、照樣回 `events_before` ——
+    /// 那些就是緊鄰錨點的更舊事件，🚫 不能丟，所以接在這一頁的最前面。
     async fn history(&self, id: &str, before: Option<&str>, limit: u32) -> Result<Page, SdkError> {
         if limit == 0 {
             return Err(SdkError::Usage("history limit must be at least 1".into()));
         }
         let room = self.room(id)?;
-        let mut options = MessagesOptions::backward();
-        options.limit = UInt::from(limit);
-        options.from = before.map(str::to_string);
-        let messages = room.messages(options).await.map_err(matrix_error)?;
-        let events = aggregate(id, messages.chunk.iter().map(to_message).collect());
-        Ok(Page {
-            events,
-            next: messages.end,
-        })
+        let (adjacent, from) = match before {
+            None => (Vec::new(), None),
+            Some(anchor) => {
+                let anchor = matrix_sdk::ruma::EventId::parse(anchor).map_err(|error| {
+                    SdkError::Usage(format!("`before` must be an event id: {error}"))
+                })?;
+                let context = room
+                    .event_with_context(&anchor, false, UInt::from(0u32), None)
+                    .await
+                    .map_err(matrix_error)?;
+                // 🚨 沒有 token ＝ 那一則之前已經沒有東西了（房間的開頭）：
+                // 🚫 不要再用 `from: None` 去問 —— 那會拿到**最新**的一頁，看起來像成功。
+                if context.prev_batch_token.is_none() {
+                    let events = aggregate(id, context.events_before.iter().map(to_message).collect());
+                    let next = next_anchor_of(&events);
+                    return Ok(Page { events, next });
+                }
+                (context.events_before, context.prev_batch_token)
+            }
+        };
+        let remaining = limit.saturating_sub(u32::try_from(adjacent.len()).unwrap_or(u32::MAX));
+        let mut timeline: Vec<TimelineEvent> = adjacent;
+        if remaining > 0 {
+            let mut options = MessagesOptions::backward();
+            options.limit = UInt::from(remaining);
+            options.from = from;
+            let messages = room.messages(options).await.map_err(matrix_error)?;
+            timeline.extend(messages.chunk);
+        }
+        let events = aggregate(id, timeline.iter().map(to_message).collect());
+        let next = next_anchor_of(&events);
+        Ok(Page { events, next })
     }
 
     async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError> {
@@ -589,6 +621,15 @@ fn matrix_error(error: matrix_sdk::Error) -> SdkError {
 // ---- 事件 → Message ----
 
 /// `TimelineEvent` 是 matrix-sdk 解密過的結果：解得開就是明文事件，解不開是原事件加原因。這裡把它變成我們的 `Message`。
+/// 下一頁的錨：這一頁**最舊**那則的 `event_id`（頁是新到舊，所以是最後一則）。
+///
+/// Return:
+///     Some(event_id)  還可以往回問
+///     None            這一頁是空的 —— 到頭了
+fn next_anchor_of(events: &[Message]) -> Option<String> {
+    events.last().map(|message| message.id.clone())
+}
+
 fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
     let (raw, decrypted, reason) = match &event.kind {
         TimelineEventKind::Decrypted(decrypted) => (
