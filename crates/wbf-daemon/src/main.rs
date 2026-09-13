@@ -96,6 +96,17 @@ fn main() -> ExitCode {
     };
     drop(token);
 
+    // 🚨 **獨佔先拿**（architecture-v2 §0.2）：在動這個目錄的任何東西之前 —— 尤其是下面那個
+    // 「刪掉舊的 daemon.json」—— 因為沒拿到鎖就動，等於去動另一個 daemon 正在用的檔。
+    // ⚠️ 這個值要一路活到程序結束（鎖綁在它身上），所以 🚫 不可以 `let _ =`。
+    let _data_dir_lock = match wbf_daemon::lock::acquire(&cli.data_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
     // ⚠️ 先刪掉上一次留下的：它的 port 可能是別人的，而前端把「這個檔出現」當成 ready。
     // 刪不掉就不要跑——那代表前端會拿到一份我們沒寫過的 port（fail closed）。
     let ready_path = cli.data_dir.join("daemon.json");

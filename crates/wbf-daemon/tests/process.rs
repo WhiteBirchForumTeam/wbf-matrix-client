@@ -206,3 +206,70 @@ fn a_world_readable_token_file_stops_the_daemon_from_starting() {
     assert!(!output.status.success(), "0644 的 token 檔不該啟動得起來");
     assert!(!dir.path().join("daemon.json").exists(), "也不該寫 ready");
 }
+
+/// 資料目錄的獨佔（architecture-v2 §0.2）：第二個 daemon **起不來**，而且不會動到第一個的東西。
+///
+/// 🚨 這條在 2026-09-13 之前是不成立的：`cache.db` 開在 WAL（SQLite 本來就支援多程序），
+/// 而 port 預設是隨機的，所以兩個 daemon 可以同時開著同一個資料目錄互相踩。
+#[tokio::test]
+async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
+    let dir = tempfile::Builder::new()
+        .prefix("wl")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let token_file = dir.path().join("daemon.token");
+    std::fs::write(&token_file, TOKEN).unwrap();
+
+    let (mut first, ready) = spawn_daemon(dir.path(), &token_file);
+    let ready_path = dir.path().join("daemon.json");
+    let before = std::fs::read(&ready_path).unwrap();
+
+    let second = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
+        .arg("-s")
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--token-file")
+        .arg(&token_file)
+        .output()
+        .expect("the daemon binary runs");
+    assert!(!second.status.success(), "第二個不該起得來");
+    let complaint = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        complaint.contains("another daemon is already using this data directory"),
+        "{complaint}"
+    );
+    assert!(second.stdout.is_empty(), "起不來就🚫 不該印 ready");
+
+    // 🔴 重點：第一個的 ready 檔**一個 byte 都沒被動到**（沒拿到鎖就不准碰這個目錄）。
+    assert_eq!(std::fs::read(&ready_path).unwrap(), before);
+    // 第一個也還活著、還在服務。
+    let keys = RpcKeys::from_token(&TOKEN);
+    let replies = call(
+        ready.rpc_port,
+        &keys,
+        &[
+            json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "daemon.info", "id": 1 }),
+        ],
+    )
+    .await;
+    assert_eq!(replies[1]["result"]["instance"], ready.instance);
+
+    // 收攤：停掉第一個之後，同一個目錄就換得了人。
+    let replies = call(
+        ready.rpc_port,
+        &keys,
+        &[
+            json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "daemon.shutdown", "id": 1 }),
+        ],
+    )
+    .await;
+    assert_eq!(replies[1]["code"], 0, "{}", replies[1]);
+    assert!(wait_for_exit(&mut first).success());
+
+    let (mut third, third_ready) = spawn_daemon(dir.path(), &token_file);
+    assert_ne!(third_ready.instance, ready.instance, "是新的一個實例");
+    let _ = third.kill();
+    let _ = third.wait();
+}

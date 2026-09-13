@@ -4255,6 +4255,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "uuid",
  "wbf-core",
  "wbf-sdk",
  "zeroize",

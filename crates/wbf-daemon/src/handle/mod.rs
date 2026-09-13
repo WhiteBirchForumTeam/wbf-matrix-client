@@ -46,28 +46,15 @@ fn is_allowed_while_locked(method: &str) -> bool {
     method == "hello" || method.starts_with("daemon.") || method.starts_with("vault.")
 }
 
-/// 鑄一個這次啟動的身分：RFC 4122 的 UUID v4 文字（隨機來自 OS）。
+/// 鑄一個這次啟動的身分：UUID v4（`uuid` crate，隨機來自 OS）。
 ///
 /// Return:
 ///     String  example: "3f2b1c4a-5d6e-4f80-9a1b-2c3d4e5f6071"
 ///
-/// 🚫 不引 uuid crate：這裡只要「夠亂、格式標準、印得出來」，122 bit 隨機的碰撞機率
-/// 遠低於任何我們會遇到的情況（維護者 2026-09-13）。
+/// 📎 用現成的：`uuid` **本來就在依賴樹裡**（matrix-sdk → ruma），所以這裡沒有多一個相依，
+/// 而版本／variant 位元與文字格式那些細節也不該由我們自己維護（維護者 2026-09-13）。
 fn new_instance_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS randomness");
-    // 版本 4（隨機）與 RFC 4122 的 variant 位元：不設的話它就不是一個合法的 UUID v4。
-    bytes[6] = (bytes[6] & 0x0F) | 0x40;
-    bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 pub struct Handle {
