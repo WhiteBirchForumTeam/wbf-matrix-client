@@ -42,6 +42,8 @@ mod backup_ops;
 pub mod conf;
 mod error;
 pub mod event;
+/// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
+pub mod job;
 mod handles;
 mod login_ops;
 mod media_ops;
@@ -63,7 +65,7 @@ pub use accounts::AccountSummary;
 use accounts::{AccountDir, DataDirMap};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};
-pub use event::CoreEvent;
+pub use event::{CoreEvent, SyncState};
 use event::EventSink;
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};

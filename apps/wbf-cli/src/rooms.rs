@@ -92,7 +92,7 @@ pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), Co
     let mut events = context.core()?.subscribe();
     let printer = tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
-            if let CoreEvent::Message(message) = event {
+            if let CoreEvent::Message { message, .. } = event {
                 print_line(&message);
             }
         }

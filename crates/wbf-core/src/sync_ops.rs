@@ -87,7 +87,10 @@ impl Core {
             }
             // 自己送的也發出去（呼叫端自己濾），但 `once` 不把自己的算「第一則」。
             let own = message.sender == me;
-            self.events.emit(CoreEvent::Message(message.clone()));
+            self.events.emit(CoreEvent::Message {
+                user: me.clone(),
+                message: message.clone(),
+            });
             seen.push((**message).clone());
             match once && !own {
                 true => WatchControl::Stop,

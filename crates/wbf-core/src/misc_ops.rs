@@ -180,8 +180,10 @@ impl Core {
             .create_upload(&session.server, &session.user_id, &file_cipher, &block)
             .await?;
         let summary = client
+            // ⚠️ 串流事先不知道總長：`total` 是 `None`，🚫 不填 0 假裝知道。
             .send_stream(&state, &mut source, &mut |done, _| {
-                self.events.progress(format!("chunk {done}"))
+                self.events
+                    .progress_of(done as u64, None, format!("chunk {done}"))
             })
             .await?;
         let mut final_block = state.block.clone();
