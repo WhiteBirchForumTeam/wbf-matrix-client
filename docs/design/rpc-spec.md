@@ -336,9 +336,14 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `room.message` | `{ user, room, message: Message }`（chat-model §2.2，含 `decrypted`／`undecryptable_reason`） | 這個帳號收到一則新訊息（sync 或 `Event/Push` 進來、解完密、寫進快取**之後**） |
 | `sync.state` | `{ user, state: "connected"\|"disconnected"\|"catching_up"\|"caught_up", cg_seq? }` | 跟 server 的連線狀態變了 |
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
+| `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事 |
 
 - 推播**要先 `subscribe`**（§4.6）。`progress` 例外：**發出長工作的那條連線自動收到自己請求的 `progress`**，不必訂——不然每個前端都要多寫一步。
 - 推播是「不用輪詢」，🚫 不是「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
+  🚨 **但掉了一定要發 `desync`**：不講的話 UI 永遠不會去重查（它以為自己收齊了）。
+- ⚠️ **`progress` 要在源頭節流**（每 100 ms 或每 1%，最後一則一定發），而且跟房間事件**不走同一條佇列**
+  —— 不然一個大檔上傳會把 `room.message` 擠掉（daemon-runtime §5.4；跟 architecture-v2 §6.1.1
+  對上游連線立的是同一條規矩）。
 - ⚠️ core 現在的 `CoreEvent::Progress` 是一句字串，`room.message` 對得上 `CoreEvent::Message`；
   `sync.state` 與結構化的 `progress` 是 **core 要補的 variant**（daemon PR 順手做，🚫 不在 daemon 裡 parse 那句字串）。
 
@@ -472,6 +477,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 |---|---|---|---|
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
+| `desync` 推播（§4） | ❌（daemon 層） | — | ❌ |
 | **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`） | 🔁 core 只有上游那條；`local` 要接 `cache.db` | 本機 | ❌ |
 | `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
