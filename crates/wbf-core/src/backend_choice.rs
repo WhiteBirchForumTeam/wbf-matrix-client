@@ -130,39 +130,84 @@ impl crate::Core {
     /// 🚫 不壞在「以為對方懂我們的協議」。所以這個函數**不回 `Err`**：探測失敗不是錯誤，
     /// 是一個答案。
     ///
-    /// ⚠️ 一個 server dir 探一次就記住（`Core::backends`），🚫 不寫進磁碟。
+    /// 🚨 **只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴1）：
+    ///
+    /// | 探測結果 | 這次回 | 記住嗎 |
+    /// |---|---|---|
+    /// | `Hello` 回了、版本認得 | `WbfSdk` | ✅ 那是 server 的事實 |
+    /// | `Hello` 回了、版本不認得 | `MatrixSdk` | ✅ 同上 |
+    /// | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記** |
+    ///
+    /// ⚠️ 為什麼失敗不能記：這個快取的 key 是 **server dir**（一台 server 一格，因為
+    /// 「講不講 wbf」是 server 的性質），但探測是**拿某一個帳號的 token 去問的**。
+    /// 🚨 所以 A 帳號的 token 過期，如果把失敗記下來，同一台 server 上 token 好的 B 帳號
+    /// 會被**永久降級**成 `MatrixSdk`，wbf 的功能整個消失 —— ⭐ 那是把「帳號的狀態」
+    /// 寫進了「server 的事實」。📎 成功可以共用（server 對誰都講同一套協議），失敗不行。
+    ///
+    /// 📎 代價：對一般 homeserver，每次用到 wbf-only 的功能都會再試一次 WS handshake。
+    /// ⭐ 可以接受 —— 那些呼叫本來就會失敗（那個功能在那台 server 上是關的），
+    /// 而多記一個錯的結論會讓**能動的**帳號也不能動。
+    ///
+    /// ⚠️ 一個 server dir 一個 [`tokio::sync::OnceCell`]，所以**同時進來的人共用同一次探測**，
+    /// 🚫 不是各探一次（審查 rumia🟡2）。只在記憶體裡，🚫 不寫進磁碟。
     ///
     /// Args:
-    ///     account: 哪個帳號（它決定 server dir 與 access_token）
+    ///     account: 哪個帳號（它決定 server dir，也決定拿誰的 token 去問）
     /// Return:
-    ///     BackendKind  Wbf ＝ `Hello` 通了；MatrixSdk ＝ 其他所有情況
+    ///     BackendKind  WbfSdk ＝ `Hello` 通了；MatrixSdk ＝ 其他所有情況
     pub async fn get_backend_kind(&self, account: &crate::accounts::AccountDir) -> BackendKind {
-        let dir = account.server_dir();
-        if let Some(known) = self
+        let cell = self
             .backends
             .lock()
             .expect("the backend registry is never poisoned")
-            .get(&dir)
-        {
-            return *known;
+            .entry(account.server_dir())
+            .or_default()
+            .clone();
+        // ⭐ `get_or_try_init` 的兩個性質正好是要的：**失敗不寫進去**（所以下次會重探），
+        // 而且同時進來的人**等同一次**探測（🚫 不是各開一條 WS）。
+        // ⚠️ 註冊表的鎖在上面那一段就放掉了 —— 🚫 std 的 Mutex 不能跨 await 持有。
+        let answered = cell
+            .get_or_try_init(|| async {
+                let kind = match self.probe_wbf(account).await? {
+                    true => BackendKind::WbfSdk,
+                    false => BackendKind::MatrixSdk,
+                };
+                self.events.progress(format!(
+                    "{} speaks {}",
+                    account.server_host,
+                    match kind {
+                        BackendKind::WbfSdk => "the wbf protocol",
+                        BackendKind::MatrixSdk => "plain Matrix",
+                    }
+                ));
+                Ok::<BackendKind, CoreError>(kind)
+            })
+            .await;
+        match answered {
+            Ok(kind) => *kind,
+            // ⚠️ 問不到就當一般 homeserver —— **只算這一次**，🚫 沒有記下來。
+            Err(_) => BackendKind::MatrixSdk,
         }
-        let found = match self.probe_wbf(account).await {
-            Ok(true) => BackendKind::WbfSdk,
-            Ok(false) | Err(_) => BackendKind::MatrixSdk,
-        };
-        self.events.progress(format!(
-            "{} speaks {}",
-            account.server_host,
-            match found {
-                BackendKind::WbfSdk => "the wbf protocol",
-                BackendKind::MatrixSdk => "plain Matrix",
-            }
-        ));
+    }
+
+    /// 註冊表**現在記住了什麼**。⚠️ 只給測試用：唯一能分辨「記住了」與「只是回了一次」
+    /// 的方式就是問它 —— 而那個分辨正是 rumia🔴1 要的（PR #33）。
+    ///
+    /// Args:
+    ///     account: 哪個帳號（它決定 server dir）
+    /// Return:
+    ///     Some(BackendKind)  探過而且 server 回答過
+    ///     None               沒探過，或探了但**失敗**（🚫 失敗不留下結論）
+    #[cfg(test)]
+    pub(crate) fn get_remembered_backend(
+        &self,
+        account: &crate::accounts::AccountDir,
+    ) -> Option<BackendKind> {
         self.backends
             .lock()
             .expect("the backend registry is never poisoned")
-            .insert(dir, found);
-        found
+            .get(&account.server_dir())
+            .and_then(|cell| cell.get().copied())
     }
 
     /// 🚫 **只有階段 7／8 的會話監督者該叫它**：連線重起時，「這台是不是 wbf」要重問一次。
@@ -233,6 +278,24 @@ impl crate::Core {
 mod tests {
     use super::*;
 
+    /// ⚠️ 沒有人在這個 port 上聽 —— 探測一定連不上，那正是要驗的那條路。
+    /// 📎 用 `127.0.0.1` 而不是一個不存在的網域：🚫 不要讓測試去打 DNS。
+    const DEAD: &str = "http://127.0.0.1:1";
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wbf-core-bc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn unlocked(dir: &std::path::Path) -> crate::Core {
+        wbf_sdk::vault::Vault::create(dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
+        let core = crate::Core::open(dir);
+        core.unlock(None).unwrap();
+        core
+    }
+
     /// `http` 永遠是 matrix-sdk —— 🚫 沒有「wbf over http」這種東西了。
     #[test]
     fn http_always_means_the_matrix_backend() {
@@ -286,6 +349,122 @@ mod tests {
             BackendKind::MatrixSdk,
             "對方不講：fallback，🚫 不是報錯"
         );
+    }
+
+    /// 🚨 **探測失敗不留下結論** —— 真的跑 `get_backend_kind`（PR #33 審查 rumia🔴1）。
+    ///
+    /// session 指向一個**沒有人在聽**的位址，所以探測一定失敗。它要：
+    /// 回 `MatrixSdk`（fail safe），但🚫 **不准記住** —— 不然同一台 server 上
+    /// token 好的另一個帳號會被那個失敗**永久降級**，wbf 的功能整個消失。
+    /// ⭐ 「記住了沒有」是唯一分辨得出來的地方，所以斷言的是它。
+    #[tokio::test]
+    async fn a_failed_probe_answers_matrix_sdk_without_remembering_it() {
+        let dir = scratch("probe-fails");
+        let core = unlocked(&dir);
+        let vault = core.vault().unwrap();
+        let account =
+            crate::accounts::AccountDir::locate(&dir, &vault.account_dir_key(), DEAD, "@a:dead")
+                .unwrap();
+        std::fs::create_dir_all(&account.dir).unwrap();
+        vault
+            .seal_session(
+                &account.session_path(),
+                &wbf_sdk::login::Session {
+                    server: DEAD.to_string(),
+                    user_id: "@a:dead".to_string(),
+                    device_id: "DEV".to_string(),
+                    access_token: "syt_nobody_is_listening".to_string(),
+                    store_dir: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            core.get_backend_kind(&account).await,
+            BackendKind::MatrixSdk,
+            "探不到就當一般 homeserver"
+        );
+        assert_eq!(
+            core.get_remembered_backend(&account),
+            None,
+            "🚫 失敗不准留下結論——不然同 server 的其他帳號會被連坐"
+        );
+        // 再問一次還是一樣的答案，而且還是沒記住（所以下一次仍然會重探）。
+        assert_eq!(core.get_backend_kind(&account).await, BackendKind::MatrixSdk);
+        assert_eq!(core.get_remembered_backend(&account), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠️ 上面那條驗的是**失敗**那半（那是真的跑我們的 code）。成功那半沒有假的 wbf server
+    /// 可以驅動，所以這裡直接釘 `get_backend_kind` 依賴的機制：
+    /// `OnceCell::get_or_try_init` **出錯不寫進去、成功才寫**。
+    /// 📎 講明白比假裝蓋到好。
+    #[tokio::test]
+    async fn a_failed_probe_leaves_no_conclusion_so_the_next_account_can_still_win() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cell: tokio::sync::OnceCell<BackendKind> = tokio::sync::OnceCell::new();
+        let probes = AtomicUsize::new(0);
+
+        // A 帳號：token 被拒。
+        let refused = cell
+            .get_or_try_init(|| async {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Err::<BackendKind, CoreError>(CoreError::new(
+                    CoreErrorKind::Usage,
+                    "token refused",
+                ))
+            })
+            .await;
+        assert!(refused.is_err());
+        assert!(cell.get().is_none(), "🚫 失敗不准留下結論");
+
+        // B 帳號：同一台 server，token 是好的 —— 它必須探得到、而且結論是 wbf。
+        let answered = cell
+            .get_or_try_init(|| async {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok::<BackendKind, CoreError>(BackendKind::WbfSdk)
+            })
+            .await;
+        assert_eq!(*answered.unwrap(), BackendKind::WbfSdk);
+        assert_eq!(probes.load(Ordering::SeqCst), 2, "失敗之後要再探一次");
+
+        // 成功之後才記住：第三個人不再探。
+        let reused = cell
+            .get_or_try_init(|| async {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok::<BackendKind, CoreError>(BackendKind::MatrixSdk)
+            })
+            .await;
+        assert_eq!(*reused.unwrap(), BackendKind::WbfSdk, "用記住的那個");
+        assert_eq!(probes.load(Ordering::SeqCst), 2, "🚫 成功之後不再探");
+    }
+
+    /// 🚨 **同時進來的人共用一次探測**（PR #33 審查 rumia🟡2）——
+    /// 🚫 不是各開一條 WS、各問一次 `Hello`。
+    #[tokio::test]
+    async fn three_callers_at_once_share_a_single_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cell: tokio::sync::OnceCell<BackendKind> = tokio::sync::OnceCell::new();
+        let probes = AtomicUsize::new(0);
+        let probe_once = || async {
+            probes.fetch_add(1, Ordering::SeqCst);
+            // 讓另外兩個排隊者真的有機會進來。
+            tokio::task::yield_now().await;
+            Ok::<BackendKind, CoreError>(BackendKind::WbfSdk)
+        };
+
+        let (first, second, third) = tokio::join!(
+            cell.get_or_try_init(probe_once),
+            cell.get_or_try_init(probe_once),
+            cell.get_or_try_init(probe_once)
+        );
+        for answer in [first, second, third] {
+            assert_eq!(*answer.unwrap(), BackendKind::WbfSdk);
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "只准探一次");
     }
 
     /// 🚧 還沒有 ws 定義的方法**先走 matrix-sdk**，不管走哪條、不管對方是誰。

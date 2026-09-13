@@ -145,8 +145,16 @@ pub struct Core {
     /// 它會變（升級、降級），而寫進檔案的那份不會有人通知你它過期了。
     /// 📎 現在的作廢時機是 daemon 重開；會話重連時也該重探（階段 7／8 接上會話監督者時，
     /// 用 [`Core::forget_backend_probe`]）。
-    pub(crate) backends:
-        std::sync::Mutex<std::collections::HashMap<PathBuf, crate::BackendKind>>,
+    ///
+    /// 🚨 值是 `OnceCell` 而不是 `BackendKind`，為了兩件事（PR #33 審查 rumia）：
+    /// **探測失敗不會留下結論**（`get_or_try_init` 出錯時不寫進去，下次重探），
+    /// 而**同時進來的人共用同一次探測**（🚫 不是各開一條 WS）。
+    pub(crate) backends: std::sync::Mutex<
+        std::collections::HashMap<
+            PathBuf,
+            std::sync::Arc<tokio::sync::OnceCell<crate::BackendKind>>,
+        >,
+    >,
 }
 
 impl Core {
