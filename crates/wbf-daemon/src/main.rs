@@ -96,10 +96,11 @@ fn main() -> ExitCode {
     };
     drop(token);
 
-    // 🚨 **獨佔先拿**（architecture-v2 §0.2）：在動這個目錄的任何東西之前 —— 尤其是下面那個
+    // 🚨 **寫鎖先拿**（architecture-v2 §0.2）：daemon 是**會寫**的那個，所以拿排他；
+    // 唯讀的工具走 `lock_for_reading`（共享）。在動這個目錄的任何東西之前 —— 尤其是下面那個
     // 「刪掉舊的 daemon.json」—— 因為沒拿到鎖就動，等於去動另一個 daemon 正在用的檔。
     // ⚠️ 這個值要一路活到程序結束（鎖綁在它身上），所以 🚫 不可以 `let _ =`。
-    let _data_dir_lock = match wbf_daemon::lock::acquire(&cli.data_dir) {
+    let _data_dir_lock = match wbf_daemon::lock::lock_for_writing(&cli.data_dir) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("{error}");
