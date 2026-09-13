@@ -19,7 +19,7 @@ use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
 /// 換 schema 就加一，舊檔整個重建（§1）。
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// `events.kind` 的整數碼。順序是格式的一部分，只能往後加。
 const KIND_TEXT: i64 = 0;
@@ -187,6 +187,14 @@ impl Cache {
                        refreshed_at = excluded.refreshed_at",
                 )
                 .map_err(db_error)?;
+            // 🚨 **只准 0 → 1，🚫 不准 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
+            // 「沒加密」—— 過期的、別的帳號舊的、有 bug 的 —— 都🚫 不准把已知加密的房間蓋回明文。
+            // ⭐ 蓋回去的下一步就是送檔時用 `cipher: none` 把區塊金鑰公開出去（約定 §5.1）。
+            let mut mark_encryption = transaction
+                .prepare_cached(
+                    "UPDATE rooms SET encrypted = CASE WHEN encrypted = 1 THEN 1 ELSE ?2 END WHERE id = ?1",
+                )
+                .map_err(db_error)?;
             for conversation in conversations {
                 let room = room_row_id(&transaction, &conversation.id)?;
                 insert
@@ -196,6 +204,9 @@ impl Cache {
                         serde_json::to_string(conversation).expect("Conversation serializes"),
                         now,
                     ])
+                    .map_err(db_error)?;
+                mark_encryption
+                    .execute(params![room, conversation.encrypted])
                     .map_err(db_error)?;
             }
         }
@@ -208,16 +219,25 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT l.conversation_json FROM room_list l JOIN users u ON u.id = l.user WHERE u.mxid = ?1",
+                "SELECT l.conversation_json, r.encrypted FROM room_list l
+                   JOIN users u ON u.id = l.user JOIN rooms r ON r.id = l.room
+                 WHERE u.mxid = ?1",
             )
             .map_err(db_error)?;
         let rows = statement
-            .query_map(params![user_id], |row| row.get::<_, String>(0))
+            .query_map(params![user_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<bool>>(1)?))
+            })
             .map_err(db_error)?;
         let mut conversations: Vec<Conversation> = Vec::new();
         for row in rows {
-            let json = row.map_err(db_error)?;
-            if let Ok(conversation) = serde_json::from_str(&json) {
+            let (json, room_is_encrypted) = row.map_err(db_error)?;
+            if let Ok(mut conversation) = serde_json::from_str::<Conversation>(&json) {
+                // 🚨 `rooms.encrypted` 是**房間的**事實，`conversation_json` 只是**這個帳號上次看到的樣子**。
+                // 房間說加密就是加密 —— 🚫 不讓一份舊的「沒加密」從讀的這一側漏出去。
+                if room_is_encrypted == Some(true) {
+                    conversation.encrypted = true;
+                }
                 conversations.push(conversation);
             }
         }
@@ -1031,7 +1051,8 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
         .execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);
-             CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);
+             CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
+               encrypted INTEGER CHECK (encrypted IN (0, 1)));
              CREATE TABLE events (
                id INTEGER PRIMARY KEY,
                room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -1193,6 +1214,88 @@ mod tests {
 
     fn ids(messages: &[Message]) -> Vec<String> {
         messages.iter().map(|message| message.id.clone()).collect()
+    }
+
+    fn room(id: &str, encrypted: bool) -> Conversation {
+        Conversation {
+            id: id.into(),
+            kind: ConversationKind::Group,
+            name: Some(id.into()),
+            topic: None,
+            encrypted,
+            member_count: 2,
+            my_power_level: 0,
+            can_send_message: true,
+            direct_peer: None,
+        }
+    }
+
+    fn column_encrypted(cache: &Cache, room_id: &str) -> Option<bool> {
+        cache
+            .connection
+            .query_row(
+                "SELECT encrypted FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 🚨 **加密只准升、不准降**：Matrix 房間一開加密就關不掉，所以一份過期的「沒加密」
+    /// 🚫 不准把已知加密的房間蓋回明文 —— 蓋回去的下一步是用 `cipher: none` 把區塊金鑰公開送出。
+    #[test]
+    fn a_room_once_known_encrypted_is_never_downgraded_to_plaintext() {
+        let (mut cache, dir) = open("encrypted-ratchet");
+        cache.upsert_conversations(ALICE, &[room("!r", true)]).unwrap();
+        assert_eq!(column_encrypted(&cache, "!r"), Some(true));
+
+        // 同一個帳號之後又拿到一份說「沒加密」的（過期、或有 bug）。
+        cache.upsert_conversations(ALICE, &[room("!r", false)]).unwrap();
+        assert_eq!(column_encrypted(&cache, "!r"), Some(true), "🚫 不准降回明文");
+        assert!(
+            cache.list_conversations(ALICE).unwrap()[0].encrypted,
+            "讀出來也要是加密"
+        );
+
+        // 明文房間升級成加密：可以。
+        cache.upsert_conversations(ALICE, &[room("!plain", false)]).unwrap();
+        assert_eq!(column_encrypted(&cache, "!plain"), Some(false));
+        cache.upsert_conversations(ALICE, &[room("!plain", true)]).unwrap();
+        assert_eq!(column_encrypted(&cache, "!plain"), Some(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 加密是**房間的**事實、不是「某個帳號上次看到的」—— 所以 B 帳號那份舊的
+    /// `conversation_json` 說沒加密，讀出來仍然要是加密（A 已經確認過了）。
+    #[test]
+    fn another_accounts_stale_view_cannot_hide_that_a_room_is_encrypted() {
+        let (mut cache, dir) = open("encrypted-across-accounts");
+        cache.upsert_conversations(BOB, &[room("!r", false)]).unwrap();
+        cache.upsert_conversations(ALICE, &[room("!r", true)]).unwrap();
+
+        let bob_sees = cache.list_conversations(BOB).unwrap();
+        assert!(
+            bob_sees[0].encrypted,
+            "🚨 BOB 的 JSON 是舊的，但房間已知加密 —— 讀出來不准是明文"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 只因為**收到事件**才建出來的房間列：**不知道**加不加密（NULL），🚫 不是明文（0）。
+    #[test]
+    fn a_room_seen_only_through_events_has_unknown_encryption_not_plaintext() {
+        let (mut cache, dir) = open("encrypted-unknown");
+        cache
+            .upsert_messages(ALICE, &[text("!only-events", "$1", Some(1), 1)])
+            .unwrap();
+        assert_eq!(
+            column_encrypted(&cache, "!only-events"),
+            None,
+            "🚫 不知道就是不知道——預設成 0 等於預設明文"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

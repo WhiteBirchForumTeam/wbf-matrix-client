@@ -360,7 +360,7 @@ fn cached_page(messages: Vec<Message>) -> (Vec<Message>, Option<String>) {
 /// | backend | 上游怎麼定位 | 本地怎麼定位 | 對得上嗎 |
 /// |---|---|---|---|
 /// | matrix-sdk `/messages`（現在唯一有歷史的） | 不透明 token | `r_seq` | ❌ 沒有翻譯 |
-/// | wbf（`Event/*`） | `r_seq`／`g_seq`（server 自己塞的） | `r_seq` | ✅ **同一套** |
+/// | wbf（`Event/Recent` 點名房間，wbfuwunel #51） | **`g_seq`**（server 自己發的） | 現在是 `r_seq` | ⚠️ 接的時候本地要換成 `g_seq` 才是同一套 |
 ///
 /// ⚠️ 所以 `Both` 帶 `before` 在 matrix backend 上是壞的：
 ///
@@ -368,9 +368,12 @@ fn cached_page(messages: Vec<Message>) -> (Vec<Message>, Option<String>) {
 /// - 🚨 **剛好是數字的 token 更糟**：它會指到本地一個不相干的位置，然後看起來像成功。
 ///   協議上 token 就是不透明字串，🚫 不該賭它的長相。
 ///
-/// ⭐ **出口**：wbf 那條線的房間歷史 API 正在 server 端開發中（維護者 2026-09-13）。
-/// 接上之後兩半講同一種 `r_seq`，這個守門就該**整個拿掉** —— 🚫 它不是 `Both` 的固有性質，
+/// ⭐ **出口**：wbf 的房間歷史 ＝ `Event/Recent` 點名一個房 ＋ `before`（wbfuwunel PR #51）。
+/// 🚨 **它翻頁用的是 `g_seq`，🚫 不是 `r_seq`**（server 那邊 `r_seq` 沒有索引；分工是
+/// `g_seq` 翻頁、`r_seq` 判斷有沒有洞）。所以接上的時候本地翻頁也要換成 `g_seq`，兩半才真的是
+/// 同一套 —— 那時這個守門就該**整個拿掉**。🚫 它不是 `Both` 的固有性質，
 /// 介面（rpc-spec 的 `sync`）也不會因此改。
+/// 📎 更正：這裡之前寫過「兩半講同一種 `r_seq`」，那是 #51 公開之前的猜測，錯的。
 ///
 /// 📎 在那之前也不擋路：「點開房間」就是不帶 `before` 的 `Both`，之後往回翻用 `Local`
 /// （daemon-runtime §3.4）；要用 server 座標一頁頁翻用 `Server`。
