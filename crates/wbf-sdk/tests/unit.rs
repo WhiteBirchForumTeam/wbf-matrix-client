@@ -363,6 +363,22 @@ fn event_recent_and_batch_match_server_vectors() {
             "{name}：表上的號要跟 server 向量一樣"
         );
     }
+    // 🚫 `code_id: 0` 是「欄位漏了」的預設值（server 表：0 永遠不是合法的碼）：
+    // 🚫 不准變成 `Some(0)` —— 重送判斷那邊 `from_id(0)` 本來就認不得，但 log 會印出「(0)」，
+    // 讀的人會以為 server 真的回了碼 0。字串、負數也一樣當沒有。
+    for meta in [
+        br#"{"code":"Corrupt","code_id":0,"message":"m"}"#.as_slice(),
+        br#"{"code":"Corrupt","code_id":"1002","message":"m"}"#.as_slice(),
+        br#"{"code":"Corrupt","code_id":-1,"message":"m"}"#.as_slice(),
+        br#"{"code":"Corrupt","message":"m"}"#.as_slice(),
+    ] {
+        let error = protocol::server_error(meta);
+        let SdkError::Server { code_id, .. } = &error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(*code_id, None, "{}", String::from_utf8_lossy(meta));
+        assert_eq!(error.to_string(), "server Corrupt: m", "log 不准印出假的序號");
+    }
     match protocol::server_error(&pack_named("error_too_many_connections").meta) {
         SdkError::Server { code, meta, .. } => {
             assert_eq!(code, "TooManyConnections");
