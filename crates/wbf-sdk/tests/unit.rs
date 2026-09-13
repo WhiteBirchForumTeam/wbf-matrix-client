@@ -3,6 +3,7 @@
 
 use wbf_sdk::chunk_crypto::{chunk_count, expected_plain_len, locate, MAX_CHUNK_INDEX};
 use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
+use wbf_sdk::error_code::WbfErrorCode;
 
 fn unhex(text: &str) -> Vec<u8> {
     hex::decode(text.replace([' ', '\n'], "")).expect("valid hex")
@@ -342,6 +343,25 @@ fn event_recent_and_batch_match_server_vectors() {
     match protocol::expect_batch(&request, pack_named("error_unsupported"), 0) {
         Err(SdkError::Server { code, .. }) => assert_eq!(code, "Unsupported"),
         other => panic!("expected Server(Unsupported), got {other:?}"),
+    }
+    // 🚨 server 向量裡的每一個 Error：**認碼只看 `code_id`**（issue #29 第 2 項）。
+    for (name, expected) in [
+        ("error_superseded", WbfErrorCode::Superseded),
+        ("error_rate_limited", WbfErrorCode::RateLimited),
+        ("error_out_of_order", WbfErrorCode::OutOfOrder),
+        ("error_unsupported", WbfErrorCode::Unsupported),
+        ("error_too_many_connections", WbfErrorCode::TooManyConnections),
+        ("error_invalid_request", WbfErrorCode::InvalidRequest),
+    ] {
+        let error = protocol::server_error(&pack_named(name).meta);
+        assert_eq!(error.wbf_code(), Some(expected), "{name}");
+        assert_eq!(
+            u64::from(expected.id()),
+            serde_json::from_slice::<serde_json::Value>(&pack_named(name).meta).unwrap()["code_id"]
+                .as_u64()
+                .unwrap(),
+            "{name}：表上的號要跟 server 向量一樣"
+        );
     }
     match protocol::server_error(&pack_named("error_too_many_connections").meta) {
         SdkError::Server { code, meta, .. } => {

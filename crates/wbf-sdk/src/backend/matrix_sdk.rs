@@ -581,6 +581,8 @@ fn matrix_error(error: matrix_sdk::Error) -> SdkError {
             code: kind.errcode().to_string(),
             message: error.to_string(),
             meta: serde_json::json!({ "status": status }),
+            // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+            code_id: None,
         };
     }
     SdkError::Network(format!("matrix: {error}"))

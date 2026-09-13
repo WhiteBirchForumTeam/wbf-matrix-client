@@ -28,6 +28,7 @@ pub mod cipher;
 pub mod client;
 pub mod download;
 pub mod error;
+pub mod error_code;
 pub mod event_json;
 pub mod login;
 pub mod manifest;

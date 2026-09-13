@@ -150,6 +150,8 @@ impl WsChannel {
                             code: "Unauthorized".into(),
                             message: "websocket upgrade refused: token invalid".into(),
                             meta: serde_json::Value::Null,
+                            // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+                            code_id: None,
                         }
                     }
                     other => SdkError::Network(format!("websocket connect {url}: {other}")),
@@ -281,6 +283,8 @@ impl PackChannel for HttpChannel {
                 code: "Unauthorized".into(),
                 message: "http pack refused: token invalid".into(),
                 meta: serde_json::Value::Null,
+                // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+                code_id: None,
             }),
             _ => Err(SdkError::Network(format!("http pack: status {status}"))),
         }
