@@ -538,8 +538,13 @@ async fn hello_ping_status_abort() {
         (0, Some(3), Some(40))
     );
     client.abort_upload(state.upload_id).await.unwrap();
-    let after = client.upload_status(state.upload_id).await;
-    assert_eq!(after.unwrap_err().server_code(), Some("NotFound"));
+    let after = client.upload_status(state.upload_id).await.unwrap_err();
+    assert_eq!(after.server_code(), Some("NotFound"), "名字給人看");
+    // ⭐ 程式認的是序號：假 server 從 `WbfErrorCode` 反查補上的 `code_id` 要對得上。
+    assert_eq!(
+        after.wbf_code(),
+        Some(wbf_sdk::error_code::WbfErrorCode::NotFound)
+    );
 }
 
 /// wbfuwunel 對 `Create` 的回應標頭 id 是新上傳 id（plan-v1 §6 記的順帶發現）：兩種都要收；
@@ -922,4 +927,77 @@ async fn recent_over_a_single_response_channel_is_unsupported() {
         Err(SdkError::Server { code, .. }) => assert_eq!(code, "Unsupported"),
         other => panic!("{other:?}"),
     }
+}
+
+/// 上傳到第一塊時被 server 回一次指定的錯誤，回傳 `send_chunks` 的結果與送過幾次 `Chunk`。
+async fn upload_with_first_chunk_rejected(
+    code: &'static str,
+    code_id: Option<u64>,
+) -> (Result<(), SdkError>, usize) {
+    let mut server = FakeServer::new();
+    let plaintext = sample(3_000);
+    let file_cipher = FileCipher::with_fixed(Cipher::None, [0; 32], [0; 8], 1000);
+    let state = {
+        let mut client = WbfClient::new(&mut server);
+        client
+            .create_upload(SERVER, USER, &file_cipher, &block_for("x", Some(3_000)))
+            .await
+            .unwrap()
+    };
+    server.reject_next_chunk_with = Some((code, code_id));
+    server.requests.clear();
+    let result = {
+        let mut client = WbfClient::new(&mut server);
+        client
+            .send_chunks(&state, &mut Cursor::new(&plaintext), 0, false, &mut |_, _| {})
+            .await
+            .map(|_| ())
+    };
+    let chunks_sent = server
+        .requests
+        .iter()
+        .filter(|(kind, subtype, _)| {
+            *kind == wbf_wire::Kind::Upload && *subtype == wbf_wire::pack::upload::CHUNK
+        })
+        .count();
+    (result, chunks_sent)
+}
+
+/// `Corrupt`（1002）重送一次就好（server 表：再來一次就是編碼端的 bug）。
+#[tokio::test]
+async fn a_chunk_rejected_as_corrupt_is_resent_once() {
+    let (result, chunks_sent) = upload_with_first_chunk_rejected("Corrupt", Some(1002)).await;
+    result.expect("重送之後要傳完");
+    assert_eq!(chunks_sent, 4, "3 塊 ＋ 被拒的那塊重送一次");
+}
+
+/// 🚨 **只有名字叫 `Corrupt`、沒有合法 `code_id` 的，不是 wbf 的 Corrupt**（issue #29 第 2 項）：
+/// 🚫 不重送，原樣往上報。`SdkError::Server` 也裝 Matrix 的 errcode 與我們合成的碼，比名字等於賭它們不撞名。
+#[tokio::test]
+async fn an_error_merely_named_corrupt_is_not_resent() {
+    let (result, chunks_sent) = upload_with_first_chunk_rejected("Corrupt", None).await;
+    let error = result.expect_err("不認得就是失敗");
+    assert_eq!(error.wbf_code(), None, "code_id 是 0 ＝沒有");
+    assert_eq!(chunks_sent, 1, "🚫 不准重送");
+}
+
+/// ⭐ **序號是權威、名字只給人看**：名字寫的是別的，序號是 1002，就是 Corrupt。
+#[tokio::test]
+async fn the_code_id_decides_even_when_the_name_says_something_else() {
+    let (result, chunks_sent) = upload_with_first_chunk_rejected("RenamedForHumans", Some(1002)).await;
+    result.expect("序號說 Corrupt，就照 Corrupt 重送");
+    assert_eq!(chunks_sent, 4);
+}
+
+/// 🚨 **不認得的碼：不重試、往上報**（server 表的規則）。🚫 不照序號範圍猜 —— 1599 在「狀態」那一家，但不是任何碼。
+#[tokio::test]
+async fn an_unknown_code_id_is_reported_not_retried() {
+    let (result, chunks_sent) = upload_with_first_chunk_rejected("SomethingNew", Some(1599)).await;
+    let error = result.expect_err("不認得就是失敗");
+    assert_eq!(error.wbf_code(), None);
+    assert!(
+        error.to_string().contains("(1599)"),
+        "不認得的碼要原樣留在 log 裡：{error}"
+    );
+    assert_eq!(chunks_sent, 1, "🚫 不准重試");
 }

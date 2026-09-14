@@ -47,6 +47,22 @@ pub struct FakeServer {
     pub drop_stream_after_batches: Option<u32>,
     /// 故障：Hello 宣告的 `recent_max_limit`／`recent_max_batch`（預設 500／100；設 0 模擬 server 設定誤植）。
     pub hello_recent_max: Option<(u32, u32)>,
+    /// 故障：下一塊 `Upload/Chunk` 回這個 `Error`（`code` 名字、`code_id`），只觸發一次。
+    /// ⚠️ 名字與序號**分開給**，才測得出 client 認的是哪一個（issue #29 第 2 項）。
+    pub reject_next_chunk_with: Option<(&'static str, Option<u64>)>,
+}
+
+/// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
+/// 真 server 兩個都送，這裡照表補上，client 那邊才會像對真 server 一樣只看序號。
+///
+/// ⭐ **從 `WbfErrorCode` 反查，🚫 不再手寫第二張表**（PR #37 審查 cirno💡）：變體名就是 server 的 `code` 名字，
+/// 所以掃一遍序號、比 `Debug` 名字就夠了。server 表加碼時只要動 `error_code.rs` 一個地方。
+/// 📎 只在測試裡這樣做：SDK 本身🚫 不從名字反查序號（那正是 #29 第 2 項要拿掉的東西）。
+fn code_id_of(code: &str) -> Option<u64> {
+    (1000..2000).find(|code_id| {
+        wbf_sdk::error_code::WbfErrorCode::from_id(*code_id)
+            .is_some_and(|known| format!("{known:?}") == code)
+    })
 }
 
 impl FakeServer {
@@ -121,6 +137,12 @@ impl FakeServer {
             },
             Err((code, message, mut extra)) => {
                 extra["code"] = serde_json::Value::String(code.to_string());
+                // 故障注入的那一筆自己帶 code_id（可能故意沒有、或跟名字對不上）；其他照表補。
+                if extra.get("code_id").is_none() {
+                    if let Some(code_id) = code_id_of(code) {
+                        extra["code_id"] = serde_json::json!(code_id);
+                    }
+                }
                 extra["message"] = serde_json::Value::String(message);
                 Pack {
                     kind: Kind::Control,
@@ -193,6 +215,16 @@ impl FakeServer {
         &mut self,
         request: &Pack,
     ) -> Result<(serde_json::Value, Vec<u8>), (&'static str, String, serde_json::Value)> {
+        if let Some((code, code_id)) = self.reject_next_chunk_with.take() {
+            let mut extra = serde_json::json!({});
+            // `code_id: None` 送 **0**：server 表說 0 永遠不是合法的碼（欄位漏了的預設值），client 必須當成沒有。
+            // 📎 用 0 而不是整個不帶，是因為下面 `code_id_of` 照表補的時候只看欄位在不在。
+            extra["code_id"] = match code_id {
+                Some(code_id) => serde_json::json!(code_id),
+                None => serde_json::json!(0),
+            };
+            return Err((code, "injected".into(), extra));
+        }
         let upload = self.uploads.get_mut(&request.id).ok_or((
             "NotFound",
             "no upload".to_string(),

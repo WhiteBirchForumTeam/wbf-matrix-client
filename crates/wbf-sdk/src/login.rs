@@ -124,5 +124,7 @@ async fn parse_matrix_response<T: serde::de::DeserializeOwned>(
         code,
         message,
         meta: serde_json::Value::Null,
+        // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+        code_id: None,
     })
 }

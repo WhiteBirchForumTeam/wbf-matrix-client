@@ -13,6 +13,7 @@ use crate::chunk_block::ChunkedBlock;
 use crate::chunk_crypto::{chunk_count, expected_plain_len, DescriptionSlot, FileCipher};
 use crate::client::WbfClient;
 use crate::error::SdkError;
+use crate::error_code::WbfErrorCode;
 use crate::manifest::{Manifest, UploadState};
 use crate::protocol::{self, ChunkAck, CreateAck, SealAck};
 
@@ -154,7 +155,13 @@ impl<C: PackChannel> WbfClient<C> {
                     index = ack.received;
                 }
                 // 線上規格 §3.2：server 說該送哪塊就跳去哪塊（漏了 Ack 的重送、或狀態檔比 server 舊）。
-                Err(SdkError::Server { code, meta, .. }) if code == "OutOfOrder" => {
+                // 🚨 認碼只看 `code_id`（`wbf_code`），🚫 不比名字（issue #29 第 2 項）。
+                Err(error @ SdkError::Server { .. })
+                    if error.wbf_code() == Some(WbfErrorCode::OutOfOrder) =>
+                {
+                    let SdkError::Server { meta, .. } = error else {
+                        unreachable!("the guard matched Server")
+                    };
                     let expected = meta
                         .get("expected_seq")
                         .and_then(|value| value.as_u64())
@@ -286,7 +293,7 @@ impl<C: PackChannel> WbfClient<C> {
     ) -> Result<ChunkAck, SdkError> {
         let request = protocol::chunk(upload_id, index, sealed, is_last);
         let ack = match self.send_and_expect_ack(request.clone()).await {
-            Err(SdkError::Server { code, .. }) if code == "Corrupt" => {
+            Err(error) if error.wbf_code() == Some(WbfErrorCode::Corrupt) => {
                 self.send_and_expect_ack(request).await?
             }
             other => other?,

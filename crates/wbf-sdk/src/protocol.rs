@@ -171,10 +171,17 @@ pub fn server_error(meta: &[u8]) -> SdkError {
         .and_then(|message| message.as_str())
         .unwrap_or("(no message)")
         .to_string();
+    // 🚨 只收**非 0 的整數**：`0` 是欄位漏了的預設值（server 表：`0` 永遠不是合法的碼），
+    // 字串 `"1503"`、負數、小數都不是 server 會送的形狀 —— 🚫 不猜，當成沒有。
+    let code_id = value
+        .get("code_id")
+        .and_then(|code_id| code_id.as_u64())
+        .filter(|code_id| *code_id != 0);
     SdkError::Server {
         code,
         message,
         meta: value,
+        code_id,
     }
 }
 

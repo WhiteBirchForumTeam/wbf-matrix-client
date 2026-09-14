@@ -9,10 +9,18 @@ pub enum SdkError {
     /// 呼叫者給錯：seek 超過檔尾、空檔、chunk_size 0…（CLI exit 1）。
     Usage(String),
     /// server 回 `Error` pack、或 HTTP 非 2xx（CLI exit 2）。`meta` 是整份 Error meta，含 `expected_seq` 這類額外欄位。
+    ///
+    /// ⚠️ 這個變體裝著**三種來源**：wbf 的 `Error` pack、Matrix HTTP 的 `errcode`（`M_FORBIDDEN`）、
+    /// 我們自己合成的（HTTP 401 的 `Unauthorized`、`HTTP_502`）。所以 `code` 只能給人看 ——
+    /// 🚨 **程式要判斷 wbf 的錯誤，用 [`SdkError::wbf_code`]**（只看 `code_id`），🚫 不要比 `code` 字串。
     Server {
+        /// 名字，給人看的, example: "OutOfOrder"、"M_FORBIDDEN"
         code: String,
         message: String,
         meta: serde_json::Value,
+        /// wbf `Error` pack 帶的序號（wbfuwunel `wbf-wire-format.md` §3.4）。
+        /// `None` ＝ 不是 wbf pack 來的（Matrix、合成的），或 pack 裡沒有合法的非 0 整數。
+        code_id: Option<u64>,
     },
     /// 約定 §3.1 任一條不過、CRC 不對、事件與 `Info` 對不上（CLI exit 3）。
     Integrity(String),
@@ -29,6 +37,13 @@ impl std::fmt::Display for SdkError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SdkError::Usage(message) => write!(formatter, "usage: {message}"),
+            // ⚠️ 帶上 `code_id`：不認得的碼要「原樣留在 log」（server 表的規則），而名字之外那個號才是權威。
+            SdkError::Server {
+                code,
+                message,
+                code_id: Some(code_id),
+                ..
+            } => write!(formatter, "server {code} ({code_id}): {message}"),
             SdkError::Server { code, message, .. } => write!(formatter, "server {code}: {message}"),
             SdkError::Integrity(message) => write!(formatter, "integrity: {message}"),
             SdkError::Network(message) => write!(formatter, "network: {message}"),
@@ -78,11 +93,31 @@ impl From<std::io::Error> for SdkError {
 }
 
 impl SdkError {
+    /// 🚨 **只給人看、給測試斷言名字用** —— 🚫 **程式決策請用 [`SdkError::wbf_code`]**（只看 `code_id`）。
+    /// 這個字串同時裝著 wbf 的名字、Matrix 的 `errcode` 與我們合成的碼，拿它判斷就是在賭三者不撞名
+    /// （PR #37 審查 cirno💡）。
+    ///
     /// Return:
     ///     Option<&str>  `Server` 的 code, example: "OutOfOrder"；其他變體 None
     pub fn server_code(&self) -> Option<&str> {
         match self {
             SdkError::Server { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// 這是不是一個**認得的** wbf 錯誤碼。🚨 **只看 `code_id`**，🚫 不看名字（issue #29 第 2 項）。
+    ///
+    /// Return:
+    ///     Some(WbfErrorCode)  wbf `Error` pack 來的、而且 `code_id` 在表上
+    ///     None                不是 `Server`、不是 wbf pack 來的、或不認得的碼 ——
+    ///                         呼叫端一律當「失敗了，不知道能不能重試」：🚫 不重試
+    pub fn wbf_code(&self) -> Option<crate::error_code::WbfErrorCode> {
+        match self {
+            SdkError::Server {
+                code_id: Some(code_id),
+                ..
+            } => crate::error_code::WbfErrorCode::from_id(*code_id),
             _ => None,
         }
     }
