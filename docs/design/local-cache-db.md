@@ -435,8 +435,11 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 1. is_redacted=1                  → 「已刪除」的記號
 2. 還沒解開（class=general）       → 「解不開」的記號（kind=undecryptable，跟已刪除一樣 UI 直接渲染）
 3. ref_event_id 是 NULL           → 顯示自己的 content_json
-   不是 NULL                      → 讀者還沒同步到那個 edit → 「過時」的記號（kind=outdated），原文與 edit 內容都不給
-                                    同步過               → 取那個 edit 的 m.new_content 替換（m.relates_to 留自己原本的）；edited_by = 它的 sender
+   不是 NULL                      → 以被指的那個 edit 為準（維護者 2026-09-14）：
+                                    讀者還沒同步到它   → 「過時」的記號（kind=outdated），原文與 edit 內容都不給
+                                    讀者 hide 了它     → 這則跟著隱藏（不出現在結果裡）
+                                    它被 redact        → 「已刪除」（正常流程會先重設指標，這條是防線）
+                                    否則               → 取它的 m.new_content 替換（m.relates_to 留自己原本的）；edited_by = 它的 sender
 ```
 
 🚨 第 3 步在讀取端**再驗一次**：那一列必須真的是「指回這則、同一個 sender、沒被 redact 的 edit」，對不上就顯示原文（A6：不假定寫入端永遠對）。
@@ -514,7 +517,8 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 - msg／edit 的內容是約定 §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）。
 - 每一則寫入時都查「有沒有 redact、edit 在等這則」，redact 先處理；自己是 edit／redact 時，目標在就處理，不在就等。
 
-**讀取**：`find_current_edit` 照 §7.5；reaction 🚨 只算讀者自己同步過、沒被 redact 的。
+**讀取**：`find_current_edit` 照 §7.5；reaction 🚨 只算讀者自己同步過、沒 hide、沒被 redact 的（PR #39 審查 rumia🟡、cirno💡1、salvia）。
+📎 Delete for me 在 UI 上是對**原訊息**發 hidden；對 edit／reaction 那一列發的情況一樣照規則走：有參照就以參照物為準。
 ⚠️ 目前顯示哪個 edit 記在目標那一列，是所有帳號共用的：帳號 B 同步到較新的 edit，帳號 A 沒同步過它，A 讀這則拿到的是 `outdated`，
 🚫 不會退回 A 看得到的舊版本（那要每次讀取都掃參照，正是 `modified_timestamp` 要省掉的）。
 

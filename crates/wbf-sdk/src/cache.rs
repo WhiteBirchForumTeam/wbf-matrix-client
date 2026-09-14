@@ -556,11 +556,12 @@ impl Cache {
     ///
     /// 1. `is_redacted` → 已刪除
     /// 2. 還沒解開（general）→ 解不開的記號
-    /// 3. 自己的 `ref_event_id` 是 NULL → 自己的 `content_json`；不是 → 換成那個 edit 的 `m.new_content`
+    /// 3. 自己的 `ref_event_id` 是 NULL → 自己的 `content_json`；不是 → **以被指的那個 edit 為準**：
+    ///    讀者還沒同步到 → 過時；讀者 hide 了它 → 整則不出現；被 redact → 已刪除；否則換成它的 `m.new_content`
     ///
     /// Return:
     ///     Ok(Some(Message))
-    ///     Ok(None)            壞列（class 認不得、msg 沒有 content_json 或解不開 JSON）：§1，壞資料當沒有
+    ///     Ok(None)            不出現：目前的 edit 被這個讀者 hide 了；或壞列（class 認不得、msg 沒有 content_json 或解不開 JSON，§1）
     fn to_message(&self, user_id: &str, row: &EventRow) -> Result<Option<Message>, SdkError> {
         let Some(class) = EventClass::from_column(&row.class) else {
             return Ok(None);
@@ -585,7 +586,7 @@ impl Cache {
         };
         if row.is_redacted {
             message.kind = MessageKind::Deleted {
-                reason: self.find_redaction_reason(row, raw_event.as_ref())?,
+                reason: self.find_redaction_reason(row.room, &row.event_id, raw_event.as_ref())?,
             };
             return Ok(Some(message));
         }
@@ -613,8 +614,13 @@ impl Cache {
                 message.edited_by = Some(editor);
                 to_replaced_body(&own_content, &new_content)
             }
-            CurrentEdit::NotVisible => {
+            CurrentEdit::NotSynced => {
                 message.kind = MessageKind::Outdated;
+                return Ok(Some(message));
+            }
+            CurrentEdit::Hidden => return Ok(None),
+            CurrentEdit::Redacted { reason } => {
+                message.kind = MessageKind::Deleted { reason };
                 return Ok(Some(message));
             }
         };
@@ -631,45 +637,80 @@ impl Cache {
         Ok(Some(message))
     }
 
-    /// 訊息自己的 `ref_event_id` 指的那個 edit（寫入時已經驗過、選過最新的）。
+    /// 訊息自己的 `ref_event_id` 指的那個 edit（寫入時已經驗過、選過最新的）。**有參照就以參照物為準**（維護者 2026-09-14）。
     ///
-    /// 🚨 消費端再問一次（A6）：那一列必須**真的是指回這則的 edit、同一個 sender、沒被 redact**，
+    /// 🚨 消費端再問一次（A6）：那一列必須**真的是指回這則的 edit、同一個 sender**，
     /// 對不上就當沒被 edit 過，顯示原文 —— 🚫 不因為寫入端的一個 bug 就把別人的內容顯示成這則。
-    /// 🚨 對得上、但**這個帳號沒同步過那個 edit** → 還沒同步到，版本過時（維護者 2026-09-14：可見性跟 events 表完全一致）。
+    /// 對得上之後照這個順序看那一列：
+    ///
+    /// 1. 這個帳號沒同步過 → 還沒同步到，版本過時（可見性跟 events 表完全一致）
+    /// 2. 這個帳號 hide 了它（Delete for me）→ 這則跟著隱藏
+    /// 3. 被 redact → 已刪除。📎 正常流程裡 redact 掉目前的 edit 會重設指標（`apply_redaction`），這條是防線
     ///
     /// Args:
     ///     user_id: 讀者, example: "@alice:localhost"
     ///     row: 要顯示的那則訊息
     /// Return:
-    ///     Ok(CurrentEdit::NotEdited)   沒被 edit 過，或指到的那列對不上
-    ///     Ok(CurrentEdit::Visible)     有，而且讀者同步過
-    ///     Ok(CurrentEdit::NotVisible)  有，但讀者沒同步過
+    ///     Ok(CurrentEdit::NotEdited)          沒被 edit 過，或指到的那列對不上
+    ///     Ok(CurrentEdit::NotSynced)          讀者沒同步過那個 edit
+    ///     Ok(CurrentEdit::Hidden)             讀者 hide 了那個 edit
+    ///     Ok(CurrentEdit::Redacted { reason }) 那個 edit 被 redact 了
+    ///     Ok(CurrentEdit::Visible { .. })     照常換成它的內容
     fn find_current_edit(&self, user_id: &str, row: &EventRow) -> Result<CurrentEdit, SdkError> {
         let Some(edit_event_id) = row.ref_event_id.as_deref() else {
             return Ok(CurrentEdit::NotEdited);
         };
-        let found: Option<(Option<String>, bool)> = self
+        // hidden：NULL ＝ 讀者沒有同步紀錄；0／1 ＝ 有紀錄、hide 了沒。
+        let found: Option<PointedEditRow> = self
             .connection
             .prepare_cached(
-                "SELECT x.content_json,
-                        EXISTS (SELECT 1 FROM events_synced_log l JOIN users reader ON reader.id = l.user
-                                WHERE l.event = x.id AND reader.mxid = ?5)
+                "SELECT x.content_json, x.raw_event, x.is_redacted,
+                        (SELECT l.hidden FROM events_synced_log l JOIN users reader ON reader.id = l.user
+                         WHERE l.event = x.id AND reader.mxid = ?5)
                  FROM events x
                  WHERE x.room = ?1 AND x.event_id = ?2 AND x.class = 'edit' AND x.ref_event_id = ?3
-                   AND x.sender = ?4 AND x.is_redacted = 0",
+                   AND x.sender = ?4",
             )
             .map_err(db_error)?
             .query_row(
                 params![row.room, edit_event_id, row.event_id, row.sender_row, user_id],
-                |sql_row| Ok((sql_row.get(0)?, sql_row.get::<_, i64>(1)? == 1)),
+                |sql_row| {
+                    Ok(PointedEditRow {
+                        content_json: sql_row.get(0)?,
+                        raw_event: sql_row.get(1)?,
+                        is_redacted: sql_row.get::<_, i64>(2)? == 1,
+                        reader_hidden: sql_row.get(3)?,
+                    })
+                },
             )
             .optional()
             .map_err(db_error)?;
-        let Some((content_json, is_visible)) = found else {
+        let Some(PointedEditRow {
+            content_json,
+            raw_event: edit_raw_event,
+            is_redacted,
+            reader_hidden: hidden,
+        }) = found
+        else {
             return Ok(CurrentEdit::NotEdited);
         };
-        if !is_visible {
-            return Ok(CurrentEdit::NotVisible);
+        match hidden {
+            None => return Ok(CurrentEdit::NotSynced),
+            Some(0) => {}
+            // 0 以外的值都不是正面認得「沒 hide」：當 hide 了（fail closed）。
+            Some(_) => return Ok(CurrentEdit::Hidden),
+        }
+        if is_redacted {
+            let edit_raw_event: Option<serde_json::Value> = edit_raw_event
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok());
+            return Ok(CurrentEdit::Redacted {
+                reason: self.find_redaction_reason(
+                    row.room,
+                    edit_event_id,
+                    edit_raw_event.as_ref(),
+                )?,
+            });
         }
         Ok(
             match content_json
@@ -685,7 +726,7 @@ impl Cache {
         )
     }
 
-    /// 參照這則的 reaction，🚨 **只算這個帳號同步過的**（跟事件本身同一條可見性規則），被 redact 的不算。
+    /// 參照這則的 reaction，🚨 **只算這個帳號同步過、沒 hide 的**（跟事件本身同一條可見性規則），被 redact 的不算。
     fn list_reactions(&self, user_id: &str, row: &EventRow) -> Result<Vec<Reaction>, SdkError> {
         let mut statement = self
             .connection
@@ -695,7 +736,7 @@ impl Cache {
                  JOIN events_synced_log l ON l.event = x.id
                  JOIN users reader ON reader.id = l.user
                  WHERE x.room = ?1 AND x.ref_event_id = ?2 AND x.class = 'reaction' AND x.is_redacted = 0
-                   AND reader.mxid = ?3
+                   AND reader.mxid = ?3 AND l.hidden = 0
                  ORDER BY x.id",
             )
             .map_err(db_error)?;
@@ -733,7 +774,8 @@ impl Cache {
     /// 刪除的理由：本地有 redact 事件就用它的 `reason`，否則看 server 蓋在原樣上的 `redacted_because`。
     fn find_redaction_reason(
         &self,
-        row: &EventRow,
+        room: i64,
+        event_id: &str,
         raw_event: Option<&serde_json::Value>,
     ) -> Result<Option<String>, SdkError> {
         let redaction_body: Option<Option<String>> = self
@@ -743,7 +785,7 @@ impl Cache {
                  ORDER BY id LIMIT 1",
             )
             .map_err(db_error)?
-            .query_row(params![row.room, row.event_id], |sql_row| sql_row.get(0))
+            .query_row(params![room, event_id], |sql_row| sql_row.get(0))
             .optional()
             .map_err(db_error)?;
         let reason_in = |content: Option<&serde_json::Value>| {
@@ -1173,6 +1215,15 @@ const EVENT_ROW_COLUMNS: &str =
     "e.id, e.room, e.event_id, r.room_id, e.sender, s.mxid, e.origin_server_ts, e.r_seq, e.g_seq,
      e.decrypted, e.raw_event, e.event_type, e.content_json, e.is_redacted, e.class, e.ref_event_id";
 
+/// [`Cache::find_current_edit`] 讀到的那個 edit 列。
+struct PointedEditRow {
+    content_json: Option<String>,
+    raw_event: Option<String>,
+    is_redacted: bool,
+    /// None ＝ 讀者沒有同步紀錄；Some(0／1) ＝ 有紀錄、hide 了沒。
+    reader_hidden: Option<i64>,
+}
+
 /// [`Cache::find_current_edit`] 的答案。
 enum CurrentEdit {
     NotEdited,
@@ -1180,7 +1231,11 @@ enum CurrentEdit {
         new_content: serde_json::Value,
         editor: String,
     },
-    NotVisible,
+    NotSynced,
+    Hidden,
+    Redacted {
+        reason: Option<String>,
+    },
 }
 
 struct EventRow {
@@ -3143,6 +3198,78 @@ mod tests {
             .unwrap();
         assert_eq!(written, 0);
         assert_eq!(cache.count_rows("events").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 有參照就以參照物為準：讀者 hide 了目前的 edit → 這則跟著隱藏（維護者 2026-09-14）。別的帳號不受影響。
+    #[test]
+    fn hiding_the_current_edit_hides_the_message_for_that_reader() {
+        let (mut cache, dir) = open("edit-hidden");
+        let fixtures = [
+            text("!r", "$t", Some(1), 1),
+            edit_of("!r", "$e", CAROL, "$t", 20, "hello"),
+        ];
+        put(&mut cache, ALICE, &fixtures);
+        put(&mut cache, BOB, &fixtures);
+        assert!(cache.hide_message(ALICE, "!r", "$e").unwrap());
+        assert!(cache.history(ALICE, "!r", None, 10).unwrap().is_empty());
+        assert!(cache
+            .list_messages_by_event_ids(ALICE, "!r", &["$t".to_string()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(body_of(&cache, BOB, "!r", "$t").as_deref(), Some("hello"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 防線：指標還指著一個被 redact 的 edit（正常流程會重設，這裡用 SQL 做出來）→ 已刪除，🚫 不顯示那個 edit 的內容。
+    #[test]
+    fn a_current_edit_that_is_redacted_shows_deleted() {
+        let (mut cache, dir) = open("edit-pointer-redacted");
+        put(
+            &mut cache,
+            ALICE,
+            &[
+                text("!r", "$t", Some(1), 1),
+                edit_of("!r", "$e", CAROL, "$t", 20, "hello"),
+            ],
+        );
+        cache
+            .connection
+            .execute(
+                "UPDATE events SET is_redacted = 1 WHERE event_id = '$e'",
+                [],
+            )
+            .unwrap();
+        let shown = cache.history(ALICE, "!r", None, 1).unwrap().remove(0);
+        assert!(
+            matches!(shown.kind, MessageKind::Deleted { .. }),
+            "{shown:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// reaction 被讀者 hide 了就不算。
+    #[test]
+    fn a_hidden_reaction_is_not_counted() {
+        let (mut cache, dir) = open("reaction-hidden");
+        put(
+            &mut cache,
+            ALICE,
+            &[
+                text("!r", "$t", Some(1), 1),
+                reaction_of("!r", "$r1", BOB, "$t", "👍"),
+                reaction_of("!r", "$r2", CAROL, "$t", "👍"),
+            ],
+        );
+        assert!(cache.hide_message(ALICE, "!r", "$r1").unwrap());
+        let shown = cache.history(ALICE, "!r", None, 1).unwrap().remove(0);
+        assert_eq!(
+            shown.reactions,
+            vec![Reaction {
+                key: "👍".into(),
+                by: vec![CAROL.into()]
+            }]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
