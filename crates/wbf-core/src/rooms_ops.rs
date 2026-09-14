@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use wbf_sdk::chat::{ChatBackend, Conversation, Message, MessageKind};
 use wbf_sdk::manifest::Manifest;
-use wbf_sdk::Cipher;
+use wbf_sdk::{Cipher, EventPage, IncomingEvent};
 
 use crate::accounts::AccountDir;
 use crate::backend_choice::{get_backend_for, BackendKind, MethodHome};
@@ -292,18 +292,29 @@ impl Core {
             .upstream_page_of(account, room, limit, before, server_backup)
             .await?;
         if sync == SyncMode::Server {
-            // 🚫 看一眼不寫庫。
-            return Ok((page.events, page.next));
+            // 🚫 看一眼不寫庫：只折這一頁裡的關係事件。
+            let messages = wbf_sdk::event_json::messages_from_incoming(room, &page.events);
+            return Ok((messages, page.next));
         }
-        // `Both`：寫進去**等它落地**，再用這一頁的 event_id 讀回。
+        // `Both`：**原樣**寫進去等它落地（local-cache-db.md §7），再用這一頁的 event_id 讀回。
         // ⭐ 上游決定**哪幾則、什麼順序**，本地決定**每一則長什麼樣**（已解密的明文不會被密文蓋掉、
-        // `hidden` 的不出來）。🚫 不從本地「照 r_seq 重讀一頁」：非 fork server 的事件沒有 r_seq。
+        // 別頁的 edit／redact／reaction 已經套上、`hidden` 的不出來）。
+        // 🚫 不從本地「照 r_seq 重讀一頁」：非 fork server 的事件沒有 r_seq。
         let (cache, me) = self.server_cache_and_me(account)?;
-        let event_ids: Vec<String> = page.events.iter().map(|message| message.id.clone()).collect();
+        let event_ids: Vec<String> = page
+            .events
+            .iter()
+            .filter_map(IncomingEvent::find_event_id)
+            .map(str::to_string)
+            .collect();
         let events = page.events;
-        let writer_me = me.clone();
+        let (writer_me, writer_room) = (me.clone(), room.to_string());
         cache
-            .run(move |cache| cache.upsert_messages(&writer_me, &events).map(|_| ()))
+            .run(move |cache| {
+                cache
+                    .upsert_events(&writer_me, &writer_room, &events)
+                    .map(|_| ())
+            })
             .await?;
         let read_back = cache
             .read()
@@ -325,7 +336,7 @@ impl Core {
         limit: u32,
         before: Option<&str>,
         server_backup: bool,
-    ) -> Result<wbf_sdk::chat::Page, CoreError> {
+    ) -> Result<EventPage, CoreError> {
         let speaks_wbf = self.get_backend_kind(account).await == BackendKind::WbfSdk;
         let backend = get_backend_for(Transport::default(), speaks_wbf, MethodHome::BothSides)?;
         if backend == BackendKind::WbfSdk {
@@ -360,7 +371,10 @@ impl Core {
             return Ok(Anchor::Found(None));
         };
         let (cache, me) = self.server_cache_and_me(account)?;
-        let position = cache.read().await.find_event_position(&me, room, event_id)?;
+        let position = cache
+            .read()
+            .await
+            .find_event_position(&me, room, event_id)?;
         Ok(match position.and_then(|position| position.g_seq) {
             Some(g_seq) => Anchor::Found(Some(g_seq)),
             None => Anchor::NotInLocalCache,
@@ -374,7 +388,7 @@ impl Core {
         room: &str,
         limit: u32,
         before_g_seq: Option<i64>,
-    ) -> Result<wbf_sdk::chat::Page, CoreError> {
+    ) -> Result<EventPage, CoreError> {
         let mut client = self
             .client_of(account, Transport::default(), MethodHome::BothSides)
             .await?;
@@ -402,7 +416,10 @@ impl Core {
             )
             .await?;
         // 回來的是新到舊（g_seq 遞減），跟 `/messages` 往回翻同一個方向。
-        Ok(page_from_raw_window(room, &raws))
+        // WS 這條路不解密：密文原樣交出去（local-cache-db.md §7.2）。
+        Ok(EventPage::from_upstream_order(
+            raws.into_iter().map(IncomingEvent::from_ws_json).collect(),
+        ))
     }
 
     /// 純本地的一頁。
@@ -495,27 +512,6 @@ enum Anchor {
     NotInLocalCache,
 }
 
-/// wbf 的一窗（原始事件 JSON，新到舊）→ `Page`：訊息照常折疊，**`next` 從折疊之前的原始順序取**。
-///
-/// 🚨 **游標不准從折疊後的輸出推**（PR #36 審查 rumia🔴）：`messages_from_json` 會把 reaction／edit／redaction
-/// 折進目標、從輸出拿掉；要是最舊那則原始事件被折掉，折疊後的最後一則比較新，拿它往回問就重複同一段。
-/// 📎 跟 matrix backend 的 `page_from_timeline` 同一條規則。
-///
-/// Args:
-///     room: room_id, example: "!r:localhost"
-///     raws: 這一窗的原始事件，新到舊
-/// Return:
-///     Page  `next` ＝ 原始順序裡最舊、而且有 `event_id` 的那則；空窗（或整窗都沒有 id）才是 None ＝到頭了
-fn page_from_raw_window(room: &str, raws: &[serde_json::Value]) -> wbf_sdk::chat::Page {
-    let next = raws
-        .iter()
-        .rev()
-        .find_map(|raw| raw.get("event_id").and_then(|event_id| event_id.as_str()))
-        .map(str::to_string);
-    let events = wbf_sdk::event_json::messages_from_json(room, raws);
-    wbf_sdk::chat::Page { events, next }
-}
-
 fn refuse_local_paging_without_r_seq(room: &str) -> CoreError {
     CoreError::new(
         CoreErrorKind::Usage,
@@ -533,6 +529,8 @@ fn kind_matches(message: &Message, wanted: &str) -> bool {
         MessageKind::Text { .. } => wanted == "text" || wanted == "m.room.message",
         MessageKind::File { .. } => wanted == "file" || wanted == "org.wbftw.wbfuwunel.file",
         MessageKind::Deleted { .. } => wanted == "deleted",
+        MessageKind::Undecryptable => wanted == "undecryptable",
+        MessageKind::Outdated => wanted == "outdated",
         MessageKind::System { event_type, .. } => wanted == "system" || wanted == event_type,
         MessageKind::Unsupported { event_type, .. } => {
             wanted == "unsupported" || wanted == event_type
@@ -558,13 +556,13 @@ pub fn cipher_for_plaintext_room(requested: Option<&str>) -> Result<Cipher, Core
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wbf_sdk::chat::MessageKind;
 
     const SERVER: &str = "http://127.0.0.1:1";
     const ME: &str = "@a:localhost";
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("wbf-core-rooms-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("wbf-core-rooms-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -576,8 +574,7 @@ mod tests {
         let core = Core::open(dir);
         core.unlock(None).unwrap();
         let vault = core.vault().unwrap();
-        let account =
-            AccountDir::locate(dir, &vault.account_dir_key(), SERVER, ME).unwrap();
+        let account = AccountDir::locate(dir, &vault.account_dir_key(), SERVER, ME).unwrap();
         std::fs::create_dir_all(&account.dir).unwrap();
         vault
             .seal_session(
@@ -594,30 +591,23 @@ mod tests {
         (core, account)
     }
 
-    fn text(id: &str, r_seq: Option<i64>, ts: u64) -> Message {
-        Message {
-            id: id.to_string(),
-            conversation: "!r".to_string(),
-            sender: "@b:localhost".to_string(),
-            sent_at: ts,
-            kind: MessageKind::Text {
-                body: id.to_string(),
-                formatted_html: None,
-            },
-            reply_to: None,
-            edited_by: None,
-            reactions: Vec::new(),
-            decrypted: Some(true),
-            undecryptable_reason: None,
-            r_seq,
-            g_seq: r_seq.map(|seq| seq * 10),
+    fn text(id: &str, r_seq: Option<i64>, ts: u64) -> IncomingEvent {
+        let mut event = serde_json::json!({
+            "type": "m.room.message", "event_id": id, "room_id": "!r", "sender": "@b:localhost",
+            "origin_server_ts": ts, "content": { "msgtype": "m.text", "body": id },
+        });
+        if let Some(r_seq) = r_seq {
+            event["unsigned"] = serde_json::json!({
+                wbf_sdk::protocol::R_SEQ_KEY: r_seq, wbf_sdk::protocol::G_SEQ_KEY: r_seq * 10,
+            });
         }
+        IncomingEvent::Plain { event }
     }
 
-    fn seed(core: &Core, account: &AccountDir, messages: Vec<Message>) {
+    fn seed(core: &Core, account: &AccountDir, events: Vec<IncomingEvent>) {
         let (cache, me) = core.server_cache_and_me(account).unwrap();
         cache
-            .run_blocking(move |cache| cache.upsert_messages(&me, &messages).map(|_| ()))
+            .run_blocking(move |cache| cache.upsert_events(&me, "!r", &events).map(|_| ()))
             .unwrap();
     }
 
@@ -640,7 +630,10 @@ mod tests {
     }
 
     fn ids(page: &MessagePage) -> Vec<&str> {
-        page.events.iter().map(|message| message.id.as_str()).collect()
+        page.events
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect()
     }
 
     /// fork 房的本地翻頁：`before` 是 **event_id**、`next` 是這頁最舊那則的 event_id，
@@ -652,7 +645,9 @@ mod tests {
         seed(
             &core,
             &account,
-            (1..=5).map(|seq| text(&format!("${seq}"), Some(seq), seq as u64)).collect(),
+            (1..=5)
+                .map(|seq| text(&format!("${seq}"), Some(seq), seq as u64))
+                .collect(),
         );
 
         let first = core.history(&local_query(None), &me()).await.unwrap();
@@ -702,7 +697,12 @@ mod tests {
                 ..local_query(None)
             };
             let error = core.history(&query, &me()).await.unwrap_err();
-            assert_eq!(error.kind, CoreErrorKind::Usage, "sync={sync:?}: {}", error.message);
+            assert_eq!(
+                error.kind,
+                CoreErrorKind::Usage,
+                "sync={sync:?}: {}",
+                error.message
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -720,26 +720,12 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, CoreErrorKind::Usage);
-        assert!(error.message.contains("not in the local cache"), "{}", error.message);
+        assert!(
+            error.message.contains("not in the local cache"),
+            "{}",
+            error.message
+        );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 🚨 **`next` 從原始順序取，不從折疊後的輸出取**（PR #36 審查 rumia🔴）：
-    /// 這一窗新到舊是 `[$t, $r]`，最舊的 `$r` 是對 `$t` 的 reaction —— 折疊後只剩 `$t`，但下一頁要從 `$r` 之前問。
-    #[test]
-    fn the_next_anchor_of_a_wbf_window_is_its_oldest_raw_event() {
-        let raws = [
-            serde_json::json!({ "type": "m.room.message", "event_id": "$t", "room_id": "!r", "sender": "@a:x",
-                "origin_server_ts": 2, "content": { "msgtype": "m.text", "body": "hi" } }),
-            serde_json::json!({ "type": "m.reaction", "event_id": "$r", "room_id": "!r", "sender": "@b:x",
-                "origin_server_ts": 1,
-                "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "👍" } } }),
-        ];
-        let page = page_from_raw_window("!r", &raws);
-        let ids: Vec<&str> = page.events.iter().map(|message| message.id.as_str()).collect();
-        assert_eq!(ids, ["$t"], "reaction 折進了目標");
-        assert_eq!(page.next.as_deref(), Some("$r"), "🚨 游標是上游最舊那則");
-        assert_eq!(page_from_raw_window("!r", &[]).next, None, "空窗才是到頭");
     }
 
     #[test]

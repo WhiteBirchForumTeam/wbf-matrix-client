@@ -110,6 +110,8 @@ pub enum MessageKind {
     File { attachment: Attachment, caption: Option<String> },     // 我們的分塊檔；圖片影片也是 File，用 mimetype 分
     Deleted { by: PeerId, reason: Option<String> },
     System(SystemEvent),                  // 誰加入、改名、改權限…；UI 印成一行灰字
+    Undecryptable,                        // 解不開的加密事件：跟 Deleted 一樣是明確的記號（decrypted: false 帶原因）
+    Outdated,                             // 被 edit 過、但目前那個 edit 這個帳號還沒同步到：本地版本過時，原文與 edit 都不給
     Unsupported { event_type: String },   // 認不得的事件：照印 type，不丟
 }
 
@@ -197,7 +199,9 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照約定 §5。**送出時同一個請求要宣告 `attachments`**（約定 §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
 | `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
-| `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為，我們不能保留原文**（本地也不存，§7.1） |
+| `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（local-cache-db.md §7.2、§7.6，維護者 2026-09-14） |
+| `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
+| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（local-cache-db.md §7.5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
 | `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>` |
 | `System` | `m.room.member`、`m.room.name`、`m.room.topic`、`m.room.power_levels`、`m.room.encryption`、`m.room.pinned_events`… |
 | `Unsupported` | 其他所有 type。**不丟**，這是 fail-safe：至少讓人看到「這裡有東西」 |
@@ -250,7 +254,9 @@ pub enum Update {
 }
 ```
 
-現在的實作：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（CLI 規格 §3.4.2）。
+現在的實作：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。
+⚠️ 第 3 步實作的變體是 `NewEvents { conversation, events: Vec<IncomingEvent> }`（上游給的**原樣**，關係事件也在），🚫 不是 `NewMessage`：
+快取要存原樣（local-cache-db.md §7），通知由 core 用 `event_json::messages_from_incoming` 折好再發。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（CLI 規格 §3.4.2）。
 之後換自己的協定：server 推 pack，adapter 翻成同一個 `Update`，CLI／UI 不動。
 
 ### 4.3 順序：為什麼不能用時間戳排序

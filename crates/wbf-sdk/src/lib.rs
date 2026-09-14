@@ -13,6 +13,7 @@
 //! - `cache`（feature `cache`）：`cache.db`，SQLCipher 的本地快取（local-cache-db.md §6）；金鑰從 `vault` 來。
 //! - `vault`：本地金鑰庫（`local.key`、子金鑰、`session.sealed`），local-cache-db.md §4。
 //!
+//! - `incoming`：上游給的事件原樣（`IncomingEvent`）、一頁的游標、事件分類與 edit 的有效性規則（local-cache-db.md §7）。
 //! - `event_json`：原始 Matrix 事件 JSON → `Message`，matrix backend 與 `recent` 共用。
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
 
@@ -30,6 +31,7 @@ pub mod download;
 pub mod error;
 pub mod error_code;
 pub mod event_json;
+pub mod incoming;
 pub mod login;
 pub mod manifest;
 #[cfg(feature = "cache")]
@@ -43,7 +45,7 @@ pub mod vault;
 pub use account_dir::{find_dir_name_plaintext, to_dir_name, DirScope};
 pub use channel::{Channel, PackChannel, Transport};
 pub use chat::{
-    Attachment, ChatBackend, Conversation, ConversationKind, Message, MessageKind, Page, Update,
+    Attachment, ChatBackend, Conversation, ConversationKind, Message, MessageKind, Update,
     WatchControl, WatchEnd,
 };
 pub use chunk_block::{BlockError, ChunkedBlock};
@@ -52,6 +54,7 @@ pub use cipher::Cipher;
 pub use client::{OnBatch, RecentPlan, RecentSync, RecentWindow, WbfClient};
 pub use download::{DownloadReport, SeekResult};
 pub use error::SdkError;
+pub use incoming::{EventPage, IncomingEvent};
 pub use login::Session;
 pub use manifest::{Manifest, UploadState};
 pub use room_keys::{get_snapshot_status, SnapshotStatus};
