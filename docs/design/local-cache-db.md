@@ -34,7 +34,7 @@
 |---|---|
 | 房間列表與 metadata | room_id、名稱、是否 E2EE、成員數、最後活動時間 |
 | 時間線事件，**解密後的明文** | 含 `org.wbftw.wbfuwunel.chunked` 區塊（裡面有媒體金鑰）。這是整個 DB 非加密不可的理由 |
-| 每房的翻頁 token、閱讀位置 | `read`／`watch` 接著翻用 |
+| 每房的閱讀位置 | `read`／`watch` 接著看用。📎 翻頁 token 🚫 不存：往回翻一律拿 `event_id` 當錨（rpc-spec §3.3） |
 | 已知的 manifest | 就是事件區塊加 mxc，給 `files`／`download` 用；不另存一份，從事件查 |
 
 | 不存 | 理由 |

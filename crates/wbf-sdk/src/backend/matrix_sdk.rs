@@ -214,8 +214,8 @@ impl ChatBackend for MatrixBackend {
             return Err(SdkError::Usage("history limit must be at least 1".into()));
         }
         let room = self.room(id)?;
-        let (adjacent, from) = match before {
-            None => (Vec::new(), None),
+        let (adjacent, from, remaining) = match before {
+            None => (Vec::new(), None, limit),
             Some(anchor) => {
                 let anchor = matrix_sdk::ruma::EventId::parse(anchor).map_err(|error| {
                     SdkError::Usage(format!("`before` must be an event id: {error}"))
@@ -224,17 +224,20 @@ impl ChatBackend for MatrixBackend {
                     .event_with_context(&anchor, false, UInt::from(0u32), None)
                     .await
                     .map_err(matrix_error)?;
-                // 🚨 沒有 token ＝ 那一則之前已經沒有東西了（房間的開頭）：
-                // 🚫 不要再用 `from: None` 去問 —— 那會拿到**最新**的一頁，看起來像成功。
-                if context.prev_batch_token.is_none() {
-                    let events = aggregate(id, context.events_before.iter().map(to_message).collect());
-                    let next = next_anchor_of(&events);
-                    return Ok(Page { events, next });
+                let has_prev_token = context.prev_batch_token.is_some();
+                match plan_after_context(context.events_before, has_prev_token, limit) {
+                    ContextPlan::Done(events_before) => {
+                        let events = aggregate(id, events_before.iter().map(to_message).collect());
+                        let next = next_anchor_of(&events);
+                        return Ok(Page { events, next });
+                    }
+                    ContextPlan::Continue {
+                        adjacent,
+                        remaining,
+                    } => (adjacent, context.prev_batch_token, remaining),
                 }
-                (context.events_before, context.prev_batch_token)
             }
         };
-        let remaining = limit.saturating_sub(u32::try_from(adjacent.len()).unwrap_or(u32::MAX));
         let mut timeline: Vec<TimelineEvent> = adjacent;
         if remaining > 0 {
             let mut options = MessagesOptions::backward();
@@ -623,6 +626,50 @@ fn matrix_error(error: matrix_sdk::Error) -> SdkError {
 // ---- 事件 → Message ----
 
 /// `TimelineEvent` 是 matrix-sdk 解密過的結果：解得開就是明文事件，解不開是原事件加原因。這裡把它變成我們的 `Message`。
+/// `/context` 回來之後，這一頁還要不要再問 `/messages`。
+#[derive(Debug, PartialEq, Eq)]
+enum ContextPlan<T> {
+    /// 不用再問：緊鄰的已經湊滿一頁，或那一則之前已經沒有東西（房間的開頭）。
+    Done(Vec<T>),
+    /// 還差幾則：從 `prev_batch_token` 往回問 `/messages`。
+    Continue { adjacent: Vec<T>, remaining: u32 },
+}
+
+/// 🚨 **這一頁最多 `limit` 則** —— `/context` 回多少都一樣（PR #36 審查 rumia🔴）。
+///
+/// `/context` 的 `limit` 我們給 0，但有的 server 把 0 當「預設值」、照樣回一串 `events_before`；
+/// 整串塞進這一頁，`limit = 1` 就可能回 10 則。所以先截到 `limit`。
+///
+/// ⭐ **截掉的不會被跳過**：下一頁的錨是**這一頁最舊那則的 `event_id`**（`next_anchor_of`），
+/// 下一次會對它重新 `/context` —— 被截掉的那幾則比它舊，下一頁自然拿到。
+/// 🚫 所以截掉之後**不能**再從 `prev_batch_token` 接 `/messages`：那個 token 在**整串** `events_before` 之前，
+/// 接下去會跳過被截掉的那段。
+///
+/// 🚨 沒有 token ＝ 那一則之前已經沒有東西（房間的開頭）：🚫 不再用 `from: None` 去問，那會拿到最新一頁、看起來像成功。
+///
+/// Args:
+///     events_before: `/context` 回的緊鄰更舊事件，新到舊, example: vec![e9, e8, e7]
+///     has_prev_token: `/context` 有沒有給 `prev_batch_token`, example: true
+///     limit: 這一頁最多幾則（呼叫端已擋掉 0）, example: 1
+/// Return:
+///     Done(events)                 截到 `limit` 的緊鄰事件就是整頁
+///     Continue { adjacent, remaining }  緊鄰的不到 `limit`、而且還有 token：再問 `remaining` 則
+fn plan_after_context<T>(mut events_before: Vec<T>, has_prev_token: bool, limit: u32) -> ContextPlan<T> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    if events_before.len() >= limit {
+        events_before.truncate(limit);
+        return ContextPlan::Done(events_before);
+    }
+    if !has_prev_token {
+        return ContextPlan::Done(events_before);
+    }
+    let remaining = u32::try_from(limit - events_before.len()).unwrap_or(u32::MAX);
+    ContextPlan::Continue {
+        adjacent: events_before,
+        remaining,
+    }
+}
+
 /// 下一頁的錨：這一頁**最舊**那則的 `event_id`（頁是新到舊，所以是最後一則）。
 ///
 /// Return:
@@ -655,4 +702,45 @@ fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
     message.decrypted = decrypted;
     message.undecryptable_reason = reason;
     (message, relation)
+}
+
+#[cfg(test)]
+mod context_plan_tests {
+    use super::*;
+
+    /// 🚨 **`/context` 回的比 `limit` 多：截到 `limit`，而且不再接 `/messages`**（PR #36 審查 rumia🔴）。
+    /// 有的 server 把 `limit=0` 當預設值；整串塞進來，`limit = 1` 就回 10 則。
+    #[test]
+    fn a_context_that_returns_more_than_the_limit_is_cut_to_the_limit() {
+        let events_before: Vec<u32> = (0..10).rev().collect(); // 9, 8, …, 0：新到舊
+        assert_eq!(
+            plan_after_context(events_before, true, 1),
+            ContextPlan::Done(vec![9]),
+            "最多 1 則，而且是最新（緊鄰錨點）的那則；🚫 不從 token 接，那會跳過被截掉的 8…0"
+        );
+    }
+
+    #[test]
+    fn exactly_the_limit_needs_no_messages_call() {
+        assert_eq!(plan_after_context(vec![3, 2], true, 2), ContextPlan::Done(vec![3, 2]));
+    }
+
+    #[test]
+    fn fewer_than_the_limit_continues_from_the_token_for_the_rest() {
+        assert_eq!(
+            plan_after_context(vec![3, 2], true, 5),
+            ContextPlan::Continue {
+                adjacent: vec![3, 2],
+                remaining: 3
+            }
+        );
+    }
+
+    /// 沒有 token ＝房間的開頭：🚫 不再問（`from: None` 會拿到最新一頁），也🚫 不超過 limit。
+    #[test]
+    fn no_token_means_the_start_of_the_room_and_still_respects_the_limit() {
+        assert_eq!(plan_after_context(vec![3, 2], false, 5), ContextPlan::Done(vec![3, 2]));
+        assert_eq!(plan_after_context(vec![3, 2, 1], false, 2), ContextPlan::Done(vec![3, 2]));
+        assert_eq!(plan_after_context(Vec::<u32>::new(), false, 5), ContextPlan::Done(vec![]));
+    }
 }

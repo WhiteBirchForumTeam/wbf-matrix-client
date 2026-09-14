@@ -277,6 +277,14 @@ impl Core {
         sync: SyncMode,
         server_backup: bool,
     ) -> Result<(Vec<Message>, Option<String>), CoreError> {
+        // 🚫 `limit = 0` 在入口就擋（PR #36 審查 cirno💡1）：wbf 那條會送 `Recent{limit: 0}` 拿回空頁、`next` 是 None，
+        // UI 會讀成「到頭了」；matrix 那條卻回 Usage —— 同一個輸入兩種答案。三種 `sync` 都經過這裡，所以只擋這一次。
+        if limit == 0 {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                "limit must be at least 1: an empty page means \"no older messages\", so asking for zero would say that falsely",
+            ));
+        }
         if sync == SyncMode::Local {
             return self.cached_page_of(account, room, limit, before).await;
         }
@@ -658,6 +666,24 @@ mod tests {
             let error = core.history(&local_query(before), &me()).await.unwrap_err();
             assert_eq!(error.kind, CoreErrorKind::Usage, "before={before:?}");
             assert!(error.message.contains("sync=both"), "{}", error.message);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚫 `limit = 0` 在入口就擋：空頁的意思是「沒有更舊的了」，要 0 則會假裝那件事（PR #36 審查 cirno💡1）。
+    /// ⚠️ 用 `server` 模式驗：它會打上游，所以要在**連網之前**就擋下來（session 指向沒人在聽的位址，連了就是 Network 錯）。
+    #[tokio::test]
+    async fn a_zero_limit_is_refused_before_anything_is_asked() {
+        let dir = scratch("zero-limit");
+        let (core, _account) = core_with_account(&dir);
+        for sync in [SyncMode::Local, SyncMode::Server, SyncMode::Both] {
+            let query = HistoryQuery {
+                limit: 0,
+                sync,
+                ..local_query(None)
+            };
+            let error = core.history(&query, &me()).await.unwrap_err();
+            assert_eq!(error.kind, CoreErrorKind::Usage, "sync={sync:?}: {}", error.message);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
