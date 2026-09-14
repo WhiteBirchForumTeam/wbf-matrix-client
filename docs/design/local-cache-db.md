@@ -225,7 +225,7 @@ CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_
   encrypted INTEGER CHECK (encrypted IN (0, 1)));
 
 -- 🚧 這張表會照 §7 改（2026-09-14 草案）：message_json 改名 raw_event 並改存原始事件、加 final_body／is_processed／
---    is_redacted／class／edit_g_seq。下面是現在實作的樣子。
+--    is_redacted／class／ref_event_id。下面是現在實作的樣子。
 -- 事件一份，解密後的明文放這裡，不記誰的。
 -- message_json 是 Message 去掉 id／conversation／sender／sent_at／r_seq／g_seq／decrypted 之後的剩餘（kind、reply_to、edited_by、
 -- reactions、undecryptable_reason），讀出時從欄位組回完整的 Message（split_message／join_message），同一份資料不存兩次。
@@ -364,7 +364,13 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 | **`is_processed`** | BOOL | 0 | 這一則處理完了沒。⚠️ edit／redact／reaction 自己的效果在**目標**上，所以它們也需要這一欄 |
 | **`is_redacted`** | BOOL | 0 | 被 redact 過就打勾。**redact 優先**：打勾之後任何 edit 都不能改它 |
 | **`class`** | | `general` | `general`（還不知道是什麼的密文）／`msg`／`edit`／`redact`／`reaction` |
-| **`edit_g_seq`** | INTEGER | NULL | 見 §7.5；在**目標**與**edit 事件**上意思不同 |
+| **`ref_event_id`** | TEXT | NULL | **參照**：edit／redact／reaction 指向的**目標的 `event_id`**。一般訊息是 NULL。**加索引** `(room, ref_event_id)`（§7.4 用它反查「誰參照這則」） |
+
+⚠️ **`ref_event_id` 是 §6 第 2 條原則的刻意例外**（「字串識別碼在整個 DB 裡各只出現一次，其餘全走整數外鍵」）：
+這裡**沒辦法用外鍵**，因為目標那一列**可能還不存在**（只先讀到 edit／redact）。
+📎 只有關係事件才填，數量遠少於訊息。
+⭐ 用 `event_id` 而不是 `g_seq` 參照（維護者 2026-09-14）：關係事件本身就帶著目標的 `event_id`（`m.relates_to.event_id`、`redacts`），
+寫入當下就填得進去；🚫 **不帶目標的 `g_seq`**，要等目標到了才知道 —— 而且一般 Matrix server 根本沒有 `g_seq`。
 
 ### 7.4 各類事件怎麼處理
 
@@ -372,17 +378,26 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 收到事件 → 先解密（明文事件不用解）
   ├─ 解不開           → class=general，final_body=NULL，is_processed=0
   ├─ msg              → final_body=內容，class=msg，is_processed=1
-  ├─ edit             → 自己：final_body=new_content（本地審計），class=edit
+  ├─ edit             → 自己：final_body=new_content（本地審計），class=edit，ref_event_id=目標
   │                     目標：照 §7.5 決定要不要改
-  ├─ redact           → 目標：is_redacted=1（原始事件照樣留著）
-  │                     自己：class=redact，is_processed=1
-  └─ reaction         → class=reaction（怎麼聚合回目標見 §7.7 第 1 點）
+  ├─ redact           → 自己：class=redact，ref_event_id=目標，is_processed=1
+  │                     目標：is_redacted=1（原始事件照樣留著）
+  └─ reaction         → 自己：class=reaction，ref_event_id=目標
 ```
 
 - **明文事件**（沒加密的房間）：收到當下就分類、`is_processed=1`，不用等解密。
-- **目標還沒到本地**：那則 edit／redact／reaction 就停在 `is_processed=0`，**等目標到了再處理**。不另開暫存表 —— `is_processed` 就是那張表。
+- ⭐ **目標還沒到本地**（只先讀到 edit 或 redact）：那則關係事件停在 `is_processed=0`。
+  **目標寫入時，先查「誰參照這則」**（維護者 2026-09-14）：
 
-### 7.5 edit：全量取代，只套最新的（`edit_g_seq`）
+  ```sql
+  SELECT … FROM events WHERE room = ? AND ref_event_id = <目標的 event_id> AND is_processed = 0
+  ```
+
+  有索引，這一查很快。查到的依 §7.5／§7.6 套上去再標 `is_processed=1`。
+  不另開暫存表 —— `is_processed=0` 加上 `ref_event_id` 就是那張表。
+- **reaction 聚合**：讀取時用同一個索引查 `class = reaction AND ref_event_id = <這則>`。
+
+### 7.5 edit：全量取代，只套最新的
 
 ⭐ **Matrix 的 edit 是全量修改，不是 delta**（查證於 vendor 的 matrix-sdk，它照 spec v1.17「validity of replacement events」）：
 
@@ -390,26 +405,24 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 - 🚫 **不能 edit 一個 edit**（`OriginalEventIsReplacement`）：每個 edit 都直接指向**原始事件**，沒有鏈。
 - 有多個 edit 時**套最新的那一個**，🚫 不重播中間的（matrix-sdk-ui 的 `resolve_edits`）。
 
-所以不必記錄或重播 edit 的歷史，**只要知道目前套的是哪一個**：
-
-| 列 | `edit_g_seq` 的意思 |
-|---|---|
-| **目標**（被改的訊息） | 目前套用的那個 edit 事件的 `g_seq`；沒被 edit 過是 NULL |
-| **edit 事件自己** | 它要改的**目標**的 `g_seq` |
+所以不必記錄或重播 edit 的歷史，**只要知道最新的是哪一個**。
+⭐ 那個答案不必另外存在目標上：**參照這則目標（`ref_event_id`）的 edit 裡，edit 自己的 `g_seq` 最大的那個**，
+有索引，查得到。🚫 不在目標上多存一份「目前套的是誰」—— 那是同一個事實的第二份，遲早對不上。
 
 收到一個 edit：
 
 ```
-找目標
-  ├─ 目標不在本地           → 這個 edit 停在 is_processed=0，等目標到
+找目標（ref_event_id）
+  ├─ 目標不在本地           → 這個 edit 停在 is_processed=0，等目標到（§7.4）
   ├─ 目標 is_redacted=1     → 跳過（redact 優先）
-  ├─ 目標.edit_g_seq ≥ 這個 edit 的 g_seq → 跳過（它比較舊）
+  ├─ 參照同一目標、有效的 edit 裡有 g_seq 比它新的 → 跳過（它比較舊）
   ├─ 這個 edit 無效（下表）  → 跳過
-  └─ 否則                   → 目標.final_body = new_content、目標.edit_g_seq = 這個 edit 的 g_seq
+  └─ 否則                   → 目標.final_body = new_content
 不管哪一條，這個 edit 自己都標 is_processed=1（目標不在本地那條除外）
 ```
 
 ⭐ **能省就省**：比較舊的、目標已 redact 的，直接跳過改的步驟（維護者 2026-09-14）。
+📎 比新舊用的是 **edit 事件自己**的 `g_seq`，跟參照用哪一欄無關。一般 server 沒有 `g_seq` 時怎麼比，見 §7.7 第 1 點。
 
 🚨 **無效的 edit 必須忽略**（spec 規定；有兩條是資安相關）：
 
@@ -429,20 +442,22 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 
 ### 7.7 🚧 還沒拍板的
 
-1. **「目標還沒到」的 edit／redact／reaction，目標到了之後怎麼找回來？** 現在的欄位裡沒有「它指向哪一則」
-   （`edit_g_seq` 要等目標到了才知道）。
-   - (a) 目標寫入時，掃**同一個房間**裡 `is_processed=0` 的關係事件，從 `raw_event` 解析出目標 id。不加欄位。
-   - (b) 多一欄 `relates_to`（目標 event_id）加索引，直接查。
-   - 📎 傾向 (b)：reaction 在讀取時也要靠它聚合回目標。
-2. **一般 Matrix server 沒有 `g_seq`**，`edit_g_seq` 比不出新舊。
+✅ ~~關係事件怎麼找回目標~~：用 `ref_event_id`（維護者 2026-09-14），見 §7.3、§7.4。
+
+1. **一般 Matrix server 沒有 `g_seq`**，edit 比不出新舊。
    - (a) 沒有 `g_seq` 就不套 edit（標處理過、不改目標）。
    - (b) 退回 `origin_server_ts`，平手比 `event_id`。
    - 📎 傾向 (b)，並寫明是退化做法（chat-model §4.3 說過時間戳排序不可靠，但一般 server 上沒有更好的依據）。
-3. **`final_body` 存什麼格式**：只存文字的話，檔案訊息（附件區塊、說明）放不下。
+2. **`final_body` 存什麼格式**：只存文字的話，檔案訊息（附件區塊、說明）放不下。
    - 📎 傾向存**解密後的整份 `content` JSON**，讀取時從它組出 `Message`。
-4. **解密還沒接**：`Event/Recent` 那條路現在完全不解密（`decrypted=0`）。
+3. **解密還沒接**：`Event/Recent` 那條路現在完全不解密（`decrypted=0`）。
    - 📎 傾向實作分兩支：先做**明文事件**的分類與 edit／redact／reaction 套用，密文一律 `general`；
      把 WS 收到的密文交給 matrix-sdk 的 `Room::decrypt_event`（它是 `pub`）另開一支。
+4. **「套了」與「跳過」怎麼分**（§7.5）：跳過的 edit 也標 `is_processed=1`，所以「最新的有效 edit」不能只看 `is_processed`。
+   - (a) 跳過的另外標記（例如多一個布林）。
+   - (b) 不分：每次從**參照這則、有效的所有 edit** 裡取 `g_seq` 最大的重算 `final_body`（比較舊的本來就不會贏）。
+   - 📎 傾向 **(b)**：少一個狀態；「跳過」的理由本來就是「比較舊」，重算時它自然不會被選到。
+     ⚠️ 但「無效的 edit」（sender 不同等）重算時要**每次重新驗**，或在寫入時就別當 `class = edit`（例如歸 `general`）。
 
 ## 8. 媒體儲存池：整檔明文放進一個加密的池，不進 DB（維護者 2026-09-07 定）
 
