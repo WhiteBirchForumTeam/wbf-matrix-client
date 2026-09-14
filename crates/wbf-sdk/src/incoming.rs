@@ -198,9 +198,9 @@ pub struct Classified {
     pub class: EventClass,
     /// 明文的 `type`；沒解開的是 None。
     pub event_type: Option<String>,
-    /// `final_body` 的初值：msg 是自己的 `content`、edit 是 `m.new_content`、redact／reaction 是自己的 `content`；
+    /// `content_json` 的初值：msg 是自己的 `content`、edit 是 `m.new_content`、redact／reaction 是自己的 `content`；
     /// 沒解開的是 None（＝還沒處理）。
-    pub final_body: Option<serde_json::Value>,
+    pub content_json: Option<serde_json::Value>,
     /// edit／redact／reaction 指向的目標。
     pub ref_event_id: Option<String>,
 }
@@ -219,7 +219,7 @@ pub fn classify(incoming: &IncomingEvent) -> Classified {
         return Classified {
             class: EventClass::General,
             event_type: None,
-            final_body: None,
+            content_json: None,
             ref_event_id: None,
         };
     };
@@ -240,7 +240,7 @@ pub fn classify(incoming: &IncomingEvent) -> Classified {
             .and_then(|value| value.as_str())
             .map(str::to_string)
     };
-    let (class, ref_event_id, final_body) = match event_type.as_str() {
+    let (class, ref_event_id, content_json) = match event_type.as_str() {
         "m.room.redaction" => {
             // room v11 起 `redacts` 在 content 裡；之前在事件頂層。兩邊都看。
             let target = content
@@ -277,7 +277,7 @@ pub fn classify(incoming: &IncomingEvent) -> Classified {
     Classified {
         class,
         event_type: Some(event_type),
-        final_body: Some(final_body),
+        content_json: Some(content_json),
         ref_event_id,
     }
 }
@@ -332,16 +332,16 @@ pub fn check_replacement(
     Ok(())
 }
 
-/// 套一個有效的 edit 之後，目標的 `final_body`：`m.new_content` 整份取代，
+/// 顯示一則被 edit 過的訊息時用的 content（讀取時算，🚫 不寫回任何一列）：`m.new_content` 整份取代，
 /// 但 **`m.relates_to` 留目標原本的**（spec：`m.new_content` 裡的 `m.relates_to` 不算數）—— 否則回覆關係被 edit 洗掉。
 ///
 /// Args:
-///     target_final_body: 目標現在的 final_body, example: {"msgtype":"m.text","body":"hi","m.relates_to":{"m.in_reply_to":{"event_id":"$q"}}}
-///     new_content: edit 的 final_body（`m.new_content`）, example: {"msgtype":"m.text","body":"hello"}
+///     target_content_json: 目標自己的 content_json, example: {"msgtype":"m.text","body":"hi","m.relates_to":{"m.in_reply_to":{"event_id":"$q"}}}
+///     new_content: 最新那個有效 edit 的 content_json（`m.new_content`）, example: {"msgtype":"m.text","body":"hello"}
 /// Return:
 ///     Value  new_content 去掉它自己的 `m.relates_to`、補上目標的（目標沒有就不補）
 pub fn to_replaced_body(
-    target_final_body: &serde_json::Value,
+    target_content_json: &serde_json::Value,
     new_content: &serde_json::Value,
 ) -> serde_json::Value {
     let mut replaced = match new_content {
@@ -349,7 +349,7 @@ pub fn to_replaced_body(
         _ => serde_json::Map::new(),
     };
     replaced.remove("m.relates_to");
-    if let Some(relates) = target_final_body.get("m.relates_to") {
+    if let Some(relates) = target_content_json.get("m.relates_to") {
         replaced.insert("m.relates_to".into(), relates.clone());
     }
     serde_json::Value::Object(replaced)
@@ -405,13 +405,13 @@ mod tests {
             reason: "x".into(),
         };
         assert_eq!(classify(&undecrypted).class, EventClass::General);
-        assert_eq!(classify(&undecrypted).final_body, None);
+        assert_eq!(classify(&undecrypted).content_json, None);
 
         let message = classify(&plain(
             json!({"type": "m.room.message", "content": {"body": "hi"}}),
         ));
         assert_eq!(message.class, EventClass::Msg);
-        assert_eq!(message.final_body, Some(json!({"body": "hi"})));
+        assert_eq!(message.content_json, Some(json!({"body": "hi"})));
 
         let edit = classify(&plain(json!({"type": "m.room.message", "content": {
             "body": "* hello", "m.new_content": {"body": "hello"},
@@ -419,9 +419,9 @@ mod tests {
         assert_eq!(edit.class, EventClass::Edit);
         assert_eq!(edit.ref_event_id.as_deref(), Some("$t"));
         assert_eq!(
-            edit.final_body,
+            edit.content_json,
             Some(json!({"body": "hello"})),
-            "edit 的 final_body 是 new_content"
+            "edit 的 content_json 是 new_content"
         );
 
         let redact_v11 = classify(&plain(
