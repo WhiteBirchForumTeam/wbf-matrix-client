@@ -200,7 +200,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§6）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名 2026-09-09 起都是加密的**（§11）：`servers/` 與 `accounts/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 6. 快取的 schema（v2，2026-09-07 維護者定；就是 `wbf-sdk::cache` 建的）
+## 6. 快取的 schema（v2 2026-09-07 維護者定、v5 2026-09-14 照 §7 改 `events`；就是 `wbf-sdk::cache` 建的）
 
 三條原則：
 
@@ -224,24 +224,25 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
   encrypted INTEGER CHECK (encrypted IN (0, 1)));
 
--- 🚧 這張表會照 §7 改（2026-09-14 草案）：message_json 改名 raw_event 並改存原始事件、加 final_body／is_processed／
---    is_redacted／class／ref_event_id。下面是現在實作的樣子。
--- 事件一份，解密後的明文放這裡，不記誰的。
--- message_json 是 Message 去掉 id／conversation／sender／sent_at／r_seq／g_seq／decrypted 之後的剩餘（kind、reply_to、edited_by、
--- reactions、undecryptable_reason），讀出時從欄位組回完整的 Message（split_message／join_message），同一份資料不存兩次。
+-- 事件一份，不記誰的。收到的原樣存 raw_event、要顯示的存 final_body（§7，schema v5）。
 CREATE TABLE events (
   id INTEGER PRIMARY KEY,
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
   event_id TEXT NOT NULL,
   sender INTEGER NOT NULL REFERENCES users(id),
   r_seq INTEGER, g_seq INTEGER, origin_server_ts INTEGER NOT NULL,
-  kind INTEGER NOT NULL,                -- 0 text、1 file、2 deleted、3 system、4 unsupported
-  decrypted INTEGER,                    -- 1／0／NULL（NULL = 本來就不是加密事件）
-  message_json TEXT NOT NULL);
+  decrypted INTEGER CHECK (decrypted IN (0, 1)),   -- 1／0／NULL（NULL = 本來就不是加密事件）
+  raw_event TEXT,                       -- 收到的原樣（密文就是密文）；第一次寫入後永遠不動。matrix-sdk 解開的拿不到密文 → NULL
+  event_type TEXT,                      -- 明文的 type；還沒解開的是 NULL（§7.8）
+  final_body TEXT,                      -- 要顯示的 content JSON；NULL = 還沒處理
+  is_processed INTEGER NOT NULL DEFAULT 0 CHECK (is_processed IN (0, 1)),
+  is_redacted INTEGER NOT NULL DEFAULT 0 CHECK (is_redacted IN (0, 1)),
+  class TEXT NOT NULL DEFAULT 'general' CHECK (class IN ('general', 'msg', 'edit', 'redact', 'reaction')),
+  ref_event_id TEXT);                   -- edit／redact／reaction 指向的目標（§7.3 的刻意例外：目標可能還不在，沒辦法外鍵）
 CREATE UNIQUE INDEX events_by_event_id ON events (room, event_id);
 CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NULL;   -- 排序、判洞、跳第 N 則
 CREATE INDEX events_by_time ON events (room, origin_server_ts);
-CREATE INDEX events_files ON events (room) WHERE kind = 1;
+CREATE INDEX events_by_ref ON events (room, ref_event_id) WHERE ref_event_id IS NOT NULL;   -- 「誰參照這則」
 
 -- 同步紀錄：哪個 user 真的從 server 拿到過哪一則，至少一次。hidden = Delete for me（chat-model §5）：
 -- 再同步只更新 last_synced_at，不動 hidden；讀取濾掉 hidden = 1。
@@ -305,10 +306,10 @@ CREATE INDEX event_media_by_media ON event_media (media);
 
 規則：
 
-- **寫入**（`upsert_messages(user_id, &[Message])`，一個 transaction）：mxid／room_id 換成整數 id（`INSERT OR IGNORE` 再 `SELECT id`）→ 事件 upsert（`ON CONFLICT(room, event_id)`；**唯一不覆蓋的情況是密文不蓋明文**：快取裡 `decrypted = 1`、來的 `decrypted = 0` 就跳過）→ file 事件建 `media`（已有就不動）與 `event_media` → `events_synced_log(event, user)` upsert（新列 `hidden = 0`，已有只更新 `last_synced_at`）。
-- **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model §4.3 的退化表）。
+- **寫入**（`upsert_events(user_id, room_id, &[IncomingEvent])`，一個房間、一個 transaction）：mxid／room_id 換成整數 id（`INSERT OR IGNORE` 再 `SELECT id`）→ 事件照 §7 寫入與處理（`raw_event` 只寫一次、`final_body` 不被密文蓋掉、file 內容建 `media`（已有就不動）與 `event_media`）→ `events_synced_log(event, user)` upsert（新列 `hidden = 0`，已有只更新 `last_synced_at`）。
+- **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0 AND class IN ('msg', 'general')`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model §4.3 的退化表）。每列從 `final_body` 組回 `Message`（§7.8）；`files` 另加 `json_extract(final_body, '$.msgtype')` 是約定 §5 的檔、而且沒被 redact。
 - **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。**預設不叫它；`account del`（即 `logout`）不叫它，只有 `account destroy` 叫**；這個 server 最後一個帳號登出時 CLI 直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
-- 解不開的加密事件也存（`decrypted = 0` 帶原因），之後拿到金鑰重解時覆蓋；不存等於每次都要重拉。`recent` 拿到的原始 `m.room.encrypted` 是 `decrypted = 0`、原因 `NotDecryptedHere`。
+- 解不開的加密事件也存（`decrypted = 0`、`class = general`、密文在 `raw_event`），之後明文到了才處理（§7.4）；不存等於每次都要重拉。`recent` 拿到的原始 `m.room.encrypted` 就是這樣存的。
 - **威脅模型的邊界（PR #13 審查 rumia 🟡1，維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
 - **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`（PR #13 審查 salvia 🟢3、cirno）。
 - **洞**：有 `r_seq` 的 room，「快取裡有哪些」就是 `r_seq` 的集合，缺的就是洞，不存 token。沒有 `r_seq` 的 room 只快取最新一段連續視窗。
@@ -321,10 +322,10 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - `hide_message` 只對這個帳號的 synced_log 列動手，沒同步過的東西沒有可藏的（回 false）。
 - `media` 這一版只建與寫指針（`find_media`／`touch_media`、file 事件進來時的 `INSERT OR IGNORE`）；池與下載管線是 §8 的 PR。
 
-## 7. 事件的處理：原始事件永遠不動，最終內容另存（維護者 2026-09-14 定，🚧 草案）
+## 7. 事件的處理：原始事件永遠不動，最終內容另存（維護者 2026-09-14 定）
 
-> 🚧 **狀態：設計草案，還沒實作**。§7.1–§7.6 是維護者 2026-09-14 定的；§7.7 是**還沒拍板**的四件事。
-> 實作時 §6 的 `events` 表跟著改，schema 版本加一（照 §1：版本不符就重建，不寫遷移）。
+> **狀態：已實作（schema v5）**，§7.7 第 1、4 點還沒拍板，實作怎麼繞開它們見 §7.8。
+> §7.1 描述的是改之前的樣子，留著當理由。
 
 ### 7.1 為什麼要改：現在的做法是「轉換完才存」
 
@@ -444,20 +445,62 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 
 ✅ ~~關係事件怎麼找回目標~~：用 `ref_event_id`（維護者 2026-09-14），見 §7.3、§7.4。
 
-1. **一般 Matrix server 沒有 `g_seq`**，edit 比不出新舊。
+1. 🚧 **一般 Matrix server 沒有 `g_seq`**，edit 比不出新舊（維護者 2026-09-14：待定）。
    - (a) 沒有 `g_seq` 就不套 edit（標處理過、不改目標）。
    - (b) 退回 `origin_server_ts`，平手比 `event_id`。
    - 📎 傾向 (b)，並寫明是退化做法（chat-model §4.3 說過時間戳排序不可靠，但一般 server 上沒有更好的依據）。
-2. **`final_body` 存什麼格式**：只存文字的話，檔案訊息（附件區塊、說明）放不下。
-   - 📎 傾向存**解密後的整份 `content` JSON**，讀取時從它組出 `Message`。
+2. ✅ ~~**`final_body` 存什麼格式**~~：**解密後的整份 `content` JSON**（維護者 2026-09-14），讀取時從它組出 `Message`。
+   edit 的 `final_body` 是它的 `m.new_content`。
 3. **解密還沒接**：`Event/Recent` 那條路現在完全不解密（`decrypted=0`）。
-   - 📎 傾向實作分兩支：先做**明文事件**的分類與 edit／redact／reaction 套用，密文一律 `general`；
+   - ✅ 這一支只做**明文事件**的分類與 edit／redact／reaction 套用，密文一律 `general`；
      把 WS 收到的密文交給 matrix-sdk 的 `Room::decrypt_event`（它是 `pub`）另開一支。
-4. **「套了」與「跳過」怎麼分**（§7.5）：跳過的 edit 也標 `is_processed=1`，所以「最新的有效 edit」不能只看 `is_processed`。
+   - ✅ **matrix-sdk 解開的事件拿不到密文**（`DecryptedRoomEvent` 只有明文）：`raw_event` 放 NULL（維護者 2026-09-14）。
+     走 WS 自己撈的，密文就是自己的，照存。
+4. 🚧 **「套了」與「跳過」怎麼分**（§7.5，維護者 2026-09-14：待定）：跳過的 edit 也標 `is_processed=1`，所以「最新的有效 edit」不能只看 `is_processed`。
    - (a) 跳過的另外標記（例如多一個布林）。
    - (b) 不分：每次從**參照這則、有效的所有 edit** 裡取 `g_seq` 最大的重算 `final_body`（比較舊的本來就不會贏）。
    - 📎 傾向 **(b)**：少一個狀態；「跳過」的理由本來就是「比較舊」，重算時它自然不會被選到。
      ⚠️ 但「無效的 edit」（sender 不同等）重算時要**每次重新驗**，或在寫入時就別當 `class = edit`（例如歸 `general`）。
+
+### 7.8 實作（2026-09-14，schema v5）
+
+**接縫**：上游給的事件一律先變成 `wbf_sdk::IncomingEvent`（原樣，三種：`Plain`／`Decrypted { ciphertext, cleartext }`／`Undecrypted { ciphertext, reason }`），
+backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原始順序取），watch 的 `Update::NewEvents` 也是原樣。
+寫庫的路存原樣；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁。
+分類與 edit 的有效性規則在 `wbf_sdk::incoming`（純 JSON、有單元測試），SQL 在 `cache.rs`。
+
+**跟 §7.3 的表不一樣的地方**：
+
+| 項目 | 做法 | 為什麼 |
+|---|---|---|
+| 多一欄 `event_type` | 明文的 `type` | `final_body` 只有 `content`（§7.7 第 2 點），而加密事件的 `raw_event` 是 `m.room.encrypted`、matrix-sdk 解開的甚至是 NULL —— 沒有這欄就不知道要怎麼顯示，也驗不了「edit 不能改 type」 |
+| 拿掉 `kind` | 讀取時從 `final_body` 算 | 同一個事實的第二份（§6 原則）；`files` 改用 `json_extract(final_body, '$.msgtype')` |
+| 留著 `decrypted` | NULL／0／1 | 「原本是不是加密事件」要明說 —— edit 的資安規則（加密的目標配明文 edit）靠它，🚫 不靠「`raw_event` 是 NULL 所以大概是加密的」這種巧合 |
+| 不存解不開的原因 | 讀出來一律 `NotDecryptedHere` | matrix-sdk 給的 UTD 原因只在那一次請求有意義 |
+
+**處理流程**（`upsert_events` 的同一個 transaction 裡）：
+
+- 🚫 **不寫**：沒有 `event_id` 或 `sender` 的（佔位值相等會讓 edit 的 sender 比對放行）；事件自帶的 `room_id` 跟參數不一樣的。
+- 同一則再來：`raw_event`／`r_seq`／`g_seq` 只從 NULL 補；server 蓋了 `redacted_because` 就 `is_redacted = 1`（只升不降）；
+  原本是 `general`、這次帶明文 → 照明文分類，當作第一次處理。其他一律不動（`final_body` 不被覆蓋）。
+- msg：`is_processed = 1`；反查 `ref_event_id = 這則 AND is_processed = 0`，redact 先、edit 照 `g_seq` 由新到舊套上。
+- reaction：`is_processed = 1`，讀取時才聚合（只算讀者自己同步過、沒被 redact 的）。
+- redact：目標在本地（而且不是 `general`）→ 目標 `is_redacted = 1`、自己 `is_processed = 1`；不在就等。
+- edit：目標在本地 → redact 過或無效（`incoming::check_replacement`）就跳過；有**別的有效 edit** 時比 `g_seq`：
+  比它新的存在就跳過，否則目標的 `final_body` 換成 `m.new_content`（**`m.relates_to` 留目標原本的**，回覆關係不被洗掉）。
+
+**§7.7 第 1、4 點待定期間的行為**（刻意保守，定案後再改）：
+
+- 🚧 第 1 點：**只有一個有效 edit 時不必比**，照套。要比而任何一方缺 `g_seq`（一般 server）→ 這個 edit **留 `is_processed = 0`、目標不動**。
+  所以一般 server 上是「第一個處理到的 edit 生效」；目標後到時，等著的 edit 照 `g_seq` 由新到舊、沒有 `g_seq` 的照寫入順序處理。
+- 🚧 第 4 點：沒有另存「跳過」的標記；比新舊時每次重驗「別的 edit」有效不有效。
+  ⚠️ 已知的寬鬆：讀取時的 `edited_by` 看的是「有處理過、沒被 redact、同一個 sender 的 edit」，
+  所以「同 sender 但改了 type 之類而被跳過」的 edit 會讓目標被標成改過（內容不受影響）。
+
+**還沒做的**：
+
+- redact 掉一個**已經套上**的 edit，目標不會退回上一版（`final_body` 已經被換掉；加密事件的原文只有 `final_body` 那份）。
+- 解密（§7.7 第 3 點，另開一支）。
 
 ## 8. 媒體儲存池：整檔明文放進一個加密的池，不進 DB（維護者 2026-09-07 定）
 

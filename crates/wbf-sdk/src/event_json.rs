@@ -5,6 +5,7 @@
 //! 解密狀態（`decrypted`）這裡一律 None：只有 matrix-sdk 的 `TimelineEvent` 知道，由它的 adapter 補。
 
 use crate::chat::{Attachment, Message, MessageKind, Reaction};
+use crate::incoming::IncomingEvent;
 use crate::protocol::event_seqs;
 
 /// 約定 §5 的 msgtype 與區塊 key。
@@ -24,6 +25,42 @@ pub fn messages_from_json(conversation: &str, raws: &[serde_json::Value]) -> Vec
         conversation,
         raws.iter()
             .map(|raw| (message_from_json(raw), relation_of(raw)))
+            .collect(),
+    )
+}
+
+/// 上游一頁（`IncomingEvent`，照上游順序）→ 顯示用的 `Message`，關係事件折進**同一頁**的目標（`aggregate`）。
+/// 給不寫庫的路（`sync=server`、watch 的通知）；寫庫的路讀回本地處理過的樣子（local-cache-db.md §7）。
+///
+/// Args:
+///     conversation: room_id，sync 的事件沒帶時補上
+///     events: 上游那一頁
+/// Return:
+///     Vec<Message>  沒解開的是 `Unsupported`、`decrypted: Some(false)` 帶原因；已折進去的關係事件不在裡面
+pub fn messages_from_incoming(conversation: &str, events: &[IncomingEvent]) -> Vec<Message> {
+    aggregate(
+        conversation,
+        events
+            .iter()
+            .map(|incoming| {
+                let envelope = incoming.envelope();
+                let mut message = message_from_json(incoming.cleartext().unwrap_or(envelope));
+                // server 蓋的欄位一律從 envelope 拿：自己解的明文不一定帶著它們。
+                let text = |key: &str| envelope.get(key).and_then(|value| value.as_str());
+                message.id = text("event_id").unwrap_or("unknown").to_string();
+                message.sender = text("sender").unwrap_or("unknown").to_string();
+                message.sent_at = envelope
+                    .get("origin_server_ts")
+                    .and_then(|ts| ts.as_u64())
+                    .unwrap_or(0);
+                (message.r_seq, message.g_seq) = incoming.seqs();
+                message.decrypted = incoming.decrypted();
+                message.undecryptable_reason = match incoming {
+                    IncomingEvent::Undecrypted { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                };
+                (message, incoming.cleartext().and_then(relation_of))
+            })
             .collect(),
     )
 }
@@ -100,7 +137,7 @@ pub fn message_from_json(raw: &serde_json::Value) -> Message {
     }
 }
 
-fn kind_from_content(
+pub(crate) fn kind_from_content(
     event_type: &str,
     content: &serde_json::Value,
     raw: &serde_json::Value,

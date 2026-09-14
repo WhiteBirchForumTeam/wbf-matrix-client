@@ -184,7 +184,7 @@ impl ServerCache {
     /// **丟進去就走**：不等它寫完。`emit_after_commit` 在 commit 成功之後才發。
     ///
     /// Args:
-    ///     work: 對資料庫做的事，example: |cache| cache.upsert_messages(&me, &events).map(|_| ())
+    ///     work: 對資料庫做的事，example: |cache| cache.upsert_events(&me, &room, &events).map(|_| ())
     ///     emit_after_commit: 成功才發的事件；失敗一則都不發
     ///
     /// ⚠️ 寫失敗**只發一則 `Note`，不擋任何人**（跟舊的 `write_through` 同一條政策：
@@ -263,7 +263,7 @@ impl ServerCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wbf_sdk::chat::{Message, MessageKind};
+    use wbf_sdk::IncomingEvent;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("wbf-sc-{name}-{}", std::process::id()));
@@ -285,23 +285,15 @@ mod tests {
         .0
     }
 
-    fn message(room: &str, event_id: &str, r_seq: i64) -> Message {
-        Message {
-            id: event_id.to_string(),
-            conversation: room.to_string(),
-            sender: "@a:localhost".to_string(),
-            sent_at: 1,
-            kind: MessageKind::Text {
-                body: "hi".to_string(),
-                formatted_html: None,
-            },
-            reply_to: None,
-            edited_by: None,
-            reactions: Vec::new(),
-            decrypted: None,
-            undecryptable_reason: None,
-            r_seq: Some(r_seq),
-            g_seq: Some(r_seq),
+    fn message(room: &str, event_id: &str, r_seq: i64) -> IncomingEvent {
+        IncomingEvent::Plain {
+            event: serde_json::json!({
+                "type": "m.room.message", "event_id": event_id, "room_id": room, "sender": "@a:localhost",
+                "origin_server_ts": 1, "content": { "msgtype": "m.text", "body": "hi" },
+                "unsigned": {
+                    wbf_sdk::protocol::R_SEQ_KEY: r_seq, wbf_sdk::protocol::G_SEQ_KEY: r_seq,
+                },
+            }),
         }
     }
 
@@ -313,7 +305,7 @@ mod tests {
         let cache = open(&dir, &events);
 
         let written = cache
-            .run(move |cache| cache.upsert_messages("@a:localhost", &[message("!r", "$1", 1)]))
+            .run(move |cache| cache.upsert_events("@a:localhost", "!r", &[message("!r", "$1", 1)]))
             .await
             .unwrap();
         assert_eq!(written, 1);
@@ -344,8 +336,9 @@ mod tests {
             cache.post(
                 move |cache| {
                     cache
-                        .upsert_messages(
+                        .upsert_events(
                             "@a:localhost",
+                            "!r",
                             &[message("!r", &format!("${index}"), index)],
                         )
                         .map(|_| ())
@@ -395,8 +388,9 @@ mod tests {
                     // 這是真實情況，也是唯一索引 `(room, r_seq)` 會被兩邊同時碰的原因。
                     cache
                         .run(move |cache| {
-                            cache.upsert_messages(
+                            cache.upsert_events(
                                 account,
+                                "!r",
                                 &[message("!r", &format!("${index}"), index)],
                             )
                         })
@@ -453,7 +447,7 @@ mod tests {
                     let event_id = format!("${index}-{round}");
                     let seq = round + (index as i64) * 100_000;
                     if let Err(error) =
-                        cache.upsert_messages("@a:localhost", &[message("!r", &event_id, seq)])
+                        cache.upsert_events("@a:localhost", "!r", &[message("!r", &event_id, seq)])
                     {
                         assert!(
                             error.to_string().contains("locked"),
@@ -485,8 +479,9 @@ mod tests {
             cache.post(
                 move |cache| {
                     cache
-                        .upsert_messages(
+                        .upsert_events(
                             "@a:localhost",
+                            "!r",
                             &[message("!r", &format!("${index}"), index)],
                         )
                         .map(|_| ())

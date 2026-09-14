@@ -250,7 +250,9 @@ pub enum Update {
 }
 ```
 
-現在的實作：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（CLI 規格 §3.4.2）。
+現在的實作：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。
+⚠️ 第 3 步實作的變體是 `NewEvents { conversation, events: Vec<IncomingEvent> }`（上游給的**原樣**，關係事件也在），🚫 不是 `NewMessage`：
+快取要存原樣（local-cache-db.md §7），通知由 core 用 `event_json::messages_from_incoming` 折好再發。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（CLI 規格 §3.4.2）。
 之後換自己的協定：server 推 pack，adapter 翻成同一個 `Update`，CLI／UI 不動。
 
 ### 4.3 順序：為什麼不能用時間戳排序

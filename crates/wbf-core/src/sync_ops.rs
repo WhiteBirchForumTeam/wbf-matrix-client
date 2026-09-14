@@ -7,11 +7,12 @@
 use serde::Serialize;
 
 use wbf_sdk::chat::{ChatBackend, Update, WatchControl};
-use wbf_sdk::event_json::messages_from_json;
+use wbf_sdk::event_json::messages_from_incoming;
+use wbf_sdk::IncomingEvent;
 use wbf_sdk::{RecentPlan, Transport};
 
-use crate::error::{CoreError, CoreErrorKind};
 use crate::backend_choice::MethodHome;
+use crate::error::{CoreError, CoreErrorKind};
 use crate::{Core, CoreEvent, Target};
 
 /// `watch` 要等多久、等到什麼為止。
@@ -90,31 +91,40 @@ impl Core {
         let (cache, _) = self.server_cache_and_me(&account)?;
         let mut seen = 0usize;
         let mut on_update = |update: Update| -> WatchControl {
-            let Update::NewMessage(message) = &update else {
+            let Update::NewEvents {
+                conversation,
+                events,
+            } = update
+            else {
                 return WatchControl::Continue;
             };
-            if message.conversation != room {
+            if conversation != room {
                 return WatchControl::Continue;
             }
+            // 通知給折好的訊息；庫裡存原樣（關係事件也存，local-cache-db.md §7）。
+            let messages = messages_from_incoming(&conversation, &events);
             // 自己送的也發出去（呼叫端自己濾），但 `once` 不把自己的算「第一則」。
-            let own = message.sender == me;
+            let any_from_others = messages.iter().any(|message| message.sender != me);
+            seen += messages.len();
+            let notices = messages
+                .into_iter()
+                .map(|message| CoreEvent::Message {
+                    user: me.clone(),
+                    message: Box::new(message),
+                })
+                .collect();
             // 🚨 寫跟事件**一起**進 queue：事件由寫入者在 commit 之後發，
             // 所以收到通知的人去讀本地一定讀得到（daemon-runtime §2.3）。
-            let stored = (**message).clone();
             let writer_me = me.clone();
             cache.post(
                 move |cache| {
                     cache
-                        .upsert_messages(&writer_me, std::slice::from_ref(&stored))
+                        .upsert_events(&writer_me, &conversation, &events)
                         .map(|_| ())
                 },
-                vec![CoreEvent::Message {
-                    user: me.clone(),
-                    message: message.clone(),
-                }],
+                notices,
             );
-            seen += 1;
-            match once && !own {
+            match once && any_from_others {
                 true => WatchControl::Stop,
                 false => WatchControl::Continue,
             }
@@ -175,13 +185,32 @@ impl Core {
                     .is_some()
             });
             skipped_without_room += without_room.len();
-            let messages = messages_from_json("unknown", &with_room);
+            // `upsert_events` 一次一個房間：照 room_id 分組，原樣寫（這條路不解密，local-cache-db.md §7.2）。
+            let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
+                std::collections::BTreeMap::new();
+            for raw in with_room {
+                let room = raw
+                    .get("room_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                by_room
+                    .entry(room)
+                    .or_default()
+                    .push(IncomingEvent::from_ws_json(raw));
+            }
             // ⚠️ 這個回呼是**同步**的（SDK 的收批介面），而 `written` 要的是真的寫進去幾則，
             // 所以走 `run_blocking`：排進同一條 queue、等它 commit。
             // ⭐ 阻塞的程度跟以前一樣（以前也是在這裡同步寫），換到的是「順序與水位由一個地方管」。
             let me_here = me.clone();
             written += cache
-                .run_blocking(move |cache| cache.upsert_messages(&me_here, &messages))
+                .run_blocking(move |cache| {
+                    let mut written_here = 0usize;
+                    for (room, events) in &by_room {
+                        written_here += cache.upsert_events(&me_here, room, events)?;
+                    }
+                    Ok(written_here)
+                })
                 .map_err(|error| wbf_sdk::SdkError::Usage(error.message))?;
             self.events.progress(format!(
                 "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",

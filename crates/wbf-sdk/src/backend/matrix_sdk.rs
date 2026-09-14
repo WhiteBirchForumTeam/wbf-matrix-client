@@ -28,13 +28,11 @@ use matrix_sdk::SqliteStoreConfig;
 use matrix_sdk::{Client, Room, SessionMeta};
 
 use crate::chat::{
-    Attachment, ChatBackend, Conversation, ConversationKind, Message, Page, Update, WatchControl,
-    WatchEnd,
+    Attachment, ChatBackend, Conversation, ConversationKind, Update, WatchControl, WatchEnd,
 };
 use crate::error::SdkError;
-use crate::event_json::{
-    aggregate, message_from_json, relation_of, Relation, CHUNKED_BLOCK_KEY, FILE_MSGTYPE,
-};
+use crate::event_json::{CHUNKED_BLOCK_KEY, FILE_MSGTYPE};
+use crate::incoming::{EventPage, IncomingEvent};
 use crate::login::Session;
 use crate::vault::Key32;
 
@@ -209,7 +207,12 @@ impl ChatBackend for MatrixBackend {
     /// ⭐ 所以**不必暫存 token**：任何一則事件都拿得到它的位置，代價是每頁多一次請求。
     /// ⚠️ `/context` 的 `limit` 給 0，但有的 server 會把 0 當預設值、照樣回 `events_before` ——
     /// 那些就是緊鄰錨點的更舊事件，🚫 不能丟，所以接在這一頁的最前面。
-    async fn history(&self, id: &str, before: Option<&str>, limit: u32) -> Result<Page, SdkError> {
+    async fn history(
+        &self,
+        id: &str,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<EventPage, SdkError> {
         if limit == 0 {
             return Err(SdkError::Usage("history limit must be at least 1".into()));
         }
@@ -226,7 +229,9 @@ impl ChatBackend for MatrixBackend {
                     .map_err(matrix_error)?;
                 let has_prev_token = context.prev_batch_token.is_some();
                 match plan_after_context(context.events_before, has_prev_token, limit) {
-                    ContextPlan::Done(events_before) => return Ok(page_from_timeline(id, &events_before)),
+                    ContextPlan::Done(events_before) => {
+                        return Ok(page_from_timeline(&events_before))
+                    }
                     ContextPlan::Continue {
                         adjacent,
                         remaining,
@@ -242,7 +247,7 @@ impl ChatBackend for MatrixBackend {
             let messages = room.messages(options).await.map_err(matrix_error)?;
             timeline.extend(messages.chunk);
         }
-        Ok(page_from_timeline(id, &timeline))
+        Ok(page_from_timeline(&timeline))
     }
 
     async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError> {
@@ -336,17 +341,17 @@ impl ChatBackend for MatrixBackend {
             let mut control = WatchControl::Continue;
             for (room_id, update) in &response.rooms.joined {
                 let room_id: &OwnedRoomId = room_id;
-                let messages = aggregate(
-                    room_id.as_str(),
-                    update.timeline.events.iter().map(to_message).collect(),
-                );
-                for message in messages {
-                    if on_update(Update::NewMessage(Box::new(message))) == WatchControl::Stop {
-                        control = WatchControl::Stop;
-                        break;
-                    }
+                let events: Vec<IncomingEvent> =
+                    update.timeline.events.iter().map(to_incoming).collect();
+                if events.is_empty() {
+                    continue;
                 }
-                if control == WatchControl::Stop {
+                let update = Update::NewEvents {
+                    conversation: room_id.to_string(),
+                    events,
+                };
+                if on_update(update) == WatchControl::Stop {
+                    control = WatchControl::Stop;
                     break;
                 }
             }
@@ -648,7 +653,11 @@ enum ContextPlan<T> {
 /// Return:
 ///     Done(events)                 截到 `limit` 的緊鄰事件就是整頁
 ///     Continue { adjacent, remaining }  緊鄰的不到 `limit`、而且還有 token：再問 `remaining` 則
-fn plan_after_context<T>(mut events_before: Vec<T>, has_prev_token: bool, limit: u32) -> ContextPlan<T> {
+fn plan_after_context<T>(
+    mut events_before: Vec<T>,
+    has_prev_token: bool,
+    limit: u32,
+) -> ContextPlan<T> {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     if events_before.len() >= limit {
         events_before.truncate(limit);
@@ -664,50 +673,31 @@ fn plan_after_context<T>(mut events_before: Vec<T>, has_prev_token: bool, limit:
     }
 }
 
-/// 上游一頁（新到舊）→ `Page`：訊息照常折疊，**`next` 從折疊之前的原始順序取**。
-///
-/// 🚨 **游標不准從 `aggregate` 之後的輸出推**（PR #36 審查 rumia🔴）：`aggregate` 會把 reaction／edit／redaction
-/// 折進目標、從輸出拿掉。要是**最舊那則原始事件**被折掉（例：聯邦補回的歷史順序錯亂，關係事件排在目標後面），
-/// 折疊後的最後一則會比較新，拿它往回問就重複同一段 —— 游標要的是「上游這一頁到哪裡」，🚫 不是「這一頁顯示了什麼」。
-///
-/// Args:
-///     id: room_id，sync 的事件沒帶時補上
-///     timeline: 上游給的這一頁，新到舊
-/// Return:
-///     Page  `next` ＝ 原始順序裡最舊、而且有合法 id 的那則；整頁都沒有 id（或空頁）才是 None ＝到頭了
-fn page_from_timeline(id: &str, timeline: &[TimelineEvent]) -> Page {
-    let next = timeline
-        .iter()
-        .rev()
-        .find_map(|event| event.event_id())
-        .map(|event_id| event_id.to_string());
-    let events = aggregate(id, timeline.iter().map(to_message).collect());
-    Page { events, next }
+/// 上游一頁（新到舊）→ `EventPage`：事件原樣、照上游順序，`next` 由 `EventPage::from_upstream_order` 取。
+fn page_from_timeline(timeline: &[TimelineEvent]) -> EventPage {
+    EventPage::from_upstream_order(timeline.iter().map(to_incoming).collect())
 }
 
-fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
-    let (raw, decrypted, reason) = match &event.kind {
-        TimelineEventKind::Decrypted(decrypted) => (
-            serde_json::to_value(&decrypted.event).unwrap_or(serde_json::Value::Null),
-            Some(true),
-            None,
-        ),
-        TimelineEventKind::UnableToDecrypt { event, utd_info } => (
-            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
-            Some(false),
-            Some(format!("{:?}", utd_info.reason)),
-        ),
-        TimelineEventKind::PlainText { event } => (
-            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
-            None,
-            None,
-        ),
-    };
-    let relation = relation_of(&raw);
-    let mut message = message_from_json(&raw);
-    message.decrypted = decrypted;
-    message.undecryptable_reason = reason;
-    (message, relation)
+/// matrix-sdk 的 `TimelineEvent` → 原樣的事件。
+///
+/// ⚠️ 解開的事件 matrix-sdk **不給密文**（`DecryptedRoomEvent` 只有明文），所以 `ciphertext: None`
+/// （維護者 2026-09-14：拿不到就放 NULL）。解不開的，`event` 就是收到的密文，照存。
+fn to_incoming(event: &TimelineEvent) -> IncomingEvent {
+    let to_json =
+        |raw: serde_json::Result<serde_json::Value>| raw.unwrap_or(serde_json::Value::Null);
+    match &event.kind {
+        TimelineEventKind::Decrypted(decrypted) => IncomingEvent::Decrypted {
+            ciphertext: None,
+            cleartext: to_json(serde_json::to_value(&decrypted.event)),
+        },
+        TimelineEventKind::UnableToDecrypt { event, utd_info } => IncomingEvent::Undecrypted {
+            ciphertext: to_json(serde_json::to_value(event)),
+            reason: format!("{:?}", utd_info.reason),
+        },
+        TimelineEventKind::PlainText { event } => IncomingEvent::Plain {
+            event: to_json(serde_json::to_value(event)),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -720,11 +710,10 @@ mod context_plan_tests {
         )
     }
 
-    /// 🚨 **`next` 從原始順序取，不從折疊後的輸出取**（PR #36 審查 rumia🔴）。
-    /// 這一頁新到舊是 `[$t, $r]`，而最舊的 `$r` 是**對 `$t` 的 reaction**（順序錯亂的歷史才會這樣）：
-    /// 折疊後只剩 `$t`，但下一頁要從 `$r` 之前問 —— 從 `$t` 問會把 `$r` 再拿一次。
+    /// 🚨 **`next` 從原始順序取**（PR #36 審查 rumia🔴）。這一頁新到舊是 `[$t, $r]`，最舊的 `$r` 是**對 `$t` 的 reaction**：
+    /// 顯示時會折進 `$t`，但下一頁要從 `$r` 之前問 —— 而且 `$r` 本身要原樣留著給快取存（local-cache-db.md §7）。
     #[test]
-    fn the_next_anchor_is_the_oldest_raw_event_even_when_aggregation_folds_it_away() {
+    fn a_timeline_page_keeps_every_raw_event_and_its_next_is_the_oldest() {
         let target = plaintext(serde_json::json!({
             "type": "m.room.message", "event_id": "$t", "sender": "@a:x", "origin_server_ts": 2,
             "content": { "msgtype": "m.text", "body": "hi" }
@@ -733,15 +722,23 @@ mod context_plan_tests {
             "type": "m.reaction", "event_id": "$r", "sender": "@b:x", "origin_server_ts": 1,
             "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "👍" } }
         }));
-        let page = page_from_timeline("!room:x", &[target, reaction]);
-        let ids: Vec<&str> = page.events.iter().map(|message| message.id.as_str()).collect();
-        assert_eq!(ids, ["$t"], "reaction 折進了目標");
-        assert_eq!(page.next.as_deref(), Some("$r"), "🚨 游標是上游最舊那則，不是折疊後的最後一則");
+        let page = page_from_timeline(&[target, reaction]);
+        let ids: Vec<Option<&str>> = page
+            .events
+            .iter()
+            .map(IncomingEvent::find_event_id)
+            .collect();
+        assert_eq!(
+            ids,
+            [Some("$t"), Some("$r")],
+            "原樣、照上游順序，關係事件也在"
+        );
+        assert_eq!(page.next.as_deref(), Some("$r"), "🚨 游標是上游最舊那則");
     }
 
     #[test]
     fn an_empty_page_has_no_next_anchor() {
-        assert_eq!(page_from_timeline("!room:x", &[]).next, None);
+        assert_eq!(page_from_timeline(&[]).next, None);
     }
 
     /// 🚨 **`/context` 回的比 `limit` 多：截到 `limit`，而且不再接 `/messages`**（PR #36 審查 rumia🔴）。
@@ -758,7 +755,10 @@ mod context_plan_tests {
 
     #[test]
     fn exactly_the_limit_needs_no_messages_call() {
-        assert_eq!(plan_after_context(vec![3, 2], true, 2), ContextPlan::Done(vec![3, 2]));
+        assert_eq!(
+            plan_after_context(vec![3, 2], true, 2),
+            ContextPlan::Done(vec![3, 2])
+        );
     }
 
     #[test]
@@ -775,8 +775,17 @@ mod context_plan_tests {
     /// 沒有 token ＝房間的開頭：🚫 不再問（`from: None` 會拿到最新一頁），也🚫 不超過 limit。
     #[test]
     fn no_token_means_the_start_of_the_room_and_still_respects_the_limit() {
-        assert_eq!(plan_after_context(vec![3, 2], false, 5), ContextPlan::Done(vec![3, 2]));
-        assert_eq!(plan_after_context(vec![3, 2, 1], false, 2), ContextPlan::Done(vec![3, 2]));
-        assert_eq!(plan_after_context(Vec::<u32>::new(), false, 5), ContextPlan::Done(vec![]));
+        assert_eq!(
+            plan_after_context(vec![3, 2], false, 5),
+            ContextPlan::Done(vec![3, 2])
+        );
+        assert_eq!(
+            plan_after_context(vec![3, 2, 1], false, 2),
+            ContextPlan::Done(vec![3, 2])
+        );
+        assert_eq!(
+            plan_after_context(Vec::<u32>::new(), false, 5),
+            ContextPlan::Done(vec![])
+        );
     }
 }

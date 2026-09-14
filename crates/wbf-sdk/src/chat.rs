@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunk_block::ChunkedBlock;
 use crate::error::SdkError;
+use crate::incoming::{EventPage, IncomingEvent};
 
 /// 高層的分類，從 room 的事實推出來（chat-model §2.1、§3.1、§3.2）；底層永遠是 room。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,19 +112,16 @@ pub struct Message {
     pub g_seq: Option<i64>,
 }
 
-/// `history` 的一頁：`next` 是這一頁最舊那則的 `event_id`；None 表示到頭了（CLI 規格 §3.4.1）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Page {
-    pub events: Vec<Message>,
-    pub next: Option<String>,
-}
-
 /// watch 流的一則（chat-model §4.2 的縮小版：第 3 步只有新訊息與房間層的變化）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "update", rename_all = "snake_case")]
 pub enum Update {
-    /// Box：`Message` 幾百 byte，其他變體只有一個 id（clippy large_enum_variant）。
-    NewMessage(Box<Message>),
+    /// 一個房間新到的事件，**原樣、照上游順序**（關係事件也在裡面）：寫庫的人要原樣（local-cache-db.md §7），
+    /// 要顯示的人自己折（`event_json::messages_from_incoming`）。
+    NewEvents {
+        conversation: String,
+        events: Vec<IncomingEvent>,
+    },
     /// 第 3 步只有這一個房間層的變化；「新加入的房間」用 `conversations()` 看，watch 還不推。
     ConversationLeft { id: String },
 }
@@ -154,7 +152,13 @@ pub trait ChatBackend {
     ///
     /// 🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token ——
     /// UI 不分 server 是誰，一律拿手上最舊那則往回問（chat-model §4.3、rpc-spec §3.3）。
-    async fn history(&self, id: &str, before: Option<&str>, limit: u32) -> Result<Page, SdkError>;
+    /// 回的是**原樣**的事件（local-cache-db.md §7：原始事件存庫、顯示另外折）。
+    async fn history(
+        &self,
+        id: &str,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<EventPage, SdkError>;
 
     /// Return:
     ///     Ok(String)   event_id

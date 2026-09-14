@@ -166,7 +166,10 @@ impl Core {
     ///     Ok(true)    本來開著、現在關了
     ///     Ok(false)   本來就沒開
     ///     Err(Io)     還有別的請求拿著它 —— 🚫 不從它們底下抽掉，登出重試一次就好（清理是冪等的）
-    pub(crate) fn close_server_cache(&self, server_dir: &std::path::Path) -> Result<bool, CoreError> {
+    pub(crate) fn close_server_cache(
+        &self,
+        server_dir: &std::path::Path,
+    ) -> Result<bool, CoreError> {
         let mut registry = self
             .server_caches
             .lock()
@@ -264,7 +267,10 @@ mod tests {
             "🚨 close 回來時，queue 裡排著的那件要已經寫完"
         );
         assert!(!is_registered(&core, &server_dir), "關完註冊表裡沒有它");
-        assert!(!core.close_server_cache(&server_dir).unwrap(), "再關一次：本來就沒開");
+        assert!(
+            !core.close_server_cache(&server_dir).unwrap(),
+            "再關一次：本來就沒開"
+        );
 
         // queue 裡那件在關之前寫完了：重新開一份讀得到。
         let reopened = core.server_cache_of(&account, SERVER).unwrap();
@@ -299,7 +305,10 @@ mod tests {
             .await
             .expect("最後一個帳號登出要成功");
 
-        assert!(!is_registered(&core, &server_dir), "🚨 註冊表不准留著已刪的檔");
+        assert!(
+            !is_registered(&core, &server_dir),
+            "🚨 註冊表不准留著已刪的檔"
+        );
         assert!(
             !server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists(),
             "cache.db 要真的刪掉"
