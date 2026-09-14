@@ -529,6 +529,7 @@ fn kind_matches(message: &Message, wanted: &str) -> bool {
         MessageKind::Text { .. } => wanted == "text" || wanted == "m.room.message",
         MessageKind::File { .. } => wanted == "file" || wanted == "org.wbftw.wbfuwunel.file",
         MessageKind::Deleted { .. } => wanted == "deleted",
+        MessageKind::Undecryptable => wanted == "undecryptable",
         MessageKind::System { event_type, .. } => wanted == "system" || wanted == event_type,
         MessageKind::Unsupported { event_type, .. } => {
             wanted == "unsupported" || wanted == event_type

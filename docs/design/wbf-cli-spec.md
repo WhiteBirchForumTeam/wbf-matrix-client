@@ -197,7 +197,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `room <room_id>`（還沒） | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
-| `read <room_id> [--limit <n>] [--before <token>] [--type <名>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
+| `read <room_id> [--limit <n>] [--before <token>] [--type <名>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`undecryptable`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
 | `files <room_id> [--limit <n>] [--before <token>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
 
 事件的統一形狀（`read`、`watch`、`files` 都用）就是 chat-model §2.3 的 `Message` 序列化：
@@ -205,7 +205,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 欄位 | 說明 |
 |---|---|
 | `id`、`conversation`、`sender`、`sent_at` | event_id、room_id、mxid、`origin_server_ts`（毫秒，只當顯示用） |
-| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`deleted`（`reason`）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
+| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`deleted`（`reason`）、`undecryptable`（沒有欄位；`decrypted: false`、`undecryptable_reason` 在訊息上）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
 | `reply_to`、`edited_by`、`reactions` | 同一頁內的關係事件折進目標（chat-model §3.4） |
 | `decrypted` | `true`／`false`／`null`。`null` 表示本來就不是加密事件 |
 | `undecryptable_reason` | `decrypted` 是 `false` 才有，matrix-sdk 給的原因（example: `MissingMegolmSession`） |
@@ -213,7 +213,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 規則：
 
-- **解不開不是錯誤。** 加密房間裡拿不到 key 的事件照印，`decrypted: false` 帶原因，exit 仍是 0。用 exit 3 只會讓一整頁因為一則舊訊息全掛。
+- **解不開不是錯誤。** 加密房間裡拿不到 key 的事件照印，`kind: "undecryptable"`、`decrypted: false` 帶原因，exit 仍是 0。用 exit 3 只會讓一整頁因為一則舊訊息全掛。
 - **`next` 是 `event_id`（這一頁最舊那則），不落地。** 只印在 stdout，不寫狀態檔；要接著翻是呼叫者的事。🚫 不是 server 的翻頁 token（rpc-spec §3.3）。session 檔的 SDK store 另有它自己的 sync 位置，跟這個無關。
 - **`--type`、`--sender` 在 client 端濾**：Matrix 的 `filter` 參數各 server 支援程度不一，而且只是省流量，結果一樣。過濾後一頁可能是空的但 `next` 不是 null，呼叫者要照 `next` 判斷有沒有到頭，不是照 `events` 長度。
 - **`files` 不驗完整性**：它只解區塊、印 manifest，不碰 `Info`。核對是 `info`／`download` 的事（約定 §3.1）。

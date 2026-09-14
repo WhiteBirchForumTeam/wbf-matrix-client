@@ -7,8 +7,8 @@
 //! schema 風格：實體表 `INTEGER PRIMARY KEY` 加識別碼的 UNIQUE 索引；關聯表整數複合主鍵 `WITHOUT ROWID`；
 //! 字串識別碼（mxid、room_id、event_id）各只存一次，其餘全走整數外鍵。整數 id 不出這個檔。
 //! **事件存原樣、顯示另存**（§7，維護者 2026-09-14）：`raw_event` 第一次寫入之後永遠不動；解密結果與套過 edit 的內容在
-//! `content_json`，**兩者寫進去就不改**；edit／redact／reaction 用 `ref_event_id` 指目標。edit 在讀取時才解析
-//! （參照這則、有效、最新的那個），redact 在目標那列打勾 `is_redacted`。
+//! `content_json`，**兩者寫進去就不改**。edit／redact／reaction 的 `ref_event_id` 指目標；訊息自己的 `ref_event_id` 指
+//! **目前要顯示的 edit**，寫入時比 `modified_timestamp` 決定換不換（§7.5）。redact 在目標那列打勾 `is_redacted`。
 //! 這裡只有 SQL 與我們的聊天模型（`Message`、`Conversation`），沒有 matrix-sdk、沒有網路。
 //! 🚫 金鑰不進錯誤訊息、不 log。
 
@@ -292,11 +292,9 @@ impl Cache {
                 .and_then(|ts| ts.as_i64())
                 .unwrap_or(0);
             let classified = classify(incoming);
-            // 只有 redact 要等目標（在目標那列打勾）；其他分完類就處理完了 —— edit 在讀取時才解析（§7.5）。
-            let is_processed_on_arrival = matches!(
-                classified.class,
-                EventClass::Msg | EventClass::Edit | EventClass::Reaction
-            );
+            // edit／redact 要等目標（改目標那一列）；msg、reaction 分完類就處理完了。
+            let is_processed_on_arrival =
+                matches!(classified.class, EventClass::Msg | EventClass::Reaction);
             let raw_event = incoming.raw_event().map(|raw| raw.to_string());
             let content_json = classified
                 .content_json
@@ -306,8 +304,8 @@ impl Cache {
             let inserted = transaction
                 .prepare_cached(
                     "INSERT INTO events (room, event_id, sender, r_seq, g_seq, origin_server_ts, decrypted, raw_event,
-                       event_type, content_json, is_processed, is_redacted, class, ref_event_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                       event_type, content_json, is_processed, is_redacted, class, ref_event_id, modified_timestamp)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?6)
                      ON CONFLICT(room, event_id) DO NOTHING",
                 )
                 .map_err(db_error)?
@@ -554,8 +552,11 @@ impl Cache {
         Ok(messages)
     }
 
-    /// 一列 → 顯示用的 `Message`：`content_json`（被 edit 過就換成最新那個 edit 的）組內容、`is_redacted` 蓋成已刪除，
-    /// reaction 從參照這則的列查。
+    /// 一列 → 顯示用的 `Message`（§7.5 的讀取順序）：
+    ///
+    /// 1. `is_redacted` → 已刪除
+    /// 2. 還沒解開（general）→ 解不開的記號
+    /// 3. 自己的 `ref_event_id` 是 NULL → 自己的 `content_json`；不是 → 換成那個 edit 的 `m.new_content`
     ///
     /// Return:
     ///     Ok(Some(Message))
@@ -573,10 +574,7 @@ impl Cache {
             conversation: row.room_id.clone(),
             sender: row.sender.clone(),
             sent_at: row.origin_server_ts.max(0) as u64,
-            kind: MessageKind::Unsupported {
-                event_type: "m.room.encrypted".into(),
-                body: None,
-            },
+            kind: MessageKind::Undecryptable,
             reply_to: None,
             edited_by: None,
             reactions: Vec::new(),
@@ -585,16 +583,16 @@ impl Cache {
             r_seq: row.r_seq,
             g_seq: row.g_seq,
         };
-        if class != EventClass::Msg {
-            // general：還沒解開的密文。
-            message.decrypted = Some(false);
-            message.undecryptable_reason = Some(NOT_DECRYPTED_HERE.into());
-            return Ok(Some(message));
-        }
         if row.is_redacted {
             message.kind = MessageKind::Deleted {
                 reason: self.find_redaction_reason(row, raw_event.as_ref())?,
             };
+            return Ok(Some(message));
+        }
+        if class != EventClass::Msg {
+            // general：還沒解開的密文。
+            message.decrypted = Some(false);
+            message.undecryptable_reason = Some(NOT_DECRYPTED_HERE.into());
             return Ok(Some(message));
         }
         let (Some(event_type), Some(own_content)) = (
@@ -605,8 +603,8 @@ impl Cache {
         ) else {
             return Ok(None);
         };
-        // ⭐ 這則自己的 content_json 永遠不改；被 edit 過就在這裡換成最新那個 edit 的（§7.5）。
-        let content = match self.find_latest_edit(user_id, row, raw_event.as_ref())? {
+        // ⭐ 這則自己的 content_json 永遠不改；被 edit 過就在這裡換成目前那個 edit 的（§7.5）。
+        let content = match self.find_current_edit(row)? {
             Some((new_content, editor)) => {
                 message.edited_by = Some(editor);
                 to_replaced_body(&own_content, &new_content)
@@ -626,77 +624,39 @@ impl Cache {
         Ok(Some(message))
     }
 
-    /// 參照這則的 edit 裡**最新、有效**的那個（§7.5）。
+    /// 訊息自己的 `ref_event_id` 指的那個 edit（寫入時已經驗過、選過最新的）。
     ///
-    /// - 新舊：`origin_server_ts` 大的新，平手比 `event_id`（字典序大的新）—— 以 server 蓋的時間為準，
-    ///   有沒有 `g_seq` 都同一條規則（維護者 2026-09-14）。
-    /// - 🚨 有效：`incoming::check_replacement`（sender 相同、明文 edit 不能蓋加密訊息…），不是正面認得就跳過。
-    /// - 🚨 只算**這個帳號同步過**、沒被 redact 的 —— redact 掉最新的 edit，自然退回上一個。
+    /// 🚨 消費端再問一次（A6）：那一列必須**真的是指回這則的 edit、同一個 sender、沒被 redact**，
+    /// 對不上就當沒有，顯示原文 —— 🚫 不因為寫入端的一個 bug 就把別人的內容顯示成這則。
     ///
     /// Return:
-    ///     Ok(Some((new_content, editor)))  有；editor 是那個 edit 的 sender
-    ///     Ok(None)                         沒有任何有效的 edit
-    fn find_latest_edit(
+    ///     Ok(Some((new_content, editor)))  有
+    ///     Ok(None)                         沒被 edit 過，或指到的那列對不上
+    fn find_current_edit(
         &self,
-        user_id: &str,
         row: &EventRow,
-        raw_event: Option<&serde_json::Value>,
     ) -> Result<Option<(serde_json::Value, String)>, SdkError> {
-        let target = ReplacementSide {
-            sender: &row.sender,
-            class: EventClass::Msg,
-            event_type: row.event_type.as_deref(),
-            is_state: is_state_event(raw_event),
-            was_encrypted: row.decrypted.is_some(),
+        let Some(edit_event_id) = row.ref_event_id.as_deref() else {
+            return Ok(None);
         };
-        let mut statement = self
+        let found: Option<Option<String>> = self
             .connection
             .prepare_cached(
-                "SELECT x.content_json, u.mxid, x.event_type, x.decrypted, x.raw_event FROM events x
-                 JOIN users u ON u.id = x.sender
-                 JOIN events_synced_log l ON l.event = x.id
-                 JOIN users reader ON reader.id = l.user
-                 WHERE x.room = ?1 AND x.ref_event_id = ?2 AND x.class = 'edit' AND x.is_redacted = 0
-                   AND reader.mxid = ?3
-                 ORDER BY x.origin_server_ts DESC, x.event_id DESC",
+                "SELECT x.content_json FROM events x
+                 WHERE x.room = ?1 AND x.event_id = ?2 AND x.class = 'edit' AND x.ref_event_id = ?3
+                   AND x.sender = ?4 AND x.is_redacted = 0",
             )
+            .map_err(db_error)?
+            .query_row(
+                params![row.room, edit_event_id, row.event_id, row.sender_row],
+                |sql_row| sql_row.get(0),
+            )
+            .optional()
             .map_err(db_error)?;
-        let candidates = statement
-            .query_map(params![row.room, row.event_id, user_id], |sql_row| {
-                Ok((
-                    sql_row.get::<_, Option<String>>(0)?,
-                    sql_row.get::<_, String>(1)?,
-                    sql_row.get::<_, Option<String>>(2)?,
-                    sql_row.get::<_, Option<i64>>(3)?,
-                    sql_row.get::<_, Option<String>>(4)?,
-                ))
-            })
-            .map_err(db_error)?;
-        for candidate in candidates {
-            let (content_json, editor, event_type, decrypted, edit_raw_event) =
-                candidate.map_err(db_error)?;
-            let edit_raw_event: Option<serde_json::Value> = edit_raw_event
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok());
-            let edit = ReplacementSide {
-                sender: &editor,
-                class: EventClass::Edit,
-                event_type: event_type.as_deref(),
-                is_state: is_state_event(edit_raw_event.as_ref()),
-                was_encrypted: decrypted.is_some(),
-            };
-            if check_replacement(&target, &edit).is_err() {
-                continue;
-            }
-            let Some(new_content) = content_json
-                .as_deref()
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-            else {
-                continue;
-            };
-            return Ok(Some((new_content, editor)));
-        }
-        Ok(None)
+        Ok(found
+            .flatten()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .map(|new_content| (new_content, row.sender.clone())))
     }
 
     /// 參照這則的 reaction，🚨 **只算這個帳號同步過的**（跟事件本身同一條可見性規則），被 redact 的不算。
@@ -1185,12 +1145,13 @@ fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry>
 /// `SELECT` 一列事件時的欄位順序；跟 `event_row_from_sql` 一起改。
 const EVENT_ROW_COLUMNS: &str =
     "e.id, e.room, e.event_id, r.room_id, e.sender, s.mxid, e.origin_server_ts, e.r_seq, e.g_seq,
-     e.decrypted, e.raw_event, e.event_type, e.content_json, e.is_redacted, e.class";
+     e.decrypted, e.raw_event, e.event_type, e.content_json, e.is_redacted, e.class, e.ref_event_id";
 
 struct EventRow {
     room: i64,
     event_id: String,
     room_id: String,
+    sender_row: i64,
     sender: String,
     origin_server_ts: i64,
     r_seq: Option<i64>,
@@ -1201,6 +1162,8 @@ struct EventRow {
     content_json: Option<String>,
     is_redacted: bool,
     class: String,
+    /// msg：目前要顯示的 edit；關係事件：目標。
+    ref_event_id: Option<String>,
 }
 
 fn event_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
@@ -1208,6 +1171,7 @@ fn event_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         room: row.get(1)?,
         event_id: row.get(2)?,
         room_id: row.get(3)?,
+        sender_row: row.get(4)?,
         sender: row.get(5)?,
         origin_server_ts: row.get(6)?,
         r_seq: row.get(7)?,
@@ -1218,6 +1182,7 @@ fn event_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         content_json: row.get(12)?,
         is_redacted: row.get::<_, i64>(13)? == 1,
         class: row.get(14)?,
+        ref_event_id: row.get(15)?,
     })
 }
 
@@ -1228,11 +1193,131 @@ fn is_state_event(raw_event: Option<&serde_json::Value>) -> bool {
     raw_event.is_some_and(|raw| raw.get("state_key").is_some())
 }
 
-/// 剛寫進來（或剛解開）的一則（§7.4）。🚫 **不改任何一列的 `content_json`**：edit 在讀取時才解析（§7.5）。
+/// 驗 edit、比新舊時要知道的一列。
+struct EventFacts {
+    id: i64,
+    event_id: String,
+    sender: String,
+    origin_server_ts: i64,
+    decrypted: Option<i64>,
+    is_state: bool,
+    event_type: Option<String>,
+    class: Option<EventClass>,
+    is_redacted: bool,
+    modified_timestamp: i64,
+    ref_event_id: Option<String>,
+}
+
+impl EventFacts {
+    fn replacement_side(&self) -> ReplacementSide<'_> {
+        ReplacementSide {
+            sender: &self.sender,
+            // 認不得的 class 當 General：不是 msg 也不是 edit，check_replacement 一律拒絕。
+            class: self.class.unwrap_or(EventClass::General),
+            event_type: self.event_type.as_deref(),
+            is_state: self.is_state,
+            was_encrypted: self.decrypted.is_some(),
+        }
+    }
+}
+
+fn list_event_facts(
+    transaction: &Transaction<'_>,
+    condition: &str,
+    parameters: impl rusqlite::Params,
+) -> Result<Vec<EventFacts>, SdkError> {
+    let mut statement = transaction
+        .prepare_cached(&format!(
+            "SELECT e.id, e.event_id, u.mxid, e.origin_server_ts, e.decrypted, e.raw_event, e.event_type, e.class,
+                    e.is_redacted, e.modified_timestamp, e.ref_event_id
+             FROM events e JOIN users u ON u.id = e.sender WHERE {condition}"
+        ))
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map(parameters, |row| {
+            let raw_event: Option<String> = row.get(5)?;
+            Ok(EventFacts {
+                id: row.get(0)?,
+                event_id: row.get(1)?,
+                sender: row.get(2)?,
+                origin_server_ts: row.get(3)?,
+                decrypted: row.get(4)?,
+                is_state: is_state_event(
+                    raw_event
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .as_ref(),
+                ),
+                event_type: row.get(6)?,
+                class: EventClass::from_column(&row.get::<_, String>(7)?),
+                is_redacted: row.get::<_, i64>(8)? == 1,
+                modified_timestamp: row.get(9)?,
+                ref_event_id: row.get(10)?,
+            })
+        })
+        .map_err(db_error)?;
+    let collected: Vec<EventFacts> = rows.collect::<rusqlite::Result<_>>().map_err(db_error)?;
+    Ok(collected)
+}
+
+fn find_event_facts(
+    transaction: &Transaction<'_>,
+    condition: &str,
+    parameters: impl rusqlite::Params,
+) -> Result<Option<EventFacts>, SdkError> {
+    Ok(list_event_facts(transaction, condition, parameters)?
+        .into_iter()
+        .next())
+}
+
+fn list_waiting_relations(
+    transaction: &Transaction<'_>,
+    room: i64,
+    target_event_id: &str,
+    class: EventClass,
+) -> Result<Vec<i64>, SdkError> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT id FROM events WHERE room = ?1 AND ref_event_id = ?2 AND class = ?3 AND is_processed = 0",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map(params![room, target_event_id, class.to_column()], |row| {
+            row.get(0)
+        })
+        .map_err(db_error)?;
+    let collected: Vec<i64> = rows.collect::<rusqlite::Result<_>>().map_err(db_error)?;
+    Ok(collected)
+}
+
+fn set_processed(transaction: &Transaction<'_>, event: i64) -> Result<(), SdkError> {
+    transaction
+        .prepare_cached("UPDATE events SET is_processed = 1 WHERE id = ?1")
+        .map_err(db_error)?
+        .execute(params![event])
+        .map_err(db_error)?;
+    Ok(())
+}
+
+fn set_current_edit(
+    transaction: &Transaction<'_>,
+    target: i64,
+    edit_event_id: Option<&str>,
+    modified_timestamp: i64,
+) -> Result<(), SdkError> {
+    transaction
+        .prepare_cached("UPDATE events SET ref_event_id = ?2, modified_timestamp = ?3 WHERE id = ?1 AND class = 'msg'")
+        .map_err(db_error)?
+        .execute(params![target, edit_event_id, modified_timestamp])
+        .map_err(db_error)?;
+    Ok(())
+}
+
+/// 剛寫進來（或剛解開）的一則（§7.4）。🚫 **不改任何一列的 `content_json`**。
 ///
 /// - msg／edit 的內容是約定 §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
-/// - 等著這則的 redact（先到的）→ 現在打勾
-/// - 自己是 redact → 目標在就打勾，不在就等
+/// - 等著這則的 redact、edit（先到的）→ 現在處理
+/// - 自己是 edit／redact → 目標在就處理，不在就等
 fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result<(), SdkError> {
     let Some((event_id, class, event_type, content_json)) = transaction
         .prepare_cached(
@@ -1261,62 +1346,140 @@ fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result
             content_json.as_deref(),
         )?;
     }
-    let waiting: Vec<i64> = {
-        let mut statement = transaction
-            .prepare_cached(
-                "SELECT id FROM events
-                 WHERE room = ?1 AND ref_event_id = ?2 AND class = 'redact' AND is_processed = 0",
-            )
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map(params![room, event_id], |row| row.get(0))
-            .map_err(db_error)?;
-        let collected: Vec<i64> = rows.collect::<rusqlite::Result<_>>().map_err(db_error)?;
-        collected
-    };
-    for redaction in waiting {
+    // redact 先（§7.6）：打勾之後，等著的 edit 都會跳過。
+    for redaction in list_waiting_relations(transaction, room, &event_id, EventClass::Redact)? {
         apply_redaction(transaction, room, redaction)?;
     }
-    if class == Some(EventClass::Redact) {
-        apply_redaction(transaction, room, event)?;
+    for edit in list_waiting_relations(transaction, room, &event_id, EventClass::Edit)? {
+        apply_edit(transaction, room, edit)?;
+    }
+    match class {
+        Some(EventClass::Redact) => apply_redaction(transaction, room, event)?,
+        Some(EventClass::Edit) => apply_edit(transaction, room, event)?,
+        _ => {}
     }
     Ok(())
 }
 
-/// redact（§7.6）：目標在本地就打勾 `is_redacted`、這個 redact 標處理過；目標還不在就留著 `is_processed = 0` 等它到。
+/// edit（§7.5）：目標在本地、沒被 redact、這個 edit 有效、**比目前的新** → 目標的 `ref_event_id` 換成它、
+/// `modified_timestamp` 換成它的 server 時間；否則跳過。不管換不換，這個 edit 都標處理過（目標不在或還沒解開除外）。
+///
+/// 「比目前的新」：目標還沒被 edit 過（`ref_event_id` 是 NULL）就直接換 —— 🚫 不拿目標自己的時間比，
+/// 發送端時鐘偏一點不該讓第一個 edit 失效；已經有了就比 `(origin_server_ts, event_id)` 對 `(modified_timestamp, ref_event_id)`。
+fn apply_edit(transaction: &Transaction<'_>, room: i64, edit: i64) -> Result<(), SdkError> {
+    let Some(edit) = find_event_facts(
+        transaction,
+        "e.id = ?1 AND e.class = 'edit' AND e.is_processed = 0",
+        params![edit],
+    )?
+    else {
+        return Ok(());
+    };
+    let Some(target_event_id) = edit.ref_event_id.as_deref() else {
+        return set_processed(transaction, edit.id);
+    };
+    let Some(target) = find_event_facts(
+        transaction,
+        "e.room = ?1 AND e.event_id = ?2",
+        params![room, target_event_id],
+    )?
+    else {
+        return Ok(());
+    };
+    if target.class == Some(EventClass::General) {
+        // 目標還沒解開：驗不了 type／加密，等它解開（process_event 會再叫）。
+        return Ok(());
+    }
+    if target.is_redacted
+        || edit.is_redacted
+        || check_replacement(&target.replacement_side(), &edit.replacement_side()).is_err()
+    {
+        return set_processed(transaction, edit.id);
+    }
+    let is_newer = match target.ref_event_id.as_deref() {
+        None => true,
+        Some(current) => {
+            (edit.origin_server_ts, edit.event_id.as_str()) > (target.modified_timestamp, current)
+        }
+    };
+    if is_newer {
+        set_current_edit(
+            transaction,
+            target.id,
+            Some(&edit.event_id),
+            edit.origin_server_ts,
+        )?;
+    }
+    set_processed(transaction, edit.id)
+}
+
+/// redact（§7.6）：目標在本地就打勾 `is_redacted`、`modified_timestamp` 換成 redact 的 server 時間，這個 redact 標處理過；
+/// 目標還不在就留著 `is_processed = 0` 等它到。
 /// 🚫 不動目標的 `raw_event`、`content_json`：密文與明文都還在，可以復原（§7.2）。
 /// ⭐ 目標還沒解開（general）也照打勾：刪不刪跟看不看得懂無關。
+/// ⭐ 被 redact 的是**某則訊息目前顯示的 edit** → 那則訊息退回剩下的有效 edit 裡最新的（沒有就顯示原文）。
 fn apply_redaction(
     transaction: &Transaction<'_>,
     room: i64,
     redaction: i64,
 ) -> Result<(), SdkError> {
-    let Some(target_event_id) = transaction
-        .prepare_cached(
-            "SELECT ref_event_id FROM events WHERE id = ?1 AND class = 'redact' AND is_processed = 0",
-        )
-        .map_err(db_error)?
-        .query_row(params![redaction], |row| row.get::<_, Option<String>>(0))
-        .optional()
-        .map_err(db_error)?
-        .flatten()
+    let Some(redaction) = find_event_facts(
+        transaction,
+        "e.id = ?1 AND e.class = 'redact' AND e.is_processed = 0",
+        params![redaction],
+    )?
     else {
         return Ok(());
     };
-    let marked = transaction
-        .prepare_cached("UPDATE events SET is_redacted = 1 WHERE room = ?1 AND event_id = ?2")
+    let Some(target_event_id) = redaction.ref_event_id.as_deref() else {
+        return set_processed(transaction, redaction.id);
+    };
+    let Some(target) = find_event_facts(
+        transaction,
+        "e.room = ?1 AND e.event_id = ?2",
+        params![room, target_event_id],
+    )?
+    else {
+        return Ok(());
+    };
+    transaction
+        .prepare_cached("UPDATE events SET is_redacted = 1, modified_timestamp = ?2 WHERE id = ?1")
         .map_err(db_error)?
-        .execute(params![room, target_event_id])
+        .execute(params![target.id, redaction.origin_server_ts])
         .map_err(db_error)?;
-    if marked == 0 {
+    set_processed(transaction, redaction.id)?;
+    if target.class != Some(EventClass::Edit) {
         return Ok(());
     }
-    transaction
-        .prepare_cached("UPDATE events SET is_processed = 1 WHERE id = ?1")
-        .map_err(db_error)?
-        .execute(params![redaction])
-        .map_err(db_error)?;
-    Ok(())
+    let Some(edited_event_id) = target.ref_event_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(edited) = find_event_facts(
+        transaction,
+        "e.room = ?1 AND e.event_id = ?2 AND e.class = 'msg' AND e.ref_event_id = ?3",
+        params![room, edited_event_id, target.event_id],
+    )?
+    else {
+        return Ok(());
+    };
+    let candidates = list_event_facts(
+        transaction,
+        "e.room = ?1 AND e.ref_event_id = ?2 AND e.class = 'edit' AND e.is_redacted = 0
+         ORDER BY e.origin_server_ts DESC, e.event_id DESC",
+        params![room, edited.event_id],
+    )?;
+    let fallback = candidates.iter().find(|candidate| {
+        check_replacement(&edited.replacement_side(), &candidate.replacement_side()).is_ok()
+    });
+    match fallback {
+        Some(previous) => set_current_edit(
+            transaction,
+            edited.id,
+            Some(&previous.event_id),
+            previous.origin_server_ts,
+        ),
+        None => set_current_edit(transaction, edited.id, None, redaction.origin_server_ts),
+    }
 }
 
 /// 內容是約定 §5 的檔：建 `media`（已有就不動）與 `event_media`。
@@ -1546,7 +1709,8 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                is_processed INTEGER NOT NULL DEFAULT 0 CHECK (is_processed IN (0, 1)),
                is_redacted INTEGER NOT NULL DEFAULT 0 CHECK (is_redacted IN (0, 1)),
                class TEXT NOT NULL DEFAULT 'general' CHECK (class IN ('general', 'msg', 'edit', 'redact', 'reaction')),
-               ref_event_id TEXT);
+               ref_event_id TEXT,
+               modified_timestamp INTEGER NOT NULL);
              CREATE UNIQUE INDEX events_by_event_id ON events (room, event_id);
              CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NULL;
              CREATE INDEX events_by_time ON events (room, origin_server_ts);
@@ -2383,7 +2547,7 @@ mod tests {
         assert_eq!(column_of::<i64>(&cache, "is_processed", "$c"), 0);
         let shown = cache.history(BOB, "!r", None, 1).unwrap().remove(0);
         assert_eq!(shown.decrypted, Some(false));
-        assert!(matches!(shown.kind, MessageKind::Unsupported { .. }));
+        assert!(matches!(shown.kind, MessageKind::Undecryptable));
 
         let cleartext = event_json(
             "!r",
@@ -2618,24 +2782,180 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚨 edit 也只算這個帳號同步過的：BOB 看過的 edit 🚫 不會改 ALICE 看到的內容。
+    /// ⭐ 目標那一列記著「目前顯示哪個 edit」與它的時間（§7.5）；讀取只照那一列走。
     #[test]
-    fn an_edit_only_another_account_synced_does_not_change_what_the_reader_sees() {
-        let (mut cache, dir) = open("edit-visibility");
-        let target = text("!r", "$t", Some(1), 1);
-        put(&mut cache, ALICE, std::slice::from_ref(&target));
+    fn the_target_row_points_at_the_current_edit_with_its_server_time() {
+        let (mut cache, dir) = open("edit-pointer");
+        put(&mut cache, ALICE, &[text("!r", "$t", None, 1)]);
+        assert_eq!(
+            column_of::<Option<String>>(&cache, "ref_event_id", "$t"),
+            None
+        );
+        assert_eq!(
+            column_of::<i64>(&cache, "modified_timestamp", "$t"),
+            1,
+            "寫入時等於自己的 server 時間"
+        );
         put(
             &mut cache,
-            BOB,
-            &[target, edit_of("!r", "$e", CAROL, "$t", 20, "bob saw this")],
+            ALICE,
+            &[
+                edit_of("!r", "$new", CAROL, "$t", 30, "newest"),
+                edit_of("!r", "$old", CAROL, "$t", 20, "older"),
+            ],
+        );
+        assert_eq!(
+            column_of::<Option<String>>(&cache, "ref_event_id", "$t").as_deref(),
+            Some("$new")
+        );
+        assert_eq!(column_of::<i64>(&cache, "modified_timestamp", "$t"), 30);
+        assert_eq!(
+            column_of::<i64>(&cache, "is_processed", "$old"),
+            1,
+            "比較舊的跳過，也算處理過"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 第一個 edit 🚫 不跟目標自己的時間比：發送端時鐘偏了，edit 的時間比原文早，也照樣生效。
+    #[test]
+    fn the_first_edit_applies_even_if_its_clock_is_behind_the_original() {
+        let (mut cache, dir) = open("edit-skew");
+        put(
+            &mut cache,
+            ALICE,
+            &[
+                text("!r", "$t", None, 100),
+                edit_of("!r", "$e", CAROL, "$t", 50, "skewed"),
+            ],
         );
         assert_eq!(
             body_of(&cache, ALICE, "!r", "$t").as_deref(),
-            Some("body $t")
+            Some("skewed")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// edit 先到、目標還沒解開：等；目標解開之後才驗、才生效。
+    #[test]
+    fn an_edit_waits_while_its_target_is_still_undecrypted() {
+        let (mut cache, dir) = open("edit-general");
+        let ciphertext = serde_json::json!({
+            "type": "m.room.encrypted", "event_id": "$t", "room_id": "!r", "sender": CAROL,
+            "origin_server_ts": 1, "content": { "ciphertext": "AAA" },
+        });
+        cache
+            .upsert_events(
+                ALICE,
+                "!r",
+                &[IncomingEvent::Undecrypted {
+                    ciphertext,
+                    reason: "x".into(),
+                }],
+            )
+            .unwrap();
+        let edit_cleartext = event_json(
+            "!r",
+            "$e",
+            CAROL,
+            None,
+            20,
+            serde_json::json!({
+                "msgtype": "m.text", "body": "* hello",
+                "m.new_content": { "msgtype": "m.text", "body": "hello" },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$t" },
+            }),
+        );
+        cache
+            .upsert_events(
+                ALICE,
+                "!r",
+                &[IncomingEvent::Decrypted {
+                    ciphertext: None,
+                    cleartext: edit_cleartext,
+                }],
+            )
+            .unwrap();
+        assert_eq!(column_of::<i64>(&cache, "is_processed", "$e"), 0);
+        let target_cleartext = event_json(
+            "!r",
+            "$t",
+            CAROL,
+            None,
+            1,
+            serde_json::json!({ "msgtype": "m.text", "body": "hi" }),
+        );
+        cache
+            .upsert_events(
+                ALICE,
+                "!r",
+                &[IncomingEvent::Decrypted {
+                    ciphertext: None,
+                    cleartext: target_cleartext,
+                }],
+            )
+            .unwrap();
+        assert_eq!(body_of(&cache, ALICE, "!r", "$t").as_deref(), Some("hello"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// redact：目標打勾、`modified_timestamp` 換成 redact 的時間；還沒解開的訊息被 redact 也顯示「已刪除」。
+    #[test]
+    fn a_redaction_moves_the_modified_timestamp_and_wins_over_undecryptable() {
+        let (mut cache, dir) = open("redact-time");
+        put(
+            &mut cache,
+            ALICE,
+            &[text("!r", "$t", None, 1), redaction_of("!r", "$x", "$t")],
+        );
+        assert_eq!(column_of::<i64>(&cache, "modified_timestamp", "$t"), 9);
+        let ciphertext = serde_json::json!({
+            "type": "m.room.encrypted", "event_id": "$c", "room_id": "!r", "sender": CAROL,
+            "origin_server_ts": 2, "content": { "ciphertext": "AAA" },
+        });
+        cache
+            .upsert_events(
+                ALICE,
+                "!r",
+                &[IncomingEvent::Undecrypted {
+                    ciphertext,
+                    reason: "x".into(),
+                }],
+            )
+            .unwrap();
+        put(&mut cache, ALICE, &[redaction_of("!r", "$y", "$c")]);
+        assert!(matches!(
+            cache
+                .list_messages_by_event_ids(ALICE, "!r", &["$c".to_string()])
+                .unwrap()[0]
+                .kind,
+            MessageKind::Deleted { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 讀取端再驗一次：訊息那列的 `ref_event_id` 被弄成指向別人的事件，🚫 不顯示那個內容。
+    #[test]
+    fn a_pointer_to_something_that_is_not_its_edit_shows_the_original() {
+        let (mut cache, dir) = open("edit-pointer-guard");
+        put(
+            &mut cache,
+            ALICE,
+            &[
+                text("!r", "$t", None, 1),
+                edit_of("!r", "$m", "@mallory:localhost", "$other", 20, "pwned"),
+            ],
+        );
+        cache
+            .connection
+            .execute(
+                "UPDATE events SET ref_event_id = '$m' WHERE event_id = '$t'",
+                [],
+            )
+            .unwrap();
         assert_eq!(
-            body_of(&cache, BOB, "!r", "$t").as_deref(),
-            Some("bob saw this")
+            body_of(&cache, ALICE, "!r", "$t").as_deref(),
+            Some("body $t")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

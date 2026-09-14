@@ -70,7 +70,10 @@ pub enum MessageKind {
     },
     /// 誰加入、改名、改權限…；`line` 是給人看的一行。
     System { event_type: String, line: String },
-    /// 認不得的事件：照印 type，不丟（chat-model §3.4）。解不開的加密事件也走這裡，`Message.decrypted` 是 `Some(false)`。
+    /// 解不開的加密事件：跟 `Deleted` 一樣是明確的記號，UI 直接渲染（維護者 2026-09-14）。
+    /// `Message.decrypted` 是 `Some(false)`，原因在 `undecryptable_reason`。
+    Undecryptable,
+    /// 認不得的事件：照印 type，不丟（chat-model §3.4）。
     Unsupported {
         event_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

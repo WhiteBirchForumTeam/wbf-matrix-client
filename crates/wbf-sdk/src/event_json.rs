@@ -180,10 +180,7 @@ pub(crate) fn kind_from_content(
                 },
             }
         }
-        "m.room.encrypted" => MessageKind::Unsupported {
-            event_type: event_type.to_string(),
-            body: None,
-        },
+        "m.room.encrypted" => MessageKind::Undecryptable,
         "m.room.member"
         | "m.room.name"
         | "m.room.topic"

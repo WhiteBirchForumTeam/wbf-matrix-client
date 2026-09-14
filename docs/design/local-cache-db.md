@@ -238,7 +238,8 @@ CREATE TABLE events (
   is_processed INTEGER NOT NULL DEFAULT 0 CHECK (is_processed IN (0, 1)),
   is_redacted INTEGER NOT NULL DEFAULT 0 CHECK (is_redacted IN (0, 1)),
   class TEXT NOT NULL DEFAULT 'general' CHECK (class IN ('general', 'msg', 'edit', 'redact', 'reaction')),
-  ref_event_id TEXT);                   -- edit／redact／reaction 指向的目標（§7.3 的刻意例外：目標可能還不在，沒辦法外鍵）
+  ref_event_id TEXT,                    -- edit／redact／reaction：指向的目標；msg：目前要顯示的 edit（§7.3 的刻意例外：可能還不在，沒辦法外鍵）
+  modified_timestamp INTEGER NOT NULL); -- 寫入時＝自己的 origin_server_ts；被 edit 換版或被 redact 時換成那個事件的 server 時間（§7.5）
 CREATE UNIQUE INDEX events_by_event_id ON events (room, event_id);
 CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NULL;   -- 排序、判洞、跳第 N 則
 CREATE INDEX events_by_time ON events (room, origin_server_ts);
@@ -352,7 +353,8 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 
 - 🚫 **原始事件永遠不改**。收到什麼存什麼：密文就留著密文，被 redact 了也還在 —— 所以可以復原。
 - 🚫 **每一則自己的明文也不改**（維護者 2026-09-14 改定）：解密結果寫進 `content_json` 之後就不動，edit 🚫 不寫回目標。
-  顯示時才引用「目前最新的那個 edit」（§7.5）；redact 只在目標打勾 `is_redacted`。
+  目標那一列只記「目前要顯示哪個 edit」（`ref_event_id`）與「最後一次變動的 server 時間」（`modified_timestamp`），顯示時引用（§7.5）；
+  redact 只在目標打勾 `is_redacted`。
 - ⭐ **先解密再寫入**：寫進去的時候就已經處理過，只有解不開的才停在「未處理」。
 - 📎 **redact 要不要真的清掉本地的唯一快取，是裝置端的選擇，🚫 不是協議保證**（維護者 2026-09-14）。
   client 選擇不清，redact 對它就是「標記」而不是「抹除」—— 在這個 client 上不算 bug。
@@ -363,18 +365,18 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 |---|---|---|---|
 | **`raw_event`** | TEXT | NULL | 原始事件 JSON。**原本的 `message_json` 改名**；⚠️ 內容也變了：以前存的是轉換過的 `Message`，之後存 server 給的原樣。🚫 第一次寫入之後**永遠不覆蓋**（只從 NULL 補）。matrix-sdk 解開的事件拿不到密文 → NULL（§7.7 第 3 點） |
 | **`content_json`** | TEXT | **NULL** | 這一則**自己的**明文 `content`（edit 是它的 `m.new_content`）。⭐ **NULL ＝還沒處理**（維護者：用 NULL 而不是空字串，才分得出處理過沒有）。🚫 寫進去就不改 —— edit 不寫回目標（維護者 2026-09-14 從 `final_body` 改名改義） |
-| **`is_processed`** | BOOL | 0 | 這一則處理完了沒。解不開的是 0；redact 的效果在**目標**上，目標還沒到之前也是 0；其他分完類就是 1 |
+| **`is_processed`** | BOOL | 0 | 這一則處理完了沒。解不開的是 0；edit／redact 的效果在**目標**上，目標還沒到（或還沒解開）之前也是 0；其他分完類就是 1 |
 | **`is_redacted`** | BOOL | 0 | 被 redact 過就打勾。**redact 優先**：打勾之後顯示「已刪除」，任何 edit 都不看 |
 | **`class`** | | `general` | `general`（還不知道是什麼的密文）／`msg`／`edit`／`redact`／`reaction` |
-| **`ref_event_id`** | TEXT | NULL | **參照**：edit／redact／reaction 指向的**目標的 `event_id`**。一般訊息是 NULL。**加索引** `(room, ref_event_id)`（用它反查「誰參照這則」） |
+| **`ref_event_id`** | TEXT | NULL | **兩種意思，看 `class`**（維護者 2026-09-14）：edit／redact／reaction → 指向的**目標的 `event_id`**；msg → **目前要顯示的那個 edit 的 `event_id`**（沒被 edit 過是 NULL）。**加索引** `(room, ref_event_id)`（反查「誰參照這則」）。⚠️ 所以每一條用它的查詢都要帶 `class` 條件 |
+| **`modified_timestamp`** | INTEGER | — | 這一列最後一次變動的 server 時間：寫入時＝自己的 `origin_server_ts`；換成新的 edit 時＝那個 edit 的 `origin_server_ts`；被 redact 時＝那個 redact 的。edit 寫入時拿它**直接比大小**，讀取不必再查參照（§7.5） |
 
 ⚠️ **`ref_event_id` 是 §6 第 2 條原則的刻意例外**（「字串識別碼在整個 DB 裡各只出現一次，其餘全走整數外鍵」）：
 這裡**沒辦法用外鍵**，因為目標那一列**可能還不存在**（只先讀到 edit／redact）。
 📎 只有關係事件才填，數量遠少於訊息。
 ⭐ 用 `event_id` 而不是 `g_seq` 參照（維護者 2026-09-14）：關係事件本身就帶著目標的 `event_id`（`m.relates_to.event_id`、`redacts`），
 寫入當下就填得進去；🚫 **不帶目標的 `g_seq`**，要等目標到了才知道 —— 而且一般 Matrix server 根本沒有 `g_seq`。
-🚫 **不另加「目標到了才補上」的外鍵欄**（維護者 2026-09-14 討論過）：`ref_event_id` 加索引已經查得到「誰參照這則」，
-外鍵只是同一個關係的第二份，還要在目標寫入時回頭補 —— 多一個會漂移的狀態，換不到新的查詢能力。
+🚫 **不另加外鍵欄**（維護者 2026-09-14 討論過）：`ref_event_id` 加索引已經查得到「誰參照這則」，外鍵只是同一個關係的第二份。
 
 ### 7.4 各類事件怎麼處理
 
@@ -382,25 +384,27 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 收到事件 → 先解密（明文事件不用解）
   ├─ 解不開           → class=general，content_json=NULL，is_processed=0
   ├─ msg              → content_json=內容，class=msg，is_processed=1
-  ├─ edit             → content_json=new_content，class=edit，ref_event_id=目標，is_processed=1
-  │                     目標：🚫 不動（讀取時才解析，§7.5）
+  ├─ edit             → content_json=new_content，class=edit，ref_event_id=目標
+  │                     目標在本地：照 §7.5 決定換不換目標的 ref_event_id／modified_timestamp，自己 is_processed=1
+  │                     不在（或還沒解開）：自己 is_processed=0 等著；目標的 content_json 🚫 永遠不動
   ├─ redact           → class=redact，ref_event_id=目標
-  │                     目標在本地：目標 is_redacted=1、自己 is_processed=1；不在：自己 is_processed=0 等著
+  │                     目標在本地：目標 is_redacted=1、modified_timestamp=redact 的時間，自己 is_processed=1；不在：等著
   └─ reaction         → class=reaction，ref_event_id=目標，is_processed=1（讀取時聚合）
 ```
 
 - **明文事件**（沒加密的房間）：收到當下就分類，不用等解密。
-- ⭐ **目標還沒到本地**：edit、reaction 什麼都不用等 —— 讀取時一查就有。只有 redact 要在目標那列打勾，所以停在 `is_processed=0`；
-  **目標寫入時，先查「誰參照這則」**（維護者 2026-09-14）：
+- ⭐ **目標還沒到本地**：edit、redact 停在 `is_processed=0`（reaction 不用等，讀取時聚合）。
+  **目標寫入時，先查「誰參照這則」**（維護者 2026-09-14），redact 先、edit 後：
 
   ```sql
   SELECT id FROM events WHERE room = ? AND ref_event_id = <目標的 event_id> AND class = 'redact' AND is_processed = 0
+  SELECT id FROM events WHERE room = ? AND ref_event_id = <目標的 event_id> AND class = 'edit'   AND is_processed = 0
   ```
 
   有索引，這一查很快。不另開暫存表 —— `is_processed=0` 加上 `ref_event_id` 就是那張表。
 - **reaction 聚合**：讀取時用同一個索引查 `class = reaction AND ref_event_id = <這則>`。
 
-### 7.5 edit：全量取代，顯示時引用最新的
+### 7.5 edit：全量取代，目標記著目前顯示哪一個
 
 ⭐ **Matrix 的 edit 是全量修改，不是 delta**（查證於 vendor 的 matrix-sdk，它照 spec v1.17「validity of replacement events」）：
 
@@ -409,17 +413,33 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 - 有多個 edit 時**用最新的那一個**，🚫 不重播中間的（matrix-sdk-ui 的 `resolve_edits`）。
 
 所以不必記錄或重播 edit 的歷史，**只要知道最新的是哪一個**，而且 🚫 **不必把它寫回目標**（維護者 2026-09-14）：
-全量的 `m.new_content` 本來就存在 edit 自己那列，顯示目標時直接引用。
+全量的 `m.new_content` 本來就存在 edit 自己那列，目標只記**指向它**（`ref_event_id`）與它的時間（`modified_timestamp`）。
 
-**讀取一則 msg 時**：
+**寫入一個 edit 時**（維護者 2026-09-14）：
 
 ```
-is_redacted=1                           → 「已刪除」，不看 edit
-否則找 ref_event_id = 這則、class = edit、is_redacted = 0、這個帳號同步過的 edit，
-    照 origin_server_ts 由新到舊（平手比 event_id，字典序大的新），第一個有效的（下表）
-  ├─ 找到 → 顯示的 content = 它的 m.new_content，但 m.relates_to 留目標原本的（回覆關係不被洗掉）；edited_by = 它的 sender
-  └─ 沒有 → 顯示目標自己的 content_json
+目標不在本地（或還沒解開）                         → edit 等著（is_processed=0），目標寫入時再處理
+目標在本地 AND 目標 is_redacted=0 AND edit 有效（下表）AND edit 比目前的新
+                                                    → 目標.ref_event_id = edit.event_id
+                                                      目標.modified_timestamp = edit.origin_server_ts
+否則                                                → 跳過
+（目標在本地時，不管換不換，edit 自己 is_processed=1；目標的 content_json 🚫 永遠不動）
 ```
+
+「比目前的新」：
+- 目標還沒被 edit 過（`ref_event_id` 是 NULL）→ 直接換。🚫 不拿目標自己的時間比：發送端時鐘偏一點，不該讓第一個 edit 失效。
+- 已經有了 → `(edit.origin_server_ts, edit.event_id) > (目標.modified_timestamp, 目標.ref_event_id)`：直接比大小，平手比 `event_id`（字典序大的新）。
+
+**讀取一則訊息時**（維護者 2026-09-14）：
+
+```
+1. is_redacted=1                  → 「已刪除」的記號
+2. 還沒解開（class=general）       → 「解不開」的記號（kind=undecryptable，跟已刪除一樣 UI 直接渲染）
+3. ref_event_id 是 NULL           → 顯示自己的 content_json
+   不是 NULL                      → 取那個 edit 的 m.new_content 替換（m.relates_to 留自己原本的，回覆關係不被洗掉）；edited_by = 它的 sender
+```
+
+🚨 第 3 步在讀取端**再驗一次**：那一列必須真的是「指回這則、同一個 sender、沒被 redact 的 edit」，對不上就顯示原文（A6：不假定寫入端永遠對）。
 
 ⭐ **新舊比 `origin_server_ts`，以 server 為準**（維護者 2026-09-14）：有沒有 `g_seq` 都同一條規則，所以一般 Matrix server 也比得出來。
 📎 spec 規定 server 端聚合 `m.replace` 時也是這樣選「最新」（`origin_server_ts`，平手比 `event_id`），跟別的 client 看到的一致。
@@ -428,9 +448,10 @@ is_redacted=1                           → 「已刪除」，不看 edit
 
 ⭐ 這個設計順便解掉幾件事：
 
-- **先到後到都一樣**：edit 比目標早到，什麼都不用補；目標一到，讀取時就查得到。
-- **redact 掉最新的 edit，自然退回上一個**；全部 redact 掉就是原文（目標那列從沒被改過）。
-- 沒有「套了」與「跳過」要分（原 §7.7 第 4 點）：沒有東西被套上，每次讀取都從有效的 edit 裡選。
+- **先到後到都一樣**：比大小的結果跟到達順序無關。
+- **目標那列的明文從沒被改過**，所以 redact 掉目前顯示的 edit 時退得回去（§7.6）。
+- 沒有「套了」與「跳過」要分（原 §7.7 第 4 點）：跳過的就是比較舊的，而目前生效的是哪個，目標那列自己記著。
+- 讀取不必掃參照：一次唯一索引 `(room, event_id)` 就拿到 edit 的內容。
 
 🚨 **無效的 edit 必須忽略**（spec 規定；有兩條是資安相關）：
 
@@ -446,7 +467,10 @@ is_redacted=1                           → 「已刪除」，不看 edit
 
 - 目標 `is_redacted=1`，UI 看到的是「已刪除」。目標還沒解開（`general`）也照打勾：刪不刪跟看不看得懂無關。
 - 🚫 **不動 `raw_event`、`content_json`**：密文與明文都還在，可以復原（§7.2）。
-- 被 redact 的是一個 edit：那個 edit 不再被選，顯示退回上一個有效的 edit（§7.5）。
+- 目標的 `modified_timestamp` 換成 redact 的 server 時間。
+- 被 redact 的是**某則訊息目前顯示的 edit**：那則訊息重新從剩下的、沒被 redact 的有效 edit 裡取最新的
+  （`ref_event_id`／`modified_timestamp` 換成它的）；一個都不剩就 `ref_event_id = NULL`、`modified_timestamp` = redact 的時間，顯示原文。
+  📎 只有這個情況要掃一次參照，平常的讀寫都不用。
 
 ### 7.7 拍板紀錄
 
@@ -460,7 +484,7 @@ is_redacted=1                           → 「已刪除」，不看 edit
      把 WS 收到的密文交給 matrix-sdk 的 `Room::decrypt_event`（它是 `pub`）另開一支。
    - ✅ **matrix-sdk 解開的事件拿不到密文**（`DecryptedRoomEvent` 只有明文）：`raw_event` 放 NULL（維護者 2026-09-14）。
      走 WS 自己撈的，密文就是自己的，照存。
-4. ✅ ~~**「套了」與「跳過」怎麼分**~~：不存在了 —— edit 不寫回目標，讀取時從有效的 edit 裡選最新的（維護者 2026-09-14），見 §7.5。
+4. ✅ ~~**「套了」與「跳過」怎麼分**~~：不存在了 —— 目標那列的 `ref_event_id` 就是目前生效的那個，跳過的就是比較舊的（維護者 2026-09-14），見 §7.5。
 
 ### 7.8 實作（2026-09-14，schema v5）
 
@@ -477,6 +501,7 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 | 拿掉 `kind` | 讀取時從 `content_json` 算 | 同一個事實的第二份（§6 原則）；`files` 改用 `json_extract(content_json, '$.msgtype')` |
 | 留著 `decrypted` | NULL／0／1 | 「原本是不是加密事件」要明說 —— edit 的資安規則（加密的目標配明文 edit）靠它，🚫 不靠「`raw_event` 是 NULL 所以大概是加密的」這種巧合 |
 | 不存解不開的原因 | 讀出來一律 `NotDecryptedHere` | matrix-sdk 給的 UTD 原因只在那一次請求有意義 |
+| 解不開有專用的 `kind` | `MessageKind::Undecryptable`（JSON `"kind": "undecryptable"`） | 維護者 2026-09-14：跟 `deleted` 一樣是 UI 直接渲染的記號，🚫 不再混在 `unsupported` 裡 |
 
 **寫入**（`upsert_events` 的同一個 transaction 裡）：
 
@@ -484,9 +509,11 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 - 同一則再來：`raw_event`／`r_seq`／`g_seq` 只從 NULL 補；server 蓋了 `redacted_because` 就 `is_redacted = 1`（只升不降）；
   原本是 `general`、這次帶明文 → 照明文分類，當作第一次處理。其他一律不動（`content_json` 不被覆蓋）。
 - msg／edit 的內容是約定 §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）。
-- 每一則寫入時都查「有沒有 redact 在等這則」，有就打勾；redact 自己寫入時，目標在就打勾，不在就等。
+- 每一則寫入時都查「有沒有 redact、edit 在等這則」，redact 先處理；自己是 edit／redact 時，目標在就處理，不在就等。
 
-**讀取**：`find_latest_edit` 照 §7.5；reaction 與 edit 都 🚨 只算讀者自己同步過、沒被 redact 的。
+**讀取**：`find_current_edit` 照 §7.5；reaction 🚨 只算讀者自己同步過、沒被 redact 的。
+⚠️ edit **不照讀者過濾**：目前顯示哪個 edit 記在目標那一列，是所有帳號共用的（§6「同一台機器的帳號屬於同一個人」）——
+帳號 B 同步到的 edit，帳號 A 讀這則時也會看到新內容。
 
 **已知的限制**：
 
