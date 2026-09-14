@@ -54,13 +54,14 @@ pub struct FakeServer {
 
 /// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
 /// 真 server 兩個都送，這裡照表補上，client 那邊才會像對真 server 一樣只看序號。
+///
+/// ⭐ **從 `WbfErrorCode` 反查，🚫 不再手寫第二張表**（PR #37 審查 cirno💡）：變體名就是 server 的 `code` 名字，
+/// 所以掃一遍序號、比 `Debug` 名字就夠了。server 表加碼時只要動 `error_code.rs` 一個地方。
+/// 📎 只在測試裡這樣做：SDK 本身🚫 不從名字反查序號（那正是 #29 第 2 項要拿掉的東西）。
 fn code_id_of(code: &str) -> Option<u64> {
-    Some(match code {
-        "TooLarge" => 1103,
-        "NotFound" => 1501,
-        "Conflict" => 1502,
-        "OutOfOrder" => 1503,
-        _ => return None,
+    (1000..2000).find(|code_id| {
+        wbf_sdk::error_code::WbfErrorCode::from_id(*code_id)
+            .is_some_and(|known| format!("{known:?}") == code)
     })
 }
 

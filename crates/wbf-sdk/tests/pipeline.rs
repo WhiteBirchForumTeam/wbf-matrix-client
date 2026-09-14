@@ -538,8 +538,13 @@ async fn hello_ping_status_abort() {
         (0, Some(3), Some(40))
     );
     client.abort_upload(state.upload_id).await.unwrap();
-    let after = client.upload_status(state.upload_id).await;
-    assert_eq!(after.unwrap_err().server_code(), Some("NotFound"));
+    let after = client.upload_status(state.upload_id).await.unwrap_err();
+    assert_eq!(after.server_code(), Some("NotFound"), "名字給人看");
+    // ⭐ 程式認的是序號：假 server 從 `WbfErrorCode` 反查補上的 `code_id` 要對得上。
+    assert_eq!(
+        after.wbf_code(),
+        Some(wbf_sdk::error_code::WbfErrorCode::NotFound)
+    );
 }
 
 /// wbfuwunel 對 `Create` 的回應標頭 id 是新上傳 id（plan-v1 §6 記的順帶發現）：兩種都要收；

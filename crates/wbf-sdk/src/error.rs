@@ -93,6 +93,10 @@ impl From<std::io::Error> for SdkError {
 }
 
 impl SdkError {
+    /// 🚨 **只給人看、給測試斷言名字用** —— 🚫 **程式決策請用 [`SdkError::wbf_code`]**（只看 `code_id`）。
+    /// 這個字串同時裝著 wbf 的名字、Matrix 的 `errcode` 與我們合成的碼，拿它判斷就是在賭三者不撞名
+    /// （PR #37 審查 cirno💡）。
+    ///
     /// Return:
     ///     Option<&str>  `Server` 的 code, example: "OutOfOrder"；其他變體 None
     pub fn server_code(&self) -> Option<&str> {
