@@ -3,6 +3,7 @@
 
 use wbf_sdk::chunk_crypto::{chunk_count, expected_plain_len, locate, MAX_CHUNK_INDEX};
 use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
+use wbf_sdk::error_code::WbfErrorCode;
 
 fn unhex(text: &str) -> Vec<u8> {
     hex::decode(text.replace([' ', '\n'], "")).expect("valid hex")
@@ -370,6 +371,41 @@ fn event_recent_and_batch_match_server_vectors() {
     match protocol::expect_batch(&request, pack_named("error_unsupported"), 0) {
         Err(SdkError::Server { code, .. }) => assert_eq!(code, "Unsupported"),
         other => panic!("expected Server(Unsupported), got {other:?}"),
+    }
+    // 🚨 server 向量裡的每一個 Error：**認碼只看 `code_id`**（issue #29 第 2 項）。
+    for (name, expected) in [
+        ("error_superseded", WbfErrorCode::Superseded),
+        ("error_rate_limited", WbfErrorCode::RateLimited),
+        ("error_out_of_order", WbfErrorCode::OutOfOrder),
+        ("error_unsupported", WbfErrorCode::Unsupported),
+        ("error_too_many_connections", WbfErrorCode::TooManyConnections),
+        ("error_invalid_request", WbfErrorCode::InvalidRequest),
+    ] {
+        let error = protocol::server_error(&pack_named(name).meta);
+        assert_eq!(error.wbf_code(), Some(expected), "{name}");
+        assert_eq!(
+            u64::from(expected.id()),
+            serde_json::from_slice::<serde_json::Value>(&pack_named(name).meta).unwrap()["code_id"]
+                .as_u64()
+                .unwrap(),
+            "{name}：表上的號要跟 server 向量一樣"
+        );
+    }
+    // 🚫 `code_id: 0` 是「欄位漏了」的預設值（server 表：0 永遠不是合法的碼）：
+    // 🚫 不准變成 `Some(0)` —— 重送判斷那邊 `from_id(0)` 本來就認不得，但 log 會印出「(0)」，
+    // 讀的人會以為 server 真的回了碼 0。字串、負數也一樣當沒有。
+    for meta in [
+        br#"{"code":"Corrupt","code_id":0,"message":"m"}"#.as_slice(),
+        br#"{"code":"Corrupt","code_id":"1002","message":"m"}"#.as_slice(),
+        br#"{"code":"Corrupt","code_id":-1,"message":"m"}"#.as_slice(),
+        br#"{"code":"Corrupt","message":"m"}"#.as_slice(),
+    ] {
+        let error = protocol::server_error(meta);
+        let SdkError::Server { code_id, .. } = &error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(*code_id, None, "{}", String::from_utf8_lossy(meta));
+        assert_eq!(error.to_string(), "server Corrupt: m", "log 不准印出假的序號");
     }
     match protocol::server_error(&pack_named("error_too_many_connections").meta) {
         SdkError::Server { code, meta, .. } => {

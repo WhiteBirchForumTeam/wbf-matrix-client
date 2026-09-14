@@ -342,10 +342,16 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 |---|---|
 | 0 | 成功 |
 | 1 | 用法錯：參數、找不到檔、`local.key`／`session.sealed` 壞掉或解不開、passphrase 錯 |
-| 2 | server 回 `Error` pack 或 HTTP 非 2xx；stderr 印 `code` 與 `message` |
+| 2 | server 回 `Error` pack 或 HTTP 非 2xx；stderr 印 `code`、wbf 的 `code_id`（有的話）與 `message`，例：`server OutOfOrder (1503): expected chunk 1` |
 | 3 | **完整性失敗**：CRC、AEAD 標籤、長度、sha256、事件與 `Info` 對不上。半成品已刪 |
 | 4 | 網路：連不上、斷線且續傳次數用完 |
 | 5 | 等逾時：`watch once --timeout` 到了還沒有事件 |
+
+⚠️ **SDK 認 wbf 的錯誤碼只看 `code_id`，🚫 不看 `code` 名字**（wbfuwunel `wbf-wire-format.md` §3.4；issue #29 第 2 項）。
+`code` 那個字串同時裝著 Matrix 的 `errcode`（`M_FORBIDDEN`）與我們自己合成的（HTTP 401 的 `Unauthorized`），
+所以只給人看。📎 在程式裡是 `SdkError::wbf_code()` → `WbfErrorCode`（`wbf-sdk/src/error_code.rs`，server 那張表的投影）。
+🚨 **不認得的碼**（包括 `0`、表上沒有的號）一律當「失敗了、不知道能不能重試」：🚫 不重試，原樣往上報 ——
+例如上傳只在認得的 `Corrupt`（1002）重送一次、認得的 `OutOfOrder`（1503）跳回 `expected_seq`，其他一律 exit 2。
 
 ## 5. Manifest：`upload` 印的、`download` 吃的
 
