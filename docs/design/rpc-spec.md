@@ -305,37 +305,35 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
-| `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「`before` 是哪一套座標」 |
+| `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「往回翻：`before` 與 `next`」 |
 | `room.files` | `{ room, limit, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
 | `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（daemon-runtime §6） |
 
-🚨 **`before` 是哪一套座標，看 `sync`**（`room.history`／`room.files`；PR #32 審查 cirno🔴）：
+🚨 **往回翻：`before` 與 `next` 一律是 `event_id`**（`room.history`／`room.files`；維護者 2026-09-14）。
 
-| `sync` | `before` 收什麼 | 回應的 `next` 是什麼 |
-|---|---|---|
-| `local`（預設） | 本地 `r_seq` 的**數字** | 本地 `r_seq` |
-| `server` | server 的**翻頁 token** | server 的翻頁 token |
-| `both` | 🚫 **不接受 `before`**（帶了就是 `1100`＝`CoreErrorKind::Usage`） | 本地 `r_seq` |
+`next` 是這一頁**最舊那則**的 `event_id`；下一頁把它當 `before` 傳回來。`next` 不在 ＝ 到頭了。
+⭐ UI 不分 server 是誰：一律拿手上最舊那則往回問，問到它覺得夠了為止。
+📎 為什麼是 `event_id` 不是 `r_seq`：它是可攜的權威（chat-model §4.3），而一般 Matrix server 上**根本沒有 `r_seq`**。
+每則 `Message` 照樣帶 `r_seq`／`g_seq`，判斷有沒有漏、算未讀用它們。
 
-🚨 **`both` 那一格是權宜的，它會消失**。問題不在 `both`，在**現在只有一個 backend 拿得到歷史**：
+| `sync` | 做什麼 |
+|---|---|
+| `local`（預設） | 只讀本地。🚫 **一般 Matrix 房（沒有 `r_seq`）不答**：那種房「不快取回答、總是詢問」，拿時間戳排是錯的。🚫 錨點不在本地也不答（空頁會被讀成「到頭了」）。兩種都回 `1100` |
+| `server` | 問上游、**不寫庫** |
+| `both` | **永遠問上游** → 寫進去（已解密的不被密文蓋掉；沒有的插入，解不開也存）→ 用這一頁的 `event_id` 從本地讀回，**順序照上游** |
 
-| backend | 上游怎麼定位 | 本地怎麼定位 | 對得上嗎 |
-|---|---|---|---|
-| matrix-sdk `/messages`（現在唯一有歷史的） | 不透明 token | `r_seq` | ❌ 沒有翻譯 |
-| **wbf**（`Event/Recent` 點名房間，wbfuwunel #51） | **`g_seq`** | 現在是 `r_seq` | ⚠️ 接的時候本地要換成 `g_seq` 才是同一套 |
+daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` 參數所以用預設的 ws，§2）：
 
-⚠️ 所以在 matrix backend 上，`both` 帶一個 token 進來，好一點是解析失敗（而且是在**已經抓完、
-已經寫進庫之後**才失敗）；🚨 壞的是那個 token 剛好長得像數字 —— 它會指到本地一個不相干的位置，
-然後**看起來像成功**。協議上 token 就是不透明字串，🚫 不該賭它的長相。
+| backend | 怎麼從 `event_id` 往回翻 |
+|---|---|
+| wbf-sdk | 本地查那則的 **`g_seq`** → `Event/Recent{ rooms: [這個房], before: g_seq }`（wbfuwunel #51） |
+| matrix-sdk | `/context/{event_id}` 拿 `prev_batch_token` → `/messages` 往回。🚫 **不暫存 token** |
 
-⭐ **出口**：wbf 的房間歷史 ＝ `Event/Recent` 點名一個房 ＋ `before`（wbfuwunel PR #51）。
-🚨 **它翻頁用的是 `g_seq`，🚫 不是 `r_seq`**（server 那邊 `r_seq` 沒有索引）：`g_seq` 翻頁、`r_seq` 判斷有沒有洞。
-所以接上的時候，**`before` 的座標會從 `r_seq` 換成 `g_seq`**（本地與上游同一套），`both` 也就收得下 `before` 了。
-⚠️ 那是一次**語意改變**（同一個欄位換座標），要在那支 PR 裡明講。
-📎 更正：這裡之前寫過「上下兩半講同一種 `r_seq`」，那是 #51 公開之前的猜測，錯的。
-
-📎 在那之前也不擋路：**點開房間 = 不帶 `before` 的 `both`**（拉最新的一頁順便入庫），
-**往回翻 = `local`**（資料已經在庫裡了，翻頁很便宜）。要一頁頁跟 server 翻就整條都用 `server`。
+- ⚠️ wbf 要的 `g_seq` 只在本地有。錨點本地查不到（例如上一頁是 `sync=server` 拿的，沒寫庫）→ 改走 `/context`，它只要 `event_id`。
+- ⚠️ `both` 暫時**每一頁都問上游**，🚫 不先判本地有沒有洞：本地 `r_seq` 天生不連號（reaction／edit／redaction 併進目標不存列、
+  看不到的事件 server 會跳過、超大事件被跨過），「連號＝沒洞」判不出來。之後有 server 推送再確認。
+- 🚨 `both` 的 `next` 用**上游那一頁**的：最舊那則被 `hidden` 的話，讀回來的最後一則比較新，拿它往回問會一直拿到同一頁。
+- ⚠️ 聯邦開了之後：wbf 那一窗到底 ≠ 房間到頭（更早的在別台 server），那時要走 `/messages`（wbfuwunel room-seq-and-recent.md §2.1）。
 
 🚫 **沒有 `room.watch`**。CLI 的 `watch tail|wait|once` 是「一個命令一個程序」的產物；daemon 常駐，
 新訊息走**訂閱＋推播**（§4）。rpc-cli 要模擬 `watch once --timeout` 就是「訂閱、等第一則、退訂」。
@@ -577,8 +575,8 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `room.send_text` | ✅ | matrix-sdk `Room::send` | 🔁 `Event/Send` 等附件宣告（約定 §5.2）一起做 |
 | `room.send_file` | ✅ | 上傳 **WS** ＋ 事件 matrix-sdk | 🔁 一半 |
 | `room.send_attachment`、`media.create` | ❌ | — | ❌ |
-| `room.history`（`source: server`） | ✅ | matrix-sdk `/messages` | 🔁 |
-| `room.history`／`room.files`（`source: cache`） | ✅ | 本機 `cache.db` | ✅ |
+| `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server、或錨點不在本地） | ✅ wbf／🔁 一般 server |
+| `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
 | `room.message` 推播 | ✅（`CoreEvent::Message`，來自 `watch`） | matrix-sdk `/sync` | 🔁 daemon 版要接 `Event/Subscribe`／`Push` |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`--transport http` 是 fallback） | ✅ |

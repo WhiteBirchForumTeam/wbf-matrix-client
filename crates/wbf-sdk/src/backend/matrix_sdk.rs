@@ -200,20 +200,49 @@ impl ChatBackend for MatrixBackend {
         self.describe(&room).await
     }
 
+    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（chat-model §4.3：`event_id` 是可攜的權威）。
+    /// 標準 Matrix 沒有「從某則事件往前翻」的 API，所以分兩步：
+    ///
+    /// 1. `/context/{event_id}` 拿到**那一則之前**的 token（`prev_batch_token`）；
+    /// 2. `/messages` 從那個 token 往回。
+    ///
+    /// ⭐ 所以**不必暫存 token**：任何一則事件都拿得到它的位置，代價是每頁多一次請求。
+    /// ⚠️ `/context` 的 `limit` 給 0，但有的 server 會把 0 當預設值、照樣回 `events_before` ——
+    /// 那些就是緊鄰錨點的更舊事件，🚫 不能丟，所以接在這一頁的最前面。
     async fn history(&self, id: &str, before: Option<&str>, limit: u32) -> Result<Page, SdkError> {
         if limit == 0 {
             return Err(SdkError::Usage("history limit must be at least 1".into()));
         }
         let room = self.room(id)?;
-        let mut options = MessagesOptions::backward();
-        options.limit = UInt::from(limit);
-        options.from = before.map(str::to_string);
-        let messages = room.messages(options).await.map_err(matrix_error)?;
-        let events = aggregate(id, messages.chunk.iter().map(to_message).collect());
-        Ok(Page {
-            events,
-            next: messages.end,
-        })
+        let (adjacent, from, remaining) = match before {
+            None => (Vec::new(), None, limit),
+            Some(anchor) => {
+                let anchor = matrix_sdk::ruma::EventId::parse(anchor).map_err(|error| {
+                    SdkError::Usage(format!("`before` must be an event id: {error}"))
+                })?;
+                let context = room
+                    .event_with_context(&anchor, false, UInt::from(0u32), None)
+                    .await
+                    .map_err(matrix_error)?;
+                let has_prev_token = context.prev_batch_token.is_some();
+                match plan_after_context(context.events_before, has_prev_token, limit) {
+                    ContextPlan::Done(events_before) => return Ok(page_from_timeline(id, &events_before)),
+                    ContextPlan::Continue {
+                        adjacent,
+                        remaining,
+                    } => (adjacent, context.prev_batch_token, remaining),
+                }
+            }
+        };
+        let mut timeline: Vec<TimelineEvent> = adjacent;
+        if remaining > 0 {
+            let mut options = MessagesOptions::backward();
+            options.limit = UInt::from(remaining);
+            options.from = from;
+            let messages = room.messages(options).await.map_err(matrix_error)?;
+            timeline.extend(messages.chunk);
+        }
+        Ok(page_from_timeline(id, &timeline))
     }
 
     async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError> {
@@ -591,6 +620,71 @@ fn matrix_error(error: matrix_sdk::Error) -> SdkError {
 // ---- 事件 → Message ----
 
 /// `TimelineEvent` 是 matrix-sdk 解密過的結果：解得開就是明文事件，解不開是原事件加原因。這裡把它變成我們的 `Message`。
+/// `/context` 回來之後，這一頁還要不要再問 `/messages`。
+#[derive(Debug, PartialEq, Eq)]
+enum ContextPlan<T> {
+    /// 不用再問：緊鄰的已經湊滿一頁，或那一則之前已經沒有東西（房間的開頭）。
+    Done(Vec<T>),
+    /// 還差幾則：從 `prev_batch_token` 往回問 `/messages`。
+    Continue { adjacent: Vec<T>, remaining: u32 },
+}
+
+/// 🚨 **這一頁最多 `limit` 則** —— `/context` 回多少都一樣（PR #36 審查 rumia🔴）。
+///
+/// `/context` 的 `limit` 我們給 0，但有的 server 把 0 當「預設值」、照樣回一串 `events_before`；
+/// 整串塞進這一頁，`limit = 1` 就可能回 10 則。所以先截到 `limit`。
+///
+/// ⭐ **截掉的不會被跳過**：下一頁的錨是**這一頁最舊那則的 `event_id`**（`next_anchor_of`），
+/// 下一次會對它重新 `/context` —— 被截掉的那幾則比它舊，下一頁自然拿到。
+/// 🚫 所以截掉之後**不能**再從 `prev_batch_token` 接 `/messages`：那個 token 在**整串** `events_before` 之前，
+/// 接下去會跳過被截掉的那段。
+///
+/// 🚨 沒有 token ＝ 那一則之前已經沒有東西（房間的開頭）：🚫 不再用 `from: None` 去問，那會拿到最新一頁、看起來像成功。
+///
+/// Args:
+///     events_before: `/context` 回的緊鄰更舊事件，新到舊, example: vec![e9, e8, e7]
+///     has_prev_token: `/context` 有沒有給 `prev_batch_token`, example: true
+///     limit: 這一頁最多幾則（呼叫端已擋掉 0）, example: 1
+/// Return:
+///     Done(events)                 截到 `limit` 的緊鄰事件就是整頁
+///     Continue { adjacent, remaining }  緊鄰的不到 `limit`、而且還有 token：再問 `remaining` 則
+fn plan_after_context<T>(mut events_before: Vec<T>, has_prev_token: bool, limit: u32) -> ContextPlan<T> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    if events_before.len() >= limit {
+        events_before.truncate(limit);
+        return ContextPlan::Done(events_before);
+    }
+    if !has_prev_token {
+        return ContextPlan::Done(events_before);
+    }
+    let remaining = u32::try_from(limit - events_before.len()).unwrap_or(u32::MAX);
+    ContextPlan::Continue {
+        adjacent: events_before,
+        remaining,
+    }
+}
+
+/// 上游一頁（新到舊）→ `Page`：訊息照常折疊，**`next` 從折疊之前的原始順序取**。
+///
+/// 🚨 **游標不准從 `aggregate` 之後的輸出推**（PR #36 審查 rumia🔴）：`aggregate` 會把 reaction／edit／redaction
+/// 折進目標、從輸出拿掉。要是**最舊那則原始事件**被折掉（例：聯邦補回的歷史順序錯亂，關係事件排在目標後面），
+/// 折疊後的最後一則會比較新，拿它往回問就重複同一段 —— 游標要的是「上游這一頁到哪裡」，🚫 不是「這一頁顯示了什麼」。
+///
+/// Args:
+///     id: room_id，sync 的事件沒帶時補上
+///     timeline: 上游給的這一頁，新到舊
+/// Return:
+///     Page  `next` ＝ 原始順序裡最舊、而且有合法 id 的那則；整頁都沒有 id（或空頁）才是 None ＝到頭了
+fn page_from_timeline(id: &str, timeline: &[TimelineEvent]) -> Page {
+    let next = timeline
+        .iter()
+        .rev()
+        .find_map(|event| event.event_id())
+        .map(|event_id| event_id.to_string());
+    let events = aggregate(id, timeline.iter().map(to_message).collect());
+    Page { events, next }
+}
+
 fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
     let (raw, decrypted, reason) = match &event.kind {
         TimelineEventKind::Decrypted(decrypted) => (
@@ -614,4 +708,75 @@ fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
     message.decrypted = decrypted;
     message.undecryptable_reason = reason;
     (message, relation)
+}
+
+#[cfg(test)]
+mod context_plan_tests {
+    use super::*;
+
+    fn plaintext(json: serde_json::Value) -> TimelineEvent {
+        TimelineEvent::from_plaintext(
+            matrix_sdk::ruma::serde::Raw::from_json_string(json.to_string()).unwrap(),
+        )
+    }
+
+    /// 🚨 **`next` 從原始順序取，不從折疊後的輸出取**（PR #36 審查 rumia🔴）。
+    /// 這一頁新到舊是 `[$t, $r]`，而最舊的 `$r` 是**對 `$t` 的 reaction**（順序錯亂的歷史才會這樣）：
+    /// 折疊後只剩 `$t`，但下一頁要從 `$r` 之前問 —— 從 `$t` 問會把 `$r` 再拿一次。
+    #[test]
+    fn the_next_anchor_is_the_oldest_raw_event_even_when_aggregation_folds_it_away() {
+        let target = plaintext(serde_json::json!({
+            "type": "m.room.message", "event_id": "$t", "sender": "@a:x", "origin_server_ts": 2,
+            "content": { "msgtype": "m.text", "body": "hi" }
+        }));
+        let reaction = plaintext(serde_json::json!({
+            "type": "m.reaction", "event_id": "$r", "sender": "@b:x", "origin_server_ts": 1,
+            "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "👍" } }
+        }));
+        let page = page_from_timeline("!room:x", &[target, reaction]);
+        let ids: Vec<&str> = page.events.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(ids, ["$t"], "reaction 折進了目標");
+        assert_eq!(page.next.as_deref(), Some("$r"), "🚨 游標是上游最舊那則，不是折疊後的最後一則");
+    }
+
+    #[test]
+    fn an_empty_page_has_no_next_anchor() {
+        assert_eq!(page_from_timeline("!room:x", &[]).next, None);
+    }
+
+    /// 🚨 **`/context` 回的比 `limit` 多：截到 `limit`，而且不再接 `/messages`**（PR #36 審查 rumia🔴）。
+    /// 有的 server 把 `limit=0` 當預設值；整串塞進來，`limit = 1` 就回 10 則。
+    #[test]
+    fn a_context_that_returns_more_than_the_limit_is_cut_to_the_limit() {
+        let events_before: Vec<u32> = (0..10).rev().collect(); // 9, 8, …, 0：新到舊
+        assert_eq!(
+            plan_after_context(events_before, true, 1),
+            ContextPlan::Done(vec![9]),
+            "最多 1 則，而且是最新（緊鄰錨點）的那則；🚫 不從 token 接，那會跳過被截掉的 8…0"
+        );
+    }
+
+    #[test]
+    fn exactly_the_limit_needs_no_messages_call() {
+        assert_eq!(plan_after_context(vec![3, 2], true, 2), ContextPlan::Done(vec![3, 2]));
+    }
+
+    #[test]
+    fn fewer_than_the_limit_continues_from_the_token_for_the_rest() {
+        assert_eq!(
+            plan_after_context(vec![3, 2], true, 5),
+            ContextPlan::Continue {
+                adjacent: vec![3, 2],
+                remaining: 3
+            }
+        );
+    }
+
+    /// 沒有 token ＝房間的開頭：🚫 不再問（`from: None` 會拿到最新一頁），也🚫 不超過 limit。
+    #[test]
+    fn no_token_means_the_start_of_the_room_and_still_respects_the_limit() {
+        assert_eq!(plan_after_context(vec![3, 2], false, 5), ContextPlan::Done(vec![3, 2]));
+        assert_eq!(plan_after_context(vec![3, 2, 1], false, 2), ContextPlan::Done(vec![3, 2]));
+        assert_eq!(plan_after_context(Vec::<u32>::new(), false, 5), ContextPlan::Done(vec![]));
+    }
 }

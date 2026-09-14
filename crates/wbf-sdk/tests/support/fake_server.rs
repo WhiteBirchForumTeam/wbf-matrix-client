@@ -47,6 +47,10 @@ pub struct FakeServer {
     pub drop_stream_after_batches: Option<u32>,
     /// 故障：Hello 宣告的 `recent_max_limit`／`recent_max_batch`（預設 500／100；設 0 模擬 server 設定誤植）。
     pub hello_recent_max: Option<(u32, u32)>,
+    /// 模擬 server 的**位元組上限**：一窗最多放這麼多則（比 `limit` 小），而且 `more: true`。
+    pub window_cap_by_bytes: Option<usize>,
+    /// 模擬舊 server：Batch 的 meta **不帶** `more`。
+    pub omit_more: bool,
     /// 故障：下一塊 `Upload/Chunk` 回這個 `Error`（`code` 名字、`code_id`），只觸發一次。
     /// ⚠️ 名字與序號**分開給**，才測得出 client 認的是哪一個（issue #29 第 2 項）。
     pub reject_next_chunk_with: Option<(&'static str, Option<u64>)>,
@@ -423,15 +427,22 @@ impl FakeServer {
                 .as_i64()
                 .unwrap_or(0)
         };
-        let window: Vec<&serde_json::Value> = self
+        let in_range: Vec<&serde_json::Value> = self
             .recent_events
             .iter()
             .filter(|event| {
                 let g = g_seq_of(event);
                 g > cg_seq && before.is_none_or(|before| g < before)
             })
-            .take(limit)
             .collect();
+        // 窗停在哪：先看「位元組」（這裡用則數模擬），再看 limit —— 跟 server 的 WindowBudget 同一個順序。
+        let cap = self
+            .window_cap_by_bytes
+            .map_or(limit, |by_bytes| by_bytes.min(limit));
+        let window: Vec<&serde_json::Value> = in_range.iter().take(cap).copied().collect();
+        // `more` ＝「窗停在上限」，🚫 不是「區間裡還有剩」：剛好填滿上限時 server 也不知道後面還有沒有，
+        // 所以照樣說 true（server 向量 `batch_last` 就是 `tc = limit`、`more: true`）。
+        let more = cap > 0 && window.len() == cap;
         let tc = window.len();
         let mut packs = Vec::new();
         let mut sent = 0usize;
@@ -444,15 +455,17 @@ impl FakeServer {
                 (Some(first), Some(last)) => (g_seq_of(first), g_seq_of(last)),
                 _ => (0, 0),
             };
+            let mut meta = serde_json::json!({ "bc": slice.len(), "fs": fs, "ls": ls, "r": tc - sent_after, "tc": tc });
+            if !self.omit_more {
+                meta["more"] = serde_json::json!(more);
+            }
             Pack {
                 kind: Kind::Event,
                 subtype: wbf_wire::pack::event::BATCH,
                 flags: flags::IS_RESPONSE,
                 id: request.id,
                 seq,
-                meta: serde_json::json!({ "bc": slice.len(), "fs": fs, "ls": ls, "r": tc - sent_after, "tc": tc })
-                    .to_string()
-                    .into_bytes(),
+                meta: meta.to_string().into_bytes(),
                 data: wbf_sdk::protocol::join_length_prefixed(&items),
             }
         };

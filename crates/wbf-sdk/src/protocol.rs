@@ -297,6 +297,12 @@ pub const RECENT_MAX_BATCH: u32 = 100;
 /// `Event/Recent` 的請求 meta：**一窗**。欄位順序就是線上的 JSON 順序（向量檔逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RecentRequest {
+    /// 只讀這幾個房間；`None` ＝ 每個加入的房（wbfuwunel #51）。⭐ **一個房 ＋ `before` 就是那個房的歷史**。
+    /// ⚠️ 點名一個自己不在的房，整個請求回 `Forbidden`；`Some(vec![])` 是問零個房、拿空窗。
+    /// 📎 放在第一個欄位只是為了讓既有三筆向量的 byte 順序不變（`limit` 仍在 `cg_seq` 前面）；
+    /// server 用 JSON 解析，🚫 不看順序。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rooms: Option<Vec<String>>,
     /// 這一窗最多幾則；server 的 `wbf_recent_max_limit`（預設 500）以上會被 clamp，所以 client 也先 clamp（不然算不出「窗滿了沒」）。
     pub limit: u32,
     /// client 快取裡最新的 `g_seq`；None 或 0 = 沒有快取。
@@ -311,7 +317,7 @@ pub struct RecentRequest {
 }
 
 /// Args:
-///     request: example: RecentRequest { limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
+///     request: example: RecentRequest { rooms: None, limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
 ///     id: client 自己選的，回應（一串 `Batch`）抄它；不能是靠 seq 對回應的 0
 ///     seq: 請求號
 pub fn recent(request: &RecentRequest, id: u64, seq: u32) -> Pack {
@@ -339,6 +345,18 @@ pub struct BatchMeta {
     pub ls: i64,
     /// remain：這批之後這一窗還剩幾則；0 就是這窗結束。
     pub r: u32,
+    /// 🚨 **這一窗停在上限（則數或位元組）而不是事件用完**（wbfuwunel 窗的位元組上限，2026-09-14 合併）。
+    ///
+    /// ⚠️ 位元組上限滿的窗 `tc < limit`，所以「`tc < limit` ＝沒有更多」**不再成立** ——
+    /// 照舊規則會把水位推過還在的事件。追平與否一律看這個欄位。
+    /// 📎 **沒有這個欄位要當 `true`**（server 的規則）：多一趟請求，換不留洞。
+    #[serde(default = "more_when_absent")]
+    pub more: bool,
+}
+
+/// `BatchMeta::more` 缺欄位時的值。⚠️ 是 `true`：不確定就再問一趟，🚫 不假設已經拿完。
+fn more_when_absent() -> bool {
+    true
 }
 
 /// `Recent` 的回應要是 `Event/Batch`：`IS_RESPONSE`、`id` 抄請求、`seq` 是這窗的第幾個 Batch（從 0 嚴格 +1）。

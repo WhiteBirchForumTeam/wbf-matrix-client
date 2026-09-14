@@ -61,6 +61,16 @@ pub struct Cache {
     path: PathBuf,
 }
 
+/// 一則事件在房間裡的位置（[`Cache::find_event_position`]）。
+///
+/// ⚠️ 兩個號各司其職（wbfuwunel room-seq-and-recent.md §2）：**`g_seq` 翻頁**（server 的游標），
+/// **`r_seq` 判洞**（房內連續）。非 fork server 的事件兩個都是 `None`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventPosition {
+    pub r_seq: Option<i64>,
+    pub g_seq: Option<i64>,
+}
+
 /// 本地閱讀位置（§6 `read_positions`）：`event_id` 是權威，`r_seq` 給算術用。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPosition {
@@ -405,6 +415,99 @@ impl Cache {
         let mut messages = Vec::new();
         for row in rows {
             if let Some(message) = join_message(&row.map_err(db_error)?) {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
+    }
+
+    /// 一則事件在房間裡的**位置**：翻頁時把 UI 給的 `event_id` 換成上游聽得懂的座標。
+    ///
+    /// 🚨 **只看這個帳號看得到的**（JOIN `events_synced_log`）：別的帳號同步進來、這個帳號從沒看過的事件，
+    /// 🚫 不准拿來當翻頁的錨 —— 那等於用 B 的可見範圍替 A 定位，而且洩漏「那則事件存在」。
+    /// ⚠️ `hidden` 的也算（刪給自己看的只是不顯示，位置照樣是真的）。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     event_id: example: "$e1"
+    /// Return:
+    ///     Ok(Some(EventPosition))  找到了；`r_seq`／`g_seq` 在非 fork server 上是 None
+    ///     Ok(None)                 這個帳號在這個房間沒有這則（沒同步過、別人的、不存在）
+    pub fn find_event_position(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<EventPosition>, SdkError> {
+        self.connection
+            .query_row(
+                "SELECT e.r_seq, e.g_seq FROM events e
+                   JOIN events_synced_log l ON l.event = e.id
+                   JOIN users reader ON reader.id = l.user
+                   JOIN rooms r ON r.id = e.room
+                 WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.event_id = ?3",
+                params![user_id, room_id, event_id],
+                |row| {
+                    Ok(EventPosition {
+                        r_seq: row.get(0)?,
+                        g_seq: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// 按給的 `event_id` 從本地讀回訊息，**順序照給的**。
+    ///
+    /// ⭐ 用在「問完上游、寫進去、再從本地讀回這一頁」：上游決定**哪幾則、什麼順序**
+    /// （`Recent` 照 `g_seq`、`/messages` 照拓樸序），本地決定**每一則長什麼樣**
+    /// （已解密的明文不會被密文蓋掉、`hidden` 的不出來、別的帳號的看不到）。
+    /// 🚫 **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（chat-model §4.3）。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     event_ids: 上游那一頁的順序, example: &["$new".to_string(), "$old".to_string()]
+    /// Return:
+    ///     Ok(Vec<Message>)  照 `event_ids` 的順序；本地沒有、`hidden`、這個帳號看不到的就不在裡面
+    pub fn list_messages_by_event_ids(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        event_ids: &[String],
+    ) -> Result<Vec<Message>, SdkError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT e.event_id, r.room_id, s.mxid, e.origin_server_ts, e.r_seq, e.g_seq, e.decrypted, e.message_json
+                 FROM events e
+                 JOIN events_synced_log l ON l.event = e.id
+                 JOIN users reader ON reader.id = l.user
+                 JOIN users s ON s.id = e.sender
+                 JOIN rooms r ON r.id = e.room
+                 WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.event_id = ?3 AND l.hidden = 0",
+            )
+            .map_err(db_error)?;
+        let mut messages = Vec::with_capacity(event_ids.len());
+        for event_id in event_ids {
+            let row = statement
+                .query_row(params![user_id, room_id, event_id], |row| {
+                    Ok(EventRow {
+                        event_id: row.get(0)?,
+                        room_id: row.get(1)?,
+                        sender: row.get(2)?,
+                        origin_server_ts: row.get(3)?,
+                        r_seq: row.get(4)?,
+                        g_seq: row.get(5)?,
+                        decrypted: row.get(6)?,
+                        message_json: row.get(7)?,
+                    })
+                })
+                .optional()
+                .map_err(db_error)?;
+            if let Some(message) = row.as_ref().and_then(join_message) {
                 messages.push(message);
             }
         }
@@ -1214,6 +1317,69 @@ mod tests {
 
     fn ids(messages: &[Message]) -> Vec<String> {
         messages.iter().map(|message| message.id.clone()).collect()
+    }
+
+    /// 🚨 翻頁的錨**只認這個帳號看得到的事件**：BOB 同步進來、ALICE 從沒看過的，
+    /// 🚫 不准給 ALICE 當錨 —— 那等於用 BOB 的可見範圍替 ALICE 定位，還洩漏那則事件存在。
+    #[test]
+    fn an_event_only_another_account_synced_cannot_be_used_as_a_paging_anchor() {
+        let (mut cache, dir) = open("position-visibility");
+        cache
+            .upsert_messages(BOB, &[text("!r", "$bobs", Some(7), 7)])
+            .unwrap();
+
+        assert_eq!(
+            cache.find_event_position(BOB, "!r", "$bobs").unwrap(),
+            Some(EventPosition {
+                r_seq: Some(7),
+                g_seq: Some(70),
+            })
+        );
+        assert_eq!(
+            cache.find_event_position(ALICE, "!r", "$bobs").unwrap(),
+            None,
+            "🚫 ALICE 沒看過就沒有這個錨"
+        );
+        assert_eq!(
+            cache.find_event_position(BOB, "!other", "$bobs").unwrap(),
+            None,
+            "🚫 別的房間的同名 id 也不算"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 從本地讀回「上游那一頁」：**順序照給的**（🚫 不靠 `r_seq`、🚫 不靠時間戳），
+    /// 本地沒有的、`hidden` 的、別的帳號的都不出來。
+    #[test]
+    fn messages_read_back_by_event_id_keep_the_upstream_order_and_local_rules() {
+        let (mut cache, dir) = open("by-event-ids");
+        // 非 fork server 的事件：沒有 r_seq，而且時間戳故意跟上游順序相反。
+        cache
+            .upsert_messages(
+                ALICE,
+                &[
+                    text("!r", "$older", None, 900),
+                    text("!r", "$newer", None, 100),
+                    text("!r", "$hidden", None, 500),
+                ],
+            )
+            .unwrap();
+        cache.hide_message(ALICE, "!r", "$hidden").unwrap();
+        cache
+            .upsert_messages(BOB, &[text("!r", "$bob-only", None, 1)])
+            .unwrap();
+
+        let upstream_order = ["$newer", "$hidden", "$missing", "$bob-only", "$older"]
+            .map(str::to_string);
+        let read_back = cache
+            .list_messages_by_event_ids(ALICE, "!r", &upstream_order)
+            .unwrap();
+        assert_eq!(
+            ids(&read_back),
+            ["$newer", "$older"],
+            "照上游的順序；hidden、本地沒有、別的帳號的都不在"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn room(id: &str, encrypted: bool) -> Conversation {

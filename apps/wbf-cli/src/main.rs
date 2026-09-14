@@ -234,7 +234,7 @@ pub enum Command {
         room: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        /// 接上一頁印的 next；--from-cache 時是 r_seq（只要比它小的）
+        /// 接上一頁印的 next：那頁最舊那則的 event_id（只要比它舊的）；有沒有 --from-cache 都一樣
         #[arg(long)]
         before: Option<String>,
         /// 不連 server，從 cache.db 讀（CLI 規格 §3.5）
