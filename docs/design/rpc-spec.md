@@ -291,7 +291,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | `account.switch` | `{ user, server? }` | `SwitchResult`：`{ current, switched_from?, logged_in }` | `switch_current` |
 | `account.whoami` | `{ user?, server? }` | `{ user_id, device_id, server }` | `whoami` |
 | `account.del` | `{ user, server?, accept_history_loss?: bool }` | `{ user }` | `log_out`。閘門擋下 → `1021` |
-| `account.destroy` | `{ user, server?, accept_history_loss?: bool }` | `DestroyResult`：`{ user, events_removed, media_removed, pool_files_removed, recovery_key_destroyed }` | `destroy_account` |
+| `account.destroy` | `{ user, server?, accept_history_loss?: bool }` | `DestroyResult`：`{ user, events_removed, media_removed, pool_files_removed, recovery_key_destroyed, account_dir_removed, server_dir_removed }` | `destroy_account` |
 
 ⚠️ `password` 在 RPC 上是明文字串——它在加密的 frame 裡，而且**只在這一則**。daemon 🚫 不留、不進 log、不進任何推播。
 🚫 沒有「確認」這種互動：`account.destroy` 沒有 `--yes`，前端要問就自己問（daemon 不代前端做決定，§3）。
