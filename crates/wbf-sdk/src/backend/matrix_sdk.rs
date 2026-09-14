@@ -226,11 +226,7 @@ impl ChatBackend for MatrixBackend {
                     .map_err(matrix_error)?;
                 let has_prev_token = context.prev_batch_token.is_some();
                 match plan_after_context(context.events_before, has_prev_token, limit) {
-                    ContextPlan::Done(events_before) => {
-                        let events = aggregate(id, events_before.iter().map(to_message).collect());
-                        let next = next_anchor_of(&events);
-                        return Ok(Page { events, next });
-                    }
+                    ContextPlan::Done(events_before) => return Ok(page_from_timeline(id, &events_before)),
                     ContextPlan::Continue {
                         adjacent,
                         remaining,
@@ -246,9 +242,7 @@ impl ChatBackend for MatrixBackend {
             let messages = room.messages(options).await.map_err(matrix_error)?;
             timeline.extend(messages.chunk);
         }
-        let events = aggregate(id, timeline.iter().map(to_message).collect());
-        let next = next_anchor_of(&events);
-        Ok(Page { events, next })
+        Ok(page_from_timeline(id, &timeline))
     }
 
     async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError> {
@@ -670,13 +664,25 @@ fn plan_after_context<T>(mut events_before: Vec<T>, has_prev_token: bool, limit:
     }
 }
 
-/// 下一頁的錨：這一頁**最舊**那則的 `event_id`（頁是新到舊，所以是最後一則）。
+/// 上游一頁（新到舊）→ `Page`：訊息照常折疊，**`next` 從折疊之前的原始順序取**。
 ///
+/// 🚨 **游標不准從 `aggregate` 之後的輸出推**（PR #36 審查 rumia🔴）：`aggregate` 會把 reaction／edit／redaction
+/// 折進目標、從輸出拿掉。要是**最舊那則原始事件**被折掉（例：聯邦補回的歷史順序錯亂，關係事件排在目標後面），
+/// 折疊後的最後一則會比較新，拿它往回問就重複同一段 —— 游標要的是「上游這一頁到哪裡」，🚫 不是「這一頁顯示了什麼」。
+///
+/// Args:
+///     id: room_id，sync 的事件沒帶時補上
+///     timeline: 上游給的這一頁，新到舊
 /// Return:
-///     Some(event_id)  還可以往回問
-///     None            這一頁是空的 —— 到頭了
-fn next_anchor_of(events: &[Message]) -> Option<String> {
-    events.last().map(|message| message.id.clone())
+///     Page  `next` ＝ 原始順序裡最舊、而且有合法 id 的那則；整頁都沒有 id（或空頁）才是 None ＝到頭了
+fn page_from_timeline(id: &str, timeline: &[TimelineEvent]) -> Page {
+    let next = timeline
+        .iter()
+        .rev()
+        .find_map(|event| event.event_id())
+        .map(|event_id| event_id.to_string());
+    let events = aggregate(id, timeline.iter().map(to_message).collect());
+    Page { events, next }
 }
 
 fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
@@ -707,6 +713,36 @@ fn to_message(event: &TimelineEvent) -> (Message, Option<Relation>) {
 #[cfg(test)]
 mod context_plan_tests {
     use super::*;
+
+    fn plaintext(json: serde_json::Value) -> TimelineEvent {
+        TimelineEvent::from_plaintext(
+            matrix_sdk::ruma::serde::Raw::from_json_string(json.to_string()).unwrap(),
+        )
+    }
+
+    /// 🚨 **`next` 從原始順序取，不從折疊後的輸出取**（PR #36 審查 rumia🔴）。
+    /// 這一頁新到舊是 `[$t, $r]`，而最舊的 `$r` 是**對 `$t` 的 reaction**（順序錯亂的歷史才會這樣）：
+    /// 折疊後只剩 `$t`，但下一頁要從 `$r` 之前問 —— 從 `$t` 問會把 `$r` 再拿一次。
+    #[test]
+    fn the_next_anchor_is_the_oldest_raw_event_even_when_aggregation_folds_it_away() {
+        let target = plaintext(serde_json::json!({
+            "type": "m.room.message", "event_id": "$t", "sender": "@a:x", "origin_server_ts": 2,
+            "content": { "msgtype": "m.text", "body": "hi" }
+        }));
+        let reaction = plaintext(serde_json::json!({
+            "type": "m.reaction", "event_id": "$r", "sender": "@b:x", "origin_server_ts": 1,
+            "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "👍" } }
+        }));
+        let page = page_from_timeline("!room:x", &[target, reaction]);
+        let ids: Vec<&str> = page.events.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(ids, ["$t"], "reaction 折進了目標");
+        assert_eq!(page.next.as_deref(), Some("$r"), "🚨 游標是上游最舊那則，不是折疊後的最後一則");
+    }
+
+    #[test]
+    fn an_empty_page_has_no_next_anchor() {
+        assert_eq!(page_from_timeline("!room:x", &[]).next, None);
+    }
 
     /// 🚨 **`/context` 回的比 `limit` 多：截到 `limit`，而且不再接 `/messages`**（PR #36 審查 rumia🔴）。
     /// 有的 server 把 `limit=0` 當預設值；整串塞進來，`limit = 1` 就回 10 則。

@@ -402,9 +402,7 @@ impl Core {
             )
             .await?;
         // 回來的是新到舊（g_seq 遞減），跟 `/messages` 往回翻同一個方向。
-        let events = wbf_sdk::event_json::messages_from_json(room, &raws);
-        let next = events.last().map(|message| message.id.clone());
-        Ok(wbf_sdk::chat::Page { events, next })
+        Ok(page_from_raw_window(room, &raws))
     }
 
     /// 純本地的一頁。
@@ -495,6 +493,27 @@ enum Anchor {
     Found(Option<i64>),
     /// 這個帳號本地沒有那則，或它沒有 `g_seq` —— 呼叫端改走 `/context`。
     NotInLocalCache,
+}
+
+/// wbf 的一窗（原始事件 JSON，新到舊）→ `Page`：訊息照常折疊，**`next` 從折疊之前的原始順序取**。
+///
+/// 🚨 **游標不准從折疊後的輸出推**（PR #36 審查 rumia🔴）：`messages_from_json` 會把 reaction／edit／redaction
+/// 折進目標、從輸出拿掉；要是最舊那則原始事件被折掉，折疊後的最後一則比較新，拿它往回問就重複同一段。
+/// 📎 跟 matrix backend 的 `page_from_timeline` 同一條規則。
+///
+/// Args:
+///     room: room_id, example: "!r:localhost"
+///     raws: 這一窗的原始事件，新到舊
+/// Return:
+///     Page  `next` ＝ 原始順序裡最舊、而且有 `event_id` 的那則；空窗（或整窗都沒有 id）才是 None ＝到頭了
+fn page_from_raw_window(room: &str, raws: &[serde_json::Value]) -> wbf_sdk::chat::Page {
+    let next = raws
+        .iter()
+        .rev()
+        .find_map(|raw| raw.get("event_id").and_then(|event_id| event_id.as_str()))
+        .map(str::to_string);
+    let events = wbf_sdk::event_json::messages_from_json(room, raws);
+    wbf_sdk::chat::Page { events, next }
 }
 
 fn refuse_local_paging_without_r_seq(room: &str) -> CoreError {
@@ -703,6 +722,24 @@ mod tests {
         assert_eq!(error.kind, CoreErrorKind::Usage);
         assert!(error.message.contains("not in the local cache"), "{}", error.message);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 **`next` 從原始順序取，不從折疊後的輸出取**（PR #36 審查 rumia🔴）：
+    /// 這一窗新到舊是 `[$t, $r]`，最舊的 `$r` 是對 `$t` 的 reaction —— 折疊後只剩 `$t`，但下一頁要從 `$r` 之前問。
+    #[test]
+    fn the_next_anchor_of_a_wbf_window_is_its_oldest_raw_event() {
+        let raws = [
+            serde_json::json!({ "type": "m.room.message", "event_id": "$t", "room_id": "!r", "sender": "@a:x",
+                "origin_server_ts": 2, "content": { "msgtype": "m.text", "body": "hi" } }),
+            serde_json::json!({ "type": "m.reaction", "event_id": "$r", "room_id": "!r", "sender": "@b:x",
+                "origin_server_ts": 1,
+                "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$t", "key": "👍" } } }),
+        ];
+        let page = page_from_raw_window("!r", &raws);
+        let ids: Vec<&str> = page.events.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(ids, ["$t"], "reaction 折進了目標");
+        assert_eq!(page.next.as_deref(), Some("$r"), "🚨 游標是上游最舊那則");
+        assert_eq!(page_from_raw_window("!r", &[]).next, None, "空窗才是到頭");
     }
 
     #[test]
