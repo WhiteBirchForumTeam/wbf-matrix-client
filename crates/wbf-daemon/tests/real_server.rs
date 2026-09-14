@@ -306,21 +306,13 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
     // 新到舊，這才是一頁該有的順序。
     let newest_first: Vec<String> = sent.iter().rev().cloned().collect();
 
-    async fn page(
-        client: &mut Client,
-        room: &str,
-        sync: &str,
-        before: Option<&str>,
-    ) -> (Vec<String>, Option<String>) {
+    async fn page(client: &mut Client, room: &str, sync: &str, before: Option<&str>) -> (Vec<String>, Option<String>) {
         let mut params = json!({ "room": room, "limit": 3, "sync": sync });
         if let Some(before) = before {
             params["before"] = json!(before);
         }
         let reply = client.call("room.history", params).await;
-        assert_eq!(
-            reply["code"], 0,
-            "room.history sync={sync} before={before:?}: {reply}"
-        );
+        assert_eq!(reply["code"], 0, "room.history sync={sync} before={before:?}: {reply}");
         assert_eq!(reply["sync"], sync, "回應要說出用了哪一種");
         let ids = reply["result"]["events"]
             .as_array()
@@ -335,17 +327,9 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
     // ── sync=server：第一頁走 wbf，第二頁因為沒寫庫、只能走 /context ──
     let (first, next) = page(&mut client, &room, "server", None).await;
     assert_eq!(first, newest_first[0..3], "server 第一頁（wbf）");
-    assert_eq!(
-        next.as_deref(),
-        Some(newest_first[2].as_str()),
-        "next 是這頁最舊那則"
-    );
+    assert_eq!(next.as_deref(), Some(newest_first[2].as_str()), "next 是這頁最舊那則");
     let (second, _) = page(&mut client, &room, "server", next.as_deref()).await;
-    assert_eq!(
-        second,
-        newest_first[3..6],
-        "server 第二頁（/context）要緊接著第一頁"
-    );
+    assert_eq!(second, newest_first[3..6], "server 第二頁（/context）要緊接著第一頁");
 
     // ── sync=local：server 模式不寫庫，所以本地什麼都沒有 → 錨點不在本地要拒答 ──
     let reply = client
@@ -354,10 +338,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
             json!({ "room": room, "limit": 3, "sync": "local", "before": newest_first[2] }),
         )
         .await;
-    assert_ne!(
-        reply["code"], 0,
-        "server 模式不寫庫，本地不該有這個錨: {reply}"
-    );
+    assert_ne!(reply["code"], 0, "server 模式不寫庫，本地不該有這個錨: {reply}");
 
     // ── sync=both：寫進去；第二頁的錨點本地查得到 → wbf Recent{rooms, before: g_seq} ──
     let (first, next) = page(&mut client, &room, "both", None).await;
@@ -367,17 +348,10 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
 
     // ── sync=local：both 寫進去了，本地也能用 event_id 接著翻 ──
     let (local_second, _) = page(&mut client, &room, "local", next.as_deref()).await;
-    assert_eq!(
-        local_second,
-        newest_first[3..6],
-        "本地拿同一個錨要得到同一頁"
-    );
+    assert_eq!(local_second, newest_first[3..6], "本地拿同一個錨要得到同一頁");
 
     let reply = client
-        .call(
-            "account.del",
-            json!({ "user": user, "accept_history_loss": true }),
-        )
+        .call("account.del", json!({ "user": user, "accept_history_loss": true }))
         .await;
     assert_eq!(reply["code"], 0, "account.del: {reply}");
     stop_daemon(daemon, client).await;

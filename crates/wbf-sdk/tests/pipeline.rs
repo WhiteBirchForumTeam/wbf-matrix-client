@@ -951,13 +951,7 @@ async fn upload_with_first_chunk_rejected(
     let result = {
         let mut client = WbfClient::new(&mut server);
         client
-            .send_chunks(
-                &state,
-                &mut Cursor::new(&plaintext),
-                0,
-                false,
-                &mut |_, _| {},
-            )
+            .send_chunks(&state, &mut Cursor::new(&plaintext), 0, false, &mut |_, _| {})
             .await
             .map(|_| ())
     };
@@ -992,8 +986,7 @@ async fn an_error_merely_named_corrupt_is_not_resent() {
 /// ⭐ **序號是權威、名字只給人看**：名字寫的是別的，序號是 1002，就是 Corrupt。
 #[tokio::test]
 async fn the_code_id_decides_even_when_the_name_says_something_else() {
-    let (result, chunks_sent) =
-        upload_with_first_chunk_rejected("RenamedForHumans", Some(1002)).await;
+    let (result, chunks_sent) = upload_with_first_chunk_rejected("RenamedForHumans", Some(1002)).await;
     result.expect("序號說 Corrupt，就照 Corrupt 重送");
     assert_eq!(chunks_sent, 4);
 }
@@ -1042,10 +1035,7 @@ async fn a_window_cut_short_by_bytes_is_followed_not_taken_as_caught_up() {
         .unwrap();
     assert_eq!(seen, 25, "每一則都要拿到");
     assert_eq!(summary.events, 25);
-    assert_eq!(
-        summary.windows, 4,
-        "7 ＋ 7 ＋ 7 ＋ 4（最後一窗 4 < 7，more: false）"
-    );
+    assert_eq!(summary.windows, 4, "7 ＋ 7 ＋ 7 ＋ 4（最後一窗 4 < 7，more: false）");
     assert!(summary.caught_up);
     assert_eq!(summary.new_cg_seq, Some(1025));
 }
@@ -1073,10 +1063,7 @@ async fn a_batch_without_more_is_taken_as_more_and_costs_one_extra_window() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        summary.windows, 2,
-        "第一窗 3 則（沒說 more → 當 true）、第二窗空 → 追平"
-    );
+    assert_eq!(summary.windows, 2, "第一窗 3 則（沒說 more → 當 true）、第二窗空 → 追平");
     assert_eq!(summary.events, 3);
     assert!(summary.caught_up);
     assert_eq!(summary.new_cg_seq, Some(1003), "水位還是第一窗的 fs");

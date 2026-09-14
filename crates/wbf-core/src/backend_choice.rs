@@ -442,10 +442,7 @@ mod tests {
             "🚫 失敗不准留下結論——不然同 server 的其他帳號會被連坐"
         );
         // 再問一次還是一樣的答案，而且還是沒記住（所以下一次仍然會重探）。
-        assert_eq!(
-            core.get_backend_kind(&account).await,
-            BackendKind::MatrixSdk
-        );
+        assert_eq!(core.get_backend_kind(&account).await, BackendKind::MatrixSdk);
         assert_eq!(core.get_remembered_backend(&account), None);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -469,7 +466,8 @@ mod tests {
         let accounts: Vec<_> = ["@a:dead", "@b:dead"]
             .into_iter()
             .map(|user| {
-                let account = crate::accounts::AccountDir::locate(&dir, &key, DEAD, user).unwrap();
+                let account =
+                    crate::accounts::AccountDir::locate(&dir, &key, DEAD, user).unwrap();
                 std::fs::create_dir_all(&account.dir).unwrap();
                 seal_dead_session(&core, &account, user);
                 account
@@ -486,10 +484,7 @@ mod tests {
             core.get_backend_kind(&accounts[0]),
             core.get_backend_kind(&accounts[1])
         );
-        assert_eq!(
-            (first, second),
-            (BackendKind::MatrixSdk, BackendKind::MatrixSdk)
-        );
+        assert_eq!((first, second), (BackendKind::MatrixSdk, BackendKind::MatrixSdk));
 
         assert_eq!(
             core.count_probe_cells(),
@@ -525,10 +520,7 @@ mod tests {
         std::fs::create_dir_all(&account.dir).unwrap();
         // 🚫 不封 session：`is_logged_in()` 是 false，logout 不必連網路就會走到本地清理。
         core.set_remembered_backend(&account, BackendKind::WbfSdk);
-        assert_eq!(
-            core.get_remembered_backend(&account),
-            Some(BackendKind::WbfSdk)
-        );
+        assert_eq!(core.get_remembered_backend(&account), Some(BackendKind::WbfSdk));
 
         core.log_out("@a:dead", None, true, false)
             .await
@@ -544,7 +536,11 @@ mod tests {
     }
 
     /// 把一個「指向沒人在聽的位址」的 session 封進這個帳號。
-    fn seal_dead_session(core: &crate::Core, account: &crate::accounts::AccountDir, user: &str) {
+    fn seal_dead_session(
+        core: &crate::Core,
+        account: &crate::accounts::AccountDir,
+        user: &str,
+    ) {
         core.vault()
             .unwrap()
             .seal_session(
@@ -575,7 +571,10 @@ mod tests {
         let refused = cell
             .get_or_try_init(|| async {
                 probes.fetch_add(1, Ordering::SeqCst);
-                Err::<BackendKind, CoreError>(CoreError::new(CoreErrorKind::Usage, "token refused"))
+                Err::<BackendKind, CoreError>(CoreError::new(
+                    CoreErrorKind::Usage,
+                    "token refused",
+                ))
             })
             .await;
         assert!(refused.is_err());

@@ -19,8 +19,8 @@ use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
-use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
+use crate::backend_choice::MethodHome;
 use crate::{Core, Target};
 
 /// `media-stats`。
@@ -250,8 +250,12 @@ impl Core {
         account: &AccountDir,
     ) -> Result<WbfClient<Channel>, CoreError> {
         let session = self.session_of(account)?;
-        let channel =
-            Channel::connect(&session.server, &session.access_token, Transport::WebSocket).await?;
+        let channel = Channel::connect(
+            &session.server,
+            &session.access_token,
+            Transport::WebSocket,
+        )
+        .await?;
         Ok(WbfClient::new(channel))
     }
 }

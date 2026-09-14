@@ -113,11 +113,7 @@ mod tests {
             Internal,
         ];
         for code in all {
-            assert_eq!(
-                WbfErrorCode::from_id(u64::from(code.id())),
-                Some(code),
-                "{code:?}"
-            );
+            assert_eq!(WbfErrorCode::from_id(u64::from(code.id())), Some(code), "{code:?}");
         }
         let mut ids: Vec<u16> = all.iter().map(|code| code.id()).collect();
         ids.sort_unstable();

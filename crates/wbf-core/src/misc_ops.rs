@@ -9,9 +9,9 @@ use wbf_sdk::chunk_crypto::{choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::{ChunkedBlock, FileCipher, Transport};
 
-use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::upload_ops::UploadRequest;
+use crate::backend_choice::MethodHome;
 use crate::{Core, Target};
 
 /// `info`：這份媒體長什麼樣。**本地與上游都答得出大部分**（daemon-runtime §3.1 的 `sync`）。
