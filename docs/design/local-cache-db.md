@@ -239,7 +239,7 @@ CREATE TABLE events (
   is_redacted INTEGER NOT NULL DEFAULT 0 CHECK (is_redacted IN (0, 1)),
   class TEXT NOT NULL DEFAULT 'general' CHECK (class IN ('general', 'msg', 'edit', 'redact', 'reaction')),
   ref_event_id TEXT,                    -- edit／redact／reaction：指向的目標；msg：目前要顯示的 edit（§7.3 的刻意例外：可能還不在，沒辦法外鍵）
-  modified_timestamp INTEGER NOT NULL); -- 寫入時＝自己的 origin_server_ts；被 edit 換版或被 redact 時換成那個事件的 server 時間（§7.5）
+  modified_timestamp INTEGER NOT NULL DEFAULT 0); -- 寫入時＝0；被 edit 換版或被 redact 時換成那個事件的 server 時間（§7.5）
 CREATE UNIQUE INDEX events_by_event_id ON events (room, event_id);
 CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NULL;   -- 排序、判洞、跳第 N 則
 CREATE INDEX events_by_time ON events (room, origin_server_ts);
@@ -369,7 +369,7 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 | **`is_redacted`** | BOOL | 0 | 被 redact 過就打勾。**redact 優先**：打勾之後顯示「已刪除」，任何 edit 都不看 |
 | **`class`** | | `general` | `general`（還不知道是什麼的密文）／`msg`／`edit`／`redact`／`reaction` |
 | **`ref_event_id`** | TEXT | NULL | **兩種意思，看 `class`**（維護者 2026-09-14）：edit／redact／reaction → 指向的**目標的 `event_id`**；msg → **目前要顯示的那個 edit 的 `event_id`**（沒被 edit 過是 NULL）。**加索引** `(room, ref_event_id)`（反查「誰參照這則」）。⚠️ 所以每一條用它的查詢都要帶 `class` 條件 |
-| **`modified_timestamp`** | INTEGER | — | 這一列最後一次變動的 server 時間：寫入時＝自己的 `origin_server_ts`；換成新的 edit 時＝那個 edit 的 `origin_server_ts`；被 redact 時＝那個 redact 的。edit 寫入時拿它**直接比大小**，讀取不必再查參照（§7.5） |
+| **`modified_timestamp`** | INTEGER | **0** | 這一列最後一次變動的 server 時間：寫入時＝**0**（所以第一個 edit 一定贏，發送端時鐘偏了也一樣）；換成新的 edit 時＝那個 edit 的 `origin_server_ts`；被 redact 時＝那個 redact 的。edit 寫入時拿它**直接比大小**，讀取不必再查參照（§7.5） |
 
 ⚠️ **`ref_event_id` 是 §6 第 2 條原則的刻意例外**（「字串識別碼在整個 DB 裡各只出現一次，其餘全走整數外鍵」）：
 這裡**沒辦法用外鍵**，因為目標那一列**可能還不存在**（只先讀到 edit／redact）。
@@ -426,9 +426,8 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 （目標在本地時，不管換不換，edit 自己 is_processed=1；目標的 content_json 🚫 永遠不動）
 ```
 
-「比目前的新」：
-- 目標還沒被 edit 過（`ref_event_id` 是 NULL）→ 直接換。🚫 不拿目標自己的時間比：發送端時鐘偏一點，不該讓第一個 edit 失效。
-- 已經有了 → `(edit.origin_server_ts, edit.event_id) > (目標.modified_timestamp, 目標.ref_event_id)`：直接比大小，平手比 `event_id`（字典序大的新）。
+「比目前的新」**一律看 `modified_timestamp`**（維護者 2026-09-14）：`(edit.origin_server_ts, edit.event_id) > (目標.modified_timestamp, 目標.ref_event_id)`，
+平手比 `event_id`（字典序大的新；還沒有 edit 的 NULL 最小）。訊息寫入時 `modified_timestamp = 0`，所以第一個 edit 不管時間戳多少都會贏。
 
 **讀取一則訊息時**（維護者 2026-09-14）：
 
@@ -436,10 +435,14 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 1. is_redacted=1                  → 「已刪除」的記號
 2. 還沒解開（class=general）       → 「解不開」的記號（kind=undecryptable，跟已刪除一樣 UI 直接渲染）
 3. ref_event_id 是 NULL           → 顯示自己的 content_json
-   不是 NULL                      → 取那個 edit 的 m.new_content 替換（m.relates_to 留自己原本的，回覆關係不被洗掉）；edited_by = 它的 sender
+   不是 NULL                      → 讀者還沒同步到那個 edit → 「過時」的記號（kind=outdated），原文與 edit 內容都不給
+                                    同步過               → 取那個 edit 的 m.new_content 替換（m.relates_to 留自己原本的）；edited_by = 它的 sender
 ```
 
 🚨 第 3 步在讀取端**再驗一次**：那一列必須真的是「指回這則、同一個 sender、沒被 redact 的 edit」，對不上就顯示原文（A6：不假定寫入端永遠對）。
+🚨 **可見性跟 `events` 表完全一致**（維護者 2026-09-14）：`events_synced_log` 替每一則寫入的事件記一列，edit、redact 也一樣；
+指向的 edit 讀者沒有那一列，就是還沒同步到（🚫 不叫「禁止」：通常只是這個帳號還沒拉到那一段，同步之後就好）。⭐ 回的是**單則訊息的記號**，🚫 不是整個請求的錯誤 —— 同一頁的其他訊息照常、翻頁不會卡住。
+📎 redact **不套**這條：`is_redacted=1` 就顯示已刪除，不管讀者有沒有同步過那個 redact 事件 —— 那是「少給」，不會洩漏內容（維護者 2026-09-14）。
 
 ⭐ **新舊比 `origin_server_ts`，以 server 為準**（維護者 2026-09-14）：有沒有 `g_seq` 都同一條規則，所以一般 Matrix server 也比得出來。
 📎 spec 規定 server 端聚合 `m.replace` 時也是這樣選「最新」（`origin_server_ts`，平手比 `event_id`），跟別的 client 看到的一致。
@@ -469,7 +472,7 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
 - 🚫 **不動 `raw_event`、`content_json`**：密文與明文都還在，可以復原（§7.2）。
 - 目標的 `modified_timestamp` 換成 redact 的 server 時間。
 - 被 redact 的是**某則訊息目前顯示的 edit**：那則訊息重新從剩下的、沒被 redact 的有效 edit 裡取最新的
-  （`ref_event_id`／`modified_timestamp` 換成它的）；一個都不剩就 `ref_event_id = NULL`、`modified_timestamp` = redact 的時間，顯示原文。
+  （`ref_event_id`／`modified_timestamp` 換成它的）；一個都不剩就 `ref_event_id = NULL`、`modified_timestamp = 0`（回到沒被 edit 過的樣子，晚到的 edit 照樣能贏），顯示原文。
   📎 只有這個情況要掃一次參照，平常的讀寫都不用。
 
 ### 7.7 拍板紀錄
@@ -501,7 +504,7 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 | 拿掉 `kind` | 讀取時從 `content_json` 算 | 同一個事實的第二份（§6 原則）；`files` 改用 `json_extract(content_json, '$.msgtype')` |
 | 留著 `decrypted` | NULL／0／1 | 「原本是不是加密事件」要明說 —— edit 的資安規則（加密的目標配明文 edit）靠它，🚫 不靠「`raw_event` 是 NULL 所以大概是加密的」這種巧合 |
 | 不存解不開的原因 | 讀出來一律 `NotDecryptedHere` | matrix-sdk 給的 UTD 原因只在那一次請求有意義 |
-| 解不開有專用的 `kind` | `MessageKind::Undecryptable`（JSON `"kind": "undecryptable"`） | 維護者 2026-09-14：跟 `deleted` 一樣是 UI 直接渲染的記號，🚫 不再混在 `unsupported` 裡 |
+| 解不開、過時有專用的 `kind` | `MessageKind::Undecryptable`／`Outdated`（JSON `"undecryptable"`／`"outdated"`） | 維護者 2026-09-14：跟 `deleted` 一樣是 UI 直接渲染的記號，🚫 不再混在 `unsupported` 裡 |
 
 **寫入**（`upsert_events` 的同一個 transaction 裡）：
 
@@ -512,8 +515,8 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 - 每一則寫入時都查「有沒有 redact、edit 在等這則」，redact 先處理；自己是 edit／redact 時，目標在就處理，不在就等。
 
 **讀取**：`find_current_edit` 照 §7.5；reaction 🚨 只算讀者自己同步過、沒被 redact 的。
-⚠️ edit **不照讀者過濾**：目前顯示哪個 edit 記在目標那一列，是所有帳號共用的（§6「同一台機器的帳號屬於同一個人」）——
-帳號 B 同步到的 edit，帳號 A 讀這則時也會看到新內容。
+⚠️ 目前顯示哪個 edit 記在目標那一列，是所有帳號共用的：帳號 B 同步到較新的 edit，帳號 A 沒同步過它，A 讀這則拿到的是 `outdated`，
+🚫 不會退回 A 看得到的舊版本（那要每次讀取都掃參照，正是 `modified_timestamp` 要省掉的）。
 
 **已知的限制**：
 

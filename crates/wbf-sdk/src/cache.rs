@@ -305,7 +305,7 @@ impl Cache {
                 .prepare_cached(
                     "INSERT INTO events (room, event_id, sender, r_seq, g_seq, origin_server_ts, decrypted, raw_event,
                        event_type, content_json, is_processed, is_redacted, class, ref_event_id, modified_timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?6)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
                      ON CONFLICT(room, event_id) DO NOTHING",
                 )
                 .map_err(db_error)?
@@ -604,12 +604,19 @@ impl Cache {
             return Ok(None);
         };
         // ⭐ 這則自己的 content_json 永遠不改；被 edit 過就在這裡換成目前那個 edit 的（§7.5）。
-        let content = match self.find_current_edit(row)? {
-            Some((new_content, editor)) => {
+        let content = match self.find_current_edit(user_id, row)? {
+            CurrentEdit::NotEdited => own_content,
+            CurrentEdit::Visible {
+                new_content,
+                editor,
+            } => {
                 message.edited_by = Some(editor);
                 to_replaced_body(&own_content, &new_content)
             }
-            None => own_content,
+            CurrentEdit::NotVisible => {
+                message.kind = MessageKind::Outdated;
+                return Ok(Some(message));
+            }
         };
         // system_line 要 sender 與 state_key：狀態事件從不加密，所以 raw_event 一定在；沒有就只給 sender。
         let envelope = raw_event.unwrap_or_else(|| serde_json::json!({ "sender": row.sender }));
@@ -627,36 +634,55 @@ impl Cache {
     /// 訊息自己的 `ref_event_id` 指的那個 edit（寫入時已經驗過、選過最新的）。
     ///
     /// 🚨 消費端再問一次（A6）：那一列必須**真的是指回這則的 edit、同一個 sender、沒被 redact**，
-    /// 對不上就當沒有，顯示原文 —— 🚫 不因為寫入端的一個 bug 就把別人的內容顯示成這則。
+    /// 對不上就當沒被 edit 過，顯示原文 —— 🚫 不因為寫入端的一個 bug 就把別人的內容顯示成這則。
+    /// 🚨 對得上、但**這個帳號沒同步過那個 edit** → 還沒同步到，版本過時（維護者 2026-09-14：可見性跟 events 表完全一致）。
     ///
+    /// Args:
+    ///     user_id: 讀者, example: "@alice:localhost"
+    ///     row: 要顯示的那則訊息
     /// Return:
-    ///     Ok(Some((new_content, editor)))  有
-    ///     Ok(None)                         沒被 edit 過，或指到的那列對不上
-    fn find_current_edit(
-        &self,
-        row: &EventRow,
-    ) -> Result<Option<(serde_json::Value, String)>, SdkError> {
+    ///     Ok(CurrentEdit::NotEdited)   沒被 edit 過，或指到的那列對不上
+    ///     Ok(CurrentEdit::Visible)     有，而且讀者同步過
+    ///     Ok(CurrentEdit::NotVisible)  有，但讀者沒同步過
+    fn find_current_edit(&self, user_id: &str, row: &EventRow) -> Result<CurrentEdit, SdkError> {
         let Some(edit_event_id) = row.ref_event_id.as_deref() else {
-            return Ok(None);
+            return Ok(CurrentEdit::NotEdited);
         };
-        let found: Option<Option<String>> = self
+        let found: Option<(Option<String>, bool)> = self
             .connection
             .prepare_cached(
-                "SELECT x.content_json FROM events x
+                "SELECT x.content_json,
+                        EXISTS (SELECT 1 FROM events_synced_log l JOIN users reader ON reader.id = l.user
+                                WHERE l.event = x.id AND reader.mxid = ?5)
+                 FROM events x
                  WHERE x.room = ?1 AND x.event_id = ?2 AND x.class = 'edit' AND x.ref_event_id = ?3
                    AND x.sender = ?4 AND x.is_redacted = 0",
             )
             .map_err(db_error)?
             .query_row(
-                params![row.room, edit_event_id, row.event_id, row.sender_row],
-                |sql_row| sql_row.get(0),
+                params![row.room, edit_event_id, row.event_id, row.sender_row, user_id],
+                |sql_row| Ok((sql_row.get(0)?, sql_row.get::<_, i64>(1)? == 1)),
             )
             .optional()
             .map_err(db_error)?;
-        Ok(found
-            .flatten()
-            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-            .map(|new_content| (new_content, row.sender.clone())))
+        let Some((content_json, is_visible)) = found else {
+            return Ok(CurrentEdit::NotEdited);
+        };
+        if !is_visible {
+            return Ok(CurrentEdit::NotVisible);
+        }
+        Ok(
+            match content_json
+                .as_deref()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            {
+                Some(new_content) => CurrentEdit::Visible {
+                    new_content,
+                    editor: row.sender.clone(),
+                },
+                None => CurrentEdit::NotEdited,
+            },
+        )
     }
 
     /// 參照這則的 reaction，🚨 **只算這個帳號同步過的**（跟事件本身同一條可見性規則），被 redact 的不算。
@@ -1147,6 +1173,16 @@ const EVENT_ROW_COLUMNS: &str =
     "e.id, e.room, e.event_id, r.room_id, e.sender, s.mxid, e.origin_server_ts, e.r_seq, e.g_seq,
      e.decrypted, e.raw_event, e.event_type, e.content_json, e.is_redacted, e.class, e.ref_event_id";
 
+/// [`Cache::find_current_edit`] 的答案。
+enum CurrentEdit {
+    NotEdited,
+    Visible {
+        new_content: serde_json::Value,
+        editor: String,
+    },
+    NotVisible,
+}
+
 struct EventRow {
     room: i64,
     event_id: String,
@@ -1364,8 +1400,8 @@ fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result
 /// edit（§7.5）：目標在本地、沒被 redact、這個 edit 有效、**比目前的新** → 目標的 `ref_event_id` 換成它、
 /// `modified_timestamp` 換成它的 server 時間；否則跳過。不管換不換，這個 edit 都標處理過（目標不在或還沒解開除外）。
 ///
-/// 「比目前的新」：目標還沒被 edit 過（`ref_event_id` 是 NULL）就直接換 —— 🚫 不拿目標自己的時間比，
-/// 發送端時鐘偏一點不該讓第一個 edit 失效；已經有了就比 `(origin_server_ts, event_id)` 對 `(modified_timestamp, ref_event_id)`。
+/// 「比目前的新」一律看 `modified_timestamp`：`(edit 的 origin_server_ts, event_id) > (modified_timestamp, ref_event_id)`。
+/// 訊息寫入時 `modified_timestamp = 0`，所以第一個 edit 不管時間戳多少都會贏（維護者 2026-09-14）。
 fn apply_edit(transaction: &Transaction<'_>, room: i64, edit: i64) -> Result<(), SdkError> {
     let Some(edit) = find_event_facts(
         transaction,
@@ -1396,12 +1432,9 @@ fn apply_edit(transaction: &Transaction<'_>, room: i64, edit: i64) -> Result<(),
     {
         return set_processed(transaction, edit.id);
     }
-    let is_newer = match target.ref_event_id.as_deref() {
-        None => true,
-        Some(current) => {
-            (edit.origin_server_ts, edit.event_id.as_str()) > (target.modified_timestamp, current)
-        }
-    };
+    // 一律看 modified_timestamp（寫入時是 0，所以第一個 edit 一定贏）；平手比 event_id，目前沒有 edit 的 None 最小。
+    let is_newer = (edit.origin_server_ts, Some(edit.event_id.as_str()))
+        > (target.modified_timestamp, target.ref_event_id.as_deref());
     if is_newer {
         set_current_edit(
             transaction,
@@ -1478,7 +1511,8 @@ fn apply_redaction(
             Some(&previous.event_id),
             previous.origin_server_ts,
         ),
-        None => set_current_edit(transaction, edited.id, None, redaction.origin_server_ts),
+        // 一個都不剩：回到沒被 edit 過的樣子（modified_timestamp 回 0），之後晚到的 edit 照樣能贏。
+        None => set_current_edit(transaction, edited.id, None, 0),
     }
 }
 
@@ -1710,7 +1744,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                is_redacted INTEGER NOT NULL DEFAULT 0 CHECK (is_redacted IN (0, 1)),
                class TEXT NOT NULL DEFAULT 'general' CHECK (class IN ('general', 'msg', 'edit', 'redact', 'reaction')),
                ref_event_id TEXT,
-               modified_timestamp INTEGER NOT NULL);
+               modified_timestamp INTEGER NOT NULL DEFAULT 0);
              CREATE UNIQUE INDEX events_by_event_id ON events (room, event_id);
              CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NULL;
              CREATE INDEX events_by_time ON events (room, origin_server_ts);
@@ -2779,6 +2813,39 @@ mod tests {
             cache.history(ALICE, "!r", None, 1).unwrap()[0].edited_by,
             None
         );
+        assert_eq!(
+            column_of::<i64>(&cache, "modified_timestamp", "$t"),
+            0,
+            "一個都不剩：回到沒被 edit 過"
+        );
+        // 回到 0 之後，晚到的 edit（時間比那兩個 redact 都早）照樣能贏。
+        put(
+            &mut cache,
+            ALICE,
+            &[edit_of("!r", "$late", CAROL, "$t", 5, "late")],
+        );
+        assert_eq!(body_of(&cache, ALICE, "!r", "$t").as_deref(), Some("late"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 可見性跟 events 表完全一致：目前的 edit 讀者還沒同步到 → 過時的記號，🚫 原文與 edit 內容都不給。
+    #[test]
+    fn a_current_edit_the_reader_has_not_synced_is_outdated() {
+        let (mut cache, dir) = open("edit-outdated");
+        let target = text("!r", "$t", Some(1), 1);
+        put(&mut cache, ALICE, std::slice::from_ref(&target));
+        put(
+            &mut cache,
+            BOB,
+            &[target, edit_of("!r", "$e", CAROL, "$t", 20, "bob saw this")],
+        );
+        let alice_view = cache.history(ALICE, "!r", None, 1).unwrap().remove(0);
+        assert_eq!(alice_view.kind, MessageKind::Outdated);
+        assert_eq!(alice_view.edited_by, None);
+        assert_eq!(
+            body_of(&cache, BOB, "!r", "$t").as_deref(),
+            Some("bob saw this")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2793,8 +2860,8 @@ mod tests {
         );
         assert_eq!(
             column_of::<i64>(&cache, "modified_timestamp", "$t"),
-            1,
-            "寫入時等於自己的 server 時間"
+            0,
+            "寫入時是 0：第一個 edit 一定贏"
         );
         put(
             &mut cache,

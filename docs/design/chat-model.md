@@ -111,6 +111,7 @@ pub enum MessageKind {
     Deleted { by: PeerId, reason: Option<String> },
     System(SystemEvent),                  // 誰加入、改名、改權限…；UI 印成一行灰字
     Undecryptable,                        // 解不開的加密事件：跟 Deleted 一樣是明確的記號（decrypted: false 帶原因）
+    Outdated,                             // 被 edit 過、但目前那個 edit 這個帳號還沒同步到：本地版本過時，原文與 edit 都不給
     Unsupported { event_type: String },   // 認不得的事件：照印 type，不丟
 }
 
@@ -200,6 +201,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（local-cache-db.md §7.2、§7.6，維護者 2026-09-14） |
 | `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
+| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（local-cache-db.md §7.5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
 | `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>` |
 | `System` | `m.room.member`、`m.room.name`、`m.room.topic`、`m.room.power_levels`、`m.room.encryption`、`m.room.pinned_events`… |
 | `Unsupported` | 其他所有 type。**不丟**，這是 fail-safe：至少讓人看到「這裡有東西」 |

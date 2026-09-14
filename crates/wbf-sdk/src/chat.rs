@@ -73,6 +73,9 @@ pub enum MessageKind {
     /// 解不開的加密事件：跟 `Deleted` 一樣是明確的記號，UI 直接渲染（維護者 2026-09-14）。
     /// `Message.decrypted` 是 `Some(false)`，原因在 `undecryptable_reason`。
     Undecryptable,
+    /// 這則被 edit 過，但目前的那個 edit 這個帳號**還沒同步到**：本地手上的版本過時了，🚫 原文與 edit 內容都不給，
+    /// 同步之後就會是新版本（維護者 2026-09-14）。跟 `Deleted`、`Undecryptable` 一樣是 UI 直接渲染的記號。
+    Outdated,
     /// 認不得的事件：照印 type，不丟（chat-model §3.4）。
     Unsupported {
         event_type: String,
