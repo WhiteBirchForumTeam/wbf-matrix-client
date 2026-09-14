@@ -345,6 +345,18 @@ pub struct BatchMeta {
     pub ls: i64,
     /// remain：這批之後這一窗還剩幾則；0 就是這窗結束。
     pub r: u32,
+    /// 🚨 **這一窗停在上限（則數或位元組）而不是事件用完**（wbfuwunel 窗的位元組上限，2026-09-14 合併）。
+    ///
+    /// ⚠️ 位元組上限滿的窗 `tc < limit`，所以「`tc < limit` ＝沒有更多」**不再成立** ——
+    /// 照舊規則會把水位推過還在的事件。追平與否一律看這個欄位。
+    /// 📎 **沒有這個欄位要當 `true`**（server 的規則）：多一趟請求，換不留洞。
+    #[serde(default = "more_when_absent")]
+    pub more: bool,
+}
+
+/// `BatchMeta::more` 缺欄位時的值。⚠️ 是 `true`：不確定就再問一趟，🚫 不假設已經拿完。
+fn more_when_absent() -> bool {
+    true
 }
 
 /// `Recent` 的回應要是 `Event/Batch`：`IS_RESPONSE`、`id` 抄請求、`seq` 是這窗的第幾個 Batch（從 0 嚴格 +1）。

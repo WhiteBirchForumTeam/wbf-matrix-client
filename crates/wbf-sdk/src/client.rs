@@ -35,6 +35,8 @@ pub struct RecentWindow {
     pub first_fs: Option<i64>,
     /// 最後一個非空 Batch 的 `ls`；下一窗的 `before`。
     pub last_ls: Option<i64>,
+    /// 最後一個 Batch 的 `more`：true ＝這窗停在上限、後面還有；false ＝事件用完了。
+    pub more: bool,
 }
 
 /// `recent_sync` 整輪的結果。
@@ -46,7 +48,7 @@ pub struct RecentSync {
     pub windows: u32,
     pub events: u64,
     pub last_ls: Option<i64>,
-    /// true = 一窗 `tc < window` 回到了 `cg_seq`；false = 被 `max_events` 停下，`last_ls` 以下到舊水位之間還沒拿
+    /// true = 一窗回來說 `more: false`（回到了 `cg_seq`）；false = 被 `max_events` 停下，`last_ls` 以下到舊水位之間還沒拿
     /// （那段之後靠逐房翻頁補，local-cache-db §6 的「洞」）。
     pub caught_up: bool,
 }
@@ -251,6 +253,7 @@ impl<C: PackChannel> WbfClient<C> {
             if meta.bc > 0 {
                 window.last_ls = Some(meta.ls);
             }
+            window.more = meta.more;
             window.batches += 1;
             window.events += u64::from(meta.bc);
             expected_seq += 1;
@@ -273,8 +276,10 @@ impl<C: PackChannel> WbfClient<C> {
     /// 整輪同步（pack-pipeline §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉，拉到追平或湊滿 `plan.max_events`。
     /// 三層：上層要 `max_events` 則 → 底層每次 `Recent` 要一窗（`window`，≤ 500）→ server 每 `batch` 則回一個 `Batch`。
     /// 最後一窗會縮成剩下的數量，總量剛好不多拿。
-    /// - 一窗收完且 `tc < 這窗要的`：追平（`caught_up`）。
-    /// - `tc == 這窗要的`：可能還有更舊的，帶 `before = 最後的 ls` 再一窗；湊滿 `max_events` 就停。
+    /// - 一窗收完且最後一個 Batch 說 `more: false`：追平（`caught_up`）。
+    /// - `more: true`（窗停在則數或**位元組**上限）：帶 `before = 最後的 ls` 再一窗；湊滿 `max_events` 就停。
+    ///   🚨 🚫 **不看 `tc < 這窗要的`**：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14 合併）。
+    /// - 空窗：追平，不管 `more`（server 保證第一則一定收進窗，所以停在上限的窗不會是空的）。
     /// - 新水位一律是**第一窗第一個 Batch 的 `fs`**（比它新的全都拿到了），追平或被總量停下都可以存。
     /// - 中途錯誤：原樣回；已交給 `on_batch` 的事件有效，`new_cg_seq` 不會給（呼叫者不推水位，下次重來會拿到同樣的）。
     ///
@@ -331,7 +336,6 @@ impl<C: PackChannel> WbfClient<C> {
             } else {
                 RECENT_NEXT_WINDOW_TIMEOUT
             };
-            let asked = request.limit;
             let window_result = self.recent_window(&request, timeout, on_batch).await?;
             if summary.windows == 0 {
                 summary.new_cg_seq = window_result.first_fs;
@@ -339,11 +343,16 @@ impl<C: PackChannel> WbfClient<C> {
             summary.windows += 1;
             summary.events += window_result.events;
             summary.last_ls = window_result.last_ls.or(summary.last_ls);
-            if window_result.tc < asked {
+            // 🚨 **看 `more`，🚫 不看 `tc < limit`**：位元組上限滿的窗也是 `tc < limit`，
+            // 照舊規則會在這裡宣告追平、把水位推過還沒拿到的事件（wbfuwunel 窗的位元組上限）。
+            if !window_result.more {
                 summary.caught_up = true;
                 break;
             }
             let Some(last_ls) = window_result.last_ls else {
+                // 空窗＝區間裡真的沒有事件了，**不管 `more` 說什麼**。依據是 server 的保證：
+                // 「第一則一定收進窗」，所以停在上限的窗不可能是空的。
+                // ⭐ 這也是「沒帶 `more` 的舊 server」唯一的收尾方式：當 true 多問一趟、拿到空窗就結束。
                 summary.caught_up = true;
                 break;
             };

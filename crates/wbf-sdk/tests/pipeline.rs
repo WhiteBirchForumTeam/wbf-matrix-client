@@ -642,7 +642,7 @@ fn recent_fixture(count: i64) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// pack-pipeline §6：一窗多個 Batch、`tc == limit` 就帶 `before` 再一窗、水位是第一窗第一個 Batch 的 fs。
+/// pack-pipeline §6：一窗多個 Batch、`more: true` 就帶 `before` 再一窗、水位是第一窗第一個 Batch 的 fs。
 #[tokio::test]
 async fn recent_sync_pulls_windows_until_caught_up() {
     let mut server = FakeServer::new();
@@ -712,7 +712,7 @@ async fn recent_sync_pulls_windows_until_caught_up() {
     assert_eq!(summary.windows, 1);
     assert!(summary.caught_up);
 
-    // 剛好整窗（10 則新的、limit 10）：第一窗 tc == limit，第二窗空 → 追平，水位 = 第一窗的 fs。
+    // 剛好整窗（10 則新的、limit 10）：第一窗停在則數上限（more: true，server 也不知道後面還有沒有），第二窗空 → 追平，水位 = 第一窗的 fs。
     server.recent_events = recent_fixture(35);
     let mut client = WbfClient::new(&mut server);
     client.hello("test").await.unwrap();
@@ -1002,4 +1002,69 @@ async fn an_unknown_code_id_is_reported_not_retried() {
         "不認得的碼要原樣留在 log 裡：{error}"
     );
     assert_eq!(chunks_sent, 1, "🚫 不准重試");
+}
+
+/// 🚨 **位元組上限切短的窗：`tc < limit` 但 `more: true` —— 要接著問，🚫 不准宣告追平**
+/// （wbfuwunel 窗的位元組上限，2026-09-14 合併）。
+///
+/// 舊規則「`tc < limit` ＝沒有更多」在這裡會停在第一窗、`caught_up = true`，而呼叫端接著把
+/// 水位存成第一窗的 `fs` —— 比水位舊、還沒拿到的那些事件就**永遠不會再被問**。
+#[tokio::test]
+async fn a_window_cut_short_by_bytes_is_followed_not_taken_as_caught_up() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["recent", "batch"];
+    server.recent_events = recent_fixture(25); // g_seq 1001..=1025
+    server.window_cap_by_bytes = Some(7); // limit 是 10，但位元組只放得下 7 則
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test").await.unwrap();
+    let mut seen = 0usize;
+    let summary = client
+        .recent_sync(
+            None,
+            RecentPlan {
+                max_events: None,
+                window: 10,
+                batch: None,
+            },
+            &mut |_, events| {
+                seen += events.len();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen, 25, "每一則都要拿到");
+    assert_eq!(summary.events, 25);
+    assert_eq!(summary.windows, 4, "7 ＋ 7 ＋ 7 ＋ 4（最後一窗 4 < 7，more: false）");
+    assert!(summary.caught_up);
+    assert_eq!(summary.new_cg_seq, Some(1025));
+}
+
+/// 舊 server 不帶 `more`：當成 `true`，**多問一趟**，拿到空窗才算追平 —— 🚫 不假設拿完了。
+///
+/// ⚠️ 空窗能當結束，是靠 server 的保證「第一則一定收進窗」：停在上限的窗不可能是空的。
+#[tokio::test]
+async fn a_batch_without_more_is_taken_as_more_and_costs_one_extra_window() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["recent", "batch"];
+    server.recent_events = recent_fixture(3);
+    server.omit_more = true;
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test").await.unwrap();
+    let summary = client
+        .recent_sync(
+            None,
+            RecentPlan {
+                max_events: None,
+                window: 10,
+                batch: None,
+            },
+            &mut |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.windows, 2, "第一窗 3 則（沒說 more → 當 true）、第二窗空 → 追平");
+    assert_eq!(summary.events, 3);
+    assert!(summary.caught_up);
+    assert_eq!(summary.new_cg_seq, Some(1003), "水位還是第一窗的 fs");
 }

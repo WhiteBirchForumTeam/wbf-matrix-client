@@ -330,7 +330,8 @@ fn event_recent_and_batch_match_server_vectors() {
             bc: 1,
             fs: 4712,
             ls: 4712,
-            r: 1
+            r: 1,
+            more: true
         }
     );
     assert_eq!(events.len(), 1);
@@ -345,7 +346,9 @@ fn event_recent_and_batch_match_server_vectors() {
             bc: 1,
             fs: 4711,
             ls: 4711,
-            r: 0
+            r: 0,
+            // ⚠️ `r = 0` 但 `more = true`：這窗結束了，但它停在上限（limit 2 剛好滿），後面還有。
+            more: true
         }
     );
     assert_eq!(event_seqs(&events[0]), (Some(1), Some(4711)));
@@ -363,10 +366,15 @@ fn event_recent_and_batch_match_server_vectors() {
             bc: 0,
             fs: 0,
             ls: 0,
-            r: 0
+            r: 0,
+            more: false
         }
     );
     assert!(events.is_empty());
+    // 🚨 沒有 `more` 的 Batch（舊 server）要當 `true`：不確定就再問一趟，🚫 不假設拿完了。
+    let without_more: BatchMeta =
+        serde_json::from_str(r#"{"tc":0,"bc":0,"fs":0,"ls":0,"r":0}"#).unwrap();
+    assert!(without_more.more, "缺欄位＝還有");
     // 走 HTTP 的 Recent：server 回 Error(Unsupported)，expect_batch 變 Server 錯。
     match protocol::expect_batch(&request, pack_named("error_unsupported"), 0) {
         Err(SdkError::Server { code, .. }) => assert_eq!(code, "Unsupported"),
