@@ -478,3 +478,63 @@ fn event_send_meta_shape() {
         r#"{"room_id":"!r:localhost","type":"m.room.encrypted","txn_id":"t1","attachments":["mxc://localhost/1122334455667788"]}"#
     );
 }
+
+/// 從 Matrix 錯誤來的 `Error` 多帶的欄位，對著 server 產生的向量（wbfuwunel #56）。
+/// ⭐ 走橋的失敗回覆（flags 帶 `IS_BRIDGED`）與原生的 `Error` 解法一樣。
+#[test]
+fn error_meta_matrix_fields_match_server_vectors() {
+    use wbf_sdk::error_code::WbfErrorCode;
+    use wbf_sdk::protocol;
+    use wbf_wire::pack::flags;
+    use wbf_wire::Pack;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let pack_named = |name: &str| -> Pack {
+        let entry = vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"));
+        Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
+    };
+
+    let rate_limited = protocol::server_error(&pack_named("error_rate_limited").meta);
+    assert_eq!(rate_limited.wbf_code(), Some(WbfErrorCode::RateLimited));
+    assert_eq!(rate_limited.matrix_status(), Some(429));
+    assert_eq!(rate_limited.matrix_errcode(), Some("M_LIMIT_EXCEEDED"));
+    assert_eq!(rate_limited.retry_after_ms(), Some(700));
+    assert!(!rate_limited.is_soft_logout(), "欄位不出現 ＝ false");
+
+    let locked = protocol::server_error(&pack_named("error_session_locked").meta);
+    assert_eq!(locked.wbf_code(), Some(WbfErrorCode::Unauthorized));
+    assert_eq!(locked.matrix_errcode(), Some("M_USER_LOCKED"));
+    assert!(locked.is_soft_logout());
+    assert_eq!(locked.retry_after_ms(), None);
+
+    let bridged = pack_named("bridge_error_forbidden");
+    assert_ne!(bridged.flags & flags::IS_BRIDGED, 0, "走橋的回覆也帶 bit4");
+    let forbidden = protocol::server_error(&bridged.meta);
+    assert_eq!(forbidden.wbf_code(), Some(WbfErrorCode::Forbidden));
+    assert_eq!(forbidden.matrix_status(), Some(403));
+    assert_eq!(forbidden.matrix_errcode(), Some("M_FORBIDDEN"));
+}
+
+/// 🚨 `soft_logout` 只認 JSON 的 `true`；形狀不對的欄位一律當沒有（fail closed）。
+#[test]
+fn error_meta_matrix_fields_reject_the_wrong_shapes() {
+    use wbf_sdk::protocol;
+    let error = protocol::server_error(
+        br#"{"code":"Unauthorized","code_id":1301,"soft_logout":"true","status":"401","errcode":"","retry_after_ms":-1}"#,
+    );
+    assert!(!error.is_soft_logout(), "字串 \"true\" 不算");
+    assert_eq!(error.matrix_status(), None, "字串的狀態碼不算");
+    assert_eq!(error.matrix_errcode(), None, "空字串不算");
+    assert_eq!(error.retry_after_ms(), None, "負數不算");
+    let out_of_range = protocol::server_error(br#"{"code":"x","code_id":1901,"status":42}"#);
+    assert_eq!(out_of_range.matrix_status(), None, "不是 HTTP 狀態碼的範圍");
+    assert!(
+        !wbf_sdk::SdkError::Network("x".into()).is_soft_logout(),
+        "不是 Server 就是 false"
+    );
+}

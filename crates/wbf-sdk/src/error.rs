@@ -121,4 +121,55 @@ impl SdkError {
             _ => None,
         }
     }
+
+    // ---- 從 Matrix 錯誤來的 `Error` 多帶的欄位（wbfuwunel #56，wire-format §3.4 表下）----
+    //
+    // ⚠️ 只讀 **wbf `Error` pack 的 meta**：直接打 Matrix HTTP 的錯誤（`login.rs`）meta 不是這個形狀，這幾個一律 None／false。
+    // ⚠️ 欄位「不出現」就是沒有值：server 2026-09-15 起不再寫 `"soft_logout": false`、`"retry_after_ms": null`。
+    // 📎 認碼仍然只看 `code_id`（`wbf_code`）；這幾個是**附加的原因**，給「能不能 refresh、要等多久」這種決定用。
+
+    /// Return:
+    ///     Some(u16)  Matrix 的 HTTP 狀態碼, example: 429；只收 100–599 的整數
+    ///     None       不是 `Server`、沒有這個欄位、或形狀不對
+    pub fn matrix_status(&self) -> Option<u16> {
+        self.server_meta_field("status")?
+            .as_u64()
+            .filter(|status| (100..=599).contains(status))
+            .map(|status| status as u16)
+    }
+
+    /// Return:
+    ///     Some(&str)  Matrix body 的 `errcode`, example: "M_USER_LOCKED"；空字串不算
+    ///     None        不是 `Server`、沒有、或不是字串
+    pub fn matrix_errcode(&self) -> Option<&str> {
+        self.server_meta_field("errcode")?
+            .as_str()
+            .filter(|errcode| !errcode.is_empty())
+    }
+
+    /// Return:
+    ///     Some(u64)  server 說要等多久再試（毫秒）, example: 700
+    ///     None       沒說（包括限速但不知道要等多久）
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.server_meta_field("retry_after_ms")?.as_u64()
+    }
+
+    /// session 是不是 **soft logout**（token 過期但可以 refresh）。
+    ///
+    /// 🚨 **只有 JSON 的 `true` 才算**：不出現、`false`、字串 `"true"`、數字都是 false。
+    /// 錯判成 true 的後果是拿一個已經被撤銷的 session 去 refresh；錯判成 false 只是要使用者重新登入 —— 所以往 false 那邊倒。
+    ///
+    /// Return:
+    ///     bool  true ＝ server 明說 `"soft_logout": true`
+    pub fn is_soft_logout(&self) -> bool {
+        self.server_meta_field("soft_logout")
+            .is_some_and(|value| value.as_bool() == Some(true))
+    }
+
+    fn server_meta_field(&self, key: &str) -> Option<&serde_json::Value> {
+        match self {
+            SdkError::Server { meta, .. } => meta.get(key),
+            _ => None,
+        }
+    }
 }

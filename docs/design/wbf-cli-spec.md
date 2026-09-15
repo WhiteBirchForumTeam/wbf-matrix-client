@@ -353,6 +353,17 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 🚨 **不認得的碼**（包括 `0`、表上沒有的號）一律當「失敗了、不知道能不能重試」：🚫 不重試，原樣往上報 ——
 例如上傳只在認得的 `Corrupt`（1002）重送一次、認得的 `OutOfOrder`（1503）跳回 `expected_seq`，其他一律 exit 2。
 
+📎 **從 Matrix 錯誤來的 `Error`（原生 kind 與走橋的都是）多帶 Matrix 的欄位**（wbfuwunel #56，wire-format §3.4 表下）：
+`status`（一定有）、`errcode`、`retry_after_ms`、`soft_logout`（只會是 `true` 或不出現）。SDK 的讀法是
+`SdkError::matrix_status()`／`matrix_errcode()`／`retry_after_ms()`／`is_soft_logout()`：**欄位不出現就是沒有值**
+（server 2026-09-15 起不再寫 `"soft_logout": false`、`"retry_after_ms": null`），形狀不對一律當沒有；
+`is_soft_logout` 只認 JSON 的 `true`（錯判成可以 refresh 的代價比錯判成要重新登入大）。
+它們是**附加的原因**（例：`M_USER_LOCKED` 被鎖、`M_UNKNOWN_TOKEN` ＋ soft logout 可以 refresh、沒有 soft logout 要重新登入），
+🚫 不取代上面「認碼只看 `code_id`」。
+
+📎 flags bit4 `IS_BRIDGED`（`0x10`）是定義過的位元（走橋的 Matrix 端點呼叫，server 的回覆也帶它）；bit5–bit7 仍然保留，
+收到就是 `ReservedFlags`。
+
 ## 5. Manifest：`upload` 印的、`download` 吃的
 
 就是約定 §5 事件區塊的 JSON，外加 `mxc` 與 `server`：
