@@ -2,8 +2,8 @@
 //! 這裡的 RFC 8439 與 NIST GCM 兩條證明底下的 AEAD 呼叫是標準的那個。
 
 use wbf_sdk::chunk_crypto::{chunk_count, expected_plain_len, locate, MAX_CHUNK_INDEX};
-use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
 use wbf_sdk::error_code::WbfErrorCode;
+use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
 
 fn unhex(text: &str) -> Vec<u8> {
     hex::decode(text.replace([' ', '\n'], "")).expect("valid hex")
@@ -311,11 +311,30 @@ fn event_recent_and_batch_match_server_vectors() {
         vector.id,
         vector.seq,
     );
-    let meta_of = |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
-    assert_eq!(meta_of(&ours), meta_of(&vector), "recent_one_room_history meta");
+    let meta_of =
+        |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
     assert_eq!(
-        (ours.kind, ours.subtype, ours.flags, ours.id, ours.seq, &ours.data),
-        (vector.kind, vector.subtype, vector.flags, vector.id, vector.seq, &vector.data),
+        meta_of(&ours),
+        meta_of(&vector),
+        "recent_one_room_history meta"
+    );
+    assert_eq!(
+        (
+            ours.kind,
+            ours.subtype,
+            ours.flags,
+            ours.id,
+            ours.seq,
+            &ours.data
+        ),
+        (
+            vector.kind,
+            vector.subtype,
+            vector.flags,
+            vector.id,
+            vector.seq,
+            &vector.data
+        ),
         "recent_one_room_history 其他欄位逐一相等"
     );
 
@@ -386,7 +405,10 @@ fn event_recent_and_batch_match_server_vectors() {
         ("error_rate_limited", WbfErrorCode::RateLimited),
         ("error_out_of_order", WbfErrorCode::OutOfOrder),
         ("error_unsupported", WbfErrorCode::Unsupported),
-        ("error_too_many_connections", WbfErrorCode::TooManyConnections),
+        (
+            "error_too_many_connections",
+            WbfErrorCode::TooManyConnections,
+        ),
         ("error_invalid_request", WbfErrorCode::InvalidRequest),
     ] {
         let error = protocol::server_error(&pack_named(name).meta);
@@ -413,7 +435,11 @@ fn event_recent_and_batch_match_server_vectors() {
             panic!("{error:?}")
         };
         assert_eq!(*code_id, None, "{}", String::from_utf8_lossy(meta));
-        assert_eq!(error.to_string(), "server Corrupt: m", "log 不准印出假的序號");
+        assert_eq!(
+            error.to_string(),
+            "server Corrupt: m",
+            "log 不准印出假的序號"
+        );
     }
     match protocol::server_error(&pack_named("error_too_many_connections").meta) {
         SdkError::Server { code, meta, .. } => {
@@ -476,5 +502,65 @@ fn event_send_meta_shape() {
     assert_eq!(
         String::from_utf8(pack.meta).unwrap(),
         r#"{"room_id":"!r:localhost","type":"m.room.encrypted","txn_id":"t1","attachments":["mxc://localhost/1122334455667788"]}"#
+    );
+}
+
+/// 從 Matrix 錯誤來的 `Error` 多帶的欄位，對著 server 產生的向量（wbfuwunel #56）。
+/// ⭐ 走橋的失敗回覆（flags 帶 `IS_BRIDGED`）與原生的 `Error` 解法一樣。
+#[test]
+fn error_meta_matrix_fields_match_server_vectors() {
+    use wbf_sdk::error_code::WbfErrorCode;
+    use wbf_sdk::protocol;
+    use wbf_wire::pack::flags;
+    use wbf_wire::Pack;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let pack_named = |name: &str| -> Pack {
+        let entry = vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"));
+        Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
+    };
+
+    let rate_limited = protocol::server_error(&pack_named("error_rate_limited").meta);
+    assert_eq!(rate_limited.wbf_code(), Some(WbfErrorCode::RateLimited));
+    assert_eq!(rate_limited.matrix_status(), Some(429));
+    assert_eq!(rate_limited.matrix_errcode(), Some("M_LIMIT_EXCEEDED"));
+    assert_eq!(rate_limited.retry_after_ms(), Some(700));
+    assert!(!rate_limited.is_soft_logout(), "欄位不出現 ＝ false");
+
+    let locked = protocol::server_error(&pack_named("error_session_locked").meta);
+    assert_eq!(locked.wbf_code(), Some(WbfErrorCode::Unauthorized));
+    assert_eq!(locked.matrix_errcode(), Some("M_USER_LOCKED"));
+    assert!(locked.is_soft_logout());
+    assert_eq!(locked.retry_after_ms(), None);
+
+    let bridged = pack_named("bridge_error_forbidden");
+    assert_ne!(bridged.flags & flags::IS_BRIDGED, 0, "走橋的回覆也帶 bit4");
+    let forbidden = protocol::server_error(&bridged.meta);
+    assert_eq!(forbidden.wbf_code(), Some(WbfErrorCode::Forbidden));
+    assert_eq!(forbidden.matrix_status(), Some(403));
+    assert_eq!(forbidden.matrix_errcode(), Some("M_FORBIDDEN"));
+}
+
+/// 🚨 `soft_logout` 只認 JSON 的 `true`；形狀不對的欄位一律當沒有（fail closed）。
+#[test]
+fn error_meta_matrix_fields_reject_the_wrong_shapes() {
+    use wbf_sdk::protocol;
+    let error = protocol::server_error(
+        br#"{"code":"Unauthorized","code_id":1301,"soft_logout":"true","status":"401","errcode":"","retry_after_ms":-1}"#,
+    );
+    assert!(!error.is_soft_logout(), "字串 \"true\" 不算");
+    assert_eq!(error.matrix_status(), None, "字串的狀態碼不算");
+    assert_eq!(error.matrix_errcode(), None, "空字串不算");
+    assert_eq!(error.retry_after_ms(), None, "負數不算");
+    let out_of_range = protocol::server_error(br#"{"code":"x","code_id":1901,"status":42}"#);
+    assert_eq!(out_of_range.matrix_status(), None, "不是 HTTP 狀態碼的範圍");
+    assert!(
+        !wbf_sdk::SdkError::Network("x".into()).is_soft_logout(),
+        "不是 Server 就是 false"
     );
 }

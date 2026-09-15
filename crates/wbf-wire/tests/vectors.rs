@@ -169,6 +169,17 @@ fn encode_rejects_reserved_flags() {
         data: vec![0xde, 0xad, 0xbe, 0xef, 0x01],
     };
     assert_eq!(pack.encode(), Err(EncodeError::ReservedFlags(0x80)));
+    // bit4 `IS_BRIDGED` 定義了（wbfuwunel #56）；bit5 仍然保留（與 rejected[reserved_flag_bit5] 對稱）。
+    let bridged = Pack {
+        flags: wbf_wire::pack::flags::IS_BRIDGED,
+        ..pack.clone()
+    };
+    assert!(bridged.encode().is_ok(), "bit4 送得出去");
+    let bit5 = Pack {
+        flags: 0x20,
+        ..pack
+    };
+    assert_eq!(bit5.encode(), Err(EncodeError::ReservedFlags(0x20)));
 }
 
 /// 向量檔的每個 id 都要說得出自己是什麼型別（wire-format §2.2）。

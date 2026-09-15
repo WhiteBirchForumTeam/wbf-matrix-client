@@ -155,8 +155,12 @@ pub mod flags {
     pub const WANT_ACK: u8 = 0x02;
     pub const IS_RESPONSE: u8 = 0x04;
     pub const IS_LAST: u8 = 0x08;
+    /// 走橋：這個 pack 是 Matrix 端點的呼叫，server 轉成內部 HTTP 請求（wbfuwunel #56，
+    /// `docs/design/wbf-api-bridge.md`、`docs/bridge-specs/index.md`）。server 對它的每個回覆也帶這一位：
+    /// 成功 `01 01 02 14`、失敗 `01 01 03 14`。bit5–bit7 仍然保留。
+    pub const IS_BRIDGED: u8 = 0x10;
     /// 所有定義過的位元；`flags & !KNOWN != 0` 就是 `ReservedFlags`。
-    pub const KNOWN: u8 = META_ENCRYPTED | WANT_ACK | IS_RESPONSE | IS_LAST;
+    pub const KNOWN: u8 = META_ENCRYPTED | WANT_ACK | IS_RESPONSE | IS_LAST | IS_BRIDGED;
 }
 
 /// 一個 pack 的欄位。`encode` 與 `decode` 互為反函數（向量測試保證）。
