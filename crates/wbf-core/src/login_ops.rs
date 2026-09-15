@@ -69,9 +69,27 @@ impl Core {
         server_backup: bool,
     ) -> Result<LoginResult, CoreError> {
         let vault = self.vault()?;
+        // 🚨 全程握著帳號生命週期鎖（`account_lock`）：destroy／logout 正在刪目錄的時候不准建，反之亦然。
+        // ⚠️ 排在碰任何目錄之前（下面那行就可能刪 `m/`）。
+        let _lifecycle = crate::account_lock::lock_account_lifecycle(&self.data_dir)?;
         let dir_key = vault.account_dir_key();
         // 帳號目錄由 server host 加 localpart 決定（store 在 login 前就要有路徑）。
         let account = AccountDir::locate(&self.data_dir, &dir_key, server, user)?;
+        // 🚨 這台 server 的目錄正在（或上次刪到一半停在）被刪：🚫 不准在上面建東西（維護者 2026-09-15）。
+        let server_lock = account
+            .server_dir()
+            .join(crate::account_lock::TO_BE_DELETED_LOCK_FILE_NAME);
+        if server_lock.exists() {
+            return Err(CoreError::new(
+                CoreErrorKind::ServerPendingRemoval,
+                format!(
+                    "the local data for this server is being removed ({} exists); \
+                     if no destroy is running, a previous one stopped part way: delete {} by hand, then log in again",
+                    server_lock.display(),
+                    account.server_dir().display()
+                ),
+            ));
+        }
         // 沒有 session 卻留著 `m/`：上次沒走 logout（或舊版的 logout 沒刪），那個 store
         // 綁著已經失效的裝置。消費端自己再清一次。
         if !account.is_logged_in() && account.matrix_store_dir().exists() {

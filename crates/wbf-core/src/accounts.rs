@@ -208,6 +208,10 @@ pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap
                 continue;
             }
             let server_dir_name = server_entry.file_name().to_string_lossy().into_owned();
+            // destroy 改名後還沒刪完的舊目錄：垃圾，🚫 不當成 server（local-cache-db.md §6）。
+            if crate::account_lock::is_to_be_deleted_dir_name(&server_dir_name) {
+                continue;
+            }
             let Some(server_host) =
                 find_dir_name_plaintext(&key, DirScope::Server, &server_dir_name)
             else {
@@ -402,7 +406,10 @@ impl DataDirMap {
             return None;
         }
         let servers = self.data_dir.join(SERVERS_DIR_NAME);
-        let any_entry = std::fs::read_dir(&servers).ok()?.flatten().next().is_some();
+        // 等著被刪的舊 server 目錄不算：它們本來就不該解得開，拿它們提示「local.key 換過了」是誤報。
+        let any_entry = std::fs::read_dir(&servers).ok()?.flatten().any(|entry| {
+            !crate::account_lock::is_to_be_deleted_dir_name(&entry.file_name().to_string_lossy())
+        });
         any_entry.then(|| {
             format!(
                 "warning: no directory in {} could be decrypted with this local.key; if this data dir was made by an older build, delete it and run `login` again",
@@ -887,5 +894,30 @@ mod tests {
             .find_account_dir("alice", Some("http://localhost:6167"))
             .is_ok());
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// destroy 改名後沒刪完的 `🗑️…`：🚫 不當 server、🚫 不觸發「local.key 換過了」的提示。
+    #[test]
+    fn to_be_deleted_server_dirs_are_skipped_by_the_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "wbf-core-scan-to-be-deleted-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::create(&dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
+        let leftover = dir.join(SERVERS_DIR_NAME).join(format!(
+            "{}anything",
+            crate::account_lock::TO_BE_DELETED_PREFIX
+        ));
+        std::fs::create_dir_all(leftover.join(ACCOUNTS_DIR_NAME)).unwrap();
+        let map = refresh_data_dir_map(&dir, &vault).unwrap();
+        assert!(map.list_accounts(&vault).unwrap().is_empty());
+        assert_eq!(
+            map.find_undecryptable_layout_hint(),
+            None,
+            "垃圾目錄不是換過 local.key 的證據"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

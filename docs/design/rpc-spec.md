@@ -291,7 +291,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | `account.switch` | `{ user, server? }` | `SwitchResult`：`{ current, switched_from?, logged_in }` | `switch_current` |
 | `account.whoami` | `{ user?, server? }` | `{ user_id, device_id, server }` | `whoami` |
 | `account.del` | `{ user, server?, accept_history_loss?: bool }` | `{ user }` | `log_out`。閘門擋下 → `1021` |
-| `account.destroy` | `{ user, server?, accept_history_loss?: bool }` | `DestroyResult`：`{ user, events_removed, media_removed, pool_files_removed, recovery_key_destroyed }` | `destroy_account` |
+| `account.destroy` | `{ user, server?, accept_history_loss?: bool }` | `DestroyResult`：`{ user, events_removed, media_removed, pool_files_removed, recovery_key_destroyed, account_dir_removed, server_dir_removed }` | `destroy_account` |
 
 ⚠️ `password` 在 RPC 上是明文字串——它在加密的 frame 裡，而且**只在這一則**。daemon 🚫 不留、不進 log、不進任何推播。
 🚫 沒有「確認」這種互動：`account.destroy` 沒有 `--yes`，前端要問就自己問（daemon 不代前端做決定，§3）。
@@ -453,6 +453,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | 1010 | `no_such_account` | 1 |
 | 1011 | `ambiguous_account` | 1 |
 | 1012 | `not_logged_in` | 1 |
+| 1013 | `account_busy` | 1 |
+| 1014 | `server_pending_removal` | 1 |
 | 1020 | `no_recovery_key_here` | 1 |
 | 1021 | `history_would_be_lost` | 1 |
 | 1100 | `usage` | 1 |
@@ -462,7 +464,9 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | 1500 | `integrity` | 3 |
 | 1600 | `timeout` | 5 |
 
-- 號碼**留了縫**（1006–1009、1013–1019……）：同一族拆新 variant 就填進去，🚫 不重排。
+- `account_busy`（1013）：另一個 `account.login`／`account.del`／`account.destroy` 正握著 `<data dir>/account.lock`（PR #40）。🚫 daemon 不排隊，前端決定要不要稍後再試。
+- `server_pending_removal`（1014）：`account.login` 的那台 server 目錄帶著 `to_be_deleted.lock`（destroy 最後一個帳號時放的，刪完整個目錄才會消失）。它還在就代表上次刪到一半停了；🚫 core 不自己收拾，`msg` 說出要手動刪的目錄（維護者 2026-09-15）。
+- 號碼**留了縫**（1006–1009、1015–1019……）：同一族拆新 variant 就填進去，🚫 不重排。
 - `usage`（1100）是過渡桶子（`error.rs` 自己標的）：每次前端需要分辨就拆一個新號碼出去，🚫 讓前端 parse `msg`。
 - `msg` 就是 `CoreError.message`，給人看。**`kind` 的名字不另外放進回應**——`code` 就是它，一個欄位夠了（§4.6）。
 - RPC 層錯誤（1xx）的 exit code 一律 **1**（用法錯），除了 `105` 是 **130**（跟 Ctrl-C 一樣的慣例）。

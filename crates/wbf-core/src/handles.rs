@@ -73,6 +73,14 @@ impl Core {
     /// server 不符、解不開就重建（§1），重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
+        #[cfg(test)]
+        {
+            *RAW_CACHE_OPENS
+                .lock()
+                .expect("the raw-open counter is never poisoned")
+                .entry(account.server_dir())
+                .or_insert(0) += 1;
+        }
         let identity = CacheIdentity {
             server: server.to_string(),
         };
@@ -115,13 +123,49 @@ impl Core {
         account: &AccountDir,
         server: &str,
     ) -> Result<std::sync::Arc<crate::server_cache::ServerCache>, CoreError> {
+        self.open_server_cache(account, server, OpenWhen::Always)?
+            .ok_or_else(|| {
+                CoreError::new(
+                    crate::error::CoreErrorKind::Io,
+                    "the server cache was not opened although it was asked to open always",
+                )
+            })
+    }
+
+    /// 同 [`Core::server_cache_of`]，但 **`cache.db` 不在就不開**（🚫 不建一個空的）。
+    ///
+    /// ⭐ 「在不在」跟「開」在**同一把註冊表的鎖裡**判斷（PR #40 審查 rumia🟡）：
+    /// 用在「只是要處理既有資料」的路徑（`destroy` 的忘掉鏈），🚫 不先 `exists()` 再另外呼叫開庫。
+    /// ⚠️ 還剩的窗口：`log_out` 的 `close_server_cache` 與刪檔之間沒有同一把鎖（既有行為，不在這裡）。
+    ///
+    /// Return:
+    ///     Ok(Some(Arc<ServerCache>))  已經開著、或檔案在而開起來了
+    ///     Ok(None)                    沒開著、而且沒有 `cache.db`
+    ///     Err(...)                    開不了（磁碟、金鑰）
+    pub(crate) fn find_server_cache_if_present(
+        &self,
+        account: &AccountDir,
+        server: &str,
+    ) -> Result<Option<std::sync::Arc<crate::server_cache::ServerCache>>, CoreError> {
+        self.open_server_cache(account, server, OpenWhen::FileExists)
+    }
+
+    fn open_server_cache(
+        &self,
+        account: &AccountDir,
+        server: &str,
+        when: OpenWhen,
+    ) -> Result<Option<std::sync::Arc<crate::server_cache::ServerCache>>, CoreError> {
         let dir = account.server_dir();
         let mut registry = self
             .server_caches
             .lock()
             .expect("the server-cache registry is never poisoned");
         if let Some(existing) = registry.get(&dir) {
-            return Ok(existing.clone());
+            return Ok(Some(existing.clone()));
+        }
+        if when == OpenWhen::FileExists && !dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists() {
+            return Ok(None);
         }
         let identity = CacheIdentity {
             server: server.to_string(),
@@ -144,7 +188,7 @@ impl Core {
         }
         let cache = std::sync::Arc::new(cache);
         registry.insert(dir, cache.clone());
-        Ok(cache)
+        Ok(Some(cache))
     }
 
     /// 關掉這個 server dir 的 `cache.db` 寫入者與讀連線，並從註冊表拿掉。
@@ -166,7 +210,10 @@ impl Core {
     ///     Ok(true)    本來開著、現在關了
     ///     Ok(false)   本來就沒開
     ///     Err(Io)     還有別的請求拿著它 —— 🚫 不從它們底下抽掉，登出重試一次就好（清理是冪等的）
-    pub(crate) fn close_server_cache(&self, server_dir: &std::path::Path) -> Result<bool, CoreError> {
+    pub(crate) fn close_server_cache(
+        &self,
+        server_dir: &std::path::Path,
+    ) -> Result<bool, CoreError> {
         let mut registry = self
             .server_caches
             .lock()
@@ -196,6 +243,37 @@ impl Core {
             self.vault()?.media_store_key(),
         )?)
     }
+}
+
+/// [`Core::open_server_cache`] 什麼時候才開。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenWhen {
+    /// 沒有就建（一般的讀寫路徑）。
+    Always,
+    /// `cache.db` 在才開。
+    FileExists,
+}
+
+/// 每個 server dir 上 [`Core::cache_of`] 開過幾次**繞過唯一寫入者**的連線。
+///
+/// 🚨 daemon 裡一台 server 只准一個寫入者（`ServerCache`，#32）；會刪東西的路徑（`destroy_account`）
+/// 🚫 不准走這條。按目錄計數，理由跟 `server_cache::WRITERS_STARTED` 一樣：並行的測試不會互相抬高。
+/// 📎 只在測試編譯：正式 build 不付每次開庫加鎖的成本（PR #40 審查 cirno🟡2）。
+#[cfg(test)]
+static RAW_CACHE_OPENS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Return:
+///     usize  這個 server dir 上 `cache_of` 開過的次數；0 = 從來沒有
+#[cfg(test)]
+pub(crate) fn get_raw_cache_opens_for(server_dir: &std::path::Path) -> usize {
+    RAW_CACHE_OPENS
+        .lock()
+        .expect("the raw-open counter is never poisoned")
+        .get(server_dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -264,7 +342,10 @@ mod tests {
             "🚨 close 回來時，queue 裡排著的那件要已經寫完"
         );
         assert!(!is_registered(&core, &server_dir), "關完註冊表裡沒有它");
-        assert!(!core.close_server_cache(&server_dir).unwrap(), "再關一次：本來就沒開");
+        assert!(
+            !core.close_server_cache(&server_dir).unwrap(),
+            "再關一次：本來就沒開"
+        );
 
         // queue 裡那件在關之前寫完了：重新開一份讀得到。
         let reopened = core.server_cache_of(&account, SERVER).unwrap();
@@ -299,7 +380,10 @@ mod tests {
             .await
             .expect("最後一個帳號登出要成功");
 
-        assert!(!is_registered(&core, &server_dir), "🚨 註冊表不准留著已刪的檔");
+        assert!(
+            !is_registered(&core, &server_dir),
+            "🚨 註冊表不准留著已刪的檔"
+        );
         assert!(
             !server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists(),
             "cache.db 要真的刪掉"
