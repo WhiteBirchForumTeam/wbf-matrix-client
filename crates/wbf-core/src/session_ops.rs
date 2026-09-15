@@ -213,16 +213,23 @@ impl Core {
         // 🚨 **先關、再刪**：註冊表可能還握著這台 server 的 cache.db（登出時已經關過就是 no-op）。
         // 關不掉就在這裡停：什麼都還沒刪。
         self.close_server_cache(&server_dir)?;
-        let account_dir_removed = remove_server_dir_with_the_account_last(
+        let removal = remove_server_dir_with_the_account_last(
             &server_dir,
             &account.dir,
             &mut remove_path_if_present,
+            &mut |dir| std::fs::remove_dir(dir),
         )?;
-        self.events.progress(format!(
-            "removed {} (no account on this server is left)",
-            server_dir.display()
-        ));
-        Ok((account_dir_removed, true))
+        match &removal.left_behind {
+            None if removal.server_dir_removed => self.events.progress(format!(
+                "removed {} (no account on this server is left)",
+                server_dir.display()
+            )),
+            None => {}
+            Some(left_behind) => self.events.progress(format!(
+                "the account is gone, but {left_behind}; nothing but empty directories is left there"
+            )),
+        }
+        Ok((removal.account_dir_removed, removal.server_dir_removed))
     }
 
     /// 這個帳號在哪個 server：`--server` 覆蓋優先，否則問它封著的 session。
@@ -453,27 +460,49 @@ fn remove_path_if_present(path: &std::path::Path) -> Result<bool, CoreError> {
     }
 }
 
-/// 整個 server 目錄，**帳號目錄最後**（PR #40 審查 rumia🔴）：先刪 `a/` 以外的東西（`cache.db`、媒體池…），
-/// 再刪帳號目錄，最後才收掉已經空了的 `a/` 與 server 目錄本身。
+/// [`remove_server_dir_with_the_account_last`] 的結果。
+struct ServerDirRemoval {
+    account_dir_removed: bool,
+    server_dir_removed: bool,
+    /// 帳號目錄已經刪掉之後、收空目錄時沒收掉的那一個（給人看的一句話）；None ＝ 沒有。
+    left_behind: Option<String>,
+}
+
+/// 整個 server 目錄，**帳號目錄最後**（PR #40 審查 rumia🔴×2）。
 ///
-/// 🚫 `a/` 與 server 目錄用 `remove_dir`（只刪空目錄）：這中間要是有人建了新帳號，🚫 不連它一起刪。
+/// ⭐ 保證的是：**回 `Err` ⇒ 帳號目錄還在**，所以重跑 destroy 找得到它、能接著清。為了讓這句話成立：
+///
+/// 1. 先刪 `a/` 以外的東西（`cache.db`、媒體池…）—— 失敗就回 Err，帳號沒動。
+/// 2. **再看一次** `a/` 底下是不是只剩這個帳號：中途有人建了新帳號，就只刪這個帳號的目錄、🚫 不收 server 目錄。
+/// 3. 刪帳號目錄 —— 失敗就回 Err（`remove_dir_all` 最後一步才刪目錄本身，所以失敗時目錄還在）。
+/// 4. 收掉已經空了的 `a/` 與 server 目錄：🚫 **不回 Err**。這時帳號已經不在，回 Err 等於告訴呼叫端「重跑」，
+///    但重跑找不到它；而且留下的只可能是空目錄（或第 2 步之後才冒出來的新帳號，`remove_dir` 不會碰它）。
+///    所以只記在 `left_behind`。
 ///
 /// Args:
 ///     server_dir: example: "<data dir>/s/<b58>_<b58>"
 ///     account_dir: 必須是 `server_dir/a/` 底下的那個帳號（呼叫端已經驗過形狀）
-///     remove: 刪一個路徑；測試用它在指定的一步失敗
+///     remove: 刪一個路徑（目錄就整棵）；測試用它在指定的一步失敗或插入一個新帳號
+///     remove_empty_dir: 只刪空目錄；測試用它模擬收尾失敗
 /// Return:
-///     Ok(bool)  帳號目錄刪了沒（本來就不在是 false）
-///     Err(Io)   某一步刪不掉；⭐ 失敗在帳號目錄之前的話，帳號目錄還在
+///     Ok(ServerDirRemoval)
+///     Err(Io)  第 1 或第 3 步刪不掉；帳號目錄還在
 fn remove_server_dir_with_the_account_last(
     server_dir: &std::path::Path,
     account_dir: &std::path::Path,
     remove: &mut dyn FnMut(&std::path::Path) -> Result<bool, CoreError>,
-) -> Result<bool, CoreError> {
+    remove_empty_dir: &mut dyn FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> Result<ServerDirRemoval, CoreError> {
     let accounts_dir = server_dir.join(accounts::ACCOUNTS_DIR_NAME);
     let entries = match std::fs::read_dir(server_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ServerDirRemoval {
+                account_dir_removed: false,
+                server_dir_removed: false,
+                left_behind: None,
+            })
+        }
         Err(error) => return Err(remove_error(server_dir, error)),
     };
     let mut others = Vec::new();
@@ -486,15 +515,35 @@ fn remove_server_dir_with_the_account_last(
     for other in &others {
         remove(other)?;
     }
+    if has_another_account_entry(&accounts_dir, account_dir) {
+        return Ok(ServerDirRemoval {
+            account_dir_removed: remove(account_dir)?,
+            server_dir_removed: false,
+            left_behind: None,
+        });
+    }
     let account_dir_removed = remove(account_dir)?;
     for empty_dir in [accounts_dir.as_path(), server_dir] {
-        match std::fs::remove_dir(empty_dir) {
+        match remove_empty_dir(empty_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(remove_error(empty_dir, error)),
+            Err(error) => {
+                return Ok(ServerDirRemoval {
+                    account_dir_removed,
+                    server_dir_removed: false,
+                    left_behind: Some(format!(
+                        "{} could not be removed: {error}",
+                        empty_dir.display()
+                    )),
+                })
+            }
         }
     }
-    Ok(account_dir_removed)
+    Ok(ServerDirRemoval {
+        account_dir_removed,
+        server_dir_removed: true,
+        left_behind: None,
+    })
 }
 
 fn remove_error(path: &std::path::Path, error: std::io::Error) -> CoreError {
@@ -633,12 +682,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚨 **帳號目錄最後才刪**（PR #40 審查 rumia🔴）：server 目錄裡別的東西刪不掉時，帳號目錄還在，
-    /// 所以重跑 destroy 找得到它、能接著清。
-    #[test]
-    fn a_failure_while_removing_the_server_dir_leaves_the_account_dir_for_a_retry() {
+    fn server_dir_fixture(
+        name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let root =
-            std::env::temp_dir().join(format!("wbf-core-destroy-order-{}", std::process::id()));
+            std::env::temp_dir().join(format!("wbf-core-destroy-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let server_dir = root.join("s").join("srv");
         let account_dir = server_dir.join("a").join("acct");
@@ -646,9 +694,20 @@ mod tests {
         std::fs::create_dir_all(server_dir.join("media")).unwrap();
         std::fs::write(server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME), b"db").unwrap();
         std::fs::write(server_dir.join("media").join("pool"), b"bytes").unwrap();
+        (root, server_dir, account_dir)
+    }
 
+    fn is_cache_db(path: &std::path::Path) -> bool {
+        path.file_name() == Some(std::ffi::OsStr::new(wbf_sdk::cache::CACHE_FILE_NAME))
+    }
+
+    /// 🚨 **回 Err ⇒ 帳號目錄還在**（PR #40 審查 rumia🔴）：server 目錄裡別的東西刪不掉時，帳號目錄沒動，
+    /// 所以重跑 destroy 找得到它、能接著清。
+    #[test]
+    fn a_failure_before_the_account_dir_is_removed_leaves_it_for_a_retry() {
+        let (root, server_dir, account_dir) = server_dir_fixture("order");
         let mut fail_on_cache_db = |path: &std::path::Path| {
-            if path.file_name() == Some(std::ffi::OsStr::new(wbf_sdk::cache::CACHE_FILE_NAME)) {
+            if is_cache_db(path) {
                 Err(CoreError::new(
                     CoreErrorKind::Io,
                     "simulated: cache.db is busy",
@@ -661,22 +720,81 @@ mod tests {
             &server_dir,
             &account_dir,
             &mut fail_on_cache_db,
+            &mut |dir| std::fs::remove_dir(dir),
         )
-        .unwrap_err();
+        .err()
+        .expect("刪不掉 cache.db 要回 Err");
         assert_eq!(error.kind, CoreErrorKind::Io);
         assert!(
             account_dir.exists(),
             "🚨 帳號目錄還在：重跑 destroy 找得到它"
         );
 
-        let removed = remove_server_dir_with_the_account_last(
+        let removal = remove_server_dir_with_the_account_last(
             &server_dir,
             &account_dir,
             &mut remove_path_if_present,
+            &mut |dir| std::fs::remove_dir(dir),
         )
         .unwrap();
-        assert!(removed);
+        assert!(removal.account_dir_removed && removal.server_dir_removed);
         assert!(!server_dir.exists(), "重跑之後整個清掉");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 🚨 帳號目錄**刪掉之後**的收尾失敗 🚫 不回 Err（PR #40 審查 rumia🔴 第二輪）：回 Err 等於叫呼叫端重跑，
+    /// 但重跑已經找不到帳號。留下的只有空目錄，記在 `left_behind`。
+    #[test]
+    fn a_failure_after_the_account_dir_is_gone_is_reported_but_not_an_error() {
+        let (root, server_dir, account_dir) = server_dir_fixture("tail");
+        let removal = remove_server_dir_with_the_account_last(
+            &server_dir,
+            &account_dir,
+            &mut remove_path_if_present,
+            &mut |_| Err(std::io::Error::other("simulated: permission denied")),
+        )
+        .expect("帳號目錄已經刪掉了，收尾失敗不能回 Err");
+        assert!(removal.account_dir_removed);
+        assert!(!removal.server_dir_removed);
+        assert!(removal.left_behind.is_some());
+        assert!(!account_dir.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&server_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![std::ffi::OsString::from("a")],
+            "只剩空的 a/"
+        );
+        assert_eq!(std::fs::read_dir(server_dir.join("a")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 🚨 清到一半有人建了新帳號（PR #40 審查 rumia🟡）：只刪這個帳號的目錄，🚫 不收 server 目錄、不碰新帳號。
+    #[test]
+    fn an_account_created_during_cleanup_is_left_alone() {
+        let (root, server_dir, account_dir) = server_dir_fixture("race");
+        let newcomer = server_dir.join("a").join("newcomer");
+        let newcomer_to_create = newcomer.clone();
+        let mut create_a_newcomer_while_removing = |path: &std::path::Path| {
+            if is_cache_db(path) {
+                std::fs::create_dir_all(&newcomer_to_create).unwrap();
+            }
+            remove_path_if_present(path)
+        };
+        let removal = remove_server_dir_with_the_account_last(
+            &server_dir,
+            &account_dir,
+            &mut create_a_newcomer_while_removing,
+            &mut |dir| std::fs::remove_dir(dir),
+        )
+        .unwrap();
+        assert!(removal.account_dir_removed);
+        assert!(!removal.server_dir_removed);
+        assert!(!account_dir.exists());
+        assert!(newcomer.exists(), "🚫 不碰中途新建的帳號");
         let _ = std::fs::remove_dir_all(&root);
     }
 
