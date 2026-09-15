@@ -31,6 +31,20 @@ pub const ACCOUNT_LOCK_FILE_NAME: &str = "account.lock";
 /// （`ServerPendingRemoval`），🚫 core 不自己收拾，由使用者手動刪那個目錄。
 pub const SERVER_LOCK_FILE_NAME: &str = "server.lock";
 
+/// 收掉 `server.lock` 之前，server 目錄先改名成 `<原名>_to_be_delete`（維護者 2026-09-15）。
+///
+/// 改名之後原本的 `s/<b58>` 就不存在了：之後登入這台 server 建的是全新的目錄，🚫 不會被上一次沒刪完的東西擋住；
+/// 而留下來的 `*_to_be_delete` 一看就知道是垃圾。掃描資料目錄時一律跳過它（`accounts::refresh_data_dir_map`）。
+/// 📎 真的目錄名是 `<base58>_<base58>`，正好一個 `_`（base58 沒有 `_`）；帶這個後綴的名字至少有三個，
+/// 所以不會跟真的 server 目錄撞名。
+pub const TO_BE_DELETED_SUFFIX: &str = "_to_be_delete";
+
+/// Return:
+///     bool  這個 `s/` 底下的名字是不是「等著被刪」的舊 server 目錄
+pub fn is_to_be_deleted_dir_name(dir_name: &str) -> bool {
+    dir_name.ends_with(TO_BE_DELETED_SUFFIX)
+}
+
 /// 拿到的鎖。⚠️ **活著就是鎖著**：呼叫端要把它拿到操作結束，🚫 不要 `let _ = lock_account_lifecycle(...)`。
 #[derive(Debug)]
 pub(crate) struct AccountLifecycleLock {

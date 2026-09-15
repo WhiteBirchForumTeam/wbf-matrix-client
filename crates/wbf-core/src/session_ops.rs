@@ -483,8 +483,11 @@ struct ServerDirRemoval {
 /// 2. **再看一次** `a/` 底下是不是只剩這個帳號：有別的，就只刪這個帳號的目錄、收回 `server.lock`、🚫 不收 server 目錄。
 ///    📎 呼叫端握著 `account.lock`，正常流程裡不會有新帳號冒出來；這一步是防線，🚫 不是同步。
 /// 3. 刪帳號目錄 —— 失敗就回 Err（`remove_dir_all` 最後一步才刪目錄本身，所以失敗時目錄還在）。
-/// 4. 收尾：空的 `a/` → `server.lock` → 空的 server 目錄。🚫 **不回 Err**：這時帳號已經不在，回 Err 等於叫人重跑卻找不到它；
-///    只記在 `left_behind`。⭐ `server.lock` 排在 `a/` 之後：`a/` 收不掉（不該發生的狀態）時標記留著，登入照樣被擋。
+/// 4. 收尾：空的 `a/` → server 目錄**改名**成 `<原名>_to_be_delete` → 刪裡面的 `server.lock` → 刪那個空目錄。
+///    🚫 **不回 Err**：這時帳號已經不在，回 Err 等於叫人重跑卻找不到它；只記在 `left_behind`。
+///    ⭐ `server.lock` 排在 `a/` 與改名之後：改名前任何一步沒成，標記都還在原本的位置，登入照樣被擋；
+///    改名之後原本的路徑就沒了，登入建的是新目錄，而留下的 `*_to_be_delete` 掃描時一律跳過（維護者 2026-09-15）。
+///    改名的目標已經存在（上一次也停在這裡）就停下、🚫 不覆蓋，交給人手動收。
 ///
 /// Args:
 ///     server_dir: example: "<data dir>/s/<b58>_<b58>"
@@ -556,15 +559,34 @@ fn remove_server_dir_with_the_account_last(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Ok(incomplete(&accounts_dir, error)),
     }
-    match std::fs::remove_file(&server_lock) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Ok(incomplete(&server_lock, error)),
+    let mut renamed_name = server_dir.as_os_str().to_os_string();
+    renamed_name.push(crate::account_lock::TO_BE_DELETED_SUFFIX);
+    let renamed = std::path::PathBuf::from(renamed_name);
+    if renamed.exists() {
+        return Ok(incomplete(
+            server_dir,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is already there from an earlier removal",
+                    renamed.display()
+                ),
+            ),
+        ));
     }
-    match remove_empty_dir(server_dir) {
+    if let Err(error) = std::fs::rename(server_dir, &renamed) {
+        return Ok(incomplete(server_dir, error));
+    }
+    let renamed_lock = renamed.join(crate::account_lock::SERVER_LOCK_FILE_NAME);
+    match std::fs::remove_file(&renamed_lock) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Ok(incomplete(server_dir, error)),
+        Err(error) => return Ok(incomplete(&renamed_lock, error)),
+    }
+    match remove_empty_dir(&renamed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Ok(incomplete(&renamed, error)),
     }
     Ok(ServerDirRemoval {
         account_dir_removed,
@@ -829,6 +851,68 @@ mod tests {
         );
         assert!(removal.server_dir_removed);
         assert!(!server_dir.exists(), "刪完整個目錄，標記跟著消失");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⭐ 改名之後才出事：原本的路徑已經不在（登入不會被擋），留下的是 `*_to_be_delete`，掃描時跳過（維護者 2026-09-15）。
+    #[test]
+    fn a_failure_after_the_rename_leaves_only_a_to_be_deleted_dir() {
+        let (root, server_dir, account_dir) = server_dir_fixture("renamed");
+        let removal = remove_server_dir_with_the_account_last(
+            &server_dir,
+            &account_dir,
+            &mut remove_path_if_present,
+            &mut |dir| {
+                if dir
+                    .to_string_lossy()
+                    .ends_with(crate::account_lock::TO_BE_DELETED_SUFFIX)
+                {
+                    Err(std::io::Error::other("simulated: permission denied"))
+                } else {
+                    std::fs::remove_dir(dir)
+                }
+            },
+        )
+        .unwrap();
+        assert!(removal.account_dir_removed && !removal.server_dir_removed);
+        assert!(removal.left_behind.is_some());
+        assert!(
+            !server_dir.exists(),
+            "原本的路徑已經不在：登入這台 server 不會被 server.lock 擋住"
+        );
+        let renamed = root
+            .join("s")
+            .join(format!("srv{}", crate::account_lock::TO_BE_DELETED_SUFFIX));
+        assert!(renamed.exists(), "留下的是一看就知道是垃圾的目錄");
+        assert!(
+            !renamed
+                .join(crate::account_lock::SERVER_LOCK_FILE_NAME)
+                .exists(),
+            "標記在改名之後才收"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 改名的目標已經在（上一次也停在這裡）：🚫 不覆蓋，停下；`server.lock` 留著、登入照樣被擋。
+    #[test]
+    fn an_earlier_to_be_deleted_dir_stops_the_rename_and_keeps_the_marker() {
+        let (root, server_dir, account_dir) = server_dir_fixture("rename-taken");
+        let earlier = root
+            .join("s")
+            .join(format!("srv{}", crate::account_lock::TO_BE_DELETED_SUFFIX));
+        std::fs::create_dir_all(earlier.join("leftover")).unwrap();
+        let removal = remove_server_dir_with_the_account_last(
+            &server_dir,
+            &account_dir,
+            &mut remove_path_if_present,
+            &mut |dir| std::fs::remove_dir(dir),
+        )
+        .unwrap();
+        assert!(removal.account_dir_removed && !removal.server_dir_removed);
+        assert!(server_dir
+            .join(crate::account_lock::SERVER_LOCK_FILE_NAME)
+            .exists());
+        assert!(earlier.join("leftover").exists(), "🚫 不碰上一次留下的東西");
         let _ = std::fs::remove_dir_all(&root);
     }
 
