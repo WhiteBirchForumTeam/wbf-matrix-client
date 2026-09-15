@@ -2,8 +2,8 @@
 //! 這裡的 RFC 8439 與 NIST GCM 兩條證明底下的 AEAD 呼叫是標準的那個。
 
 use wbf_sdk::chunk_crypto::{chunk_count, expected_plain_len, locate, MAX_CHUNK_INDEX};
-use wbf_sdk::error_code::WbfErrorCode;
 use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
+use wbf_sdk::error_code::WbfErrorCode;
 
 fn unhex(text: &str) -> Vec<u8> {
     hex::decode(text.replace([' ', '\n'], "")).expect("valid hex")
@@ -311,30 +311,11 @@ fn event_recent_and_batch_match_server_vectors() {
         vector.id,
         vector.seq,
     );
-    let meta_of =
-        |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
+    let meta_of = |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
+    assert_eq!(meta_of(&ours), meta_of(&vector), "recent_one_room_history meta");
     assert_eq!(
-        meta_of(&ours),
-        meta_of(&vector),
-        "recent_one_room_history meta"
-    );
-    assert_eq!(
-        (
-            ours.kind,
-            ours.subtype,
-            ours.flags,
-            ours.id,
-            ours.seq,
-            &ours.data
-        ),
-        (
-            vector.kind,
-            vector.subtype,
-            vector.flags,
-            vector.id,
-            vector.seq,
-            &vector.data
-        ),
+        (ours.kind, ours.subtype, ours.flags, ours.id, ours.seq, &ours.data),
+        (vector.kind, vector.subtype, vector.flags, vector.id, vector.seq, &vector.data),
         "recent_one_room_history 其他欄位逐一相等"
     );
 
@@ -405,10 +386,7 @@ fn event_recent_and_batch_match_server_vectors() {
         ("error_rate_limited", WbfErrorCode::RateLimited),
         ("error_out_of_order", WbfErrorCode::OutOfOrder),
         ("error_unsupported", WbfErrorCode::Unsupported),
-        (
-            "error_too_many_connections",
-            WbfErrorCode::TooManyConnections,
-        ),
+        ("error_too_many_connections", WbfErrorCode::TooManyConnections),
         ("error_invalid_request", WbfErrorCode::InvalidRequest),
     ] {
         let error = protocol::server_error(&pack_named(name).meta);
@@ -435,11 +413,7 @@ fn event_recent_and_batch_match_server_vectors() {
             panic!("{error:?}")
         };
         assert_eq!(*code_id, None, "{}", String::from_utf8_lossy(meta));
-        assert_eq!(
-            error.to_string(),
-            "server Corrupt: m",
-            "log 不准印出假的序號"
-        );
+        assert_eq!(error.to_string(), "server Corrupt: m", "log 不准印出假的序號");
     }
     match protocol::server_error(&pack_named("error_too_many_connections").meta) {
         SdkError::Server { code, meta, .. } => {
