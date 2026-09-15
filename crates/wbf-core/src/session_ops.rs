@@ -795,6 +795,9 @@ mod tests {
         assert!(!removal.server_dir_removed);
         assert!(!account_dir.exists());
         assert!(newcomer.exists(), "🚫 不碰中途新建的帳號");
+        // ⭐ 刪帳號目錄之前那次再檢查看到了它：這是正常結果，🚫 不是「收不掉」的警告。
+        // （沒有那次檢查也不會刪到新帳號 —— `remove_dir` 會拒絕非空的 a/ —— 但會變成 left_behind。）
+        assert!(removal.left_behind.is_none(), "{:?}", removal.left_behind);
         let _ = std::fs::remove_dir_all(&root);
     }
 
