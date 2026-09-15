@@ -78,7 +78,7 @@ impl Core {
         // 🚨 這台 server 的目錄正在（或上次刪到一半停在）被刪：🚫 不准在上面建東西（維護者 2026-09-15）。
         let server_lock = account
             .server_dir()
-            .join(crate::account_lock::SERVER_LOCK_FILE_NAME);
+            .join(crate::account_lock::TO_BE_DELETED_LOCK_FILE_NAME);
         if server_lock.exists() {
             return Err(CoreError::new(
                 CoreErrorKind::ServerPendingRemoval,

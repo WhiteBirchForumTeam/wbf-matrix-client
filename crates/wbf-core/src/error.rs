@@ -43,7 +43,7 @@ pub enum CoreErrorKind {
     NotLoggedIn,
     /// 另一個登入／登出／摧毀正在進行（`account.lock` 被握著）。前端可以稍後再試，🚫 core 不排隊。
     AccountBusy,
-    /// 這台 server 的目錄正在被刪（`s/<b58>/server.lock` 在）：登入這台 server 一律拒絕。
+    /// 這台 server 的目錄正在被刪（`s/<b58>/to_be_deleted.lock` 在）：登入這台 server 一律拒絕。
     /// 🚫 core 不自己收拾（維護者 2026-09-15）：訊息說出要手動刪的目錄。
     ServerPendingRemoval,
     /// 這台機器沒保管這個帳號的 recovery key（`key-backup restore` 要它）。

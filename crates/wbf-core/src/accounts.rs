@@ -896,7 +896,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// destroy 改名後沒刪完的 `*_to_be_delete`：🚫 不當 server、🚫 不觸發「local.key 換過了」的提示。
+    /// destroy 改名後沒刪完的 `🗑️…`：🚫 不當 server、🚫 不觸發「local.key 換過了」的提示。
     #[test]
     fn to_be_deleted_server_dirs_are_skipped_by_the_scan() {
         let dir = std::env::temp_dir().join(format!(
@@ -907,8 +907,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let vault = Vault::create(&dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
         let leftover = dir.join(SERVERS_DIR_NAME).join(format!(
-            "anything{}",
-            crate::account_lock::TO_BE_DELETED_SUFFIX
+            "{}anything",
+            crate::account_lock::TO_BE_DELETED_PREFIX
         ));
         std::fs::create_dir_all(leftover.join(ACCOUNTS_DIR_NAME)).unwrap();
         let map = refresh_data_dir_map(&dir, &vault).unwrap();

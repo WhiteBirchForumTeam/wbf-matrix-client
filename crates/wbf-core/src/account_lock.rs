@@ -24,25 +24,34 @@ use crate::error::{CoreError, CoreErrorKind};
 
 pub const ACCOUNT_LOCK_FILE_NAME: &str = "account.lock";
 
-/// `s/<b58>/server.lock`：**這個 server 目錄正在被刪**（維護者 2026-09-15）。
+/// `s/<b58>/to_be_deleted.lock`：**這個 server 目錄正在被刪**（維護者 2026-09-15）。
 ///
 /// 跟 `account.lock` 不一樣，它是**磁碟上的標記**、🚫 不是 OS 鎖：程序當掉它也還在。
 /// destroy 最後一個帳號時第一步放下、整個目錄刪完才消失；它還在，登入這台 server 就一律拒絕
 /// （`ServerPendingRemoval`），🚫 core 不自己收拾，由使用者手動刪那個目錄。
-pub const SERVER_LOCK_FILE_NAME: &str = "server.lock";
+pub const TO_BE_DELETED_LOCK_FILE_NAME: &str = "to_be_deleted.lock";
 
-/// 收掉 `server.lock` 之前，server 目錄先改名成 `<原名>_to_be_delete`（維護者 2026-09-15）。
+/// 收掉 `to_be_deleted.lock` 之前，server 目錄先改名、**名字最前面加上 🗑️**：`s/🗑️<b58>_<b58>`（維護者 2026-09-15）。
 ///
-/// 改名之後原本的 `s/<b58>` 就不存在了：之後登入這台 server 建的是全新的目錄，🚫 不會被上一次沒刪完的東西擋住；
-/// 而留下來的 `*_to_be_delete` 一看就知道是垃圾。掃描資料目錄時一律跳過它（`accounts::refresh_data_dir_map`）。
-/// 📎 真的目錄名是 `<base58>_<base58>`，正好一個 `_`（base58 沒有 `_`）；帶這個後綴的名字至少有三個，
-/// 所以不會跟真的 server 目錄撞名。
-pub const TO_BE_DELETED_SUFFIX: &str = "_to_be_delete";
+/// 改名之後原本的 `s/<b58>_<b58>` 就不存在了：之後登入這台 server 建的是全新的目錄，🚫 不會被上一次沒刪完的東西擋住；
+/// 而留下來的 `🗑️…` 一看就知道是垃圾。掃描資料目錄時一律跳過它（`accounts::refresh_data_dir_map`）。
+/// 📎 真的目錄名只有 base58 字元與一個 `_`，永遠不會以 🗑️ 開頭，所以不會跟真的 server 目錄撞名。
+pub const TO_BE_DELETED_PREFIX: &str = "🗑️";
 
 /// Return:
 ///     bool  這個 `s/` 底下的名字是不是「等著被刪」的舊 server 目錄
 pub fn is_to_be_deleted_dir_name(dir_name: &str) -> bool {
-    dir_name.ends_with(TO_BE_DELETED_SUFFIX)
+    dir_name.starts_with(TO_BE_DELETED_PREFIX)
+}
+
+/// Args:
+///     server_dir: example: "<data dir>/s/<b58>_<b58>"
+/// Return:
+///     Some(PathBuf)  同一層、名字前面加 🗑️, example: "<data dir>/s/🗑️<b58>_<b58>"
+///     None           路徑沒有最後一段名字（呼叫端當成改名失敗）
+pub fn to_to_be_deleted_dir(server_dir: &Path) -> Option<std::path::PathBuf> {
+    let name = server_dir.file_name()?.to_str()?;
+    Some(server_dir.with_file_name(format!("{TO_BE_DELETED_PREFIX}{name}")))
 }
 
 /// 拿到的鎖。⚠️ **活著就是鎖著**：呼叫端要把它拿到操作結束，🚫 不要 `let _ = lock_account_lifecycle(...)`。
