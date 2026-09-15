@@ -60,6 +60,8 @@ impl Core {
         accept_history_loss: bool,
         server_backup: bool,
     ) -> Result<LogoutResult, CoreError> {
+        // 🚨 全程握著帳號生命週期鎖（`account_lock`）：登入正在建同一個目錄時不准刪。
+        let _lifecycle = crate::account_lock::lock_account_lifecycle(&self.data_dir)?;
         let account = self.find_account_by_full_mxid(user, server)?;
         let user = self
             .log_out_account(&account, accept_history_loss, server_backup)
@@ -90,6 +92,9 @@ impl Core {
         accept_history_loss: bool,
         server_backup: bool,
     ) -> Result<DestroyResult, CoreError> {
+        // 🚨 **全程**握著帳號生命週期鎖（`account_lock`，PR #40 審查 rumia🔴 第三輪、維護者 2026-09-15）：
+        // 這期間登入被拒，所以「最後一個帳號」的判斷到刪完都成立 —— 🚫 不靠「再掃一次目錄」當同步。
+        let _lifecycle = crate::account_lock::lock_account_lifecycle(&self.data_dir)?;
         // 維護者 2026-09-10：會刪檔的命令，路徑**當場刷新一次**再比對——帳號目錄與
         // recovery key 都從同一份快照來，中間不再掃第二次（掃兩次就有兩個不同時刻的答案）。
         let map = self.refresh_data_dir_map()?;
@@ -226,7 +231,7 @@ impl Core {
             )),
             None => {}
             Some(left_behind) => self.events.progress(format!(
-                "the account is gone, but {left_behind}; nothing but empty directories is left there"
+                "the account is gone, but the cleanup was incomplete: {left_behind}"
             )),
         }
         Ok((removal.account_dir_removed, removal.server_dir_removed))
@@ -472,12 +477,14 @@ struct ServerDirRemoval {
 ///
 /// ⭐ 保證的是：**回 `Err` ⇒ 帳號目錄還在**，所以重跑 destroy 找得到它、能接著清。為了讓這句話成立：
 ///
-/// 1. 先刪 `a/` 以外的東西（`cache.db`、媒體池…）—— 失敗就回 Err，帳號沒動。
-/// 2. **再看一次** `a/` 底下是不是只剩這個帳號：中途有人建了新帳號，就只刪這個帳號的目錄、🚫 不收 server 目錄。
+/// 0. 放下 `server.lock`（維護者 2026-09-15）：從這一刻起到整個目錄刪完，登入這台 server 一律被拒 ——
+///    程序中途當掉也一樣。放不下就回 Err，什麼都沒刪。
+/// 1. 刪 `a/` 與 `server.lock` 以外的東西（`cache.db`、媒體池…）—— 失敗就回 Err，帳號沒動。
+/// 2. **再看一次** `a/` 底下是不是只剩這個帳號：有別的，就只刪這個帳號的目錄、收回 `server.lock`、🚫 不收 server 目錄。
+///    📎 呼叫端握著 `account.lock`，正常流程裡不會有新帳號冒出來；這一步是防線，🚫 不是同步。
 /// 3. 刪帳號目錄 —— 失敗就回 Err（`remove_dir_all` 最後一步才刪目錄本身，所以失敗時目錄還在）。
-/// 4. 收掉已經空了的 `a/` 與 server 目錄：🚫 **不回 Err**。這時帳號已經不在，回 Err 等於告訴呼叫端「重跑」，
-///    但重跑找不到它；而且留下的只可能是空目錄（或第 2 步之後才冒出來的新帳號，`remove_dir` 不會碰它）。
-///    所以只記在 `left_behind`。
+/// 4. 收尾：空的 `a/` → `server.lock` → 空的 server 目錄。🚫 **不回 Err**：這時帳號已經不在，回 Err 等於叫人重跑卻找不到它；
+///    只記在 `left_behind`。⭐ `server.lock` 排在 `a/` 之後：`a/` 收不掉（不該發生的狀態）時標記留著，登入照樣被擋。
 ///
 /// Args:
 ///     server_dir: example: "<data dir>/s/<b58>_<b58>"
@@ -486,7 +493,7 @@ struct ServerDirRemoval {
 ///     remove_empty_dir: 只刪空目錄；測試用它模擬收尾失敗
 /// Return:
 ///     Ok(ServerDirRemoval)
-///     Err(Io)  第 1 或第 3 步刪不掉；帳號目錄還在
+///     Err(Io)  第 0、1 或 3 步失敗；帳號目錄還在
 fn remove_server_dir_with_the_account_last(
     server_dir: &std::path::Path,
     account_dir: &std::path::Path,
@@ -494,21 +501,28 @@ fn remove_server_dir_with_the_account_last(
     remove_empty_dir: &mut dyn FnMut(&std::path::Path) -> std::io::Result<()>,
 ) -> Result<ServerDirRemoval, CoreError> {
     let accounts_dir = server_dir.join(accounts::ACCOUNTS_DIR_NAME);
-    let entries = match std::fs::read_dir(server_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ServerDirRemoval {
-                account_dir_removed: false,
-                server_dir_removed: false,
-                left_behind: None,
-            })
-        }
-        Err(error) => return Err(remove_error(server_dir, error)),
-    };
+    let server_lock = server_dir.join(crate::account_lock::SERVER_LOCK_FILE_NAME);
+    if !server_dir.exists() {
+        return Ok(ServerDirRemoval {
+            account_dir_removed: false,
+            server_dir_removed: false,
+            left_behind: None,
+        });
+    }
+    std::fs::write(&server_lock, b"").map_err(|error| {
+        CoreError::new(
+            CoreErrorKind::Io,
+            format!(
+                "could not mark {} for removal: {error}",
+                server_dir.display()
+            ),
+        )
+    })?;
+    let entries = std::fs::read_dir(server_dir).map_err(|error| remove_error(server_dir, error))?;
     let mut others = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| remove_error(server_dir, error))?;
-        if entry.path() != accounts_dir {
+        if entry.path() != accounts_dir && entry.path() != server_lock {
             others.push(entry.path());
         }
     }
@@ -516,28 +530,41 @@ fn remove_server_dir_with_the_account_last(
         remove(other)?;
     }
     if has_another_account_entry(&accounts_dir, account_dir) {
+        let account_dir_removed = remove(account_dir)?;
+        let left_behind = match std::fs::remove_file(&server_lock) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                "{} could not be removed: {error}",
+                server_lock.display()
+            )),
+        };
         return Ok(ServerDirRemoval {
-            account_dir_removed: remove(account_dir)?,
+            account_dir_removed,
             server_dir_removed: false,
-            left_behind: None,
+            left_behind,
         });
     }
     let account_dir_removed = remove(account_dir)?;
-    for empty_dir in [accounts_dir.as_path(), server_dir] {
-        match remove_empty_dir(empty_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Ok(ServerDirRemoval {
-                    account_dir_removed,
-                    server_dir_removed: false,
-                    left_behind: Some(format!(
-                        "{} could not be removed: {error}",
-                        empty_dir.display()
-                    )),
-                })
-            }
-        }
+    let incomplete = |path: &std::path::Path, error: std::io::Error| ServerDirRemoval {
+        account_dir_removed,
+        server_dir_removed: false,
+        left_behind: Some(format!("{} could not be removed: {error}", path.display())),
+    };
+    match remove_empty_dir(&accounts_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Ok(incomplete(&accounts_dir, error)),
+    }
+    match std::fs::remove_file(&server_lock) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Ok(incomplete(&server_lock, error)),
+    }
+    match remove_empty_dir(server_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Ok(incomplete(server_dir, error)),
     }
     Ok(ServerDirRemoval {
         account_dir_removed,
@@ -758,18 +785,81 @@ mod tests {
         assert!(!removal.server_dir_removed);
         assert!(removal.left_behind.is_some());
         assert!(!account_dir.exists());
-        let leftovers: Vec<_> = std::fs::read_dir(&server_dir)
+        let mut leftovers: Vec<_> = std::fs::read_dir(&server_dir)
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name())
             .collect();
+        leftovers.sort();
         assert_eq!(
             leftovers,
-            vec![std::ffi::OsString::from("a")],
-            "只剩空的 a/"
+            vec![
+                std::ffi::OsString::from("a"),
+                std::ffi::OsString::from("server.lock")
+            ],
+            "只剩空的 a/，而 🚨 server.lock 留著：登入照樣被擋"
         );
         assert_eq!(std::fs::read_dir(server_dir.join("a")).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 🚨 `server.lock` 從第一步就放下、**比帳號目錄晚**才收：刪帳號目錄的那一刻它一定在（維護者 2026-09-15）。
+    #[test]
+    fn the_server_lock_is_down_before_anything_is_removed_and_up_only_at_the_end() {
+        let (root, server_dir, account_dir) = server_dir_fixture("server-lock");
+        let server_lock = server_dir.join(crate::account_lock::SERVER_LOCK_FILE_NAME);
+        let lock_to_watch = server_lock.clone();
+        let mut removed_while_unmarked = Vec::new();
+        let mut watch_the_marker = |path: &std::path::Path| {
+            if !lock_to_watch.exists() {
+                removed_while_unmarked.push(path.to_path_buf());
+            }
+            remove_path_if_present(path)
+        };
+        let removal = remove_server_dir_with_the_account_last(
+            &server_dir,
+            &account_dir,
+            &mut watch_the_marker,
+            &mut |dir| std::fs::remove_dir(dir),
+        )
+        .unwrap();
+        assert!(
+            removed_while_unmarked.is_empty(),
+            "🚨 沒標記就刪了：{removed_while_unmarked:?}"
+        );
+        assert!(removal.server_dir_removed);
+        assert!(!server_dir.exists(), "刪完整個目錄，標記跟著消失");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 🚨 `server.lock` 在 → 登入這台 server 被拒，在碰目錄、連網路之前（維護者 2026-09-15）。
+    #[tokio::test]
+    async fn a_login_to_a_server_being_removed_is_refused() {
+        let (dir, core) = scratch_unlocked("pending-removal");
+        let server = "http://127.0.0.1:1";
+        let key = core.vault().unwrap().account_dir_key();
+        let account = AccountDir::locate(&dir, &key, server, "@alice:localhost").unwrap();
+        std::fs::create_dir_all(account.server_dir()).unwrap();
+        std::fs::write(
+            account
+                .server_dir()
+                .join(crate::account_lock::SERVER_LOCK_FILE_NAME),
+            b"",
+        )
+        .unwrap();
+
+        let error = core
+            .log_in(server, "@alice:localhost", "password", "test", false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind,
+            CoreErrorKind::ServerPendingRemoval,
+            "{}",
+            error.message
+        );
+        assert!(!account.dir.exists(), "🚫 沒建帳號目錄");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 🚨 清到一半有人建了新帳號（PR #40 審查 rumia🟡）：只刪這個帳號的目錄，🚫 不收 server 目錄、不碰新帳號。
@@ -840,6 +930,79 @@ mod tests {
             .is_none());
         assert!(!server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists());
         assert_eq!(crate::server_cache::get_writers_started_for(&server_dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 登入／登出正握著帳號生命週期鎖 → destroy **被拒、什麼都沒動**（PR #40 審查 rumia🔴 第三輪）。
+    #[tokio::test]
+    async fn a_destroy_is_refused_while_another_account_operation_holds_the_lock() {
+        let (dir, core) = scratch_unlocked("busy-destroy");
+        let alice = account_of(&core, &dir, "@alice:localhost");
+        seed_events(&core, &alice, "@alice:localhost", "$a");
+        let in_progress = crate::account_lock::lock_account_lifecycle(&dir).unwrap();
+
+        let error = core
+            .destroy_account("@alice:localhost", Some(SERVER), true, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::AccountBusy, "{}", error.message);
+        assert!(
+            alice.dir.exists()
+                && alice
+                    .server_dir()
+                    .join(wbf_sdk::cache::CACHE_FILE_NAME)
+                    .exists()
+        );
+        let still_there = core
+            .server_cache_of(&alice, SERVER)
+            .unwrap()
+            .read()
+            .await
+            .history("@alice:localhost", "!r", None, 10)
+            .unwrap();
+        assert_eq!(still_there.len(), 1, "🚫 忘掉鏈也沒跑");
+
+        drop(in_progress);
+        core.close_server_cache(&alice.server_dir()).unwrap();
+        core.destroy_account("@alice:localhost", Some(SERVER), true, false)
+            .await
+            .expect("放手之後 destroy 照常");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 destroy 正握著鎖 → 同時進來的**登入被拒**，而且在碰任何目錄、連任何網路之前就被拒。
+    #[tokio::test]
+    async fn a_login_is_refused_while_a_destroy_holds_the_lock() {
+        let (dir, core) = scratch_unlocked("busy-login");
+        let destroying = crate::account_lock::lock_account_lifecycle(&dir).unwrap();
+        // server 位址是一個不會有人聽的埠：真的去連就會變成 Network，而不是 AccountBusy。
+        let error = core
+            .log_in(
+                "http://127.0.0.1:1",
+                "@alice:localhost",
+                "password",
+                "test",
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::AccountBusy, "{}", error.message);
+        drop(destroying);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// logout 也拿同一把鎖。
+    #[tokio::test]
+    async fn a_logout_is_refused_while_the_lock_is_held() {
+        let (dir, core) = scratch_unlocked("busy-logout");
+        let _alice = account_of(&core, &dir, "@alice:localhost");
+        let held = crate::account_lock::lock_account_lifecycle(&dir).unwrap();
+        let error = core
+            .log_out("@alice:localhost", Some(SERVER), true, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::AccountBusy, "{}", error.message);
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

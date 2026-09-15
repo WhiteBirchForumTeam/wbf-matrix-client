@@ -376,8 +376,8 @@ fn exit_code(error: &CoreError) -> u8 {
     match error.kind {
         // 🚫 「還沒解鎖」「要 passphrase」這些都是用法問題，跟打錯字同一級。
         Usage | Io | Locked | NoKeyFile | NeedPassphrase | UnexpectedPassphrase
-        | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | NoRecoveryKeyHere
-        | HistoryWouldBeLost => 1,
+        | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | AccountBusy
+        | ServerPendingRemoval | NoRecoveryKeyHere | HistoryWouldBeLost => 1,
         Server => 2,
         Integrity => 3,
         Network => 4,

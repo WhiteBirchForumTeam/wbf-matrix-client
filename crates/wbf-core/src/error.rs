@@ -41,6 +41,11 @@ pub enum CoreErrorKind {
     AmbiguousAccount,
     /// 這個帳號沒登入（`session.sealed` 不在）。
     NotLoggedIn,
+    /// 另一個登入／登出／摧毀正在進行（`account.lock` 被握著）。前端可以稍後再試，🚫 core 不排隊。
+    AccountBusy,
+    /// 這台 server 的目錄正在被刪（`s/<b58>/server.lock` 在）：登入這台 server 一律拒絕。
+    /// 🚫 core 不自己收拾（維護者 2026-09-15）：訊息說出要手動刪的目錄。
+    ServerPendingRemoval,
     /// 這台機器沒保管這個帳號的 recovery key（`key-backup restore` 要它）。
     NoRecoveryKeyHere,
     /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（local-cache-db.md §10.7）。
@@ -79,6 +84,8 @@ impl CoreErrorKind {
             CoreErrorKind::NoSuchAccount => 1010,
             CoreErrorKind::AmbiguousAccount => 1011,
             CoreErrorKind::NotLoggedIn => 1012,
+            CoreErrorKind::AccountBusy => 1013,
+            CoreErrorKind::ServerPendingRemoval => 1014,
             CoreErrorKind::NoRecoveryKeyHere => 1020,
             CoreErrorKind::HistoryWouldBeLost => 1021,
             CoreErrorKind::Usage => 1100,
@@ -177,6 +184,8 @@ mod tests {
             (CoreErrorKind::NoSuchAccount, 1010),
             (CoreErrorKind::AmbiguousAccount, 1011),
             (CoreErrorKind::NotLoggedIn, 1012),
+            (CoreErrorKind::AccountBusy, 1013),
+            (CoreErrorKind::ServerPendingRemoval, 1014),
             (CoreErrorKind::NoRecoveryKeyHere, 1020),
             (CoreErrorKind::HistoryWouldBeLost, 1021),
             (CoreErrorKind::Usage, 1100),

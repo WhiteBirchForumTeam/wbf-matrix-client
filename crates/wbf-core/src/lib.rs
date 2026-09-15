@@ -36,6 +36,7 @@
 // ⚠️ 這兩個是**內部**：它們的型別（`DataDirMap`、`AccountDir`）帶著路徑與 `Vault`，
 // 跨不了 RPC 也綁不了 uniffi。公開面只走 `Core` 的方法與可序列化的 DTO
 //（PR #24 審查 cirno🔴）。
+mod account_lock;
 mod account_ops;
 mod accounts;
 mod backend_choice;
