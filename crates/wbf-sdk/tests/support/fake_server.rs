@@ -54,6 +54,10 @@ pub struct FakeServer {
     /// 故障：下一塊 `Upload/Chunk` 回這個 `Error`（`code` 名字、`code_id`），只觸發一次。
     /// ⚠️ 名字與序號**分開給**，才測得出 client 認的是哪一個（issue #29 第 2 項）。
     pub reject_next_chunk_with: Option<(&'static str, Option<u64>)>,
+    /// 走橋 `GetEvent`（`0x14/0x20`）查得到的事件（wbfuwunel #56）；照 `room_id`＋`event_id` 找。
+    pub bridged_events: Vec<serde_json::Value>,
+    /// 故障：走橋 `GetEvent` 回的是這一則，不管問的是哪一則（模擬回錯事件的 server）。
+    pub bridge_answers_with: Option<serde_json::Value>,
 }
 
 /// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
@@ -80,6 +84,9 @@ impl FakeServer {
     pub fn handle(&mut self, request: &Pack) -> Pack {
         self.requests
             .push((request.kind, request.subtype, request.seq));
+        if request.flags & flags::IS_BRIDGED != 0 {
+            return self.bridge(request);
+        }
         let result = match (request.kind, request.subtype) {
             (Kind::Event, wbf_wire::pack::event::RECENT) => Err((
                 "Unsupported",
@@ -158,6 +165,70 @@ impl FakeServer {
                     data: Vec::new(),
                 }
             }
+        }
+    }
+
+    /// 走橋（index.md §1.2）：成功 `Control/Ack`、失敗 `Control/Error`，**兩者都帶 bit4**；失敗的 meta 帶 Matrix 的 `status`／`errcode`。
+    fn bridge(&mut self, request: &Pack) -> Pack {
+        let response = |subtype: u8, meta: serde_json::Value, data: Vec<u8>| Pack {
+            kind: Kind::Control,
+            subtype,
+            flags: flags::IS_RESPONSE | flags::IS_BRIDGED,
+            id: request.id,
+            seq: request.seq,
+            meta: meta.to_string().into_bytes(),
+            data,
+        };
+        let not_found = |message: &str| {
+            response(
+                control::ERROR,
+                serde_json::json!({ "code": "NotFound", "code_id": code_id_of("NotFound"),
+                    "errcode": "M_NOT_FOUND", "message": message, "status": 404 }),
+                Vec::new(),
+            )
+        };
+        if (request.kind, request.subtype) != (Kind::Event, 0x20) {
+            return response(
+                control::ERROR,
+                serde_json::json!({ "code": "UnknownKind", "code_id": code_id_of("UnknownKind"),
+                    "message": "not on this fake bridge", "status": 400 }),
+                Vec::new(),
+            );
+        }
+        let variables: serde_json::Value =
+            serde_json::from_slice(&request.meta).unwrap_or_default();
+        let wanted = |key: &str| {
+            variables
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        let found = match &self.bridge_answers_with {
+            Some(answer) => Some(answer.clone()),
+            None => self
+                .bridged_events
+                .iter()
+                .find(|event| {
+                    event
+                        .get("room_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        == wanted("room_id")
+                        && event
+                            .get("event_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                            == wanted("event_id")
+                })
+                .cloned(),
+        };
+        match found {
+            Some(event) => response(
+                control::ACK,
+                serde_json::json!({ "headers": { "content-type": "application/json" }, "status": 200 }),
+                event.to_string().into_bytes(),
+            ),
+            None => not_found("Event not found."),
         }
     }
 

@@ -346,9 +346,22 @@ impl Core {
                         .wbf_room_page_of(account, room, limit, before_g_seq)
                         .await;
                 }
-                // ⚠️ wbf 要的是 `g_seq`，而它只在本地有。那則不在本地（`sync=server` 不寫庫，
-                // 所以它給的 `next` 本地查不到）→ 改走 `/context`：它只要 `event_id`。
-                Anchor::NotInLocalCache => {}
+                // ⚠️ wbf 要的是 `g_seq`，那則不在本地（`sync=server` 不寫庫，所以它給的 `next` 本地查不到）
+                // → 走橋問 server 那一則（wbfuwunel #56 的 `GetEvent`）：server 存的事件 `unsigned` 就帶 `g_seq`，
+                // 拿到了照樣接 `Recent`，🚫 不必為了一個翻頁位置開 matrix-sdk、再 sync 一次。
+                Anchor::NotInLocalCache => {
+                    if let Some(event_id) = before {
+                        if let Some(before_g_seq) = self
+                            .find_g_seq_over_the_bridge(account, room, event_id)
+                            .await?
+                        {
+                            return self
+                                .wbf_room_page_of(account, room, limit, Some(before_g_seq))
+                                .await;
+                        }
+                    }
+                    // 那則沒有 `g_seq`（這個 fork 開始編號之前的舊資料、outlier）→ 退回 `/context`：它只要 `event_id`。
+                }
             }
         }
         let backend = self.synced_backend_of(account, server_backup).await?;
@@ -379,6 +392,34 @@ impl Core {
             Some(g_seq) => Anchor::Found(Some(g_seq)),
             None => Anchor::NotInLocalCache,
         })
+    }
+
+    /// 走橋拿一則事件的 `g_seq`（`GET /rooms/{room_id}/event/{event_id}`，wbfuwunel #56）。
+    ///
+    /// ⚠️ server 說「不存在或看不到」（`NotFound`）就原樣往上報，🚫 不退回 `/context`：那條路問的是同一個 server、同一條可見性規則，
+    /// 退過去只會多一次同樣的拒絕，還得先開 matrix-sdk。
+    /// 📎 `get_event` 已經驗過回來的 `event_id`／`room_id` 就是問的那兩個。
+    ///
+    /// Args:
+    ///     room: example: "!abc:localhost"
+    ///     event_id: 翻頁的錨, example: "$old"
+    /// Return:
+    ///     Ok(Some(g_seq))  server 有這則、而且它帶著 `g_seq`
+    ///     Ok(None)         有這則，但沒有 `g_seq`（呼叫端退回 `/context`）
+    ///     Err(...)         看不到、連不上、形狀不對
+    async fn find_g_seq_over_the_bridge(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        event_id: &str,
+    ) -> Result<Option<i64>, CoreError> {
+        let mut client = self
+            .client_of(account, Transport::default(), MethodHome::BothSides)
+            .await?;
+        client.hello(HISTORY_CLIENT_NAME).await?;
+        let event = client.get_event(room, event_id).await?;
+        let (_r_seq, g_seq) = wbf_sdk::protocol::event_seqs(&event);
+        Ok(g_seq)
     }
 
     /// wbf 的一頁房間歷史：`Event/Recent{ rooms: [這個房], before }`（wbfuwunel #51）。
@@ -508,7 +549,7 @@ const HISTORY_CLIENT_NAME: &str = "wbf-client history";
 enum Anchor {
     /// 換到了；`None` ＝ 沒帶 `before`（最新的一頁）。
     Found(Option<i64>),
-    /// 這個帳號本地沒有那則，或它沒有 `g_seq` —— 呼叫端改走 `/context`。
+    /// 這個帳號本地沒有那則，或它沒有 `g_seq` —— 呼叫端先走橋問 server，問不到 `g_seq` 才改走 `/context`。
     NotInLocalCache,
 }
 

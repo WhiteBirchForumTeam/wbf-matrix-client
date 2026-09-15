@@ -1068,3 +1068,52 @@ async fn a_batch_without_more_is_taken_as_more_and_costs_one_extra_window() {
     assert!(summary.caught_up);
     assert_eq!(summary.new_cg_seq, Some(1003), "水位還是第一窗的 fs");
 }
+
+/// 走橋的 `GetEvent`（wbfuwunel #56）：拿得到那則、`unsigned` 的 `g_seq` 原樣在；請求帶 bit4。
+#[tokio::test]
+async fn get_event_over_the_bridge_returns_the_event_with_its_positions() {
+    let mut server = FakeServer::new();
+    server.bridged_events.push(serde_json::json!({
+        "type": "m.room.message", "event_id": "$e", "room_id": "!r:localhost", "sender": "@a:localhost",
+        "origin_server_ts": 1, "content": { "body": "hi" },
+        "unsigned": { "org.wbftw.wbfuwunel.r_seq": 3, "org.wbftw.wbfuwunel.g_seq": 4711 }
+    }));
+    let mut client = WbfClient::new(&mut server);
+    let event = client.get_event("!r:localhost", "$e").await.unwrap();
+    assert_eq!(wbf_sdk::protocol::event_seqs(&event), (Some(3), Some(4711)));
+    drop(client);
+    assert_eq!(server.requests.last().map(|request| (request.0, request.1)), Some((wbf_wire::Kind::Event, 0x20)));
+}
+
+/// 看不到的事件：Matrix 的 404 原樣變成 `Server`，帶 `status`／`errcode`。
+#[tokio::test]
+async fn get_event_over_the_bridge_reports_not_found_with_the_matrix_fields() {
+    let mut server = FakeServer::new();
+    let mut client = WbfClient::new(&mut server);
+    let error = client.get_event("!r:localhost", "$missing").await.unwrap_err();
+    assert_eq!(error.wbf_code(), Some(wbf_sdk::error_code::WbfErrorCode::NotFound));
+    assert_eq!(error.matrix_status(), Some(404));
+    assert_eq!(error.matrix_errcode(), Some("M_NOT_FOUND"));
+}
+
+/// 🚨 server 回的是另一則事件：`Protocol`，🚫 不把別則的位置當成這一則的。
+#[tokio::test]
+async fn get_event_over_the_bridge_refuses_another_event() {
+    let mut server = FakeServer::new();
+    server.bridge_answers_with = Some(serde_json::json!({
+        "type": "m.room.message", "event_id": "$other", "room_id": "!r:localhost", "sender": "@a:localhost",
+        "origin_server_ts": 1, "content": {}, "unsigned": { "org.wbftw.wbfuwunel.g_seq": 1 }
+    }));
+    let mut client = WbfClient::new(&mut server);
+    let error = client.get_event("!r:localhost", "$e").await.unwrap_err();
+    assert!(matches!(error, SdkError::Protocol(_)), "{error:?}");
+
+    let mut server = FakeServer::new();
+    server.bridge_answers_with = Some(serde_json::json!({
+        "type": "m.room.message", "event_id": "$e", "room_id": "!elsewhere:localhost", "sender": "@a:localhost",
+        "origin_server_ts": 1, "content": {}, "unsigned": { "org.wbftw.wbfuwunel.g_seq": 1 }
+    }));
+    let mut client = WbfClient::new(&mut server);
+    let error = client.get_event("!r:localhost", "$e").await.unwrap_err();
+    assert!(matches!(error, SdkError::Protocol(_)), "別的房間的同名事件也不算：{error:?}");
+}

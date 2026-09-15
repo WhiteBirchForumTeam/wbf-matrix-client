@@ -260,7 +260,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 /// | 步驟 | 走哪條 | 為什麼一定是它 |
 /// |---|---|---|
 /// | `sync=server` 第一頁 | wbf `Recent{rooms}` | 沒帶 `before`，而 server 講 wbf |
-/// | `sync=server` 第二頁 | **matrix `/context`** | `server` 不寫庫 → 錨點本地查不到 `g_seq` → 只能走 `/context` |
+/// | `sync=server` 第二頁 | **走橋 `GetEvent` 拿錨點的 `g_seq` → wbf `Recent{rooms, before}`** | `server` 不寫庫 → 錨點本地查不到 `g_seq` → 問 server（wbfuwunel #56）；那則沒有 `g_seq` 才退回 matrix `/context` |
 /// | `sync=both` 兩頁 | wbf `Recent{rooms, before: g_seq}` | 第一頁寫進去了，第二頁的錨點本地查得到 |
 /// | `sync=local` | 本地 | 驗 `both` 真的寫進去了，而且本地也能拿 `event_id` 接著翻 |
 ///
@@ -324,12 +324,12 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         (ids, next)
     }
 
-    // ── sync=server：第一頁走 wbf，第二頁因為沒寫庫、只能走 /context ──
+    // ── sync=server：第一頁走 wbf，第二頁沒寫庫 → 走橋拿錨點的 g_seq，再走 wbf ──
     let (first, next) = page(&mut client, &room, "server", None).await;
     assert_eq!(first, newest_first[0..3], "server 第一頁（wbf）");
     assert_eq!(next.as_deref(), Some(newest_first[2].as_str()), "next 是這頁最舊那則");
     let (second, _) = page(&mut client, &room, "server", next.as_deref()).await;
-    assert_eq!(second, newest_first[3..6], "server 第二頁（/context）要緊接著第一頁");
+    assert_eq!(second, newest_first[3..6], "server 第二頁（橋＋Recent）要緊接著第一頁");
 
     // ── sync=local：server 模式不寫庫，所以本地什麼都沒有 → 錨點不在本地要拒答 ──
     let reply = client

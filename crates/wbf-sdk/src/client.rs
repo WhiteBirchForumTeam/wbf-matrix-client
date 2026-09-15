@@ -147,6 +147,65 @@ impl<C: PackChannel> WbfClient<C> {
         }
     }
 
+    /// 走橋呼叫一支 Matrix 端點（wbfuwunel #56）。
+    ///
+    /// Args:
+    ///     endpoint: example: protocol::BRIDGE_GET_EVENT
+    ///     variables: 路徑與 query 變數，example: &GetEventVariables { room_id: "!r:x", event_id: "$e" }
+    ///     body: HTTP body 原樣；沒有就給空
+    /// Return:
+    ///     Ok(BridgeReply)   2xx
+    ///     Err(SdkError)     `Server`（帶 Matrix 的 `status`／`errcode`）、`Protocol`、`Network`
+    pub async fn call_bridge(
+        &mut self,
+        endpoint: protocol::BridgedEndpoint,
+        variables: &impl serde::Serialize,
+        body: Vec<u8>,
+    ) -> Result<protocol::BridgeReply, SdkError> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let request = protocol::bridge_request(endpoint, variables, body, seq);
+        let response = self.channel.request(request.clone()).await?;
+        protocol::expect_bridge_reply(&request, response)
+    }
+
+    /// 用 event id 拿單一則事件（走橋的 `GET /rooms/{room_id}/event/{event_id}`）。
+    ///
+    /// 🚨 消費端再驗一次：回來的事件的 `event_id` 與 `room_id` 必須就是問的那兩個，對不上是 `Protocol` ——
+    /// 🚫 不把另一則事件的位置當成這一則的。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    ///     event_id: example: "$e1"
+    /// Return:
+    ///     Ok(Value)        那則事件的 JSON（`unsigned` 帶 `r_seq`／`g_seq`，被收回的 `content` 是 `{}`）
+    ///     Err(Server)      不存在或看不到（`NotFound`，404）等
+    ///     Err(Protocol)    body 不是 JSON 物件，或 id 對不上
+    pub async fn get_event(
+        &mut self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<serde_json::Value, SdkError> {
+        let reply = self
+            .call_bridge(
+                protocol::BRIDGE_GET_EVENT,
+                &protocol::GetEventVariables { room_id, event_id },
+                Vec::new(),
+            )
+            .await?;
+        let event: serde_json::Value = serde_json::from_slice(&reply.body)
+            .map_err(|error| SdkError::Protocol(format!("GetEvent body is not JSON: {error}")))?;
+        let text = |key: &str| event.get(key).and_then(|value| value.as_str());
+        if text("event_id") != Some(event_id) || text("room_id") != Some(room_id) {
+            return Err(SdkError::Protocol(format!(
+                "GetEvent for {event_id} in {room_id} returned another event ({:?} in {:?})",
+                text("event_id"),
+                text("room_id")
+            )));
+        }
+        Ok(event)
+    }
+
     pub async fn ping(&mut self) -> Result<(), SdkError> {
         self.call(protocol::ping).await?;
         Ok(())
