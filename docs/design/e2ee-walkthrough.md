@@ -355,7 +355,7 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 | 3 | **只重查變了的人的裝置**；哪台裝置新了／沒了由狀態機自己比 | `OlmEngine::mark_users_changed(diff.changed)` → `send_outgoing_requests`（KeysQuery 走橋 `0x17 0x21`） | ✅ #48（真 server 驗過：A 靠它才看到 B）。上游 `OlmMachine` 對每台裝置逐台追蹤，回應進來自己算差 |
 | 4 | **自己驗雜湊**：查回來的金鑰照 §3.4 重算 ＝ 清單上那個人的雜湊 → 看到的是同一組 | `device_version::compute_device_keys_hash(user, keys_query 回應)` 對 `members[user].hash` | ✅ 函式與黃金向量 #46；❌ **還沒接進迴圈**（3b：查完對一次，對不上就再查，`unhashable` 跳過） |
 | 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | `OlmEngine::share_room_key(room, users, settings)`（缺 Olm session 先 claim，全走橋） | ✅ #48（真 server 驗過）。⚠️ `settings.sharing_strategy` 目前用上游預設，3b 要明確選（§13 第 8 條） |
-| 6 | **帶房間版本號送出**；對不上 1506 → 回到第 1 步（重試一次是 client 政策） | `SendRequest::room_version` ✅ #46；加密 `encrypt_room_event_raw` ＋ 1506 迴圈 | ❌ 3b |
+| 6 | **帶房間版本號送出**；對不上 1506 → **daemon 自動補齊金鑰、把錯誤原樣回給 UI 並發「可以送了」的狀態；重送由 UI 決定**（維護者 2026-09-21，§16.6） | `SendRequest::room_version` ✅ #46；加密 `encrypt_room_event_raw` ＋ 1506 迴圈 | ❌ 3b |
 | 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（訂閱 → 拉到追平 → 匯入 → 落地 → 銷毀）✅ #48；成員清單就是第 1 步 | ✅ 方法都在，**什麼時候叫由 UI 決定** |
 | 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；**收推播的迴圈** | ❌ 第 4 階段（通道還不能收非回應的 pack）。在那之前正確性完全由第 6 步的 1506 守——這跟 server 的設計一致：推播是加速，不是正確性來源 |
 | 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()` | ✅ #48（假 server ＋ 真 server）。房間事件的 `Event/Unsubscribe` 跟第 4 階段一起（現在沒訂房間事件） |
@@ -366,5 +366,35 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 第 6 步（送出＋1506 迴圈）與第 4 步（雜湊接進迴圈）是 3b；第 8、10 步（推播、Superseded）要第 4 階段的通道。**在推播做出來之前，這套邏輯已經是正確的，只是慢一拍**——
 被擋一次才知道要重查，而 server 的設計本來就把正確性放在 1506、不放在推播。
 
-🚫 兩個刻意沒做的：不在 SDK 裡替每房存「上次那份成員清單」（那是 UI／daemon 的狀態，跟「這輪金鑰發給誰」綁在一起，放 SDK 會變成第二份會漂移的名單）；
-不自動重試 1506（幾次是 client 政策，UI 決定）。
+🚫 一個刻意沒放在 wbf-sdk 裡的：「上次那份成員清單」不在 SDK 層存——它跟「這輪金鑰發給誰」綁在一起，是 daemon 的狀態（§16.6），放 SDK 會變成第二份會漂移的名單。
+
+### 16.6 誰呼叫：UI 與 daemon 的分界（維護者 2026-09-21 定）
+
+原則一句話：**訊息是 UI 的，金鑰是 daemon 的。** UI 決定什麼時候確認、什麼時候送、要不要重送；daemon 負責金鑰永遠補齊，補齊了就用 RPC 訊息告訴 UI。
+wbf-sdk 只提供方法，不在這兩者之間選邊。
+
+1506 其實是兩件事疊在一起，分開給：
+
+- **金鑰面**（daemon）：房間版本號過期 ＝ 現在的裝置集合裡有人沒拿到房間金鑰。修法是成員清單 → 比出誰變了 → 重查那個人 → 補發或輪換 → 更新 daemon 存的那份房間快照。
+  只有 daemon 做得到（OlmMachine 與 crypto store 在它手上），而且不管 UI 之後重不重送都該做——這是金鑰衛生，不是那則訊息的事。
+- **訊息面**（UI）：這則要不要再送、送幾次、畫面顯示傳送中還是失敗。daemon 🚫 不自動重送：使用者可能已經撤回或改了，daemon 不會知道；重試次數是每則訊息的政策，放 UI 才自然。
+
+| 動作 | 誰 | 什麼時候 | 內容 | 狀態 |
+|---|---|---|---|---|
+| 點進房間時確認「現在的人、裝置有沒有變」 | **UI** 叫 | 點進房間那一刻；重連、切回前景時對每個開著的房再叫 | daemon 的 `refresh_room_devices(room)` RPC：`room_device_versions` → 跟 daemon 存的上一份 `diff_from` → 有變就 `mark_users_changed` ＋ `send_outgoing_requests` ＋ `share_room_key` → 換掉快照 | ✅ 定案；RPC 還沒露 |
+| 送訊息 | **UI** 叫 | 使用者按下送出 | daemon 的 send RPC：`encrypt_room_event_raw` → `Event/Send` 帶 daemon 快照裡的 `room_version` | ✅ 定案；3b |
+| 送出被 1506 擋 | **daemon** 自動補金鑰，然後把錯誤**原樣**回給 UI | 每次收到 1506 | 跑一次 `refresh_room_devices`（同一支例行程序）→ 回 1506 給 UI（附 server 說的目前號碼）→ **補齊完再送一則 RPC 狀態訊息給 UI：這個房的版本已更新到 V、可以送了** | ✅ 定案；3b |
+| 重送 | **UI** 決定要不要、幾次 | 收到上面那則「可以送了」之後 | 再叫一次同一個 send RPC，**同一個 `txn_id`**（server 冪等：已收下的回原本的 `event_id`，不會送兩次） | ✅ 定案 |
+| 每房「上次那份成員清單」（發上一輪房間金鑰時依據的那份） | **daemon** 存 | 每次 refresh 拿到新的就換 | `RoomDeviceVersions`（可序列化待加） | 定案；落在哪（記憶體或 cache.db）待定 |
+| 上線：to-device 追平 | **daemon** 自動 | 連線建好、登入完 | `device_subscribe` → `pull_to_device` | ✅ 方法在；daemon 還沒接 |
+| 下線：退訂 | **daemon** 自動 | 登出、關連線前 | `device_unsubscribe` | ✅ 方法在 |
+| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | 第 4 階段 | ❌ 通道還不能收 |
+
+⭐ **一支例行程序、三個觸發點**：`refresh_room_devices(room)` 被 UI 點進房間叫、被 1506 叫、將來被 `DeviceChanged` 叫。內容一樣，只有「誰按下去」不同。
+
+**UI 收到 1506 之後的畫面流**：訊息標成失敗（或傳送中）→ 等 daemon 的「房間 V 可以送了」狀態訊息 → 決定重送（同 `txn_id`）→ 又被 1506 就再等一次；幾次之後放棄是 UI 的政策。
+daemon 補完到 UI 重送之間版本號還可能再變，那就再吃一次 1506，由 UI 的次數自然收斂，daemon 不幫忙。
+
+維護者原話（2026-09-21）：「發送訊息還是由 UI 做，daemon 不自動重試，被 server 擋的訊息原樣到 UI。……金鑰補齊由 daemon，補齊完應該要發 RPC msg 狀態到 UI，這樣 UI 才知道房間版本更新了可以 ready 送，重送是 client 的事。」更細的還沒定，表裡標「待定」的都是。
+
+⚠️ 這一節推翻了 §16.5 第 6 列括號裡那句「daemon 自動重試」——定案是 **daemon 補金鑰、UI 重送**。
