@@ -1082,3 +1082,122 @@ async fn a_batch_without_more_is_taken_as_more_and_costs_one_extra_window() {
     assert!(summary.caught_up);
     assert_eq!(summary.new_cg_seq, Some(1003), "水位還是第一窗的 fs");
 }
+
+// ---- 走橋：Members 拿房間版本號、發 to-device（#45 第 2 支）----
+
+fn joined_member(user_id: &str, device_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "m.room.member", "state_key": user_id, "sender": user_id, "origin_server_ts": 1,
+        "content": { "membership": "join" },
+        "unsigned": { "org.wbftw.device_version": device_version }
+    })
+}
+
+/// `room_device_versions`：走橋的 `Members` 帶 `membership=join`（bit4、`0x13/0x29`），回來的號碼與每個人的裝置版本號都讀得到。
+#[tokio::test]
+async fn room_device_versions_come_from_the_bridged_members_call() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["bridge"];
+    server.bridged_members = Some(serde_json::json!({
+        "chunk": [joined_member("@alice:localhost", "1-aaaaaaaaaa"), joined_member("@bob:localhost", "3-810b7c3be4")],
+        "org.wbftw.room_version": 81234
+    }));
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let versions = client.room_device_versions("!r:localhost").await.unwrap();
+    assert_eq!(versions.room_version, 81234);
+    assert_eq!(versions.members["@bob:localhost"].seq, 3);
+    assert_eq!(versions.members.len(), 2);
+    drop(client);
+    let last = server.requests.last().copied().unwrap();
+    assert_eq!((last.0, last.1), (wbf_wire::Kind::Room, 0x29));
+}
+
+/// 🚨 舊 server：成員清單沒有 `org.wbftw.room_version` → `Protocol`，🚫 不是一個 0 的房間版本號。
+#[tokio::test]
+async fn room_device_versions_refuse_a_members_response_without_the_number() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["bridge"];
+    server.bridged_members =
+        Some(serde_json::json!({ "chunk": [joined_member("@alice:localhost", "1-aaaaaaaaaa")] }));
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let error = client
+        .room_device_versions("!r:localhost")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Protocol(_)), "{error:?}");
+}
+
+/// 不在房裡：Matrix 的 403 原樣變成 `Server`，帶 `status`／`errcode`。
+#[tokio::test]
+async fn room_device_versions_report_forbidden_with_the_matrix_fields() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["bridge"];
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let error = client
+        .room_device_versions("!r:localhost")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.wbf_code(),
+        Some(wbf_sdk::error_code::WbfErrorCode::Forbidden)
+    );
+    assert_eq!(error.matrix_status(), Some(403));
+    assert_eq!(error.matrix_errcode(), Some("M_FORBIDDEN"));
+}
+
+/// 🚨 server 沒宣告 `bridge`（或還沒 hello）：一個橋的 pack 都不送（`Usage`）。
+#[tokio::test]
+async fn bridged_calls_need_the_bridge_feature() {
+    let mut server = FakeServer::new();
+    let mut client = WbfClient::new(&mut server);
+    let before_hello = client
+        .room_device_versions("!r:localhost")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(before_hello, SdkError::Usage(_)),
+        "{before_hello:?}"
+    );
+    client.hello("test", &[]).await.unwrap();
+    let not_advertised = client
+        .send_to_device("m.room.encrypted", "t1", b"{}".to_vec())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(not_advertised, SdkError::Usage(_)),
+        "{not_advertised:?}"
+    );
+    drop(client);
+    assert!(
+        server
+            .requests
+            .iter()
+            .all(|request| request.0 == wbf_wire::Kind::Control),
+        "只送過 Hello，橋的 pack 一個都沒送：{:?}",
+        server.requests
+    );
+}
+
+/// `send_to_device`：走橋的 `0x16/0x25`，變數是 `event_type`／`txn_id`、body 原樣。
+#[tokio::test]
+async fn send_to_device_goes_over_the_bridge_with_the_body_as_is() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["bridge"];
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let body =
+        br#"{"messages":{"@bob:localhost":{"DEV1":{"algorithm":"m.olm.v1.curve25519-aes-sha2"}}}}"#
+            .to_vec();
+    client
+        .send_to_device("m.room.encrypted", "txn-7", body.clone())
+        .await
+        .unwrap();
+    drop(client);
+    assert_eq!(
+        server.to_device_sent,
+        vec![("m.room.encrypted".to_string(), "txn-7".to_string(), body)]
+    );
+}

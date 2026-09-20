@@ -294,8 +294,8 @@ server 不再推「誰的裝置清單變了」那份清單，改成一個**可�
 | # | server 給的 | client 端 | 狀態 |
 |---|---|---|---|
 | 1 | `Hello.features` 帶 `"org.wbftw.device_versions"` 才推 `DeviceChanged`；**宣告後加密訊息漏帶 `room_version` 會被 `InvalidRequest` 拒** | `protocol::DEVICE_VERSIONS_FEATURE`；`WbfClient::hello(name, features)` | ✅ 常數與參數在；🚫 **16.3 做完之前沒有任何一條路可以宣告它** |
-| 2 | 成員清單（`0x13 0x29`／HTTP `/members`）最外層 `org.wbftw.room_version`，每個 `join` 成員 `unsigned["org.wbftw.device_version"]`；橋不再收 `at` | `device_version::RoomDeviceVersions::from_members_body`（沒有號碼就是錯，不是 0）、`diff_from`（誰要重查、誰離開） | ✅ 讀法在；打 Members 的呼叫等橋的通用入口 |
-| 3 | `Event/Send` meta 多 `room_version`；只查 `m.room.encrypted`；對不上回 1506，meta 帶目前的號碼 | `SendRequest::room_version`、`WbfErrorCode::RoomDevicesChanged`、`SdkError::current_room_version` | ✅ 協議層在；重查→補發→重送的迴圈等 OlmMachine |
+| 2 | 成員清單（`0x13 0x29`／HTTP `/members`）最外層 `org.wbftw.room_version`，每個 `join` 成員 `unsigned["org.wbftw.device_version"]`；橋不再收 `at` | `device_version::RoomDeviceVersions::from_members_body`（沒有號碼就是錯，不是 0）、`diff_from`（誰要重查、誰離開） | ✅ `WbfClient::room_device_versions(room_id)`（走橋的 Members，`membership=join`） |
+| 3 | `Event/Send` meta 多 `room_version`；只查 `m.room.encrypted`；對不上回 1506，meta 帶目前的號碼 | `SendRequest::room_version`、`WbfErrorCode::RoomDevicesChanged`、`SdkError::current_room_version` | ✅ 協議層在；`/keys/*` 與發 to-device 走橋的入口在（`call_bridge`、`send_to_device`）；重查→補發→重送的迴圈等 OlmMachine |
 | 4 | `Event/DeviceChanged`（`0x14 0x07`）：`{user_id, device_version, rooms, gap}`，跟 `Push` 共用 `id`／`seq`／`gap` | `pack::event::DEVICE_CHANGED`、`protocol::DeviceChangedMeta`（缺 `gap` 當 true） | ✅ 解得開；收包迴圈還沒分派它 |
 
 順手一起的：`Device/CryptoState`（`0x16 0x08`）→ `pack::device::CRYPTO_STATE`、`protocol::CryptoStateMeta`（`unused_fallback_key_types` 缺欄位是錯，🚫 不補成空：
@@ -323,8 +323,8 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
 
 | 支 | 內容 | 宣告 feature？ |
 |---|---|---|
-| **1**（這一支） | 協議層：向量、subtype 常數、`room_version`、1506、`DeviceChangedMeta`／`CryptoStateMeta`、`device_version` 模組。**行為不變** | 🚫 |
-| 2 | 橋的通用入口（`IS_BRIDGED` 的請求／回覆；PR #43 那份 `call_bridge` 的形狀）＋ `Kind::Room`／`Keys`；打 Members 拿 `RoomDeviceVersions`；`/keys/*`、`/sendToDevice` 走橋 | 🚫 |
+| **1**（✅ PR #46 已合併） | 協議層：向量、subtype 常數、`room_version`、1506、`DeviceChangedMeta`／`CryptoStateMeta`、`device_version` 模組。**行為不變** | 🚫 |
+| **2**（✅ 已做） | 橋的通用入口 `WbfClient::call_bridge`（先過 `Hello.features` 的 `bridge` 閘門；`IS_BRIDGED` 的請求／回覆，形狀取自 PR #43）＋ `Kind::Room`／`Keys`；`room_device_versions` 打 Members；`send_to_device`；`/keys/*` 五支的 `BridgedEndpoint` 常數（第 3 支的 OlmMachine 迴圈直接用 `call_bridge`） | 🚫 |
 | 3 | OlmMachine 的 `outgoing_requests` 迴圈、送出前比對、16.2 的迴圈、收包分派 `DeviceChanged`／`CryptoState`；**#45 的驗收**（Bob 登新裝置 → 帶舊號碼送 → 1506 → 修 → 重送 → Bob 新裝置收到房間金鑰）走通 | ✅ 這一支才開 |
 
 🚨 為什麼 1、2 不能宣告：宣告的連線送加密訊息漏帶號碼是 `InvalidRequest`，而 1、2 還沒有「送出前比對」——宣告了就是把自己所有加密訊息擋掉。
