@@ -325,6 +325,17 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
 |---|---|---|
 | **1**（✅ PR #46 已合併） | 協議層：向量、subtype 常數、`room_version`、1506、`DeviceChangedMeta`／`CryptoStateMeta`、`device_version` 模組。**行為不變** | 🚫 |
 | **2**（✅ 已做） | 橋的通用入口 `WbfClient::call_bridge`（先過 `Hello.features` 的 `bridge` 閘門；`IS_BRIDGED` 的請求／回覆，形狀取自 PR #43）＋ `Kind::Room`／`Keys`；`room_device_versions` 打 Members；`send_to_device`；`/keys/*` 五支的 `BridgedEndpoint` 常數（第 3 支的 OlmMachine 迴圈直接用 `call_bridge`） | 🚫 |
-| 3 | OlmMachine 的 `outgoing_requests` 迴圈、送出前比對、16.2 的迴圈、收包分派 `DeviceChanged`／`CryptoState`；**#45 的驗收**（Bob 登新裝置 → 帶舊號碼送 → 1506 → 修 → 重送 → Bob 新裝置收到房間金鑰）走通 | ✅ 這一支才開 |
+| **3a**（✅ 已做） | **收與發金鑰**：`crypto_engine::OlmEngine`（feature `matrix`）——同一個 sqlite crypto store（`m/`）上的 `OlmMachine`，`send_outgoing_requests` 把 KeysUpload／Query／Claim／SignaturesUpload／發 to-device 全部走橋，`receive_to_device` 把 `Device/Fetch` 拉到的推進去（回新的 `RoomKeyInfo`），`share_room_key` 把房間金鑰分給一群人，`mark_users_changed` 是 1506 之後重查的入口。`0x16` 的 `Fetch`／`Batch`／`Subscribe`（不帶 `cd_seq`）／`ItemsDestroy`／`ItemsDestroyed`／`CryptoState` 編解碼與 `WbfClient::device_*`；`to_device_state`（`cd_seq` 與待銷毀清單落在 `m/`）。對真 server 走通：同帳號兩台裝置，房間金鑰只靠 WS 從 A 到 B（`tests/e2e_crypto_engine.rs`） | 🚫 |
+| 3b | **送**：`encrypt_room_event_raw` → `Event/Send` 帶 `room_version`；送出前拿 `room_device_versions` 比對；16.2 的 1506 迴圈；WS 密文 `decrypt_room_event`；**#45 的驗收**（Bob 登新裝置 → 帶舊號碼送 → 1506 → 修 → 重送 → Bob 新裝置收到房間金鑰）走通 | ✅ 這一支才開 |
+| 4 | 推播：通道能收非回應的 pack（`Event/Push`、`Device/Push`、`CryptoState`、`DeviceChanged`、`Superseded`），`Subscribe` 帶 `cd_seq` 補窗——daemon-runtime 第 4 階段，維護者要先討論 | — |
 
-🚨 為什麼 1、2 不能宣告：宣告的連線送加密訊息漏帶號碼是 `InvalidRequest`，而 1、2 還沒有「送出前比對」——宣告了就是把自己所有加密訊息擋掉。
+🚨 為什麼 1、2、3a 不能宣告：宣告的連線送加密訊息漏帶號碼是 `InvalidRequest`，而它們還沒有「送出前比對」——宣告了就是把自己所有加密訊息擋掉。
+
+### 16.4 3a 對真 server 走通時踩到的四件事（2026-09-21）
+
+- **已追蹤的人不會因為 `update_tracked_users` 再查一次**：A 上傳金鑰時狀態機就順手查過自己（那時 B 還沒上傳），之後只靠 `track_users` 永遠看不到 B。
+  要的是「這個人變了、重查」——`OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口），也就是 16.2 里收到 1506 之後對 `diff.changed` 要做的事。
+- **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs`：`Forbidden`）：所以拉→匯入→銷毀之前要先 `device_subscribe`。這一版只訂不帶 `cd_seq` 的（不補窗，回 `Ack` 再 `CryptoState`）；
+  訂了之後新的 to-device 會用 `Push` 推到這條連線，而通道還沒有收推播的迴圈——這是第 4 階段的事，在那之前 `device_subscribe` 只能在一次走完的流程裡用。
+- **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
+- ruma 組請求時對要 token 的端點一定要給 token：引擎給一個占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填（client 蓋不掉）。

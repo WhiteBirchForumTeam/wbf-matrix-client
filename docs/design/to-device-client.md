@@ -210,15 +210,17 @@ Session/Login
   所以「先不刪，之後再說」不會掉東西——但會讓佇列一直長大（server 端有
   `!admin user to-device-queue` 看得到）。🚫 不要把「反正不會掉」當成不實作銷毀的理由。
 
-## 8. client 端要做的（還一個字都沒寫）
+## 8. client 端要做的（🔁 2026-09-21 更新狀態）
 
-| # | 做什麼 | 在哪 |
-|---|---|---|
-| 1 | `Kind::Device = 0x16` 進 pack 的 kind 表 | `crates/wbf-wire/src/pack.rs`（現在只有 `Event = 0x14`） |
-| 2 | 七個 subtype 的 meta 型別與 `counts`／`tc × 8 byte` 的編解碼 | `wbf-sdk`，跟 `Event` 那組放一起 |
-| 3 | `cd_seq` 與待銷毀清單的落地 | **帳號目錄的 `m/` 裡面**（§2.1），🚫 不進 `cache.db` |
-| 4 | 訂閱／補洞／匯入／銷毀的狀態機 | ⚠️ **daemon 才有意義**——「一個命令一個程序」的東西沒有人在線上收（architecture-v2 §1） |
-| 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表要跟上 server 的 §3.4 |
+| # | 做什麼 | 在哪 | 狀態 |
+|---|---|---|---|
+| 1 | `Kind::Device = 0x16` 進 pack 的 kind 表 | `crates/wbf-wire/src/pack.rs` | ✅ 含八個 subtype 常數（`pack::device`） |
+| 2 | 八個 subtype 的 meta 型別與 `counts`／`tc × 8 byte` 的編解碼 | `wbf-sdk/src/protocol.rs` 的 Device 段：`device_fetch`／`device_subscribe`／`device_items_destroy`、`parse_device_batch`、`parse_items_destroyed`、`parse_subscribe_reply`、`CryptoStateMeta` | ✅ 對 server 向量逐 byte；`WbfClient::device_fetch_window`／`device_subscribe`／`device_items_destroy` |
+| 3 | `cd_seq` 與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），🚫 不進 `cache.db` | ✅ |
+| 4 | 訂閱／補洞／匯入／銷毀的狀態機 | ⚠️ **daemon 才有意義**——「一個命令一個程序」的東西沒有人在線上收（architecture-v2 §1）；匯入用 `crypto_engine::OlmEngine::receive_to_device` | 🔧 「拉」的那半（Fetch → 匯入 → 銷毀）在 `tests/e2e_crypto_engine.rs` 對真 server 走通；`Push`／補窗要通道能收推播（daemon-runtime 第 4 階段） |
+| 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；收到它要停掉這條的收取並通知上層 | ❌ 跟第 4 條一起（它是推來的） |
+
+⚠️ 實跑補的一條：**`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs` 回 `Forbidden`），所以順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，跟 §7 一致；🚫 不能只 Fetch 不 Subscribe 就想銷毀。
 
 ⭐ 第 4 條決定了順序：**這件事排在 daemon 之後**，handover §7 第 3 項。
 

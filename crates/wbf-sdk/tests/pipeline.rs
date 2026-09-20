@@ -1201,3 +1201,157 @@ async fn send_to_device_goes_over_the_bridge_with_the_body_as_is() {
         vec![("m.room.encrypted".to_string(), "txn-7".to_string(), body)]
     );
 }
+
+// ---- to-device 佇列：Fetch 一窗、ItemsDestroy（#45 第 3 支，「拉」的那半）----
+
+fn to_device_item(count: u64) -> (u64, serde_json::Value) {
+    (
+        count,
+        serde_json::json!({ "type": "m.room_key", "sender": "@alice:localhost", "content": { "count": count } }),
+    )
+}
+
+/// 三則、每批兩則 → 兩個 Batch；舊→新；`nt` 是最後一則的 count；`more` 照 server。
+#[tokio::test]
+async fn device_fetch_window_reassembles_batches_oldest_first() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["device"];
+    server.to_device_queue = vec![
+        to_device_item(4712),
+        to_device_item(4713),
+        to_device_item(4720),
+    ];
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let window = client
+        .device_fetch_window(
+            &wbf_sdk::protocol::DeviceFetchRequest {
+                cd_seq: Some(4711),
+                limit: Some(1000),
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(window.tc, 3);
+    assert_eq!(
+        window
+            .items
+            .iter()
+            .map(|(count, _)| *count)
+            .collect::<Vec<_>>(),
+        vec![4712, 4713, 4720]
+    );
+    assert_eq!(window.items[2].1["content"]["count"], 4720);
+    assert_eq!(window.nt, Some(4720));
+    assert!(!window.more);
+
+    // 帶 cd_seq = nt 再拉：空窗。
+    let empty = client
+        .device_fetch_window(
+            &wbf_sdk::protocol::DeviceFetchRequest {
+                cd_seq: Some(4720),
+                limit: None,
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!((empty.tc, empty.nt, empty.items.len()), (0, None, 0));
+    drop(client);
+    assert!(server
+        .requests
+        .iter()
+        .any(|request| (request.0, request.1) == (wbf_wire::Kind::Device, 0x01)));
+}
+
+/// `ItemsDestroy`：要先 `Subscribe`（持有佇列），否則 `Forbidden`；只有 `ItemsDestroyed` 回來的才算沒了；只收到 `Ack` 是 `Protocol`；空清單不送。
+#[tokio::test]
+async fn device_items_destroy_needs_the_items_destroyed_reply() {
+    let mut server = FakeServer::new();
+    server.extra_features = vec!["device"];
+    server.otk_count = 42;
+    server.to_device_queue = vec![to_device_item(1), to_device_item(2), to_device_item(3)];
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let forbidden = client
+        .device_items_destroy(&[1], std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        forbidden.wbf_code(),
+        Some(wbf_sdk::error_code::WbfErrorCode::Forbidden),
+        "沒訂閱不能銷毀：{forbidden:?}"
+    );
+    let state = client
+        .device_subscribe("DEV1", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(state.otk_counts["signed_curve25519"], 42);
+    assert_eq!(state.unused_fallback_key_types, vec!["signed_curve25519"]);
+    let gone = client
+        .device_items_destroy(&[1, 2, 99], std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        gone,
+        vec![1, 2, 99],
+        "本來就不在的（99）也算沒了：要的是狀態不是事件"
+    );
+    assert_eq!(
+        client
+            .device_items_destroy(&[], std::time::Duration::from_secs(1))
+            .await
+            .unwrap(),
+        Vec::<u64>::new()
+    );
+    drop(client);
+    assert_eq!(server.to_device_queue.len(), 1, "佇列只剩 3");
+    let requests_before = server.requests.len();
+
+    server.omit_items_destroyed = true;
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    client
+        .device_subscribe("DEV1", std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    let error = client
+        .device_items_destroy(&[3], std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Protocol(_)), "{error:?}");
+    drop(client);
+    assert!(server.requests.len() > requests_before);
+}
+
+/// 🚨 server 沒宣告 `device`：Fetch／ItemsDestroy 一個 pack 都不送。
+#[tokio::test]
+async fn device_calls_need_the_device_feature() {
+    let mut server = FakeServer::new();
+    let mut client = WbfClient::new(&mut server);
+    client.hello("test", &[]).await.unwrap();
+    let error = client
+        .device_fetch_window(
+            &wbf_sdk::protocol::DeviceFetchRequest::default(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error:?}");
+    let error = client
+        .device_items_destroy(&[1], std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error:?}");
+    let error = client
+        .device_subscribe("DEV1", std::time::Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error:?}");
+    drop(client);
+    assert!(server
+        .requests
+        .iter()
+        .all(|request| request.0 == wbf_wire::Kind::Control));
+}

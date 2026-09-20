@@ -17,6 +17,8 @@
 //! - `event_json`：原始 Matrix 事件 JSON → `Message`，matrix backend 與 `recent` 共用。
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
 //! - `device_version`：裝置版本號與房間版本號（server 的 `wbf-room-device-version.md`）：成員清單怎麼讀、1506 之後跟誰重查、雜湊怎麼自己重算。
+//! - `to_device_state`：to-device 的 `cd_seq` 與待銷毀清單，落在 `m/`（to-device-client.md §2、§4）。
+//! - `crypto_engine`（feature `matrix`）：`OlmMachine` 只當狀態機用——to-device 推進去、`outgoing_requests` 走橋送出去、房間金鑰分給一群人（e2ee-walkthrough.md §13）。
 
 pub mod account_dir;
 pub mod backend;
@@ -28,6 +30,8 @@ pub mod chunk_block;
 pub mod chunk_crypto;
 pub mod cipher;
 pub mod client;
+#[cfg(feature = "matrix")]
+pub mod crypto_engine;
 pub mod device_version;
 pub mod download;
 pub mod error;
@@ -41,6 +45,7 @@ pub mod media;
 pub mod media_pool;
 pub mod protocol;
 pub mod room_keys;
+pub mod to_device_state;
 pub mod upload;
 pub mod vault;
 

@@ -4278,6 +4278,7 @@ dependencies = [
  "hex",
  "http",
  "matrix-sdk",
+ "matrix-sdk-crypto",
  "reqwest",
  "rusqlite",
  "serde",

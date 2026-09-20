@@ -7,7 +7,8 @@ use crate::channel::PackChannel;
 use crate::device_version::RoomDeviceVersions;
 use crate::error::SdkError;
 use crate::protocol::{
-    self, BatchMeta, HelloAck, InfoAck, ReadAck, RecentRequest, SendAck, SendRequest, StatusAck,
+    self, BatchMeta, DeviceFetchRequest, HelloAck, InfoAck, ReadAck, RecentRequest, SendAck,
+    SendRequest, StatusAck,
 };
 
 pub struct WbfClient<C: PackChannel> {
@@ -25,6 +26,19 @@ pub struct WbfClient<C: PackChannel> {
 /// `recent_window`／`recent_sync` 每收到一個 Batch 叫一次：meta 加這批的事件（新到舊）。回 `Err` 就中止。
 pub type OnBatch<'a> =
     &'a mut (dyn FnMut(&BatchMeta, Vec<serde_json::Value>) -> Result<(), SdkError> + Send);
+
+/// `Device/Fetch` 一窗的結果（to-device-client.md §7）：舊→新。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceWindow {
+    /// `(count, 事件 JSON)`，舊→新。事件是 `{type, sender, content}`（server 對內容是瞎的）。
+    pub items: Vec<(u64, serde_json::Value)>,
+    /// 這一窗總共幾則。
+    pub tc: u32,
+    /// 這一窗最新的 count：下一窗的 `cd_seq`。空窗是 None。
+    pub nt: Option<u64>,
+    /// true ＝ 窗停在上限，後面可能還有（帶 `cd_seq = nt` 再拉）；false ＝ 佇列真的拉完了。
+    pub more: bool,
+}
 
 /// `Recent` 一窗的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -232,6 +246,174 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(())
     }
 
+    /// 一串回應的請求（`Recent`、`Device/Fetch`、`ItemsDestroy`）用的會話號：client 自己選，從 1 起、永遠不是 0。
+    /// 型別 byte 是 SESSION（wire-format §2.2）：沒帶 server 回 InvalidRequest「carries none」（2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
+    fn next_session_id(&mut self) -> u64 {
+        self.next_stream_id =
+            self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
+        wbf_wire::pack::id::compose(wbf_wire::pack::id::SESSION, self.next_stream_id)
+            .expect("masked to 56 bits above")
+    }
+
+    /// `Device/Fetch` 一窗：從 `cd_seq` 之後拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
+    /// 拉到的還沒匯進 crypto store，🚫 不推水位、🚫 不銷毀：那是呼叫者匯入成功之後的事。
+    ///
+    /// Args:
+    ///     request: example: &DeviceFetchRequest { cd_seq: Some(4711), limit: Some(1000) }
+    ///     per_pack_timeout: 每個 Batch 之間最多等多久, example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(DeviceWindow)  這一窗（可能是空的）
+    ///     Err(Usage)        沒 hello、或 server 沒宣告 `device`
+    ///     Err(Server)       `Unsupported`（走 HTTP）等
+    ///     Err(Protocol)     Batch 形狀錯、窗沒收到 `r = 0` 就結束
+    pub async fn device_fetch_window(
+        &mut self,
+        request: &DeviceFetchRequest,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<DeviceWindow, SdkError> {
+        self.require_feature(protocol::DEVICE_FEATURE)?;
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let pack = protocol::device_fetch(request, self.next_session_id(), seq);
+        let mut window = DeviceWindow::default();
+        let mut expected_seq = 0u32;
+        let mut sent = 0u32;
+        let mut finished = false;
+        let mut on_pack = |response: Pack| -> Result<bool, SdkError> {
+            let batch = protocol::expect_device_batch(&pack, response, expected_seq)?;
+            let (meta, items) = protocol::parse_device_batch(&batch)?;
+            if expected_seq == 0 {
+                window.tc = meta.tc;
+            } else if meta.tc != window.tc {
+                return Err(SdkError::Protocol(format!(
+                    "Device/Batch {expected_seq} says tc {} but the window started with tc {}",
+                    meta.tc, window.tc
+                )));
+            }
+            sent = sent.saturating_add(meta.bc);
+            if window.tc != sent.saturating_add(meta.r) {
+                return Err(SdkError::Protocol(format!(
+                    "Device/Batch {expected_seq}: tc {} ≠ sent {sent} + r {}",
+                    window.tc, meta.r
+                )));
+            }
+            if let Some((last_count, _)) = items.last() {
+                // 舊→新：跨 Batch 也要嚴格遞增。
+                if window.nt.is_some_and(|previous| previous >= meta.ot) {
+                    return Err(SdkError::Protocol(format!(
+                        "Device/Batch {expected_seq} starts at {} but the previous batch ended at {:?}",
+                        meta.ot, window.nt
+                    )));
+                }
+                window.nt = Some(*last_count);
+            }
+            window.more = meta.more;
+            window.items.extend(items);
+            expected_seq += 1;
+            let more_batches = meta.r > 0;
+            finished = !more_batches;
+            Ok(more_batches)
+        };
+        self.channel
+            .request_stream(pack.clone(), per_pack_timeout, &mut on_pack)
+            .await?;
+        if !finished {
+            return Err(SdkError::Protocol(
+                "the channel ended the Device/Fetch window before a Batch with r = 0".into(),
+            ));
+        }
+        Ok(window)
+    }
+
+    /// `Device/Subscribe`（不帶 `cd_seq`）：把這條連線登記成這台裝置佇列的持有者——🚨 `ItemsDestroy` 只有持有者能做，
+    /// 而且後來的接手先來的（to-device-client.md §5）。回覆是 `Ack` 再 `CryptoState`（自己的 OTK 存量），這裡回後者。
+    /// ⚠️ 訂閱之後 server 會把新的 to-device 用 `Push` 推到這條連線，而這條通道還沒有收推播的迴圈（第 4 階段）：
+    /// 這一版只在「訂閱 → 拉 → 匯入 → 銷毀」這種一次走完的流程裡用它。
+    ///
+    /// Args:
+    ///     device_id: 自己的裝置 id（server 會跟 session 比對）, example: "RJYKSTBOIE"
+    ///     per_pack_timeout: example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(CryptoStateMeta)  訂閱成功，附自己的金鑰存量
+    ///     Err(Server)          `Forbidden`：不是這個 session 的裝置
+    ///     Err(Protocol)        只收到 `Ack` 沒收到 `CryptoState`、或形狀錯
+    pub async fn device_subscribe(
+        &mut self,
+        device_id: &str,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<protocol::CryptoStateMeta, SdkError> {
+        self.require_feature(protocol::DEVICE_FEATURE)?;
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let pack = protocol::device_subscribe(
+            &protocol::DeviceSubscribeRequest {
+                cd_seq: None,
+                device_id: device_id.to_string(),
+            },
+            self.next_session_id(),
+            seq,
+        );
+        let mut acknowledged = false;
+        let mut crypto_state = None;
+        let mut on_pack = |response: Pack| -> Result<bool, SdkError> {
+            match protocol::parse_subscribe_reply(&pack, &response)? {
+                protocol::SubscribeReply::Acknowledged => acknowledged = true,
+                protocol::SubscribeReply::CryptoState(state) => crypto_state = Some(state),
+            }
+            Ok(!(acknowledged && crypto_state.is_some()))
+        };
+        self.channel
+            .request_stream(pack.clone(), per_pack_timeout, &mut on_pack)
+            .await?;
+        match (acknowledged, crypto_state) {
+            (true, Some(state)) => Ok(state),
+            (acknowledged, state) => Err(SdkError::Protocol(format!(
+                "Subscribe ended with ack {acknowledged} and crypto state {}",
+                state.is_some()
+            ))),
+        }
+    }
+
+    /// `Device/ItemsDestroy`：叫 server 刪掉這些 count（已經匯進 crypto store 的）。回應是先 `Ack`（只是收到）再 `ItemsDestroyed`。
+    /// 🚨 要先 `device_subscribe`：只有持有這台裝置佇列的連線能銷毀，否則 server 回 `Forbidden`。
+    /// 🚨 只有 `ItemsDestroyed` 裡回來的才算沒了；沒回來的留在待銷毀清單上下次再送（to-device-client.md §4）。
+    ///
+    /// Args:
+    ///     counts: example: &[4712, 4713]；空的就不送、直接回 Ok(vec![])
+    ///     per_pack_timeout: example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(Vec<u64>)   遠端已經沒有的 count（命令列過的子集）
+    ///     Err(Protocol)  只收到 `Ack` 沒收到 `ItemsDestroyed`、或形狀錯
+    pub async fn device_items_destroy(
+        &mut self,
+        counts: &[u64],
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<Vec<u64>, SdkError> {
+        self.require_feature(protocol::DEVICE_FEATURE)?;
+        if counts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let pack = protocol::device_items_destroy(counts, self.next_session_id(), seq);
+        let mut destroyed: Option<Vec<u64>> = None;
+        let mut on_pack = |response: Pack| -> Result<bool, SdkError> {
+            match protocol::parse_items_destroyed(&pack, &response, counts)? {
+                None => Ok(true),
+                Some(gone) => {
+                    destroyed = Some(gone);
+                    Ok(false)
+                }
+            }
+        };
+        self.channel
+            .request_stream(pack.clone(), per_pack_timeout, &mut on_pack)
+            .await?;
+        destroyed.ok_or_else(|| {
+            SdkError::Protocol("ItemsDestroy got an Ack but no ItemsDestroyed".into())
+        })
+    }
+
     pub async fn ping(&mut self) -> Result<(), SdkError> {
         self.call(protocol::ping).await?;
         Ok(())
@@ -303,14 +485,7 @@ impl<C: PackChannel> WbfClient<C> {
         self.require_feature("recent")?;
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        // id 由 client 選（回應是一串 Batch，不能靠 seq 對）；從 1 起，永遠不是 0。
-        // 型別 byte 是 SESSION（wire-format §2.2）：沒帶 server 回 InvalidRequest「carries none」
-        // （2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
-        self.next_stream_id =
-            self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
-        let session_id =
-            wbf_wire::pack::id::compose(wbf_wire::pack::id::SESSION, self.next_stream_id)
-                .expect("masked to 56 bits above");
+        let session_id = self.next_session_id();
         let pack = protocol::recent(request, session_id, seq);
         let mut window = RecentWindow::default();
         let mut expected_seq = 0u32;
