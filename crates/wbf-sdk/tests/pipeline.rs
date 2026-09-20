@@ -1462,6 +1462,125 @@ mod with_crypto_engine {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn joined(user_id: &str, device_version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "m.room.member", "state_key": user_id, "content": { "membership": "join" },
+            "unsigned": { "org.wbftw.device_version": device_version }
+        })
+    }
+
+    /// 假 server 的 KeysQuery 回「什麼金鑰都沒有」：這個人的裝置雜湊就是三項全空的那個值。
+    fn hash_of_no_keys(user_id: &str) -> String {
+        wbf_sdk::device_version::compute_device_keys_hash(user_id, &serde_json::json!({}))
+    }
+
+    async fn engine_and_server(
+        name: &str,
+        members: serde_json::Value,
+    ) -> (OlmEngine, FakeServer, std::path::PathBuf) {
+        let dir = scratch_store(name);
+        let engine = OlmEngine::open(&dir, &Key32([3u8; 32]), "@alice:localhost", "DEV1")
+            .await
+            .unwrap();
+        let mut server = FakeServer::new();
+        server.extra_features = vec!["bridge", "device", "attachments"];
+        server.bridged_members = Some(members);
+        (engine, server, dir)
+    }
+
+    /// 🚨 成員清單上的裝置雜湊跟查回來的金鑰對不上：重查一次仍對不上 → `Protocol`，房間金鑰不發（fail closed）。
+    #[tokio::test]
+    async fn refresh_refuses_to_share_when_the_device_hash_does_not_match() {
+        let members = serde_json::json!({
+            "chunk": [joined("@alice:localhost", "1-aaaaaaaaaa")],
+            "org.wbftw.room_version": 7
+        });
+        let (engine, mut server, dir) = engine_and_server("hash-mismatch", members).await;
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let error = engine
+            .refresh_room_devices(&mut client, "!r:localhost", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SdkError::Protocol(message) if message.contains("hash")),
+            "{error:?}"
+        );
+        drop(client);
+        let keys_queries = server
+            .requests
+            .iter()
+            .filter(|request| (request.0, request.1) == (wbf_wire::Kind::Keys, 0x21))
+            .count();
+        assert_eq!(keys_queries, 2, "對不上要再查一次，才拒絕");
+        assert!(server.to_device_sent.is_empty(), "🚫 沒發任何房間金鑰");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 雜湊對得上：refresh 通過、`rechecked` 空；之後 `encrypt_and_send` 帶那份的號碼——對就 `Sent`，server 說變了就 `RoomDevicesChanged`。
+    #[tokio::test]
+    async fn refresh_then_send_reports_1506_as_an_outcome_not_an_error() {
+        use wbf_sdk::crypto_engine::{OutgoingRoomEvent, SendOutcome};
+        let members = serde_json::json!({
+            "chunk": [joined("@alice:localhost", &format!("1-{}", hash_of_no_keys("@alice:localhost")))],
+            "org.wbftw.room_version": 7
+        });
+        let (engine, mut server, dir) = engine_and_server("send-1506", members).await;
+        server.current_room_version = Some(7);
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let refresh = engine
+            .refresh_room_devices(&mut client, "!r:localhost", None)
+            .await
+            .unwrap();
+        assert_eq!(refresh.versions.room_version, 7);
+        assert!(refresh.rechecked.is_empty(), "{refresh:?}");
+        assert_eq!(refresh.diff.changed, vec!["@alice:localhost".to_string()]);
+        let message = OutgoingRoomEvent {
+            event_type: "m.room.message".into(),
+            content: serde_json::json!({ "msgtype": "m.text", "body": "hi" }),
+            txn_id: "t1".into(),
+            attachments: Vec::new(),
+        };
+        let sent = engine
+            .encrypt_and_send(&mut client, &refresh, &message)
+            .await
+            .unwrap();
+        assert!(matches!(sent, SendOutcome::Sent { .. }), "{sent:?}");
+        drop(client);
+        assert_eq!(
+            server
+                .sent_events
+                .last()
+                .map(|sent| (sent.1.as_str(), sent.2)),
+            Some(("m.room.encrypted", Some(7)))
+        );
+
+        // server 那邊有人換了裝置：號碼變 9，帶 7 送 → 1506，不是 Err。
+        server.current_room_version = Some(9);
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let stale = engine
+            .encrypt_and_send(&mut client, &refresh, &message)
+            .await
+            .unwrap();
+        let SendOutcome::RoomDevicesChanged {
+            current_room_version,
+            error,
+        } = stale
+        else {
+            panic!("{stale:?}")
+        };
+        assert_eq!(current_room_version, Some(9));
+        assert_eq!(
+            error.wbf_code(),
+            Some(wbf_sdk::error_code::WbfErrorCode::RoomDevicesChanged)
+        );
+        drop(client);
+        assert_eq!(server.sent_events.len(), 1, "被擋的那則沒進去");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 一次拉完多窗（limit 夾成每窗一則）：每窗一筆 report、水位逐窗前進、最後一窗 `more: false` 才停。
     #[tokio::test]
     async fn pull_to_device_walks_windows_until_caught_up() {

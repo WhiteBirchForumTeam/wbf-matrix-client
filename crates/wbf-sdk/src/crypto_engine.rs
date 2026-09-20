@@ -11,27 +11,31 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use matrix_sdk::ruma;
 use matrix_sdk::{SqliteCryptoStore, SqliteStoreConfig};
 use matrix_sdk_crypto::store::types::RoomKeyInfo;
+use matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent;
 use matrix_sdk_crypto::types::requests::{AnyOutgoingRequest, OutgoingRequest, ToDeviceRequest};
 use matrix_sdk_crypto::{
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, OlmMachineBuilder,
-    TrustRequirement,
+    CollectStrategy, DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
+    OlmMachineBuilder, TrustRequirement,
 };
 use ruma::api::auth_scheme::SendAccessToken;
 use ruma::api::client::keys::{claim_keys, get_keys, upload_keys, upload_signatures};
 use ruma::api::client::sync::sync_events::DeviceLists;
 use ruma::api::client::to_device::send_event_to_device;
 use ruma::api::{IncomingResponseExt as _, OutgoingRequestExt as _, SupportedVersions};
-use ruma::events::AnyToDeviceEvent;
+use ruma::events::{AnyMessageLikeEventContent, AnyToDeviceEvent};
 use ruma::serde::Raw;
 use ruma::{DeviceId, OneTimeKeyAlgorithm, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId};
 
 use crate::channel::PackChannel;
 use crate::client::{DeviceWindow, WbfClient};
-use crate::protocol::{self, BridgedEndpoint, DeviceFetchRequest, NoVariables};
+use crate::device_version::{compute_device_keys_hash, MembersDiff, RoomDeviceVersions};
+use crate::error_code::WbfErrorCode;
+use crate::protocol::{self, BridgedEndpoint, DeviceFetchRequest, NoVariables, SendRequest};
 use crate::to_device_state::ToDeviceState;
 use crate::vault::Key32;
 use crate::SdkError;
@@ -61,10 +65,56 @@ pub struct ImportReport {
 /// `pull_to_device` 最多拉幾窗：一窗 1000 則、六十四窗就是六萬多則 to-device，到這個數還沒追平是不對勁，停下來報錯。
 const PULL_WINDOWS_LIMIT: usize = 64;
 
+/// `refresh_room_devices` 一輪的結果：這一刻的房間快照（下次送帶它的 `room_version`）、跟上一份比出來的差、發了幾個 to-device。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoomRefresh {
+    /// 哪個房；`encrypt_and_send` 只收這個 struct，所以沒 refresh 過的房送不了（上游在沒有 outbound session 時是 panic 不是回錯）。
+    pub room_id: String,
+    /// 這一刻的房間版本號與每個 `join` 成員的裝置版本號——**呼叫者要存下來**，下次 refresh 當 `previous`、下次送帶它的 `room_version`。
+    pub versions: RoomDeviceVersions,
+    /// 誰要重查（新加入、裝置版本號變了）、誰離開了；`previous` 是 None 時全部算 changed。
+    pub diff: MembersDiff,
+    /// 這輪發了幾個 to-device（房間金鑰補發給新裝置）；0 ＝ 每台裝置都已經有了。
+    pub shared_to_device_requests: usize,
+    /// 雜湊第一次對不上、重查一次才對上的人（通常是空的；非空代表查詢與清單之間有人換了金鑰）。
+    pub rechecked: Vec<String>,
+}
+
+/// 一則要加密送出的房間事件（`encrypt_and_send` 的輸入）；房間與房間版本號從 `RoomRefresh` 來，不在這裡。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingRoomEvent {
+    /// 明文的事件型別, example: "m.room.message"
+    pub event_type: String,
+    /// 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
+    pub content: serde_json::Value,
+    /// 重送用同一個, example: "txn-1"
+    pub txn_id: String,
+    /// 這則用到的 mxc（server 讀不到密文，靠它替媒體 +1）, example: vec![]
+    pub attachments: Vec<String>,
+}
+
+/// `encrypt_and_send` 的結果：送進去了，或被 1506 擋下來。
+/// 被擋不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 補金鑰、UI 決定重送，e2ee-walkthrough §16.6）。
+#[derive(Debug)]
+pub enum SendOutcome {
+    Sent {
+        event_id: String,
+    },
+    /// server 說帶的 `room_version` 過期，訊息沒送。拿 `current_room_version` 只能知道自己過期，🚫 不能直接拿它重送：
+    /// 先 `refresh_room_devices`（金鑰補到新的裝置），再帶那份快照的 `room_version` 重送（同一個 `txn_id`）。
+    RoomDevicesChanged {
+        current_room_version: Option<u64>,
+        error: SdkError,
+    },
+}
+
 pub struct OlmEngine {
     machine: OlmMachine,
     /// crypto store 與 `td.json` 所在的 `m/`。
     store_dir: PathBuf,
+    /// 最近一次 `/keys/query` 回答這個人的 body（整份）：拿來重算裝置雜湊跟成員清單上的比（server §3.4）。
+    /// 只在記憶體：重開就重查。
+    last_keys_query: Mutex<BTreeMap<String, serde_json::Value>>,
 }
 
 impl OlmEngine {
@@ -107,7 +157,166 @@ impl OlmEngine {
         Ok(OlmEngine {
             machine,
             store_dir: store_dir.to_path_buf(),
+            last_keys_query: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// 點進房間、被 1506 擋、（將來）收到 `DeviceChanged` 都叫這一支（e2ee-walkthrough §16.6：一支例行程序、三個觸發點）：
+    /// 拿這一刻的成員清單與版本號 → 跟上一份比出誰變了 → 只重查那些人 → 雜湊對一次（不對再查一次，還不對就拒絕）→
+    /// 把房間金鑰補給每台還沒有的裝置（有人離開由上游決定輪換）。
+    ///
+    /// Args:
+    ///     client: 要能走橋的連線
+    ///     room_id: example: "!r:localhost"
+    ///     previous: 上一次的 `RoomRefresh::versions`（發上一輪房間金鑰時依據的那份）；None ＝ 第一次進這個房，每個人都查
+    /// Return:
+    ///     Ok(RoomRefresh)  下次送帶 `versions.room_version`
+    ///     Err(Server)      不在房裡（`Forbidden`）等
+    ///     Err(Protocol)    server 沒給號碼；或某人的裝置雜湊重查一次後仍對不上（🚨 fail closed：看到的不是同一組金鑰就不發）
+    pub async fn refresh_room_devices<C: PackChannel>(
+        &self,
+        client: &mut WbfClient<C>,
+        room_id: &str,
+        previous: Option<&RoomDeviceVersions>,
+    ) -> Result<RoomRefresh, SdkError> {
+        let versions = client.room_device_versions(room_id).await?;
+        let members: Vec<String> = versions.members.keys().cloned().collect();
+        let diff = match previous {
+            Some(previous) => versions.diff_from(previous),
+            None => MembersDiff {
+                changed: members.clone(),
+                left: Vec::new(),
+            },
+        };
+        self.track_users(&members).await?;
+        if !diff.changed.is_empty() {
+            self.mark_users_changed(&diff.changed).await?;
+        }
+        self.send_outgoing_requests(client).await?;
+        let rechecked = self.mismatched_device_hashes(&versions);
+        if !rechecked.is_empty() {
+            // 查詢與清單之間可能有人換了金鑰：再查一次。還對不上就不是競態，是我們或 server 壞了，🚫 不帶著存疑的名單發金鑰。
+            self.mark_users_changed(&rechecked).await?;
+            self.send_outgoing_requests(client).await?;
+            let still = self.mismatched_device_hashes(&versions);
+            if !still.is_empty() {
+                return Err(SdkError::Protocol(format!(
+                    "device keys hash still does not match the member list for {still:?} after re-querying: refusing to share the room key"
+                )));
+            }
+        }
+        let shared_to_device_requests = self
+            .share_room_key(client, room_id, &members, room_key_share_settings())
+            .await?;
+        Ok(RoomRefresh {
+            room_id: room_id.to_string(),
+            versions,
+            diff,
+            shared_to_device_requests,
+            rechecked,
+        })
+    }
+
+    /// 加密一則房間事件並帶房間版本號送出（`Event/Send`）。房間與號碼從 `refresh` 來：🚨 只收 `refresh_room_devices` 回的那份，
+    /// 因為上游在這個房還沒有 outbound session（從沒 share 過）時是 **panic** 不是回錯——refresh 就是建 session 的那一步。
+    /// 被 1506 擋是 `Ok(RoomDevicesChanged)` 不是 `Err`：這條路預期內的結果，訊息沒送，金鑰要補（再 refresh 一次）、重不重送由上層決定。
+    ///
+    /// Args:
+    ///     refresh: 這個房最近一次 `refresh_room_devices` 的結果（帶它的 `versions.room_version`）
+    ///     message: example: &OutgoingRoomEvent { event_type: "m.room.message".into(), content: json!({"msgtype":"m.text","body":"hi"}), txn_id: "txn-1".into(), attachments: vec![] }
+    /// Return:
+    ///     Ok(SendOutcome::Sent)                 送進去了
+    ///     Ok(SendOutcome::RoomDevicesChanged)   1506：號碼過期，訊息沒送
+    ///     Err(Protocol)                         加密失敗（例：這個房沒有 outbound session）
+    ///     Err(Server)                           其他拒絕（含宣告過 feature 却漏帶號碼的 `InvalidRequest`）
+    pub async fn encrypt_and_send<C: PackChannel>(
+        &self,
+        client: &mut WbfClient<C>,
+        refresh: &RoomRefresh,
+        message: &OutgoingRoomEvent,
+    ) -> Result<SendOutcome, SdkError> {
+        let owned_room_id: OwnedRoomId = RoomId::parse(&refresh.room_id).map_err(|error| {
+            SdkError::Usage(format!("bad room id {:?}: {error}", refresh.room_id))
+        })?;
+        let raw_content: Raw<AnyMessageLikeEventContent> = Raw::from_json(
+            serde_json::value::to_raw_value(&message.content)
+                .map_err(|error| SdkError::Protocol(format!("event content: {error}")))?,
+        );
+        let encrypted = self
+            .machine
+            .encrypt_room_event_raw(&owned_room_id, &message.event_type, &raw_content)
+            .await
+            .map_err(|error| SdkError::Protocol(format!("encrypt: {error}")))?;
+        let request = SendRequest {
+            room_id: refresh.room_id.clone(),
+            event_type: "m.room.encrypted".to_string(),
+            txn_id: message.txn_id.clone(),
+            attachments: message.attachments.clone(),
+            room_version: Some(refresh.versions.room_version),
+        };
+        let body = encrypted.content.json().get().as_bytes().to_vec();
+        match client.send_event(&request, body).await {
+            Ok(ack) => Ok(SendOutcome::Sent {
+                event_id: ack.event_id,
+            }),
+            Err(error) if error.wbf_code() == Some(WbfErrorCode::RoomDevicesChanged) => {
+                Ok(SendOutcome::RoomDevicesChanged {
+                    current_room_version: error.current_room_version(),
+                    error,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 解一則 WS 拉到的 `m.room.encrypted` 事件（`Recent`／`Push` 給的原樣 JSON）。
+    ///
+    /// Args:
+    ///     room_id: example: "!r:localhost"
+    ///     event: 完整的密文事件（有 `event_id`、`sender`、`content.ciphertext`…）
+    /// Return:
+    ///     Ok(Value)       解開後的完整事件（`type`、`content` 是明文，`event_id`／`sender` 照帶）
+    ///     Err(Protocol)   解不開（沒有那把房間金鑰、密文壞了…）；訊息帶上游的原因
+    pub async fn decrypt_room_event(
+        &self,
+        room_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        let owned_room_id: OwnedRoomId = RoomId::parse(room_id)
+            .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
+        let raw: Raw<EncryptedEvent> = Raw::from_json(
+            serde_json::value::to_raw_value(event)
+                .map_err(|error| SdkError::Protocol(format!("encrypted event: {error}")))?,
+        );
+        let decrypted = self
+            .machine
+            .decrypt_room_event(&raw, &owned_room_id, &decryption_settings())
+            .await
+            .map_err(|error| SdkError::Protocol(format!("decrypt: {error}")))?;
+        serde_json::from_str(decrypted.event.json().get())
+            .map_err(|error| SdkError::Protocol(format!("decrypted event is not JSON: {error}")))
+    }
+
+    /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 server §3.4 重算的比。
+    ///
+    /// Return:
+    ///     Vec<String>  對不上的人（排序）。沒查過的人、`unhashable` 的人不算（算不出來不是對不上）
+    pub fn mismatched_device_hashes(&self, versions: &RoomDeviceVersions) -> Vec<String> {
+        let answers = self
+            .last_keys_query
+            .lock()
+            .expect("keys query cache poisoned");
+        versions
+            .members
+            .iter()
+            .filter(|(user_id, version)| {
+                version.is_hashable()
+                    && answers
+                        .get(*user_id)
+                        .is_some_and(|body| compute_device_keys_hash(user_id, body) != version.hash)
+            })
+            .map(|(user_id, _)| user_id.clone())
+            .collect()
     }
 
     pub fn machine(&self) -> &OlmMachine {
@@ -417,6 +626,17 @@ impl OlmEngine {
                 let reply = self
                     .call_bridge_with(client, protocol::BRIDGE_KEYS_QUERY, ruma_request)
                     .await?;
+                // 留一份原樣的答案給雜湊比對（狀態機吃進去就拿不回來了）。
+                let body = reply.json("KeysQuery")?;
+                {
+                    let mut answers = self
+                        .last_keys_query
+                        .lock()
+                        .expect("keys query cache poisoned");
+                    for user_id in query.device_keys.keys() {
+                        answers.insert(user_id.to_string(), body.clone());
+                    }
+                }
                 let response = parse_response::<get_keys::v3::Response>(&reply, "KeysQuery")?;
                 self.machine
                     .mark_request_as_sent(request_id, &response)
@@ -492,6 +712,18 @@ impl OlmEngine {
     {
         let body = ruma_request_body(request)?;
         client.call_bridge(endpoint, &NoVariables {}, body).await
+    }
+}
+
+/// 房間金鑰發給誰（§13 第 8 條：要明確選，🚫 不默默用預設）。
+///
+/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。server 規格 §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
+/// 要每個帳號都 bootstrap 過交叉簽章才有意義——client 這邊還沒做（`SigningKeysUpload` 只有號碼），現在選它等於發給零台裝置。
+/// ✅ 交叉簽章做好之後要換成 `IdentityBasedStrategy`，這裡是唯一要改的地方。
+pub fn room_key_share_settings() -> EncryptionSettings {
+    EncryptionSettings {
+        sharing_strategy: CollectStrategy::AllDevices,
+        ..EncryptionSettings::default()
     }
 }
 

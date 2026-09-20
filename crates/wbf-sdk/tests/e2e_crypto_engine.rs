@@ -2,8 +2,10 @@
 //!
 //! ```text
 //! WBF_E2E_SERVER=http://127.0.0.1:6167 WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=<檔> \
-//!     cargo test -p wbf-sdk --features matrix --test e2e_crypto_engine -- --ignored --nocapture
+//!     cargo test -p wbf-sdk --features matrix --test e2e_crypto_engine -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! ⚠️ `--test-threads=1`：兩條測試都用同一個帳號（alice），並行跑會互相分到對方裝置的房間金鑰、互相推 CryptoState。
 //!
 //! 走的是 e2ee-walkthrough §6 那條最容易漏的路：同一個帳號的**兩台裝置** A、B，各自只靠 WS（橋 ＋ `Device/Fetch`）——
 //! A 上傳金鑰、查到 B、跟 B claim OTK 建 Olm、把一個加密房的房間金鑰用 to-device 發給 B；B 用 `Device/Fetch` 拉、匯進自己的
@@ -14,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use matrix_sdk_crypto::EncryptionSettings;
-use wbf_sdk::crypto_engine::OlmEngine;
+use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, SendOutcome};
 use wbf_sdk::login::{login_with_password, logout, Session};
 use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_FEATURE};
 use wbf_sdk::to_device_state::ToDeviceState;
@@ -257,4 +259,405 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     logout(&b.session).await.expect("logout B");
     let _ = std::fs::remove_dir_all(&a.store_dir);
     let _ = std::fs::remove_dir_all(&b.store_dir);
+}
+
+// ---- #45 的驗收（3b）：Bob 登新裝置 → 帶舊號碼送 → 1506 → 補金鑰 → 重送 → Bob 新裝置收到房間金鑰、解得開 ----
+//
+// 多要一個帳號：WBF_E2E_USER_B、WBF_E2E_PASSWORD_B_FILE（沒設就跳過這條）。
+
+struct TargetB {
+    user: String,
+    password: String,
+}
+
+fn target_b() -> Option<TargetB> {
+    let password = std::fs::read_to_string(env("WBF_E2E_PASSWORD_B_FILE")?)
+        .ok()?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    Some(TargetB {
+        user: env("WBF_E2E_USER_B")?,
+        password,
+    })
+}
+
+/// 登入一台裝置；`declare_device_versions` 是「這條連線會在每則加密訊息帶 `room_version`」的宣告——只有送出那台才開。
+async fn log_in_device_of(
+    server: &str,
+    user: &str,
+    password: &str,
+    label: &str,
+    declare_device_versions: bool,
+) -> Device {
+    let session = login_with_password(server, user, password, label)
+        .await
+        .expect("login");
+    let channel = Channel::connect(&session.server, &session.access_token, Transport::WebSocket)
+        .await
+        .expect("ws");
+    let mut ws = WbfClient::new(channel);
+    let features: &[&str] = if declare_device_versions {
+        &[wbf_sdk::protocol::DEVICE_VERSIONS_FEATURE]
+    } else {
+        &[]
+    };
+    ws.hello(label, features).await.expect("hello");
+    let store_dir =
+        std::env::temp_dir().join(format!("wbf-e2e-45-{}-{}", label, std::process::id()));
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let engine = OlmEngine::open(
+        &store_dir,
+        &random_key(),
+        &session.user_id,
+        &session.device_id,
+    )
+    .await
+    .expect("open the crypto store");
+    Device {
+        session,
+        ws,
+        engine,
+        store_dir,
+    }
+}
+
+async fn http_post(session: &Session, path: &str, body: serde_json::Value) -> serde_json::Value {
+    reqwest::Client::new()
+        .post(format!("{}{path}", session.server))
+        .bearer_auth(&session.access_token)
+        .json(&body)
+        .send()
+        .await
+        .expect(path)
+        .json()
+        .await
+        .expect("json body")
+}
+
+/// 用 `Recent` 把這個房的密文事件拉下來（新→舊）直到看到 `wanted_event_id`，交給引擎解。
+/// 實跑（2026-09-21）是 0 次輪詢就看到；留著輪詢只是防 server 端寫入與索引之間哪天出現一拍。
+/// 📎 曾經以為 Recent 看不到帶 room_version 的加密訊息，追下去是 txn_id 跨輪重用被 server 去重、拿到上一輪別的房的 event_id——
+/// 不是 Recent 的問題（見 e2ee-walkthrough §16.4）。
+async fn read_room_events(
+    device: &mut Device,
+    room_id: &str,
+    wanted_event_id: &str,
+) -> Vec<serde_json::Value> {
+    for attempt in 0..25 {
+        let events = read_room_events_once(device, room_id).await;
+        if events
+            .iter()
+            .any(|event| event["event_id"] == wanted_event_id)
+        {
+            eprintln!("[recent] {wanted_event_id} visible after {attempt} retries");
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("{wanted_event_id} never showed up in Recent for {room_id}");
+}
+
+async fn read_room_events_once(device: &mut Device, room_id: &str) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    let mut collect = |_: &wbf_sdk::protocol::BatchMeta, batch: Vec<serde_json::Value>| {
+        events.extend(batch);
+        Ok(())
+    };
+    device
+        .ws
+        .recent_window(
+            &wbf_sdk::protocol::RecentRequest {
+                rooms: Some(vec![room_id.to_string()]),
+                limit: 50,
+                cg_seq: None,
+                before: None,
+                batch: None,
+            },
+            Duration::from_secs(30),
+            &mut collect,
+        )
+        .await
+        .expect("Recent");
+    events
+        .into_iter()
+        .filter(|event| event["type"] == "m.room.encrypted")
+        .collect()
+}
+
+async fn decrypt_body(device: &Device, room_id: &str, event: &serde_json::Value) -> String {
+    let clear = device
+        .engine
+        .decrypt_room_event(room_id, event)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} cannot decrypt {}: {error}",
+                device.session.device_id, event["event_id"]
+            )
+        });
+    assert_eq!(clear["type"], "m.room.message", "{clear}");
+    clear["content"]["body"].as_str().expect("body").to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel with two accounts; see file header"]
+async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent() {
+    let (Some(target), Some(target_b)) = (target(), target_b()) else {
+        eprintln!("WBF_E2E_* (incl. _B) not set; skipping");
+        return;
+    };
+    // ⚠️ txn_id 每輪要不同：server 的 WS Send 把 txn 去重鍵在帳號（`sender_device: None`），重用會拿到上一輪別的房的 event_id。
+    let run_tag = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0)
+    );
+    let txn_1 = format!("45-txn-1-{run_tag}");
+    let txn_2 = format!("45-txn-2-{run_tag}");
+    // Alice 的送出裝置宣告 feature：之後每則加密訊息都帶 room_version。Bob 的裝置只收，不宣告。
+    let mut alice = log_in_device_of(
+        &target.server,
+        &target.user,
+        &target.password,
+        "45 alice A",
+        true,
+    )
+    .await;
+    let mut bob1 = log_in_device_of(
+        &target.server,
+        &target_b.user,
+        &target_b.password,
+        "45 bob B1",
+        false,
+    )
+    .await;
+    alice
+        .engine
+        .send_outgoing_requests(&mut alice.ws)
+        .await
+        .expect("alice uploads keys");
+    bob1.engine
+        .send_outgoing_requests(&mut bob1.ws)
+        .await
+        .expect("bob B1 uploads keys");
+
+    // 1. Alice 開加密房、邀 Bob、Bob 加入（建房與成員操作走 HTTP，不在這一支的範圍）。
+    let room_id = create_encrypted_room(&alice.session).await;
+    http_post(
+        &alice.session,
+        &format!("/_matrix/client/v3/rooms/{room_id}/invite"),
+        serde_json::json!({ "user_id": bob1.session.user_id }),
+    )
+    .await;
+    let joined = http_post(
+        &bob1.session,
+        &format!("/_matrix/client/v3/join/{room_id}"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(joined["room_id"], room_id, "{joined}");
+
+    // 2. Alice 點進房間：refresh（第一次，每個人都查）→ 房間金鑰發給 Alice 與 Bob B1。
+    let first = alice
+        .engine
+        .refresh_room_devices(&mut alice.ws, &room_id, None)
+        .await
+        .expect("alice refresh #1");
+    assert_eq!(first.versions.members.len(), 2, "{first:?}");
+    assert!(first.versions.members.contains_key(&bob1.session.user_id));
+    assert!(first.shared_to_device_requests >= 1, "{first:?}");
+    assert!(first.rechecked.is_empty(), "雜湊第一次就對上：{first:?}");
+
+    // 3. Alice 帶這份快照的號碼送：接受。Bob B1 拉 to-device 拿到房間金鑰、Recent 拉密文、解開。
+    let sent = alice
+        .engine
+        .encrypt_and_send(
+            &mut alice.ws,
+            &first,
+            &OutgoingRoomEvent {
+                event_type: "m.room.message".into(),
+                content: serde_json::json!({ "msgtype": "m.text", "body": "hi bob" }),
+                txn_id: txn_1.clone(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("send #1");
+    let SendOutcome::Sent {
+        event_id: first_event_id,
+    } = sent
+    else {
+        panic!("{sent:?}")
+    };
+    bob1.ws
+        .device_subscribe(&bob1.session.device_id, Duration::from_secs(30))
+        .await
+        .expect("B1 subscribes");
+    let reports = bob1
+        .engine
+        .pull_to_device(&mut bob1.ws, Duration::from_secs(30))
+        .await
+        .expect("B1 pulls");
+    assert!(
+        reports
+            .iter()
+            .flat_map(|report| report.room_keys.iter())
+            .any(|key| key.room_id.as_str() == room_id),
+        "{reports:?}"
+    );
+    let events = read_room_events(&mut bob1, &room_id, &first_event_id).await;
+    let first_event = events
+        .iter()
+        .find(|event| event["event_id"] == first_event_id)
+        .expect("B1 sees the event");
+    assert_eq!(decrypt_body(&bob1, &room_id, first_event).await, "hi bob");
+
+    // 4. Bob 在新裝置 B2 登入並上傳金鑰 → Bob 的裝置版本號變、房間版本號變。
+    let mut bob2 = log_in_device_of(
+        &target.server,
+        &target_b.user,
+        &target_b.password,
+        "45 bob B2",
+        false,
+    )
+    .await;
+    bob2.engine
+        .send_outgoing_requests(&mut bob2.ws)
+        .await
+        .expect("bob B2 uploads keys");
+    assert_ne!(bob1.session.device_id, bob2.session.device_id);
+
+    // 5. Alice 帶**舊**號碼送：server 擋下（1506，帶目前的號碼），訊息沒送。
+    let stale = alice
+        .engine
+        .encrypt_and_send(
+            &mut alice.ws,
+            &first,
+            &OutgoingRoomEvent {
+                event_type: "m.room.message".into(),
+                content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),
+                txn_id: txn_2.clone(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("send #2 (stale)");
+    let SendOutcome::RoomDevicesChanged {
+        current_room_version,
+        ..
+    } = stale
+    else {
+        panic!("stale version must be refused: {stale:?}")
+    };
+    let current_room_version = current_room_version.expect("1506 carries the current room version");
+    assert!(
+        current_room_version > first.versions.room_version,
+        "{current_room_version} > {}",
+        first.versions.room_version
+    );
+
+    // 6. 修：refresh（跟上一份比 → 只有 Bob 變了 → 只重查 Bob → 房間金鑰補給 B2）。
+    let second = alice
+        .engine
+        .refresh_room_devices(&mut alice.ws, &room_id, Some(&first.versions))
+        .await
+        .expect("alice refresh #2");
+    assert_eq!(
+        second.diff.changed,
+        vec![bob1.session.user_id.clone()],
+        "{second:?}"
+    );
+    assert!(second.diff.left.is_empty());
+    assert!(
+        second.versions.room_version >= current_room_version,
+        "{second:?}"
+    );
+    assert!(
+        second.versions.members[&bob1.session.user_id].seq
+            > first.versions.members[&bob1.session.user_id].seq
+    );
+    assert!(
+        second.shared_to_device_requests >= 1,
+        "B2 must get the room key: {second:?}"
+    );
+    let known = alice
+        .engine
+        .known_devices_of(&bob1.session.user_id)
+        .await
+        .unwrap();
+    assert!(known.contains(&bob2.session.device_id), "{known:?}");
+
+    // 7. 帶新號碼重送（同一個 txn_id）：接受。
+    let resent = alice
+        .engine
+        .encrypt_and_send(
+            &mut alice.ws,
+            &second,
+            &OutgoingRoomEvent {
+                event_type: "m.room.message".into(),
+                content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),
+                txn_id: txn_2.clone(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("send #2 (resend)");
+    let SendOutcome::Sent {
+        event_id: second_event_id,
+    } = resent
+    else {
+        panic!("{resent:?}")
+    };
+    assert_ne!(second_event_id, first_event_id);
+
+    // 8. Bob 的新裝置 B2 收到那一輪的房間金鑰、解得開重送的那則；舊裝置 B1 也解得開。
+    bob2.ws
+        .device_subscribe(&bob2.session.device_id, Duration::from_secs(30))
+        .await
+        .expect("B2 subscribes");
+    let reports = bob2
+        .engine
+        .pull_to_device(&mut bob2.ws, Duration::from_secs(30))
+        .await
+        .expect("B2 pulls");
+    assert!(
+        reports
+            .iter()
+            .flat_map(|report| report.room_keys.iter())
+            .any(|key| key.room_id.as_str() == room_id),
+        "B2 got no room key: {reports:?}"
+    );
+    let events = read_room_events(&mut bob2, &room_id, &second_event_id).await;
+    let second_event = events
+        .iter()
+        .find(|event| event["event_id"] == second_event_id)
+        .expect("B2 sees the event");
+    assert_eq!(
+        decrypt_body(&bob2, &room_id, second_event).await,
+        "hi again"
+    );
+    bob1.engine
+        .pull_to_device(&mut bob1.ws, Duration::from_secs(30))
+        .await
+        .expect("B1 pulls again");
+    let events = read_room_events(&mut bob1, &room_id, &second_event_id).await;
+    let second_event = events
+        .iter()
+        .find(|event| event["event_id"] == second_event_id)
+        .expect("B1 sees the event");
+    assert_eq!(
+        decrypt_body(&bob1, &room_id, second_event).await,
+        "hi again"
+    );
+
+    for device in [&mut bob1, &mut bob2] {
+        device.ws.device_unsubscribe().await.expect("unsubscribe");
+    }
+    for device in [&alice, &bob1, &bob2] {
+        logout(&device.session).await.expect("logout");
+        let _ = std::fs::remove_dir_all(&device.store_dir);
+    }
 }

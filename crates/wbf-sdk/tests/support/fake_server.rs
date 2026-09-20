@@ -69,6 +69,12 @@ pub struct FakeServer {
     pub subscribed_device: Option<String>,
     /// `Subscribe` 之後跟的 `CryptoState` 帶的 OTK 數量。
     pub otk_count: u64,
+    /// 走橋 `KeysQuery`（`0x17/0x21`）回的 body；None → 什麼金鑰都沒有（`device_keys: {}`）。
+    pub keys_query_body: Option<serde_json::Value>,
+    /// `Event/Send`：學 server 的 F4——這個房目前的房間版本號；`m.room.encrypted` 帶的 `room_version` 對不上就 1506。None ＝ 不檢查。
+    pub current_room_version: Option<u64>,
+    /// `Event/Send` 收下的：(room_id, type, room_version)。
+    pub sent_events: Vec<(String, String, Option<u64>)>,
 }
 
 /// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
@@ -135,6 +141,7 @@ impl FakeServer {
             }
             (Kind::Download, download::INFO) => self.info(request),
             (Kind::Download, download::READ) => self.read(request),
+            (Kind::Event, wbf_wire::pack::event::SEND) => self.send(request),
             // 說出口的退出：解除持有；沒訂也是 no-op。
             (Kind::Device, wbf_wire::pack::device::UNSUBSCRIBE) => {
                 self.subscribed_device = None;
@@ -247,6 +254,27 @@ impl FakeServer {
                 ));
                 ok(b"{}".to_vec())
             }
+            // E2EE (A)：金鑰端點。這個假 server 不存金鑰，只回形狀對的答案讓狀態機往下走。
+            (Kind::Keys, 0x20) => {
+                ok(br#"{"one_time_key_counts":{"signed_curve25519":50}}"#.to_vec())
+            }
+            (Kind::Keys, 0x21) => {
+                // 🚨 問到的每個人都要在 `device_keys` 裡有一個條目（哪怕是空的）：上游對沒回答的人會一直重查。
+                let body = self.keys_query_body.clone().unwrap_or_else(|| {
+                    let asked: serde_json::Value =
+                        serde_json::from_slice(&request.data).unwrap_or_default();
+                    let mut device_keys = serde_json::Map::new();
+                    if let Some(users) = asked["device_keys"].as_object() {
+                        for user_id in users.keys() {
+                            device_keys.insert(user_id.clone(), serde_json::json!({}));
+                        }
+                    }
+                    serde_json::json!({ "device_keys": device_keys, "failures": {}, "master_keys": {},
+                        "self_signing_keys": {}, "user_signing_keys": {} })
+                });
+                ok(body.to_string().into_bytes())
+            }
+            (Kind::Keys, 0x22) => ok(br#"{"one_time_keys":{},"failures":{}}"#.to_vec()),
             _ => rejected(
                 "UnknownKind",
                 400,
@@ -254,6 +282,38 @@ impl FakeServer {
                 "not on this fake bridge",
             ),
         }
+    }
+
+    /// `Event/Send`（media-attachments §3 ＋ wbf-room-device-version §7）：收下並發一個假的 event_id；
+    /// `current_room_version` 有設時，`m.room.encrypted` 帶的 `room_version` 對不上就回 1506（meta 帶目前的號碼）。
+    fn send(
+        &mut self,
+        request: &Pack,
+    ) -> Result<(serde_json::Value, Vec<u8>), (&'static str, String, serde_json::Value)> {
+        let meta: serde_json::Value = serde_json::from_slice(&request.meta).map_err(|_| {
+            (
+                "InvalidRequest",
+                "meta not json".to_string(),
+                serde_json::json!({}),
+            )
+        })?;
+        let room_id = meta["room_id"].as_str().unwrap_or_default().to_string();
+        let event_type = meta["type"].as_str().unwrap_or_default().to_string();
+        let room_version = meta["room_version"].as_u64();
+        if let Some(current) = self.current_room_version {
+            if event_type == "m.room.encrypted" && room_version != Some(current) {
+                return Err((
+                    "RoomDevicesChanged",
+                    "the room's members or their devices changed since this room_version: fetch the members again".to_string(),
+                    serde_json::json!({ "room_version": current }),
+                ));
+            }
+        }
+        self.sent_events.push((room_id, event_type, room_version));
+        Ok((
+            serde_json::json!({ "event_id": format!("$fake-{}", self.sent_events.len()) }),
+            Vec::new(),
+        ))
     }
 
     fn create(
