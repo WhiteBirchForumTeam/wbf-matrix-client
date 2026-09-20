@@ -150,3 +150,31 @@ fn sdk_error_current_room_version() {
     );
     assert_eq!(error.current_room_version(), Some(81240));
 }
+
+// ---- Device 的原生 pack 與 to_device_state ----
+
+#[test]
+fn device_items_destroy() {
+    let pack = wbf_sdk::protocol::device_items_destroy(&[4712, 4713], 1, 1);
+    assert_eq!(pack.meta, br#"{"tc":2}"#);
+    assert_eq!(pack.data.len(), 16);
+}
+
+#[test]
+fn decode_counts() {
+    let pack = wbf_sdk::protocol::device_items_destroy(&[4712, 4713], 1, 1);
+    assert_eq!(
+        wbf_sdk::protocol::decode_counts(&pack.data).unwrap(),
+        vec![4712, 4713]
+    );
+}
+
+#[test]
+fn to_device_state_mark_processed_and_destroyed() {
+    let mut state = wbf_sdk::to_device_state::ToDeviceState::default();
+    state.mark_processed(4712);
+    assert_eq!(state.cd_seq, Some(4712));
+    assert_eq!(state.to_destroy, vec![4712]);
+    state.mark_destroyed(&[4712]);
+    assert!(state.to_destroy.is_empty());
+}

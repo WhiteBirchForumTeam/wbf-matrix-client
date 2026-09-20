@@ -59,6 +59,16 @@ pub struct FakeServer {
     pub bridged_members: Option<serde_json::Value>,
     /// 走橋 `SendToDevice`（`0x16/0x25`）收到的：(event_type, txn_id, body)。
     pub to_device_sent: Vec<(String, String, Vec<u8>)>,
+    /// 這台裝置的 to-device 佇列：(count, 事件)，count 遞增（舊→新）。`Device/Fetch` 從這裡拉，`ItemsDestroy` 從這裡刪。
+    pub to_device_queue: Vec<(u64, serde_json::Value)>,
+    /// `Device/Batch` 每批幾則（預設 2，好測跨 Batch）。
+    pub device_batch_size: usize,
+    /// 故障：`ItemsDestroy` 只回 `Ack`、不回 `ItemsDestroyed`（模擬斷在中間的 server）。
+    pub omit_items_destroyed: bool,
+    /// `Device/Subscribe` 登記過的裝置：只有登記過（持有佇列）才能 `ItemsDestroy`，否則 `Forbidden`（學 server device.rs）。
+    pub subscribed_device: Option<String>,
+    /// `Subscribe` 之後跟的 `CryptoState` 帶的 OTK 數量。
+    pub otk_count: u64,
 }
 
 /// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
@@ -78,6 +88,7 @@ impl FakeServer {
     pub fn new() -> FakeServer {
         FakeServer {
             next_id: 0x1122_3344_5566_7788,
+            device_batch_size: 2,
             ..Default::default()
         }
     }
@@ -124,6 +135,11 @@ impl FakeServer {
             }
             (Kind::Download, download::INFO) => self.info(request),
             (Kind::Download, download::READ) => self.read(request),
+            // 說出口的退出：解除持有；沒訂也是 no-op。
+            (Kind::Device, wbf_wire::pack::device::UNSUBSCRIBE) => {
+                self.subscribed_device = None;
+                Ok((serde_json::json!({}), Vec::new()))
+            }
             _ => Err((
                 "UnknownKind",
                 "no such kind/subtype".to_string(),
@@ -560,6 +576,162 @@ impl FakeServer {
         }
         packs
     }
+
+    /// `Device/Fetch` 一窗 → 一串 `Device/Batch`（wbf-to-device.md §3）：只要 count > cd_seq 的，舊→新，最多 `limit` 則，
+    /// 每 `device_batch_size` 則一個 Batch；meta 帶 `counts`（跟 data 一一對應）、`ot`／`nt`。
+    fn device_batches(&self, request: &Pack) -> Vec<Pack> {
+        let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
+        let cd_seq = meta["cd_seq"].as_u64().unwrap_or(0);
+        let limit = meta["limit"].as_u64().unwrap_or(1000).clamp(1, 1000) as usize;
+        let window: Vec<&(u64, serde_json::Value)> = self
+            .to_device_queue
+            .iter()
+            .filter(|(count, _)| *count > cd_seq)
+            .take(limit)
+            .collect();
+        let tc = window.len();
+        let more = tc == limit;
+        let make = |seq: u32, slice: &[&(u64, serde_json::Value)], sent_after: usize| {
+            let items: Vec<Vec<u8>> = slice
+                .iter()
+                .map(|(_, event)| event.to_string().into_bytes())
+                .collect();
+            let counts: Vec<u64> = slice.iter().map(|(count, _)| *count).collect();
+            let (ot, nt) = (
+                counts.first().copied().unwrap_or(0),
+                counts.last().copied().unwrap_or(0),
+            );
+            Pack {
+                kind: Kind::Device,
+                subtype: wbf_wire::pack::device::BATCH,
+                flags: flags::IS_RESPONSE,
+                id: request.id,
+                seq,
+                meta: serde_json::json!({ "bc": slice.len(), "counts": counts, "more": more, "nt": nt, "ot": ot,
+                    "r": tc - sent_after, "tc": tc })
+                .to_string()
+                .into_bytes(),
+                data: wbf_sdk::protocol::join_length_prefixed(&items),
+            }
+        };
+        if tc == 0 {
+            return vec![make(0, &[], 0)];
+        }
+        let batch = self.device_batch_size.max(1);
+        let mut packs = Vec::new();
+        let mut sent = 0usize;
+        let mut seq = 0u32;
+        while sent < tc {
+            let end = (sent + batch).min(tc);
+            packs.push(make(seq, &window[sent..end], end));
+            sent = end;
+            seq += 1;
+        }
+        packs
+    }
+
+    /// `Device/ItemsDestroy` → 先 `Control/Ack`（只是收到）再 `Device/ItemsDestroyed`（真的沒了的：佇列裡有的刪掉、本來就不在的也算沒了）。
+    /// `tc` 跟 data 長度對不上 → `InvalidRequest`，一則都不刪（to-device-client.md §4 第 4 條）。
+    fn items_destroy_replies(&mut self, request: &Pack) -> Vec<Pack> {
+        let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
+        let tc = meta["tc"].as_u64().unwrap_or(u64::MAX) as usize;
+        // 學真 server：`Ack` 抄命令的 seq，`ItemsDestroyed` 的 seq 是 0（2026-09-21 實跑）。
+        let reply = |kind: Kind, subtype: u8, meta: serde_json::Value, data: Vec<u8>| Pack {
+            kind,
+            subtype,
+            flags: flags::IS_RESPONSE,
+            id: request.id,
+            seq: if kind == Kind::Control {
+                request.seq
+            } else {
+                0
+            },
+            meta: meta.to_string().into_bytes(),
+            data,
+        };
+        if self.subscribed_device.is_none() {
+            return vec![reply(
+                Kind::Control,
+                control::ERROR,
+                serde_json::json!({ "code": "Forbidden", "code_id": code_id_of("Forbidden"),
+                    "message": "only the connection holding this device's to-device queue may destroy from it" }),
+                Vec::new(),
+            )];
+        }
+        if request.data.len() != tc * 8 {
+            return vec![reply(
+                Kind::Control,
+                control::ERROR,
+                serde_json::json!({ "code": "InvalidRequest", "code_id": code_id_of("InvalidRequest"),
+                    "message": "tc does not match the data length" }),
+                Vec::new(),
+            )];
+        }
+        let asked: Vec<u64> = request
+            .data
+            .chunks_exact(8)
+            .map(|chunk| u64::from_be_bytes(chunk.try_into().unwrap()))
+            .collect();
+        self.to_device_queue
+            .retain(|(count, _)| !asked.contains(count));
+        let mut replies = vec![reply(
+            Kind::Control,
+            control::ACK,
+            serde_json::json!({}),
+            Vec::new(),
+        )];
+        if !self.omit_items_destroyed {
+            let mut data = Vec::new();
+            for count in &asked {
+                data.extend_from_slice(&count.to_be_bytes());
+            }
+            replies.push(reply(
+                Kind::Device,
+                wbf_wire::pack::device::ITEMS_DESTROYED,
+                serde_json::json!({ "bc": asked.len(), "tc": tc }),
+                data,
+            ));
+        }
+        replies
+    }
+
+    /// `Device/Subscribe`（不帶 `cd_seq`）→ `Ack` 再 `CryptoState`（wbf-e2ee.md §3.3）；`device_id` 缺了 → `InvalidRequest`。
+    fn subscribe_replies(&mut self, request: &Pack) -> Vec<Pack> {
+        let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
+        let reply = |kind: Kind, subtype: u8, seq: u32, meta: serde_json::Value| Pack {
+            kind,
+            subtype,
+            flags: flags::IS_RESPONSE,
+            id: request.id,
+            seq,
+            meta: meta.to_string().into_bytes(),
+            data: Vec::new(),
+        };
+        let Some(device_id) = meta["device_id"].as_str() else {
+            return vec![reply(
+                Kind::Control,
+                control::ERROR,
+                request.seq,
+                serde_json::json!({ "code": "InvalidRequest", "code_id": code_id_of("InvalidRequest"), "message": "missing device_id" }),
+            )];
+        };
+        self.subscribed_device = Some(device_id.to_string());
+        vec![
+            reply(
+                Kind::Control,
+                control::ACK,
+                request.seq,
+                serde_json::json!({}),
+            ),
+            reply(
+                Kind::Device,
+                wbf_wire::pack::device::CRYPTO_STATE,
+                0,
+                serde_json::json!({ "gap": false, "otk_counts": { "signed_curve25519": self.otk_count },
+                    "unused_fallback_key_types": ["signed_curve25519"] }),
+            ),
+        ]
+    }
 }
 
 impl PackChannel for FakeServer {
@@ -573,12 +745,19 @@ impl PackChannel for FakeServer {
         let decoded = Pack::decode(&bytes)?;
         self.requests
             .push((decoded.kind, decoded.subtype, decoded.seq));
-        if (decoded.kind, decoded.subtype) != (Kind::Event, wbf_wire::pack::event::RECENT) {
-            let response = self.handle(&decoded);
-            on_pack(Pack::decode(&response.encode()?)?)?;
-            return Ok(());
-        }
-        let batches = self.recent_batches(&decoded);
+        let batches = match (decoded.kind, decoded.subtype) {
+            (Kind::Event, wbf_wire::pack::event::RECENT) => self.recent_batches(&decoded),
+            (Kind::Device, wbf_wire::pack::device::FETCH) => self.device_batches(&decoded),
+            (Kind::Device, wbf_wire::pack::device::ITEMS_DESTROY) => {
+                self.items_destroy_replies(&decoded)
+            }
+            (Kind::Device, wbf_wire::pack::device::SUBSCRIBE) => self.subscribe_replies(&decoded),
+            _ => {
+                let response = self.handle(&decoded);
+                on_pack(Pack::decode(&response.encode()?)?)?;
+                return Ok(());
+            }
+        };
         let drop_after = self.drop_stream_after_batches.take();
         for (index, batch) in batches.into_iter().enumerate() {
             if drop_after.is_some_and(|after| index as u32 >= after) {

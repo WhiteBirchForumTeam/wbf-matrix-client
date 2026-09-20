@@ -869,3 +869,217 @@ fn a_bridge_reply_without_the_bridge_bit_or_a_2xx_is_not_success() {
         "橋之前的拒絕：沒有 bit4，照樣是 Server"
     );
 }
+
+/// `0x16 Device` 的原生 pack 對著 server 向量（wbf-to-device.md §3）：三個請求逐 byte 一樣（meta 鍵序也是），
+/// `Batch` 與 `ItemsDestroyed` 解得出 count 與事件。
+#[test]
+fn device_packs_match_server_vectors() {
+    use wbf_sdk::protocol::{self, DeviceFetchRequest, DeviceSubscribeRequest};
+    use wbf_wire::Pack;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let pack_named = |name: &str| -> Pack {
+        let entry = vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"));
+        Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
+    };
+
+    let fetch = pack_named("device_fetch");
+    let ours = protocol::device_fetch(
+        &DeviceFetchRequest {
+            cd_seq: Some(4711),
+            limit: Some(1000),
+        },
+        fetch.id,
+        fetch.seq,
+    );
+    assert_eq!(
+        ours.encode().unwrap(),
+        fetch.encode().unwrap(),
+        "Fetch 逐 byte"
+    );
+
+    let subscribe = pack_named("device_subscribe");
+    let ours = protocol::device_subscribe(
+        &DeviceSubscribeRequest {
+            cd_seq: Some(4711),
+            device_id: "RJYKSTBOIE".into(),
+        },
+        subscribe.id,
+        subscribe.seq,
+    );
+    assert_eq!(
+        ours.encode().unwrap(),
+        subscribe.encode().unwrap(),
+        "Subscribe 逐 byte"
+    );
+
+    let destroy = pack_named("device_items_destroy");
+    let ours = protocol::device_items_destroy(&[0x1268, 0x1269], destroy.id, destroy.seq);
+    assert_eq!(
+        ours.encode().unwrap(),
+        destroy.encode().unwrap(),
+        "ItemsDestroy 逐 byte（tc 與 2×u64 大端）"
+    );
+
+    let batch = pack_named("device_batch");
+    let checked = protocol::expect_device_batch(&fetch, batch, 0).unwrap();
+    let (meta, items) = protocol::parse_device_batch(&checked).unwrap();
+    assert_eq!((meta.tc, meta.bc, meta.r, meta.more), (1, 1, 0, false));
+    assert_eq!(
+        (meta.ot, meta.nt, meta.counts.clone()),
+        (4712, 4712, vec![4712])
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].0, 4712);
+    assert_eq!(
+        items[0].1["content"]["algorithm"],
+        "m.olm.v1.curve25519-aes-sha2"
+    );
+
+    let destroyed = pack_named("device_items_destroyed");
+    assert_eq!(
+        protocol::parse_items_destroyed(&destroy, &destroyed, &[0x1268, 0x1269]).unwrap(),
+        Some(vec![0x1268, 0x1269])
+    );
+    let ack = Pack {
+        kind: wbf_wire::Kind::Control,
+        subtype: wbf_wire::pack::control::ACK,
+        flags: wbf_wire::pack::flags::IS_RESPONSE,
+        id: destroy.id,
+        seq: destroy.seq,
+        meta: b"{}".to_vec(),
+        data: Vec::new(),
+    };
+    assert_eq!(
+        protocol::parse_items_destroyed(&destroy, &ack, &[0x1268, 0x1269]).unwrap(),
+        None,
+        "Ack 只是收到"
+    );
+}
+
+/// 🚨 Device 那組的 fail closed：count 不遞增、`ot`／`nt` 對不上、`ItemsDestroyed` 回了沒列過的 count、`tc` 跟命令不符——全是 `Protocol`。
+#[test]
+fn device_packs_reject_inconsistent_shapes() {
+    use wbf_sdk::protocol::{self, join_length_prefixed};
+    use wbf_sdk::SdkError;
+    use wbf_wire::pack::{device, flags};
+    use wbf_wire::{Kind, Pack};
+    let batch = |meta: &str, items: &[&str]| Pack {
+        kind: Kind::Device,
+        subtype: device::BATCH,
+        flags: flags::IS_RESPONSE,
+        id: 7,
+        seq: 0,
+        meta: meta.as_bytes().to_vec(),
+        data: join_length_prefixed(
+            &items
+                .iter()
+                .map(|item| item.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    fn is_protocol<T>(result: Result<T, SdkError>) -> bool {
+        matches!(result, Err(SdkError::Protocol(_)))
+    }
+    assert!(
+        is_protocol(protocol::parse_device_batch(&batch(
+            r#"{"tc":2,"bc":2,"ot":5,"nt":4,"counts":[5,4],"r":0,"more":false}"#,
+            &["{}", "{}"]
+        ))),
+        "count 不遞增"
+    );
+    assert!(
+        is_protocol(protocol::parse_device_batch(&batch(
+            r#"{"tc":2,"bc":2,"ot":4,"nt":6,"counts":[4,5],"r":0,"more":false}"#,
+            &["{}", "{}"]
+        ))),
+        "nt 不是最後一個 count"
+    );
+    assert!(
+        is_protocol(protocol::parse_device_batch(&batch(
+            r#"{"tc":2,"bc":2,"ot":4,"nt":5,"counts":[4],"r":0,"more":false}"#,
+            &["{}", "{}"]
+        ))),
+        "counts 少一個"
+    );
+    assert!(
+        is_protocol(protocol::parse_device_batch(&batch(
+            r#"{"tc":1,"bc":1,"ot":4,"nt":4,"counts":[4],"r":0,"more":false}"#,
+            &["[1,2]"]
+        ))),
+        "事件不是物件"
+    );
+    let (meta, _) = protocol::parse_device_batch(&batch(
+        r#"{"tc":1,"bc":1,"ot":4,"nt":4,"counts":[4],"r":0}"#,
+        &["{}"],
+    ))
+    .unwrap();
+    assert!(meta.more, "缺 more ＝ true");
+
+    let command = protocol::device_items_destroy(&[10, 11], 9, 3);
+    let destroyed = |meta: &str, counts: &[u64]| Pack {
+        kind: Kind::Device,
+        subtype: device::ITEMS_DESTROYED,
+        flags: flags::IS_RESPONSE,
+        id: 9,
+        seq: 3,
+        meta: meta.as_bytes().to_vec(),
+        data: counts
+            .iter()
+            .flat_map(|count| count.to_be_bytes())
+            .collect(),
+    };
+    assert!(
+        is_protocol(protocol::parse_items_destroyed(
+            &command,
+            &destroyed(r#"{"tc":2,"bc":1}"#, &[99]),
+            &[10, 11]
+        )),
+        "沒列過的 count"
+    );
+    assert!(
+        is_protocol(protocol::parse_items_destroyed(
+            &command,
+            &destroyed(r#"{"tc":3,"bc":1}"#, &[10]),
+            &[10, 11]
+        )),
+        "tc 跟命令不符"
+    );
+    assert!(
+        is_protocol(protocol::parse_items_destroyed(
+            &command,
+            &destroyed(r#"{"tc":2,"bc":2}"#, &[10]),
+            &[10, 11]
+        )),
+        "bc 跟 data 不符"
+    );
+    let mut wrong_id = destroyed(r#"{"tc":2,"bc":1}"#, &[10]);
+    wrong_id.id = 8;
+    assert!(
+        is_protocol(protocol::parse_items_destroyed(
+            &command,
+            &wrong_id,
+            &[10, 11]
+        )),
+        "id 沒抄"
+    );
+    assert_eq!(
+        protocol::parse_items_destroyed(
+            &command,
+            &destroyed(r#"{"tc":2,"bc":1}"#, &[11]),
+            &[10, 11]
+        )
+        .unwrap(),
+        Some(vec![11]),
+        "只回了一則：另一則留在清單上"
+    );
+    assert!(
+        is_protocol(protocol::decode_counts(&[0u8; 12])),
+        "不是 8 的倍數"
+    );
+}

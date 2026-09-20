@@ -4,7 +4,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use wbf_wire::pack::{control, download, event, flags, upload};
+use wbf_wire::pack::{control, device, download, event, flags, upload};
 use wbf_wire::{EncryptedFileInfo, Kind, Pack};
 
 use crate::error::SdkError;
@@ -170,6 +170,8 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
 
 /// server 在 `Hello.features` 宣告「橋在」的字串（wbf-api-bridge.md §3 批 3-C）。沒宣告的 server 不送橋的 pack。
 pub const BRIDGE_FEATURE: &str = "bridge";
+/// server 宣告「`0x16 Device` 的原生 pack（to-device 佇列）在」的字串（同上）。
+pub const DEVICE_FEATURE: &str = "device";
 
 /// 一支走橋的 Matrix 端點：kind ＋ subtype 決定 method 與路徑模板（server 那邊的白名單）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -736,4 +738,349 @@ pub struct CryptoStateMeta {
 
 fn gap_when_missing() -> bool {
     true
+}
+
+// ---- Device（kind 0x16）：to-device 佇列的原生 pack（wbfuwunel `wbf-to-device.md` §3；client 端的解讀在 to-device-client.md）----
+//
+// 跟 `Event` 那組刻意不同的三處（server §3.1）：**順序舊→新**；`ot`／`nt` 不是 `fs`／`ls`（兩邊方向相反，🚫 不混用）；
+// 每則的 count 不在事件裡，在 meta 的 `counts`（跟 data 一一對應）。
+// 📎 訂閱（`Subscribe`／`Push`／`CryptoState`）要能收非回應的 pack，通道還沒有那個能力（daemon-runtime 第 4 階段）；
+// 這裡先只有 `Fetch`／`Batch`／`ItemsDestroy`／`ItemsDestroyed` 這條「拉」的路，`Subscribe` 只有編碼。
+
+/// `Device/Fetch` 的請求 meta。鍵序照 server 向量 `device_fetch`（`cd_seq` 在 `limit` 前）。
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct DeviceFetchRequest {
+    /// 只要比它新的：我**已經處理完**到哪（to-device-client.md §2）；None ＝ 從頭。下一窗帶上一窗的 `nt`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cd_seq: Option<u64>,
+    /// 這一窗最多幾則；None 用 server 預設（1000）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Args:
+///     request: example: DeviceFetchRequest { cd_seq: Some(4711), limit: Some(1000) }
+///     id: client 選的會話號（型別 `SESSION`）, example: pack::id::compose(pack::id::SESSION, 31)
+pub fn device_fetch(request: &DeviceFetchRequest, id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Device,
+        subtype: device::FETCH,
+        flags: 0,
+        id,
+        seq,
+        meta: serde_json::to_vec(request).expect("DeviceFetchRequest serializes"),
+        data: Vec::new(),
+    }
+}
+
+/// `Device/Subscribe` 的 meta。鍵序照向量 `device_subscribe`（`cd_seq`、`device_id`）。
+/// ⚠️ `device_id` 是明示意圖，server 會跟 session 的比對，不合回 `Forbidden`（to-device-client.md §5）。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DeviceSubscribeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cd_seq: Option<u64>,
+    pub device_id: String,
+}
+
+pub fn device_subscribe(request: &DeviceSubscribeRequest, id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Device,
+        subtype: device::SUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta: serde_json::to_vec(request).expect("DeviceSubscribeRequest serializes"),
+        data: Vec::new(),
+    }
+}
+
+/// `Device/Subscribe`（不帶 `cd_seq`）的回覆，照 server 送來的順序：先 `Ack`（登記好了），再 `CryptoState`（自己的金鑰存量）。
+/// 📎 帶 `cd_seq` 的訂閱會在兩者之間補一輪 `Push`——那要通道能收推播，還沒有（daemon-runtime 第 4 階段），所以這裡不認 `Push`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscribeReply {
+    /// 登記好了：這條連線現在持有這台裝置的佇列（之後才能 `ItemsDestroy`）。
+    Acknowledged,
+    /// 自己這台裝置的 OTK 存量；每個 `Subscribe` 之後一定跟一個。
+    CryptoState(CryptoStateMeta),
+}
+
+/// Args:
+///     request: 送出的 `Subscribe` pack
+/// Return:
+///     Ok(SubscribeReply)
+///     Err(Server)      `Error`（含 `Forbidden`：`device_id` 不是這個 session 的）
+///     Err(Protocol)    `id` 沒抄、`Ack` 的 `seq` 沒抄、或不是 Ack／CryptoState（例：帶 `cd_seq` 才會有的 `Push`）
+pub fn parse_subscribe_reply(request: &Pack, response: &Pack) -> Result<SubscribeReply, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "Subscribe reply id {} does not echo the request id {}",
+            response.id, request.id
+        )));
+    }
+    if response.flags & flags::IS_RESPONSE == 0 {
+        return Err(SdkError::Protocol(
+            "Subscribe reply without IS_RESPONSE".into(),
+        ));
+    }
+    match (response.kind, response.subtype) {
+        (Kind::Control, control::ACK) if response.seq == request.seq => Ok(SubscribeReply::Acknowledged),
+        (Kind::Control, control::ACK) => Err(SdkError::Protocol(format!(
+            "Subscribe Ack seq {} does not echo the request seq {}",
+            response.seq, request.seq
+        ))),
+        (Kind::Device, device::CRYPTO_STATE) => {
+            Ok(SubscribeReply::CryptoState(parse_meta(response)?))
+        }
+        (kind, subtype) => Err(SdkError::Protocol(format!(
+            "expected Ack or Device/CryptoState after Subscribe, got kind {kind:?} subtype {subtype:#04x}"
+        ))),
+    }
+}
+
+/// `Device/Unsubscribe`：說出口的退出（wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
+/// 🚨 下線前要叫：不叫的話這條連線退了卻還佔著裝置，別的連線得靠搶佔才進得來。斷線 server 會自動退，但那是「沒說出口的退出」，兩條路都要有。
+///
+/// Args:
+///     id: client 選的會話號（這個 kind 每個 subtype 都要 `SESSION` 型別的 id）
+pub fn device_unsubscribe(id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Device,
+        subtype: device::UNSUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta: b"{}".to_vec(),
+        data: Vec::new(),
+    }
+}
+
+/// `Device/ItemsDestroy`：meta `{"tc"}`，data 是 `tc` 個 u64 大端的 count（不是 JSON、沒有分隔符）。
+/// 送的是**清單**不是水位（to-device-client.md §4）：只列匯進 crypto store 成功的那些。
+///
+/// Args:
+///     counts: example: &[4712, 4713]
+pub fn device_items_destroy(counts: &[u64], id: u64, seq: u32) -> Pack {
+    let mut data = Vec::with_capacity(counts.len() * 8);
+    for count in counts {
+        data.extend_from_slice(&count.to_be_bytes());
+    }
+    Pack {
+        kind: Kind::Device,
+        subtype: device::ITEMS_DESTROY,
+        flags: 0,
+        id,
+        seq,
+        meta: serde_json::json!({ "tc": counts.len() })
+            .to_string()
+            .into_bytes(),
+        data,
+    }
+}
+
+/// `Device/Batch` 的 meta（server §3）。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DeviceBatchMeta {
+    /// 這一窗總共幾則（≤ limit）。
+    pub tc: u32,
+    /// 這個 Batch 幾則。
+    pub bc: u32,
+    /// oldest：這批最舊的 count（舊→新，所以是第一則）。
+    pub ot: u64,
+    /// newest：這批最新的 count（最後一則）——下一窗的 `cd_seq`。
+    pub nt: u64,
+    /// 每則的 count，跟 data 一一對應（`bc` 個）。
+    pub counts: Vec<u64>,
+    /// 這窗還剩幾則沒送。
+    pub r: u32,
+    /// 這窗停在上限（則數或 byte）；🚨 缺欄位當 true（跟 `Event/Batch` 同一條規則）。
+    #[serde(default = "more_when_missing")]
+    pub more: bool,
+}
+
+/// `Device/ItemsDestroyed` 的 meta：`tc` 抄命令的總數，`bc` 是真的沒了幾則（data 是那 `bc` 個 count）。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct ItemsDestroyedMeta {
+    pub tc: u32,
+    pub bc: u32,
+}
+
+fn more_when_missing() -> bool {
+    true
+}
+
+/// 驗一個 `Device/Batch`：`IS_RESPONSE`、`id` 抄 `Fetch`、`seq` 是這窗的第幾個（從 0 嚴格 +1）。`Error` → `Server`。
+pub fn expect_device_batch(
+    request: &Pack,
+    response: Pack,
+    expected_seq: u32,
+) -> Result<Pack, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    if response.kind != Kind::Device
+        || response.subtype != device::BATCH
+        || response.flags & flags::IS_RESPONSE == 0
+    {
+        return Err(SdkError::Protocol(format!(
+            "expected a Device/Batch response, got kind {:?} subtype {:#04x} flags {:#04x}",
+            response.kind, response.subtype, response.flags
+        )));
+    }
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "Device/Batch id {} does not echo the Fetch id {}",
+            response.id, request.id
+        )));
+    }
+    if response.seq != expected_seq {
+        return Err(SdkError::Protocol(format!(
+            "Device/Batch seq {} where {expected_seq} was expected",
+            response.seq
+        )));
+    }
+    Ok(response)
+}
+
+/// 一個 `Device/Batch` → meta 與 `(count, 事件 JSON)`，舊→新。
+///
+/// Return:
+///     Ok((DeviceBatchMeta, Vec<(u64, Value)>))
+///     Err(Protocol)   meta 不是這個形狀、長度前綴切不齊、則數跟 `bc` 或 `counts` 對不上、count 不是嚴格遞增、
+///                     `ot`／`nt` 不是第一／最後一個 count、`tc < bc + r`、事件不是 JSON 物件
+pub fn parse_device_batch(
+    batch: &Pack,
+) -> Result<(DeviceBatchMeta, Vec<(u64, serde_json::Value)>), SdkError> {
+    let meta: DeviceBatchMeta = parse_meta(batch)?;
+    let items = split_length_prefixed(&batch.data)?;
+    if items.len() as u32 != meta.bc || meta.counts.len() as u32 != meta.bc {
+        return Err(SdkError::Protocol(format!(
+            "Device/Batch meta says bc {} but data holds {} events and counts has {}",
+            meta.bc,
+            items.len(),
+            meta.counts.len()
+        )));
+    }
+    if meta.tc < meta.bc.saturating_add(meta.r) {
+        return Err(SdkError::Protocol(format!(
+            "Device/Batch meta inconsistent: tc {} < bc {} + r {}",
+            meta.tc, meta.bc, meta.r
+        )));
+    }
+    if meta.bc > 0 {
+        // 舊→新、count 嚴格遞增；`ot`／`nt` 就是頭尾。錯一個就是 server 或通道壞了，🚫 不猜。
+        if meta.counts.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(SdkError::Protocol(format!(
+                "Device/Batch counts are not strictly increasing: {:?}",
+                meta.counts
+            )));
+        }
+        if meta.counts[0] != meta.ot || meta.counts[meta.counts.len() - 1] != meta.nt {
+            return Err(SdkError::Protocol(format!(
+                "Device/Batch ot {} / nt {} do not match counts {:?}",
+                meta.ot, meta.nt, meta.counts
+            )));
+        }
+    }
+    let mut events = Vec::with_capacity(items.len());
+    for (count, item) in meta.counts.iter().zip(items) {
+        let event: serde_json::Value = serde_json::from_slice(item).map_err(|error| {
+            SdkError::Protocol(format!("to-device item {count} is not JSON: {error}"))
+        })?;
+        if !event.is_object() {
+            return Err(SdkError::Protocol(format!(
+                "to-device item {count} is not a JSON object"
+            )));
+        }
+        events.push((*count, event));
+    }
+    Ok((meta, events))
+}
+
+/// `ItemsDestroy` 的兩個回應（to-device-client.md §4）：先 `Control/Ack`（只是命令收到），再 `Device/ItemsDestroyed`（真的沒了的那些）。
+///
+/// Args:
+///     request: 送出的 `ItemsDestroy` pack
+///     sent_count: 命令裡列了幾則, example: 2
+/// Return:
+///     Ok(None)         `Ack`：命令收到，🚫 不能據此清待銷毀清單
+///     Ok(Some(counts)) `ItemsDestroyed`：這些 count 遠端已經沒有了（可能是這次刪的、也可能本來就不在）
+///     Err(Server)      `Error`
+///     Err(Protocol)    形狀不對：id／seq 沒抄、`tc` 跟命令不符、data 長度不是 `bc × 8`、回來的 count 不在命令裡
+pub fn parse_items_destroyed(
+    request: &Pack,
+    response: &Pack,
+    sent: &[u64],
+) -> Result<Option<Vec<u64>>, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    // 兩個回覆都抄 `id`；`seq` 只有 `Ack` 抄命令的（`ItemsDestroyed` 自己是一則無序類，server 給 0——
+    // 2026-09-21 對真 server 實跑看到的；向量裡命令的 seq 剛好也是 0，看不出來）。
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "ItemsDestroy reply id {} does not echo the command id {}",
+            response.id, request.id
+        )));
+    }
+    if response.flags & flags::IS_RESPONSE == 0 {
+        return Err(SdkError::Protocol(
+            "ItemsDestroy reply without IS_RESPONSE".into(),
+        ));
+    }
+    match (response.kind, response.subtype) {
+        (Kind::Control, control::ACK) if response.seq == request.seq => Ok(None),
+        (Kind::Control, control::ACK) => Err(SdkError::Protocol(format!(
+            "ItemsDestroy Ack seq {} does not echo the command seq {}",
+            response.seq, request.seq
+        ))),
+        (Kind::Device, device::ITEMS_DESTROYED) => {
+            let meta: ItemsDestroyedMeta = parse_meta(response)?;
+            if meta.tc as usize != sent.len() {
+                return Err(SdkError::Protocol(format!(
+                    "ItemsDestroyed tc {} but the command listed {}",
+                    meta.tc,
+                    sent.len()
+                )));
+            }
+            let destroyed = decode_counts(&response.data)?;
+            if destroyed.len() as u32 != meta.bc {
+                return Err(SdkError::Protocol(format!(
+                    "ItemsDestroyed bc {} but data holds {} counts",
+                    meta.bc,
+                    destroyed.len()
+                )));
+            }
+            // 🚨 消費端再驗一次：只認命令裡列過的。沒列過的 count 回來，是 server 或通道壞了，🚫 不拿它去清清單。
+            if let Some(stranger) = destroyed.iter().find(|count| !sent.contains(count)) {
+                return Err(SdkError::Protocol(format!(
+                    "ItemsDestroyed names count {stranger} which the command did not list"
+                )));
+            }
+            Ok(Some(destroyed))
+        }
+        (kind, subtype) => Err(SdkError::Protocol(format!(
+            "expected Ack or Device/ItemsDestroyed, got kind {kind:?} subtype {subtype:#04x}"
+        ))),
+    }
+}
+
+/// `tc × 8 byte` 的 u64 大端 count 串。
+///
+/// Return:
+///     Ok(Vec<u64>)
+///     Err(Protocol)  長度不是 8 的倍數
+pub fn decode_counts(data: &[u8]) -> Result<Vec<u64>, SdkError> {
+    if !data.len().is_multiple_of(8) {
+        return Err(SdkError::Protocol(format!(
+            "a count list must be a multiple of 8 bytes, got {}",
+            data.len()
+        )));
+    }
+    Ok(data
+        .chunks_exact(8)
+        .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("chunks_exact(8)")))
+        .collect())
 }

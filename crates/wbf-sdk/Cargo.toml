@@ -28,6 +28,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 http = "1"
 matrix-sdk = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk", default-features = false, features = ["e2e-encryption", "bundled-sqlite"], optional = true }
+# E2EE 的狀態機（`OlmMachine`）：只當加解密的引用，網路自己走 WS（e2ee-walkthrough.md §13）。跟 matrix-sdk 同一棵 vendor 樹，版本一定一致。
+matrix-sdk-crypto = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk-crypto", optional = true }
 futures-core = { version = "0.3", optional = true }
 # cache.db（local-cache-db.md §3）：SQLCipher，raw key 由 vault 導出。Windows 編 OpenSSL 要 Strawberry Perl（§3 的建置需求）。
 rusqlite = { version = "0.40", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "limits", "cache"], optional = true }
@@ -36,7 +38,7 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled-sq
 default = []
 # 第 3 步的房間 backend：唯一 use matrix_sdk 的地方是 src/backend/matrix_sdk.rs（plan-v1 §7.2）。
 # 預設關：wbf-sdk 本體不拖 matrix-sdk，apps/wbf-cli 才開。
-matrix = ["dep:matrix-sdk", "dep:futures-core"]
+matrix = ["dep:matrix-sdk", "dep:matrix-sdk-crypto", "dep:futures-core"]
 # 本地快取 cache.db（local-cache-db.md §6）。與 matrix feature 的 store 共用同一份 libsqlite3-sys（feature 統一後是 SQLCipher 版）。
 cache = ["dep:rusqlite"]
 
