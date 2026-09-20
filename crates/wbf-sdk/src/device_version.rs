@@ -337,24 +337,25 @@ mod tests {
         let mut empty_signatures = unsigned_master.clone();
         empty_signatures["signatures"] = json!({});
 
-        let none = compute_device_keys_hash(
-            "@bob:localhost",
-            &keys_query(Some(unsigned_master), None, &[]),
-        );
-        assert_eq!(
-            none,
-            compute_device_keys_hash(
-                "@bob:localhost",
-                &keys_query(Some(signed_by_alice_only), None, &[])
-            )
-        );
-        assert_eq!(
-            none,
-            compute_device_keys_hash(
-                "@bob:localhost",
-                &keys_query(Some(empty_signatures), None, &[])
-            )
-        );
+        // 🚨 期望值不經過被測的過濾函式：直接照規則框出「主金鑰（沒有 signatures 欄位）＋ 空的自簽 ＋ 沒有裝置」。
+        // 三個輸入互相比是不夠的——過濾函式若把「沒有」寫成 `{}`，三個會一起錯、一起相等（變異驗證抓到的）。
+        let canonical_master = serde_json::to_vec(&unsigned_master).unwrap();
+        let mut framed = (canonical_master.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&canonical_master);
+        framed.extend_from_slice(&0u32.to_be_bytes());
+        let expected = hex::encode(Sha256::digest(&framed))[..HASH_HEX_LEN].to_string();
+
+        for (label, master) in [
+            ("從沒被簽過", unsigned_master),
+            ("只被 Alice 簽過", signed_by_alice_only),
+            ("signatures 是空物件", empty_signatures),
+        ] {
+            assert_eq!(
+                compute_device_keys_hash("@bob:localhost", &keys_query(Some(master), None, &[])),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]
