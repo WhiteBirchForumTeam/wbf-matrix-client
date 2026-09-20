@@ -302,6 +302,14 @@ impl BridgeReply {
 pub fn expect_bridge_reply(request: &Pack, response: Pack) -> Result<BridgeReply, SdkError> {
     let is_bridged = response.flags & flags::IS_BRIDGED != 0;
     let ack = expect_ack(request, response)?;
+    // 🚨 `expect_ack` 也放行 `Pong`（ping 要用）；橋的成功回覆只有 `Ack`（index.md §1.2）。一個 meta 湊成 `{"status":200}`
+    // 的 Pong 不是這個請求的答案，🚫 不當成功。
+    if ack.subtype != control::ACK {
+        return Err(SdkError::Protocol(format!(
+            "a bridged request must be answered by Control/Ack, got subtype {:#04x}",
+            ack.subtype
+        )));
+    }
     if !is_bridged {
         return Err(SdkError::Protocol(
             "a bridged request was answered by an Ack without IS_BRIDGED".into(),

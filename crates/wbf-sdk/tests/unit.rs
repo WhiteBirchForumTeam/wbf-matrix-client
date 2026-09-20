@@ -840,6 +840,20 @@ fn a_bridge_reply_without_the_bridge_bit_or_a_2xx_is_not_success() {
         ),
         "3xx 不是成功"
     );
+    assert!(
+        matches!(
+            protocol::expect_bridge_reply(
+                &request,
+                response(
+                    control::PONG,
+                    flags::IS_RESPONSE | flags::IS_BRIDGED,
+                    r#"{"status":200}"#
+                )
+            ),
+            Err(SdkError::Protocol(_))
+        ),
+        "帶 bit4、status 200 的 Pong 不是橋的回覆（PR #47 審查 rumia 🔴）"
+    );
     let locked = protocol::expect_bridge_reply(
         &request,
         response(
