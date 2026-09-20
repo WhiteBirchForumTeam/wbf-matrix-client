@@ -299,3 +299,103 @@ impl<R: std::io::Seek> std::io::Seek for FailAfter<R> {
         self.inner.seek(position)
     }
 }
+
+/// 走橋（#45 第 2 支）對真 server：`Hello` 宣告 `bridge` 與 `org.wbftw.device_versions`；開一個加密房，
+/// `Members` 回來的房間版本號與自己的裝置版本號讀得到；發一則 to-device 給自己（走橋）被收下。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn bridge_members_and_send_to_device_against_real_server() {
+    use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_VERSIONS_FEATURE};
+    let Some(target) = target() else {
+        eprintln!("WBF_E2E_* not set; skipping");
+        return;
+    };
+    let session = login_with_password(
+        &target.server,
+        &target.user,
+        &target.password,
+        "wbf-sdk e2e bridge",
+    )
+    .await
+    .expect("login");
+
+    // 加密房走 HTTP 開（建房不在這一支的範圍）。
+    let created: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/_matrix/client/v3/createRoom", session.server))
+        .bearer_auth(&session.access_token)
+        .json(&serde_json::json!({
+            "preset": "private_chat",
+            "initial_state": [{ "type": "m.room.encryption", "state_key": "", "content": { "algorithm": "m.megolm.v1.aes-sha2" } }]
+        }))
+        .send()
+        .await
+        .expect("createRoom")
+        .json()
+        .await
+        .expect("createRoom body");
+    let room_id = created["room_id"].as_str().expect("room_id").to_string();
+
+    let channel = Channel::connect(&session.server, &session.access_token, Transport::WebSocket)
+        .await
+        .expect("ws");
+    let mut ws = WbfClient::new(channel);
+    let hello = ws.hello("wbf-sdk e2e bridge", &[]).await.expect("hello");
+    assert!(
+        hello
+            .features
+            .iter()
+            .any(|feature| feature == BRIDGE_FEATURE),
+        "{:?}",
+        hello.features
+    );
+    assert!(
+        hello
+            .features
+            .iter()
+            .any(|feature| feature == DEVICE_VERSIONS_FEATURE),
+        "{:?}",
+        hello.features
+    );
+
+    let versions = ws
+        .room_device_versions(&room_id)
+        .await
+        .expect("Members over the bridge");
+    assert!(versions.room_version > 0, "{versions:?}");
+    let mine = versions
+        .members
+        .get(&session.user_id)
+        .expect("I am a joined member");
+    assert!(mine.seq >= 1, "{mine:?}");
+    // 再拿一次：同一個房間、沒人動 → 兩個號碼一樣（不是每次讀都跳）。
+    let again = ws
+        .room_device_versions(&room_id)
+        .await
+        .expect("Members again");
+    assert_eq!(again, versions);
+
+    // 發 to-device 給自己這台裝置；同一個 txn_id 重送也是 Ok（冪等）。
+    let body = serde_json::json!({ "messages": { session.user_id.clone(): { session.device_id.clone(): { "body": "via bridge" } } } })
+        .to_string()
+        .into_bytes();
+    ws.send_to_device("org.wbftw.e2e", "e2e-bridge-1", body.clone())
+        .await
+        .expect("SendToDevice");
+    ws.send_to_device("org.wbftw.e2e", "e2e-bridge-1", body)
+        .await
+        .expect("SendToDevice again (idempotent)");
+
+    // 不在房裡的房間：Matrix 的 403 帶 errcode 過來。
+    let error = ws
+        .room_device_versions("!nonexistent:localhost")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .matrix_status()
+            .is_some_and(|status| status == 403 || status == 404),
+        "{error:?}"
+    );
+
+    logout(&session).await.expect("logout");
+}

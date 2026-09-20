@@ -652,3 +652,220 @@ fn error_meta_matrix_fields_reject_the_wrong_shapes() {
         "不是 Server 就是 false"
     );
 }
+
+/// 走橋的請求與回覆，對著 server 產生的向量（wbfuwunel `wbf-api-bridge.md`）：請求逐 byte 一樣（meta 的鍵序也是）。
+#[test]
+fn bridge_request_and_replies_match_server_vectors() {
+    use wbf_sdk::protocol::{self, BridgedEndpoint};
+    use wbf_sdk::SdkError;
+    use wbf_wire::{Kind, Pack};
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let bytes_named = |name: &str| -> Vec<u8> {
+        let entry = vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"));
+        hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()
+    };
+
+    #[derive(serde::Serialize)]
+    struct SetStateEventVariables<'a> {
+        room_id: &'a str,
+        event_type: &'a str,
+        state_key: &'a str,
+    }
+    let set_state_event = BridgedEndpoint {
+        kind: Kind::Event,
+        subtype: 0x23,
+    };
+    let variables = SetStateEventVariables {
+        room_id: "!r:localhost",
+        event_type: "m.room.topic",
+        state_key: "",
+    };
+    let request = protocol::bridge_request(
+        set_state_event,
+        &variables,
+        br#"{"topic":"hello"}"#.to_vec(),
+        50,
+    );
+    assert_eq!(
+        request.encode().unwrap(),
+        bytes_named("bridge_set_state_event"),
+        "逐 byte 一樣；state_key 的空字串不能省"
+    );
+
+    let ack = Pack::decode(&bytes_named("bridge_ack")).unwrap();
+    let reply = protocol::expect_bridge_reply(&request, ack).unwrap();
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        reply.headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(reply.body, br#"{"event_id":"$t0p1c:localhost"}"#.to_vec());
+    assert_eq!(
+        reply.json("SetStateEvent").unwrap()["event_id"],
+        "$t0p1c:localhost"
+    );
+
+    let forbidden = Pack::decode(&bytes_named("bridge_error_forbidden")).unwrap();
+    let request_51 = protocol::bridge_request(set_state_event, &variables, Vec::new(), 51);
+    match protocol::expect_bridge_reply(&request_51, forbidden) {
+        Err(error @ SdkError::Server { .. }) => {
+            assert_eq!(error.matrix_status(), Some(403));
+            assert_eq!(error.matrix_errcode(), Some("M_FORBIDDEN"));
+        }
+        other => panic!("expected Server, got {other:?}"),
+    }
+}
+
+/// 這一支用到的端點：號碼照 server 的 bridge-specs 總表；變數的鍵序照範例，沒給的 query 變數整個省掉。
+#[test]
+fn bridged_endpoints_and_variables_follow_the_specs_index() {
+    use wbf_sdk::protocol::{self, MembersVariables, NoVariables, SendToDeviceVariables};
+    use wbf_wire::Kind;
+    let first_four_bytes = |endpoint: protocol::BridgedEndpoint| {
+        let pack = protocol::bridge_request(endpoint, &NoVariables {}, Vec::new(), 1);
+        pack.encode().unwrap()[..4].to_vec()
+    };
+    // index.md：「前 4 個 byte 就決定了這是哪個操作」：01 KK SS 10。
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_MEMBERS),
+        [0x01, 0x13, 0x29, 0x10]
+    );
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_SEND_TO_DEVICE),
+        [0x01, 0x16, 0x25, 0x10]
+    );
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_KEYS_UPLOAD),
+        [0x01, 0x17, 0x20, 0x10]
+    );
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_KEYS_QUERY),
+        [0x01, 0x17, 0x21, 0x10]
+    );
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_KEYS_CLAIM),
+        [0x01, 0x17, 0x22, 0x10]
+    );
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_SIGNING_KEYS_UPLOAD),
+        [0x01, 0x17, 0x24, 0x10]
+    );
+    assert_eq!(
+        first_four_bytes(protocol::BRIDGE_SIGNATURES_UPLOAD),
+        [0x01, 0x17, 0x25, 0x10]
+    );
+    assert_eq!(Kind::from_byte(0x13), Some(Kind::Room));
+    assert_eq!(Kind::from_byte(0x17), Some(Kind::Keys));
+
+    assert_eq!(serde_json::to_string(&NoVariables {}).unwrap(), "{}");
+    assert_eq!(
+        serde_json::to_string(&MembersVariables {
+            room_id: "!r:localhost",
+            membership: Some("join")
+        })
+        .unwrap(),
+        r#"{"room_id":"!r:localhost","membership":"join"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&MembersVariables {
+            room_id: "!r:localhost",
+            membership: None
+        })
+        .unwrap(),
+        r#"{"room_id":"!r:localhost"}"#,
+        "沒給的 query 變數整個省掉，🚫 不送空字串"
+    );
+    assert_eq!(
+        serde_json::to_string(&SendToDeviceVariables {
+            event_type: "m.room.encrypted",
+            txn_id: "t1"
+        })
+        .unwrap(),
+        r#"{"event_type":"m.room.encrypted","txn_id":"t1"}"#
+    );
+}
+
+/// 🚨 走橋的 Ack 沒帶 bit4、或狀態不是 2xx：🚫 不當成功（fail closed）。沒帶 bit4 的 **Error** 照樣是被拒（session 在橋之前被擋）。
+#[test]
+fn a_bridge_reply_without_the_bridge_bit_or_a_2xx_is_not_success() {
+    use wbf_sdk::protocol;
+    use wbf_sdk::SdkError;
+    use wbf_wire::pack::{control, flags};
+    use wbf_wire::{Kind, Pack};
+    let request = protocol::bridge_request(
+        protocol::BRIDGE_MEMBERS,
+        &protocol::MembersVariables {
+            room_id: "!r:x",
+            membership: Some("join"),
+        },
+        Vec::new(),
+        7,
+    );
+    let response = |subtype: u8, response_flags: u8, meta: &str| Pack {
+        kind: Kind::Control,
+        subtype,
+        flags: response_flags,
+        id: 0,
+        seq: 7,
+        meta: meta.as_bytes().to_vec(),
+        data: br#"{}"#.to_vec(),
+    };
+    assert!(
+        matches!(
+            protocol::expect_bridge_reply(
+                &request,
+                response(control::ACK, flags::IS_RESPONSE, r#"{"status":200}"#)
+            ),
+            Err(SdkError::Protocol(_))
+        ),
+        "沒帶 bit4 的 Ack"
+    );
+    assert!(
+        matches!(
+            protocol::expect_bridge_reply(
+                &request,
+                response(
+                    control::ACK,
+                    flags::IS_RESPONSE | flags::IS_BRIDGED,
+                    r#"{"status":302}"#
+                )
+            ),
+            Err(SdkError::Protocol(_))
+        ),
+        "3xx 不是成功"
+    );
+    assert!(
+        matches!(
+            protocol::expect_bridge_reply(
+                &request,
+                response(
+                    control::PONG,
+                    flags::IS_RESPONSE | flags::IS_BRIDGED,
+                    r#"{"status":200}"#
+                )
+            ),
+            Err(SdkError::Protocol(_))
+        ),
+        "帶 bit4、status 200 的 Pong 不是橋的回覆（PR #47 審查 rumia 🔴）"
+    );
+    let locked = protocol::expect_bridge_reply(
+        &request,
+        response(
+            control::ERROR,
+            flags::IS_RESPONSE,
+            r#"{"code":"Unauthorized","code_id":1301,"errcode":"M_USER_LOCKED","status":401}"#,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        locked.matrix_errcode(),
+        Some("M_USER_LOCKED"),
+        "橋之前的拒絕：沒有 bit4，照樣是 Server"
+    );
+}

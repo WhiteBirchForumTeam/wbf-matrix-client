@@ -4,6 +4,7 @@
 use wbf_wire::Pack;
 
 use crate::channel::PackChannel;
+use crate::device_version::RoomDeviceVersions;
 use crate::error::SdkError;
 use crate::protocol::{
     self, BatchMeta, HelloAck, InfoAck, ReadAck, RecentRequest, SendAck, SendRequest, StatusAck,
@@ -153,6 +154,82 @@ impl<C: PackChannel> WbfClient<C> {
                 "this server does not advertise the `{name}` feature"
             ))),
         }
+    }
+
+    /// 走橋呼叫一支 Matrix 端點（wbf-api-bridge.md）。先過 `Hello.features` 的 `bridge` 閘門：沒問過或 server 沒宣告都不送。
+    ///
+    /// Args:
+    ///     endpoint: example: protocol::BRIDGE_KEYS_QUERY
+    ///     variables: 路徑與 query 變數，example: &protocol::NoVariables {}
+    ///     body: HTTP body 原樣；沒有就給空
+    /// Return:
+    ///     Ok(BridgeReply)   2xx
+    ///     Err(SdkError)     `Usage`（沒 hello 或 server 沒宣告 bridge）、`Server`（帶 Matrix 的 `status`／`errcode`）、`Protocol`、`Network`
+    pub async fn call_bridge(
+        &mut self,
+        endpoint: protocol::BridgedEndpoint,
+        variables: &impl serde::Serialize,
+        body: Vec<u8>,
+    ) -> Result<protocol::BridgeReply, SdkError> {
+        self.require_feature(protocol::BRIDGE_FEATURE)?;
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let request = protocol::bridge_request(endpoint, variables, body, seq);
+        let response = self.channel.request(request.clone()).await?;
+        protocol::expect_bridge_reply(&request, response)
+    }
+
+    /// 一個房間的房間版本號與每個已加入成員的裝置版本號（走橋的 `Members`，只要 `join` 的）。
+    /// 送加密訊息前、與收到 1506 之後都靠它（wbfuwunel `wbf-room-device-version.md` §5、§7.2）。
+    ///
+    /// 🚨 fail closed：server 沒給號碼（舊 server、或不是成員清單）是 `Protocol`，🚫 不會回 0。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    /// Return:
+    ///     Ok(RoomDeviceVersions)  同一刻讀到的房間版本號與成員的裝置版本號
+    ///     Err(Server)             不在房裡也看不到歷史（`Forbidden`，403）等
+    ///     Err(Protocol)           body 不是 JSON、沒有房間版本號、某個 `join` 成員沒有（或解不開）裝置版本號
+    pub async fn room_device_versions(
+        &mut self,
+        room_id: &str,
+    ) -> Result<RoomDeviceVersions, SdkError> {
+        let reply = self
+            .call_bridge(
+                protocol::BRIDGE_MEMBERS,
+                &protocol::MembersVariables {
+                    room_id,
+                    membership: Some("join"),
+                },
+                Vec::new(),
+            )
+            .await?;
+        RoomDeviceVersions::from_members_body(&reply.json("Members")?)
+    }
+
+    /// **發** to-device（走橋的 `PUT /sendToDevice/{event_type}/{txn_id}`）：房間金鑰、金鑰請求、驗證。
+    /// 對方裝置的持有連線立刻收到原生的 `Device/Push`；沒連線就留在佇列。
+    ///
+    /// Args:
+    ///     event_type: example: "m.room.encrypted"
+    ///     txn_id: 冪等鍵，重試用同一個、新的一則換一個, example: "txn-7"
+    ///     messages_body: `{"messages": {"@user": {"<device_id 或 *>": {…content…}}}}` 的 JSON bytes
+    /// Return:
+    ///     Ok(())         server 收下（重送同一個 `txn_id` 也是 Ok，但什麼都不送）
+    ///     Err(Server)    被拒（例：帳號被暫停）
+    pub async fn send_to_device(
+        &mut self,
+        event_type: &str,
+        txn_id: &str,
+        messages_body: Vec<u8>,
+    ) -> Result<(), SdkError> {
+        self.call_bridge(
+            protocol::BRIDGE_SEND_TO_DEVICE,
+            &protocol::SendToDeviceVariables { event_type, txn_id },
+            messages_body,
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn ping(&mut self) -> Result<(), SdkError> {

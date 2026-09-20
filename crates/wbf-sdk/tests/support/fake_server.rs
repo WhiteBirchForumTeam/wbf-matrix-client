@@ -54,6 +54,11 @@ pub struct FakeServer {
     /// 故障：下一塊 `Upload/Chunk` 回這個 `Error`（`code` 名字、`code_id`），只觸發一次。
     /// ⚠️ 名字與序號**分開給**，才測得出 client 認的是哪一個（issue #29 第 2 項）。
     pub reject_next_chunk_with: Option<(&'static str, Option<u64>)>,
+    /// 走橋 `Members`（`0x13/0x29`）回的 body（成員清單的 JSON，含不含 `org.wbftw.room_version` 由測試決定）；
+    /// None → `Forbidden`（403，不在房裡）。
+    pub bridged_members: Option<serde_json::Value>,
+    /// 走橋 `SendToDevice`（`0x16/0x25`）收到的：(event_type, txn_id, body)。
+    pub to_device_sent: Vec<(String, String, Vec<u8>)>,
 }
 
 /// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
@@ -80,6 +85,9 @@ impl FakeServer {
     pub fn handle(&mut self, request: &Pack) -> Pack {
         self.requests
             .push((request.kind, request.subtype, request.seq));
+        if request.flags & flags::IS_BRIDGED != 0 {
+            return self.bridge(request);
+        }
         let result = match (request.kind, request.subtype) {
             (Kind::Event, wbf_wire::pack::event::RECENT) => Err((
                 "Unsupported",
@@ -158,6 +166,77 @@ impl FakeServer {
                     data: Vec::new(),
                 }
             }
+        }
+    }
+
+    /// 走橋（bridge-specs index.md §1.2）：成功 `Control/Ack`、失敗 `Control/Error`，**兩者都帶 bit4**；失敗的 meta 帶 Matrix 的 `status`／`errcode`。
+    /// 只認這些測試用到的兩支；其他一律 `UnknownKind`。
+    fn bridge(&mut self, request: &Pack) -> Pack {
+        let response = |subtype: u8, meta: serde_json::Value, data: Vec<u8>| Pack {
+            kind: Kind::Control,
+            subtype,
+            flags: flags::IS_RESPONSE | flags::IS_BRIDGED,
+            id: request.id,
+            seq: request.seq,
+            meta: meta.to_string().into_bytes(),
+            data,
+        };
+        let ok = |data: Vec<u8>| {
+            response(
+                control::ACK,
+                serde_json::json!({ "headers": { "content-type": "application/json" }, "status": 200 }),
+                data,
+            )
+        };
+        let rejected = |code: &str, status: u16, errcode: &str, message: &str| {
+            response(
+                control::ERROR,
+                serde_json::json!({ "code": code, "code_id": code_id_of(code),
+                    "errcode": errcode, "message": message, "status": status }),
+                format!(r#"{{"errcode":"{errcode}","error":"{message}"}}"#).into_bytes(),
+            )
+        };
+        let variables: serde_json::Value =
+            serde_json::from_slice(&request.meta).unwrap_or_default();
+        let variable = |key: &str| variables.get(key).and_then(|value| value.as_str());
+        match (request.kind, request.subtype) {
+            (Kind::Room, 0x29) => {
+                if variable("room_id").is_none() {
+                    return rejected("InvalidRequest", 400, "M_INVALID_PARAM", "missing room_id");
+                }
+                match &self.bridged_members {
+                    Some(body) => ok(body.to_string().into_bytes()),
+                    None => rejected(
+                        "Forbidden",
+                        403,
+                        "M_FORBIDDEN",
+                        "You don't have permission to view the room.",
+                    ),
+                }
+            }
+            (Kind::Device, 0x25) => {
+                let (Some(event_type), Some(txn_id)) = (variable("event_type"), variable("txn_id"))
+                else {
+                    return rejected(
+                        "InvalidRequest",
+                        400,
+                        "M_INVALID_PARAM",
+                        "missing event_type or txn_id",
+                    );
+                };
+                self.to_device_sent.push((
+                    event_type.to_string(),
+                    txn_id.to_string(),
+                    request.data.clone(),
+                ));
+                ok(b"{}".to_vec())
+            }
+            _ => rejected(
+                "UnknownKind",
+                400,
+                "M_UNRECOGNIZED",
+                "not on this fake bridge",
+            ),
         }
     }
 

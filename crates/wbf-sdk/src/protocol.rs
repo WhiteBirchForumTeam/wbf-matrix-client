@@ -163,6 +163,172 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
     }
 }
 
+// ---- 橋：pack 帶 flags bit4，server 轉成內部 HTTP 請求交給 Matrix 端點（wbfuwunel `wbf-api-bridge.md`）----
+//
+// 🚨 **號碼的權威在 server 的 `docs/bridge-specs/index.md`**（wire-format §3.2 只列原生的）。這裡只抄**用得到的**那幾個，
+// 用到一個抄一個，🚫 不整張表搬過來 —— 搬過來的那份不會知道 server 改了。
+
+/// server 在 `Hello.features` 宣告「橋在」的字串（wbf-api-bridge.md §3 批 3-C）。沒宣告的 server 不送橋的 pack。
+pub const BRIDGE_FEATURE: &str = "bridge";
+
+/// 一支走橋的 Matrix 端點：kind ＋ subtype 決定 method 與路徑模板（server 那邊的白名單）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgedEndpoint {
+    pub kind: Kind,
+    pub subtype: u8,
+}
+
+/// `GET /_matrix/client/v3/rooms/{room_id}/members`（bridge-specs `0x13-room.md` §0x29）。
+/// 回應多兩個 Matrix 沒有的欄位：最外層 `org.wbftw.room_version`、每個 `join` 成員的 `unsigned["org.wbftw.device_version"]`
+/// —— 讀法在 `device_version::RoomDeviceVersions::from_members_body`。🚫 不收 `at`。
+pub const BRIDGE_MEMBERS: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Room,
+    subtype: 0x29,
+};
+/// `PUT /_matrix/client/v3/sendToDevice/{event_type}/{txn_id}`（bridge-specs `0x16-device.md` §0x25）：**發** to-device。
+/// `txn_id` 是冪等鍵：重試用同一個，新的一則換一個。
+pub const BRIDGE_SEND_TO_DEVICE: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Device,
+    subtype: 0x25,
+};
+/// `POST /_matrix/client/v3/keys/upload`（bridge-specs `0x17-keys.md` §0x20）。data 送 `{}` 就是讀回目前的 OTK 數量。
+pub const BRIDGE_KEYS_UPLOAD: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Keys,
+    subtype: 0x20,
+};
+/// `POST /_matrix/client/v3/keys/query`（§0x21）。
+pub const BRIDGE_KEYS_QUERY: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Keys,
+    subtype: 0x21,
+};
+/// `POST /_matrix/client/v3/keys/claim`（§0x22）。⚠️ claim 走的那把就從對方的庫存消失。
+pub const BRIDGE_KEYS_CLAIM: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Keys,
+    subtype: 0x22,
+};
+/// `POST /_matrix/client/v3/keys/device_signing/upload`（§0x24）。換掉既有的交叉簽章金鑰要 UIAA（index.md §1.5），第一次上傳不用。
+pub const BRIDGE_SIGNING_KEYS_UPLOAD: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Keys,
+    subtype: 0x24,
+};
+/// `POST /_matrix/client/v3/keys/signatures/upload`（§0x25）。
+pub const BRIDGE_SIGNATURES_UPLOAD: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Keys,
+    subtype: 0x25,
+};
+
+/// 沒有任何變數的端點（`/keys/*` 那幾支）：meta 是 `{}`。
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+pub struct NoVariables {}
+
+/// `Members` 的變數：欄位順序照 bridge-specs 的範例。`membership` 沒給就整個省掉（index.md §1.3：query 變數不送空值）。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MembersVariables<'a> {
+    pub room_id: &'a str,
+    /// `join`／`invite`／`leave`／`ban`／`knock`；None ＝ 照 Matrix 預設回所有成員事件
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership: Option<&'a str>,
+}
+
+/// `SendToDevice` 的變數（兩個都是 path 變數，缺了 server 回 `InvalidRequest`）。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct SendToDeviceVariables<'a> {
+    pub event_type: &'a str,
+    pub txn_id: &'a str,
+}
+
+/// 走橋的請求：`id` 填 0（一個請求一個回應，不開會話）、flags 只有 `IS_BRIDGED`。
+///
+/// Args:
+///     endpoint: example: BRIDGE_MEMBERS
+///     variables: 路徑與 query 變數的 JSON 物件（**欄位順序就是線上的順序**，用 struct 定），example: &MembersVariables { room_id: "!r:x", membership: Some("join") }
+///     body: HTTP body 原樣；沒有 body 的端點給空
+///     seq: 請求號
+pub fn bridge_request(
+    endpoint: BridgedEndpoint,
+    variables: &impl Serialize,
+    body: Vec<u8>,
+    seq: u32,
+) -> Pack {
+    Pack {
+        kind: endpoint.kind,
+        subtype: endpoint.subtype,
+        flags: flags::IS_BRIDGED,
+        id: 0,
+        seq,
+        meta: serde_json::to_vec(variables).expect("bridge variables serialize"),
+        data: body,
+    }
+}
+
+/// 走橋成功回覆（`Control/Ack` ＋ `IS_BRIDGED`）的 meta。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BridgeAckMeta {
+    pub status: u16,
+    /// 只有表上宣告要轉的 header 才會出現。
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+/// 走橋的成功回覆：Matrix 端點回的 HTTP 狀態、header 與 body 原樣。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeReply {
+    pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+impl BridgeReply {
+    /// Return:
+    ///     Ok(Value)       body 解成 JSON
+    ///     Err(Protocol)   body 不是 JSON（帶端點名字，好認）
+    pub fn json(&self, endpoint_name: &str) -> Result<serde_json::Value, SdkError> {
+        serde_json::from_slice(&self.body).map_err(|error| {
+            SdkError::Protocol(format!("{endpoint_name} body is not JSON: {error}"))
+        })
+    }
+}
+
+/// 驗走橋的回應（index.md §1.2）。
+///
+/// - `Error`：一律 `SdkError::Server`（meta 帶 `status`／`errcode`…）。⚠️ **不看有沒有 bit4**：session 在橋之前就被 WS 擋下時，
+///   回的是通道自己的 `Error`（沒有 bit4、data 空），那一樣是被拒。
+/// - `Ack`：🚨 **必須帶 bit4、狀態必須是 2xx**，否則是 `Protocol` —— 不帶 bit4 的 Ack 不是這個請求的答案，🚫 不當成功。
+///
+/// Return:
+///     Ok(BridgeReply)
+///     Err(Server)    server 或 Matrix 端點拒絕
+///     Err(Protocol)  形狀不對（id／seq 沒抄、不是 Control 回應、Ack 沒帶 bit4、meta 解不開、狀態不是 2xx）
+pub fn expect_bridge_reply(request: &Pack, response: Pack) -> Result<BridgeReply, SdkError> {
+    let is_bridged = response.flags & flags::IS_BRIDGED != 0;
+    let ack = expect_ack(request, response)?;
+    // 🚨 `expect_ack` 也放行 `Pong`（ping 要用）；橋的成功回覆只有 `Ack`（index.md §1.2）。一個 meta 湊成 `{"status":200}`
+    // 的 Pong 不是這個請求的答案，🚫 不當成功。
+    if ack.subtype != control::ACK {
+        return Err(SdkError::Protocol(format!(
+            "a bridged request must be answered by Control/Ack, got subtype {:#04x}",
+            ack.subtype
+        )));
+    }
+    if !is_bridged {
+        return Err(SdkError::Protocol(
+            "a bridged request was answered by an Ack without IS_BRIDGED".into(),
+        ));
+    }
+    let meta: BridgeAckMeta = parse_meta(&ack)?;
+    if !(200..300).contains(&meta.status) {
+        return Err(SdkError::Protocol(format!(
+            "a bridged Ack must carry a 2xx status, got {}",
+            meta.status
+        )));
+    }
+    Ok(BridgeReply {
+        status: meta.status,
+        headers: meta.headers,
+        body: ack.data,
+    })
+}
+
 /// Error pack 的 meta → `SdkError::Server`。meta 不是 JSON 也照樣回 `Server`，code 填 `unknown`：
 /// 對方明說拒絕了，不能因為訊息壞掉就當成別的。
 pub fn server_error(meta: &[u8]) -> SdkError {
