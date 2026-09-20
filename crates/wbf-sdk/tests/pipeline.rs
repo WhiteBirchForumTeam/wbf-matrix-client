@@ -524,7 +524,7 @@ async fn server_description_tampered_fails_closed() {
 async fn hello_ping_status_abort() {
     let mut server = FakeServer::new();
     let mut client = WbfClient::new(&mut server);
-    let hello = client.hello("wbf-sdk-test").await.unwrap();
+    let hello = client.hello("wbf-sdk-test", &[]).await.unwrap();
     assert!(hello.features.iter().any(|feature| feature == "upload"));
     client.ping().await.unwrap();
     let file_cipher = FileCipher::with_fixed(Cipher::None, [0; 32], [0; 8], 16);
@@ -574,7 +574,7 @@ async fn create_ack_header_id_variants() {
     let mut server = FakeServer::new();
     server.wrong_response_id_once = Some(1);
     let mut client = WbfClient::new(&mut server);
-    let error = client.hello("test").await.unwrap_err();
+    let error = client.hello("test", &[]).await.unwrap_err();
     assert!(
         matches!(error, SdkError::Protocol(_)),
         "non-Create must echo id 0: {error}"
@@ -598,6 +598,7 @@ async fn feature_gated_commands_refuse_without_advertised_feature() {
         event_type: "m.room.message".into(),
         txn_id: "t".into(),
         attachments: vec![],
+        room_version: None,
     };
 
     let mut server = FakeServer::new();
@@ -611,7 +612,7 @@ async fn feature_gated_commands_refuse_without_advertised_feature() {
     assert!(server.requests.is_empty(), "nothing was sent");
 
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     assert!(client.has_feature("upload") && !client.has_feature("recent"));
     let error = client
         .recent_window(&request, std::time::Duration::from_secs(1), &mut ignore)
@@ -649,7 +650,7 @@ async fn recent_sync_pulls_windows_until_caught_up() {
     server.extra_features = vec!["recent", "batch", "seq"];
     server.recent_events = recent_fixture(25);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let mut seen: Vec<(u32, u32, u32, i64)> = Vec::new(); // (tc, bc, r, fs)
     let mut events = 0usize;
     let plan = |window: u32, batch: Option<u32>| RecentPlan {
@@ -697,7 +698,7 @@ async fn recent_sync_pulls_windows_until_caught_up() {
 
     // 帶水位再同步：只拿比 1025 新的 → 空窗，一個空 Batch，水位不動（None）。
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let mut batches = 0;
     let summary = client
         .recent_sync(Some(1025), plan(10, Some(4)), &mut |meta, _| {
@@ -715,7 +716,7 @@ async fn recent_sync_pulls_windows_until_caught_up() {
     // 剛好整窗（10 則新的、limit 10）：第一窗停在則數上限（more: true，server 也不知道後面還有沒有），第二窗空 → 追平，水位 = 第一窗的 fs。
     server.recent_events = recent_fixture(35);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let summary = client
         .recent_sync(Some(1025), plan(10, None), &mut |_, _| Ok(()))
         .await
@@ -732,7 +733,7 @@ async fn recent_sync_total_cap_splits_into_windows_and_shrinks_the_last_one() {
     server.extra_features = vec!["recent", "batch"];
     server.recent_events = recent_fixture(1200);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let mut window_sizes: Vec<u32> = Vec::new();
     let summary = client
         .recent_sync(
@@ -769,7 +770,7 @@ async fn recent_sync_total_cap_splits_into_windows_and_shrinks_the_last_one() {
     // 不會去要第三窗；水位仍是第一窗的 fs（2200）。
     server.recent_events = recent_fixture(1200);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let mut window_sizes: Vec<u32> = Vec::new();
     let mut oldest_seen = i64::MAX;
     let summary = client
@@ -806,7 +807,7 @@ async fn recent_sync_total_cap_splits_into_windows_and_shrinks_the_last_one() {
     // 總量比實際少：要 1000、只有 50 → 一窗 50 就追平。
     server.recent_events = recent_fixture(50);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let summary = client
         .recent_sync(None, RecentPlan::default(), &mut |_, _| Ok(()))
         .await
@@ -816,7 +817,7 @@ async fn recent_sync_total_cap_splits_into_windows_and_shrinks_the_last_one() {
     // 剛好等於總量：320 則、總量 320 → 一窗 320 湊滿就停，不多要一窗。
     server.recent_events = recent_fixture(320);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let summary = client
         .recent_sync(
             None,
@@ -843,7 +844,7 @@ async fn recent_sync_mid_window_disconnect_keeps_what_arrived_and_gives_no_water
     server.recent_events = recent_fixture(12);
     server.drop_stream_after_batches = Some(2);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let mut got = 0usize;
     let error = client
         .recent_sync(
@@ -865,7 +866,7 @@ async fn recent_sync_mid_window_disconnect_keeps_what_arrived_and_gives_no_water
 
     // limit 9999 → clamp 到 server 說的 500：12 則一窗就追平（tc 12 < 500）。
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let summary = client
         .recent_sync(
             None,
@@ -889,7 +890,7 @@ async fn recent_sync_survives_a_zero_max_in_hello() {
     server.hello_recent_max = Some((0, 0));
     server.recent_events = recent_fixture(7);
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let summary = client
         .recent_sync(
             None,
@@ -911,7 +912,7 @@ async fn recent_over_a_single_response_channel_is_unsupported() {
     let mut server = FakeServer::new();
     server.extra_features = vec!["recent", "batch"];
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     // 直接打 request()（不是 request_stream）模擬 HTTP：fake 的 handle 對 Recent 回 Unsupported。
     let pack = wbf_sdk::protocol::recent(
         &wbf_sdk::protocol::RecentRequest {
@@ -951,7 +952,13 @@ async fn upload_with_first_chunk_rejected(
     let result = {
         let mut client = WbfClient::new(&mut server);
         client
-            .send_chunks(&state, &mut Cursor::new(&plaintext), 0, false, &mut |_, _| {})
+            .send_chunks(
+                &state,
+                &mut Cursor::new(&plaintext),
+                0,
+                false,
+                &mut |_, _| {},
+            )
             .await
             .map(|_| ())
     };
@@ -986,7 +993,8 @@ async fn an_error_merely_named_corrupt_is_not_resent() {
 /// ⭐ **序號是權威、名字只給人看**：名字寫的是別的，序號是 1002，就是 Corrupt。
 #[tokio::test]
 async fn the_code_id_decides_even_when_the_name_says_something_else() {
-    let (result, chunks_sent) = upload_with_first_chunk_rejected("RenamedForHumans", Some(1002)).await;
+    let (result, chunks_sent) =
+        upload_with_first_chunk_rejected("RenamedForHumans", Some(1002)).await;
     result.expect("序號說 Corrupt，就照 Corrupt 重送");
     assert_eq!(chunks_sent, 4);
 }
@@ -1016,7 +1024,7 @@ async fn a_window_cut_short_by_bytes_is_followed_not_taken_as_caught_up() {
     server.recent_events = recent_fixture(25); // g_seq 1001..=1025
     server.window_cap_by_bytes = Some(7); // limit 是 10，但位元組只放得下 7 則
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let mut seen = 0usize;
     let summary = client
         .recent_sync(
@@ -1035,7 +1043,10 @@ async fn a_window_cut_short_by_bytes_is_followed_not_taken_as_caught_up() {
         .unwrap();
     assert_eq!(seen, 25, "每一則都要拿到");
     assert_eq!(summary.events, 25);
-    assert_eq!(summary.windows, 4, "7 ＋ 7 ＋ 7 ＋ 4（最後一窗 4 < 7，more: false）");
+    assert_eq!(
+        summary.windows, 4,
+        "7 ＋ 7 ＋ 7 ＋ 4（最後一窗 4 < 7，more: false）"
+    );
     assert!(summary.caught_up);
     assert_eq!(summary.new_cg_seq, Some(1025));
 }
@@ -1050,7 +1061,7 @@ async fn a_batch_without_more_is_taken_as_more_and_costs_one_extra_window() {
     server.recent_events = recent_fixture(3);
     server.omit_more = true;
     let mut client = WbfClient::new(&mut server);
-    client.hello("test").await.unwrap();
+    client.hello("test", &[]).await.unwrap();
     let summary = client
         .recent_sync(
             None,
@@ -1063,7 +1074,10 @@ async fn a_batch_without_more_is_taken_as_more_and_costs_one_extra_window() {
         )
         .await
         .unwrap();
-    assert_eq!(summary.windows, 2, "第一窗 3 則（沒說 more → 當 true）、第二窗空 → 追平");
+    assert_eq!(
+        summary.windows, 2,
+        "第一窗 3 則（沒說 more → 當 true）、第二窗空 → 追平"
+    );
     assert_eq!(summary.events, 3);
     assert!(summary.caught_up);
     assert_eq!(summary.new_cg_seq, Some(1003), "水位還是第一窗的 fs");

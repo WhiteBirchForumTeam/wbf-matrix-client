@@ -81,7 +81,7 @@ async fn upload_download_seek_resume_stream_against_real_server() {
         .await
         .expect("ws");
     let mut ws = WbfClient::new(channel);
-    let hello = ws.hello("wbf-sdk e2e").await.expect("hello");
+    let hello = ws.hello("wbf-sdk e2e", &[]).await.expect("hello");
     assert!(
         hello.features.contains(&"upload".to_string())
             && hello.features.contains(&"download".to_string())

@@ -95,3 +95,58 @@ fn chunked_block_from_description_json() {
     assert_eq!(block.chunk_size, 16);
     assert_eq!(block.cipher, Cipher::None);
 }
+
+// ---- device_version（server 的 wbf-room-device-version.md）----
+
+#[test]
+fn device_version_parse() {
+    use wbf_sdk::device_version::DeviceVersion;
+    assert_eq!(
+        DeviceVersion::parse("3-810b7c3be4"),
+        Some(DeviceVersion {
+            seq: 3,
+            hash: "810b7c3be4".into()
+        })
+    );
+}
+
+#[test]
+fn device_version_to_text() {
+    use wbf_sdk::device_version::DeviceVersion;
+    assert_eq!(
+        DeviceVersion {
+            seq: 3,
+            hash: "810b7c3be4".into()
+        }
+        .to_text(),
+        "3-810b7c3be4"
+    );
+}
+
+#[test]
+fn room_device_versions_from_members_body() {
+    use wbf_sdk::device_version::RoomDeviceVersions;
+    let body = serde_json::json!({"chunk":[{"type":"m.room.member","state_key":"@bob:localhost","content":{"membership":"join"},"unsigned":{"org.wbftw.device_version":"3-810b7c3be4"}}],"org.wbftw.room_version":81234});
+    let versions = RoomDeviceVersions::from_members_body(&body).unwrap();
+    assert_eq!(versions.room_version, 81234);
+    assert_eq!(versions.members["@bob:localhost"].to_text(), "3-810b7c3be4");
+}
+
+/// 黃金向量的輸入寫在 `device_version.rs` 的單元測試（太長不放 docstring）；這裡只釘住輸出的形狀。
+#[test]
+fn compute_device_keys_hash() {
+    use wbf_sdk::device_version::{compute_device_keys_hash, HASH_HEX_LEN};
+    let hash = compute_device_keys_hash("@bob:localhost", &serde_json::json!({}));
+    assert_eq!(hash.len(), HASH_HEX_LEN);
+    assert!(hash
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+}
+
+#[test]
+fn sdk_error_current_room_version() {
+    let error = wbf_sdk::protocol::server_error(
+        br#"{"code":"RoomDevicesChanged","code_id":1506,"message":"stale","room_version":81240}"#,
+    );
+    assert_eq!(error.current_room_version(), Some(81240));
+}
