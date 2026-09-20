@@ -135,6 +135,11 @@ impl FakeServer {
             }
             (Kind::Download, download::INFO) => self.info(request),
             (Kind::Download, download::READ) => self.read(request),
+            // 說出口的退出：解除持有；沒訂也是 no-op。
+            (Kind::Device, wbf_wire::pack::device::UNSUBSCRIBE) => {
+                self.subscribed_device = None;
+                Ok((serde_json::json!({}), Vec::new()))
+            }
             _ => Err((
                 "UnknownKind",
                 "no such kind/subtype".to_string(),

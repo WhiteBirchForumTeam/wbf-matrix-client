@@ -339,3 +339,32 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
   訂了之後新的 to-device 會用 `Push` 推到這條連線，而通道還沒有收推播的迴圈——這是第 4 階段的事，在那之前 `device_subscribe` 只能在一次走完的流程裡用。
 - **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
 - ruma 組請求時對要 token 的端點一定要給 token：引擎給一個占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填（client 蓋不掉）。
+
+### 16.5 整套分發邏輯對照 server 的設計（維護者 2026-09-21 要求逐條確認）
+
+server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2；`wbf-event-push.md` §1；`wbf-to-device.md` §4）一句話：**幾乎都靠版本號**——
+房間版本號變了就代表成員或裝置有變，去看誰的裝置版本號不一樣，只重查那個人，狀態機比出哪台裝置新了／沒了，補發或輪換。
+推播只是加速，正確性由送出時的 1506 守；下線說出口退訂，上線主動確認一次，訂閱中也沒有空窗。**由 UI 主導什麼時候做；SDK 只負責每一步能正常呼叫、收到東西自動處理對。**
+
+下表是那套邏輯的每一步，對到 client 現在的方法與狀態：
+
+| # | server 設計的那一步 | client 的方法 | 狀態 |
+|---|---|---|---|
+| 1 | **點進房間／送出前**拿一次成員清單：房間版本號 ＋ 每個 `join` 成員的裝置版本號（同一刻） | `WbfClient::room_device_versions(room_id)` → `RoomDeviceVersions` | ✅ #47（真 server 驗過） |
+| 2 | **跟上次那份比**：誰新加入、誰的裝置版本號變了（要重查）、誰不在了（要換房間金鑰） | `RoomDeviceVersions::diff_from(&previous)` → `MembersDiff { changed, left }` | ✅ #46。⚠️ 「上次那份」由呼叫端存（每房一份，跟發上一輪房間金鑰時的名單綁在一起）；SDK 還沒替它落地 |
+| 3 | **只重查變了的人的裝置**；哪台裝置新了／沒了由狀態機自己比 | `OlmEngine::mark_users_changed(diff.changed)` → `send_outgoing_requests`（KeysQuery 走橋 `0x17 0x21`） | ✅ #48（真 server 驗過：A 靠它才看到 B）。上游 `OlmMachine` 對每台裝置逐台追蹤，回應進來自己算差 |
+| 4 | **自己驗雜湊**：查回來的金鑰照 §3.4 重算 ＝ 清單上那個人的雜湊 → 看到的是同一組 | `device_version::compute_device_keys_hash(user, keys_query 回應)` 對 `members[user].hash` | ✅ 函式與黃金向量 #46；❌ **還沒接進迴圈**（3b：查完對一次，對不上就再查，`unhashable` 跳過） |
+| 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | `OlmEngine::share_room_key(room, users, settings)`（缺 Olm session 先 claim，全走橋） | ✅ #48（真 server 驗過）。⚠️ `settings.sharing_strategy` 目前用上游預設，3b 要明確選（§13 第 8 條） |
+| 6 | **帶房間版本號送出**；對不上 1506 → 回到第 1 步（重試一次是 client 政策） | `SendRequest::room_version` ✅ #46；加密 `encrypt_room_event_raw` ＋ 1506 迴圈 | ❌ 3b |
+| 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（訂閱 → 拉到追平 → 匯入 → 落地 → 銷毀）✅ #48；成員清單就是第 1 步 | ✅ 方法都在，**什麼時候叫由 UI 決定** |
+| 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；**收推播的迴圈** | ❌ 第 4 階段（通道還不能收非回應的 pack）。在那之前正確性完全由第 6 步的 1506 守——這跟 server 的設計一致：推播是加速，不是正確性來源 |
+| 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()` | ✅ #48（假 server ＋ 真 server）。房間事件的 `Event/Unsubscribe` 跟第 4 階段一起（現在沒訂房間事件） |
+| 10 | **同一台裝置只有一條連線在收**；被接手的那條收到 `Superseded` 要停、不重訂 | `WbfErrorCode::Superseded` 認得 ✅；停掉收取並通知上層 | ❌ 第 4 階段（它是推來的） |
+| 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_window` 把「匯入 → 落地 → 銷毀」鎖成一步，UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
+
+**核對結論**：第 1–5、7、9 步的方法都在而且對真 server 驗過，走的就是 server 設計的那條「版本號變了 → 看誰不一樣 → 只查那個人 → 狀態機比裝置 → 補發」的路；
+第 6 步（送出＋1506 迴圈）與第 4 步（雜湊接進迴圈）是 3b；第 8、10 步（推播、Superseded）要第 4 階段的通道。**在推播做出來之前，這套邏輯已經是正確的，只是慢一拍**——
+被擋一次才知道要重查，而 server 的設計本來就把正確性放在 1506、不放在推播。
+
+🚫 兩個刻意沒做的：不在 SDK 裡替每房存「上次那份成員清單」（那是 UI／daemon 的狀態，跟「這輪金鑰發給誰」綁在一起，放 SDK 會變成第二份會漂移的名單）；
+不自動重試 1506（幾次是 client 政策，UI 決定）。

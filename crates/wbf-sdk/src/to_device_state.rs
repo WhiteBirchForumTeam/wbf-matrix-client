@@ -112,6 +112,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 第二次 `save` 要蓋掉既有的 `td.json`（PR #48 審查 rumia 🔴 說 Windows 的 rename 不能覆蓋——std 的 `rename` 在 Windows
+    /// 走 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，這條測試在 Windows 上實跑就是證據）。
+    #[test]
+    fn saving_again_replaces_the_existing_file() {
+        let dir = scratch_dir("overwrite");
+        let mut state = ToDeviceState::default();
+        state.mark_processed(1);
+        state.save(&dir).unwrap();
+        state.mark_processed(2);
+        state.mark_destroyed(&[1]);
+        state.save(&dir).unwrap();
+        state.mark_processed(3);
+        state.save(&dir).unwrap();
+        assert_eq!(
+            ToDeviceState::load(&dir).unwrap(),
+            ToDeviceState {
+                cd_seq: Some(3),
+                to_destroy: vec![2, 3]
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 🚨 `Ack` 不清清單；`ItemsDestroyed` 只清回來的那些，沒回來的留著下次再送。
     #[test]
     fn only_counts_the_server_says_are_gone_leave_the_list() {

@@ -374,6 +374,19 @@ impl<C: PackChannel> WbfClient<C> {
         }
     }
 
+    /// `Device/Unsubscribe`：下線前說出口的退出——解除這條連線對裝置佇列的持有（to-device-client.md §4）。沒訂也是 no-op。
+    ///
+    /// Return:
+    ///     Ok(())         退了
+    ///     Err(Usage)     沒 hello、或 server 沒宣告 `device`
+    pub async fn device_unsubscribe(&mut self) -> Result<(), SdkError> {
+        self.require_feature(protocol::DEVICE_FEATURE)?;
+        let session_id = self.next_session_id();
+        self.call(|seq| protocol::device_unsubscribe(session_id, seq))
+            .await?;
+        Ok(())
+    }
+
     /// `Device/ItemsDestroy`：叫 server 刪掉這些 count（已經匯進 crypto store 的）。回應是先 `Ack`（只是收到）再 `ItemsDestroyed`。
     /// 🚨 要先 `device_subscribe`：只有持有這台裝置佇列的連線能銷毀，否則 server 回 `Forbidden`。
     /// 🚨 只有 `ItemsDestroyed` 裡回來的才算沒了；沒回來的留在待銷毀清單上下次再送（to-device-client.md §4）。

@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use matrix_sdk::ruma;
 use matrix_sdk::{SqliteCryptoStore, SqliteStoreConfig};
@@ -30,8 +30,9 @@ use ruma::serde::Raw;
 use ruma::{DeviceId, OneTimeKeyAlgorithm, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId};
 
 use crate::channel::PackChannel;
-use crate::client::WbfClient;
-use crate::protocol::{self, BridgedEndpoint, NoVariables};
+use crate::client::{DeviceWindow, WbfClient};
+use crate::protocol::{self, BridgedEndpoint, DeviceFetchRequest, NoVariables};
+use crate::to_device_state::ToDeviceState;
 use crate::vault::Key32;
 use crate::SdkError;
 
@@ -42,8 +43,28 @@ const OUTGOING_ROUNDS_LIMIT: usize = 16;
 /// 走橋時 ruma 請求要一個 base URL 才能組 `http::Request`；橋只看 body，這個字串不會出現在線上。
 const BRIDGE_BASE_URL: &str = "http://bridge.invalid";
 
+/// 一窗 to-device 走完「匯入 → 落地 → 銷毀」之後的結果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportReport {
+    /// 這一窗帶進來的新房間金鑰（呼叫者拿它決定重解哪些密文）。
+    pub room_keys: Vec<RoomKeyInfo>,
+    /// 這一窗匯進 crypto store 的則數（狀態機吃過，不等於解得開）。
+    pub imported: usize,
+    /// 這一輪 server 說已經沒了的 count（含上次沒銷成、這次補送的）。
+    pub destroyed: Vec<u64>,
+    /// 落地後的水位。
+    pub cd_seq: Option<u64>,
+    /// 還留在待銷毀清單上的（server 這輪沒回來的，下次再送）。
+    pub still_to_destroy: usize,
+}
+
+/// `pull_to_device` 最多拉幾窗：一窗 1000 則、六十四窗就是六萬多則 to-device，到這個數還沒追平是不對勁，停下來報錯。
+const PULL_WINDOWS_LIMIT: usize = 64;
+
 pub struct OlmEngine {
     machine: OlmMachine,
+    /// crypto store 與 `td.json` 所在的 `m/`。
+    store_dir: PathBuf,
 }
 
 impl OlmEngine {
@@ -83,11 +104,103 @@ impl OlmEngine {
             .build()
             .await
             .map_err(crypto_store_error)?;
-        Ok(OlmEngine { machine })
+        Ok(OlmEngine {
+            machine,
+            store_dir: store_dir.to_path_buf(),
+        })
     }
 
     pub fn machine(&self) -> &OlmMachine {
         &self.machine
+    }
+
+    /// Return:
+    ///     Result<ToDeviceState>  `m/td.json` 現在的水位與待銷毀清單（沒檔就是從頭）
+    pub fn to_device_state(&self) -> Result<ToDeviceState, SdkError> {
+        ToDeviceState::load(&self.store_dir)
+    }
+
+    /// 一窗 to-device 的完整處理，**順序鎖死**（to-device-client.md §4、§7）：
+    /// 匯進 crypto store（sqlite commit 了才回）→ 水位與待銷毀清單落地（`m/td.json`，原子寫）→ 才叫 server 銷毀
+    /// （連上次沒銷成的一起）→ 只清 `ItemsDestroyed` 回來的。
+    /// 🚨 呼叫者拿不到「先銷毀再匯入」的路，這就是這個函式存在的理由。中途任何一步失敗，已落地的照樣有效：
+    /// 下次從 `cd_seq` 再拉是**重複**不是遺失（匯入與銷毀都冪等）。
+    ///
+    /// Args:
+    ///     client: 要先 `device_subscribe` 過的連線（沒訂閱，銷毀那一步被 `Forbidden`，但匯入與落地已經完成）
+    ///     window: `device_fetch_window` 拉到的（可以是空窗：那就只補送上次沒銷成的）
+    ///     per_pack_timeout: example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(ImportReport)
+    ///     Err(Protocol)   某則不是合法的 to-device 事件、store 寫入失敗——水位不動、不銷毀
+    ///     Err(Server)     銷毀被拒（例：沒訂閱的 `Forbidden`）——匯入與落地已完成，清單留著下次再送
+    pub async fn import_window<C: PackChannel>(
+        &self,
+        client: &mut WbfClient<C>,
+        window: DeviceWindow,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<ImportReport, SdkError> {
+        let mut state = ToDeviceState::load(&self.store_dir)?;
+        let counts: Vec<u64> = window.items.iter().map(|(count, _)| *count).collect();
+        let events: Vec<serde_json::Value> =
+            window.items.into_iter().map(|(_, event)| event).collect();
+        // 1. 匯入：Ok 就是 crypto store 的交易 commit 了（上游 receive_sync_changes 的最後兩行）。
+        let room_keys = self.receive_to_device(events, None, None).await?;
+        // 2. 落地：水位前進、這些 count 進待銷毀清單。
+        for count in &counts {
+            state.mark_processed(*count);
+        }
+        state.save(&self.store_dir)?;
+        // 3. 銷毀：送整份清單（含上次沒回來的）；只清回來的。
+        let destroyed = client
+            .device_items_destroy(&state.to_destroy.clone(), per_pack_timeout)
+            .await?;
+        state.mark_destroyed(&destroyed);
+        state.save(&self.store_dir)?;
+        Ok(ImportReport {
+            room_keys,
+            imported: counts.len(),
+            destroyed,
+            cd_seq: state.cd_seq,
+            still_to_destroy: state.to_destroy.len(),
+        })
+    }
+
+    /// 從水位起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它。每一窗都走 `import_window`。
+    /// 空窗也走一次（把上次沒銷成的補送）。
+    ///
+    /// Args:
+    ///     client: 要先 `device_subscribe` 過的連線
+    ///     per_pack_timeout: example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(Vec<ImportReport>)  每窗一筆；追平（最後一窗 `more: false`）才回
+    ///     Err(Protocol)          拉了 PULL_WINDOWS_LIMIT 窗還沒追平
+    pub async fn pull_to_device<C: PackChannel>(
+        &self,
+        client: &mut WbfClient<C>,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<Vec<ImportReport>, SdkError> {
+        let mut reports = Vec::new();
+        for _ in 0..PULL_WINDOWS_LIMIT {
+            let cd_seq = ToDeviceState::load(&self.store_dir)?.cd_seq;
+            let window = client
+                .device_fetch_window(
+                    &DeviceFetchRequest {
+                        cd_seq,
+                        limit: None,
+                    },
+                    per_pack_timeout,
+                )
+                .await?;
+            let more = more_is_only_meaningful_with_items(&window);
+            reports.push(self.import_window(client, window, per_pack_timeout).await?);
+            if !more {
+                return Ok(reports);
+            }
+        }
+        Err(SdkError::Protocol(format!(
+            "the to-device queue did not catch up after {PULL_WINDOWS_LIMIT} windows"
+        )))
     }
 
     /// 把一批 to-device 事件（`Device/Fetch` 拉到的，舊→新）與自己的 OTK 存量推進狀態機。
@@ -380,6 +493,11 @@ impl OlmEngine {
         let body = ruma_request_body(request)?;
         client.call_bridge(endpoint, &NoVariables {}, body).await
     }
+}
+
+/// 空窗就是追平，不管 `more`（server 保證第一則一定收進窗，所以停在上限的窗不會是空的）。
+fn more_is_only_meaningful_with_items(window: &DeviceWindow) -> bool {
+    !window.items.is_empty() && window.more
 }
 
 /// 只把 Olm session 的密文交給狀態機解，信任要求先照上游的預設（🚨 送出那一半決定「誰收得到金鑰」時要明確選，§13 第 8 條）。

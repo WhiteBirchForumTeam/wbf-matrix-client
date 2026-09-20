@@ -1355,3 +1355,142 @@ async fn device_calls_need_the_device_feature() {
         .iter()
         .all(|request| request.0 == wbf_wire::Kind::Control));
 }
+
+// ---- 引擎的 import_window／pull_to_device：順序鎖死（feature matrix 才有 OlmMachine）----
+
+#[cfg(feature = "matrix")]
+mod with_crypto_engine {
+    use super::*;
+    use wbf_sdk::crypto_engine::OlmEngine;
+    use wbf_sdk::to_device_state::ToDeviceState;
+    use wbf_sdk::vault::Key32;
+
+    fn scratch_store(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wbf-engine-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn opaque_item(count: u64) -> (u64, serde_json::Value) {
+        (
+            count,
+            serde_json::json!({ "type": "org.wbftw.test", "sender": "@alice:localhost", "content": { "count": count } }),
+        )
+    }
+
+    /// 🚨 匯入與落地在前、銷毀在後：銷毀被拒（沒訂閱 → `Forbidden`）時 `td.json` 已經有水位與待銷毀清單；
+    /// 訂閱後再走一次（空窗）把上次沒銷成的補送掉。
+    #[tokio::test]
+    async fn import_window_persists_before_it_destroys_and_retries_leftovers() {
+        let dir = scratch_store("import-window");
+        let engine = OlmEngine::open(&dir, &Key32([7u8; 32]), "@alice:localhost", "DEV1")
+            .await
+            .unwrap();
+        let mut server = FakeServer::new();
+        server.extra_features = vec!["device"];
+        server.to_device_queue = vec![opaque_item(7), opaque_item(8)];
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let timeout = std::time::Duration::from_secs(1);
+
+        let window = client
+            .device_fetch_window(&wbf_sdk::protocol::DeviceFetchRequest::default(), timeout)
+            .await
+            .unwrap();
+        let error = engine
+            .import_window(&mut client, window, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.wbf_code(),
+            Some(wbf_sdk::error_code::WbfErrorCode::Forbidden),
+            "{error:?}"
+        );
+        let persisted = ToDeviceState::load(&dir).unwrap();
+        assert_eq!(
+            (persisted.cd_seq, persisted.to_destroy.clone()),
+            (Some(8), vec![7, 8]),
+            "銷毀失敗前已落地"
+        );
+
+        client.device_subscribe("DEV1", timeout).await.unwrap();
+        let reports = engine.pull_to_device(&mut client, timeout).await.unwrap();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(
+            (
+                reports[0].imported,
+                reports[0].destroyed.clone(),
+                reports[0].still_to_destroy
+            ),
+            (0, vec![7, 8], 0)
+        );
+        assert_eq!(reports[0].cd_seq, Some(8));
+        assert!(ToDeviceState::load(&dir).unwrap().to_destroy.is_empty());
+
+        // 下線：說出口的退出之後，這條連線不再持有佇列 → 再銷毀又是 Forbidden。
+        client.device_unsubscribe().await.unwrap();
+        drop(client);
+        server.to_device_queue.push(opaque_item(9));
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let window = client
+            .device_fetch_window(
+                &wbf_sdk::protocol::DeviceFetchRequest {
+                    cd_seq: Some(8),
+                    limit: None,
+                },
+                timeout,
+            )
+            .await
+            .unwrap();
+        let error = engine
+            .import_window(&mut client, window, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.wbf_code(),
+            Some(wbf_sdk::error_code::WbfErrorCode::Forbidden),
+            "{error:?}"
+        );
+        assert_eq!(
+            ToDeviceState::load(&dir).unwrap().to_destroy,
+            vec![9],
+            "匯入與落地照樣完成"
+        );
+        drop(client);
+        assert_eq!(server.to_device_queue.len(), 1, "只剩退訂後那一則沒銷");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一次拉完多窗（limit 夾成每窗一則）：每窗一筆 report、水位逐窗前進、最後一窗 `more: false` 才停。
+    #[tokio::test]
+    async fn pull_to_device_walks_windows_until_caught_up() {
+        let dir = scratch_store("pull");
+        let engine = OlmEngine::open(&dir, &Key32([9u8; 32]), "@alice:localhost", "DEV1")
+            .await
+            .unwrap();
+        let mut server = FakeServer::new();
+        server.extra_features = vec!["device"];
+        server.device_batch_size = 1;
+        server.to_device_queue = vec![opaque_item(1), opaque_item(2), opaque_item(3)];
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let timeout = std::time::Duration::from_secs(1);
+        client.device_subscribe("DEV1", timeout).await.unwrap();
+        let reports = engine.pull_to_device(&mut client, timeout).await.unwrap();
+        // 假 server 的 limit 預設 1000 一窗就拉完：一筆 report、三則、全銷毀。
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            (reports[0].imported, reports[0].destroyed.clone()),
+            (3, vec![1, 2, 3])
+        );
+        assert_eq!(engine.to_device_state().unwrap().cd_seq, Some(3));
+        // 再拉：空窗一筆、什麼都沒動。
+        let again = engine.pull_to_device(&mut client, timeout).await.unwrap();
+        assert_eq!(
+            (again.len(), again[0].imported, again[0].destroyed.len()),
+            (1, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

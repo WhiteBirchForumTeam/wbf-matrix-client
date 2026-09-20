@@ -219,6 +219,8 @@ Session/Login
 | 3 | `cd_seq` 與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），🚫 不進 `cache.db` | ✅ |
 | 4 | 訂閱／補洞／匯入／銷毀的狀態機 | ⚠️ **daemon 才有意義**——「一個命令一個程序」的東西沒有人在線上收（architecture-v2 §1）；匯入用 `crypto_engine::OlmEngine::receive_to_device` | 🔧 「拉」的那半（Fetch → 匯入 → 銷毀）在 `tests/e2e_crypto_engine.rs` 對真 server 走通；`Push`／補窗要通道能收推播（daemon-runtime 第 4 階段） |
 | 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；收到它要停掉這條的收取並通知上層 | ❌ 跟第 4 條一起（它是推來的） |
+| 6 | 說出口的退出（§4）：下線前 `Unsubscribe` 解除持有 | `WbfClient::device_unsubscribe()` | ✅ |
+| 7 | 「匯入 → 落地 → 銷毀」鎖成一步，呼叫者拿不到錯的順序 | `crypto_engine::OlmEngine::import_window`／`pull_to_device` | ✅ 對真 server 走通 |
 
 ⚠️ 實跑補的一條：**`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs` 回 `Forbidden`），所以順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，跟 §7 一致；🚫 不能只 Fetch 不 Subscribe 就想銷毀。
 

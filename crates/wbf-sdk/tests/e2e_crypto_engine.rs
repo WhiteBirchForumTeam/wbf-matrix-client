@@ -16,7 +16,7 @@ use std::time::Duration;
 use matrix_sdk_crypto::EncryptionSettings;
 use wbf_sdk::crypto_engine::OlmEngine;
 use wbf_sdk::login::{login_with_password, logout, Session};
-use wbf_sdk::protocol::{DeviceFetchRequest, BRIDGE_FEATURE, DEVICE_FEATURE};
+use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_FEATURE};
 use wbf_sdk::to_device_state::ToDeviceState;
 use wbf_sdk::vault::Key32;
 use wbf_sdk::{Channel, Transport, WbfClient};
@@ -171,47 +171,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .expect("A shares the room key");
     assert!(to_device_requests >= 1, "{to_device_requests}");
 
-    // 4. B 用 Device/Fetch 從頭拉：拿到 A 發的 Olm 密文，匯進狀態機 → 就是那個房間的房間金鑰。
-    let mut state = ToDeviceState::load(&b.store_dir).unwrap();
-    assert_eq!(state, ToDeviceState::default());
-    let window =
-        b.ws.device_fetch_window(
-            &DeviceFetchRequest {
-                cd_seq: state.cd_seq,
-                limit: None,
-            },
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("B fetches its to-device queue");
-    assert!(!window.items.is_empty(), "B's queue is empty");
-    assert!(
-        window
-            .items
-            .iter()
-            .all(|(_, event)| event["type"] == "m.room.encrypted" && event["sender"] == user_id),
-        "{:?}",
-        window.items
-    );
-    let counts: Vec<u64> = window.items.iter().map(|(count, _)| *count).collect();
-    let events: Vec<serde_json::Value> = window.items.into_iter().map(|(_, event)| event).collect();
-    let room_keys = b
-        .engine
-        .receive_to_device(events, None, None)
-        .await
-        .expect("B imports");
-    assert!(
-        room_keys.iter().any(|key| key.room_id.as_str() == room_id),
-        "B got a room key for {room_id}: {room_keys:?}"
-    );
-    for count in &counts {
-        state.mark_processed(*count);
-    }
-    state.save(&b.store_dir).unwrap();
-    assert_eq!(state.cd_seq, window.nt);
-
-    // 5. 訂閱（持有這台裝置的佇列，銷毀才被准）：回來的 CryptoState 是 B 自己的 OTK 存量，餵給狀態機。
+    // 4. B 訂閱（持有這台裝置的佇列，銷毀才被准）：回來的 CryptoState 是 B 自己的 OTK 存量，餵給狀態機。
     //    A 剛 claim 走 B 一把 OTK，所以剩的比上傳的少；狀態機看到數字會決定要不要補。
+    assert_eq!(
+        b.engine.to_device_state().unwrap(),
+        ToDeviceState::default()
+    );
     let crypto_state =
         b.ws.device_subscribe(&b.session.device_id, Duration::from_secs(30))
             .await
@@ -231,30 +196,45 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .await
         .expect("B feeds its OTK counts");
 
-    // 5b. 銷毀：只有 ItemsDestroyed 回來的才從清單拿掉；之後再拉是空的。
-    let gone =
-        b.ws.device_items_destroy(&state.to_destroy.clone(), Duration::from_secs(30))
-            .await
-            .expect("B destroys");
-    assert_eq!(gone, counts);
-    state.mark_destroyed(&gone);
-    state.save(&b.store_dir).unwrap();
-    assert!(state.to_destroy.is_empty());
-    let again =
-        b.ws.device_fetch_window(
-            &DeviceFetchRequest {
-                cd_seq: state.cd_seq,
-                limit: None,
-            },
-            Duration::from_secs(30),
-        )
+    // 5. B 從頭拉到追平（Fetch → 匯入 → 落地 → 銷毀，順序在 import_window 裡鎖死）：
+    //    拿到 A 發的 Olm 密文 → 匯進狀態機 → 就是那個房間的房間金鑰；銷毀回來的 count ＝ 送的；清單清空。
+    let reports = b
+        .engine
+        .pull_to_device(&mut b.ws, Duration::from_secs(30))
+        .await
+        .expect("B pulls its to-device queue");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert!(report.imported >= 1, "{report:?}");
+    assert!(
+        report
+            .room_keys
+            .iter()
+            .any(|key| key.room_id.as_str() == room_id),
+        "B got a room key for {room_id}: {report:?}"
+    );
+    assert_eq!(report.destroyed.len(), report.imported, "{report:?}");
+    assert_eq!(report.still_to_destroy, 0);
+    let state = b.engine.to_device_state().unwrap();
+    assert_eq!(state.cd_seq, report.cd_seq);
+    assert!(state.cd_seq.is_some());
+    assert!(state.to_destroy.is_empty(), "水位與清單落地了：{state:?}");
+
+    // 5b. 再拉一次：空窗、什麼都沒動、水位不變。
+    let again = b
+        .engine
+        .pull_to_device(&mut b.ws, Duration::from_secs(30))
         .await
         .unwrap();
-    assert_eq!((again.tc, again.items.len()), (0, 0), "{again:?}");
     assert_eq!(
-        ToDeviceState::load(&b.store_dir).unwrap(),
-        state,
-        "水位與清單落地了"
+        (
+            again.len(),
+            again[0].imported,
+            again[0].destroyed.len(),
+            again[0].cd_seq
+        ),
+        (1, 0, 0, state.cd_seq),
+        "{again:?}"
     );
 
     // 6. A 再分一次同一把：每台裝置都有了 → 沒有新的 to-device。
@@ -269,6 +249,9 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .await
         .unwrap();
     assert_eq!(again_shared, 0);
+
+    // 7. 下線：說出口的退出（不叫的話這條連線退了卻還佔著裝置）。
+    b.ws.device_unsubscribe().await.expect("B unsubscribes");
 
     logout(&a.session).await.expect("logout A");
     logout(&b.session).await.expect("logout B");

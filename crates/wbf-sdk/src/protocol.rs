@@ -840,6 +840,23 @@ pub fn parse_subscribe_reply(request: &Pack, response: &Pack) -> Result<Subscrib
     }
 }
 
+/// `Device/Unsubscribe`：說出口的退出（wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
+/// 🚨 下線前要叫：不叫的話這條連線退了卻還佔著裝置，別的連線得靠搶佔才進得來。斷線 server 會自動退，但那是「沒說出口的退出」，兩條路都要有。
+///
+/// Args:
+///     id: client 選的會話號（這個 kind 每個 subtype 都要 `SESSION` 型別的 id）
+pub fn device_unsubscribe(id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Device,
+        subtype: device::UNSUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta: b"{}".to_vec(),
+        data: Vec::new(),
+    }
+}
+
 /// `Device/ItemsDestroy`：meta `{"tc"}`，data 是 `tc` 個 u64 大端的 count（不是 JSON、沒有分隔符）。
 /// 送的是**清單**不是水位（to-device-client.md §4）：只列匯進 crypto store 成功的那些。
 ///
