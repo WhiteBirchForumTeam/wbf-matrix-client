@@ -45,6 +45,10 @@ pub enum WbfErrorCode {
     Truncated = 1504,
     /// 這個訂閱被同一裝置後來的連線接手了（server 主動送的，不是某個請求的回應）。
     Superseded = 1505,
+    /// 這則加密訊息帶的 `room_version` 已經過期：房間的成員或成員的裝置變了，**訊息沒有送出**。
+    /// meta 帶目前的號碼（[`SdkError::current_room_version`]）；重拿成員清單、補發房間金鑰、帶新號碼重送
+    /// （wbfuwunel `wbf-room-device-version.md` §7）。重試幾次是 client 的政策。
+    RoomDevicesChanged = 1506,
     /// server 自己的錯。可以退避重試。
     Internal = 1901,
 }
@@ -73,6 +77,7 @@ impl WbfErrorCode {
             1503 => OutOfOrder,
             1504 => Truncated,
             1505 => Superseded,
+            1506 => RoomDevicesChanged,
             1901 => Internal,
             _ => return None,
         };
@@ -113,7 +118,11 @@ mod tests {
             Internal,
         ];
         for code in all {
-            assert_eq!(WbfErrorCode::from_id(u64::from(code.id())), Some(code), "{code:?}");
+            assert_eq!(
+                WbfErrorCode::from_id(u64::from(code.id())),
+                Some(code),
+                "{code:?}"
+            );
         }
         let mut ids: Vec<u16> = all.iter().map(|code| code.id()).collect();
         ids.sort_unstable();

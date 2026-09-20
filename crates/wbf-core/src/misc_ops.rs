@@ -407,7 +407,7 @@ impl Core {
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly)
             .await?;
-        let hello = client.hello(client_name).await?;
+        let hello = client.hello(client_name, &[]).await?;
         client.ping().await?;
         Ok(ServerHello {
             protocol: hello.protocol,

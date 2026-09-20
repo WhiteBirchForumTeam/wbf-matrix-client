@@ -2,8 +2,8 @@
 //! 這裡的 RFC 8439 與 NIST GCM 兩條證明底下的 AEAD 呼叫是標準的那個。
 
 use wbf_sdk::chunk_crypto::{chunk_count, expected_plain_len, locate, MAX_CHUNK_INDEX};
-use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
 use wbf_sdk::error_code::WbfErrorCode;
+use wbf_sdk::{ChunkedBlock, Cipher, CryptoError, DescriptionSlot, FileCipher};
 
 fn unhex(text: &str) -> Vec<u8> {
     hex::decode(text.replace([' ', '\n'], "")).expect("valid hex")
@@ -311,11 +311,30 @@ fn event_recent_and_batch_match_server_vectors() {
         vector.id,
         vector.seq,
     );
-    let meta_of = |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
-    assert_eq!(meta_of(&ours), meta_of(&vector), "recent_one_room_history meta");
+    let meta_of =
+        |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
     assert_eq!(
-        (ours.kind, ours.subtype, ours.flags, ours.id, ours.seq, &ours.data),
-        (vector.kind, vector.subtype, vector.flags, vector.id, vector.seq, &vector.data),
+        meta_of(&ours),
+        meta_of(&vector),
+        "recent_one_room_history meta"
+    );
+    assert_eq!(
+        (
+            ours.kind,
+            ours.subtype,
+            ours.flags,
+            ours.id,
+            ours.seq,
+            &ours.data
+        ),
+        (
+            vector.kind,
+            vector.subtype,
+            vector.flags,
+            vector.id,
+            vector.seq,
+            &vector.data
+        ),
         "recent_one_room_history 其他欄位逐一相等"
     );
 
@@ -386,8 +405,15 @@ fn event_recent_and_batch_match_server_vectors() {
         ("error_rate_limited", WbfErrorCode::RateLimited),
         ("error_out_of_order", WbfErrorCode::OutOfOrder),
         ("error_unsupported", WbfErrorCode::Unsupported),
-        ("error_too_many_connections", WbfErrorCode::TooManyConnections),
+        (
+            "error_too_many_connections",
+            WbfErrorCode::TooManyConnections,
+        ),
         ("error_invalid_request", WbfErrorCode::InvalidRequest),
+        (
+            "error_room_devices_changed",
+            WbfErrorCode::RoomDevicesChanged,
+        ),
     ] {
         let error = protocol::server_error(&pack_named(name).meta);
         assert_eq!(error.wbf_code(), Some(expected), "{name}");
@@ -413,7 +439,11 @@ fn event_recent_and_batch_match_server_vectors() {
             panic!("{error:?}")
         };
         assert_eq!(*code_id, None, "{}", String::from_utf8_lossy(meta));
-        assert_eq!(error.to_string(), "server Corrupt: m", "log 不准印出假的序號");
+        assert_eq!(
+            error.to_string(),
+            "server Corrupt: m",
+            "log 不准印出假的序號"
+        );
     }
     match protocol::server_error(&pack_named("error_too_many_connections").meta) {
         SdkError::Server { code, meta, .. } => {
@@ -465,6 +495,7 @@ fn event_send_meta_shape() {
         event_type: "m.room.encrypted".into(),
         txn_id: "t1".into(),
         attachments: vec!["mxc://localhost/1122334455667788".into()],
+        room_version: None,
     };
     let pack = protocol::send_event(
         &request,
@@ -476,6 +507,89 @@ fn event_send_meta_shape() {
     assert_eq!(
         String::from_utf8(pack.meta).unwrap(),
         r#"{"room_id":"!r:localhost","type":"m.room.encrypted","txn_id":"t1","attachments":["mxc://localhost/1122334455667788"]}"#
+    );
+}
+
+/// `Event/Send` 帶房間版本號、`Error(RoomDevicesChanged)`、`Event/DeviceChanged`、`Device/CryptoState`：
+/// 對著 server 的向量（wbfuwunel `wbf-room-device-version.md` §7、§6；`wbf-e2ee.md` §3）。
+/// 請求逐 byte 一樣；回應解得出每個欄位。
+#[test]
+fn room_device_version_packs_match_server_vectors() {
+    use wbf_sdk::error_code::WbfErrorCode;
+    use wbf_sdk::protocol::{self, CryptoStateMeta, DeviceChangedMeta, SendRequest};
+    use wbf_wire::pack::{device, event};
+    use wbf_wire::{Kind, Pack};
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let entry_named = |name: &str| -> &serde_json::Value {
+        vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"))
+    };
+    let pack_named = |name: &str| -> Pack {
+        Pack::decode(&hex::decode(entry_named(name)["bytes_hex"].as_str().unwrap()).unwrap())
+            .unwrap()
+    };
+
+    // 請求：沒有附件就不寫 `attachments`，`room_version` 排在最後 —— 逐 byte 跟 server 一樣。
+    let vector = pack_named("send_encrypted_with_room_version");
+    let request = SendRequest {
+        room_id: "!r:localhost".into(),
+        event_type: "m.room.encrypted".into(),
+        txn_id: "t2".into(),
+        attachments: vec![],
+        room_version: Some(81234),
+    };
+    let ours = protocol::send_event(&request, vector.data.clone(), vector.seq);
+    assert_eq!(ours.encode().unwrap(), vector.encode().unwrap());
+
+    // 1506：認碼只看 code_id；目前的號碼從 meta 讀。
+    let error = protocol::server_error(&pack_named("error_room_devices_changed").meta);
+    assert_eq!(error.wbf_code(), Some(WbfErrorCode::RoomDevicesChanged));
+    assert_eq!(error.current_room_version(), Some(81240));
+    assert_eq!(
+        protocol::server_error(&pack_named("error_rate_limited").meta).current_room_version(),
+        None,
+        "別的錯誤沒有這個欄位"
+    );
+
+    let changed = pack_named("event_device_changed");
+    assert_eq!(
+        (changed.kind, changed.subtype),
+        (Kind::Event, event::DEVICE_CHANGED)
+    );
+    let changed: DeviceChangedMeta = serde_json::from_slice(&changed.meta).unwrap();
+    assert_eq!(changed.user_id, "@bob:localhost");
+    assert_eq!(changed.device_version, "4-0123456789");
+    assert_eq!(changed.rooms["!r1:localhost"], 81240);
+    assert_eq!(changed.rooms.len(), 2);
+    assert!(!changed.gap);
+    let without_gap: DeviceChangedMeta =
+        serde_json::from_str(r#"{"user_id":"@b:x","device_version":"1-a","rooms":{}}"#).unwrap();
+    assert!(without_gap.gap, "缺 gap ＝ 當丟過");
+
+    let state = pack_named("device_crypto_state");
+    assert_eq!(
+        (state.kind, state.subtype),
+        (Kind::Device, device::CRYPTO_STATE)
+    );
+    let state: CryptoStateMeta = serde_json::from_slice(&state.meta).unwrap();
+    assert_eq!(state.otk_counts["signed_curve25519"], 42);
+    assert_eq!(state.unused_fallback_key_types, vec!["signed_curve25519"]);
+    assert!(!state.gap);
+    let empty: CryptoStateMeta =
+        serde_json::from_slice(&pack_named("device_crypto_state_empty").meta).unwrap();
+    assert!(empty.otk_counts.is_empty());
+    assert!(
+        empty.unused_fallback_key_types.is_empty(),
+        "`[]` 是「都用掉了」，要保留成空陣列"
+    );
+    assert!(
+        serde_json::from_str::<CryptoStateMeta>(r#"{"otk_counts":{},"gap":false}"#).is_err(),
+        "缺 unused_fallback_key_types 是形狀錯，不補成空"
     );
 }
 

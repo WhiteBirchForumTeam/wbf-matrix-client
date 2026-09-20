@@ -154,6 +154,18 @@ impl SdkError {
         self.server_meta_field("retry_after_ms")?.as_u64()
     }
 
+    /// `RoomDevicesChanged`（1506）帶的**目前**房間版本號（wbfuwunel `wbf-room-device-version.md` §7.1）。
+    ///
+    /// 📎 這個號碼只能拿來「知道自己過期了」，🚫 不能直接拿它重送：金鑰還沒補發給變了的裝置。
+    /// 重送前要重拿成員清單（那份帶的號碼才跟名單同一刻）。
+    ///
+    /// Return:
+    ///     Some(u64)  server 說的目前號碼, example: 81240
+    ///     None       不是 `Server`、沒有這個欄位、或不是非負整數
+    pub fn current_room_version(&self) -> Option<u64> {
+        self.server_meta_field("room_version")?.as_u64()
+    }
+
     /// session 是不是 **soft logout**（token 過期但可以 refresh）。
     ///
     /// 🚨 **只有 JSON 的 `true` 才算**：不出現、`false`、字串 `"true"`、數字都是 false。

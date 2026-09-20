@@ -392,7 +392,7 @@ impl Core {
         let mut client = self
             .client_of(account, Transport::default(), MethodHome::BothSides)
             .await?;
-        client.hello(HISTORY_CLIENT_NAME).await?;
+        client.hello(HISTORY_CLIENT_NAME, &[]).await?;
         let request = wbf_sdk::protocol::RecentRequest {
             rooms: Some(vec![room.to_string()]),
             // server 在上限以上會 clamp，client 先 clamp 才算得出「窗滿了沒」（protocol.rs）。

@@ -207,21 +207,25 @@ B2 讀得到什麼：
 
 ## 12. 現況與缺口對照
 
+🔁 **2026-09-20 更新**：寫這份時 WS 上缺的那一半，server 都補齊了（wbfuwunel `wbf-e2ee.md`、`wbf-room-device-version.md`，PR #67–#75）。
+「WS 上有嗎」那欄寫的是 **server 現在的樣子**；「現在」那欄仍是 client 目前走的路。client 要怎麼跟上見 §16。
+
 | 步驟 | 需要 | 現在 | WS 上有嗎 |
 |---|---|---|---|
-| 上傳自己的金鑰 | `/keys/upload` | matrix-sdk | ❌（不在橋上） |
-| 查別人的裝置 | `/keys/query` | matrix-sdk | ❌ |
-| **誰的裝置變了** | `device_lists.changed`／`left` | `/sync` | ❌ **最關鍵的缺口** |
-| OTK 剩幾把 | `device_one_time_keys_count`、unused fallback keys | `/sync` | ❌ |
-| 拿 OTK 建 Olm | `/keys/claim` | matrix-sdk | ❌ |
+| 上傳自己的金鑰 | `/keys/upload` | matrix-sdk | ✅ 橋 `0x17 0x20` |
+| 查別人的裝置 | `/keys/query` | matrix-sdk | ✅ 橋 `0x17 0x21` |
+| **誰的裝置變了** | `device_lists.changed`／`left` | `/sync` | ✅ **換了形狀**：成員清單帶裝置版本號與房間版本號（`0x13 0x29`）、送出時比對（1506）、`Event/DeviceChanged`（`0x14 0x07`，加速）；§16 |
+| OTK 剩幾把 | `device_one_time_keys_count`、unused fallback keys | `/sync` | ✅ `Device/CryptoState`（`0x16 0x08`，每個 `Device/Subscribe` 之後一定跟一個） |
+| 拿 OTK 建 Olm | `/keys/claim` | matrix-sdk | ✅ 橋 `0x17 0x22` |
 | **收**房間金鑰 | to-device | `/sync` | ✅ `0x16 Device` |
-| **發**房間金鑰 | `/sendToDevice` | matrix-sdk | ❌ |
-| 送訊息 | `/send` | matrix-sdk | ✅ `Event/Send`（還能帶 `attachments`） |
+| **發**房間金鑰 | `/sendToDevice` | matrix-sdk | ✅ 橋 `0x16 0x25` |
+| 送訊息 | `/send` | matrix-sdk | ✅ `Event/Send`（帶 `attachments`；加密訊息再帶 `room_version`） |
 | 收訊息 | timeline | `/sync`、`/messages` | ✅ `Recent`、Push |
 | 建房、邀請、踢人、離開 | `/createRoom` 等 | 沒做 | ✅ 橋批 1 |
-| 金鑰備份 | `/room_keys/*` | matrix-sdk | ❌ |
+| 金鑰備份 | `/room_keys/*` | matrix-sdk | ✅ 橋 `0x17 0x30`–`0x3D` |
+| 簽章上傳、交叉簽章金鑰 | `/keys/signatures/upload`、`/keys/device_signing/upload` | matrix-sdk | ✅ 橋 `0x17 0x25`、`0x24`（換金鑰要 UIAA） |
 
-**「收」這一半 WS 已經夠用**（缺 OTK 數量，可以先用 HTTP 的 `/keys/upload` 頂）；**「送」這一半還缺四支端點與裝置清單變動**。所以順序是先收、後送。
+📎 原本這裡寫「收這一半夠用、送這一半缺四支端點與裝置清單變動」——現在兩半都在 WS 上了。順序仍然是先收後送（§15），理由變成「收不必等任何人、送要先把§16 做完」。
 
 ## 13. server 補齊之後：只把 matrix-sdk-crypto 當狀態機用，行不行
 
@@ -263,6 +267,9 @@ OTK 該不該補、金鑰請求與轉發、交叉簽章與驗證狀態、重播�
 
 ## 14. 要向 server 要的（合成一個 issue）
 
+✅ 開成 wbfuwunel #65，三件都做完了：1 變成 `Device/CryptoState`（不帶 `Batch`／`Push`，獨立一個 pack）；2 **沒照這裡提的形狀做**，
+改成房間版本號（§16，理由在 server 的 `e2ee-send-guard-problem.md`：推播鏈任一環掉了訊息照樣送出、沒人知道）；3 全部上橋，連備份一起。
+
 1. `0x16` 的 `Batch`／`Push` 帶 **OTK 數量**與 **unused fallback keys**（相容的增補）。
 2. **裝置清單變動**（`changed`／`left`）走 WS 推送（放 `0x16`，或另一個訂閱）。
 3. `/keys/upload`、`/keys/query`、`/keys/claim`、`/sendToDevice` 搬上橋（批 2）；金鑰備份的 `/room_keys/*` 視需要一起。
@@ -273,3 +280,51 @@ OTK 該不該補、金鑰請求與轉發、交叉簽章與驗證狀態、重播�
 2. core：訂閱、補洞、匯入 OlmMachine、`cd_seq` 與待銷毀清單落在 `m/`、`ItemsDestroy`；自己送 `outgoing_requests`（過渡期 HTTP）。**會叫 server 刪東西，審查最嚴。**
 3. core：WS 密文當場解；`cache.db` 存 `megolm_session_id`；按匯入回傳的 `RoomKeyInfo` 重解。
 4. （server 補齊裝置清單變動與批 2 之後）送訊息改成自己加密＋`Event/Send`＋`attachments`，同時把 #11 清單裡跟「送」有關的條目逐條寫成測試。
+
+📎 2026-09-20 起，第 4 步的括號已經成立（§12）。但「送」多了一件事：**送出前比對房間版本號**（§16），做完才能在 `Hello` 宣告。
+
+## 16. 送出前比對房間版本號：client 要對齊的（issue #45，server 的 `wbf-room-device-version.md`）
+
+server 不再推「誰的裝置清單變了」那份清單，改成一個**可以在收訊息那一刻檢查的條件**：每個帳號一個裝置版本號 `序號-雜湊`、
+每個房間一個房間版本號（u64），有約定的 client 送加密訊息時帶房間版本號，過期就被 `1506 RoomDevicesChanged` 擋下，**訊息不會送出**。
+推播（`Event/DeviceChanged`）只是加速；全掉光也只是多被擋一次，🚫 不是正確性的來源。
+
+### 16.1 四件事，client 端各落在哪
+
+| # | server 給的 | client 端 | 狀態 |
+|---|---|---|---|
+| 1 | `Hello.features` 帶 `"org.wbftw.device_versions"` 才推 `DeviceChanged`；**宣告後加密訊息漏帶 `room_version` 會被 `InvalidRequest` 拒** | `protocol::DEVICE_VERSIONS_FEATURE`；`WbfClient::hello(name, features)` | ✅ 常數與參數在；🚫 **16.3 做完之前沒有任何一條路可以宣告它** |
+| 2 | 成員清單（`0x13 0x29`／HTTP `/members`）最外層 `org.wbftw.room_version`，每個 `join` 成員 `unsigned["org.wbftw.device_version"]`；橋不再收 `at` | `device_version::RoomDeviceVersions::from_members_body`（沒有號碼就是錯，不是 0）、`diff_from`（誰要重查、誰離開） | ✅ 讀法在；打 Members 的呼叫等橋的通用入口 |
+| 3 | `Event/Send` meta 多 `room_version`；只查 `m.room.encrypted`；對不上回 1506，meta 帶目前的號碼 | `SendRequest::room_version`、`WbfErrorCode::RoomDevicesChanged`、`SdkError::current_room_version` | ✅ 協議層在；重查→補發→重送的迴圈等 OlmMachine |
+| 4 | `Event/DeviceChanged`（`0x14 0x07`）：`{user_id, device_version, rooms, gap}`，跟 `Push` 共用 `id`／`seq`／`gap` | `pack::event::DEVICE_CHANGED`、`protocol::DeviceChangedMeta`（缺 `gap` 當 true） | ✅ 解得開；收包迴圈還沒分派它 |
+
+順手一起的：`Device/CryptoState`（`0x16 0x08`）→ `pack::device::CRYPTO_STATE`、`protocol::CryptoStateMeta`（`unused_fallback_key_types` 缺欄位是錯，🚫 不補成空：
+`[]` 對 OlmMachine 是「都用掉了，該換」，「沒給」是「server 不支援」）。向量檔重抄，五條新向量（`send_encrypted_with_room_version`、
+`error_room_devices_changed`、`event_device_changed`、`device_crypto_state`、`device_crypto_state_empty`）都有測試比對。
+
+### 16.2 收到 1506 之後（§7.2 的迴圈，client 的政策：重試一次）
+
+```
+送 Event/Send{ type: m.room.encrypted, room_version: V }  ──→  Error 1506 { room_version: V' }
+  ↓ 訊息沒送出；V' 只用來知道自己過期，🚫 不拿它直接重送（金鑰還沒補發）
+重拿 Members  → RoomDeviceVersions { room_version: V'', members }      ← 名單與號碼是同一刻的
+  ↓ diff_from(上一份)
+changed（新加入、版本號變了的）→ 只對他們 /keys/query → 餵 OlmMachine（update_tracked_users／mark_user_as_changed）
+left（不在了的）              → 換一把新的房間金鑰（OlmMachine 的 share 策略本來就會做，見 §9）
+  ↓ get_missing_sessions → /keys/claim；share_room_key → /sendToDevice（都走橋）
+帶 V'' 重送（同一個 txn_id）。同一個 txn_id 已經送成功過的，server 回原本的 event_id，不會再被擋。
+```
+
+📎 雜湊可以自己驗：`device_version::compute_device_keys_hash(user_id, /keys/query 的回應)` 照 server §3.4 重算（黃金向量 `810b7c3be4` 有測試釘住），
+對得上表示看到的是同一組金鑰。`unhashable` 是 server 算不出來時的佔位字，永遠對不上，序號照樣前進。
+規則裡最容易漏的一條（server PR #75 才抓到）：過濾掉別人的簽章之後 `signatures` 空了，要**整個欄位拿掉**，不是留 `{}`。
+
+### 16.3 分三支
+
+| 支 | 內容 | 宣告 feature？ |
+|---|---|---|
+| **1**（這一支） | 協議層：向量、subtype 常數、`room_version`、1506、`DeviceChangedMeta`／`CryptoStateMeta`、`device_version` 模組。**行為不變** | 🚫 |
+| 2 | 橋的通用入口（`IS_BRIDGED` 的請求／回覆；PR #43 那份 `call_bridge` 的形狀）＋ `Kind::Room`／`Keys`；打 Members 拿 `RoomDeviceVersions`；`/keys/*`、`/sendToDevice` 走橋 | 🚫 |
+| 3 | OlmMachine 的 `outgoing_requests` 迴圈、送出前比對、16.2 的迴圈、收包分派 `DeviceChanged`／`CryptoState`；**#45 的驗收**（Bob 登新裝置 → 帶舊號碼送 → 1506 → 修 → 重送 → Bob 新裝置收到房間金鑰）走通 | ✅ 這一支才開 |
+
+🚨 為什麼 1、2 不能宣告：宣告的連線送加密訊息漏帶號碼是 `InvalidRequest`，而 1、2 還沒有「送出前比對」——宣告了就是把自己所有加密訊息擋掉。

@@ -163,7 +163,7 @@ impl Core {
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly)
             .await?;
-        client.hello(client_name).await?;
+        client.hello(client_name, &[]).await?;
         let cg_seq = match from_scratch {
             true => None,
             false => cache.read().await.get_cg_seq(&me)?,

@@ -285,7 +285,7 @@ impl crate::Core {
     ///     Err(...)   連不上、token 被拒、逾時 —— 呼叫端一律當成「不是 wbf」
     async fn probe_wbf(&self, account: &crate::accounts::AccountDir) -> Result<bool, CoreError> {
         let mut client = self.connect_wbf_client(account).await?;
-        let hello = client.hello(PROBE_CLIENT_NAME).await?;
+        let hello = client.hello(PROBE_CLIENT_NAME, &[]).await?;
         Ok(hello.protocol == wbf_sdk::protocol::PROTOCOL_VERSION)
     }
 

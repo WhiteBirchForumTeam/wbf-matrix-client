@@ -140,6 +140,36 @@ pub mod event {
     pub const SEND: u8 = 0x02;
     /// 只有 server → client：`Recent` 一窗裡的一批事件，meta `{ tc, bc, fs, ls, r }`，data 是 u32 大端長度前綴的事件 JSON。
     pub const BATCH: u8 = 0x03;
+    /// 訂閱新事件的推送；`id` 由 client 選，之後每個 `Push`、`DeviceChanged` 抄它。
+    pub const SUBSCRIBE: u8 = 0x04;
+    pub const UNSUBSCRIBE: u8 = 0x05;
+    /// 只有 server → client：訂閱中的房間有新事件，meta `{ bc, fs, ls, gap }`。
+    pub const PUSH: u8 = 0x06;
+    /// 只有 server → client：某人的裝置版本號變了，meta `{ user_id, device_version, rooms, gap }`
+    /// （wbfuwunel `wbf-room-device-version.md` §6）。**只推給 `Hello.features` 宣告過
+    /// `org.wbftw.device_versions` 的連線**；`id`、`seq`、`gap` 跟這條連線的 `Push` 共用。
+    pub const DEVICE_CHANGED: u8 = 0x07;
+}
+
+/// `Kind::Device` 的 subtype（wbfuwunel `wbf-to-device.md`、`wbf-e2ee.md` §3；client 這邊的解讀在 `to-device-client.md`）。
+/// 這些是**原生**的 pack（不帶 `IS_BRIDGED`）；同一個 kind 從 `0x20` 起是走橋的 Matrix 端點。
+pub mod device {
+    /// 從 `cd_seq` 起拉 to-device 佇列；回應是一串 `Batch`。
+    pub const FETCH: u8 = 0x01;
+    /// 只有 server → client：`Fetch` 一窗裡的一批，meta `{ tc, bc, ot, nt, counts, r, more }`。
+    pub const BATCH: u8 = 0x02;
+    /// 帶結果的銷毀命令：data 是 `tc` 個 u64 大端的 count，回應是 `ItemsDestroyed`。
+    pub const ITEMS_DESTROY: u8 = 0x03;
+    /// 訂閱這個裝置的佇列；`id` 由 client 選，之後每個 `Push`、`CryptoState` 抄它。
+    pub const SUBSCRIBE: u8 = 0x04;
+    pub const UNSUBSCRIBE: u8 = 0x05;
+    /// 只有 server → client：佇列有新東西，meta `{ bc, ot, nt, counts, gap }`。
+    pub const PUSH: u8 = 0x06;
+    /// 只有 server → client：`ItemsDestroy` 的結果，meta `{ tc, bc }`。
+    pub const ITEMS_DESTROYED: u8 = 0x07;
+    /// 只有 server → client：自己的金鑰存量，meta `{ otk_counts, unused_fallback_key_types, gap }`；
+    /// 每個 `Subscribe` 之後一定跟一個，收包迴圈🚫 不能把它當成下一個請求的回覆。
+    pub const CRYPTO_STATE: u8 = 0x08;
 }
 
 /// kind `0x10 Session`（wire-format §6.3）。

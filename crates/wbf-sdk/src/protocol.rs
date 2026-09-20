@@ -12,14 +12,20 @@ use crate::error::SdkError;
 /// `Hello` 的 meta（線上規格 §1）。
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// `Hello.features` 裡唯一 server 會讀的字串（wbfuwunel `wbf-room-device-version.md` §6.2）。
+/// 宣告了，server 才推 `Event/DeviceChanged`；**宣告了之後，加密訊息漏帶 `room_version` 會被 `InvalidRequest` 拒**——
+/// 所以只有「送出前會比對房間版本號」的那條路才能宣告它。server 的 `Hello` 回應 `features` 也列這一項，
+/// 拿來判斷對面支不支援。
+pub const DEVICE_VERSIONS_FEATURE: &str = "org.wbftw.device_versions";
+
 // ---- 請求 ----
 
 /// Args:
 ///     client_name: example: "wbf-cli/0.1"
+///     features: 這條連線向 server 宣告的能力, example: &[DEVICE_VERSIONS_FEATURE]；平常是 &[]
 ///     seq: 請求號
-pub fn hello(client_name: &str, seq: u32) -> Pack {
-    let meta =
-        serde_json::json!({ "protocol": PROTOCOL_VERSION, "client": client_name, "features": [] });
+pub fn hello(client_name: &str, features: &[&str], seq: u32) -> Pack {
+    let meta = serde_json::json!({ "protocol": PROTOCOL_VERSION, "client": client_name, "features": features });
     control_request(control::HELLO, seq, meta.to_string().into_bytes())
 }
 
@@ -492,19 +498,27 @@ pub fn event_seqs(event: &serde_json::Value) -> (Option<i64>, Option<i64>) {
     (read(R_SEQ_KEY), read(G_SEQ_KEY))
 }
 
-/// `Event/Send` 的請求 meta（media-attachments.md §3）。`attachments` 是這則訊息用到的 mxc，
-/// server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（spec §12）。
+/// `Event/Send` 的請求 meta（media-attachments.md §3、wbfuwunel `wbf-room-device-version.md` §7）。
+/// `attachments` 是這則訊息用到的 mxc，server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（spec §12）。
+/// 鍵序就是線上的 JSON 序（向量逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SendRequest {
     pub room_id: String,
     #[serde(rename = "type")]
     pub event_type: String,
     pub txn_id: String,
+    /// 空的就不寫（server 向量 `send_encrypted_with_room_version` 沒有這個欄位；server 把缺欄位當空清單）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// 這則加密訊息的房間金鑰是照哪個房間版本號發的（成員清單最外層的 `org.wbftw.room_version`）。
+    /// server 只對 `m.room.encrypted` 檢查；對不上回 `RoomDevicesChanged`（1506），訊息沒送。
+    /// None ＝ 不帶：沒宣告 `DEVICE_VERSIONS_FEATURE` 的連線不檢查；宣告過的連線送加密訊息不帶會被 `InvalidRequest` 拒。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_version: Option<u64>,
 }
 
 /// Args:
-///     request: example: SendRequest { room_id: "!r:localhost".into(), event_type: "m.room.encrypted".into(), txn_id: "t1".into(), attachments: vec!["mxc://localhost/1122334455667788".into()] }
+///     request: example: SendRequest { room_id: "!r:localhost".into(), event_type: "m.room.encrypted".into(), txn_id: "t1".into(), attachments: vec!["mxc://localhost/1122334455667788".into()], room_version: Some(81234) }
 ///     content: 事件 content 的 JSON bytes（E2EE 就是 `m.room.encrypted` 的 content）
 pub fn send_event(request: &SendRequest, content: Vec<u8>, seq: u32) -> Pack {
     Pack {
@@ -518,8 +532,42 @@ pub fn send_event(request: &SendRequest, content: Vec<u8>, seq: u32) -> Pack {
     }
 }
 
-/// `Event/Send` 的 Ack meta。server 端還沒實作（提案階段），形狀照 Matrix 的 send 回應猜：`event_id`。
+/// `Event/Send` 的 Ack meta（server 向量 `ack_send`）：`event_id`。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct SendAck {
     pub event_id: String,
+}
+
+/// `Event/DeviceChanged`（`0x14 0x07`，只有 server → client）的 meta（wbfuwunel `wbf-room-device-version.md` §6）。
+/// 某人的裝置版本號變了；`rooms` 是這條連線訂閱中、而且他在裡面的房間 → 各自新的房間版本號。
+/// 一條連線一次變動只收一個，不管共同幾個房。丟了由 `gap` 提醒，最後由送出時的 1506 擋。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DeviceChangedMeta {
+    pub user_id: String,
+    /// `序號-雜湊`，解讀用 `device_version::DeviceVersion::parse`。
+    pub device_version: String,
+    pub rooms: std::collections::BTreeMap<String, u64>,
+    /// true ＝ 這條連線前面有推送（`Push` 或 `DeviceChanged`）被丟掉：重拿那些房間的成員清單。
+    /// 🚨 缺欄位當 true（不確定就多拿一次，🚫 不假設沒丟）。
+    #[serde(default = "gap_when_missing")]
+    pub gap: bool,
+}
+
+/// `Device/CryptoState`（`0x16 0x08`，只有 server → client）的 meta（wbfuwunel `wbf-e2ee.md` §3）：
+/// **自己這台裝置**的金鑰存量，跟 `/sync` 的 `device_one_time_keys_count`、`device_unused_fallback_key_types` 同義。
+/// 每個 `Device/Subscribe` 之後一定跟一個；OTK 被 claim、上傳、fallback 被用掉時再推。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CryptoStateMeta {
+    /// 每種演算法剩幾把 OTK, example: {"signed_curve25519": 42}
+    pub otk_counts: std::collections::BTreeMap<String, u64>,
+    /// 還沒被用掉的 fallback key 演算法。⚠️ `[]` 與「沒給」意思不同：OlmMachine 把沒給當 server 不支援、把 `[]` 當「都用掉了，該換」。
+    /// server 保證一定給，所以缺欄位是形狀錯，🚫 不用 `default` 補成空。
+    pub unused_fallback_key_types: Vec<String>,
+    /// 同 [`DeviceChangedMeta::gap`]：缺欄位當 true。
+    #[serde(default = "gap_when_missing")]
+    pub gap: bool,
+}
+
+fn gap_when_missing() -> bool {
+    true
 }

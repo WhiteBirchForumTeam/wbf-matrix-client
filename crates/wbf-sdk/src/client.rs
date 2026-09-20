@@ -110,8 +110,16 @@ impl<C: PackChannel> WbfClient<C> {
 
     /// Args:
     ///     client_name: example: "wbf-cli/0.1"
-    pub async fn hello(&mut self, client_name: &str) -> Result<HelloAck, SdkError> {
-        let ack = self.call(|seq| protocol::hello(client_name, seq)).await?;
+    ///     features: 向 server 宣告的能力, example: &[] 或 &[protocol::DEVICE_VERSIONS_FEATURE]。
+    ///               🚨 宣告 `DEVICE_VERSIONS_FEATURE` 的那條連線，之後每則加密訊息都必須帶 `room_version`。
+    pub async fn hello(
+        &mut self,
+        client_name: &str,
+        features: &[&str],
+    ) -> Result<HelloAck, SdkError> {
+        let ack = self
+            .call(|seq| protocol::hello(client_name, features, seq))
+            .await?;
         let hello: HelloAck = protocol::parse_meta(&ack)?;
         self.features = Some(hello.features.clone());
         self.hello = Some(hello.clone());
