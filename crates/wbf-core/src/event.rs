@@ -56,6 +56,35 @@ pub enum CoreEvent {
         /// 房間事件的水位；不知道就 `None`。
         cg_seq: Option<i64>,
     },
+    /// 這個帳號的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用才知道。
+    Link {
+        user: String,
+        role: crate::link_pool::LinkRole,
+        state: LinkState,
+        /// 關的理由；開的時候是 `None`。
+        reason: Option<String>,
+    },
+    /// 這條線收到一個 pack（`ReceivedHook` 的那一頭）。**只有標頭**，🚫 不帶 meta／data：它是 broadcast、每條 RPC 連線一份，
+    /// 而 data 可能是幾 MiB 的媒體塊或密文。要內容的由型別化的事件發（`Message` 那種）。
+    Received {
+        user: String,
+        role: crate::link_pool::LinkRole,
+        /// pack 的 kind 號（wire-format §3.1）, example: 0x16
+        kind: u8,
+        subtype: u8,
+        id: u64,
+        seq: u32,
+        /// 會話表把它交給了誰（ws-receive-dispatch.md §2.1）。
+        route: wbf_sdk::Route,
+    },
+}
+
+/// 一條線的開關（`CoreEvent::Link`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    Opened,
+    Closed,
 }
 
 /// 一個帳號跟它的 homeserver 之間現在是什麼狀態（rpc-spec §4 的 `sync.state`）。

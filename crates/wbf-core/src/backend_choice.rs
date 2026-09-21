@@ -301,19 +301,24 @@ impl crate::Core {
     ///     account: 哪個帳號
     ///     transport: 呼叫端要的那條, example: Transport::WebSocket
     ///     home: 這個方法住在哪一邊, example: MethodHome::WbfSdkOnly
+    ///     role: 走池裡哪一條線（link-pool.md §2：角色是呼叫點的屬性）, example: LinkRole::Misc
     /// Return:
-    ///     Ok(WbfClient)  開好了（WS）
-    ///     Err(Usage)     這條路到不了 wbf，而這個功能只有它有 —— 它是關的
-    ///     Err(Network)   到得了，但 WS 開不起來（維護者 2026-09-13：開失敗要報錯）
+    ///     Ok(PooledClient)  池裡那條線（沒開就開、死了重開）；丟掉就還回去
+    ///     Err(Usage)        這條路到不了 wbf，而這個功能只有它有 —— 它是關的；或帳號沒登入
+    ///     Err(Network)      到得了，但 WS 開不起來（維護者 2026-09-13：開失敗要報錯）
     pub(crate) async fn client_of(
         &self,
         account: &crate::accounts::AccountDir,
         transport: Transport,
         home: MethodHome,
-    ) -> Result<wbf_sdk::client::WbfClient<wbf_sdk::channel::Channel>, CoreError> {
+        role: crate::link_pool::LinkRole,
+    ) -> Result<crate::link_pool::PooledClient, CoreError> {
         let speaks_wbf = self.get_backend_kind(account).await == BackendKind::WbfSdk;
         match get_backend_for(transport, speaks_wbf, home)? {
-            BackendKind::WbfSdk => self.connect_wbf_client(account).await,
+            BackendKind::WbfSdk => {
+                let pool = self.pool_of_account(account)?;
+                pool.acquire(role, || self.open_link(account, role)).await
+            }
             // ⚠️ `BothSides`／`StillOnMatrixSdk` 落到這裡：這個呼叫該走 matrix-sdk，而它
             // 🚫 不該來要 wbf 的 client。⭐ 這是程式接錯線，不是使用者填錯參數 ——
             // 所以訊息講「你要錯東西了」，而不是「你的參數不對」。
@@ -442,7 +447,10 @@ mod tests {
             "🚫 失敗不准留下結論——不然同 server 的其他帳號會被連坐"
         );
         // 再問一次還是一樣的答案，而且還是沒記住（所以下一次仍然會重探）。
-        assert_eq!(core.get_backend_kind(&account).await, BackendKind::MatrixSdk);
+        assert_eq!(
+            core.get_backend_kind(&account).await,
+            BackendKind::MatrixSdk
+        );
         assert_eq!(core.get_remembered_backend(&account), None);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -466,8 +474,7 @@ mod tests {
         let accounts: Vec<_> = ["@a:dead", "@b:dead"]
             .into_iter()
             .map(|user| {
-                let account =
-                    crate::accounts::AccountDir::locate(&dir, &key, DEAD, user).unwrap();
+                let account = crate::accounts::AccountDir::locate(&dir, &key, DEAD, user).unwrap();
                 std::fs::create_dir_all(&account.dir).unwrap();
                 seal_dead_session(&core, &account, user);
                 account
@@ -484,7 +491,10 @@ mod tests {
             core.get_backend_kind(&accounts[0]),
             core.get_backend_kind(&accounts[1])
         );
-        assert_eq!((first, second), (BackendKind::MatrixSdk, BackendKind::MatrixSdk));
+        assert_eq!(
+            (first, second),
+            (BackendKind::MatrixSdk, BackendKind::MatrixSdk)
+        );
 
         assert_eq!(
             core.count_probe_cells(),
@@ -520,7 +530,10 @@ mod tests {
         std::fs::create_dir_all(&account.dir).unwrap();
         // 🚫 不封 session：`is_logged_in()` 是 false，logout 不必連網路就會走到本地清理。
         core.set_remembered_backend(&account, BackendKind::WbfSdk);
-        assert_eq!(core.get_remembered_backend(&account), Some(BackendKind::WbfSdk));
+        assert_eq!(
+            core.get_remembered_backend(&account),
+            Some(BackendKind::WbfSdk)
+        );
 
         core.log_out("@a:dead", None, true, false)
             .await
@@ -536,11 +549,7 @@ mod tests {
     }
 
     /// 把一個「指向沒人在聽的位址」的 session 封進這個帳號。
-    fn seal_dead_session(
-        core: &crate::Core,
-        account: &crate::accounts::AccountDir,
-        user: &str,
-    ) {
+    fn seal_dead_session(core: &crate::Core, account: &crate::accounts::AccountDir, user: &str) {
         core.vault()
             .unwrap()
             .seal_session(
@@ -571,10 +580,7 @@ mod tests {
         let refused = cell
             .get_or_try_init(|| async {
                 probes.fetch_add(1, Ordering::SeqCst);
-                Err::<BackendKind, CoreError>(CoreError::new(
-                    CoreErrorKind::Usage,
-                    "token refused",
-                ))
+                Err::<BackendKind, CoreError>(CoreError::new(CoreErrorKind::Usage, "token refused"))
             })
             .await;
         assert!(refused.is_err());

@@ -277,3 +277,182 @@ async fn the_daemon_keeps_serving_after_the_frontend_shreds_the_token_file() {
     assert_eq!(reply["code"], 0, "{reply}");
     assert_eq!(reply["result"]["unlocked"], false);
 }
+
+// ---- 訂閱與推播（rpc-spec §3.9、§4；link-pool.md §6）----
+
+fn link_event(user: &str) -> wbf_core::CoreEvent {
+    wbf_core::CoreEvent::Link {
+        user: user.to_string(),
+        role: wbf_core::LinkRole::Keys,
+        state: wbf_core::LinkState::Opened,
+        reason: None,
+    }
+}
+
+/// 沒訂就收不到；訂了 `"*"` 就收到；退訂之後又收不到。「收不到」的證據：事件之後送一個請求，下一包一定是那個請求的回應。
+#[tokio::test]
+async fn pushes_reach_only_the_connections_that_subscribed() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    let core = daemon.handle.core().await;
+
+    core.emit_event(link_event("@alice:localhost"));
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 1 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["id"], 1, "沒訂：下一包是回應，不是推播 {reply}");
+
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "subscribe", "params": { "events": ["*"] }, "id": 2 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["code"], 0, "{reply}");
+    assert_eq!(reply["result"]["subscribed"], json!(["*"]));
+
+    core.emit_event(link_event("@alice:localhost"));
+    let (pack_type, push) = receive(&mut socket, &keys).await;
+    assert_eq!(pack_type, PackType::Cipher, "推播也走密文");
+    assert_eq!(push["method"], "link.state", "{push}");
+    assert!(push.get("id").is_none(), "推播沒有 id：{push}");
+    assert_eq!(
+        push["params"],
+        json!({ "user": "@alice:localhost", "role": "keys", "state": "opened" })
+    );
+
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "unsubscribe", "params": { "events": ["*"] }, "id": 3 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["result"]["subscribed"], json!([]));
+    core.emit_event(link_event("@alice:localhost"));
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 4 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["id"], 4, "退訂之後又收不到 {reply}");
+
+    // 參數錯是 102，連線活著。
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "subscribe", "params": { "events": "nope" }, "id": 5 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["code"], 102, "{reply}");
+}
+
+/// `user` 過濾：只訂 alice 的，bob 的不推；沒有帳號的事件（progress）照推。
+#[tokio::test]
+async fn a_subscription_scoped_to_a_user_drops_other_users_events() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "subscribe", "params": { "events": ["link.state", "progress"], "user": "@alice:localhost" }, "id": 1 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(
+        reply["result"]["subscribed"],
+        json!(["link.state", "progress"])
+    );
+    let core = daemon.handle.core().await;
+    core.emit_event(link_event("@bob:localhost"));
+    core.emit_event(wbf_core::CoreEvent::Progress {
+        job: None,
+        done: 1,
+        total: Some(2),
+        text: "half".into(),
+    });
+    core.emit_event(link_event("@alice:localhost"));
+    let (_, first) = receive(&mut socket, &keys).await;
+    assert_eq!(
+        first["method"], "progress",
+        "bob 的被濾掉，先到的是沒有帳號的進度 {first}"
+    );
+    assert_eq!(
+        first["params"],
+        json!({ "id": null, "done": 1, "total": 2, "note": "half" })
+    );
+    let (_, second) = receive(&mut socket, &keys).await;
+    assert_eq!(second["method"], "link.state");
+    assert_eq!(second["params"]["user"], "@alice:localhost");
+}
+
+/// 讀太慢被覆蓋掉：第一包是 `desync { missed }`，🚫 不假裝沒事。
+/// 📎 `#[tokio::test]` 是單執行緒的 runtime：這個迴圈同步地發 400 則，推播 task 一則都還沒讀，佇列深度 256 → 一定 Lagged。
+#[tokio::test]
+async fn falling_behind_the_broadcast_is_reported_as_desync() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "subscribe", "params": { "events": ["*"] }, "id": 1 }),
+    )
+    .await;
+    receive(&mut socket, &keys).await;
+    let core = daemon.handle.core().await;
+    for _ in 0..400 {
+        core.emit_event(link_event("@alice:localhost"));
+    }
+    let (_, first) = receive(&mut socket, &keys).await;
+    assert_eq!(first["method"], "desync", "{first}");
+    let missed = first["params"]["missed"].as_u64().unwrap();
+    assert!(missed >= 100, "400 則進 256 深的佇列，至少漏 144：{missed}");
+    let (_, next) = receive(&mut socket, &keys).await;
+    assert_eq!(
+        next["method"], "link.state",
+        "desync 之後是還在佇列裡的那些"
+    );
+}
+
+/// `daemon.info` 報得出開著幾條上游的線；這個資料目錄沒有帳號，所以是 0。
+#[tokio::test]
+async fn daemon_info_reports_the_number_of_open_links() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 1 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["result"]["links"], 0, "{reply}");
+}

@@ -19,8 +19,9 @@ use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
-use crate::error::{CoreError, CoreErrorKind};
 use crate::backend_choice::MethodHome;
+use crate::error::{CoreError, CoreErrorKind};
+use crate::link_pool::LinkRole;
 use crate::{Core, Target};
 
 /// `media-stats`。
@@ -145,7 +146,12 @@ impl Core {
         let (mut cache, _me) = self.cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(
+                &account,
+                transport,
+                MethodHome::WbfSdkOnly,
+                LinkRole::Download,
+            )
             .await?;
         let fetched = media::fetch(
             &mut client,
@@ -205,7 +211,12 @@ impl Core {
     ) -> Result<DirectDownloadResult, CoreError> {
         let account = self.account_or_current(target)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(
+                &account,
+                transport,
+                MethodHome::WbfSdkOnly,
+                LinkRole::Download,
+            )
             .await?;
         let mut file = std::fs::File::create(out)?;
         let result = client
@@ -250,12 +261,8 @@ impl Core {
         account: &AccountDir,
     ) -> Result<WbfClient<Channel>, CoreError> {
         let session = self.session_of(account)?;
-        let channel = Channel::connect(
-            &session.server,
-            &session.access_token,
-            Transport::WebSocket,
-        )
-        .await?;
+        let channel =
+            Channel::connect(&session.server, &session.access_token, Transport::WebSocket).await?;
         Ok(WbfClient::new(channel))
     }
 }

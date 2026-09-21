@@ -343,6 +343,8 @@ impl Handle {
         let ports = *self.ports.read().await;
         Ok(json!({
             "version": format!("{DAEMON_NAME} {DAEMON_VERSION}"),
+            // 所有帳號加起來現在開著幾條上游的線（link-pool.md）。
+            "links": core.open_link_count(),
             "instance": self.instance,
             "pid": std::process::id(),
             "data_dir": self.data_dir.display().to_string(),

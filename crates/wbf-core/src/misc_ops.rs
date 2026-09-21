@@ -9,9 +9,10 @@ use wbf_sdk::chunk_crypto::{choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::{ChunkedBlock, FileCipher, Transport};
 
-use crate::error::{CoreError, CoreErrorKind};
-use crate::upload_ops::UploadRequest;
 use crate::backend_choice::MethodHome;
+use crate::error::{CoreError, CoreErrorKind};
+use crate::link_pool::LinkRole;
+use crate::upload_ops::UploadRequest;
 use crate::{Core, Target};
 
 /// `info`：這份媒體長什麼樣。**本地與上游都答得出大部分**（daemon-runtime §3.1 的 `sync`）。
@@ -120,7 +121,7 @@ impl Core {
             return self.cached_media_info(&account, mxc).await;
         }
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         let (info, description_data) = client.fetch_info(mxc).await?;
         if sync == crate::SyncMode::Both {
@@ -249,7 +250,12 @@ impl Core {
     ) -> Result<SeekResult, CoreError> {
         let account = self.account_or_current(target)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(
+                &account,
+                transport,
+                MethodHome::WbfSdkOnly,
+                LinkRole::Download,
+            )
             .await?;
         let result = client.seek_read(manifest, at, len).await?;
         Ok(SeekResult {
@@ -280,7 +286,12 @@ impl Core {
         let account = self.account_or_current(target)?;
         let session = self.session_of(&account)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(
+                &account,
+                transport,
+                MethodHome::WbfSdkOnly,
+                LinkRole::Upload,
+            )
             .await?;
         let cipher = crate::upload_ops::parse_cipher(request.cipher.as_deref())?;
         let link = match wifi {
@@ -405,7 +416,7 @@ impl Core {
     ) -> Result<ServerHello, CoreError> {
         let account = self.account_or_current(target)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         let hello = client.hello(client_name, &[]).await?;
         client.ping().await?;
@@ -428,7 +439,7 @@ impl Core {
     ) -> Result<UploadStatusReport, CoreError> {
         let account = self.account_or_current(target)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         let status = client.upload_status(upload_id).await?;
         Ok(UploadStatusReport {
@@ -455,7 +466,7 @@ impl Core {
     ) -> Result<(), CoreError> {
         let account = self.account_or_current(target)?;
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         client.abort_upload(upload_id).await?;
         if let Some(file) = file {

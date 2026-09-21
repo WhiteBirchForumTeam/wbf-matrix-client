@@ -290,6 +290,8 @@ impl Core {
         // ⚠️ 放在 match 之後：兩條分支（剛刪掉、本來就沒有）都是「現在沒有 session」。
         // 📎 這是兩個「session 被替換」的地方之一，另一個是 `log_in` 封新 session 那一行。
         self.forget_backend_probe(account);
+        // 🚨 token 撤了：這個帳號的五條線留著也是死的，整個池拿掉（link-pool.md §3）。
+        self.close_links(account, "logged out").await;
         account.delete_matrix_store()?;
         // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（§10.7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。

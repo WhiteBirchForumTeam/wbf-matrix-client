@@ -47,6 +47,8 @@ pub mod event;
 mod handles;
 /// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
 pub mod job;
+/// 連線池（link-pool.md）：一個帳號五條線。
+pub mod link_pool;
 mod login_ops;
 mod media_ops;
 mod misc_ops;
@@ -65,12 +67,13 @@ use wbf_sdk::Unlock;
 
 pub use account_ops::{AccountStatus, SwitchResult, WhoAmI};
 pub use accounts::AccountSummary;
-pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 use accounts::{AccountDir, DataDirMap};
+pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};
 use event::EventSink;
-pub use event::{CoreEvent, SyncState};
+pub use event::{CoreEvent, LinkState, SyncState};
+pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
@@ -161,6 +164,10 @@ pub struct Core {
             std::sync::Arc<tokio::sync::OnceCell<crate::BackendKind>>,
         >,
     >,
+    /// **一個帳號一個連線池**（link-pool.md）：五條線、要用才開、斷了下次要用再開。key 跟 `backends` 一樣是帳號目錄。
+    /// 登出就整個拿掉（token 撤了）；`Core` 丟掉就全關。
+    pub(crate) link_pools:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<LinkPool>>>,
 }
 
 impl Core {
@@ -178,6 +185,7 @@ impl Core {
             events: EventSink::new(),
             server_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             backends: std::sync::Mutex::new(std::collections::HashMap::new()),
+            link_pools: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

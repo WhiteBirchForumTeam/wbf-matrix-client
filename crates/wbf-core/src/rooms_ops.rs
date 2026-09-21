@@ -19,6 +19,7 @@ use wbf_sdk::{Cipher, EventPage, IncomingEvent};
 use crate::accounts::AccountDir;
 use crate::backend_choice::{get_backend_for, BackendKind, MethodHome};
 use crate::error::{CoreError, CoreErrorKind};
+use crate::link_pool::LinkRole;
 use crate::{Core, Target};
 use wbf_sdk::Transport;
 
@@ -390,7 +391,12 @@ impl Core {
         before_g_seq: Option<i64>,
     ) -> Result<EventPage, CoreError> {
         let mut client = self
-            .client_of(account, Transport::default(), MethodHome::BothSides)
+            .client_of(
+                account,
+                Transport::default(),
+                MethodHome::BothSides,
+                LinkRole::Misc,
+            )
             .await?;
         client.hello(HISTORY_CLIENT_NAME, &[]).await?;
         let request = wbf_sdk::protocol::RecentRequest {

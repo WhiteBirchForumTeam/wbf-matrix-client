@@ -117,6 +117,15 @@ impl Channel {
             Channel::Http(_) => None,
         }
     }
+
+    /// Return:
+    ///     bool  1 = WebSocket 那條線關了（之後每個請求都回 Network；連線池拿這個決定要不要重開）。HTTP 永遠是 0：它沒有「開著」這回事
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Channel::WebSocket(channel) => channel.link().is_closed(),
+            Channel::Http(_) => false,
+        }
+    }
 }
 
 impl PackChannel for Channel {
@@ -207,6 +216,11 @@ impl WsChannel {
     /// 底下那條連線：診斷（`unmatched`、`is_closed`）與需要 `AckPolicy` 的呼叫點用。
     pub fn link(&self) -> &WsLink {
         &self.link
+    }
+
+    /// 拿一條已經起好的 `WsLink` 當通道：給測試（`transport::memory_pair` 對接）與自己採傳輸的嵌入者用。正式的路是 `connect`。
+    pub fn from_link(link: WsLink) -> WsChannel {
+        WsChannel { link }
     }
 }
 
