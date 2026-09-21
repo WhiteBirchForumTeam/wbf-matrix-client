@@ -516,6 +516,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 🚨 **成功登出之後要解封**（PR #54 審查 cirno／salvia／rumia 🔴）：第一版只在 HTTP 失敗那半解封，成功登出後
+    /// 旗標留著，重登入落在同一個目錄（`AccountDir::locate` 是決定性的）就被 `AccountBusy` 磚死到 daemon 重開。
+    /// 這裡起一個回 200 的迷你 HTTP 當 homeserver 的 `/logout`，真的跑 `Core::log_out` 的成功路徑。
+    #[tokio::test]
+    async fn a_successful_logout_unblocks_the_account_so_it_can_log_in_again() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        // 只回應一次：`POST /logout` → 200 `{}`。
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await;
+        });
+        let dir = scratch("logout-succeeds");
+        let core = unlocked(&dir);
+        let key = core.vault().unwrap().account_dir_key();
+        let account = crate::accounts::AccountDir::locate(&dir, &key, &server, "@a:local").unwrap();
+        std::fs::create_dir_all(&account.dir).unwrap();
+        core.vault()
+            .unwrap()
+            .seal_session(
+                &account.session_path(),
+                &wbf_sdk::login::Session {
+                    server: server.clone(),
+                    user_id: "@a:local".to_string(),
+                    device_id: "DEV".to_string(),
+                    access_token: "syt_about_to_be_revoked".to_string(),
+                    store_dir: None,
+                },
+            )
+            .unwrap();
+        assert!(core.pool_of_account(&account).is_ok());
+
+        core.log_out("@a:local", None, true, false)
+            .await
+            .expect("the mini homeserver said 200");
+        assert!(!account.is_logged_in(), "session 刪了");
+        assert!(!core.is_logging_out(&account), "🚨 成功登出之後要解封");
+
+        // 重登入落在同一個目錄：封一個新 session，池要能開。
+        core.vault()
+            .unwrap()
+            .seal_session(
+                &account.session_path(),
+                &wbf_sdk::login::Session {
+                    server: server.clone(),
+                    user_id: "@a:local".to_string(),
+                    device_id: "DEV2".to_string(),
+                    access_token: "syt_new".to_string(),
+                    store_dir: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            core.pool_of_account(&account).is_ok(),
+            "重登入之後池要開得起來，不是 AccountBusy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 把一個「指向沒人在聽的位址」的 session 封進這個帳號。
     fn seal_dead_session(core: &crate::Core, account: &crate::accounts::AccountDir, user: &str) {
         core.vault()

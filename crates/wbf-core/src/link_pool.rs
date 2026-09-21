@@ -206,6 +206,18 @@ pub(crate) fn received_hook(
     })
 }
 
+/// 「登出中」的範圍（account-session.md §4 第 1 與第 5 步）：活著就封池，丟掉就解封。
+pub(crate) struct LoggingOutGuard<'a> {
+    core: &'a crate::Core,
+    account: &'a crate::accounts::AccountDir,
+}
+
+impl Drop for LoggingOutGuard<'_> {
+    fn drop(&mut self) {
+        self.core.end_logging_out(self.account);
+    }
+}
+
 /// 池裡拿出來的一條線。丟掉就是還回去（線不關）。
 pub enum PooledClient {
     /// 池裡那格的 guard：同一條線的下一個命令等它被丟掉。
@@ -304,7 +316,20 @@ impl crate::Core {
         Ok(client)
     }
 
-    /// 登出的封池（account-session.md §4）：放進去之後 `pool_of_account` 一律 `AccountBusy`。
+    /// 登出的封池（account-session.md §4）：guard 活著的期間 `pool_of_account` 一律 `AccountBusy`，guard 丟掉就解封——
+    /// 成功、失敗、提前 return、future 被 drop 都走同一條（PR #54 審查 cirno／salvia／rumia 🔴：第一版只在失敗分支解封，成功登出後重登入會卡 AccountBusy 到 daemon 重開）。
+    pub(crate) fn logging_out_guard<'a>(
+        &'a self,
+        account: &'a crate::accounts::AccountDir,
+    ) -> LoggingOutGuard<'a> {
+        self.begin_logging_out(account);
+        LoggingOutGuard {
+            core: self,
+            account,
+        }
+    }
+
+    /// 登出的封池：放進去之後 `pool_of_account` 一律 `AccountBusy`。🚫 生產路徑用 [`Core::logging_out_guard`]，不要手動配對。
     pub(crate) fn begin_logging_out(&self, account: &crate::accounts::AccountDir) {
         self.logging_out
             .lock()

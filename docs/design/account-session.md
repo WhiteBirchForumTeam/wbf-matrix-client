@@ -81,5 +81,7 @@
 
 ## 7. 測試
 
-- A：探活對假 server（memory transport 的 Hello）與真 server（不帶 token）；四條線的角色表；登出封鎖（封了 `client_of` 拒、解封後過；HTTP 失敗解封）；真 server 的 daemon 流程照跑。
+- A：探活對真 server（不帶 token，daemon 的 `real_server` 流程）；探活失敗不記（沒人在聽的位址）；一台 server 一格；四條線的角色表；
+  登出封鎖（封了 `pool_of_account` 拒、guard 丟掉就解封；HTTP 失敗 no-op；**HTTP 成功之後解封、重登入開得了池**——本機起一個回 200 的迷你 HTTP 當 `/logout`）。
+  ⚠️ 沒有假的 wbf server：「接得上但版本不認得」那格沒測；`connect_anonymous` 走真的 tungstenite，記憶體對接驅動不了它。
 - B：wbf 帳號登入不留 Client 的 state store（`m/` 只有 crypto store）；`room.list both` 走橋；`send_text` 明文走 `Event/Send`、加密房被拒；`backup.status` 對 wbf 帳號回明確的錯；真 server 的 daemon 流程與 sdk e2e 照跑。

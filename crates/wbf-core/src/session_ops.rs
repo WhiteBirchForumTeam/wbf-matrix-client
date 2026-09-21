@@ -278,12 +278,10 @@ impl Core {
         match vault.unseal_session(&account.session_path())? {
             Some(session) => {
                 // account-session.md §4：1 封池 → 2 HTTP 登出（只有成與不成）→ 3 關池 → 4 清本地 → 5 解封。
-                self.begin_logging_out(account);
-                if let Err(error) = logout(&session).await {
-                    // 不成：no-op、解封，連線照常收新封包（維護者 2026-09-21）。
-                    self.end_logging_out(account);
-                    return Err(error.into());
-                }
+                // 封池是一個 guard：這個函數怎麼離開（不成、`?`、成功走到底）都會解封（PR #54 審查 🔴：第一版只在失敗分支解封）。
+                let _logging_out = self.logging_out_guard(account);
+                // 不成：`?` 原樣回錯、guard 解封，連線照常收新封包（維護者 2026-09-21：no-op）。
+                logout(&session).await?;
                 // 成了：token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（link-pool.md §3）。
                 // `close_all` 等正在用線的命令做完才收那條；遠端先關了的只是丟掉，不二次跳錯。
                 // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed；「登出中」是帳號的狀態。

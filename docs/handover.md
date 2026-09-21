@@ -93,7 +93,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
-  link_pool.rs           **連線池**（link-pool.md）：`LinkRole` 五條線、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
+  link_pool.rs           **連線池**（link-pool.md）：`LinkRole` 四條線（misc／upload／download／subscriptions）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
                          `Core::client_of(…, role)` 是唯一閘門、`open_link`（session → Bearer 升級 → hello）、`close_links`（登出叫）、`received_hook`（pack → `CoreEvent::Received`）、
                          `open_link_count`（`daemon.info` 的 `links`）。單元測試用記憶體對接的假 opener
   job.rs                 「現在跑的是哪個請求」：tokio task-local，讓事件說得出屬於誰。⚠️ 不跟著 `tokio::spawn`（有測試釘住）
@@ -252,10 +252,12 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    - 維護者加的一條：**每個收到的 pack 都經過一個鉤子**（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI；link 只呼叫不判斷。
      還有：送與收分開（兩個 task）；會話項是 trait（`PackSink`）好接特規 spec；重送靠 id 表（`AckPolicy`，預設關、冪等的呼叫點自己開）。
      四條線（architecture-v2 §6.1.1）不進這層：一條 `WsLink` 一張表，daemon 開四條就是四個實例。
-1b. ✅ **連線生命週期**（維護者 2026-09-21 定：五條線各司其職、連線池按種類挑線、預設不起訂閱、斷了下次要用再開；`design/link-pool.md`）：
+1b. ✅ **連線生命週期**（維護者 2026-09-21 定：五條線各司其職，落地時房間與金鑰的訂閱暫時共用一條→四條、連線池按種類挑線、預設不起訂閱、斷了下次要用再開；`design/link-pool.md`）：
    core 的 `link_pool.rs`（`LinkPool`／`LinkRole`／`client_of(…, role)`／`open_link`／`close_links`）、`CoreEvent::Link`／`Received`；daemon 的 `push.rs`（訂閱集合、事件→推播）與 `server.rs` 的推播 task。
-   兩條訂閱線（rooms、keys）這支只保證開得起來、關得掉、有人收；內容在第 2、3 項。
-2. **E2EE 接進 daemon**（e2ee-walkthrough §16.6 的 RPC 面；走 `LinkRole::Keys` 那條線，`features_of(Keys)` 宣告 `org.wbftw.device_versions`）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
+   訂閱線（`Subscriptions`，房間與金鑰暫共用）這支只保證開得起來、關得掉、有人收；內容在第 2、3 項。
+1c. ✅ **帳號的會話 A**（`design/account-session.md`，PR #54）：探活不帶 token、以 server 為鍵；登出封池（guard）→ HTTP 登出→成了關池→清本地→解封；四條線。
+   **B**（下一支）：wbf 帳號不建 matrix-sdk 的 Client（登入走自己包的 HTTP、`m/` 由 OlmEngine 開、room.list 走橋 JoinedRooms＋GetState、send_text 走 Event/Send、備份暫擋回錯；§6 有表）。
+2. **E2EE 接進 daemon**（e2ee-walkthrough §16.6 的 RPC 面；訂閱走 `LinkRole::Subscriptions`，`Misc`（送 Event/Send）與 `Subscriptions`（收 DeviceChanged）宣告 `org.wbftw.device_versions`）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
    被 1506 擋時 daemon 自動 refresh 再把錯原樣回 UI 並發「這個房版本到 V、可以送了」的狀態訊息（daemon 🚫 不自動重送）、每房 `RoomRefresh` 的落地（記憶體還是 cache.db 待定）、
    上線 `device_subscribe` → `pull_to_device`、下線 `device_unsubscribe`。這是第一條宣告 `org.wbftw.device_versions` 的產品路徑。
 3. 交叉簽章 bootstrap（`SigningKeysUpload` 已在橋上）→ 分享策略換 `IdentityBasedStrategy`（只改 `room_key_share_settings`）。
