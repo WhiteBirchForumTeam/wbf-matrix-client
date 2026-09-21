@@ -1,4 +1,4 @@
-# 連線池：一個帳號五條線，各司其職、要用才開、斷了下次再開
+# 連線池：一個帳號四條線（設計上五條），各司其職、要用才開、斷了下次再開
 
 > 維護者 2026-09-21 定的形狀（architecture-v2 §6.1.1 四條線的落地版；daemon-runtime §11 第 4 階段 daemon 那半、第 7 階段的連線部分）。
 > 前提是 PR #52：`WsLink` 能收任何 pack、每個收到的 pack 過 `ReceivedHook`（`ws-receive-dispatch.md`）。這份文件講的是**誰擁有那些 link、什麼時候開關、命令怎麼挑線**。
@@ -6,24 +6,23 @@
 
 ## 0. 一句話
 
-每個登入的帳號一個池，池裡**五條線**，一條一個用途。命令進來先看它是哪一類、丟到那條線；線還沒開就開、開了就用、
+每個登入的帳號一個池，池裡**四條線**（設計上五條；房間與金鑰的訂閱暫時共用，§1），一條一個用途。命令進來先看它是哪一類、丟到那條線；線還沒開就開、開了就用、
 發現死了就重開再做。**沒有背景的監督者**（那是第 8 階段）：斷了不會有人主動去接，下一個要用它的命令會。
 訂閱類的線**預設不開**，收到訂閱指令才開。每條線開關都發事件；每個收到的 pack 經鉤子變成 core 的事件，daemon 的推播函數決定要不要送 UI。
 
-## 1. 五條線
+## 1. 四條線（暫時；設計上是五條）
 
 | 角色 `LinkRole` | 只做 | 誰開它 | 為什麼單獨一條 |
 |---|---|---|---|
 | `Misc` | 一問一答：`Hello`／`Ping`、`Info`、橋、`Event/Send`、`Recent`（拉窗）、`Device/Fetch`／`ItemsDestroy`（拉、銷毀） | 第一個要用的命令 | 一問一答的東西不該排在別人的長佇列後面 |
 | `Upload` | `Upload/*` | 第一個上傳 | 資料平面，長時間高頻寫，最會塞爆佇列——只能塞爆自己 |
 | `Download` | `Download/*`（`Read`、串流） | 第一個下載 | 同上；跟上傳分開，一邊塞爆不拖另一邊（維護者 2026-09-21：媒體開兩條） |
-| `Rooms` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件的訂閱） | **只有訂閱命令**（第 6 階段的 codec 做好之後） | 量大但可重拉；它自己塞爆自己沒關係 |
-| `Keys` | `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件的訂閱） | **只有訂閱命令**（PR 2 的 `device_subscription`） | 🚨 掉了就沒了：一條安靜的線，不跟任何大流量共享佇列 |
+| `Subscriptions` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件）**與** `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件） | **只有訂閱命令** | 推播線，不跟資料平面共享佇列。📌 房間與金鑰暫時共用（維護者 2026-09-21：server 每台裝置預設 4 條 WS，先不動 server）；設計上金鑰該自己一條安靜的線（🚨 掉了就沒了），要分就是多一個角色 |
 
 - ⭐ 分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind：`Misc` 收各種 kind；`Device/Fetch` 走 `Misc`（它是拉窗，不是訂閱）。
-- 兩條訂閱線**綁裝置**（server 的 `Device/Subscribe` 一台裝置一條連線在收、後來的接手），所以它們就是那個帳號**唯一**在收推播的連線；
+- 訂閱線**綁裝置**（server 的 `Device/Subscribe` 一台裝置一條連線在收、後來的接手），所以它就是那個帳號**唯一**在收推播的連線；
   🚫 不要在 `Misc` 上訂閱。
-- 一個帳號一個池；兩個帳號登在同一台 server 也各自五條（token 不同，共用會讓一個帳號塞爆另一個）。
+- 一個帳號一個池；兩個帳號登在同一台 server 也各自四條（token 不同，共用會讓一個帳號塞爆另一個）。
 
 ## 2. 命令怎麼挑線：角色是**呼叫點**的屬性
 
@@ -35,8 +34,7 @@
 | `ping`、`media_info`、`recent`／`sync_recent`、`room_history`／`room_files`（wbf 那條）、橋、`send_event`、`device_fetch`／`items_destroy` | `Misc` |
 | `upload_file`、`send_file` 的上傳半段 | `Upload` |
 | `save_media`、`media_open` 的補拉 | `Download` |
-| （PR 2）`device_subscription` | `Keys` |
-| （第 6 階段）`Event/Subscribe` | `Rooms` |
+| （PR 2）`device_subscription`、（第 6 階段）`Event/Subscribe` | `Subscriptions` |
 
 `Transport::Http`（pack over HTTP，只剩 debug 用途）🚫 不進池：每次一條、用完就丟，跟現在一樣。
 
@@ -133,5 +131,5 @@ pub trait LinkOpener: Send + Sync {
 
 - 背景重連與退避（第 8 階段）。
 - `Session/Login` 走 WS（另一支；現在的登入就是 Bearer 升級）。
-- 兩條訂閱線的**內容**：`Keys` 的訂閱、拉、匯入是 PR 2；`Rooms` 的 `Event/Subscribe` codec 是第 6 階段。這支只保證那兩條線**開得起來、關得掉、有人收**。
+- 訂閱線的**內容**：金鑰的訂閱、拉、匯入是 E2EE 那支；房間的 `Event/Subscribe` codec 是第 6 階段（兩者都走 `Subscriptions`）。這支只保證那條線**開得起來、關得掉、有人收**。
 - 同一條線並行（§5）。

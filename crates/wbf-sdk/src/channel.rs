@@ -191,15 +191,32 @@ impl WsChannel {
         hook: ReceivedHook,
         heartbeat: Heartbeat,
     ) -> Result<WsChannel, SdkError> {
+        WsChannel::connect_inner(server, Some(access_token), hook, heartbeat).await
+    }
+
+    /// **不帶 token** 的連線：只給探活（account-session.md §1）。server 允許未登入的升級，30 秒內只接受 `Hello`／`Ping`，
+    /// 之後自己關；所以拿到 `Hello` 的答案就把它丟掉。🚫 不要拿它做別的事。
+    pub async fn connect_anonymous(server: &str) -> Result<WsChannel, SdkError> {
+        WsChannel::connect_inner(server, None, crate::sessions::no_hook(), Heartbeat::OFF).await
+    }
+
+    async fn connect_inner(
+        server: &str,
+        access_token: Option<&str>,
+        hook: ReceivedHook,
+        heartbeat: Heartbeat,
+    ) -> Result<WsChannel, SdkError> {
         let url = ws_url(server)?;
         let mut request = url
             .as_str()
             .into_client_request()
             .map_err(|error| SdkError::Usage(format!("websocket url {url}: {error}")))?;
-        let bearer = format!("Bearer {access_token}").parse().map_err(|_| {
-            SdkError::Usage("access token contains characters not allowed in a header".into())
-        })?;
-        request.headers_mut().insert(AUTHORIZATION, bearer);
+        if let Some(access_token) = access_token {
+            let bearer = format!("Bearer {access_token}").parse().map_err(|_| {
+                SdkError::Usage("access token contains characters not allowed in a header".into())
+            })?;
+            request.headers_mut().insert(AUTHORIZATION, bearer);
+        }
         let (socket, _response) =
             tokio_tungstenite::connect_async(request)
                 .await

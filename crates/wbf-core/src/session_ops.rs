@@ -277,11 +277,14 @@ impl Core {
         let vault = self.vault()?;
         match vault.unseal_session(&account.session_path())? {
             Some(session) => {
-                // 🚨 只有成與不成（維護者 2026-09-21）：不成就到此為止，什麼都不關、什麼都不刪。
+                // account-session.md §4：1 封池 → 2 HTTP 登出（只有成與不成）→ 3 關池 → 4 清本地 → 5 解封。
+                // 封池是一個 guard：這個函數怎麼離開（不成、`?`、成功走到底）都會解封（PR #54 審查 🔴：第一版只在失敗分支解封）。
+                let _logging_out = self.logging_out_guard(account);
+                // 不成：`?` 原樣回錯、guard 解封，連線照常收新封包（維護者 2026-09-21：no-op）。
                 logout(&session).await?;
-                // 成了：token 在 server 那邊已經沒了，這個帳號的五條線全關、釋放資源（link-pool.md §3）。
-                // `close_all` 等正在用線的命令做完才收那條；從這一刻起才開的線，hello 就被 server 拒（每個 message 重驗）。
-                // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed。
+                // 成了：token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（link-pool.md §3）。
+                // `close_all` 等正在用線的命令做完才收那條；遠端先關了的只是丟掉，不二次跳錯。
+                // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed；「登出中」是帳號的狀態。
                 self.close_links(account, "logged out").await;
                 vault.delete_sealed_session(&account.session_path())?;
             }
@@ -291,10 +294,7 @@ impl Core {
                 account.label()
             )),
         }
-        // 🚨 session 沒了，拿它探到的 backend 也不算數了（PR #33 審查 rumia🟡）。
-        // ⚠️ 放在 match 之後：兩條分支（剛刪掉、本來就沒有）都是「現在沒有 session」。
-        // 📎 這是兩個「session 被替換」的地方之一，另一個是 `log_in` 封新 session 那一行。
-        self.forget_backend_probe(account);
+        // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：session 沒了不影響它，這裡不再忘掉探測結果。
         // 已經登出但目錄還在那條分支：池照理說是空的（沒 session 開不了線），還是掃一次——消費端自己再問一次。
         self.close_links(account, "logged out").await;
         account.delete_matrix_store()?;

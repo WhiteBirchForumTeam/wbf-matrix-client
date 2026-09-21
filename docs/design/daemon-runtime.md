@@ -351,7 +351,11 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
    `log_out_account`（logout 與 destroy 共用）刪掉之後。🚧 階段 8 的會話監督者重連時也要叫它。
    ⚠️ 新增任何封／刪／換 session 的路徑都要接上，🚫 不然下一次拿到的是舊 token 探到的答案。
 
-   🚨 **一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
+   ⚠️ **2026-09-21 起下面這一段被 `account-session.md` §1 取代**（保留當歷史）：探活改成**不帶 token**的 WS Hello（`WsChannel::connect_anonymous`）、
+   **key 是 server URL**（`Core::get_backend_kind_of_server`）、登入登出不再 `forget_backend_probe`（探活跟 token 無關，session 換了或沒了都不影響「這台講不講 wbf」）。
+   「A 的 token 壞了拖累 B」那個理由因此消失，一台 server 一格。失敗不記、同時進來共用一次探測這兩點不變。
+
+   🚨 **（舊）一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
 
    | 探測結果 | 這次回 | 記住嗎 |
    |---|---|---|
@@ -375,7 +379,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
    逐格測得到。⚠️ 只有一種情況報錯：那個 feature 只有 wbf 有，而這條路到不了它 ——
    它就是**關的**，而「因為你選了 http」跟「因為對方不是 wbf」訊息分開講。
 3. **唯一的閘門** `Core::client_of(account, transport, home)` —— 探測＋規則＋開通道都在這裡。
-   底下那半是 `connect_wbf_client`（一律 WS），🚫 只留給閘門自己與探測用
+   （2026-09-21 起底下那半是連線池 `link-pool.md`：`client_of(…, role)` 從池裡拿線；舊的 `connect_wbf_client` 已刪）
    （探測不能走閘門，不然它會叫到自己）。
 
 **🚧 那份會縮短的清單**：每個呼叫點自己用 `MethodHome` 說出它住在哪一邊 ——

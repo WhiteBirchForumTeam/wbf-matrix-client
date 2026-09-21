@@ -247,7 +247,7 @@ mod tests {
     fn every_core_event_has_a_push_name_from_the_spec() {
         let link = push_of(&CoreEvent::Link {
             user: "@a:x".into(),
-            role: LinkRole::Keys,
+            role: LinkRole::Subscriptions,
             state: LinkState::Closed,
             reason: Some("logged out".into()),
         });
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(link.user.as_deref(), Some("@a:x"));
         assert_eq!(
             link.request.params,
-            json!({ "user": "@a:x", "role": "keys", "state": "closed", "reason": "logged out" })
+            json!({ "user": "@a:x", "role": "subscriptions", "state": "closed", "reason": "logged out" })
         );
         let progress = push_of(&CoreEvent::Progress {
             job: Some(7),

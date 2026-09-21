@@ -412,7 +412,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
 | `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事。⚠️ **這是連線層的訊號**：它只保證「這條連線漏了某些事件」，🚫 不保證漏掉的裡面有它訂的那些（daemon 不替每條訂閱各記一份 lag）；寧可多報一次重讀，🚫 不假裝沒漏。什麼都沒訂的連線不收它 |
 | `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
-| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }` | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用那條線才發 |
+| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"subscriptions", state: "opened"\|"closed", reason? }`（`subscriptions` 暫時同時收房間與金鑰的推播，account-session.md §5） | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用那條線才發 |
 | `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
 - 推播**要先 `subscribe`**（§4.6）。`progress` 例外：**發出長工作的那條連線自動收到自己請求的 `progress`**，不必訂——不然每個前端都要多寫一步。

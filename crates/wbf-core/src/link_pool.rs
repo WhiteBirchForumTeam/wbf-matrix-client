@@ -17,7 +17,8 @@ use wbf_sdk::sessions::Received;
 use crate::error::CoreError;
 use crate::event::{CoreEvent, EventSink, LinkState};
 
-/// 五條線的角色（link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
+/// 四條線的角色（link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
+/// 📌 房間事件與金鑰事件的訂閱**暫時共用一條**（維護者 2026-09-21：server 每台裝置預設 4 條 WS，先不動 server）；將來要分就是多一個角色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkRole {
@@ -27,19 +28,16 @@ pub enum LinkRole {
     Upload,
     /// Download/*。
     Download,
-    /// 全局房間事件的訂閱（Event/Subscribe／Push／DeviceChanged）。只有訂閱命令會開它。
-    Rooms,
-    /// 全局金鑰事件的訂閱（Device/Subscribe／Push／CryptoState）。只有訂閱命令會開它。
-    Keys,
+    /// 訂閱線：全局房間事件（Event/Subscribe／Push／DeviceChanged）與全局金鑰事件（Device/Subscribe／Push／CryptoState）。只有訂閱命令會開它。
+    Subscriptions,
 }
 
 impl LinkRole {
-    pub const ALL: [LinkRole; 5] = [
+    pub const ALL: [LinkRole; 4] = [
         LinkRole::Misc,
         LinkRole::Upload,
         LinkRole::Download,
-        LinkRole::Rooms,
-        LinkRole::Keys,
+        LinkRole::Subscriptions,
     ];
 
     /// Return:
@@ -49,14 +47,13 @@ impl LinkRole {
             LinkRole::Misc => "misc",
             LinkRole::Upload => "upload",
             LinkRole::Download => "download",
-            LinkRole::Rooms => "rooms",
-            LinkRole::Keys => "keys",
+            LinkRole::Subscriptions => "subscriptions",
         }
     }
 
     /// 這條線是不是訂閱線（預設不開、只有訂閱命令會開，§3）。
     pub fn is_subscription(&self) -> bool {
-        matches!(self, LinkRole::Rooms | LinkRole::Keys)
+        matches!(self, LinkRole::Subscriptions)
     }
 }
 
@@ -209,6 +206,18 @@ pub(crate) fn received_hook(
     })
 }
 
+/// 「登出中」的範圍（account-session.md §4 第 1 與第 5 步）：活著就封池，丟掉就解封。
+pub(crate) struct LoggingOutGuard<'a> {
+    core: &'a crate::Core,
+    account: &'a crate::accounts::AccountDir,
+}
+
+impl Drop for LoggingOutGuard<'_> {
+    fn drop(&mut self) {
+        self.core.end_logging_out(self.account);
+    }
+}
+
 /// 池裡拿出來的一條線。丟掉就是還回去（線不關）。
 pub enum PooledClient {
     /// 池裡那格的 guard：同一條線的下一個命令等它被丟掉。
@@ -248,11 +257,7 @@ pub const LINK_CLIENT_NAME: &str = "wbf-core/0.1";
 /// ⚠️ `Keys` 之後宣告 `org.wbftw.device_versions`（那時 `Event/Send` 也一起接上，宣告了就得帶 `room_version`）；現在全部是空的。
 pub fn features_of(role: LinkRole) -> &'static [&'static str] {
     match role {
-        LinkRole::Misc
-        | LinkRole::Upload
-        | LinkRole::Download
-        | LinkRole::Rooms
-        | LinkRole::Keys => &[],
+        LinkRole::Misc | LinkRole::Upload | LinkRole::Download | LinkRole::Subscriptions => &[],
     }
 }
 
@@ -266,6 +271,16 @@ impl crate::Core {
         &self,
         account: &crate::accounts::AccountDir,
     ) -> Result<Arc<LinkPool>, CoreError> {
+        // 登出中：封池（account-session.md §4 第 1 步）。正在跑的命令握著自己的 guard，不從這裡進來，不受影響。
+        if self.is_logging_out(account) {
+            return Err(CoreError::new(
+                crate::error::CoreErrorKind::AccountBusy,
+                format!(
+                    "{} is logging out; nothing more is sent on its links",
+                    account.label()
+                ),
+            ));
+        }
         let user = self.session_of(account)?.user_id;
         Ok(self
             .link_pools
@@ -299,6 +314,42 @@ impl crate::Core {
         let mut client = WbfClient::new(Channel::WebSocket(Box::new(channel)));
         client.hello(LINK_CLIENT_NAME, features_of(role)).await?;
         Ok(client)
+    }
+
+    /// 登出的封池（account-session.md §4）：guard 活著的期間 `pool_of_account` 一律 `AccountBusy`，guard 丟掉就解封——
+    /// 成功、失敗、提前 return、future 被 drop 都走同一條（PR #54 審查 cirno／salvia／rumia 🔴：第一版只在失敗分支解封，成功登出後重登入會卡 AccountBusy 到 daemon 重開）。
+    pub(crate) fn logging_out_guard<'a>(
+        &'a self,
+        account: &'a crate::accounts::AccountDir,
+    ) -> LoggingOutGuard<'a> {
+        self.begin_logging_out(account);
+        LoggingOutGuard {
+            core: self,
+            account,
+        }
+    }
+
+    /// 登出的封池：放進去之後 `pool_of_account` 一律 `AccountBusy`。🚫 生產路徑用 [`Core::logging_out_guard`]，不要手動配對。
+    pub(crate) fn begin_logging_out(&self, account: &crate::accounts::AccountDir) {
+        self.logging_out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(account.dir.clone());
+    }
+
+    /// 解封：HTTP 登出失敗（no-op、連線照常）或本地清完（之後 `session_of` 自己會回 NotLoggedIn）。
+    pub(crate) fn end_logging_out(&self, account: &crate::accounts::AccountDir) {
+        self.logging_out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&account.dir);
+    }
+
+    pub(crate) fn is_logging_out(&self, account: &crate::accounts::AccountDir) -> bool {
+        self.logging_out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&account.dir)
     }
 
     /// 登出、destroy：這個帳號的池整個拿掉、開著的線全關。沒有池就什麼都不做。
@@ -421,7 +472,7 @@ mod tests {
         let (client, peer) = memory_client(wbf_sdk::no_hook());
         let first = connection_id_of(
             &pool
-                .acquire(LinkRole::Keys, || async move { Ok(client) })
+                .acquire(LinkRole::Subscriptions, || async move { Ok(client) })
                 .await
                 .unwrap(),
         );
@@ -435,7 +486,7 @@ mod tests {
         let (client, _peer) = memory_client(wbf_sdk::no_hook());
         let second = connection_id_of(
             &pool
-                .acquire(LinkRole::Keys, || async move { Ok(client) })
+                .acquire(LinkRole::Subscriptions, || async move { Ok(client) })
                 .await
                 .unwrap(),
         );
@@ -530,7 +581,7 @@ mod tests {
         let mut seen = events.subscribe();
         let pool = LinkPool::new("@alice:localhost", events);
         let mut peers = Vec::new();
-        for role in [LinkRole::Misc, LinkRole::Download, LinkRole::Keys] {
+        for role in [LinkRole::Misc, LinkRole::Download, LinkRole::Subscriptions] {
             let (client, peer) = memory_client(wbf_sdk::no_hook());
             peers.push(peer);
             pool.acquire(role, || async move { Ok(client) })
@@ -553,7 +604,7 @@ mod tests {
             })
             .collect();
         assert_eq!(closed.len(), 3);
-        assert!(closed.contains(&LinkRole::Keys));
+        assert!(closed.contains(&LinkRole::Subscriptions));
         // 關過之後再要就是重開，不是拿到一條死的（池不記「登出了沒」：那是 session 與 server 的事）。
         let (client, _peer) = memory_client(wbf_sdk::no_hook());
         pool.acquire(LinkRole::Misc, || async move { Ok(client) })
@@ -579,7 +630,7 @@ mod tests {
     fn the_hook_turns_a_pack_into_a_header_only_event_with_the_role() {
         let sink = EventSink::new();
         let mut seen = sink.subscribe();
-        let hook = received_hook(sink, "@alice:localhost".into(), LinkRole::Rooms);
+        let hook = received_hook(sink, "@alice:localhost".into(), LinkRole::Subscriptions);
         hook(&Received {
             connection_id: 9,
             session: None,
@@ -590,7 +641,7 @@ mod tests {
             seen.try_recv().unwrap(),
             CoreEvent::Received {
                 user: "@alice:localhost".into(),
-                role: LinkRole::Rooms,
+                role: LinkRole::Subscriptions,
                 kind: 0x16,
                 subtype: wbf_wire::pack::device::PUSH,
                 id: 0x0100_0000_0000_0001,
@@ -605,11 +656,15 @@ mod tests {
     async fn a_pack_arriving_on_a_pooled_line_becomes_a_received_event() {
         let events = EventSink::new();
         let mut seen = events.subscribe();
-        let hook = received_hook(events.clone(), "@alice:localhost".into(), LinkRole::Keys);
+        let hook = received_hook(
+            events.clone(),
+            "@alice:localhost".into(),
+            LinkRole::Subscriptions,
+        );
         let (client, mut peer) = memory_client(hook);
         let pool = LinkPool::new("@alice:localhost", events);
         let _line = pool
-            .acquire(LinkRole::Keys, || async move { Ok(client) })
+            .acquire(LinkRole::Subscriptions, || async move { Ok(client) })
             .await
             .unwrap();
         use wbf_sdk::transport::FrameSink;
@@ -631,7 +686,7 @@ mod tests {
             matches!(
                 received,
                 CoreEvent::Received {
-                    role: LinkRole::Keys,
+                    role: LinkRole::Subscriptions,
                     kind: 0x16,
                     seq: 3,
                     ..

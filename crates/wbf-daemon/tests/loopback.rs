@@ -283,7 +283,7 @@ async fn the_daemon_keeps_serving_after_the_frontend_shreds_the_token_file() {
 fn link_event(user: &str) -> wbf_core::CoreEvent {
     wbf_core::CoreEvent::Link {
         user: user.to_string(),
-        role: wbf_core::LinkRole::Keys,
+        role: wbf_core::LinkRole::Subscriptions,
         state: wbf_core::LinkState::Opened,
         reason: None,
     }
@@ -328,7 +328,7 @@ async fn pushes_reach_only_the_connections_that_subscribed() {
     assert!(push.get("id").is_none(), "推播沒有 id：{push}");
     assert_eq!(
         push["params"],
-        json!({ "user": "@alice:localhost", "role": "keys", "state": "opened" })
+        json!({ "user": "@alice:localhost", "role": "subscriptions", "state": "opened" })
     );
 
     send(

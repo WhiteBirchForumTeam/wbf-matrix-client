@@ -115,9 +115,7 @@ impl Core {
             .await;
         let account = self.move_to_canonical_dir(account, &dir_key, server, &session.user_id)?;
         vault.seal_session(&account.session_path(), &session)?;
-        // 🚨 session 換了，拿舊 token 探到的 backend 就不算數了（PR #33 審查 rumia🟡）。
-        // ⚠️ 這是兩個「session 被替換」的地方之一，另一個是 `log_out_account`。
-        self.forget_backend_probe(&account);
+        // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：換 session 不影響它，這裡不再忘掉探測結果。
         // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（link-pool.md §3；PR #53 審查 cirno 🟡1）。
         self.close_links(&account, "session replaced by a new login")
             .await;
