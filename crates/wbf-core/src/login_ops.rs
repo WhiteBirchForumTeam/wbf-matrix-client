@@ -109,6 +109,10 @@ impl Core {
         .await?;
         // ⚠️ server 回的 `user_id` 才是**權威**（大小寫、localpart 正規化可能跟打的不一樣）：
         // 目錄名對不上就搬過去。
+        // 🚫 打字算出來的目錄上不該有池（池只從 `client_of` 建、鍵是有 session 的目錄，而下面的改名只在正規目錄不存在時發生），
+        // 但這一行不靠那個前提：改名之前先關掉那裡可能有的線，之後池的鍵就找不到它了（PR #53 審查 rumia 🔴；消費端自己再問一次）。
+        self.close_links(&account, "session replaced by a new login")
+            .await;
         let account = self.move_to_canonical_dir(account, &dir_key, server, &session.user_id)?;
         vault.seal_session(&account.session_path(), &session)?;
         // 🚨 session 換了，拿舊 token 探到的 backend 就不算數了（PR #33 審查 rumia🟡）。
