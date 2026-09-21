@@ -45,6 +45,12 @@ impl Subscriptions {
         names
     }
 
+    /// Return:
+    ///     bool  1 = 什麼都沒訂（`desync` 也不該給它：它本來就收不到任何推播，漏了也沒有東西可漏；PR #53 審查 rumia 🔴2）
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     /// 這則推播要不要給這條連線。
     ///
     /// Args:
@@ -74,18 +80,28 @@ pub struct Push {
 /// core 的事件 → 推播。名字與欄位照 rpc-spec §4。
 pub fn push_of(event: &CoreEvent) -> Push {
     match event {
-        CoreEvent::Note { job, text } => Push {
-            request: Request::push("note", json!({ "id": job, "note": text })),
-            user: None,
-            job: *job,
-        },
+        // `id` 沒有就不帶（rpc-spec §4 的 `id?`），🚫 不送 `null`（PR #53 審查 cirno 🟡2）。
+        CoreEvent::Note { job, text } => {
+            let mut params = json!({ "note": text });
+            if let Some(job) = job {
+                params["id"] = json!(job);
+            }
+            Push {
+                request: Request::push("note", params),
+                user: None,
+                job: *job,
+            }
+        }
         CoreEvent::Progress {
             job,
             done,
             total,
             text,
         } => {
-            let mut params = json!({ "id": job, "done": done, "note": text });
+            let mut params = json!({ "done": done, "note": text });
+            if let Some(job) = job {
+                params["id"] = json!(job);
+            }
             if let Some(total) = total {
                 params["total"] = json!(total);
             }
@@ -250,10 +266,24 @@ mod tests {
         });
         assert_eq!(progress.request.method, "progress");
         assert_eq!(progress.job, Some(7));
+        assert_eq!(progress.request.params["id"], json!(7));
         assert!(
             progress.request.params.get("total").is_none(),
             "不知道總數就不帶"
         );
+        let orphan_note = push_of(&CoreEvent::Note {
+            job: None,
+            text: "hi".into(),
+        });
+        assert!(
+            orphan_note.request.params.get("id").is_none(),
+            "不在任何工作裡就不帶 id，不送 null：{}",
+            orphan_note.request.params
+        );
+        let mut none = Subscriptions::default();
+        assert!(none.is_empty());
+        none.subscribe(&["*".into()], None);
+        assert!(!none.is_empty());
         let received = push_of(&CoreEvent::Received {
             user: "@a:x".into(),
             role: LinkRole::Misc,

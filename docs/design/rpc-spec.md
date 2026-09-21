@@ -397,7 +397,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `unsubscribe` | `{ events: [string] }` | `{ subscribed: [string] }`（剩下的） |
 | `cancel` | `{ id: number }`——**要取消的那個請求的 `id`** | `{ ok: true, was_running: bool }`。被取消的請求自己收到 `105` |
 
-- 訂閱是**每條連線一份**，連線關了就沒了。
+- 訂閱是**每條連線一份**，連線關了就沒了。`user` 是這條連線的一個設定：後一次 `subscribe` 帶了就蓋掉前一次的，沒帶就不動。
+- **什麼都沒訂的連線連 `desync` 也不收**：它本來就收不到任何推播，漏了沒有東西可漏。
 - `cancel` 只對長工作有意義（`room.send_file`、`upload.file`、`media.save_to`、`sync.recent`）；
   對已經回完的 `id` → `was_running: false`，不是錯誤。
 
@@ -410,7 +411,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `sync.state` | `{ user, state: "connected"\|"disconnected"\|"catching_up"\|"caught_up", cg_seq? }` | 跟 server 的連線狀態變了 |
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
 | `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事 |
-| `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
+| `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
 | `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }` | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用那條線才發 |
 | `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 

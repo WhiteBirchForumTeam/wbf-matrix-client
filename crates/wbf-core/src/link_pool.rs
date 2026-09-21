@@ -69,6 +69,9 @@ pub struct LinkPool {
     user: String,
     events: EventSink,
     slots: Mutex<HashMap<LinkRole, Slot>>,
+    /// `close_all` 第一件事就是把它設成 true：之後的 `acquire` 一律拒絕，正在開的那一個開完也丟掉。
+    /// 🚨 沒有它的話：登出把格排乾之後，一個已經拿到同一格、在等鎖的 `acquire` 會看到 None 然後把線重開在已經登出的池上（PR #53 審查 rumia 🔴1）。
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl LinkPool {
@@ -79,7 +82,24 @@ impl LinkPool {
             user: user.to_string(),
             events,
             slots: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Return:
+    ///     bool  1 = `close_all` 叫過了（登出、換 session）：這個池不再開任何線
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn closed_error(&self) -> CoreError {
+        CoreError::new(
+            crate::error::CoreErrorKind::Usage,
+            format!(
+                "{}: the link pool is closed (logged out or the session was replaced); nothing more is opened on it",
+                self.user
+            ),
+        )
     }
 
     pub fn user(&self) -> &str {
@@ -103,13 +123,21 @@ impl LinkPool {
     /// Return:
     ///     Ok(PooledClient)   開著的線；丟掉 guard 就是把線還回池裡（線本身還開著）
     ///     Err(...)           `open` 的錯原樣（沒 session 是 Usage、連不上是 Network）；池裡那格維持沒開，🚫 不發事件
+    ///     Err(Usage)         池已經 `close_all` 過（登出）：拿鎖前、拿到鎖後、`open` 回來後都再問一次，開好的那條也丟掉
     pub async fn acquire<F, Fut>(&self, role: LinkRole, open: F) -> Result<PooledClient, CoreError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<WbfClient<Channel>, CoreError>>,
     {
+        if self.is_closed() {
+            return Err(self.closed_error());
+        }
         let slot = self.slot(role);
         let mut guard = slot.lock_owned().await;
+        // 等鎖的期間登出了：這格已經被排乾，🚫 不能在上面重開。
+        if self.is_closed() {
+            return Err(self.closed_error());
+        }
         let found_dead = guard
             .as_ref()
             .is_some_and(|client| client.channel().is_closed());
@@ -122,7 +150,13 @@ impl LinkPool {
             );
         }
         if guard.is_none() {
-            *guard = Some(open().await?);
+            let client = open().await?;
+            // 開的期間登出了：新開的這條不能留（丟掉就關）。
+            if self.is_closed() {
+                drop(client);
+                return Err(self.closed_error());
+            }
+            *guard = Some(client);
             self.emit_link(role, LinkState::Opened, None);
         }
         Ok(PooledClient::Pooled(guard))
@@ -135,6 +169,8 @@ impl LinkPool {
     /// Return:
     ///     usize   關掉了幾條開著的
     pub async fn close_all(&self, reason: &str) -> usize {
+        // 先封，再排：封了之後沒有任何 `acquire` 能再開線（含已經在等鎖的、正在 `open` 的）。
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let slots: Vec<(LinkRole, Slot)> = self
             .slots
             .lock()
@@ -470,6 +506,59 @@ mod tests {
             .is_ok());
     }
 
+    /// 🚨 登出與 acquire 的競賽（PR #53 審查 rumia 🔴1）：`open` 還在跑的時候 `close_all` 來了 → 開好的那條丟掉、回 Usage、池裡沒有線；
+    /// 之後的 acquire 也一律 Usage。順序由 oneshot 控制，不靠運氣。
+    #[tokio::test]
+    async fn a_logout_during_an_open_discards_the_new_line_and_refuses_later_acquires() {
+        let events = EventSink::new();
+        let mut seen = events.subscribe();
+        let pool = Arc::new(LinkPool::new("@alice:localhost", events));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (client, _peer) = memory_client(wbf_sdk::no_hook());
+        let acquiring = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.acquire(LinkRole::Misc, || async move {
+                    released.await.unwrap();
+                    Ok(client)
+                })
+                .await
+                .map(|line| connection_id_of(&line))
+            }
+        });
+        // 讓 acquire 走到 `open().await` 裡面等（它握著那一格的鎖）。
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        // 登出：第一件事封池（同步、立刻），然後等那一格的鎖——鎖在 acquire 手上，要等 open 回來才放。
+        let closing = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.close_all("logged out").await }
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(pool.is_closed(), "封池不等鎖");
+        release.send(()).unwrap();
+        let outcome = acquiring.await.unwrap();
+        assert_eq!(closing.await.unwrap(), 0, "開好的那條沒進池，沒東西可關");
+        assert!(
+            matches!(outcome, Err(ref error) if error.kind == CoreErrorKind::Usage),
+            "{outcome:?}"
+        );
+        assert_eq!(pool.open_count(), 0, "開好的那條沒留下");
+        assert!(
+            drain(&mut seen).is_empty(),
+            "沒有任何 Opened（它從來沒進池）"
+        );
+        let (client, _peer) = memory_client(wbf_sdk::no_hook());
+        let later = pool
+            .acquire(LinkRole::Keys, || async move { Ok(client) })
+            .await;
+        assert!(matches!(later, Err(ref error) if error.kind == CoreErrorKind::Usage));
+        assert!(pool.is_closed());
+    }
+
     #[tokio::test]
     async fn close_all_closes_every_open_line_and_says_why() {
         let events = EventSink::new();
@@ -500,12 +589,14 @@ mod tests {
             .collect();
         assert_eq!(closed.len(), 3);
         assert!(closed.contains(&LinkRole::Keys));
-        // 關過之後再要就是重開，不是拿到一條死的。
+        // 關過的池不再開任何線（登出了；重登入由 Core 建新池）：再要就是 Usage，🚫 不是拿到一條死的、也不是重開。
         let (client, _peer) = memory_client(wbf_sdk::no_hook());
-        pool.acquire(LinkRole::Misc, || async move { Ok(client) })
-            .await
-            .unwrap();
-        assert_eq!(pool.open_count(), 1);
+        let later = pool
+            .acquire(LinkRole::Misc, || async move { Ok(client) })
+            .await;
+        assert!(matches!(later, Err(ref error) if error.kind == CoreErrorKind::Usage));
+        assert_eq!(pool.open_count(), 0);
+        assert!(pool.is_closed());
     }
 
     fn sample_push() -> wbf_wire::Pack {

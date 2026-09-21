@@ -257,7 +257,17 @@ async fn forward_pushes(
                 }
                 push.request
             }
-            Err(broadcast::error::RecvError::Lagged(missed)) => push::desync(missed),
+            // 什麼都沒訂的連線本來就收不到推播，漏了也沒有東西可漏：🚫 不發 `desync`（推播要先 subscribe，這則也不例外；PR #53 審查 rumia 🔴2）。
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                let is_subscribed = !subscriptions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty();
+                if !is_subscribed {
+                    continue;
+                }
+                push::desync(missed)
+            }
             Err(broadcast::error::RecvError::Closed) => return,
         };
         let bytes = connection.lock().await.seal_push(&request);

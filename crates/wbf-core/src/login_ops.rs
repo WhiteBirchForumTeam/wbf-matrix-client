@@ -114,6 +114,9 @@ impl Core {
         // 🚨 session 換了，拿舊 token 探到的 backend 就不算數了（PR #33 審查 rumia🟡）。
         // ⚠️ 這是兩個「session 被替換」的地方之一，另一個是 `log_out_account`。
         self.forget_backend_probe(&account);
+        // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（link-pool.md §3；PR #53 審查 cirno 🟡1）。
+        self.close_links(&account, "session replaced by a new login")
+            .await;
         let switched_from = self.switch_current_to(&account)?;
         Ok(LoginResult {
             user_id: session.user_id,

@@ -399,7 +399,7 @@ async fn a_subscription_scoped_to_a_user_drops_other_users_events() {
     );
     assert_eq!(
         first["params"],
-        json!({ "id": null, "done": 1, "total": 2, "note": "half" })
+        json!({ "done": 1, "total": 2, "note": "half" })
     );
     let (_, second) = receive(&mut socket, &keys).await;
     assert_eq!(second["method"], "link.state");
@@ -436,6 +436,59 @@ async fn falling_behind_the_broadcast_is_reported_as_desync() {
         next["method"], "link.state",
         "desync 之後是還在佇列裡的那些"
     );
+}
+
+/// 沒訂任何東西的連線就算讀太慢也不收 `desync`：它本來就收不到推播，漏了沒東西可漏（PR #53 審查 rumia 🔴2）。
+/// 退訂之後也一樣。證據：大量事件之後送一個請求，下一包就是它的回應。
+#[tokio::test]
+async fn an_unsubscribed_connection_never_gets_desync() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    let core = daemon.handle.core().await;
+    for _ in 0..400 {
+        core.emit_event(link_event("@alice:localhost"));
+    }
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 1 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["id"], 1, "沒訂：下一包是回應，不是 desync {reply}");
+    // 訂了再退掉：同樣不收。
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "subscribe", "params": { "events": ["*"] }, "id": 2 }),
+    )
+    .await;
+    receive(&mut socket, &keys).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "unsubscribe", "params": { "events": ["*"] }, "id": 3 }),
+    )
+    .await;
+    receive(&mut socket, &keys).await;
+    for _ in 0..400 {
+        core.emit_event(link_event("@alice:localhost"));
+    }
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 4 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["id"], 4, "退訂了：下一包是回應，不是 desync {reply}");
 }
 
 /// `daemon.info` 報得出開著幾條上游的線；這個資料目錄沒有帳號，所以是 0。
