@@ -1,8 +1,8 @@
 //! 會話表：這個 pack 是誰的（ws-receive-dispatch.md §2–§4）。
 //!
-//! 純資料結構、同步、沒有網路：`SessionKey` → `PackSink`。讀取 task 每收一個 pack 叫一次 `dispatch`，
-//! 表依 §2.1 的四條規則交給在等的那一項；沒人等就是「無主」，計數、🚫 不交給剛好在等的人。
-//! 每個 pack 查完表之後都經過 `ReceivedHook`（§4）：之後 daemon 的 RPC 面用它決定要不要送到 UI，這裡只呼叫、不判斷。
+//! 純資料結構、同步、沒有網路：`SessionKey` → `PackSink`。讀取 task 每收一個 pack 先 `classify`（查表、不動表）、
+//! 放鎖之後叫鉤子、再 `dispatch`（交付）；沒人等就是「無主」，計數、🚫 不交給剛好在等的人。
+//! 鉤子（`ReceivedHook`，§4）的型別定義在這裡，但表**不持有、不呼叫**它：它在表鎖之外由 `link.rs` 叫，才不會重入死鎖。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,7 @@ pub enum Route {
 }
 
 /// 鉤子看到的一個 pack：哪條連線、哪段會話、走哪條路、pack 本身。
+/// `session`／`route` 是**查表那一刻**的答案；交付在放鎖之後，中間項目被拿掉的話交付會算成無主（差一個 pack、只影響計數）。
 pub struct Received<'a> {
     pub connection_id: u64,
     /// None ＝ 無主。
@@ -42,6 +43,7 @@ pub struct Received<'a> {
 }
 
 /// 同步、不可等待：要做慢事就自己丟進自己的佇列，讀取 task 不被它拖住。
+/// 在表鎖**之外**叫（§4），所以裡面可以讀同一條 link 的同步狀態（`unmatched()` 之類）；🚫 不能在裡面 block 等這條 link 的回覆——那是等自己。
 pub type ReceivedHook = Arc<dyn Fn(&Received<'_>) + Send + Sync>;
 
 /// 什麼都不做的鉤子（沒接 UI 的時候）。
@@ -256,23 +258,32 @@ impl PackSink for SubscriptionSink {
 
 // ---- 表 ----
 
+/// 每次 `register` 發一個新的世代號。同一個鍵先後兩段會話（`IS_LAST` 收掉舊的、同 id 再開新的）靠它分得開：
+/// 舊 handle 晚一點才 drop 時，`remove_if` 看世代不對就不動——🚫 不能把新會話從表裡拿掉（PR #52 審查 salvia 🟡3）。
+pub type SessionGeneration = u64;
+
+struct Entry {
+    generation: SessionGeneration,
+    sink: Box<dyn PackSink>,
+}
+
 pub struct SessionTable {
     connection_id: u64,
-    entries: HashMap<SessionKey, Box<dyn PackSink>>,
+    entries: HashMap<SessionKey, Entry>,
+    next_generation: SessionGeneration,
     unmatched: u64,
     /// 診斷用：無主的 pack 交到這裡（測試看「它真的被算成無主」用）。滿了就丟。
     orphans: Option<mpsc::Sender<Pack>>,
-    hook: ReceivedHook,
 }
 
 impl SessionTable {
-    pub fn new(connection_id: u64, hook: ReceivedHook) -> SessionTable {
+    pub fn new(connection_id: u64) -> SessionTable {
         SessionTable {
             connection_id,
             entries: HashMap::new(),
+            next_generation: 0,
             unmatched: 0,
             orphans: None,
-            hook,
         }
     }
 
@@ -283,24 +294,43 @@ impl SessionTable {
     /// 🚨 登記一定在送出之前（§2.1）。同一個鍵已經有人在等就是呼叫端的 bug：拒絕，🚫 不蓋掉。
     ///
     /// Return:
-    ///     Ok(())        登記了
-    ///     Err(Usage)    鍵已經被佔
-    pub fn register(&mut self, key: SessionKey, sink: Box<dyn PackSink>) -> Result<(), SdkError> {
+    ///     Ok(generation)  登記了；拿掉自己時用 `remove_if(key, generation)`
+    ///     Err(Usage)      鍵已經被佔
+    pub fn register(
+        &mut self,
+        key: SessionKey,
+        sink: Box<dyn PackSink>,
+    ) -> Result<SessionGeneration, SdkError> {
         if self.entries.contains_key(&key) {
             return Err(SdkError::Usage(format!(
                 "connection {}: session {key:?} is already registered",
                 self.connection_id
             )));
         }
-        self.entries.insert(key, sink);
-        Ok(())
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.entries.insert(key, Entry { generation, sink });
+        Ok(generation)
     }
 
+    /// 只在表裡那一項還是**自己那一代**時才拿掉。
+    ///
     /// Return:
     ///     Some(sink)    拿掉了（呼叫端自己決定要不要 `fail` 它）
-    ///     None          本來就沒有
-    pub fn remove(&mut self, key: SessionKey) -> Option<Box<dyn PackSink>> {
-        self.entries.remove(&key)
+    ///     None          本來就沒有、或已經是別人（新一代）的
+    pub fn remove_if(
+        &mut self,
+        key: SessionKey,
+        generation: SessionGeneration,
+    ) -> Option<Box<dyn PackSink>> {
+        let is_mine = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation);
+        if !is_mine {
+            return None;
+        }
+        self.entries.remove(&key).map(|entry| entry.sink)
     }
 
     pub fn set_orphan_sink(&mut self, sender: mpsc::Sender<Pack>) {
@@ -308,7 +338,7 @@ impl SessionTable {
     }
 
     /// Return:
-    ///     u64   這條連線至今收到幾個沒人等的 pack
+    ///     u64   這條連線至今收到幾個沒人等的 pack。診斷數字，不是錯：呼叫端喊停之後 server 還在送的同 id Batch 也算在裡面
     pub fn unmatched(&self) -> u64 {
         self.unmatched
     }
@@ -346,37 +376,39 @@ impl SessionTable {
         None
     }
 
-    /// 讀取 task 每收一個 pack 叫一次。
-    pub fn dispatch(&mut self, pack: Pack) {
-        match self.find_key(&pack) {
+    /// 查表、不動表：這個 pack 現在會交給誰。給鉤子用（在鎖外叫鉤子之前先問一次）。
+    ///
+    /// Return:
+    ///     (Some(key), route)   有人在等
+    ///     (None, Unmatched)    無主
+    pub fn classify(&self, pack: &Pack) -> (Option<SessionKey>, Route) {
+        match self.find_key(pack) {
             Some(key) => {
                 let route = self
                     .entries
                     .get(&key)
-                    .map(|sink| sink.route())
+                    .map(|entry| entry.sink.route())
                     .unwrap_or(Route::Unmatched);
-                (self.hook)(&Received {
-                    connection_id: self.connection_id,
-                    session: Some(key),
-                    route,
-                    pack: &pack,
-                });
+                (Some(key), route)
+            }
+            None => (None, Route::Unmatched),
+        }
+    }
+
+    /// 交付。讀取 task 每收一個 pack 叫一次（在鉤子之後）。
+    pub fn dispatch(&mut self, pack: Pack) {
+        match self.find_key(&pack) {
+            Some(key) => {
                 let finished = self
                     .entries
                     .get_mut(&key)
-                    .is_some_and(|sink| sink.deliver(pack) == Delivery::Finished);
+                    .is_some_and(|entry| entry.sink.deliver(pack) == Delivery::Finished);
                 if finished {
                     self.entries.remove(&key);
                 }
             }
             None => {
                 self.unmatched = self.unmatched.saturating_add(1);
-                (self.hook)(&Received {
-                    connection_id: self.connection_id,
-                    session: None,
-                    route: Route::Unmatched,
-                    pack: &pack,
-                });
                 if let Some(orphans) = &self.orphans {
                     let _ = orphans.try_send(pack);
                 }
@@ -386,8 +418,8 @@ impl SessionTable {
 
     /// 關線：每一項都收到 `Network(reason)`，表清空。
     pub fn fail_all(&mut self, reason: &str) {
-        for (key, sink) in self.entries.drain() {
-            sink.fail(SdkError::Network(format!(
+        for (key, entry) in self.entries.drain() {
+            entry.sink.fail(SdkError::Network(format!(
                 "connection {}: {reason} (session {key:?})",
                 self.connection_id
             )));
@@ -430,7 +462,7 @@ mod tests {
     }
 
     fn table() -> SessionTable {
-        SessionTable::new(7, no_hook())
+        SessionTable::new(7)
     }
 
     #[test]
@@ -486,10 +518,10 @@ mod tests {
     fn a_live_session_owns_every_pack_with_its_id_in_any_order() {
         let mut table = table();
         let (sink, mut receiver, _gap, end) = SubscriptionSink::new();
-        table
-            .register(SessionKey::Session(0x0100_0000_0000_0001), Box::new(sink))
-            .unwrap();
         let id = 0x0100_0000_0000_0001;
+        table
+            .register(SessionKey::Session(id), Box::new(sink))
+            .unwrap();
         table.dispatch(push(id, 2));
         table.dispatch(ack(id, 3));
         table.dispatch(push(id, 0));
@@ -568,6 +600,41 @@ mod tests {
         ));
     }
 
+    /// 🚨 同一個鍵兩代會話：舊的那代拿不掉新的（PR #52 審查 salvia 🟡3）。
+    #[test]
+    fn an_old_generation_cannot_remove_the_new_session_under_the_same_key() {
+        let mut table = table();
+        let (first, _receiver_1, _end_1) = StreamSink::new();
+        let old_generation = table
+            .register(SessionKey::Session(9), Box::new(first))
+            .unwrap();
+        table.dispatch(pack(
+            Kind::Device,
+            0x02,
+            flags::IS_RESPONSE | flags::IS_LAST,
+            9,
+            0,
+        ));
+        assert!(table.is_empty(), "IS_LAST 收掉第一代");
+        let (second, mut receiver_2, _end_2) = StreamSink::new();
+        let new_generation = table
+            .register(SessionKey::Session(9), Box::new(second))
+            .unwrap();
+        assert_ne!(old_generation, new_generation);
+        assert!(
+            table
+                .remove_if(SessionKey::Session(9), old_generation)
+                .is_none(),
+            "舊 handle 晚一點才 drop：不能動新的"
+        );
+        table.dispatch(push(9, 0));
+        assert_eq!(receiver_2.try_recv().unwrap().seq, 0, "新會話照收");
+        assert!(table
+            .remove_if(SessionKey::Session(9), new_generation)
+            .is_some());
+        assert!(table.is_empty());
+    }
+
     #[test]
     fn closing_the_connection_fails_every_waiter_and_empties_the_table() {
         let mut table = table();
@@ -600,33 +667,20 @@ mod tests {
         ));
     }
 
-    /// 鉤子看到每一個 pack，含無主的，而且帶路徑。
+    /// `classify` 不動表，答案跟 `dispatch` 會走的路一致。
     #[test]
-    fn the_hook_sees_every_pack_with_its_route() {
-        type Seen = Arc<Mutex<Vec<(Option<SessionKey>, Route, u32)>>>;
-        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-        let recorder = seen.clone();
-        let mut table = SessionTable::new(
-            1,
-            Arc::new(move |received: &Received<'_>| {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .push((received.session, received.route, received.pack.seq))
-            }),
-        );
+    fn classify_names_the_route_without_touching_the_table() {
+        let mut table = table();
         let (sink, _receiver, _gap, _end) = SubscriptionSink::new();
         table
             .register(SessionKey::Session(9), Box::new(sink))
             .unwrap();
-        table.dispatch(push(9, 0));
-        table.dispatch(ack(0, 77));
         assert_eq!(
-            *seen.lock().unwrap(),
-            vec![
-                (Some(SessionKey::Session(9)), Route::Subscription, 0),
-                (None, Route::Unmatched, 77),
-            ]
+            table.classify(&push(9, 0)),
+            (Some(SessionKey::Session(9)), Route::Subscription)
         );
+        assert_eq!(table.classify(&ack(0, 77)), (None, Route::Unmatched));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.unmatched(), 0, "classify 不計數");
     }
 }

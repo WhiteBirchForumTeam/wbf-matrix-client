@@ -109,8 +109,8 @@ async fn a_reply_that_arrives_before_anyone_waits_is_unmatched_not_delivered_to_
     let waiting = link.request(request_pack, SHORT);
     let outcome = waiting.await;
     assert!(
-        matches!(outcome, Err(SdkError::Network(ref reason)) if reason.contains("no reply")),
-        "{outcome:?}"
+        matches!(outcome, Err(SdkError::Timeout(ref reason)) if reason.contains("no reply")),
+        "連線還活著，是逾時不是斷線：{outcome:?}"
     );
     assert_eq!(peer.receive().await.seq, 1, "請求真的送出去了");
 }
@@ -357,5 +357,143 @@ async fn a_named_session_refuses_id_zero_and_a_duplicate_id() {
     assert!(matches!(
         link.open_stream(fetch(5, 3)).await,
         Err(SdkError::Usage(_))
+    ));
+}
+
+// ---- PR #52 審查補的（rumia／cirno／salvia 🔴：writer 死了沒人知道、close 不停 writer；salvia 🟡3：舊 handle 誤刪新會話）----
+
+/// 送出那半死了（對面不收了、但還在送）：在等的人要在有限時間內收到 Network，不是等到各自的 300 秒。
+#[tokio::test]
+async fn a_dead_sink_fails_every_waiter_promptly_and_closes_the_link() {
+    let (client_end, server_end) = memory_pair(64);
+    let link = Arc::new(WsLink::start(
+        client_end.source,
+        client_end.sink,
+        wbf_sdk::no_hook(),
+    ));
+    let MemoryEnd {
+        source: peer_source,
+        sink: peer_sink,
+    } = server_end;
+    // 對面不再讀 client 送的東西（丟掉 source），但它自己那條送的線還在：讀取 task 看不出任何異狀。
+    drop(peer_source);
+    let mut subscription = link
+        .subscribe(pack(
+            Kind::Device,
+            device::SUBSCRIBE,
+            0,
+            0x0100_0000_0000_0001,
+            1,
+        ))
+        .await
+        .expect("registered and queued; the failure surfaces in the writer");
+    let pending = tokio::spawn({
+        let link = link.clone();
+        async move { link.request(ping(2), LONG).await }
+    });
+    let outcome = tokio::time::timeout(LONG, pending)
+        .await
+        .expect("failed within bounded time, not after 300 s")
+        .unwrap();
+    // 請求登記在 writer 死掉之前或之後都可能（兩個 task 的競賽）：前者拿到 fail_all 的理由、後者在 send 開頭就被擋。兩種都是 Network。
+    assert!(matches!(outcome, Err(SdkError::Network(_))), "{outcome:?}");
+    assert!(link.is_closed());
+    // 訂閱一定在失敗之前就登記了：它拿到的理由就是 writer 死掉那個。
+    let subscription_outcome = subscription.next(LONG).await;
+    assert!(
+        matches!(subscription_outcome, Err(SdkError::Network(ref reason)) if reason.contains("send failed")),
+        "{subscription_outcome:?}"
+    );
+    assert!(matches!(
+        link.send(&ping(3)).await,
+        Err(SdkError::Network(_))
+    ));
+    drop(peer_sink);
+}
+
+/// `close()` 之後：`send` 立刻回錯、對面再也收不到任何 bytes、在等的人拿到 Network。
+#[tokio::test]
+async fn close_stops_both_tasks_and_nothing_goes_out_afterwards() {
+    let (link, mut peer) = connect();
+    let mut subscription = link
+        .subscribe(pack(
+            Kind::Device,
+            device::SUBSCRIBE,
+            0,
+            0x0100_0000_0000_0001,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(peer.receive().await.subtype, device::SUBSCRIBE);
+    link.close();
+    assert!(link.is_closed());
+    assert!(
+        matches!(link.send(&ping(2)).await, Err(SdkError::Network(ref reason)) if reason.contains("closed")),
+        "close 之後 send 立刻回錯"
+    );
+    assert!(matches!(
+        subscription.next(LONG).await,
+        Err(SdkError::Network(_))
+    ));
+    // 送出 task 停了 → client 那頭的 sink 丟掉 → 對面的 source 收到「對方關了」，而不是任何 bytes。
+    let peer_saw = tokio::time::timeout(LONG, peer.end.source.receive())
+        .await
+        .expect("the peer learns the link closed within bounded time");
+    assert!(matches!(peer_saw, Ok(None)), "{peer_saw:?}");
+}
+
+/// 同一個 id 兩代會話：舊 handle 晚一點才 drop，不能把新會話從表裡拿掉。
+#[tokio::test]
+async fn a_late_drop_of_an_old_handle_does_not_remove_the_new_session_with_the_same_id() {
+    let (link, mut peer) = connect();
+    let id = 0x0100_0000_0000_0009;
+    let mut old = link.open_stream(fetch(id, 1)).await.unwrap();
+    peer.receive().await;
+    peer.send(device_batch(id, 0, true)).await;
+    assert_eq!(old.next(LONG).await.unwrap().unwrap().seq, 0);
+    assert!(
+        old.next(LONG).await.unwrap().is_none(),
+        "IS_LAST 收掉第一代"
+    );
+    let mut new = link.open_stream(fetch(id, 2)).await.unwrap();
+    peer.receive().await;
+    drop(old);
+    peer.send(device_batch(id, 0, false)).await;
+    assert_eq!(
+        new.next(LONG).await.unwrap().unwrap().seq,
+        0,
+        "新會話照收，沒被舊 handle 的 Drop 拿掉"
+    );
+    assert_eq!(link.unmatched(), 0);
+}
+
+/// 逾時分兩種：連線活著是 Timeout，連線沒了是 Network。
+#[tokio::test]
+async fn a_quiet_server_is_a_timeout_but_a_dead_connection_is_a_network_error() {
+    let (link, mut peer) = connect();
+    let mut subscription = link
+        .subscribe(pack(
+            Kind::Device,
+            device::SUBSCRIBE,
+            0,
+            0x0100_0000_0000_0001,
+            1,
+        ))
+        .await
+        .unwrap();
+    peer.receive().await;
+    assert!(matches!(
+        subscription.next(SHORT).await,
+        Err(SdkError::Timeout(_))
+    ));
+    drop(peer);
+    assert!(matches!(
+        subscription.next(LONG).await,
+        Err(SdkError::Network(_))
+    ));
+    assert!(matches!(
+        link.request(ping(2), SHORT).await,
+        Err(SdkError::Network(_))
     ));
 }

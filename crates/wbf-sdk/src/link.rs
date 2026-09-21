@@ -1,7 +1,8 @@
 //! 一條連線：一個讀取 task ＋ 一個送出 task ＋ 一張會話表（ws-receive-dispatch.md §0、§5–§7）。
 //!
 //! 送與收是兩件事：`send` 只等佇列有位子，永遠不等回覆；回覆由讀取 task 查表交付。
-//! 這層🚫 不重連（第 8 階段監督者的事）：讀取 task 結束就把表清掉，之後每個請求立刻回錯。
+//! 兩個 task 哪一個死了、或呼叫端 `close()`，都走同一條路 `shut_down`：`closed` → `fail_all` → 兩個 task 都 abort。
+//! 這層🚫 不重連（第 8 階段監督者的事）：關了之後每個請求立刻回錯。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -13,8 +14,8 @@ use wbf_wire::Pack;
 
 use crate::error::SdkError;
 use crate::sessions::{
-    take_end_reason, OneshotSink, PackSink, ReceivedHook, SessionKey, SessionTable, StreamSink,
-    SubscriptionSink,
+    take_end_reason, OneshotSink, PackSink, Received, ReceivedHook, SessionGeneration, SessionKey,
+    SessionTable, StreamSink, SubscriptionSink,
 };
 use crate::transport::{FrameSink, FrameSource};
 
@@ -46,81 +47,127 @@ impl AckPolicy {
     }
 }
 
-pub struct WsLink {
+/// 兩個 task 與每個 handle 共用的那一份：表、關了沒、兩個 task 的把手、鉤子。
+struct Shared {
     connection_id: u64,
-    table: Arc<Mutex<SessionTable>>,
-    outgoing: mpsc::Sender<Vec<u8>>,
-    closed: Arc<AtomicBool>,
-    reader: JoinHandle<()>,
+    table: Mutex<SessionTable>,
+    closed: AtomicBool,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    hook: ReceivedHook,
 }
 
-impl WsLink {
-    /// 起兩個 task。`hook` 每收一個 pack 叫一次（§4）；沒接 UI 就給 `sessions::no_hook()`。
-    pub fn start<S: FrameSource, K: FrameSink>(source: S, sink: K, hook: ReceivedHook) -> WsLink {
-        let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed) + 1;
-        let table = Arc::new(Mutex::new(SessionTable::new(connection_id, hook)));
-        let closed = Arc::new(AtomicBool::new(false));
-        let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
-
-        let writer = tokio::spawn(write_queued(sink, queued));
-        let reader = tokio::spawn(read_and_dispatch(
-            source,
-            table.clone(),
-            closed.clone(),
-            writer,
-        ));
-        WsLink {
-            connection_id,
-            table,
-            outgoing,
-            closed,
-            reader,
-        }
-    }
-
-    pub fn connection_id(&self) -> u64 {
-        self.connection_id
-    }
-
-    /// Return:
-    ///     bool  1 = 讀取 task 已經結束（表已清空、之後的請求都會回錯）
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    /// Return:
-    ///     u64   這條連線至今收到幾個沒人等的 pack
-    pub fn unmatched(&self) -> u64 {
-        self.table().unmatched()
-    }
-
-    /// 診斷用：無主的 pack 也交一份到這裡。
-    pub fn set_orphan_sink(&self, sender: mpsc::Sender<Pack>) {
-        self.table().set_orphan_sink(sender);
-    }
-
+impl Shared {
     fn table(&self) -> MutexGuard<'_, SessionTable> {
         self.table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// 唯一的關線路徑（§7）：第一個叫到的人做事，之後的都是 no-op。
+    /// 順序是先 `fail_all` 再 abort：在等的人先拿到錯，task 才停（abort 自己那個 task 也可以：它在下一個 await 點才停）。
+    fn shut_down(&self, reason: &str) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.table().fail_all(reason);
+        let tasks: Vec<JoinHandle<()>> = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        for task in tasks {
+            task.abort();
+        }
+    }
+}
+
+pub struct WsLink {
+    shared: Arc<Shared>,
+    outgoing: mpsc::Sender<Vec<u8>>,
+}
+
+impl WsLink {
+    /// 起兩個 task。`hook` 每收一個 pack 叫一次（§4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
+    pub fn start<S: FrameSource, K: FrameSink>(source: S, sink: K, hook: ReceivedHook) -> WsLink {
+        let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed) + 1;
+        let shared = Arc::new(Shared {
+            connection_id,
+            table: Mutex::new(SessionTable::new(connection_id)),
+            closed: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
+            hook,
+        });
+        let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
+
+        let writer = tokio::spawn(write_queued(sink, queued, shared.clone()));
+        let reader = tokio::spawn(read_and_dispatch(source, shared.clone()));
+        shared
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend([writer, reader]);
+        // 某個 task 在把手登記進去之前就死了（多執行緒 runtime 做得到）：它叫的 shut_down 沒東西可 abort，這裡補上。
+        if shared.is_closed() {
+            for task in shared
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .drain(..)
+            {
+                task.abort();
+            }
+        }
+        WsLink { shared, outgoing }
+    }
+
+    pub fn connection_id(&self) -> u64 {
+        self.shared.connection_id
+    }
+
+    /// Return:
+    ///     bool  1 = 關了（表已清空、之後的請求都會回錯）
+    pub fn is_closed(&self) -> bool {
+        self.shared.is_closed()
+    }
+
+    /// Return:
+    ///     u64   這條連線至今收到幾個沒人等的 pack。診斷數字，不是錯（呼叫端喊停之後 server 還在送的同 id Batch 也算）
+    pub fn unmatched(&self) -> u64 {
+        self.shared.table().unmatched()
+    }
+
+    /// 診斷用：無主的 pack 也交一份到這裡。
+    pub fn set_orphan_sink(&self, sender: mpsc::Sender<Pack>) {
+        self.shared.table().set_orphan_sink(sender);
+    }
+
     /// 只送，不等回覆。有序類由呼叫端按 `seq` 送；單一送出 task 寫 sink，順序不會亂。
     ///
     /// Return:
     ///     Ok(())          進佇列了
-    ///     Err(Network)    連線已經沒了、或佇列 `SEND_TIMEOUT` 內都排不進去
+    ///     Err(Network)    連線已經關了、或佇列 `SEND_TIMEOUT` 內都排不進去
     pub async fn send(&self, pack: &Pack) -> Result<(), SdkError> {
+        if self.shared.is_closed() {
+            return Err(SdkError::Network(format!(
+                "connection {}: closed, nothing more goes out",
+                self.shared.connection_id
+            )));
+        }
         let bytes = pack.encode()?;
         match tokio::time::timeout(SEND_TIMEOUT, self.outgoing.send(bytes)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(SdkError::Network(format!(
                 "connection {}: send queue closed, the connection is gone",
-                self.connection_id
+                self.shared.connection_id
             ))),
             Err(_) => Err(SdkError::Network(format!(
                 "connection {}: send queue did not drain within {SEND_TIMEOUT:?}",
-                self.connection_id
+                self.shared.connection_id
             ))),
         }
     }
@@ -129,7 +176,8 @@ impl WsLink {
     ///
     /// Return:
     ///     Ok(Pack)        回來的那個（可能是 Error pack，這裡不解讀）
-    ///     Err(Network)    逾時、連線沒了
+    ///     Err(Timeout)    連線還活著、只是沒回
+    ///     Err(Network)    連線沒了
     ///     Err(Usage)      同一個 (id, seq) 已經有人在等
     pub async fn request(&self, pack: Pack, timeout: Duration) -> Result<Pack, SdkError> {
         self.request_with_policy(pack, AckPolicy::once(timeout))
@@ -147,7 +195,7 @@ impl WsLink {
             seq: pack.seq,
         };
         let (sink, mut receiver) = OneshotSink::new();
-        self.table().register(key, Box::new(sink))?;
+        let generation = self.shared.table().register(key, Box::new(sink))?;
         let attempts = policy.attempts.max(1);
         let mut attempt = 0u32;
         let outcome = loop {
@@ -160,20 +208,28 @@ impl WsLink {
                 Ok(Err(_dropped)) => {
                     break Err(SdkError::Network(format!(
                         "connection {}: the reply slot for {key:?} was dropped",
-                        self.connection_id
+                        self.shared.connection_id
                     )))
                 }
                 Err(_elapsed) if attempt < attempts => continue,
-                Err(_elapsed) => {
-                    break Err(SdkError::Network(format!(
-                        "connection {}: no reply to {key:?} within {:?} after {attempt} attempt(s)",
-                        self.connection_id, policy.timeout
-                    )))
-                }
+                Err(_elapsed) => break Err(self.no_reply_error(key, attempt, policy.timeout)),
             }
         };
-        self.table().remove(key);
+        self.shared.table().remove_if(key, generation);
         outcome
+    }
+
+    /// 逾時分兩種（PR #52 審查 cirno 🟡3）：連線還活著是 `Timeout`（可以重試），連線沒了是 `Network`（要重連）。
+    fn no_reply_error(&self, key: SessionKey, attempts: u32, timeout: Duration) -> SdkError {
+        let message = format!(
+            "connection {}: no reply to {key:?} within {timeout:?} after {attempts} attempt(s)",
+            self.shared.connection_id
+        );
+        if self.shared.is_closed() {
+            SdkError::Network(format!("{message}; the connection is closed"))
+        } else {
+            SdkError::Timeout(message)
+        }
     }
 
     /// 一問多答：登記 `Session(id)` → 送。回來的每一個抄這個 id 的 pack 都進 handle；handle 丟掉就從表裡拿掉。
@@ -183,15 +239,16 @@ impl WsLink {
     ///     Err(Usage)      `id` 是 0（具名會話要有名字）、或這個 id 已經有會話
     ///     Err(Network)    送不出去
     pub async fn open_stream(&self, pack: Pack) -> Result<StreamHandle, SdkError> {
-        let key = named_key(self.connection_id, &pack)?;
+        let key = named_key(self.shared.connection_id, &pack)?;
         let (sink, receiver, end) = StreamSink::new();
-        self.register_and_send(key, Box::new(sink), &pack).await?;
+        let generation = self.register_and_send(key, Box::new(sink), &pack).await?;
         Ok(StreamHandle {
             inbox: SessionInbox {
                 key,
+                generation,
                 receiver,
                 end,
-                table: self.table.clone(),
+                shared: self.shared.clone(),
             },
         })
     }
@@ -199,15 +256,16 @@ impl WsLink {
     /// 訂閱：登記長活的 `Session(id)` → 送。到 handle 被丟掉、或收到帶這個 id 的 `Control/Error`（`Superseded`）為止。
     /// 📎 線上的 `Unsubscribe` 是呼叫端的事；丟掉 handle 只是不再收。
     pub async fn subscribe(&self, pack: Pack) -> Result<Subscription, SdkError> {
-        let key = named_key(self.connection_id, &pack)?;
+        let key = named_key(self.shared.connection_id, &pack)?;
         let (sink, receiver, gap, end) = SubscriptionSink::new();
-        self.register_and_send(key, Box::new(sink), &pack).await?;
+        let generation = self.register_and_send(key, Box::new(sink), &pack).await?;
         Ok(Subscription {
             inbox: SessionInbox {
                 key,
+                generation,
                 receiver,
                 end,
-                table: self.table.clone(),
+                shared: self.shared.clone(),
             },
             gap,
         })
@@ -218,20 +276,18 @@ impl WsLink {
         key: SessionKey,
         sink: Box<dyn PackSink>,
         pack: &Pack,
-    ) -> Result<(), SdkError> {
-        self.table().register(key, sink)?;
+    ) -> Result<SessionGeneration, SdkError> {
+        let generation = self.shared.table().register(key, sink)?;
         if let Err(error) = self.send(pack).await {
-            self.table().remove(key);
+            self.shared.table().remove_if(key, generation);
             return Err(error);
         }
-        Ok(())
+        Ok(generation)
     }
 
-    /// 主動關：兩個 task 停、表清空。
+    /// 主動關：兩個 task 停、表清空、之後 `send` 立刻回錯。
     pub fn close(&self) {
-        self.reader.abort();
-        self.closed.store(true, Ordering::SeqCst);
-        self.table().fail_all("closed by this side");
+        self.shared.shut_down("closed by this side");
     }
 }
 
@@ -251,30 +307,36 @@ fn named_key(connection_id: u64, pack: &Pack) -> Result<SessionKey, SdkError> {
     Ok(SessionKey::Session(pack.id))
 }
 
-async fn write_queued<K: FrameSink>(mut sink: K, mut queued: mpsc::Receiver<Vec<u8>>) {
+/// 送出 task。sink 寫不進去就是連線死了：走 `shut_down`，🚫 不能只是自己停下來（PR #52 審查 rumia／cirno／salvia 🔴）。
+async fn write_queued<K: FrameSink>(
+    mut sink: K,
+    mut queued: mpsc::Receiver<Vec<u8>>,
+    shared: Arc<Shared>,
+) {
     while let Some(bytes) = queued.recv().await {
-        if sink.send(bytes).await.is_err() {
-            break;
+        if let Err(error) = sink.send(bytes).await {
+            shared.shut_down(&format!("send failed: {error}"));
+            return;
         }
     }
 }
 
-async fn read_and_dispatch<S: FrameSource>(
-    mut source: S,
-    table: Arc<Mutex<SessionTable>>,
-    closed: Arc<AtomicBool>,
-    writer: JoinHandle<()>,
-) {
+/// 讀取 task：收 → decode → 查表（鎖內）→ 鉤子（鎖外）→ 交付（鎖內）。
+async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
     let mut undecodable_in_a_row = 0u32;
     let reason = loop {
         match source.receive().await {
             Ok(Some(bytes)) => match Pack::decode(&bytes) {
                 Ok(pack) => {
                     undecodable_in_a_row = 0;
-                    table
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .dispatch(pack);
+                    let (session, route) = shared.table().classify(&pack);
+                    (shared.hook)(&Received {
+                        connection_id: shared.connection_id,
+                        session,
+                        route,
+                        pack: &pack,
+                    });
+                    shared.table().dispatch(pack);
                 }
                 Err(error) => {
                     undecodable_in_a_row += 1;
@@ -289,20 +351,16 @@ async fn read_and_dispatch<S: FrameSource>(
             Err(error) => break error.to_string(),
         }
     };
-    closed.store(true, Ordering::SeqCst);
-    writer.abort();
-    table
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .fail_all(&reason);
+    shared.shut_down(&reason);
 }
 
-/// 一段具名會話的收件匣；丟掉就從表裡拿掉（之後抄這個 id 的 pack 變無主）。
+/// 一段具名會話的收件匣；丟掉就從表裡拿掉（只拿自己那一代；之後抄這個 id 的 pack 變無主）。
 struct SessionInbox {
     key: SessionKey,
+    generation: SessionGeneration,
     receiver: mpsc::Receiver<Pack>,
     end: Arc<Mutex<Option<SdkError>>>,
-    table: Arc<Mutex<SessionTable>>,
+    shared: Arc<Shared>,
 }
 
 impl SessionInbox {
@@ -313,20 +371,23 @@ impl SessionInbox {
                 Some(reason) => Err(reason),
                 None => Ok(None),
             },
-            Err(_elapsed) => Err(SdkError::Network(format!(
-                "session {:?}: no pack within {timeout:?}",
-                self.key
-            ))),
+            Err(_elapsed) => {
+                let message = format!("session {:?}: no pack within {timeout:?}", self.key);
+                if self.shared.is_closed() {
+                    Err(SdkError::Network(format!(
+                        "{message}; the connection is closed"
+                    )))
+                } else {
+                    Err(SdkError::Timeout(message))
+                }
+            }
         }
     }
 }
 
 impl Drop for SessionInbox {
     fn drop(&mut self) {
-        self.table
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(self.key);
+        self.shared.table().remove_if(self.key, self.generation);
     }
 }
 
@@ -338,7 +399,8 @@ impl StreamHandle {
     /// Return:
     ///     Ok(Some(pack))   下一個
     ///     Ok(None)         會話結束了（`IS_LAST`／`Control/Error` 已經交付過）
-    ///     Err(Network)     逾時、連線沒了
+    ///     Err(Timeout)     連線還活著、只是這段時間沒有下一個
+    ///     Err(Network)     連線沒了
     ///     Err(Protocol)    收件匣塞滿（消費端沒在讀）
     pub async fn next(&mut self, timeout: Duration) -> Result<Option<Pack>, SdkError> {
         self.inbox.next(timeout).await
@@ -358,7 +420,8 @@ impl Subscription {
     /// Return:
     ///     Ok(Some(pack))   下一個（Ack、CryptoState、Push、DeviceChanged、Superseded 都從這裡來，🚫 這裡不解讀）
     ///     Ok(None)         訂閱結束了（`Control/Error` 已經交付過）
-    ///     Err(Network)     逾時、連線沒了
+    ///     Err(Timeout)     連線還活著、只是這段時間沒推
+    ///     Err(Network)     連線沒了
     pub async fn next(&mut self, timeout: Duration) -> Result<Option<Pack>, SdkError> {
         self.inbox.next(timeout).await
     }
