@@ -126,6 +126,8 @@ impl PackChannel for Channel {
 /// `GET /_wbf/v1/ws`，一個 binary message 一個 pack。
 pub struct WsChannel {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// 丟在地上的推播數（見 [`WsChannel::receive_pack`]）。只給診斷；第 4 階段的接收迴圈做好就沒有這個數。
+    dropped_pushes: u64,
 }
 
 impl WsChannel {
@@ -156,7 +158,16 @@ impl WsChannel {
                     }
                     other => SdkError::Network(format!("websocket connect {url}: {other}")),
                 })?;
-        Ok(WsChannel { socket })
+        Ok(WsChannel {
+            socket,
+            dropped_pushes: 0,
+        })
+    }
+
+    /// Return:
+    ///     u64  這條連線至今丟掉幾個不是回覆的推播（`Device/Push`、`CryptoState`、`Event/Push`、`DeviceChanged`）
+    pub fn dropped_pushes(&self) -> u64 {
+        self.dropped_pushes
     }
 }
 
@@ -173,7 +184,17 @@ impl WsChannel {
     }
 
     /// 等下一個 binary message；ping／pong／文字 frame 跳過。
-    async fn receive_pack(&mut self, timeout: Duration) -> Result<Pack, SdkError> {
+    ///
+    /// ⚠️ **推播暫時丟在地上**（到 daemon-runtime 第 4 階段的接收迴圈做好為止）：訂閱之後 server 隨時會推 `Device/Push`、
+    /// `CryptoState`（別人 claim 了我一把 OTK 就推）、`Event/Push`、`DeviceChanged`，而這條通道只有「送一個、等回覆」。
+    /// 推播的 `id` 永遠是**訂閱的 id**，回覆的 `id` 是**這次請求的 id**：推播型的 subtype 而且 id 不是這次請求的，就不是回覆，
+    /// 跳過並計數。丟掉無害：佇列裡的東西下次 `Fetch` 還在，`CryptoState` 下次 `Subscribe` 會再給，`DeviceChanged` 只是加速（正確性由 1506 守）。
+    /// `Subscribe` 自己那則 `CryptoState` id 相同，照收。🚫 不是推播型的 pack 一律交上去，id 對不對由呼叫端判（fail closed 照舊）。
+    async fn receive_pack(
+        &mut self,
+        timeout: Duration,
+        in_flight_id: u64,
+    ) -> Result<Pack, SdkError> {
         loop {
             let message = tokio::time::timeout(timeout, self.socket.next())
                 .await
@@ -183,7 +204,14 @@ impl WsChannel {
                 })?
                 .map_err(|error| SdkError::Network(format!("websocket receive: {error}")))?;
             match message {
-                Message::Binary(bytes) => return Ok(Pack::decode(&bytes)?),
+                Message::Binary(bytes) => {
+                    let pack = Pack::decode(&bytes)?;
+                    if pack.id != in_flight_id && crate::protocol::is_unsolicited_push(&pack) {
+                        self.dropped_pushes = self.dropped_pushes.saturating_add(1);
+                        continue;
+                    }
+                    return Ok(pack);
+                }
                 Message::Close(frame) => {
                     return Err(SdkError::Network(format!(
                         "websocket closed by server: {frame:?}"
@@ -200,8 +228,9 @@ impl WsChannel {
 
 impl PackChannel for WsChannel {
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
+        let in_flight_id = pack.id;
         self.send_pack(pack).await?;
-        self.receive_pack(REQUEST_TIMEOUT).await
+        self.receive_pack(REQUEST_TIMEOUT, in_flight_id).await
     }
 
     async fn request_stream(
@@ -210,9 +239,10 @@ impl PackChannel for WsChannel {
         per_pack_timeout: Duration,
         on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
+        let in_flight_id = pack.id;
         self.send_pack(pack).await?;
         loop {
-            let response = self.receive_pack(per_pack_timeout).await?;
+            let response = self.receive_pack(per_pack_timeout, in_flight_id).await?;
             if !on_pack(response)? {
                 return Ok(());
             }

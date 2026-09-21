@@ -127,7 +127,8 @@ impl RoomDeviceVersions {
                     SdkError::Protocol("a joined member event has no `state_key`".into())
                 })?;
             let version_text = member_event
-                .pointer(&format!("/unsigned/{DEVICE_VERSION_KEY}"))
+                .get("unsigned")
+                .and_then(|unsigned| unsigned.get(DEVICE_VERSION_KEY))
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
                     SdkError::Protocol(format!(
@@ -183,11 +184,17 @@ impl RoomDeviceVersions {
 /// Return:
 ///     String  10 個小寫十六進位字元, example: "810b7c3be4"；這個人一把金鑰都沒有也是一個雜湊（三項全空）
 pub fn compute_device_keys_hash(user_id: &str, keys_query: &Value) -> String {
-    let master_key = keys_query.pointer(&format!("/master_keys/{user_id}"));
-    let self_signing_key = keys_query.pointer(&format!("/self_signing_keys/{user_id}"));
+    // 🚨 用 `get` 逐層查，🚫 不把 user_id 拼進 JSON Pointer：Matrix 的 localpart 可以含 `/`（`@ops/team:x`）與 `~`，
+    // Pointer 會把它切成多層路徑、查不到 →當成沒金鑰 → 雜湊對不上 → 合法成員永遠被拒發（PR #49 審查 rumia 🔴）。
+    let key_of = |table: &str| {
+        keys_query
+            .get(table)
+            .and_then(|by_user| by_user.get(user_id))
+    };
+    let master_key = key_of("master_keys");
+    let self_signing_key = key_of("self_signing_keys");
     // serde_json 的 Map 是 BTreeMap：走訪就是裝置 ID 的 byte 序。
-    let devices = keys_query
-        .pointer(&format!("/device_keys/{user_id}"))
+    let devices = key_of("device_keys")
         .and_then(Value::as_object)
         .map(|by_device_id| by_device_id.values().collect::<Vec<_>>())
         .unwrap_or_default();
@@ -356,6 +363,27 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// 🚨 localpart 含 `/` 與 `~` 的帳號（JSON Pointer 的兩個特殊字元）也要查得到金鑰：PR #49 審查 rumia 抓到拼 Pointer 會把他當成沒金鑰。
+    #[test]
+    fn a_user_id_with_pointer_special_characters_is_looked_up_verbatim() {
+        let user_id = "@ops/team~1:localhost";
+        let mut master = master();
+        master["user_id"] = json!(user_id);
+        master["signatures"] = json!({ user_id: { "ed25519:DEV1": "c2VsZg" } });
+        let mut device = device("DEV1", "b25l");
+        device["user_id"] = json!(user_id);
+        device["signatures"] = json!({ user_id: { "ed25519:DEV1": "ZGV2" } });
+        let response = json!({
+            "master_keys": { user_id: master },
+            "device_keys": { user_id: { "DEV1": device } }
+        });
+        let with_keys = compute_device_keys_hash(user_id, &response);
+        let without_keys = compute_device_keys_hash(user_id, &json!({}));
+        assert_ne!(with_keys, without_keys, "金鑰要被看到，不能算成三項全空");
+        // 同一組金鑰掛在一個普通帳號下，除了 user_id 字串不同外其餘一樣 → 雜湊不同（user_id 進規範化 JSON），但一樣不是「沒金鑰」。
+        assert_ne!(with_keys, "810b7c3be4");
     }
 
     #[test]

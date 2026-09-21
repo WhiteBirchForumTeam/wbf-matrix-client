@@ -359,6 +359,8 @@ impl<C: PackChannel> WbfClient<C> {
             match protocol::parse_subscribe_reply(&pack, &response)? {
                 protocol::SubscribeReply::Acknowledged => acknowledged = true,
                 protocol::SubscribeReply::CryptoState(state) => crypto_state = Some(state),
+                // 訂閱那一刻剛好推來的 to-device：這一版不吃推播，佇列裡的下次 Fetch 還在。
+                protocol::SubscribeReply::LivePush => {}
             }
             Ok(!(acknowledged && crypto_state.is_some()))
         };
