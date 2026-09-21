@@ -292,6 +292,41 @@ impl<C: PackChannel> WbfClient<C> {
         }
     }
 
+    /// 房間的某一項狀態（走橋的 `GET /rooms/{room_id}/state/{event_type}/{state_key}`），只回 content。
+    /// 單項小，不會像 `room_state` 那樣碰到大房間的 `TooLarge`（PR #56 審查 cirno 🟡1）。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    ///     event_type: example: "m.room.encryption"
+    ///     state_key: 空字串是一個值、不能省, example: ""
+    /// Return:
+    ///     Ok(Some(Value))  那一項的 content
+    ///     Ok(None)         沒有這一項（404）
+    ///     Err(Server)      不在房裡也看不到（`Forbidden`）
+    pub async fn state_event(
+        &mut self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<serde_json::Value>, SdkError> {
+        let reply = self
+            .call_bridge(
+                protocol::BRIDGE_STATE_EVENT,
+                &protocol::StateEventVariables {
+                    room_id,
+                    event_type,
+                    state_key,
+                },
+                Vec::new(),
+            )
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.json("GetStateEvent")?)),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// 帳號層的 account data（走橋的 `GET /user/{user_id}/account_data/{event_type}`）。
     ///
     /// Args:

@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use wbf_sdk::chat::Conversation;
 use wbf_sdk::protocol::SendRequest;
-use wbf_sdk::room_state::{conversation_from_state, direct_peers_of_room};
+use wbf_sdk::room_state::{conversation_from_state, direct_peers_of_room, is_encryption_content};
 use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
@@ -101,8 +101,21 @@ impl Core {
         account: &AccountDir,
         room: &str,
     ) -> Result<(), CoreError> {
-        let conversation = self.wbf_conversation(account, room).await?;
-        if conversation.encrypted {
+        // 只問 `m.room.encryption` 這一項（`GetStateEvent`）：全量 `GetState` 在大房間會被 server `TooLarge` 擋，
+        // 送訊息就跟著送不了（PR #56 審查 cirno 🟡1）。沒有這一項（404）＝沒加密。
+        let mut client = self
+            .client_of(
+                account,
+                Transport::WebSocket,
+                MethodHome::WbfSdkOnly,
+                LinkRole::Misc,
+            )
+            .await?;
+        let encrypted = client
+            .state_event(room, "m.room.encryption", "")
+            .await?
+            .is_some_and(|content| is_encryption_content(&content));
+        if encrypted {
             return Err(CoreError::new(
                 CoreErrorKind::Usage,
                 format!(

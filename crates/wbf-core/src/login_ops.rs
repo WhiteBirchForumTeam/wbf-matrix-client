@@ -122,23 +122,18 @@ impl Core {
             .await?;
             session
         };
-        // ⚠️ server 回的 `user_id` 才是**權威**（大小寫、localpart 正規化可能跟打的不一樣）：
-        // 目錄名對不上就搬過去。
-        // 🚫 打字算出來的目錄上不該有池（池只從 `client_of` 建、鍵是有 session 的目錄，而下面的改名只在正規目錄不存在時發生），
-        // 但這一行不靠那個前提：改名之前先關掉那裡可能有的線，之後池的鍵就找不到它了（PR #53 審查 rumia 🔴；消費端自己再問一次）。
-        self.close_links(&account, "session replaced by a new login")
-            .await;
-        let account = self.move_to_canonical_dir(account, &dir_key, server, &session.user_id)?;
-        if speaks_wbf {
-            // 改完名才建：`m/` 要落在正規目錄（Client 那條路是登入前就建、跟著目錄一起搬）。
-            self.create_crypto_store_for(&account, &session, &vault.matrix_store_key())
-                .await?;
-        }
-        vault.seal_session(&account.session_path(), &session)?;
-        // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：換 session 不影響它，這裡不再忘掉探測結果。
-        // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（link-pool.md §3；PR #53 審查 cirno 🟡1）。
-        self.close_links(&account, "session replaced by a new login")
-            .await;
+        // 🚨 拿到 token 之後、session 封好之前，本地任何一步失敗（改名被拒、建 `m/`、封檔）都把那個 token 撤掉（best effort）
+        // 再回原錯：🚫 不在 server 上留一台本地沒有對應 session 的裝置（PR #56 審查 rumia 🔴）。兩邊都適用：Client 那條路以前也有這個窗。
+        let account = match self
+            .finish_login_locally(account, &session, &dir_key, server, speaks_wbf, vault)
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let _ = wbf_sdk::login::logout(&session).await;
+                return Err(error);
+            }
+        };
         let switched_from = self.switch_current_to(&account)?;
         Ok(LoginResult {
             user_id: session.user_id,
@@ -148,10 +143,52 @@ impl Core {
         })
     }
 
+    /// 拿到 token 之後的本地那半：改名到權威拼法的目錄 →（wbf）建 `m/` → 封 session → 關掉舊 session 的線。
+    /// 任一步失敗就回錯，呼叫端撤 token；這裡只清這次自己建的東西（wbf 的 `m/`）。
+    ///
+    /// Return:
+    ///     Ok(AccountDir)   正規目錄，session 已封
+    ///     Err(Usage)       正規目錄已經存在（另一個登入中的帳號）
+    ///     Err(Io)          改名、建 `m/`、封檔失敗
+    async fn finish_login_locally(
+        &self,
+        account: AccountDir,
+        session: &Session,
+        dir_key: &Key32,
+        server: &str,
+        speaks_wbf: bool,
+        vault: &Vault,
+    ) -> Result<AccountDir, CoreError> {
+        // ⚠️ server 回的 `user_id` 才是**權威**（大小寫、localpart 正規化可能跟打的不一樣）：
+        // 目錄名對不上就搬過去。
+        // 🚫 打字算出來的目錄上不該有池（池只從 `client_of` 建、鍵是有 session 的目錄，而下面的改名只在正規目錄不存在時發生），
+        // 但這一行不靠那個前提：改名之前先關掉那裡可能有的線，之後池的鍵就找不到它了（PR #53 審查 rumia 🔴；消費端自己再問一次）。
+        self.close_links(&account, "session replaced by a new login")
+            .await;
+        let account = self.move_to_canonical_dir(account, dir_key, server, &session.user_id)?;
+        if speaks_wbf {
+            // 改完名才建：`m/` 要落在正規目錄（Client 那條路是登入前就建、跟著目錄一起搬）。
+            self.create_crypto_store_for(&account, session, &vault.matrix_store_key())
+                .await?;
+        }
+        if let Err(error) = vault.seal_session(&account.session_path(), session) {
+            if speaks_wbf {
+                // 這次自己建的 `m/`，沒有 session 就沒有主人：順手清掉（下次登入也會清，這裡不等）。
+                let _ = account.delete_matrix_store();
+            }
+            return Err(error.into());
+        }
+        // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：換 session 不影響它，這裡不再忘掉探測結果。
+        // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（link-pool.md §3；PR #53 審查 cirno 🟡1）。
+        self.close_links(&account, "session replaced by a new login")
+            .await;
+        Ok(account)
+    }
+
     /// wbf 帳號的 `m/`：**只有 crypto store**，由 `OlmEngine` 開（account-session.md §2；裝置身分金鑰在這一步生出來，
     /// 上傳等 E2EE 那支）。這裡只要它建好，引擎本身丟掉；長活的引擎 E2EE 的 RPC 面再接。
     ///
-    /// 🚨 建不起來就把剛拿到的 token 撤掉（best effort）再回錯：🚫 不留一個「登入了、但沒有金鑰庫」的帳號——
+    /// 🚨 建不起來就把半套的 `m/` 刪掉再回錯（token 由 `log_in` 的 rollback 撤）：🚫 不留一個「登入了、但沒有金鑰庫」的帳號——
     /// 那種帳號下一次碰到 E2EE 才發現，而那時已經有人把房間金鑰發給一台不存在的裝置。
     async fn create_crypto_store_for(
         &self,
@@ -169,12 +206,11 @@ impl Core {
         {
             Ok(_engine) => Ok(()),
             Err(error) => {
-                let _ = wbf_sdk::login::logout(session).await;
                 let _ = account.delete_matrix_store();
                 Err(CoreError::new(
                     CoreErrorKind::Io,
                     format!(
-                        "logged in, but the crypto store could not be created in {}, so the new device was logged out again: {error}",
+                        "logged in, but the crypto store could not be created in {}, so the new device is logged out again: {error}",
                         account.matrix_store_dir().display()
                     ),
                 ))
@@ -290,6 +326,78 @@ mod tests {
             BackendKind::WbfSdk,
             "wbf 帳號的 backend 登入時就定了，🚫 不靠每次重探"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #56 審查 rumia 🔴：拿到 token 之後本地失敗（這裡是「server 說你是 @b、而 @b 的目錄已經有人」）要把 token 撤掉，
+    /// 🚫 不在 server 上留一台本地沒有 session 的裝置。迷你 HTTP 要收到兩個請求：`/login` 然後 `/logout`。
+    #[tokio::test]
+    async fn a_login_that_fails_locally_after_getting_a_token_logs_that_token_out() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        let logouts = Arc::new(AtomicUsize::new(0));
+        let logouts_seen = logouts.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 8192];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                let body = if head.starts_with("POST /_matrix/client/v3/login ") {
+                    r#"{"user_id":"@b:local","device_id":"DEVB","access_token":"syt_b"}"#
+                } else {
+                    assert!(
+                        head.starts_with("POST /_matrix/client/v3/logout "),
+                        "第二個請求要是 /logout：{head}"
+                    );
+                    assert!(
+                        head.contains("Bearer syt_b"),
+                        "撤的要是剛拿到的那個 token：{head}"
+                    );
+                    logouts_seen.fetch_add(1, Ordering::SeqCst);
+                    "{}"
+                };
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let dir = scratch("wbf-login-rollback");
+        let core = Core::open(&dir);
+        core.create_vault(None).unwrap();
+        core.set_remembered_backend(&server, BackendKind::WbfSdk);
+        let key = core.vault().unwrap().account_dir_key();
+        // @b 的正規目錄已經存在：改名會被拒（「log that account out first」）。
+        let existing = AccountDir::locate(&dir, &key, &server, "@b:local").unwrap();
+        std::fs::create_dir_all(&existing.dir).unwrap();
+
+        let error = core
+            .log_in(&server, "@a:local", "pw", "test device", true)
+            .await
+            .expect_err("canonical dir collision");
+        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
+        // 撤了 token。
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while logouts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("🚨 拿到 token 之後本地失敗，要對 server 撤掉它");
+        // 打字算出來的目錄沒有留下 session 或 m/。
+        let typed = AccountDir::locate(&dir, &key, &server, "@a:local").unwrap();
+        assert!(!typed.is_logged_in());
+        assert!(!typed.matrix_store_dir().exists());
+        assert!(!existing.is_logged_in(), "別人的目錄一個字都沒動");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

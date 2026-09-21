@@ -202,7 +202,10 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
     // 備份還掛在 Client 上（account-session.md §6）：wbf 帳號明講拒絕（1100），🚫 不靜默失效。
     let reply = client.call("backup.status", json!({})).await;
-    assert_eq!(reply["code"], 1100, "backup.status on a wbf account: {reply}");
+    assert_eq!(
+        reply["code"], 1100,
+        "backup.status on a wbf account: {reply}"
+    );
     let before = info["result"]["instance"]
         .as_str()
         .expect("instance")
@@ -278,7 +281,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
 /// 🚨 **房間歷史往回翻，定位一律是 `event_id`**（wbfuwunel #51；維護者 2026-09-14）。
 ///
-/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）。
+/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗明文送出被拒）。
 ///
 /// ⭐ 刻意讓**兩條上游路線都被真的打到**：
 ///
@@ -315,6 +318,18 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         )
         .await;
     assert_eq!(reply["code"], 0, "account.add: {reply}");
+
+    // wbf 帳號的送訊息走 `Event/Send` 明文：加密房要被拒（1100），而且是送之前問這一刻的 `m.room.encryption`（account-session.md §6）。
+    // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
+    if let Ok(encrypted_room) = std::env::var("WBF_E2E_ENCRYPTED_ROOM") {
+        let reply = client
+            .call(
+                "room.send_text",
+                json!({ "room": encrypted_room, "body": "must not go out in plaintext" }),
+            )
+            .await;
+        assert_eq!(reply["code"], 1100, "加密房的明文送出要被拒：{reply}");
+    }
 
     // 送 7 則，記下它們的 event_id（舊到新）。
     let mut sent = Vec::new();

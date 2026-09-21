@@ -89,11 +89,8 @@ pub fn conversation_from_state(
         .or_else(|| name_from_members(state, me));
     let topic = find_state(state, "m.room.topic", "")
         .and_then(|event| non_empty_string(&event["content"]["topic"]));
-    // 🚨 只有 `m.room.encryption` 帶著非空的 `algorithm` 才算加密：一個空 content 的 encryption 事件不算（fail closed 的方向是
-    // 「當成沒加密」——送檔前的確認會把它當明文房、拒絕帶金鑰的 cipher，而不是把明文當密文送出去）。
     let encrypted = find_state(state, "m.room.encryption", "")
-        .and_then(|event| non_empty_string(&event["content"]["algorithm"]))
-        .is_some();
+        .is_some_and(|event| is_encryption_content(&event["content"]));
 
     Ok(Conversation {
         id: room_id.to_string(),
@@ -106,6 +103,19 @@ pub fn conversation_from_state(
         can_send_message,
         direct_peer,
     })
+}
+
+/// `m.room.encryption` 的 content 算不算「這房加密了」。
+/// 🚨 只有帶著非空的 `algorithm` 才算：空 content 的 encryption 事件不算（fail closed 的方向是「當成沒加密」——
+/// 送檔前的確認會把它當明文房、拒絕帶金鑰的 cipher，而不是把明文當密文送出去）。
+/// `conversation_from_state`（全量狀態）與送訊息前的單項確認（`GetStateEvent`）共用這一句，兩邊不會漂。
+///
+/// Args:
+///     content: example: &json!({"algorithm": "m.megolm.v1.aes-sha2"})
+/// Return:
+///     bool  true 只在 `algorithm` 是非空字串
+pub fn is_encryption_content(content: &Value) -> bool {
+    non_empty_string(&content["algorithm"]).is_some()
 }
 
 fn find_state<'a>(state: &'a [Value], event_type: &str, state_key: &str) -> Option<&'a Value> {

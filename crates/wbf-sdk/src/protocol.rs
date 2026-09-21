@@ -198,6 +198,12 @@ pub const BRIDGE_ROOM_STATE: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Event,
     subtype: 0x21,
 };
+/// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`（bridge-specs `0x14-event.md` §0x22）：回**只有 content**；
+/// 沒有這一項是 404。`state_key` 空字串是一個值，不能省。單項小、不會像 `GetState` 那樣碰到 2 MiB 的 `TooLarge`。
+pub const BRIDGE_STATE_EVENT: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Event,
+    subtype: 0x22,
+};
 /// `GET /_matrix/client/v3/user/{user_id}/account_data/{event_type}`（bridge-specs `0x11-account.md` §0x25）：沒寫過是 404 `M_NOT_FOUND`。
 pub const BRIDGE_ACCOUNT_DATA: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Account,
@@ -252,6 +258,14 @@ pub struct MembersVariables<'a> {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RoomIdVariables<'a> {
     pub room_id: &'a str,
+}
+
+/// `GetStateEvent` 的變數（三個都是 path 變數；`state_key` 空字串也要送）。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StateEventVariables<'a> {
+    pub room_id: &'a str,
+    pub event_type: &'a str,
+    pub state_key: &'a str,
 }
 
 /// `GetAccountData` 的變數（兩個都是 path 變數）。
