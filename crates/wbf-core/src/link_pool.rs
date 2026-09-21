@@ -69,9 +69,6 @@ pub struct LinkPool {
     user: String,
     events: EventSink,
     slots: Mutex<HashMap<LinkRole, Slot>>,
-    /// `close_all` 第一件事就是把它設成 true：之後的 `acquire` 一律拒絕，正在開的那一個開完也丟掉。
-    /// 🚨 沒有它的話：登出把格排乾之後，一個已經拿到同一格、在等鎖的 `acquire` 會看到 None 然後把線重開在已經登出的池上（PR #53 審查 rumia 🔴1）。
-    closed: std::sync::atomic::AtomicBool,
 }
 
 impl LinkPool {
@@ -82,24 +79,7 @@ impl LinkPool {
             user: user.to_string(),
             events,
             slots: Mutex::new(HashMap::new()),
-            closed: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Return:
-    ///     bool  1 = `close_all` 叫過了（登出、換 session）：這個池不再開任何線
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn closed_error(&self) -> CoreError {
-        CoreError::new(
-            crate::error::CoreErrorKind::Usage,
-            format!(
-                "{}: the link pool is closed (logged out or the session was replaced); nothing more is opened on it",
-                self.user
-            ),
-        )
     }
 
     pub fn user(&self) -> &str {
@@ -123,21 +103,16 @@ impl LinkPool {
     /// Return:
     ///     Ok(PooledClient)   開著的線；丟掉 guard 就是把線還回池裡（線本身還開著）
     ///     Err(...)           `open` 的錯原樣（沒 session 是 Usage、連不上是 Network）；池裡那格維持沒開，🚫 不發事件
-    ///     Err(Usage)         池已經 `close_all` 過（登出）：拿鎖前、拿到鎖後、`open` 回來後都再問一次，開好的那條也丟掉
+    ///
+    /// 📌 登出跟這裡的競賽由 server 決定，不由池猜（link-pool.md §3）：登出先撤 token 再 `close_all`，之後才開的線在 hello 就被 server 拒；
+    /// 正在開的那一條由 `close_all` 等它的鎖、開完、命令做完再收。
     pub async fn acquire<F, Fut>(&self, role: LinkRole, open: F) -> Result<PooledClient, CoreError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<WbfClient<Channel>, CoreError>>,
     {
-        if self.is_closed() {
-            return Err(self.closed_error());
-        }
         let slot = self.slot(role);
         let mut guard = slot.lock_owned().await;
-        // 等鎖的期間登出了：這格已經被排乾，🚫 不能在上面重開。
-        if self.is_closed() {
-            return Err(self.closed_error());
-        }
         let found_dead = guard
             .as_ref()
             .is_some_and(|client| client.channel().is_closed());
@@ -150,27 +125,20 @@ impl LinkPool {
             );
         }
         if guard.is_none() {
-            let client = open().await?;
-            // 開的期間登出了：新開的這條不能留（丟掉就關）。
-            if self.is_closed() {
-                drop(client);
-                return Err(self.closed_error());
-            }
-            *guard = Some(client);
+            *guard = Some(open().await?);
             self.emit_link(role, LinkState::Opened, None);
         }
         Ok(PooledClient::Pooled(guard))
     }
 
-    /// 登出、destroy：全關（token 撤了，留著也是死的）。等正在用線的命令做完才關那條。
+    /// 登出、destroy、換 session：全關（token 撤了，留著也是死的）。**等正在用線的命令做完**才關那條（維護者 2026-09-21：還在處理的要處理完）；
+    /// 正在開的那一條也一樣（開的人握著鎖）。關完這個池還能再用，但 `Core` 會把它從註冊表拿掉，下一個命令用新 session 建新池。
     ///
     /// Args:
     ///     reason: example: "logged out"
     /// Return:
     ///     usize   關掉了幾條開著的
     pub async fn close_all(&self, reason: &str) -> usize {
-        // 先封，再排：封了之後沒有任何 `acquire` 能再開線（含已經在等鎖的、正在 `open` 的）。
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         let slots: Vec<(LinkRole, Slot)> = self
             .slots
             .lock()
@@ -506,10 +474,11 @@ mod tests {
             .is_ok());
     }
 
-    /// 🚨 登出與 acquire 的競賽（PR #53 審查 rumia 🔴1）：`open` 還在跑的時候 `close_all` 來了 → 開好的那條丟掉、回 Usage、池裡沒有線；
-    /// 之後的 acquire 也一律 Usage。順序由 oneshot 控制，不靠運氣。
+    /// 登出撞上正在開線的 acquire（PR #53 審查 rumia 🔴1；維護者 2026-09-21 定：還在處理的要處理完）：
+    /// `close_all` 等那一格的鎖——開完、命令用完、guard 丟掉——才收那條；收完池裡沒有線。順序由 oneshot 控制，不靠運氣。
+    /// 📌 「之後不能再開」不是池的事：server 撤了 token，hello 就拒；本地刪了 session，`open_link` 連試都不試。
     #[tokio::test]
-    async fn a_logout_during_an_open_discards_the_new_line_and_refuses_later_acquires() {
+    async fn a_logout_waits_for_the_line_being_opened_and_then_closes_it() {
         let events = EventSink::new();
         let mut seen = events.subscribe();
         let pool = Arc::new(LinkPool::new("@alice:localhost", events));
@@ -530,7 +499,7 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        // 登出：第一件事封池（同步、立刻），然後等那一格的鎖——鎖在 acquire 手上，要等 open 回來才放。
+        // 登出：等那一格的鎖——鎖在 acquire 手上，要等 open 回來、命令做完才放。
         let closing = tokio::spawn({
             let pool = pool.clone();
             async move { pool.close_all("logged out").await }
@@ -538,25 +507,21 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        assert!(pool.is_closed(), "封池不等鎖");
+        assert!(!closing.is_finished(), "登出在等正在開的那條");
         release.send(()).unwrap();
         let outcome = acquiring.await.unwrap();
-        assert_eq!(closing.await.unwrap(), 0, "開好的那條沒進池，沒東西可關");
-        assert!(
-            matches!(outcome, Err(ref error) if error.kind == CoreErrorKind::Usage),
-            "{outcome:?}"
-        );
-        assert_eq!(pool.open_count(), 0, "開好的那條沒留下");
-        assert!(
-            drain(&mut seen).is_empty(),
-            "沒有任何 Opened（它從來沒進池）"
-        );
-        let (client, _peer) = memory_client(wbf_sdk::no_hook());
-        let later = pool
-            .acquire(LinkRole::Keys, || async move { Ok(client) })
-            .await;
-        assert!(matches!(later, Err(ref error) if error.kind == CoreErrorKind::Usage));
-        assert!(pool.is_closed());
+        assert!(outcome.is_ok(), "開好的那條交給命令用：{outcome:?}");
+        // 命令做完（guard 在 spawn 裡就丟了），登出才收得到它。
+        assert_eq!(closing.await.unwrap(), 1, "收了那條剛開好、用完的線");
+        assert_eq!(pool.open_count(), 0);
+        let states: Vec<LinkState> = drain(&mut seen)
+            .into_iter()
+            .map(|event| match event {
+                CoreEvent::Link { state, .. } => state,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(states, vec![LinkState::Opened, LinkState::Closed]);
     }
 
     #[tokio::test]
@@ -589,14 +554,12 @@ mod tests {
             .collect();
         assert_eq!(closed.len(), 3);
         assert!(closed.contains(&LinkRole::Keys));
-        // 關過的池不再開任何線（登出了；重登入由 Core 建新池）：再要就是 Usage，🚫 不是拿到一條死的、也不是重開。
+        // 關過之後再要就是重開，不是拿到一條死的（池不記「登出了沒」：那是 session 與 server 的事）。
         let (client, _peer) = memory_client(wbf_sdk::no_hook());
-        let later = pool
-            .acquire(LinkRole::Misc, || async move { Ok(client) })
-            .await;
-        assert!(matches!(later, Err(ref error) if error.kind == CoreErrorKind::Usage));
-        assert_eq!(pool.open_count(), 0);
-        assert!(pool.is_closed());
+        pool.acquire(LinkRole::Misc, || async move { Ok(client) })
+            .await
+            .unwrap();
+        assert_eq!(pool.open_count(), 1);
     }
 
     fn sample_push() -> wbf_wire::Pack {

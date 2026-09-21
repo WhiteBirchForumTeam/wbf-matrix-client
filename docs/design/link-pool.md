@@ -61,9 +61,18 @@
   ⭐ 這條跟維護者說的「萬一斷掉，就主動打開再執行 RPC 要的命令」一致：是**這次 RPC 開頭**發現死了就重開，不是替上一個死掉的 RPC 補做。
 - **訂閱線**（`Rooms`／`Keys`）：`Idle` 到收到訂閱命令為止；死了也是 `Dead` 躺著，**下一個訂閱命令**來才重開＋重訂。訂閱的內容（訂了哪些房、`cd_seq` 在哪）
   🚫 不歸池管，歸 PR 2／第 6 階段那層——池只管 socket。
-- **登出、destroy、重登入（session 換了）**：那個帳號的五條**全關**（token 撤了或換了，留著也是死的），走 `LinkPool::close_all`；池整個從註冊表拿掉，下一個命令用新 session 建新池。**daemon 關**：`Core` 丟掉就全關（`Drop`）。
-  🚨 `close_all` 第一件事是把池**封起來**（`closed` 旗標），然後才排乾各格：已經拿到同一格、在等鎖的 `acquire`，還有正在 `open` 的那一個，拿到鎖或開完之後都會再問一次，
-  封了就丟掉新開的那條、回 `Usage`——🚫 不能把線重開在已經登出的池上（PR #53 審查 rumia 🔴1；測試用 oneshot 定住順序）。
+- **登出**（維護者 2026-09-21 定）：登出的 RPC 就是一次 HTTP `/logout`（或 fallback 到 matrix-sdk），**只有成與不成**。不成就到此為止，什麼都不動；
+  成了就把這個帳號的池**直接關掉、釋放資源**（`close_all`），然後才刪本地的 `session.sealed`、`m/`…。順序：
+
+  | 步 | 做什麼 | 之後的世界 |
+  |---|---|---|
+  | 1 | HTTP `/logout`（撤 token、刪裝置） | server 不再認這個 token：既有的線在下一個 message 被踢（server 每個 message 重驗），之後才開的線 hello 就被拒 |
+  | 2 | `close_all`：等每一格的鎖、取出、關掉，池從註冊表拿掉 | **還在處理的命令做完才被收**（它握著鎖）；正在開的那條也是。該落地的由 cache 寫入者照常落地 |
+  | 3 | 刪 `session.sealed`、`m/`、快照、current | 本地跟 server 一致；`session_of` 回 NotLoggedIn，連試都不試 |
+
+  🚫 **池裡不存「登出了沒」**：那件事的真相只有兩份——server 的 token 表與本地的 `session.sealed`——池再存一份就是第三份（維護者 2026-09-21：「這個改法有點髯」）。
+  登出與一般命令的競賽因此由 server 裁決：第 1 步之後任何新開的線都拿不到授權（hello 就是第一個 message），第 1 步之前開的由第 2 步收。
+- **destroy**：同上（共用同一段）。**重登入**（session 換了）：封好新 session 之後 `close_all` 舊池（舊 token 沒撤、但那些線不該再用）。**daemon 關**：`Core` 丟掉就全關（`Drop`）。
 - 🚫 **沒有背景重連、沒有退避**。第 8 階段的監督者做那個，而且做的時候用的就是這裡的 `open`／`close_all`，🚫 不另開一套。
 - 📎 重開時**不重探** backend（`backends` 那格照舊）：探測的是「這台講不講 wbf」，跟這條線死沒死無關。登出才 `forget_backend_probe`（既有）。
 
@@ -115,7 +124,7 @@ pub trait LinkOpener: Send + Sync {
 ## 8. 測試
 
 - `link_pool.rs` 單元（假 opener，記憶體對接）：同一角色第二次取用拿到同一條、不重開；不同角色是不同條；死了（對面丟掉 sink）下一次取用重開、`Link{Closed}` 再 `Link{Opened}`；
-  沒 session 回 `Usage` 且不發事件；`close_all` 五條都關、發五則 `Closed`、之後再要一律 `Usage`；**登出撞上正在 `open` 的 acquire**（oneshot 定順序）：封池不等鎖、開好的那條丟掉、沒有 `Opened`；
+  沒 session 回 `Usage` 且不發事件；`close_all` 五條都關、發五則 `Closed`；**登出撞上正在 `open` 的 acquire**（oneshot 定順序）：`close_all` 等它開完、命令做完才收那條，事件是 Opened 再 Closed；
   `Received` 事件帶對的 role 與標頭。`Transport::Http` 不進池這條沒有測試（core 從不開 Http）。
 - daemon：`subscribe`／`unsubscribe` 回剩下的集合；沒訂就收不到；訂了 `"*"` 全收；`user` 過濾；Lagged → `desync`；`progress` 不訂也收得到自己的。
 - 真 server（`--ignored`）：`server.ping` 兩次走同一條 `Misc`（`daemon.info` 看得到線數）；`account.del` 之後五條關。
