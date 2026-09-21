@@ -26,6 +26,8 @@ pub mod lock;
 pub mod message;
 pub mod pack;
 pub mod protocol;
+/// 推播：core 的事件 → RPC 的推播，與每條連線的訂閱集合（rpc-spec §3.9、§4）。
+pub mod push;
 pub mod server;
 pub mod settings;
 pub mod token;

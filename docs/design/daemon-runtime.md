@@ -651,10 +651,10 @@ let response = tokio::select! {
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ 這支分支做了 |
 | 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 這支分支做了（媒體那幾條是刻意的例外，§2.3.1） |
 | 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` → `sync`、預設 `local`，**回應回報這次用了哪一種** | ✅ 這支分支做了 |
-| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ❌ daemon 這半；✅ SDK 那半 2026-09-21 做了（`ws-receive-dispatch.md`：通道收得到推播、會話表依 id 交付、每個 pack 經過 `ReceivedHook` 給這裡接） |
+| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ✅ 2026-09-21：SDK 那半（`ws-receive-dispatch.md`）與 daemon 這半（`link-pool.md` §6：`subscribe`／`unsubscribe`、每條 RPC 連線一個推播 task、`progress`／`note` 自動路由到發那個請求的連線、`Lagged` → `desync`）。❌ 還沒：進度節流（§5.4） |
 | 5 | `cancel`（§9） | ❌ |
 | 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ❌ 向量已經有，codec 還沒寫 |
-| 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | ❌ |
+| 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | 🔧 連線的部分 2026-09-21 做了（`link-pool.md`：一個帳號五條線的池、要用才開、斷了下次再開、登出全關、每個收到的 pack 變 `CoreEvent::Received`）；收事件迴圈→寫庫→發 `room.message` 還沒（要第 6 階段的 codec） |
 | 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | ❌ |
 | 9 | **已讀三層**（§6）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | ❌ |
 

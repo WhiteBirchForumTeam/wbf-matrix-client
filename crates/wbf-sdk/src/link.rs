@@ -26,6 +26,36 @@ pub const CORRUPT_FRAME_BUDGET: u32 = 8;
 /// 送出（進佇列）最多等多久：送出 task 卡在死掉的 socket 上時，呼叫端不該永遠掛著。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 心跳（ws-receive-dispatch.md §5.1，維護者 2026-09-21：照 WireGuard 的 persistent keepalive 那個概念）：每條線自己一個，
+/// 每 `interval` 醒一次；最近 `quiet` 之內這條線有任何送或收就跳過這次，否則送一個 `Ping` 等 `Pong`；
+/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub interval: Duration,
+    pub quiet: Duration,
+    pub reply_timeout: Duration,
+}
+
+impl Heartbeat {
+    /// 預設：24 秒一次、最近 20 秒有通訊就跳過、Pong 等 10 秒。
+    /// 24 秒 ≪ server 的 `wbf_ws_idle_timeout`（300 秒），閘著的線不會被 server 當黑洞收掉；也能在半分鐘內發現對方已經不在。
+    pub const DEFAULT: Heartbeat = Heartbeat {
+        interval: Duration::from_secs(24),
+        quiet: Duration::from_secs(20),
+        reply_timeout: Duration::from_secs(10),
+    };
+
+    /// 不跳（只給測試別的事情時用）。
+    pub const OFF: Heartbeat = Heartbeat {
+        interval: Duration::MAX,
+        quiet: Duration::ZERO,
+        reply_timeout: Duration::from_secs(10),
+    };
+}
+
+/// 心跳的 `Ping` 用的請求號從這裡往下數：`WbfClient` 的計數器從 1 往上，兩邊碰到要幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。
+const HEARTBEAT_FIRST_SEQ: u32 = u32::MAX;
+
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// 一個要 Ack 的請求怎麼等（§6）。🚨 預設 `attempts = 1`：重送是冪等的呼叫點自己開的。
@@ -54,6 +84,10 @@ struct Shared {
     closed: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     hook: ReceivedHook,
+    /// 這條線起來的時間；`last_activity_ms` 從這裡算。
+    started: std::time::Instant,
+    /// 上次送或收（任何 frame）是起來之後第幾毫秒。心跳拿它決定要不要跳過。
+    last_activity_ms: AtomicU64,
 }
 
 impl Shared {
@@ -61,6 +95,19 @@ impl Shared {
         self.table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 送了或收了一個 frame。
+    fn touch(&self) {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// Return:
+    ///     Duration   距離上次送或收多久
+    fn idle_for(&self) -> Duration {
+        let now = self.started.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)))
     }
 
     fn is_closed(&self) -> bool {
@@ -89,11 +136,23 @@ impl Shared {
 pub struct WsLink {
     shared: Arc<Shared>,
     outgoing: mpsc::Sender<Vec<u8>>,
+    /// 只有交給呼叫端的那一份是 true：它被丟掉才是「不要這條線了」。心跳 task 手上那份分身是 false，被 abort 時 drop 不關線。
+    owner: bool,
 }
 
 impl WsLink {
-    /// 起兩個 task。`hook` 每收一個 pack 叫一次（§4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
+    /// 起兩個 task 加預設的心跳（`Heartbeat::DEFAULT`）。`hook` 每收一個 pack 叫一次（§4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
     pub fn start<S: FrameSource, K: FrameSink>(source: S, sink: K, hook: ReceivedHook) -> WsLink {
+        WsLink::start_with_heartbeat(source, sink, hook, Heartbeat::DEFAULT)
+    }
+
+    /// 同上，心跳的間隔自己給（測試用短的；`Heartbeat::OFF` 不跳）。
+    pub fn start_with_heartbeat<S: FrameSource, K: FrameSink>(
+        source: S,
+        sink: K,
+        hook: ReceivedHook,
+        heartbeat: Heartbeat,
+    ) -> WsLink {
         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed) + 1;
         let shared = Arc::new(Shared {
             connection_id,
@@ -101,16 +160,26 @@ impl WsLink {
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             hook,
+            started: std::time::Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
         });
         let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
 
         let writer = tokio::spawn(write_queued(sink, queued, shared.clone()));
         let reader = tokio::spawn(read_and_dispatch(source, shared.clone()));
+        let pulse = tokio::spawn(beat(
+            WsLink {
+                shared: shared.clone(),
+                outgoing: outgoing.clone(),
+                owner: false,
+            },
+            heartbeat,
+        ));
         shared
             .tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend([writer, reader]);
+            .extend([writer, reader, pulse]);
         // 某個 task 在把手登記進去之前就死了（多執行緒 runtime 做得到）：它叫的 shut_down 沒東西可 abort，這裡補上。
         if shared.is_closed() {
             for task in shared
@@ -122,7 +191,11 @@ impl WsLink {
                 task.abort();
             }
         }
-        WsLink { shared, outgoing }
+        WsLink {
+            shared,
+            outgoing,
+            owner: true,
+        }
     }
 
     pub fn connection_id(&self) -> u64 {
@@ -293,7 +366,9 @@ impl WsLink {
 
 impl Drop for WsLink {
     fn drop(&mut self) {
-        self.close();
+        if self.owner {
+            self.close();
+        }
     }
 }
 
@@ -318,6 +393,44 @@ async fn write_queued<K: FrameSink>(
             shared.shut_down(&format!("send failed: {error}"));
             return;
         }
+        shared.touch();
+    }
+}
+
+/// 心跳 task（`Heartbeat`）。拿一份 `WsLink` 的分身（同一個 `Shared`，`owner: false`）送 `Ping`：走的是一般的 `request`，所以 `Pong` 也經會話表、也過鉤子。
+async fn beat(link: WsLink, heartbeat: Heartbeat) {
+    if heartbeat.interval == Duration::MAX {
+        return;
+    }
+    let mut seq = HEARTBEAT_FIRST_SEQ;
+    loop {
+        tokio::time::sleep(heartbeat.interval).await;
+        if link.shared.is_closed() {
+            return;
+        }
+        // 最近有通訊：線是活的、server 那邊的 idle 也沒在走，這次不用跳。
+        if link.shared.idle_for() < heartbeat.quiet {
+            continue;
+        }
+        let ping = Pack {
+            kind: wbf_wire::Kind::Control,
+            subtype: wbf_wire::pack::control::PING,
+            flags: wbf_wire::pack::flags::WANT_ACK,
+            id: 0,
+            seq,
+            meta: Vec::new(),
+            data: Vec::new(),
+        };
+        seq = seq.wrapping_sub(1);
+        match link.request(ping, heartbeat.reply_timeout).await {
+            Ok(_pong) => {}
+            // 這個號剛好有人在用：那條線顯然活著，下次再說。
+            Err(SdkError::Usage(_)) => {}
+            Err(error) => {
+                link.shared.shut_down(&format!("heartbeat: {error}"));
+                return;
+            }
+        }
     }
 }
 
@@ -328,6 +441,7 @@ async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
         match source.receive().await {
             Ok(Some(bytes)) => match Pack::decode(&bytes) {
                 Ok(pack) => {
+                    shared.touch();
                     undecodable_in_a_row = 0;
                     let (session, route) = shared.table().classify(&pack);
                     (shared.hook)(&Received {

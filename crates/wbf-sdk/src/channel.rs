@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use wbf_wire::Pack;
 
 use crate::error::SdkError;
-use crate::link::{Subscription, WsLink};
+use crate::link::{Heartbeat, Subscription, WsLink};
 use crate::sessions::ReceivedHook;
 
 /// 一個請求從送出到收到回應的上限。與 server 的 `wbf_ws_idle_timeout` 預設相同：對方黑洞了就回 `Network`，
@@ -117,6 +117,15 @@ impl Channel {
             Channel::Http(_) => None,
         }
     }
+
+    /// Return:
+    ///     bool  1 = WebSocket 那條線關了（之後每個請求都回 Network；連線池拿這個決定要不要重開）。HTTP 永遠是 0：它沒有「開著」這回事
+    pub fn is_closed(&self) -> bool {
+        match self {
+            Channel::WebSocket(channel) => channel.link().is_closed(),
+            Channel::Http(_) => false,
+        }
+    }
 }
 
 impl PackChannel for Channel {
@@ -166,11 +175,21 @@ impl WsChannel {
         WsChannel::connect_with_hook(server, access_token, crate::sessions::no_hook()).await
     }
 
-    /// 同上，每收一個 pack 叫一次 `hook`（ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。
+    /// 同上，每收一個 pack 叫一次 `hook`（ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。心跳是預設的（24 秒）。
     pub async fn connect_with_hook(
         server: &str,
         access_token: &str,
         hook: ReceivedHook,
+    ) -> Result<WsChannel, SdkError> {
+        WsChannel::connect_with_heartbeat(server, access_token, hook, Heartbeat::DEFAULT).await
+    }
+
+    /// 同上，心跳的間隔自己給（ws-receive-dispatch.md §5.1；測試對真 server 用短的）。
+    pub async fn connect_with_heartbeat(
+        server: &str,
+        access_token: &str,
+        hook: ReceivedHook,
+        heartbeat: Heartbeat,
     ) -> Result<WsChannel, SdkError> {
         let url = ws_url(server)?;
         let mut request = url
@@ -200,13 +219,18 @@ impl WsChannel {
                 })?;
         let (source, sink) = crate::transport::split_socket(socket);
         Ok(WsChannel {
-            link: WsLink::start(source, sink, hook),
+            link: WsLink::start_with_heartbeat(source, sink, hook, heartbeat),
         })
     }
 
     /// 底下那條連線：診斷（`unmatched`、`is_closed`）與需要 `AckPolicy` 的呼叫點用。
     pub fn link(&self) -> &WsLink {
         &self.link
+    }
+
+    /// 拿一條已經起好的 `WsLink` 當通道：給測試（`transport::memory_pair` 對接）與自己採傳輸的嵌入者用。正式的路是 `connect`。
+    pub fn from_link(link: WsLink) -> WsChannel {
+        WsChannel { link }
     }
 }
 

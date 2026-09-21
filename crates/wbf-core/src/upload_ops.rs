@@ -17,8 +17,9 @@ use wbf_sdk::{Cipher, Transport};
 use wbf_sdk::{FileCipher, UploadState};
 
 use crate::accounts::AccountDir;
-use crate::error::{CoreError, CoreErrorKind};
 use crate::backend_choice::MethodHome;
+use crate::error::{CoreError, CoreErrorKind};
+use crate::link_pool::LinkRole;
 use crate::{Core, Target};
 
 /// 要上傳什麼、怎麼切、怎麼加密。
@@ -121,7 +122,7 @@ impl Core {
             .len();
         let session = self.session_of(account)?;
         let mut client = self
-            .client_of(account, transport, MethodHome::WbfSdkOnly)
+            .client_of(account, transport, MethodHome::WbfSdkOnly, LinkRole::Upload)
             .await?;
         let state_path = state_path_for(path);
 

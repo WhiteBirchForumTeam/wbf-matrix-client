@@ -497,3 +497,110 @@ async fn a_quiet_server_is_a_timeout_but_a_dead_connection_is_a_network_error() 
         Err(SdkError::Network(_))
     ));
 }
+
+// ---- 心跳（ws-receive-dispatch.md §5.1；維護者 2026-09-21：照 WireGuard，安靜才跳、每條線自己一個）----
+
+use wbf_sdk::link::Heartbeat;
+
+fn connect_with_heartbeat(heartbeat: Heartbeat) -> (WsLink, Peer) {
+    let (client_end, server_end) = memory_pair(64);
+    let link = WsLink::start_with_heartbeat(
+        client_end.source,
+        client_end.sink,
+        wbf_sdk::no_hook(),
+        heartbeat,
+    );
+    (link, Peer { end: server_end })
+}
+
+fn pong_for(ping: &Pack) -> Pack {
+    pack(
+        Kind::Control,
+        control::PONG,
+        flags::IS_RESPONSE,
+        0,
+        ping.seq,
+    )
+}
+
+/// 安靜的線：時間到就送 Ping；對方回 Pong 線就活著、下一個間隔再跳一次。
+#[tokio::test]
+async fn a_quiet_link_pings_and_stays_open_when_the_peer_answers() {
+    let (link, mut peer) = connect_with_heartbeat(Heartbeat {
+        interval: Duration::from_millis(100),
+        quiet: Duration::from_millis(50),
+        reply_timeout: Duration::from_millis(500),
+    });
+    let first = peer.receive().await;
+    assert_eq!(
+        (first.kind, first.subtype, first.id),
+        (Kind::Control, control::PING, 0)
+    );
+    assert!(first.flags & flags::WANT_ACK != 0);
+    peer.send(pong_for(&first)).await;
+    let second = peer.receive().await;
+    assert_eq!(second.subtype, control::PING, "下一個間隔再跳一次");
+    assert_eq!(
+        second.seq,
+        first.seq.wrapping_sub(1),
+        "心跳的請求號從上往下數"
+    );
+    peer.send(pong_for(&second)).await;
+    assert!(!link.is_closed());
+    assert_eq!(link.unmatched(), 0, "Pong 都有人等");
+}
+
+/// 忙的線不跳：最近 `quiet` 之內有收到東西就跳過（這裡對面一直送無主的 pack）。
+#[tokio::test]
+async fn a_busy_link_skips_its_heartbeat() {
+    let (link, mut peer) = connect_with_heartbeat(Heartbeat {
+        interval: Duration::from_millis(60),
+        quiet: Duration::from_millis(200),
+        reply_timeout: Duration::from_millis(500),
+    });
+    // 600 ms 裡每 40 ms 送一個 pack 給 client：線一直是「最近有通訊」。
+    for _ in 0..15 {
+        peer.send(device_push(0x0100_0000_0000_0009, 0)).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), peer.end.source.receive())
+            .await
+            .is_err(),
+        "整段時間對面沒收到任何 Ping"
+    );
+    assert!(!link.is_closed());
+    // 安靜下來之後才跳。
+    let ping = peer.receive().await;
+    assert_eq!(ping.subtype, control::PING);
+}
+
+/// Ping 沒人回：這條線死了（shut_down），在等的人立刻收到 Network、理由說是心跳。
+#[tokio::test]
+async fn an_unanswered_heartbeat_closes_the_link_and_fails_the_waiters() {
+    let (link, mut peer) = connect_with_heartbeat(Heartbeat {
+        interval: Duration::from_millis(50),
+        quiet: Duration::from_millis(10),
+        reply_timeout: Duration::from_millis(100),
+    });
+    let mut subscription = link
+        .subscribe(pack(
+            Kind::Device,
+            device::SUBSCRIBE,
+            0,
+            0x0100_0000_0000_0001,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(peer.receive().await.subtype, device::SUBSCRIBE);
+    // 訂閱那一送算通訊；等它安靜下來，Ping 來了、不回。
+    let ping = peer.receive().await;
+    assert_eq!(ping.subtype, control::PING);
+    let outcome = subscription.next(Duration::from_secs(5)).await;
+    assert!(
+        matches!(outcome, Err(SdkError::Network(ref reason)) if reason.contains("heartbeat")),
+        "{outcome:?}"
+    );
+    assert!(link.is_closed());
+}

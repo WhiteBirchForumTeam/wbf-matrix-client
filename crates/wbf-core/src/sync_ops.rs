@@ -13,6 +13,7 @@ use wbf_sdk::{RecentPlan, Transport};
 
 use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
+use crate::link_pool::LinkRole;
 use crate::{Core, CoreEvent, Target};
 
 /// `watch` 要等多久、等到什麼為止。
@@ -161,7 +162,7 @@ impl Core {
         // 🚨 `Recent` 只有 wbf 講得出來（回應是一串 `Batch`，pack-pipeline §6）——
         // 走 `http` 或對方不是 wbf 的話，這個功能就是**關的**，而閘門會說出是哪一個理由。
         let mut client = self
-            .client_of(&account, transport, MethodHome::WbfSdkOnly)
+            .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         client.hello(client_name, &[]).await?;
         let cg_seq = match from_scratch {

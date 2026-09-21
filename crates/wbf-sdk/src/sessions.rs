@@ -24,7 +24,9 @@ pub enum SessionKey {
 }
 
 /// 這個 pack 走了哪條路。只給鉤子與 log 看，表自己不用它做決定。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 有 serde：它會跟著 `CoreEvent::Received` 變成 RPC 的推播（link-pool.md §4）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Route {
     Oneshot,
     Stream,

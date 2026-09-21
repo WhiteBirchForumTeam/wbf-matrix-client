@@ -277,7 +277,12 @@ impl Core {
         let vault = self.vault()?;
         match vault.unseal_session(&account.session_path())? {
             Some(session) => {
+                // 🚨 只有成與不成（維護者 2026-09-21）：不成就到此為止，什麼都不關、什麼都不刪。
                 logout(&session).await?;
+                // 成了：token 在 server 那邊已經沒了，這個帳號的五條線全關、釋放資源（link-pool.md §3）。
+                // `close_all` 等正在用線的命令做完才收那條；從這一刻起才開的線，hello 就被 server 拒（每個 message 重驗）。
+                // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed。
+                self.close_links(account, "logged out").await;
                 vault.delete_sealed_session(&account.session_path())?;
             }
             // 已經登出但目錄還在（上次清到一半、或 del 一個登出中的帳號）：本地照樣清乾淨。
@@ -290,6 +295,8 @@ impl Core {
         // ⚠️ 放在 match 之後：兩條分支（剛刪掉、本來就沒有）都是「現在沒有 session」。
         // 📎 這是兩個「session 被替換」的地方之一，另一個是 `log_in` 封新 session 那一行。
         self.forget_backend_probe(account);
+        // 已經登出但目錄還在那條分支：池照理說是空的（沒 session 開不了線），還是掃一次——消費端自己再問一次。
+        self.close_links(account, "logged out").await;
         account.delete_matrix_store()?;
         // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（§10.7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。

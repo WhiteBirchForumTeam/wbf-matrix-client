@@ -397,7 +397,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `unsubscribe` | `{ events: [string] }` | `{ subscribed: [string] }`（剩下的） |
 | `cancel` | `{ id: number }`——**要取消的那個請求的 `id`** | `{ ok: true, was_running: bool }`。被取消的請求自己收到 `105` |
 
-- 訂閱是**每條連線一份**，連線關了就沒了。
+- 訂閱是**每條連線一份**，連線關了就沒了。`user` 是這條連線的一個設定：後一次 `subscribe` 帶了就蓋掉前一次的，沒帶就不動。
+- **什麼都沒訂的連線連 `desync` 也不收**：它本來就收不到任何推播，漏了沒有東西可漏。
 - `cancel` 只對長工作有意義（`room.send_file`、`upload.file`、`media.save_to`、`sync.recent`）；
   對已經回完的 `id` → `was_running: false`，不是錯誤。
 
@@ -409,7 +410,10 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `room.message` | `{ user, room, message: Message }`（chat-model §2.2，含 `decrypted`／`undecryptable_reason`） | 這個帳號收到一則新訊息（sync 或 `Event/Push` 進來、解完密、寫進快取**之後**） |
 | `sync.state` | `{ user, state: "connected"\|"disconnected"\|"catching_up"\|"caught_up", cg_seq? }` | 跟 server 的連線狀態變了 |
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
-| `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事 |
+| `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事。⚠️ **這是連線層的訊號**：它只保證「這條連線漏了某些事件」，🚫 不保證漏掉的裡面有它訂的那些（daemon 不替每條訂閱各記一份 lag）；寧可多報一次重讀，🚫 不假裝沒漏。什麼都沒訂的連線不收它 |
+| `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
+| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }` | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用那條線才發 |
+| `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
 - 推播**要先 `subscribe`**（§4.6）。`progress` 例外：**發出長工作的那條連線自動收到自己請求的 `progress`**，不必訂——不然每個前端都要多寫一步。
 - 推播是「不用輪詢」，🚫 不是「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
@@ -565,8 +569,10 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | method | core | 底層 | 判定 |
 |---|---|---|---|
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
-| `subscribe`／`unsubscribe`／`cancel` | ❌（daemon 層） | — | ❌ |
-| `desync` 推播（§4） | ❌（daemon 層） | — | ❌ |
+| `subscribe`／`unsubscribe` | ✅ daemon 層（每條連線一份集合，`server.rs`） | 本機 | ✅ 2026-09-21（link-pool.md §6） |
+| `cancel` | ❌（daemon 層） | — | ❌ |
+| `desync` 推播（§4） | ✅ daemon 層（broadcast `Lagged` → `desync`） | 本機 | ✅ 2026-09-21 |
+| `link.state`／`pack.received` 推播（§4） | ✅ `CoreEvent::Link`／`Received`（連線池，link-pool.md） | **WS** 五條線 | ✅ 2026-09-21 |
 | **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`）＋回應回報用了哪一種 | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地 | 本機（`local`）／同下面那幾列 | ✅ |
 | `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
@@ -590,7 +596,8 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*`、`recovery.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP） | 🔁 而且金鑰的 to-device 收發要等 `0x16 Device`（to-device-client.md） |
 | `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
-| `sync.state`／`vault.state` 推播 | ❌ | — | ❌ |
+| `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發；`vault.state` ❌ | — | ❌ |
+| `progress`／`note`／`room.message` 推播 | ✅ daemon 層接上了（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ 2026-09-21 |
 
 📎 讀法：✅ 那幾列是 wbf-sdk 第 2 步的產物（上傳／下載／`recent`／ping），它們從一開始就是 WS。
 🔁 那些全部掛在 matrix-sdk 上，遷移的順序跟 architecture-v2 §6.1 四條線一致：房間（`Subscribe`／`Push`）→ 金鑰（`Device`）→ session（`Session/*`）。
