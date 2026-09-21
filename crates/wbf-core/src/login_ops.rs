@@ -1,12 +1,16 @@
-//! 登入：建 `local.key`（如果還沒有）、走 matrix-sdk 登入、封 session、切成 current。
+//! 登入：建 `local.key`（如果還沒有）、探活、登入（一般 Matrix 走 matrix-sdk 的 Client；wbf 走自己包的 HTTP `/login`，
+//! `m/` 只建 crypto store）、封 session、切成 current（account-session.md §3）。
 
 use serde::Serialize;
 
 use wbf_sdk::backend::matrix_sdk::MatrixBackend;
-use wbf_sdk::vault::{KeyMode, Vault};
+use wbf_sdk::crypto_engine::OlmEngine;
+use wbf_sdk::login::{Session, SessionBackend};
+use wbf_sdk::vault::{Key32, KeyMode, Vault};
 use wbf_sdk::Unlock;
 
 use crate::accounts::AccountDir;
+use crate::backend_choice::BackendKind;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::Core;
 
@@ -97,16 +101,27 @@ impl Core {
                 .progress("removing a matrix store left over from a previous device");
             account.delete_matrix_store()?;
         }
-        let (_backend, session) = MatrixBackend::login(
-            server,
-            user,
-            password,
-            device_name,
-            &account.matrix_store_dir(),
-            &vault.matrix_store_key(),
-            server_backup,
-        )
-        .await?;
+        // account-session.md §3：先探活（不帶 token），再決定走哪一邊。探不到當一般 Matrix（探活自己的規矩：只算這一次）。
+        let speaks_wbf = self.get_backend_kind_of_server(server).await == BackendKind::WbfSdk;
+        let session = if speaks_wbf {
+            // wbf：標準 HTTP `/login`（自己包的那支），🚫 不建 Client。之後房間、訊息、媒體、金鑰全走 WS（§2）。
+            let mut session =
+                wbf_sdk::login::login_with_password(server, user, password, device_name).await?;
+            session.backend = Some(SessionBackend::WbfSdk);
+            session
+        } else {
+            let (_backend, session) = MatrixBackend::login(
+                server,
+                user,
+                password,
+                device_name,
+                &account.matrix_store_dir(),
+                &vault.matrix_store_key(),
+                server_backup,
+            )
+            .await?;
+            session
+        };
         // ⚠️ server 回的 `user_id` 才是**權威**（大小寫、localpart 正規化可能跟打的不一樣）：
         // 目錄名對不上就搬過去。
         // 🚫 打字算出來的目錄上不該有池（池只從 `client_of` 建、鍵是有 session 的目錄，而下面的改名只在正規目錄不存在時發生），
@@ -114,6 +129,11 @@ impl Core {
         self.close_links(&account, "session replaced by a new login")
             .await;
         let account = self.move_to_canonical_dir(account, &dir_key, server, &session.user_id)?;
+        if speaks_wbf {
+            // 改完名才建：`m/` 要落在正規目錄（Client 那條路是登入前就建、跟著目錄一起搬）。
+            self.create_crypto_store_for(&account, &session, &vault.matrix_store_key())
+                .await?;
+        }
         vault.seal_session(&account.session_path(), &session)?;
         // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：換 session 不影響它，這裡不再忘掉探測結果。
         // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（link-pool.md §3；PR #53 審查 cirno 🟡1）。
@@ -126,6 +146,40 @@ impl Core {
             server: session.server,
             switched_from,
         })
+    }
+
+    /// wbf 帳號的 `m/`：**只有 crypto store**，由 `OlmEngine` 開（account-session.md §2；裝置身分金鑰在這一步生出來，
+    /// 上傳等 E2EE 那支）。這裡只要它建好，引擎本身丟掉；長活的引擎 E2EE 的 RPC 面再接。
+    ///
+    /// 🚨 建不起來就把剛拿到的 token 撤掉（best effort）再回錯：🚫 不留一個「登入了、但沒有金鑰庫」的帳號——
+    /// 那種帳號下一次碰到 E2EE 才發現，而那時已經有人把房間金鑰發給一台不存在的裝置。
+    async fn create_crypto_store_for(
+        &self,
+        account: &AccountDir,
+        session: &Session,
+        store_key: &Key32,
+    ) -> Result<(), CoreError> {
+        match OlmEngine::open(
+            &account.matrix_store_dir(),
+            store_key,
+            &session.user_id,
+            &session.device_id,
+        )
+        .await
+        {
+            Ok(_engine) => Ok(()),
+            Err(error) => {
+                let _ = wbf_sdk::login::logout(session).await;
+                let _ = account.delete_matrix_store();
+                Err(CoreError::new(
+                    CoreErrorKind::Io,
+                    format!(
+                        "logged in, but the crypto store could not be created in {}, so the new device was logged out again: {error}",
+                        account.matrix_store_dir().display()
+                    ),
+                ))
+            }
+        }
     }
 
     /// 目錄名是拿 `--user` 打的那串算的，但權威是 server 回的 mxid。對不上就搬。
@@ -169,6 +223,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// account-session.md §3：探到 wbf → 標準 HTTP `/login`、🚫 不建 Client、`m/` 只有 crypto store、session 記著 `WbfSdk`。
+    /// 探活對真 server 要 WS，這裡直接把探測結果記進註冊表；`/login` 由本機一個回 200 的迷你 HTTP 扮。
+    #[tokio::test]
+    async fn logging_in_to_a_wbf_server_builds_no_matrix_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..read]).to_string();
+            assert!(
+                head.starts_with("POST /_matrix/client/v3/login "),
+                "wbf 帳號的登入是標準 HTTP /login：{head}"
+            );
+            let body = r#"{"user_id":"@a:local","device_id":"DEVWBF","access_token":"syt_wbf"}"#;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let dir = scratch("wbf-login");
+        let core = Core::open(&dir);
+        core.create_vault(None).unwrap();
+        core.set_remembered_backend(&server, BackendKind::WbfSdk);
+
+        let result = core
+            .log_in(&server, "@a:local", "pw", "test device", true)
+            .await
+            .expect("login over the mini /login");
+        assert_eq!(result.device_id, "DEVWBF");
+
+        let account = AccountDir::locate(
+            &dir,
+            &core.vault().unwrap().account_dir_key(),
+            &server,
+            "@a:local",
+        )
+        .unwrap();
+        let session = core.session_of(&account).unwrap();
+        assert_eq!(session.backend, Some(SessionBackend::WbfSdk));
+        assert_eq!(session.store_dir, None, "沒有 Client 就沒有它的 store 目錄");
+        let store = account.matrix_store_dir();
+        assert!(
+            store.join("matrix-sdk-crypto.sqlite3").exists(),
+            "m/ 有 OlmEngine 開的 crypto store：{}",
+            store.display()
+        );
+        assert!(
+            !store.join("matrix-sdk-state.sqlite3").exists(),
+            "🚫 沒有 matrix-sdk Client 的 state store"
+        );
+        // 之後不再探：探測結果忘掉也還是 wbf（答案在 session 裡）。
+        core.forget_backend_probe(&server);
+        assert_eq!(
+            core.get_backend_kind(&account).await,
+            BackendKind::WbfSdk,
+            "wbf 帳號的 backend 登入時就定了，🚫 不靠每次重探"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

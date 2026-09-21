@@ -76,6 +76,13 @@ impl Core {
         target: &Target,
     ) -> Result<WatchSummary, CoreError> {
         let account = self.account_or_current(target)?;
+        // wbf 帳號沒有 /sync 的迴圈：新訊息走 daemon 的訂閱＋推播（第 6 階段）。明講，🚫 不裝成連不上。
+        if self.is_wbf_account(&account)? {
+            return Err(crate::handles::no_matrix_client_error(
+                &account,
+                "watch (new messages for wbf accounts arrive by the daemon's subscribe + room.message push)",
+            ));
+        }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
             .await?;

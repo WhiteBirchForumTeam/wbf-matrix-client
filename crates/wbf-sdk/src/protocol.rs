@@ -187,6 +187,22 @@ pub const BRIDGE_MEMBERS: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Room,
     subtype: 0x29,
 };
+/// `GET /_matrix/client/v3/joined_rooms`（bridge-specs `0x13-room.md` §0x28）：回 `{"joined_rooms": […]}`。沒有變數。
+pub const BRIDGE_JOINED_ROOMS: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Room,
+    subtype: 0x28,
+};
+/// `GET /_matrix/client/v3/rooms/{room_id}/state`（bridge-specs `0x14-event.md` §0x21）：回狀態事件的陣列。
+/// ⚠️ 超過 `wbf_data_max_bytes`（2 MiB）server 回 `TooLarge`，不切包。
+pub const BRIDGE_ROOM_STATE: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Event,
+    subtype: 0x21,
+};
+/// `GET /_matrix/client/v3/user/{user_id}/account_data/{event_type}`（bridge-specs `0x11-account.md` §0x25）：沒寫過是 404 `M_NOT_FOUND`。
+pub const BRIDGE_ACCOUNT_DATA: BridgedEndpoint = BridgedEndpoint {
+    kind: Kind::Account,
+    subtype: 0x25,
+};
 /// `PUT /_matrix/client/v3/sendToDevice/{event_type}/{txn_id}`（bridge-specs `0x16-device.md` §0x25）：**發** to-device。
 /// `txn_id` 是冪等鍵：重試用同一個，新的一則換一個。
 pub const BRIDGE_SEND_TO_DEVICE: BridgedEndpoint = BridgedEndpoint {
@@ -230,6 +246,19 @@ pub struct MembersVariables<'a> {
     /// `join`／`invite`／`leave`／`ban`／`knock`；None ＝ 照 Matrix 預設回所有成員事件
     #[serde(skip_serializing_if = "Option::is_none")]
     pub membership: Option<&'a str>,
+}
+
+/// 只有 `room_id` 的端點（`GetState`）的變數。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RoomIdVariables<'a> {
+    pub room_id: &'a str,
+}
+
+/// `GetAccountData` 的變數（兩個都是 path 變數）。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountDataVariables<'a> {
+    pub user_id: &'a str,
+    pub event_type: &'a str,
 }
 
 /// `SendToDevice` 的變數（兩個都是 path 變數，缺了 server 回 `InvalidRequest`）。
@@ -683,6 +712,20 @@ pub struct SendRequest {
     /// None ＝ 不帶：沒宣告 `DEVICE_VERSIONS_FEATURE` 的連線不檢查；宣告過的連線送加密訊息不帶會被 `InvalidRequest` 拒。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_version: Option<u64>,
+}
+
+/// 一個新的 `txn_id`（128 位元的隨機十六進位）。
+/// 🚨 server 的 WS `Send` 把 txn 去重鍵在**帳號**、不分裝置（wbfuwunel #78）：重用會拿到舊的 event_id 而不是送出一則新的，
+/// 所以要跨裝置、跨重開都不撞——不能用計數器或時間戳。重試同一則才重用同一個。
+///
+/// Return:
+///     Ok(String)   example: "wbf-3f9a…"（32 個十六進位字）
+///     Err(Io)      csprng 拿不到
+pub fn new_txn_id() -> Result<String, SdkError> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| SdkError::Io(std::io::Error::other(format!("csprng: {error}"))))?;
+    Ok(format!("wbf-{}", hex::encode(bytes)))
 }
 
 /// Args:

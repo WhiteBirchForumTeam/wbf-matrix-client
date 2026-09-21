@@ -182,10 +182,16 @@ impl crate::Core {
 
     /// 同上，server 從帳號的 session 拿。沒登入的帳號沒有 server 可問 → `MatrixSdk`（fail safe，🚫 不探、不記）。
     ///
+    /// 📌 登入時就走了 wbf 那條的帳號（`Session::backend == WbfSdk`，account-session.md §2）**不再探**：答案登入時就定了，
+    /// 而 server 暫時不通時把它探成「一般 Matrix」，會讓池那條路回「你接錯線了」而不是 `Network`——錯的那個訊息。
+    ///
     /// Args:
     ///     account: 哪個帳號
     pub async fn get_backend_kind(&self, account: &crate::accounts::AccountDir) -> BackendKind {
         match self.session_of(account) {
+            Ok(session) if session.backend == Some(wbf_sdk::login::SessionBackend::WbfSdk) => {
+                BackendKind::WbfSdk
+            }
             Ok(session) => self.get_backend_kind_of_server(&session.server).await,
             Err(_) => BackendKind::MatrixSdk,
         }
@@ -550,6 +556,7 @@ mod tests {
                     device_id: "DEV".to_string(),
                     access_token: "syt_about_to_be_revoked".to_string(),
                     store_dir: None,
+                    backend: None,
                 },
             )
             .unwrap();
@@ -572,6 +579,7 @@ mod tests {
                     device_id: "DEV2".to_string(),
                     access_token: "syt_new".to_string(),
                     store_dir: None,
+                    backend: None,
                 },
             )
             .unwrap();
@@ -594,6 +602,7 @@ mod tests {
                     device_id: "DEV".to_string(),
                     access_token: "syt_nobody_is_listening".to_string(),
                     store_dir: None,
+                    backend: None,
                 },
             )
             .unwrap();

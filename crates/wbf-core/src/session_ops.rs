@@ -340,6 +340,25 @@ impl Core {
             // 已經登出的帳號沒有 session 可以問 server，也沒有 token 要失效；只是清本地殘留。
             return Ok(());
         }
+        if self.is_wbf_account(account)? {
+            // wbf 帳號沒有 Client，問不到「server 那份救得回來嗎」（備份還沒搬到橋上；account-session.md §6）：
+            // 第 1 關問不出來就當沒過（fail closed），只剩第 2 關——這台機器保管著 recovery key 才放行。
+            let Some(session) = self.vault()?.unseal_session(&account.session_path())? else {
+                return Err(refusal(
+                    account,
+                    "its session could not be opened, so it is unknown which account this is",
+                ));
+            };
+            if recovery::find(&self.data_dir, self.vault()?, &session.user_id)?.is_some() {
+                return Ok(());
+            }
+            return Err(refusal(
+                account,
+                "it is on a wbf server, where the server-side backup cannot be checked yet (wbf accounts have no\n       \
+                 matrix-sdk client; account-session.md §6), and this machine is not keeping its recovery key.\n       \
+                 Pass accept_history_loss to log out anyway",
+            ));
+        }
         let Some(backend) = self.find_backend_of(account, server_backup).await else {
             return Err(refusal(
                 account,

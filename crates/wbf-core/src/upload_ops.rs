@@ -82,6 +82,33 @@ impl Core {
         target: &Target,
     ) -> Result<SendFileResult, CoreError> {
         let account = self.account_or_current(target)?;
+        if self.is_wbf_account(&account)? {
+            // wbf 帳號：事件走 `Event/Send`，附件在 meta 裡宣告（約定 §5.2 終於成立）。加密房在**上傳之前**就拒，不白傳。
+            self.wbf_refuse_if_encrypted(&account, room).await?;
+            let manifest = self
+                .upload_with_account(&account, request, transport)
+                .await?;
+            let attachment = Attachment {
+                mxc: manifest.mxc.clone(),
+                block: manifest.block.clone(),
+            };
+            let content = wbf_sdk::event_json::file_message_content(&attachment, caption)?;
+            let event_id = self
+                .wbf_send_event(
+                    &account,
+                    room,
+                    "m.room.message",
+                    content,
+                    vec![manifest.mxc.clone()],
+                )
+                .await?;
+            return Ok(SendFileResult {
+                event_id,
+                mxc: manifest.mxc.clone(),
+                manifest,
+                attachment_declared: true,
+            });
+        }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
             .await?;

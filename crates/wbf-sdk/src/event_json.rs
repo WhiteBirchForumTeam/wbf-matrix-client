@@ -12,6 +12,42 @@ use crate::protocol::event_seqs;
 pub const FILE_MSGTYPE: &str = "org.wbftw.wbfuwunel.file";
 pub const CHUNKED_BLOCK_KEY: &str = "org.wbftw.wbfuwunel.chunked";
 
+/// 約定 §5 的檔案事件 content（`m.room.message`，msgtype 是 [`FILE_MSGTYPE`]）。
+/// matrix-sdk 那條路（`Room::send`）與 wbf 那條路（`Event/Send`）共用這一份，送出去的事件才不會漂。
+///
+/// Args:
+///     attachment: example: &Attachment { mxc: "mxc://localhost/1122334455667788".into(), block: <約定 §5 的區塊> }
+///     caption: example: Some("看這個")
+/// Return:
+///     Ok(Value)     `{"msgtype": FILE_MSGTYPE, "body": "<caption>\n<name>（WBF 分塊檔，需要 WBF client 才能開）", "url": mxc, CHUNKED_BLOCK_KEY: block, "caption"?: caption}`
+///     Err(Usage)    區塊不能進事件（`ChunkedBlock::check_as_event_block`）
+pub fn file_message_content(
+    attachment: &Attachment,
+    caption: Option<&str>,
+) -> Result<serde_json::Value, crate::error::SdkError> {
+    attachment.block.check_as_event_block()?;
+    let name = attachment
+        .block
+        .name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "file".to_string());
+    let body = match caption {
+        Some(caption) => format!("{caption}\n{name}（WBF 分塊檔，需要 WBF client 才能開）"),
+        None => format!("{name}（WBF 分塊檔，需要 WBF client 才能開）"),
+    };
+    let mut content = serde_json::json!({
+        "msgtype": FILE_MSGTYPE,
+        "body": body,
+        "url": attachment.mxc,
+        CHUNKED_BLOCK_KEY: attachment.block,
+    });
+    if let Some(caption) = caption {
+        content["caption"] = serde_json::Value::String(caption.to_string());
+    }
+    Ok(content)
+}
+
 /// 一頁事件 JSON → `Message` 陣列，關係事件折進目標（`aggregate`）。給沒有 `TimelineEvent` 的呼叫者與測試用；
 /// `decrypted` 一律 None（解密狀態只有 matrix-sdk 的 `TimelineEvent` 知道）。
 ///
@@ -358,4 +394,69 @@ pub(crate) fn aggregate(
         .filter(|(_, consumed)| !consumed)
         .map(|(message, _)| message)
         .collect()
+}
+
+#[cfg(test)]
+mod file_message_content_tests {
+    use super::*;
+    use crate::chunk_block::ChunkedBlock;
+    use crate::Cipher;
+
+    fn plain_block(name: Option<&str>) -> ChunkedBlock {
+        ChunkedBlock {
+            v: 1,
+            cipher: Cipher::None,
+            key: None,
+            nonce_base: None,
+            chunk_size: 16,
+            file_size: Some(3),
+            name: name.map(str::to_string),
+            mimetype: None,
+            sha256: None,
+        }
+    }
+
+    /// Client 那條（`Room::send`）與 wbf 那條（`Event/Send`）送的是同一份 content：這裡釘它的形狀。
+    #[test]
+    fn file_message_content_carries_url_block_body_and_optional_caption() {
+        let attachment = Attachment {
+            mxc: "mxc://localhost/1122334455667788".into(),
+            block: plain_block(Some("notes.txt")),
+        };
+        let content = file_message_content(&attachment, Some("看這個")).unwrap();
+        assert_eq!(content["msgtype"], FILE_MSGTYPE);
+        assert_eq!(content["url"], "mxc://localhost/1122334455667788");
+        assert_eq!(content["caption"], "看這個");
+        assert_eq!(
+            content["body"],
+            "看這個\nnotes.txt（WBF 分塊檔，需要 WBF client 才能開）"
+        );
+        assert_eq!(content[CHUNKED_BLOCK_KEY]["cipher"], "none");
+        assert_eq!(content[CHUNKED_BLOCK_KEY]["file_size"], 3);
+        // 沒 caption 就沒有那個欄位；沒名字用 "file"。
+        let content = file_message_content(
+            &Attachment {
+                mxc: "mxc://localhost/1".into(),
+                block: plain_block(None),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(content.get("caption").is_none());
+        assert_eq!(
+            content["body"],
+            "file（WBF 分塊檔，需要 WBF client 才能開）"
+        );
+        // 進不了事件的區塊（明文模式帶 key）→ Usage，🚫 不送出去。
+        let mut bad = plain_block(None);
+        bad.key = Some([7u8; 32]);
+        assert!(file_message_content(
+            &Attachment {
+                mxc: "mxc://localhost/1".into(),
+                block: bad,
+            },
+            None,
+        )
+        .is_err());
+    }
 }

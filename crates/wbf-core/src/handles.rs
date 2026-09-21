@@ -10,7 +10,7 @@
 use crate::error::{CoreError, CoreErrorKind};
 use wbf_sdk::backend::matrix_sdk::MatrixBackend;
 use wbf_sdk::cache::{Cache, CacheIdentity, OpenOutcome};
-use wbf_sdk::login::Session;
+use wbf_sdk::login::{Session, SessionBackend};
 use wbf_sdk::media_pool::MediaPool;
 
 use crate::accounts::AccountDir;
@@ -53,6 +53,10 @@ impl Core {
         server_backup: bool,
     ) -> Result<MatrixBackend, CoreError> {
         let session = self.session_of(account)?;
+        // wbf 帳號沒有 Client（account-session.md §2）：要用它的呼叫點就是還沒搬到 WS 上的那幾支，明講、🚫 不靜默失效。
+        if session.backend == Some(SessionBackend::WbfSdk) {
+            return Err(no_matrix_client_error(account, "this call"));
+        }
         if session.store_dir.is_none() {
             return Err(CoreError::new(
                 CoreErrorKind::NotLoggedIn,
@@ -66,6 +70,16 @@ impl Core {
             server_backup,
         )
         .await?)
+    }
+
+    /// 這個帳號是不是登入時就走了 wbf 那條（沒有 matrix-sdk 的 Client；account-session.md §2）。
+    ///
+    /// Return:
+    ///     Ok(true)      `Session::backend == WbfSdk`
+    ///     Ok(false)     一般 Matrix，或舊版／token 接的 session（這兩種照舊走 Client）
+    ///     Err(NotLoggedIn)
+    pub(crate) fn is_wbf_account(&self, account: &AccountDir) -> Result<bool, CoreError> {
+        Ok(self.session_of(account)?.backend == Some(SessionBackend::WbfSdk))
     }
 
     /// 這個帳號所屬 server 的 `cache.db`（local-cache-db.md §6，同 server 的帳號共用）。
@@ -274,6 +288,26 @@ pub(crate) fn get_raw_cache_opens_for(server_dir: &std::path::Path) -> usize {
         .get(server_dir)
         .copied()
         .unwrap_or(0)
+}
+
+/// wbf 帳號不建 matrix-sdk 的 Client（account-session.md §2），所以還掛在 Client 上的那幾支對它是**關的**——
+/// 講清楚是哪一支、為什麼、去哪看清單（§6），🚫 不靜默失效、不裝成「連不上」。
+///
+/// Args:
+///     account: 哪個帳號
+///     what: 這次要做的事, example: "watch"
+/// Return:
+///     CoreError   `Usage`
+pub(crate) fn no_matrix_client_error(account: &AccountDir, what: &str) -> CoreError {
+    CoreError::new(
+        CoreErrorKind::Usage,
+        format!(
+            "{what} is not available for {}: it is on a wbf server, and wbf accounts do not build the \
+             matrix-sdk client (backup, recovery, watch and /context still need it; account-session.md §6 lists \
+             what runs over the wbf protocol)",
+            account.label()
+        ),
+    )
 }
 
 #[cfg(test)]

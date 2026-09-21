@@ -178,6 +178,17 @@ impl SdkError {
             .is_some_and(|value| value.as_bool() == Some(true))
     }
 
+    /// 走橋的回覆是不是 Matrix 的 404（bridge-specs index.md §1.2：meta 帶 `status`）。
+    /// 🚨 **只認整數 `404`**：字串 `"404"`、`errcode` 像 `M_NOT_FOUND` 但 `status` 不是 404 的都不算——
+    /// 錯判成「沒有」會把一個真的錯誤（被拒、壞掉）當成空值吞掉。
+    ///
+    /// Return:
+    ///     bool  true ＝ `Server` 而且 meta 的 `status` 是整數 404
+    pub fn is_not_found(&self) -> bool {
+        self.server_meta_field("status")
+            .is_some_and(|status| status.as_u64() == Some(404))
+    }
+
     fn server_meta_field(&self, key: &str) -> Option<&serde_json::Value> {
         match self {
             SdkError::Server { meta, .. } => meta.get(key),

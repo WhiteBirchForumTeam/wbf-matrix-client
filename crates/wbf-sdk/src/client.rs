@@ -237,6 +237,92 @@ impl<C: PackChannel> WbfClient<C> {
         RoomDeviceVersions::from_members_body(&reply.json("Members")?)
     }
 
+    /// 我加入了哪些房間（走橋的 `GET /joined_rooms`）。
+    ///
+    /// Return:
+    ///     Ok(Vec<String>)  room_id；一個都沒有就是空的
+    ///     Err(Protocol)    body 不是 `{"joined_rooms": [字串…]}`
+    pub async fn joined_rooms(&mut self) -> Result<Vec<String>, SdkError> {
+        let reply = self
+            .call_bridge(
+                protocol::BRIDGE_JOINED_ROOMS,
+                &protocol::NoVariables {},
+                Vec::new(),
+            )
+            .await?;
+        let body = reply.json("JoinedRooms")?;
+        let rooms = body
+            .get("joined_rooms")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                SdkError::Protocol("JoinedRooms body has no joined_rooms array".into())
+            })?;
+        rooms
+            .iter()
+            .map(|room| {
+                room.as_str().map(str::to_string).ok_or_else(|| {
+                    SdkError::Protocol(format!("JoinedRooms entry is not a string: {room}"))
+                })
+            })
+            .collect()
+    }
+
+    /// 一個房間目前的全部狀態事件（走橋的 `GET /rooms/{room_id}/state`）。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    /// Return:
+    ///     Ok(Vec<Value>)   狀態事件，照 server 給的順序
+    ///     Err(Server)      不在房裡也看不到（`Forbidden`）；狀態超過 2 MiB（`TooLarge`）
+    ///     Err(Protocol)    body 不是陣列
+    pub async fn room_state(&mut self, room_id: &str) -> Result<Vec<serde_json::Value>, SdkError> {
+        let reply = self
+            .call_bridge(
+                protocol::BRIDGE_ROOM_STATE,
+                &protocol::RoomIdVariables { room_id },
+                Vec::new(),
+            )
+            .await?;
+        match reply.json("GetState")? {
+            serde_json::Value::Array(events) => Ok(events),
+            other => Err(SdkError::Protocol(format!(
+                "GetState body is not an array: {}",
+                other.to_string().chars().take(80).collect::<String>()
+            ))),
+        }
+    }
+
+    /// 帳號層的 account data（走橋的 `GET /user/{user_id}/account_data/{event_type}`）。
+    ///
+    /// Args:
+    ///     user_id: 自己, example: "@alice:localhost"
+    ///     event_type: example: "m.direct"
+    /// Return:
+    ///     Ok(Some(Value))  當初寫進去的內容
+    ///     Ok(None)         沒寫過（404 `M_NOT_FOUND`）
+    ///     Err(Server)      讀別人的（`Forbidden`）等
+    pub async fn account_data(
+        &mut self,
+        user_id: &str,
+        event_type: &str,
+    ) -> Result<Option<serde_json::Value>, SdkError> {
+        let reply = self
+            .call_bridge(
+                protocol::BRIDGE_ACCOUNT_DATA,
+                &protocol::AccountDataVariables {
+                    user_id,
+                    event_type,
+                },
+                Vec::new(),
+            )
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.json("GetAccountData")?)),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// **發** to-device（走橋的 `PUT /sendToDevice/{event_type}/{txn_id}`）：房間金鑰、金鑰請求、驗證。
     /// 對方裝置的持有連線立刻收到原生的 `Device/Push`；沒連線就留在佇列。
     ///

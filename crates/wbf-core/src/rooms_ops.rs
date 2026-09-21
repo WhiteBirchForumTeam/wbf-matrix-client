@@ -98,10 +98,15 @@ impl Core {
             let rows = cache.read().await.list_conversations(&me)?;
             return Ok(rows);
         }
-        let backend = self
-            .synced_backend_of(&account, target.server_backup)
-            .await?;
-        let conversations = backend.conversations().await?;
+        // wbf 帳號沒有 Client：走橋（`wbf_rooms.rs`）。兩條路回的 `Conversation` 同一套規則（room_state.rs 的測試釘著）。
+        let conversations = if self.is_wbf_account(&account)? {
+            self.wbf_conversations(&account).await?
+        } else {
+            self.synced_backend_of(&account, target.server_backup)
+                .await?
+                .conversations()
+                .await?
+        };
         if sync == SyncMode::Server {
             // 🚫 看一眼不寫庫。
             return Ok(conversations);
@@ -150,6 +155,9 @@ impl Core {
                 CoreError::new(CoreErrorKind::NoSuchAccount, format!("{room}: {why}"))
             });
         }
+        if self.is_wbf_account(&account)? {
+            return self.wbf_conversation(&account, room).await;
+        }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
             .await?;
@@ -164,6 +172,10 @@ impl Core {
         target: &Target,
     ) -> Result<String, CoreError> {
         let account = self.account_or_current(target)?;
+        if self.is_wbf_account(&account)? {
+            // 明文走 `Event/Send`；加密房被拒（wbf_rooms.rs）。
+            return self.wbf_send_text(&account, room, body).await;
+        }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
             .await?;
@@ -349,7 +361,15 @@ impl Core {
                 }
                 // ⚠️ wbf 要的是 `g_seq`，而它只在本地有。那則不在本地（`sync=server` 不寫庫，
                 // 所以它給的 `next` 本地查不到）→ 改走 `/context`：它只要 `event_id`。
-                Anchor::NotInLocalCache => {}
+                // wbf 帳號沒有 Client 可以走 `/context`：明講拒絕，等 wbfuwunel #64 的 `before_event_id`（account-session.md §6）。
+                Anchor::NotInLocalCache => {
+                    if self.is_wbf_account(account)? {
+                        return Err(crate::handles::no_matrix_client_error(
+                            account,
+                            "paging back from an event that is not in the local cache (it would need /context; use sync=both so the anchor is cached, or wait for wbfuwunel #64)",
+                        ));
+                    }
+                }
             }
         }
         let backend = self.synced_backend_of(account, server_backup).await?;
@@ -591,6 +611,7 @@ mod tests {
                     device_id: "DEV".to_string(),
                     access_token: "syt_nobody_is_listening".to_string(),
                     store_dir: None,
+                    backend: None,
                 },
             )
             .unwrap();
