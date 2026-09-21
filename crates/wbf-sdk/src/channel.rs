@@ -1,19 +1,18 @@
-//! 一個 pack 進、一個 pack 出的通道（線上規格 §1）：WebSocket 主要、HTTP 給測試與腳本。
+//! 通道（線上規格 §1）：WebSocket 主要、HTTP 給測試與腳本。
 //!
-//! 兩者都是「送一個、等一個」；連發與滑動窗口不在 v1（本機 64 KiB 一塊來回夠快，先求對）。
-//! 唯一的例外是 `request_stream`：`Event/Recent` 的回應是一串 `Batch`（pack-pipeline §6），送一個、收到呼叫者說停。
+//! `PackChannel` 的契約是「送一個、等一個」與「送一個、收到呼叫者說停」（`request_stream`：`Event/Recent` 的回應是一串 `Batch`）。
+//! WebSocket 底下是 `link::WsLink`（ws-receive-dispatch.md）：送與收是兩個 task，回覆依會話表交付，所以推播與回覆交錯、順序亂掉都不出事；
+//! 長活的訂閱走 `subscribe`。HTTP 一請求一回應，不能訂閱。
 
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use http::header::AUTHORIZATION;
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use wbf_wire::Pack;
 
 use crate::error::SdkError;
+use crate::link::{Subscription, WsLink};
+use crate::sessions::ReceivedHook;
 
 /// 一個請求從送出到收到回應的上限。與 server 的 `wbf_ws_idle_timeout` 預設相同：對方黑洞了就回 `Network`，
 /// 不讓 client 永遠掛著。
@@ -39,6 +38,20 @@ pub trait PackChannel {
         per_pack_timeout: Duration,
         on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError>;
+
+    /// 訂閱：長活的會話，之後抄這個 id 的每個 pack（`Ack`、`CryptoState`、`Push`、`Superseded`）都從 handle 來（ws-receive-dispatch.md §3）。
+    /// 預設回 `Usage`：只有 WebSocket 通道能收推播。
+    ///
+    /// Return:
+    ///     Ok(Subscription)
+    ///     Err(Usage)        這種通道不能長活收、或 pack 的 id 是 0
+    ///     Err(Network)      送不出去
+    async fn subscribe(&mut self, pack: Pack) -> Result<Subscription, SdkError> {
+        let _ = pack;
+        Err(SdkError::Usage(
+            "this channel cannot hold a subscription; use the WebSocket channel".into(),
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +107,18 @@ impl Channel {
     }
 }
 
+impl Channel {
+    /// Return:
+    ///     Some(n)   WebSocket：這條連線至今收到幾個沒人等的 pack（ws-receive-dispatch.md §2.1 第 4 條）
+    ///     None      HTTP：沒有這個數（一請求一回應）
+    pub fn unmatched(&self) -> Option<u64> {
+        match self {
+            Channel::WebSocket(channel) => Some(channel.link().unmatched()),
+            Channel::Http(_) => None,
+        }
+    }
+}
+
 impl PackChannel for Channel {
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
         match self {
@@ -121,17 +146,32 @@ impl PackChannel for Channel {
             }
         }
     }
+
+    async fn subscribe(&mut self, pack: Pack) -> Result<Subscription, SdkError> {
+        match self {
+            Channel::WebSocket(channel) => channel.subscribe(pack).await,
+            Channel::Http(channel) => channel.subscribe(pack).await,
+        }
+    }
 }
 
-/// `GET /_wbf/v1/ws`，一個 binary message 一個 pack。
+/// `GET /_wbf/v1/ws`：一條 `WsLink`（讀取 task ＋ 送出 task ＋ 會話表，ws-receive-dispatch.md）。
+/// `PackChannel` 的兩個方法在它上面是「登記 → 送 → 等」；推播與 `Superseded` 走 `subscribe`。
 pub struct WsChannel {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    /// 丟在地上的推播數（見 [`WsChannel::receive_pack`]）。只給診斷；第 4 階段的接收迴圈做好就沒有這個數。
-    dropped_pushes: u64,
+    link: WsLink,
 }
 
 impl WsChannel {
     pub async fn connect(server: &str, access_token: &str) -> Result<WsChannel, SdkError> {
+        WsChannel::connect_with_hook(server, access_token, crate::sessions::no_hook()).await
+    }
+
+    /// 同上，每收一個 pack 叫一次 `hook`（ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。
+    pub async fn connect_with_hook(
+        server: &str,
+        access_token: &str,
+        hook: ReceivedHook,
+    ) -> Result<WsChannel, SdkError> {
         let url = ws_url(server)?;
         let mut request = url
             .as_str()
@@ -158,79 +198,21 @@ impl WsChannel {
                     }
                     other => SdkError::Network(format!("websocket connect {url}: {other}")),
                 })?;
+        let (source, sink) = crate::transport::split_socket(socket);
         Ok(WsChannel {
-            socket,
-            dropped_pushes: 0,
+            link: WsLink::start(source, sink, hook),
         })
     }
 
-    /// Return:
-    ///     u64  這條連線至今丟掉幾個不是回覆的推播（`Device/Push`、`CryptoState`、`Event/Push`、`DeviceChanged`）
-    pub fn dropped_pushes(&self) -> u64 {
-        self.dropped_pushes
-    }
-}
-
-impl WsChannel {
-    async fn send_pack(&mut self, pack: Pack) -> Result<(), SdkError> {
-        let bytes = pack.encode()?;
-        tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            self.socket.send(Message::Binary(bytes.into())),
-        )
-        .await
-        .map_err(|_| SdkError::Network("websocket send timed out".into()))?
-        .map_err(|error| SdkError::Network(format!("websocket send: {error}")))
-    }
-
-    /// 等下一個 binary message；ping／pong／文字 frame 跳過。
-    ///
-    /// ⚠️ **推播暫時丟在地上**（到 daemon-runtime 第 4 階段的接收迴圈做好為止）：訂閱之後 server 隨時會推 `Device/Push`、
-    /// `CryptoState`（別人 claim 了我一把 OTK 就推）、`Event/Push`、`DeviceChanged`，而這條通道只有「送一個、等回覆」。
-    /// 推播的 `id` 永遠是**訂閱的 id**，回覆的 `id` 是**這次請求的 id**：推播型的 subtype 而且 id 不是這次請求的，就不是回覆，
-    /// 跳過並計數。丟掉無害：佇列裡的東西下次 `Fetch` 還在，`CryptoState` 下次 `Subscribe` 會再給，`DeviceChanged` 只是加速（正確性由 1506 守）。
-    /// `Subscribe` 自己那則 `CryptoState` id 相同，照收。🚫 不是推播型的 pack 一律交上去，id 對不對由呼叫端判（fail closed 照舊）。
-    async fn receive_pack(
-        &mut self,
-        timeout: Duration,
-        in_flight_id: u64,
-    ) -> Result<Pack, SdkError> {
-        loop {
-            let message = tokio::time::timeout(timeout, self.socket.next())
-                .await
-                .map_err(|_| SdkError::Network("websocket response timed out".into()))?
-                .ok_or_else(|| {
-                    SdkError::Network("websocket closed before a response arrived".into())
-                })?
-                .map_err(|error| SdkError::Network(format!("websocket receive: {error}")))?;
-            match message {
-                Message::Binary(bytes) => {
-                    let pack = Pack::decode(&bytes)?;
-                    if pack.id != in_flight_id && crate::protocol::is_unsolicited_push(&pack) {
-                        self.dropped_pushes = self.dropped_pushes.saturating_add(1);
-                        continue;
-                    }
-                    return Ok(pack);
-                }
-                Message::Close(frame) => {
-                    return Err(SdkError::Network(format!(
-                        "websocket closed by server: {frame:?}"
-                    )));
-                }
-                // ping／pong 由 tungstenite 自動回；文字 frame 不在協議裡，跳過等下一個。
-                Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
-                    continue
-                }
-            }
-        }
+    /// 底下那條連線：診斷（`unmatched`、`is_closed`）與需要 `AckPolicy` 的呼叫點用。
+    pub fn link(&self) -> &WsLink {
+        &self.link
     }
 }
 
 impl PackChannel for WsChannel {
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
-        let in_flight_id = pack.id;
-        self.send_pack(pack).await?;
-        self.receive_pack(REQUEST_TIMEOUT, in_flight_id).await
+        self.link.request(pack, REQUEST_TIMEOUT).await
     }
 
     async fn request_stream(
@@ -239,14 +221,26 @@ impl PackChannel for WsChannel {
         per_pack_timeout: Duration,
         on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError> {
-        let in_flight_id = pack.id;
-        self.send_pack(pack).await?;
+        let mut stream = self.link.open_stream(pack).await?;
         loop {
-            let response = self.receive_pack(per_pack_timeout, in_flight_id).await?;
-            if !on_pack(response)? {
-                return Ok(());
+            match stream.next(per_pack_timeout).await? {
+                Some(response) => {
+                    if !on_pack(response)? {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    return Err(SdkError::Protocol(format!(
+                        "session {:?} ended before the caller was done with it",
+                        stream.key()
+                    )))
+                }
             }
         }
+    }
+
+    async fn subscribe(&mut self, pack: Pack) -> Result<Subscription, SdkError> {
+        self.link.subscribe(pack).await
     }
 }
 

@@ -22,7 +22,10 @@ PR #1–#34 全部合併。
 `encrypt_and_send` 帶 `room_version`、1506 是結果不是錯、`decrypt_room_event`）。**#45 的驗收對真 server 走通**：Bob 登新裝置 → Alice 帶舊號碼送被 1506 擋 →
 refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → 兩台都解得開。分工定案（e2ee-walkthrough §16.6）：**訊息是 UI 的，金鑰是 daemon 的**。
 
-**還沒有：UI、推播／訂閱的接收迴圈（第 4 階段，維護者 2026-09-21 定了形狀，見 §7）、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
+**第 4 階段的 SDK 那半（2026-09-21）**：`WsChannel` 底下換成 `link::WsLink`——讀取 task ＋ 送出 task ＋ 會話表（`design/ws-receive-dispatch.md`）。每個收到的 pack 依 id 交給在等的會話，
+推播進訂閱的 handle（`WbfClient::device_subscription`），`Superseded` 進訂閱當終點，順序亂掉不出事；「丟推播」那段拿掉了。每個收到的 pack 都經過一個鉤子（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI。
+
+**還沒有：UI、daemon 那半的推播（封裝、`desync`、推來就叫 refresh；接在鉤子後面）、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -67,8 +70,13 @@ crates/wbf-sdk/src/
                          `compute_device_keys_hash`（照 server §3.4 重算，黃金向量 810b7c3be4；🚨 user_id 用 get 逐層查、不拼 JSON Pointer）。沒網路
   to_device_state.rs     to-device 的 `cd_seq` 與待銷毀清單 → `m/td.json`（原子寫；壞檔是錯不是從頭；Ack 不清清單，只清 ItemsDestroyed 回來的）
   protocol.rs            還有：橋（`BridgedEndpoint`、`bridge_request`／`expect_bridge_reply`，號碼只抄用得到的）、`0x16 Device` 的原生 pack（Fetch／Batch／Subscribe／
-                         ItemsDestroy／ItemsDestroyed／CryptoState）、`is_unsolicited_push`（⚠️ 第 4 階段要拿掉的暫時措施）
-  channel.rs             ⚠️ `WsChannel::receive_pack` 目前把「推播型且 id 不是這次請求的」丟掉並計數（`dropped_pushes`）——維護者 2026-09-21 定這是設計錯的，第 4 階段整段換掉（§7）
+                         ItemsDestroy／ItemsDestroyed／CryptoState）
+  channel.rs             `PackChannel`（request／request_stream／`subscribe`，後者預設回 Usage）、`Channel` enum、`HttpChannel`；`WsChannel` 是 `WsLink` 的薄殼（`connect_with_hook` 帶鉤子）
+  transport.rs           bytes 進出：`FrameSource`／`FrameSink`，tungstenite 一組、`memory_pair` 一組（測試餵亂序用）。不知道什麽是 pack
+  sessions.rs            **會話表**（ws-receive-dispatch.md §2–§4）：`SessionKey::{Session(id), Reply{id,seq}}` → `PackSink`；四條分派規則（活會話擁有它的 id → 精確 (id,seq) → Create 例外 → 無主計數）；
+                         三種 sink（單發／串流 256 滿了失敗／訂閱 64 滿了丟標 gap）；`ReceivedHook` 每個 pack 都經過（含無主），這層只呼叫不判斷。純資料結構，單元測試在同檔
+  link.rs                `WsLink`：讀取 task（收→decode→dispatch；連續 8 個壞 frame 就關）＋送出 task（有界佇列 16，單一 task 寫 sink 保序）＋表；`request`／`request_with_policy(AckPolicy)`（預設不重送）／
+                         `open_stream`／`subscribe`；關線 `fail_all`，每一項收到 Network。🚫 不重連
 crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
   lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
   error.rs               `CoreError { kind, message }`、`CoreErrorKind`、`rpc_code()`（rpc-spec §5.2 的號碼）
@@ -129,7 +137,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 3. 註冊測試帳號：`POST /_matrix/client/v3/register` 帶 `auth.type = m.login.registration_token`。
 4b. **E2EE 引擎的驗收**（#48／#49，要 feature `matrix`、兩個帳號、一定 `--test-threads=1`）：
     `WBF_E2E_SERVER=... WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=... WBF_E2E_USER_B=bob WBF_E2E_PASSWORD_B_FILE=... cargo test -p wbf-sdk --features matrix --test e2e_crypto_engine -- --ignored --test-threads=1`。
-    兩條：同帳號兩台裝置房間金鑰只靠 WS 從 A 到 B；#45 驗收（Bob 登新裝置 → 1506 → refresh → 重送 → 兩台解得開）。並行跑會互相分到對方的房間金鑰。
+    三條：同帳號兩台裝置房間金鑰只靠 WS 從 A 到 B；#45 驗收（Bob 登新裝置 → 1506 → refresh → 重送 → 兩台解得開）；
+    第 4 階段的（B 長活訂閱 → A 分房間金鑰 → `CryptoState` 與 `Push` 都進 B 的 handle → 再 `Fetch` 一窗、沒有任何 pack 無主）。並行跑會互相分到對方的房間金鑰。
+    不用 server 的那半在 `tests/dispatch.rs`（記憶體對接餵亂序）與 `sessions.rs` 的單元測試。
     橋的那條在 `e2e_local_server`（`bridge_members_and_send_to_device_against_real_server`）。
 4. `WBF_E2E_SERVER=... WBF_E2E_USER=... WBF_E2E_PASSWORD_FILE=... cargo test -p wbf-sdk --test e2e_local_server -- --ignored`（第 2 步的驗收）；`WBF_PASSWORD_FILE=... scripts/acceptance.sh`（CLI 的驗收，200 MiB 約 80 秒；`WBF_ACCEPT_SIZE_MIB=16` 快跑）。
 5. 第 3 步的手動流程：`login` → 用 token `createRoom`（`initial_state` 帶 `m.room.encryption`）→ `rooms` → `send --text` → `read` → `send --file` → `files --save` → `download --manifest`。token 現在在 `session.sealed` 裡讀不到，`createRoom` 那步的 token 用 curl 另外登入一次拿（驗收腳本就是這樣做）。
@@ -196,7 +206,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 |---|---|---|
 | **E2EE 房送檔案沒宣告附件**（約定 §5.2） | server 的 `Event/Send` 是提案；matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清。CLI 送檔會印警告 |
 | ~~`RoomCrypto` trait 還沒有~~ | ✅ 引擎是 `crypto_engine::OlmEngine`（#48／#49），沒抽 trait（只有一個實作，抽了是儀式） | CLI 送訊息還走 matrix-sdk；引擎還沒接進 daemon |
-| **推播被通道丟在地上** | 第 4 階段（§7 第 1 項） | 訂閱中收不到 Push／CryptoState／DeviceChanged／Superseded；正確性靠 1506，只是慢一拍 |
+| ~~推播被通道丟在地上~~ | ✅ 第 4 階段 SDK 那半做了（`ws-receive-dispatch.md`）：會話表依 id 交付、`device_subscription` 長活收、`Superseded` 進訂閱當終點、鉤子給 RPC 面 | daemon 那半（推播封裝、`desync`、推來就叫 refresh）還沒接（§7 第 2 項） |
 | **E2EE 沒有產品路徑** | §7 第 2 項 | 沒有任何一條路在 Hello 宣告 `org.wbftw.device_versions`；引擎只有 e2e 在用 |
 | 交叉簽章沒 bootstrap | §7 第 3 項 | 分享策略只能 `AllDevices`；server 建議的 `IdentityBased` 現在等於發給零台 |
 | PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（Recent 收 `before_event_id`）合併後重做 | 跳到訊息還是兩個來回 |
@@ -213,7 +223,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 📍 **2026-09-21 的順序**（維護者定；下面 09-14 與 0–6 是更早的清單，保留當歷史）：
 
-1. **第 4 階段：收包依種類分派**（維護者 2026-09-21 定的形狀；估 600–800 行、一支 PR）。「送一個等一個」沒錯，錯的是「下一個收到的就是我的回覆」：
+1. ✅ **第 4 階段：收包依種類分派**（維護者 2026-09-21 定的形狀；SDK 那半 2026-09-21 做完，設計在 `design/ws-receive-dispatch.md`；daemon 那半接在鉤子後面、歸第 2 項）。「送一個等一個」沒錯，錯的是「下一個收到的就是我的回覆」：
    - `WsChannel` 多一個讀取 task：收、解碼、**依 kind／subtype 分派**。回覆類（Ack／Error／橋的回覆／Batch／ItemsDestroyed）依會話 id 表交給在等的請求；
      推播類（Device／Push、CryptoState、Event／Push、DeviceChanged、Superseded）依訂閱 id 交給那個訂閱的處理器。順序亂掉不會出事。
    - 會話 id 表：無序類（id 0）以 seq 對；有序或指定 id 的（Recent、Fetch、ItemsDestroy、Subscribe）以 id 登記一個會話項，seq 只在會話內驗遞增；
@@ -221,7 +231,10 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    - 現在 `receive_pack` 那段「推播型且 id 不符就丟」與 `dropped_pushes` **整段拿掉**；`PackChannel` 的 request／request_stream 介面可以不動，底下換成從會話表取。
    - 測試要把「傳輸」跟「分派」拆開，用記憶體 duplex 餵亂序的 pack；現有的同步假 server 不夠用。
    - 要小心：WS 關掉時所有在等的會話都要收到錯、每個會話自己的逾時、訂閱句柄的緩衝要有界（滿了當一次 gap）、Superseded 是 Control/Error 帶訂閱 id 要分到訂閱不是請求。
-   - 做完之後 e2ee-walkthrough §16.5 第 8、10 列、to-device-client §8 第 4、5 列才能勾。
+   - 做完之後 e2ee-walkthrough §16.5 第 8、10 列、to-device-client §8 第 4、5 列才能勾。✅ 勾了（通道那半）。
+   - 維護者加的一條：**每個收到的 pack 都經過一個鉤子**（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI；link 只呼叫不判斷。
+     還有：送與收分開（兩個 task）；會話項是 trait（`PackSink`）好接特規 spec；重送靠 id 表（`AckPolicy`，預設關、冪等的呼叫點自己開）。
+     四條線（architecture-v2 §6.1.1）不進這層：一條 `WsLink` 一張表，daemon 開四條就是四個實例。
 2. **E2EE 接進 daemon**（e2ee-walkthrough §16.6 的 RPC 面）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
    被 1506 擋時 daemon 自動 refresh 再把錯原樣回 UI 並發「這個房版本到 V、可以送了」的狀態訊息（daemon 🚫 不自動重送）、每房 `RoomRefresh` 的落地（記憶體還是 cache.db 待定）、
    上線 `device_subscribe` → `pull_to_device`、下線 `device_unsubscribe`。這是第一條宣告 `org.wbftw.device_versions` 的產品路徑。

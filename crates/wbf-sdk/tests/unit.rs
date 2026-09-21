@@ -1083,39 +1083,3 @@ fn device_packs_reject_inconsistent_shapes() {
         "不是 8 的倍數"
     );
 }
-
-/// 推播型的 pack（id 是訂閱的 id）跟回覆分得開：通道在第 4 階段之前靠它把不是回覆的推播丟掉。
-#[test]
-fn unsolicited_pushes_are_told_apart_from_replies() {
-    use wbf_sdk::protocol::is_unsolicited_push;
-    use wbf_wire::Pack;
-    let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
-    let pack_named = |name: &str| -> Pack {
-        let entry = vectors["packs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["name"] == name)
-            .unwrap_or_else(|| panic!("vector {name}"));
-        Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
-    };
-    for pushed in [
-        "device_push",
-        "device_crypto_state",
-        "device_crypto_state_empty",
-        "event_device_changed",
-    ] {
-        assert!(is_unsolicited_push(&pack_named(pushed)), "{pushed}");
-    }
-    for reply in [
-        "device_batch",
-        "device_items_destroyed",
-        "ack_send",
-        "error_room_devices_changed",
-        "bridge_ack",
-        "device_fetch",
-    ] {
-        assert!(!is_unsolicited_push(&pack_named(reply)), "{reply}");
-    }
-}

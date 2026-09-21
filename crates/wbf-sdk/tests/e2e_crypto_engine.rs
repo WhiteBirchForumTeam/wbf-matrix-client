@@ -261,6 +261,106 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     let _ = std::fs::remove_dir_all(&b.store_dir);
 }
 
+// ---- 第 4 階段：訂閱長活，A 分房間金鑰時 server 推的 `Device/Push` 要打進 B 的 handle（ws-receive-dispatch.md §3）----
+
+/// 跟上面同一條路，但 B 用 `device_subscription`（長活）：A 分房間金鑰 → server 推 `Push` 給 B 的訂閱 → handle 收到，
+/// 而且同一條連線上 B 之後跑 `Fetch`（串流會話）也不會把訂閱的 pack 吃掉、沒有任何 pack 無主。
+/// 📎 舊通道沒有長活訂閱這個 API（推播被丟在地上），所以這條沒有「舊版會紅」可比；它驗的是推播真的進了 handle。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn a_live_subscription_receives_the_push_for_a_room_key_shared_while_it_is_open() {
+    let Some(target) = target() else {
+        eprintln!("WBF_E2E_* not set; skipping");
+        return;
+    };
+    let mut a = log_in_a_device(&target, "wbf-sdk e2e live A").await;
+    let mut b = log_in_a_device(&target, "wbf-sdk e2e live B").await;
+    let user_id = a.session.user_id.clone();
+    for device in [&mut a, &mut b] {
+        device
+            .engine
+            .send_outgoing_requests(&mut device.ws)
+            .await
+            .expect("uploads keys");
+    }
+    a.engine
+        .track_users(std::slice::from_ref(&user_id))
+        .await
+        .unwrap();
+    a.engine
+        .mark_users_changed(std::slice::from_ref(&user_id))
+        .await
+        .unwrap();
+    a.engine
+        .send_outgoing_requests(&mut a.ws)
+        .await
+        .expect("A queries keys");
+
+    // B 先訂閱、一直收；佇列是空的，所以沒有 early push。
+    let mut live =
+        b.ws.device_subscription(&b.session.device_id, Duration::from_secs(30))
+            .await
+            .expect("B subscribes for good");
+    assert!(live.early_pushes.is_empty(), "{:?}", live.early_pushes);
+    assert!(
+        live.crypto_state
+            .otk_counts
+            .get("signed_curve25519")
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+
+    // A 分房間金鑰：至少一則 to-device 給 B → server 推 Push 到 B 的訂閱。
+    let room_id = create_encrypted_room(&a.session).await;
+    let shared = a
+        .engine
+        .share_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            EncryptionSettings::default(),
+        )
+        .await
+        .expect("A shares the room key");
+    assert!(shared >= 1);
+
+    // A claim 走 B 一把 OTK 時 server 會先推 `CryptoState`（3b 在真 server 踩到的），然後才是 `Push`：兩者都進同一個 handle，順序由 server 定。
+    let mut seen = Vec::new();
+    while !seen.contains(&wbf_wire::pack::device::PUSH) {
+        let pack = live
+            .subscription
+            .next(Duration::from_secs(30))
+            .await
+            .expect("the subscription is alive")
+            .expect("a pack, not the end");
+        assert_eq!(pack.kind, wbf_wire::Kind::Device, "{pack:?}");
+        seen.push(pack.subtype);
+        assert!(seen.len() <= 4, "still no Push after {seen:?}");
+    }
+    assert!(!live.subscription.take_gap());
+
+    // 同一條連線上再拉一窗（串流會話）：Push 已經在訂閱那邊，Fetch 拿到的是佇列裡那一則本體，兩邊不打架。
+    let window =
+        b.ws.device_fetch_window(
+            &wbf_sdk::protocol::DeviceFetchRequest {
+                cd_seq: None,
+                limit: None,
+            },
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("B fetches");
+    assert!(window.tc >= 1, "{window:?}");
+    assert_eq!(b.ws.channel().unmatched(), Some(0), "每一個 pack 都有主");
+
+    b.ws.device_unsubscribe().await.expect("B unsubscribes");
+    logout(&a.session).await.expect("logout A");
+    logout(&b.session).await.expect("logout B");
+    let _ = std::fs::remove_dir_all(&a.store_dir);
+    let _ = std::fs::remove_dir_all(&b.store_dir);
+}
+
 // ---- #45 的驗收（3b）：Bob 登新裝置 → 帶舊號碼送 → 1506 → 補金鑰 → 重送 → Bob 新裝置收到房間金鑰、解得開 ----
 //
 // 多要一個帳號：WBF_E2E_USER_B、WBF_E2E_PASSWORD_B_FILE（沒設就跳過這條）。

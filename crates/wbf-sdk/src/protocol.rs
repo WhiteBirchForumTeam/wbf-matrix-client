@@ -843,24 +843,6 @@ pub fn parse_subscribe_reply(request: &Pack, response: &Pack) -> Result<Subscrib
     }
 }
 
-/// 這個 pack 是不是 server 主動推的（不是某個請求的回覆）：`Event/Push`、`Event/DeviceChanged`、`Device/Push`、`Device/CryptoState`。
-/// 它們的 `id` 都是訂閱的 id。通道在第 4 階段的接收迴圈做好前，靠這個把它們跟回覆分開（`channel::WsChannel::receive_pack`）。
-/// 📎 `ItemsDestroyed` 不算：它是 `ItemsDestroy` 的回覆。`Superseded` 也不算：它是 `Control/Error`，形狀上跟拒絕分不開，第 4 階段再處理。
-///
-/// Args:
-///     pack: example: 向量 `device_crypto_state`
-/// Return:
-///     bool  1 = 推播型的 subtype
-pub fn is_unsolicited_push(pack: &Pack) -> bool {
-    matches!(
-        (pack.kind, pack.subtype),
-        (Kind::Event, event::PUSH)
-            | (Kind::Event, event::DEVICE_CHANGED)
-            | (Kind::Device, device::PUSH)
-            | (Kind::Device, device::CRYPTO_STATE)
-    )
-}
-
 /// `Device/Unsubscribe`：說出口的退出（wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
 /// 🚨 下線前要叫：不叫的話這條連線退了卻還佔著裝置，別的連線得靠搶佔才進得來。斷線 server 會自動退，但那是「沒說出口的退出」，兩條路都要有。
 ///
