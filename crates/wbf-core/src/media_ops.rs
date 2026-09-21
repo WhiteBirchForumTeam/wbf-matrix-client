@@ -12,13 +12,10 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use wbf_sdk::channel::Channel;
-use wbf_sdk::client::WbfClient;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media::{self, FetchOutcome};
 use wbf_sdk::Transport;
 
-use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::link_pool::LinkRole;
@@ -243,27 +240,6 @@ impl Core {
             chunks: report.chunks,
             sha256_verified: report.sha256_verified,
         })
-    }
-
-    /// 這個帳號跟 server 的 wbf 通道。🚨 **一律 WebSocket**：wbf 協議就是 WS
-    /// （維護者 2026-09-13：「WBF 協議下總是用 WS」）。
-    ///
-    /// 🚫 **一般的呼叫端不要用這個，用 [`Core::client_of`]** —— 那裡才有「這台是不是 wbf」
-    /// 與「這個方法住在哪一邊」的判斷（`backend_choice`）。這條是**底下那半**，
-    /// 留給兩種人：閘門自己，以及**探測**（探測不能走閘門，不然它會叫到自己）。
-    ///
-    /// 📎 `Transport::Http`（pack over HTTP）🚫 **不從這裡走** —— 它只剩 debug 用途，
-    /// 由 `wbf-sdk` 那一層自己的測試涵蓋。
-    ///
-    /// 🚫 **回傳值不准離開這個 crate**：它握著 `access_token`。
-    pub(crate) async fn connect_wbf_client(
-        &self,
-        account: &AccountDir,
-    ) -> Result<WbfClient<Channel>, CoreError> {
-        let session = self.session_of(account)?;
-        let channel =
-            Channel::connect(&session.server, &session.access_token, Transport::WebSocket).await?;
-        Ok(WbfClient::new(channel))
     }
 }
 

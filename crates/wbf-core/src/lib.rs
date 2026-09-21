@@ -158,9 +158,11 @@ pub struct Core {
     /// 🚨 值是 `OnceCell` 而不是 `BackendKind`：**探測失敗不會留下結論**
     /// （`get_or_try_init` 出錯時不寫進去，下次重探），而**同一個帳號**同時進來的呼叫
     /// 共用同一次探測（🚫 不是各開一條 WS）。
+    /// 📌 2026-09-21 起 **key 是 server URL**（account-session.md §1）：探活不帶 token（未登入的 WS Hello），
+    /// 所以「A 的 token 壞了拖累 B」那個理由沒了，而「講不講 wbf」本來就是 server 的事實。
     pub(crate) backends: std::sync::Mutex<
         std::collections::HashMap<
-            PathBuf,
+            String,
             std::sync::Arc<tokio::sync::OnceCell<crate::BackendKind>>,
         >,
     >,
@@ -168,6 +170,9 @@ pub struct Core {
     /// 登出就整個拿掉（token 撤了）；`Core` 丟掉就全關。
     pub(crate) link_pools:
         std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<LinkPool>>>,
+    /// 正在登出的帳號（account-session.md §4 的「封池」）：在這裡的帳號 `pool_of_account` 一律拒，正在跑的命令不受影響。
+    /// 登出開始就放進去，HTTP 登出失敗或本地清完就拿掉。這是**帳號**的狀態，🚫 不是池的。
+    pub(crate) logging_out: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl Core {
@@ -186,6 +191,7 @@ impl Core {
             server_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             backends: std::sync::Mutex::new(std::collections::HashMap::new()),
             link_pools: std::sync::Mutex::new(std::collections::HashMap::new()),
+            logging_out: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 

@@ -25,9 +25,12 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 **第 4 階段的 SDK 那半（2026-09-21）**：`WsChannel` 底下換成 `link::WsLink`——讀取 task ＋ 送出 task ＋ 會話表（`design/ws-receive-dispatch.md`）。每個收到的 pack 依 id 交給在等的會話，
 推播進訂閱的 handle（`WbfClient::device_subscription`），`Superseded` 進訂閱當終點，順序亂掉不出事；「丟推播」那段拿掉了。每個收到的 pack 都經過一個鉤子（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI。
 
-**連線生命週期（2026-09-21，`design/link-pool.md`）**：一個帳號五條線（misc／upload／download／rooms／keys）的連線池在 core，要用才開、斷了下次要用再開、登出全關、沒有背景監督者；
+**連線生命週期（2026-09-21，`design/link-pool.md`）**：一個帳號四條線（misc／upload／download／subscriptions；房間與金鑰的訂閱暫時共用一條，server 每台裝置預設 4 條）的連線池在 core，要用才開、斷了下次要用再開、登出全關、沒有背景監督者；
 每條線開關發 `link.state`、收到的每個 pack 發 `pack.received`（只有標頭）。daemon 接上了 `subscribe`／`unsubscribe`、每條 RPC 連線一個推播 task（訂了才推；`progress`／`note` 發那個請求的連線不用訂）、`desync`。
 每條線自己一個**心跳**（照 WireGuard：24 秒一次、最近 20 秒有通訊就跳過、沒 Pong 就當死），閘著的線不會被 server 的 300 秒 idle 收掉。
+
+**帳號的會話（2026-09-21，`design/account-session.md`，維護者定的規矩）**：探活不帶 token（未登入的 WS Hello）、以 server 為鍵；登入登出只走標準 HTTP，WS 只用 token；
+登出是「封池 → HTTP 登出（只有成與不成）→ 成了關池（等在跑的做完）→ 清本地 → 解封；不成就解封、no-op」。**下一支（B）**：wbf 帳號不建 matrix-sdk 的 Client，`m/` 由 OlmEngine 開、房間與送訊息走 WS、備份暫擋。
 
 **還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；接在 keys 那條線上）、`Event/Subscribe` 的 codec 與 rooms 那條線的內容、監督者（背景重連、退避）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 
