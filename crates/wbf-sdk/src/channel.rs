@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use wbf_wire::Pack;
 
 use crate::error::SdkError;
-use crate::link::{Subscription, WsLink};
+use crate::link::{Heartbeat, Subscription, WsLink};
 use crate::sessions::ReceivedHook;
 
 /// 一個請求從送出到收到回應的上限。與 server 的 `wbf_ws_idle_timeout` 預設相同：對方黑洞了就回 `Network`，
@@ -175,11 +175,21 @@ impl WsChannel {
         WsChannel::connect_with_hook(server, access_token, crate::sessions::no_hook()).await
     }
 
-    /// 同上，每收一個 pack 叫一次 `hook`（ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。
+    /// 同上，每收一個 pack 叫一次 `hook`（ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。心跳是預設的（24 秒）。
     pub async fn connect_with_hook(
         server: &str,
         access_token: &str,
         hook: ReceivedHook,
+    ) -> Result<WsChannel, SdkError> {
+        WsChannel::connect_with_heartbeat(server, access_token, hook, Heartbeat::DEFAULT).await
+    }
+
+    /// 同上，心跳的間隔自己給（ws-receive-dispatch.md §5.1；測試對真 server 用短的）。
+    pub async fn connect_with_heartbeat(
+        server: &str,
+        access_token: &str,
+        hook: ReceivedHook,
+        heartbeat: Heartbeat,
     ) -> Result<WsChannel, SdkError> {
         let url = ws_url(server)?;
         let mut request = url
@@ -209,7 +219,7 @@ impl WsChannel {
                 })?;
         let (source, sink) = crate::transport::split_socket(socket);
         Ok(WsChannel {
-            link: WsLink::start(source, sink, hook),
+            link: WsLink::start_with_heartbeat(source, sink, hook, heartbeat),
         })
     }
 

@@ -67,7 +67,7 @@ pub use client::{OnBatch, RecentPlan, RecentSync, RecentWindow, WbfClient};
 pub use download::{DownloadReport, SeekResult};
 pub use error::SdkError;
 pub use incoming::{EventPage, IncomingEvent};
-pub use link::{AckPolicy, StreamHandle, Subscription, WsLink};
+pub use link::{AckPolicy, Heartbeat, StreamHandle, Subscription, WsLink};
 pub use login::Session;
 pub use manifest::{Manifest, UploadState};
 pub use room_keys::{get_snapshot_status, SnapshotStatus};
