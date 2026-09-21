@@ -651,7 +651,7 @@ let response = tokio::select! {
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ 這支分支做了 |
 | 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 這支分支做了（媒體那幾條是刻意的例外，§2.3.1） |
 | 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` → `sync`、預設 `local`，**回應回報這次用了哪一種** | ✅ 這支分支做了 |
-| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ❌ |
+| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ❌ daemon 這半；✅ SDK 那半 2026-09-21 做了（`ws-receive-dispatch.md`：通道收得到推播、會話表依 id 交付、每個 pack 經過 `ReceivedHook` 給這裡接） |
 | 5 | `cancel`（§9） | ❌ |
 | 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ❌ 向量已經有，codec 還沒寫 |
 | 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | ❌ |

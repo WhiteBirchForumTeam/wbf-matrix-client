@@ -5,7 +5,9 @@
 //! 分層：
 //! - `cipher`／`chunk_block`／`chunk_crypto`：不需要網路的部分，每塊怎麼加密、事件區塊長什麼樣、seek 怎麼算。
 //! - `protocol`：pack 怎麼組、Ack 怎麼讀。
-//! - `channel`：一個 pack 進一個 pack 出（WebSocket／HTTP）。
+//! - `channel`：`PackChannel` 與兩種通道（WebSocket／HTTP）。
+//! - `transport`／`sessions`／`link`：WebSocket 那條的三層（ws-receive-dispatch.md）——bytes 進出、會話表（這個 pack 是誰的）、
+//!   一條連線（讀取 task ＋ 送出 task ＋ 表）。
 //! - `client` + `upload` + `download`：`WbfClient`，一條通道上的命令。
 //! - `login`：純 HTTP 拿 token。
 //! - `manifest`：CLI 印的 manifest 與上傳狀態檔。
@@ -38,6 +40,7 @@ pub mod error;
 pub mod error_code;
 pub mod event_json;
 pub mod incoming;
+pub mod link;
 pub mod login;
 pub mod manifest;
 #[cfg(feature = "cache")]
@@ -45,7 +48,9 @@ pub mod media;
 pub mod media_pool;
 pub mod protocol;
 pub mod room_keys;
+pub mod sessions;
 pub mod to_device_state;
+pub mod transport;
 pub mod upload;
 pub mod vault;
 
@@ -62,8 +67,10 @@ pub use client::{OnBatch, RecentPlan, RecentSync, RecentWindow, WbfClient};
 pub use download::{DownloadReport, SeekResult};
 pub use error::SdkError;
 pub use incoming::{EventPage, IncomingEvent};
+pub use link::{AckPolicy, StreamHandle, Subscription, WsLink};
 pub use login::Session;
 pub use manifest::{Manifest, UploadState};
 pub use room_keys::{get_snapshot_status, SnapshotStatus};
+pub use sessions::{no_hook, Received, ReceivedHook, Route, SessionKey};
 pub use upload::SentSummary;
 pub use vault::{Key32, KeyMode, Unlock, Vault};

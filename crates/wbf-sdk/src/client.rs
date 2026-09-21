@@ -6,6 +6,7 @@ use wbf_wire::Pack;
 use crate::channel::PackChannel;
 use crate::device_version::RoomDeviceVersions;
 use crate::error::SdkError;
+use crate::link::Subscription;
 use crate::protocol::{
     self, BatchMeta, DeviceFetchRequest, HelloAck, InfoAck, ReadAck, RecentRequest, SendAck,
     SendRequest, StatusAck,
@@ -38,6 +39,16 @@ pub struct DeviceWindow {
     pub nt: Option<u64>,
     /// true ＝ 窗停在上限，後面可能還有（帶 `cd_seq = nt` 再拉）；false ＝ 佇列真的拉完了。
     pub more: bool,
+}
+
+/// `device_subscription` 的結果：初始存量＋長活的訂閱。
+pub struct DeviceSubscription {
+    /// `Subscribe` 後面那則 `CryptoState`（自己的 OTK 存量）。
+    pub crypto_state: protocol::CryptoStateMeta,
+    /// `CryptoState` 到之前就推來的 `Device/Push`（訂閱那一刻剛好有新的 to-device）；佇列裡還在，`Fetch` 也拉得到。
+    pub early_pushes: Vec<Pack>,
+    /// 之後的 `Push`／`CryptoState`／`DeviceChanged`／`Superseded` 都從這裡來。
+    pub subscription: Subscription,
 }
 
 /// `Recent` 一窗的結果。
@@ -102,6 +113,11 @@ impl<C: PackChannel> WbfClient<C> {
             hello: None,
             next_stream_id: 0,
         }
+    }
+
+    /// 底下的通道（診斷用：`Channel::unmatched`、`WsChannel::link`）。
+    pub fn channel(&self) -> &C {
+        &self.channel
     }
 
     /// 發一個請求號、送出、驗回應是 Ack。所有非 `Chunk` 的請求都走這裡（`Chunk` 的 seq 是塊索引，見 `upload.rs`）。
@@ -327,8 +343,8 @@ impl<C: PackChannel> WbfClient<C> {
 
     /// `Device/Subscribe`（不帶 `cd_seq`）：把這條連線登記成這台裝置佇列的持有者——🚨 `ItemsDestroy` 只有持有者能做，
     /// 而且後來的接手先來的（to-device-client.md §5）。回覆是 `Ack` 再 `CryptoState`（自己的 OTK 存量），這裡回後者。
-    /// ⚠️ 訂閱之後 server 會把新的 to-device 用 `Push` 推到這條連線，而這條通道還沒有收推播的迴圈（第 4 階段）：
-    /// 這一版只在「訂閱 → 拉 → 匯入 → 銷毀」這種一次走完的流程裡用它。
+    /// ⚠️ 這支只等到 `CryptoState` 就放手：之後 server 推到這條連線的 `Push`／`CryptoState` 沒人收（通道算成無主，佇列裡的下次 `Fetch` 還在）。
+    /// 要一直收用 [`WbfClient::device_subscription`]。這支給「訂閱 → 拉 → 匯入 → 銷毀」這種一次走完的流程。
     ///
     /// Args:
     ///     device_id: 自己的裝置 id（server 會跟 session 比對）, example: "RJYKSTBOIE"
@@ -374,6 +390,58 @@ impl<C: PackChannel> WbfClient<C> {
                 state.is_some()
             ))),
         }
+    }
+
+    /// `Device/Subscribe` 然後**一直收**（ws-receive-dispatch.md §3）：等到 `Ack` 與 `CryptoState` 才回，之後的 `Push`／`CryptoState`／`Superseded`
+    /// 都從 `subscription.next()` 來。只有 WebSocket 通道能長活收；HTTP 與假 server 回 `Usage`。
+    /// 丟掉 handle 只是不再收，🚨 線上的退出仍要叫 [`WbfClient::device_unsubscribe`]。
+    ///
+    /// Args:
+    ///     device_id: example: "RJYKSTBOIE"
+    ///     per_pack_timeout: 等 `Ack` 與 `CryptoState` 每一個的上限, example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(DeviceSubscription)  訂到了：初始存量、還沒收到 `CryptoState` 前就推來的 `Push`、長活的 handle
+    ///     Err(Server)             `Forbidden`：不是這個 session 的裝置
+    ///     Err(Usage)              沒 hello、server 沒宣告 `device`、或通道不能長活收
+    ///     Err(Protocol)           會話在 `Ack`＋`CryptoState` 之前就結束
+    pub async fn device_subscription(
+        &mut self,
+        device_id: &str,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<DeviceSubscription, SdkError> {
+        self.require_feature(protocol::DEVICE_FEATURE)?;
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let pack = protocol::device_subscribe(
+            &protocol::DeviceSubscribeRequest {
+                cd_seq: None,
+                device_id: device_id.to_string(),
+            },
+            self.next_session_id(),
+            seq,
+        );
+        let mut subscription = self.channel.subscribe(pack.clone()).await?;
+        let mut acknowledged = false;
+        let mut crypto_state = None;
+        let mut early_pushes = Vec::new();
+        while !(acknowledged && crypto_state.is_some()) {
+            let Some(reply) = subscription.next(per_pack_timeout).await? else {
+                return Err(SdkError::Protocol(format!(
+                    "Subscribe session ended with ack {acknowledged} and crypto state {}",
+                    crypto_state.is_some()
+                )));
+            };
+            match protocol::parse_subscribe_reply(&pack, &reply)? {
+                protocol::SubscribeReply::Acknowledged => acknowledged = true,
+                protocol::SubscribeReply::CryptoState(state) => crypto_state = Some(state),
+                protocol::SubscribeReply::LivePush => early_pushes.push(reply),
+            }
+        }
+        Ok(DeviceSubscription {
+            crypto_state: crypto_state.expect("loop ends only with a state"),
+            early_pushes,
+            subscription,
+        })
     }
 
     /// `Device/Unsubscribe`：下線前說出口的退出——解除這條連線對裝置佇列的持有（to-device-client.md §4）。沒訂也是 no-op。

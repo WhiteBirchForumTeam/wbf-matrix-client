@@ -327,7 +327,7 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
 | **2**（✅ 已做） | 橋的通用入口 `WbfClient::call_bridge`（先過 `Hello.features` 的 `bridge` 閘門；`IS_BRIDGED` 的請求／回覆，形狀取自 PR #43）＋ `Kind::Room`／`Keys`；`room_device_versions` 打 Members；`send_to_device`；`/keys/*` 五支的 `BridgedEndpoint` 常數（第 3 支的 OlmMachine 迴圈直接用 `call_bridge`） | 🚫 |
 | **3a**（✅ 已做） | **收與發金鑰**：`crypto_engine::OlmEngine`（feature `matrix`）——同一個 sqlite crypto store（`m/`）上的 `OlmMachine`，`send_outgoing_requests` 把 KeysUpload／Query／Claim／SignaturesUpload／發 to-device 全部走橋，`receive_to_device` 把 `Device/Fetch` 拉到的推進去（回新的 `RoomKeyInfo`），`share_room_key` 把房間金鑰分給一群人，`mark_users_changed` 是 1506 之後重查的入口。`0x16` 的 `Fetch`／`Batch`／`Subscribe`（不帶 `cd_seq`）／`ItemsDestroy`／`ItemsDestroyed`／`CryptoState` 編解碼與 `WbfClient::device_*`；`to_device_state`（`cd_seq` 與待銷毀清單落在 `m/`）。對真 server 走通：同帳號兩台裝置，房間金鑰只靠 WS 從 A 到 B（`tests/e2e_crypto_engine.rs`） | 🚫 |
 | **3b**（✅ 已做） | **送**：`OlmEngine::refresh_room_devices`（一支例行程序：成員清單 → diff → 只重查變的人 → 雜湊對一次、不對再查、還不對就拒發 → `share_room_key`）、`encrypt_and_send`（`encrypt_room_event_raw` → `Event/Send` 帶 `room_version`；1506 是 `Ok(RoomDevicesChanged)` 不是 Err）、`decrypt_room_event`；分享策略明確選 `AllDevices`（交叉簽章做好前 `IdentityBased` 等於發給零台）。**#45 的驗收對真 server 走通**（`tests/e2e_crypto_engine.rs::issue_45_acceptance_…`：Bob 登新裝置 → Alice 帶舊號碼送 → 1506 → refresh 只比出 Bob → 金鑰補到 B2 → 同 txn_id 重送接受 → B2 與 B1 都解得開） | ✅ 只有「送出那台」的連線宣告（e2e 裡 Alice 的 A）；daemon／CLI 還沒有任何一條路宣告 |
-| 4 | 推播：通道能收非回應的 pack（`Event/Push`、`Device/Push`、`CryptoState`、`DeviceChanged`、`Superseded`），`Subscribe` 帶 `cd_seq` 補窗——daemon-runtime 第 4 階段，維護者要先討論 | — |
+| **4**（✅ 已做，SDK 那一半） | 推播：通道能收非回應的 pack（`Event/Push`、`Device/Push`、`CryptoState`、`DeviceChanged`、`Superseded`）——`WsChannel` 底下換成 `link::WsLink`（讀取 task ＋ 送出 task ＋ 會話表，`ws-receive-dispatch.md`），推播依訂閱的 id 進 `Subscription` handle（`WbfClient::device_subscription`），每個收到的 pack 經過一個鉤子給之後的 RPC 面。`Subscribe` 帶 `cd_seq` 補窗與 `Event/Subscribe` 的 codec 是第 6 階段；daemon 那一半（推播封裝、`desync`）跟在鉤子後面 | 🚫 |
 
 🚨 為什麼 1、2、3a 不能宣告：宣告的連線送加密訊息漏帶號碼是 `InvalidRequest`，而它們還沒有「送出前比對」——宣告了就是把自己所有加密訊息擋掉。
 
@@ -336,15 +336,15 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
 - **已追蹤的人不會因為 `update_tracked_users` 再查一次**：A 上傳金鑰時狀態機就順手查過自己（那時 B 還沒上傳），之後只靠 `track_users` 永遠看不到 B。
   要的是「這個人變了、重查」——`OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口），也就是 16.2 里收到 1506 之後對 `diff.changed` 要做的事。
 - **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs`：`Forbidden`）：所以拉→匯入→銷毀之前要先 `device_subscribe`。這一版只訂不帶 `cd_seq` 的（不補窗，回 `Ack` 再 `CryptoState`）；
-  訂了之後新的 to-device 會用 `Push` 推到這條連線，而通道還沒有收推播的迴圈——這是第 4 階段的事，在那之前 `device_subscribe` 只能在一次走完的流程裡用。
+  訂了之後新的 to-device 會用 `Push` 推到這條連線：要一直收用 `device_subscription`（第 4 階段），`device_subscribe` 只等到 `CryptoState` 就放手、給一次走完的流程。
 - **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
 - ruma 組請求時對要 token 的端點一定要給 token：引擎給一個占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填（client 蓋不掉）。
 
 3b（2026-09-21）又踩到兩件：
 
 - **訂閱之後推播會擞進「送一個等一個」的通道**：別人 claim 了我一把 OTK，server 立刻推 `CryptoState`（id 是訂閱的 id），正在等 `ItemsDestroy` 回覆的那邊把它當回覆就對不上 id。
-  推播的 id 永遠是訂閱的、回覆的 id 是這次請求的：`WsChannel::receive_pack` 把「推播型 subtype 且 id 不是這次請求的」丟掉並計數（`dropped_pushes`），到第 4 階段的接收迴圈做好為止。
-  丟掉無害：佇列裡的下次 `Fetch` 還在、`CryptoState` 下次 `Subscribe` 再給、`DeviceChanged` 只是加速。`Subscribe` 自己那則 `CryptoState` id 相同，照收；訂閱那一刻剛好推來的 `Push`（同 id）算 `LivePush`，略過。
+  3b 當時的權宜是把「推播型 subtype 且 id 不是這次請求的」丟掉並計數——維護者 2026-09-21 指出那是設計錯誤（送一個等一個沒錯，錯的是「下一個收到的就是我的回覆」），
+  第 4 階段整段拿掉：現在每個 pack 由會話表依 id 交付（`ws-receive-dispatch.md` §2），訂閱的 id 底下的每一個（Ack、CryptoState、Push、Superseded）都進訂閱的 handle，順序無所謂。
 - **server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號**（`wbf/send.rs` 傳 `sender_device: None`）：同一帳號另一台裝置、甚至另一個房重用 txn_id，會拿到上次那則的 event_id。
   e2e 因此曾誤以為「帶 room_version 的加密訊息進不了 Recent」——追下去是每輪重用 `45-txn-1` 拿到上一輪別的房的事件。測試改成每輪唯一的 txn_id；這一點要回報給 server（HTTP 那條是以裝置為鍵的）。
 
@@ -365,13 +365,13 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 | 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | `OlmEngine::share_room_key(room, users, settings)`（缺 Olm session 先 claim，全走橋） | ✅ #48（真 server 驗過）。分享策略 3b 明確選了 `AllDevices`（`crypto_engine::room_key_share_settings`；交叉簽章做好後換 `IdentityBased`，那是唯一要改的地方） |
 | 6 | **帶房間版本號送出**；對不上 1506 → **daemon 自動補齊金鑰、把錯誤原樣回給 UI 並發「可以送了」的狀態；重送由 UI 決定**（維護者 2026-09-21，§16.6） | `OlmEngine::encrypt_and_send` → `SendOutcome::{Sent, RoomDevicesChanged}`；補金鑰是 `refresh_room_devices(previous)`；重送是再叫一次 `encrypt_and_send`（同 `txn_id`） | ✅ 3b（真 server 驗過整條）；daemon 的 RPC 面未露 |
 | 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（訂閱 → 拉到追平 → 匯入 → 落地 → 銷毀）✅ #48；成員清單就是第 1 步 | ✅ 方法都在，**什麼時候叫由 UI 決定** |
-| 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；**收推播的迴圈** | ❌ 第 4 階段（通道還不能收非回應的 pack）。在那之前正確性完全由第 6 步的 1506 守——這跟 server 的設計一致：推播是加速，不是正確性來源 |
+| 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；通道收得到推播 ✅ 第 4 階段（`WbfClient::device_subscription` 的 handle；收件匣滿了丟並標 `gap`） | ✅ 通道；❌ 「推來就叫 `refresh_room_devices`」那半在 daemon（§16.6 最後一列）。正確性仍由第 6 步的 1506 守——跟 server 的設計一致：推播是加速，不是正確性來源 |
 | 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()` | ✅ #48（假 server ＋ 真 server）。房間事件的 `Event/Unsubscribe` 跟第 4 階段一起（現在沒訂房間事件） |
-| 10 | **同一台裝置只有一條連線在收**；被接手的那條收到 `Superseded` 要停、不重訂 | `WbfErrorCode::Superseded` 認得 ✅；停掉收取並通知上層 | ❌ 第 4 階段（它是推來的） |
+| 10 | **同一台裝置只有一條連線在收**；被接手的那條收到 `Superseded` 要停、不重訂 | `WbfErrorCode::Superseded` 認得 ✅；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點（`Subscription::next` 先回那則 Error、再回 None），訂閱項從表裡拿掉 ✅ 第 4 階段 | ✅ 通道；「通知上層、不重訂」是 daemon 收到 None 之後的事 |
 | 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_window` 把「匯入 → 落地 → 銷毀」鎖成一步，UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
 
 **核對結論**：第 1–7、9 步的方法都在而且對真 server 驗過（3b 把 4、6 補齊），走的就是 server 設計的那條「版本號變了 → 看誰不一樣 → 只查那個人 → 狀態機比裝置 → 補發 → 帶號碼送 → 1506 回到第 1 步」的路；
-第 8、10 步（推播、Superseded）要第 4 階段的通道；在那之前推播被通道丟在地上（§16.4）。**在推播做出來之前，這套邏輯已經是正確的，只是慢一拍**——
+第 8、10 步（推播、Superseded）的通道那半第 4 階段做了（`ws-receive-dispatch.md`），剩下「收到之後做什麽」在 daemon。**在那之前這套邏輯已經是正確的，只是慢一拍**——
 被擋一次才知道要重查，而 server 的設計本來就把正確性放在 1506、不放在推播。
 
 🚫 一個刻意沒放在 wbf-sdk 裡的：「上次那份成員清單」不在 SDK 層存——它跟「這輪金鑰發給誰」綁在一起，是 daemon 的狀態（§16.6），放 SDK 會變成第二份會漂移的名單。
@@ -396,7 +396,7 @@ wbf-sdk 只提供方法，不在這兩者之間選邊。
 | 每房「上次那份成員清單」（發上一輪房間金鑰時依據的那份） | **daemon** 存 | 每次 refresh 拿到新的就換 | `RoomDeviceVersions`（可序列化待加） | 定案；落在哪（記憶體或 cache.db）待定 |
 | 上線：to-device 追平 | **daemon** 自動 | 連線建好、登入完 | `device_subscribe` → `pull_to_device` | ✅ 方法在；daemon 還沒接 |
 | 下線：退訂 | **daemon** 自動 | 登出、關連線前 | `device_unsubscribe` | ✅ 方法在 |
-| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | 第 4 階段 | ❌ 通道還不能收 |
+| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | `WbfClient::device_subscription` 的 handle 一直 `next()`；每個收到的 pack 同時經過 `ReceivedHook`（`WsChannel::connect_with_hook`）給 RPC 面決定要不要送 UI | ✅ 通道能收（第 4 階段）；❌ daemon 還沒接 |
 
 ⭐ **一支例行程序、三個觸發點**：`refresh_room_devices(room)` 被 UI 點進房間叫、被 1506 叫、將來被 `DeviceChanged` 叫。內容一樣，只有「誰按下去」不同。
 
