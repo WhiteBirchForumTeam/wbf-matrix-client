@@ -515,6 +515,8 @@ mod tests {
         recent_requests: Arc<Mutex<Vec<Option<i64>>>>,
         subscription_id: Arc<Mutex<Option<u64>>>,
         unsubscribed: Arc<Mutex<bool>>,
+        /// true ＝ 扣住 `Recent` 的回覆（收到請求、記下來、但先不答），給「補窗還沒完成時水位在哪」的斷言用。
+        hold_recent: Arc<Mutex<bool>>,
         outbound: tokio::sync::mpsc::Sender<Pack>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -524,12 +526,14 @@ mod tests {
         let recent_requests = Arc::new(Mutex::new(Vec::new()));
         let subscription_id = Arc::new(Mutex::new(None));
         let unsubscribed = Arc::new(Mutex::new(false));
+        let hold_recent = Arc::new(Mutex::new(false));
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel::<Pack>(16);
-        let (events_t, recents_t, sub_t, unsub_t) = (
+        let (events_t, recents_t, sub_t, unsub_t, hold_t) = (
             events.clone(),
             recent_requests.clone(),
             subscription_id.clone(),
             unsubscribed.clone(),
+            hold_recent.clone(),
         );
         let task = tokio::spawn(async move {
             loop {
@@ -601,6 +605,9 @@ mod tests {
                         let before = meta["before"].as_i64();
                         let limit = meta["limit"].as_u64().unwrap_or(320) as usize;
                         recents_t.lock().unwrap().push(cg_seq);
+                        while *hold_t.lock().unwrap() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
                         let mut window: Vec<Value> = events_t
                             .lock()
                             .unwrap()
@@ -652,6 +659,7 @@ mod tests {
             recent_requests,
             subscription_id,
             unsubscribed,
+            hold_recent,
             outbound,
             task,
         }
@@ -670,6 +678,20 @@ mod tests {
     async fn wait_for<F: FnMut() -> bool>(mut condition: F, what: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !condition() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+    }
+
+    async fn wait_for_async<F, Fut>(mut condition: F, what: &str)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition().await {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -753,10 +775,12 @@ mod tests {
         assert_eq!(cg_seq_of(&core, &account).await, Some(4801));
 
         // 有洞：server 只推了 4900，4850 掉了 → 那包帶 gap → 拿**舊水位** 4801 去 Recent，4850 才補得回來。
+        // 假 server 先扣住 Recent 的回覆：補窗還沒完成時，水位必須還在洞之前（帶 gap 的包不推水位）——不然補窗中途斷線，洞就永遠補不回來。
         fake.events
             .lock()
             .unwrap()
             .extend([text_event(4850), text_event(4900)]);
+        *fake.hold_recent.lock().unwrap() = true;
         fake.outbound
             .send(push(subscription_id, 1, true, &[text_event(4900)]))
             .await
@@ -771,6 +795,22 @@ mod tests {
             Some(4801),
             "🚨 補窗要從洞之前的水位起，不是這包的 fs"
         );
+        // 這包的事件已經寫進去（它的寫入排在 Recent 請求之前），但水位沒動。
+        wait_for_async(
+            || async {
+                cached_ids(&core, &account)
+                    .await
+                    .contains(&"$4900".to_string())
+            },
+            "the gap push itself is written",
+        )
+        .await;
+        assert_eq!(
+            cg_seq_of(&core, &account).await,
+            Some(4801),
+            "🚨 帶 gap 的包不推水位：補窗完成之前水位要還在洞之前"
+        );
+        *fake.hold_recent.lock().unwrap() = false;
         tokio::time::timeout(Duration::from_secs(10), async {
             while cg_seq_of(&core, &account).await != Some(4900) {
                 tokio::time::sleep(Duration::from_millis(20)).await;

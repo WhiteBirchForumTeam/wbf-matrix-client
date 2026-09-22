@@ -39,7 +39,9 @@ stop_room_sync(account) → task 送 Event/Unsubscribe（訂閱的 id）、等 A
 
 洞在**舊水位跟這包之間**。先把水位推到這包的 `fs` 再 `Recent(cg_seq)`，server 只給比 `cg_seq` 新的——洞就永遠補不回來。
 所以：這包的事件照樣寫（冪等），水位不動，補窗 job 拿舊水位起、推到第一窗的 `fs`（這包也在那窗裡）。
-測試 `a_room_sync_subscribes_fills_the_window_then_follows_pushes_and_gaps` 釘著：gap 之後假 server 收到的 `Recent` 帶的是舊水位。
+測試 `a_room_sync_subscribes_fills_the_window_then_follows_pushes_and_gaps` 釘著兩件事：gap 之後假 server 收到的 `Recent` 帶的是舊水位；
+而且假 server **扣住** `Recent` 的回覆時（補窗還沒完成），這包的事件已經在庫裡、水位仍在洞之前——不然補窗中途斷線，洞就永遠補不回來。
+變異驗證：把「帶 gap 不推水位」拿掉 → 這條紅。
 
 本地收件匣滿過（`take_gap`）同理：在處理下一包**之前**先補，那時水位還在丟包之前。
 
