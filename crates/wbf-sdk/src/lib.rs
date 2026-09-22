@@ -48,6 +48,7 @@ pub mod media;
 pub mod media_pool;
 pub mod protocol;
 pub mod room_keys;
+pub mod room_state;
 pub mod sessions;
 pub mod to_device_state;
 pub mod transport;

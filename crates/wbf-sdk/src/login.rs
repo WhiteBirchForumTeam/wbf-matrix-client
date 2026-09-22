@@ -15,6 +15,20 @@ pub struct Session {
     /// matrix-sdk 的 store 目錄（crypto 與 state 兩個 sqlite）；純 HTTP 登入的 session 沒有（CLI 規格 §7）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_dir: Option<String>,
+    /// 登入時探到的那一邊（account-session.md §2）：這個帳號之後的命令走哪一套。
+    /// None ＝ 舊版封的、或用 token 接的：消費端用 `store_dir` 與探活自己判（不改舊行為）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SessionBackend>,
+}
+
+/// 登入時定下的那一邊（account-session.md §2）。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBackend {
+    /// 一般 Matrix：matrix-sdk 的 Client，`m/` 裡有 state store 與 crypto store。
+    MatrixSdkClient,
+    /// wbf server：沒有 Client，`m/` 只有 `OlmEngine` 開的 crypto store；房間、訊息、媒體、金鑰全走 WS。
+    WbfSdk,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +83,7 @@ pub async fn login_with_password(
         device_id: login.device_id,
         access_token: login.access_token,
         store_dir: None,
+        backend: None,
     })
 }
 

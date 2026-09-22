@@ -93,6 +93,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
+  wbf_rooms.rs           **wbf 帳號的房間**（account-session.md §6）：清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、`Event/Send` 送明文（加密房拒）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（link-pool.md）：`LinkRole` 四條線（misc／upload／download／subscriptions）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
                          `Core::client_of(…, role)` 是唯一閘門、`open_link`（session → Bearer 升級 → hello）、`close_links`（登出叫）、`received_hook`（pack → `CoreEvent::Received`）、
                          `open_link_count`（`daemon.info` 的 `links`）。單元測試用記憶體對接的假 opener
@@ -256,7 +257,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    core 的 `link_pool.rs`（`LinkPool`／`LinkRole`／`client_of(…, role)`／`open_link`／`close_links`）、`CoreEvent::Link`／`Received`；daemon 的 `push.rs`（訂閱集合、事件→推播）與 `server.rs` 的推播 task。
    訂閱線（`Subscriptions`，房間與金鑰暫共用）這支只保證開得起來、關得掉、有人收；內容在第 2、3 項。
 1c. ✅ **帳號的會話 A**（`design/account-session.md`，PR #54）：探活不帶 token、以 server 為鍵；登出封池（guard）→ HTTP 登出→成了關池→清本地→解封；四條線。
-   **B**（下一支）：wbf 帳號不建 matrix-sdk 的 Client（登入走自己包的 HTTP、`m/` 由 OlmEngine 開、room.list 走橋 JoinedRooms＋GetState、send_text 走 Event/Send、備份暫擋回錯；§6 有表）。
+   ✅ **B**（2026-09-21）：wbf 帳號不建 matrix-sdk 的 Client——登入先探活，wbf 走自己包的 HTTP `/login`、`m/` 由 `OlmEngine` 開（只有 crypto store）、`Session::backend` 記住走哪邊；
+   `room.list`／`get` 走橋（`JoinedRooms`＋`GetState`＋`m.direct` → sdk `room_state.rs` 組 `Conversation`）、`send_text`／`send_file` 走 `Event/Send`（加密房拒；附件宣告成立）；
+   備份／watch／`/context` 對 wbf 帳號回 1100（`handles::no_matrix_client_error`），登出閘門只認本機 recovery key；§6 有表。裝置金鑰的上傳跟 E2EE 那支一起。
 2. **E2EE 接進 daemon**（e2ee-walkthrough §16.6 的 RPC 面；訂閱走 `LinkRole::Subscriptions`，`Misc`（送 Event/Send）與 `Subscriptions`（收 DeviceChanged）宣告 `org.wbftw.device_versions`）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
    被 1506 擋時 daemon 自動 refresh 再把錯原樣回 UI 並發「這個房版本到 V、可以送了」的狀態訊息（daemon 🚫 不自動重送）、每房 `RoomRefresh` 的落地（記憶體還是 cache.db 待定）、
    上線 `device_subscribe` → `pull_to_device`、下線 `device_unsubscribe`。這是第一條宣告 `org.wbftw.device_versions` 的產品路徑。

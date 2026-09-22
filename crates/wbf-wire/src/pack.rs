@@ -32,6 +32,8 @@ pub enum Kind {
     Download = 0x04,
     /// 連線背後的 session（wire-format §6.3）：`Login`、`Refresh`、`Logout`。client 這邊還沒用，先認得它才能解 server 的向量。
     Session = 0x10,
+    /// 帳號（bridge-specs `0x11-account.md`）：沒有原生的 pack，全是走橋的 Matrix 端點（profile、account data）。
+    Account = 0x11,
     /// 房間（wire-format §3.3）：沒有原生的 pack，全是走橋的 Matrix 端點（`Members` 等，bridge-specs `0x13-room.md`）。
     Room = 0x13,
     /// 房間事件的領域（wire-format §3.3）：`Recent`、`Send`、`Batch`。
@@ -55,6 +57,7 @@ impl Kind {
             0x03 => Some(Kind::Upload),
             0x04 => Some(Kind::Download),
             0x10 => Some(Kind::Session),
+            0x11 => Some(Kind::Account),
             0x13 => Some(Kind::Room),
             0x14 => Some(Kind::Event),
             0x16 => Some(Kind::Device),

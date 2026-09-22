@@ -577,15 +577,15 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
 | `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
-| `account.add` | ✅ | HTTP `/login` ＋ matrix-sdk | 🔁 `Session/Login` 只有 wire 常數（handover §6） |
+| `account.add` | ✅ | 探活（WS Hello）→ wbf：標準 HTTP `/login`、不建 Client；一般 Matrix：matrix-sdk | ✅ 2026-09-21（維護者定：登入登出維持 HTTP 慣例，account-session.md §0） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |
 | `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |
 | `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | 🔁 |
-| `room.list`／`get` | ✅ | matrix-sdk `/sync` | 🔁 |
-| `room.send_text` | ✅ | matrix-sdk `Room::send` | 🔁 `Event/Send` 等附件宣告（約定 §5.2）一起做 |
-| `room.send_file` | ✅ | 上傳 **WS** ＋ 事件 matrix-sdk | 🔁 一半 |
+| `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋 `JoinedRooms`＋`GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（account-session.md §6） |
+| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send` 明文（加密房 1100）；一般 Matrix：`Room::send` | ✅ wbf（加密等 E2EE 的 RPC 面）／🔁 一般 server |
+| `room.send_file` | ✅ | 上傳 **WS** ＋ 事件：wbf 帳號 **WS** `Event/Send` 帶 `attachments`（`attachment_declared: true`）；一般 Matrix matrix-sdk | ✅ wbf／🔁 一般 server |
 | `room.send_attachment`、`media.create` | ❌ | — | ❌ |
-| `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server、或錨點不在本地） | ✅ wbf／🔁 一般 server |
+| `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（等 wbfuwunel #64） | ✅ wbf／🔁 一般 server |
 | `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
 | `room.message` 推播 | ✅（`CoreEvent::Message`，來自 `watch`） | matrix-sdk `/sync` | 🔁 daemon 版要接 `Event/Subscribe`／`Push` |
@@ -594,7 +594,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `media.save_to` | ✅ | **WS** `Read`＋媒體池 | ✅ |
 | `media.open`（Range） | ❌ 缺 `PoolReader` 接口 | 池讀 ✅、缺塊補拉 **WS** | ❌ |
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
-| `backup.*`、`recovery.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP） | 🔁 而且金鑰的 to-device 收發要等 `0x16 Device`（to-device-client.md） |
+| `backup.*`、`recovery.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，account-session.md §6） | 🔁 搬到 crypto 層＋橋的 `/room_keys`，排在 E2EE 的 RPC 面之後 |
 | `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
 | `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發；`vault.state` ❌ | — | ❌ |
 | `progress`／`note`／`room.message` 推播 | ✅ daemon 層接上了（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ 2026-09-21 |

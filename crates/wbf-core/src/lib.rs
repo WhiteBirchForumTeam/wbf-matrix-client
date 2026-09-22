@@ -58,6 +58,7 @@ mod server_cache;
 mod session_ops;
 mod sync_ops;
 mod upload_ops;
+mod wbf_rooms;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

@@ -6,7 +6,7 @@
 //!   WBF_E2E_PASSWORD_FILE 整檔就是密碼（去掉結尾一個換行）
 //!
 //! 流程：vault.create（**passphrase 模式**）→ account.add → account.whoami → server.ping（WS）
-//! → room.list → sync.recent（WS）→ backup.status → **daemon 重開 → vault.unlock → whoami**
+//! → room.list（local 與 both，後者走橋）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
 //! → account.del。每一步看 code，🚫 不看 msg。
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
@@ -188,6 +188,10 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let reply = client.call("room.list", json!({})).await;
     assert_eq!(reply["code"], 0, "room.list: {reply}");
     assert!(reply["result"].is_array());
+    // wbf 帳號沒有 matrix-sdk 的 Client（account-session.md §2）：`sync=both` 走橋（JoinedRooms ＋ 每房 GetState ＋ m.direct）。
+    let reply = client.call("room.list", json!({ "sync": "both" })).await;
+    assert_eq!(reply["code"], 0, "room.list sync=both: {reply}");
+    assert!(reply["result"].is_array());
 
     // WS：Event/Recent。
     let reply = client
@@ -196,9 +200,12 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "recent: {reply}");
     assert!(reply["result"]["caught_up"].is_boolean(), "{reply}");
 
+    // 備份還掛在 Client 上（account-session.md §6）：wbf 帳號明講拒絕（1100），🚫 不靜默失效。
     let reply = client.call("backup.status", json!({})).await;
-    assert_eq!(reply["code"], 0, "backup.status: {reply}");
-    assert_eq!(reply["result"]["server_backup_setting"], "on");
+    assert_eq!(
+        reply["code"], 1100,
+        "backup.status on a wbf account: {reply}"
+    );
     let before = info["result"]["instance"]
         .as_str()
         .expect("instance")
@@ -274,7 +281,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
 /// 🚨 **房間歷史往回翻，定位一律是 `event_id`**（wbfuwunel #51；維護者 2026-09-14）。
 ///
-/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）。
+/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗明文送出被拒）。
 ///
 /// ⭐ 刻意讓**兩條上游路線都被真的打到**：
 ///
@@ -311,6 +318,18 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         )
         .await;
     assert_eq!(reply["code"], 0, "account.add: {reply}");
+
+    // wbf 帳號的送訊息走 `Event/Send` 明文：加密房要被拒（1100），而且是送之前問這一刻的 `m.room.encryption`（account-session.md §6）。
+    // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
+    if let Ok(encrypted_room) = std::env::var("WBF_E2E_ENCRYPTED_ROOM") {
+        let reply = client
+            .call(
+                "room.send_text",
+                json!({ "room": encrypted_room, "body": "must not go out in plaintext" }),
+            )
+            .await;
+        assert_eq!(reply["code"], 1100, "加密房的明文送出要被拒：{reply}");
+    }
 
     // 送 7 則，記下它們的 event_id（舊到新）。
     let mut sent = Vec::new();
@@ -361,11 +380,16 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         Some(newest_first[2].as_str()),
         "next 是這頁最舊那則"
     );
-    let (second, _) = page(&mut client, &room, "server", next.as_deref()).await;
+    // wbf 帳號沒有 Client 可以走 `/context`：錮點不在本地就明講拒絕（1100；account-session.md §6，等 wbfuwunel #64）。
+    let reply = client
+        .call(
+            "room.history",
+            json!({ "room": room, "limit": 3, "sync": "server", "before": next }),
+        )
+        .await;
     assert_eq!(
-        second,
-        newest_first[3..6],
-        "server 第二頁（/context）要緊接著第一頁"
+        reply["code"], 1100,
+        "server 第二頁要走 /context，wbf 帳號沒有它：{reply}"
     );
 
     // ── sync=local：server 模式不寫庫，所以本地什麼都沒有 → 錨點不在本地要拒答 ──

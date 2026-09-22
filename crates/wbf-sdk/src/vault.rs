@@ -641,6 +641,7 @@ mod tests {
             device_id: "DEV".into(),
             access_token: "syt_secret".into(),
             store_dir: None,
+            backend: None,
         }
     }
 

@@ -20,7 +20,7 @@ use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
 use matrix_sdk::encryption::recovery::RecoveryState;
 use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
 use matrix_sdk::room::MessagesOptions;
-use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
+use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
 use matrix_sdk::ruma::events::MessageLikeEventType;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
@@ -31,9 +31,10 @@ use crate::chat::{
     Attachment, ChatBackend, Conversation, ConversationKind, Update, WatchControl, WatchEnd,
 };
 use crate::error::SdkError;
-use crate::event_json::{CHUNKED_BLOCK_KEY, FILE_MSGTYPE};
+use crate::event_json::file_message_content;
 use crate::incoming::{EventPage, IncomingEvent};
 use crate::login::Session;
+use crate::login::SessionBackend;
 use crate::vault::Key32;
 
 /// 每次 `/sync` 最多等多久（server 端長輪詢）。
@@ -80,6 +81,7 @@ impl MatrixBackend {
             device_id: response.device_id.to_string(),
             access_token: response.access_token,
             store_dir: Some(store_dir.display().to_string()),
+            backend: Some(SessionBackend::MatrixSdkClient),
         };
         let me = session.user_id.clone();
         Ok((MatrixBackend { client, me }, session))
@@ -269,38 +271,11 @@ impl ChatBackend for MatrixBackend {
         caption: Option<&str>,
     ) -> Result<String, SdkError> {
         let room = self.room(id)?;
-        attachment.block.check_as_event_block()?;
-        let name = attachment
-            .block
-            .name
-            .clone()
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "file".to_string());
-        let body = match caption {
-            Some(caption) => format!("{caption}\n{name}（WBF 分塊檔，需要 WBF client 才能開）"),
-            None => format!("{name}（WBF 分塊檔，需要 WBF client 才能開）"),
-        };
-        let mut data = serde_json::Map::new();
-        data.insert(
-            "url".into(),
-            serde_json::Value::String(attachment.mxc.clone()),
-        );
-        data.insert(
-            CHUNKED_BLOCK_KEY.into(),
-            serde_json::to_value(&attachment.block).expect("ChunkedBlock serializes"),
-        );
-        if let Some(caption) = caption {
-            data.insert(
-                "caption".into(),
-                serde_json::Value::String(caption.to_string()),
-            );
-        }
-        let message_type = MessageType::new(FILE_MSGTYPE, body, data)
-            .map_err(|error| SdkError::Usage(format!("file event content: {error}")))?;
-        let response = room
-            .send(RoomMessageEventContent::new(message_type))
-            .await
-            .map_err(matrix_error)?;
+        // content 跟 wbf 那條路（`Event/Send`）同一份：兩邊送出去的事件一模一樣，只有路不同。
+        let content: RoomMessageEventContent =
+            serde_json::from_value(file_message_content(attachment, caption)?)
+                .map_err(|error| SdkError::Usage(format!("file event content: {error}")))?;
+        let response = room.send(content).await.map_err(matrix_error)?;
         Ok(response.response.event_id.to_string())
     }
 

@@ -382,6 +382,7 @@ impl Context {
             device_id: String::new(),
             access_token: token.to_string(),
             store_dir: None,
+            backend: None,
         };
         let who = whoami(&probe).await?;
         Ok(Session {
