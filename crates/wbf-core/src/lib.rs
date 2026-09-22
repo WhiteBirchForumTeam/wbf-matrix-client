@@ -53,6 +53,7 @@ mod login_ops;
 mod media_ops;
 mod misc_ops;
 mod recovery;
+mod room_sync;
 mod rooms_ops;
 mod server_cache;
 mod session_ops;
@@ -78,6 +79,7 @@ pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
+pub use room_sync::{RoomSyncStart, STARTUP_SYNC_MAX_EVENTS};
 pub use rooms_ops::{
     cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, MessagePage, SyncMode,
 };
@@ -174,6 +176,10 @@ pub struct Core {
     /// 正在登出的帳號（account-session.md §4 的「封池」）：在這裡的帳號 `pool_of_account` 一律拒，正在跑的命令不受影響。
     /// 登出開始就放進去，HTTP 登出失敗或本地清完就拿掉。這是**帳號**的狀態，🚫 不是池的。
     pub(crate) logging_out: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// 正在跟上游的帳號（`room_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Event/Push` 寫進 cache。
+    /// 登出、`stop_room_sync`、`Core` 丟掉都收。key 跟池一樣是帳號目錄。
+    pub(crate) room_syncs:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, room_sync::RoomSyncHandle>>,
 }
 
 impl Core {
@@ -193,6 +199,7 @@ impl Core {
             backends: std::sync::Mutex::new(std::collections::HashMap::new()),
             link_pools: std::sync::Mutex::new(std::collections::HashMap::new()),
             logging_out: std::sync::Mutex::new(std::collections::HashSet::new()),
+            room_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

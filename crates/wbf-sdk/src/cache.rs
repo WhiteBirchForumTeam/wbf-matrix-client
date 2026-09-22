@@ -168,6 +168,24 @@ impl Cache {
         transaction.commit().map_err(db_error)
     }
 
+    /// 水位**只往前推**：`cg_seq` 比現在的大才寫（推播一包推一次，包會亂序、會重複；`Recent` 的窗用 `set_cg_seq`）。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     cg_seq: 這一包最新那則的 `g_seq`, example: 4712
+    /// Return:
+    ///     Ok(true)    推進了（之前沒有、或比較舊）
+    ///     Ok(false)   現在的已經 ≥ 它，沒動
+    pub fn advance_cg_seq(&mut self, user_id: &str, cg_seq: i64) -> Result<bool, SdkError> {
+        match self.get_cg_seq(user_id)? {
+            Some(current) if current >= cg_seq => Ok(false),
+            _ => {
+                self.set_cg_seq(user_id, cg_seq)?;
+                Ok(true)
+            }
+        }
+    }
+
     // ---- room_list ----
 
     /// 這個帳號的房間清單（一人一列；`Conversation` 是他看到的樣子）。

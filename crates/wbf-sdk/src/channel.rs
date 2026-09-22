@@ -52,6 +52,21 @@ pub trait PackChannel {
             "this channel cannot hold a subscription; use the WebSocket channel".into(),
         ))
     }
+
+    /// 只送、不登記回覆：給「回覆會走已經在的訂閱會話」的 pack（`Event/Unsubscribe` 拄訂閱的 `id`，Ack 從訂閱的 handle 來）。
+    /// 預設回 `Usage`：只有 WebSocket 通道有這種會話。
+    ///
+    /// Return:
+    ///     Ok(())
+    ///     Err(Usage)        這種通道沒有長活的會話
+    ///     Err(Network)      送不出去
+    async fn send_only(&mut self, pack: Pack) -> Result<(), SdkError> {
+        let _ = pack;
+        Err(SdkError::Usage(
+            "this channel has no long-lived sessions to send into; use the WebSocket channel"
+                .into(),
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,6 +175,13 @@ impl PackChannel for Channel {
         match self {
             Channel::WebSocket(channel) => channel.subscribe(pack).await,
             Channel::Http(channel) => channel.subscribe(pack).await,
+        }
+    }
+
+    async fn send_only(&mut self, pack: Pack) -> Result<(), SdkError> {
+        match self {
+            Channel::WebSocket(channel) => channel.send_only(pack).await,
+            Channel::Http(channel) => channel.send_only(pack).await,
         }
     }
 }
@@ -282,6 +304,10 @@ impl PackChannel for WsChannel {
 
     async fn subscribe(&mut self, pack: Pack) -> Result<Subscription, SdkError> {
         self.link.subscribe(pack).await
+    }
+
+    async fn send_only(&mut self, pack: Pack) -> Result<(), SdkError> {
+        self.link.send(&pack).await
     }
 }
 

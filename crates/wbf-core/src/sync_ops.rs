@@ -176,87 +176,110 @@ impl Core {
             true => None,
             false => cache.read().await.get_cg_seq(&me)?,
         };
-        let mut pulled = 0usize;
-        let mut written = 0usize;
-        let mut batches = 0u32;
-        let mut skipped_without_room = 0usize;
-        let mut on_batch = |meta: &wbf_sdk::protocol::BatchMeta,
-                            raws: Vec<serde_json::Value>|
-         -> Result<(), wbf_sdk::SdkError> {
-            batches += 1;
-            pulled += raws.len();
-            // Recent 的事件自帶 `room_id`。🚫 沒帶的不猜、不寫——猜錯會落到 room
-            // "unknown"，之後查不到（PR #13 審查 salvia🟢2）。一個 Batch 寫一次 DB。
-            let (with_room, without_room): (Vec<_>, Vec<_>) = raws.into_iter().partition(|raw| {
-                raw.get("room_id")
-                    .and_then(|value| value.as_str())
-                    .is_some()
-            });
-            skipped_without_room += without_room.len();
-            // `upsert_events` 一次一個房間：照 room_id 分組，原樣寫（這條路不解密，local-cache-db.md §7.2）。
-            let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
-                std::collections::BTreeMap::new();
-            for raw in with_room {
-                let room = raw
-                    .get("room_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                by_room
-                    .entry(room)
-                    .or_default()
-                    .push(IncomingEvent::from_ws_json(raw));
-            }
-            // ⚠️ 這個回呼是**同步**的（SDK 的收批介面），而 `written` 要的是真的寫進去幾則，
-            // 所以走 `run_blocking`：排進同一條 queue、等它 commit。
-            // ⭐ 阻塞的程度跟以前一樣（以前也是在這裡同步寫），換到的是「順序與水位由一個地方管」。
-            let me_here = me.clone();
-            written += cache
-                .run_blocking(move |cache| {
-                    let mut written_here = 0usize;
-                    for (room, events) in &by_room {
-                        written_here += cache.upsert_events(&me_here, room, events)?;
-                    }
-                    Ok(written_here)
-                })
-                .map_err(|error| wbf_sdk::SdkError::Usage(error.message))?;
-            self.events.progress(format!(
-                "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",
-                meta.bc, meta.tc, meta.r, meta.fs, meta.ls
-            ));
-            Ok(())
-        };
-        let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
-        if skipped_without_room > 0 {
-            self.events.progress(format!(
-                "recent: skipped {skipped_without_room} event(s) without room_id"
-            ));
-        }
-        if let Some(new_cg_seq) = summary.new_cg_seq {
-            // 🚨 水位最後才推進，而且**跟事件走同一條 queue** —— 這樣「事件還沒寫進去、
-            // 水位卻前進了」不可能發生（daemon-runtime §2.3）。
-            let me_here = me.clone();
-            cache
-                .run(move |cache| cache.set_cg_seq(&me_here, new_cg_seq))
-                .await?;
-        }
-        if !summary.caught_up {
-            self.events.progress(format!(
-                "recent: stopped at the {} event limit; older events (below g_seq {:?}) are not in the cache yet",
-                summary.events, summary.last_ls
-            ));
-        }
-        Ok(RecentSummary {
-            pulled,
-            written,
-            windows: summary.windows,
-            batches,
-            caught_up: summary.caught_up,
-            cg_seq_before: cg_seq,
-            cg_seq_after: summary.new_cg_seq.or(cg_seq),
-            skipped_without_room,
-        })
+        pull_recent(&mut client, &cache, &self.events, &me, cg_seq, plan).await
     }
+}
+
+/// 補窗 job（`sync.recent` 與 `room_sync` 共用）：從 `cg_seq` 起一窗一窗拉、每批寫一次 DB、最後才推水位。
+///
+/// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（server 的 pack-pipeline §6.4）；下次再跑會從水位重來。
+///
+/// Args:
+///     client: 已經 hello 過的線（`Recent` 要 `recent` feature）
+///     cg_seq: 起點；None ＝ 沒有快取，從最新拿, example: Some(4700)
+///     plan: 總量／一窗幾則／一批幾則, example: RecentPlan { max_events: Some(1000), window: 320, batch: None }
+/// Return:
+///     Ok(RecentSummary)   `caught_up: false` ＝ 撞到總量停下
+///     Err(Network)        線死了
+///     Err(Server)         server 拒
+pub(crate) async fn pull_recent(
+    client: &mut wbf_sdk::client::WbfClient<wbf_sdk::channel::Channel>,
+    cache: &std::sync::Arc<crate::server_cache::ServerCache>,
+    events: &crate::event::EventSink,
+    me: &str,
+    cg_seq: Option<i64>,
+    plan: RecentPlan,
+) -> Result<RecentSummary, CoreError> {
+    let mut pulled = 0usize;
+    let mut written = 0usize;
+    let mut batches = 0u32;
+    let mut skipped_without_room = 0usize;
+    let mut on_batch = |meta: &wbf_sdk::protocol::BatchMeta,
+                        raws: Vec<serde_json::Value>|
+     -> Result<(), wbf_sdk::SdkError> {
+        batches += 1;
+        pulled += raws.len();
+        // Recent 的事件自帶 `room_id`。🚫 沒帶的不猜、不寫——猜錯會落到 room
+        // "unknown"，之後查不到（PR #13 審查 salvia🟢2）。一個 Batch 寫一次 DB。
+        let (with_room, without_room): (Vec<_>, Vec<_>) = raws.into_iter().partition(|raw| {
+            raw.get("room_id")
+                .and_then(|value| value.as_str())
+                .is_some()
+        });
+        skipped_without_room += without_room.len();
+        // `upsert_events` 一次一個房間：照 room_id 分組，原樣寫（這條路不解密，local-cache-db.md §7.2）。
+        let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
+            std::collections::BTreeMap::new();
+        for raw in with_room {
+            let room = raw
+                .get("room_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            by_room
+                .entry(room)
+                .or_default()
+                .push(IncomingEvent::from_ws_json(raw));
+        }
+        // ⚠️ 這個回呼是**同步**的（SDK 的收批介面），而 `written` 要的是真的寫進去幾則，
+        // 所以走 `run_blocking`：排進同一條 queue、等它 commit。
+        // ⭐ 阻塞的程度跟以前一樣（以前也是在這裡同步寫），換到的是「順序與水位由一個地方管」。
+        let me_here = me.to_string();
+        written += cache
+            .run_blocking(move |cache| {
+                let mut written_here = 0usize;
+                for (room, events) in &by_room {
+                    written_here += cache.upsert_events(&me_here, room, events)?;
+                }
+                Ok(written_here)
+            })
+            .map_err(|error| wbf_sdk::SdkError::Usage(error.message))?;
+        events.progress(format!(
+            "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",
+            meta.bc, meta.tc, meta.r, meta.fs, meta.ls
+        ));
+        Ok(())
+    };
+    let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
+    if skipped_without_room > 0 {
+        events.progress(format!(
+            "recent: skipped {skipped_without_room} event(s) without room_id"
+        ));
+    }
+    if let Some(new_cg_seq) = summary.new_cg_seq {
+        // 🚨 水位最後才推進，而且**跟事件走同一條 queue** —— 這樣「事件還沒寫進去、
+        // 水位卻前進了」不可能發生（daemon-runtime §2.3）。
+        let me_here = me.to_string();
+        cache
+            .run(move |cache| cache.set_cg_seq(&me_here, new_cg_seq))
+            .await?;
+    }
+    if !summary.caught_up {
+        events.progress(format!(
+            "recent: stopped at the {} event limit; older events (below g_seq {:?}) are not in the cache yet",
+            summary.events, summary.last_ls
+        ));
+    }
+    Ok(RecentSummary {
+        pulled,
+        written,
+        windows: summary.windows,
+        batches,
+        caught_up: summary.caught_up,
+        cg_seq_before: cg_seq,
+        cg_seq_after: summary.new_cg_seq.or(cg_seq),
+        skipped_without_room,
+    })
 }
 
 /// `watch` 的模式字串 → [`WatchMode`]。
