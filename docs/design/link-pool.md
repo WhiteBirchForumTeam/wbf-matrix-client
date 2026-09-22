@@ -58,8 +58,9 @@
   🚨 **命令做到一半死了不重做**：錯誤原樣回呼叫端（`Network`），要不要重來是呼叫端的事（跟 1506 的原則一樣：重送是 UI 的）。
   ⭐ 這條跟維護者說的「萬一斷掉，就主動打開再執行 RPC 要的命令」一致：是**這次 RPC 開頭**發現死了就重開，不是替上一個死掉的 RPC 補做。
 - **訂閱線**（`Subscriptions`）：`Idle` 到收到訂閱命令為止；死了也是 `Dead` 躺著，**下一個訂閱命令**來才重開＋重訂。訂閱的內容（訂了哪些房、`cd_seq` 在哪）
-  🚫 不歸池管——池只管 socket。📌 2026-09-22 起房間那半在 `room-sync.md`：`Core::start_room_sync` 就是那個「訂閱命令」（它拿這條線、訂、補窗、放手給背景 task）；
-  金鑰那半（`Device/Subscribe`）是下一支，同一條線上另一個會話。
+  🚫 不歸池管——池只管 socket。📌 2026-09-22 起（維護者定）開線多一步通用的 `Core::init_connection(account, role, client)`：hello 之後看角色，`Subscriptions` 就在這裡送 `Event/Subscribe`、
+  起收推播的 task（`room-sync.md`）；所以「開這條線」＝「訂了」，重開就重訂。`Core::open_subscriptions`／`close_subscriptions` 是開／關它的入口（還沒接 RPC）。
+  金鑰那半（`Device/Subscribe`）是下一支，`init_connection` 裡多一個會話。
 - **登出**（維護者 2026-09-21 定）：登出的 RPC 就是一次 HTTP `/logout`（或 fallback 到 matrix-sdk），**只有成與不成**。不成就到此為止，什麼都不動；
   成了就把這個帳號的池**直接關掉、釋放資源**（`close_all`），然後才刪本地的 `session.sealed`、`m/`…。順序：
 

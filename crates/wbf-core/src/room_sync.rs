@@ -1,60 +1,42 @@
-//! 跟上游：一個帳號一個背景 task，在訂閱線上收 `Event/Push` 寫進 `cache.db`（daemon-runtime 第 6／7 階段；
-//! server 的語意在 wbfuwunel `wbf-event-push.md`）。
+//! 訂閱線的內容：房間事件的訂閱與推播寫進 `cache.db`（daemon-runtime 第 6／7 階段；server 的語意在 wbfuwunel `wbf-event-push.md`）。
 //!
-//! 維護者 2026-09-22 定的順序（先純一點，🚫 不接 RPC）：
+//! 維護者 2026-09-22 定的形狀（room-sync.md §0）：
 //!
-//! 1. 讀本地水位 `cg_seq`。
-//! 2. 送 `Event/Subscribe`（帳號層、**不帶 `cg_seq`**）。收到 Ack 就登記完成——server 先登記再回 Ack，之後的每則新事件都會推來。
-//! 3. **補窗是一個 job**：同一條線、同一個 guard，`Recent{cg_seq}` 一窗一窗翻到追平或到起始總量（預設 1000；server 一窗預設 320、上限 500）。
-//! 4. 放掉 guard，背景 task 讀訂閱：**訂閱是純的**——一包來寫一包、水位只往前推到 `fs`、跳號不管。`gap` 就再跑一次同一個補窗 job。
-//! 5. 線死了 task 結束，發 `sync.state: disconnected`；🚫 不背景重連（link-pool.md §3：下一次 `start_room_sync` 重開重訂）。
+//! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Subscriptions` 就送 `Event/Subscribe`、起一個收推播的 task；其他角色不做事。
+//!   線死了、下次要用重開時自然重訂（link-pool.md §3）。
+//! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`、水位往前推到 `fs`。
+//! - **補窗全由 UI 叫 `sync.recent`**（冪等、隨時可叫）：UI 看回應的 `caught_up` 決定要不要再叫。daemon 沒有補窗 job、不發任何「有洞」的訊號。
+//! - daemon 唯一要守的：**水位不能跨過洞**（§2）——不然 UI 下次從水位起 `Recent`，洞就永遠補不回來。
 //!
-//! 事件跟 `Recent` 那條路一樣**原樣**寫（密文不解，local-cache-db.md §7.2），commit 之後才發 `room.message`（PR #32 的規矩）。
+//! 事件跟 `Recent` 那條路一樣**原樣**寫（密文不解，local-cache-db.md §7.2）；訂閱是純的，`seq` 跳號不管、`Subscribe` 不帶 `cg_seq`。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
-
-use wbf_sdk::client::RoomSubscription;
+use wbf_sdk::channel::Channel;
+use wbf_sdk::client::{RoomSubscription, WbfClient};
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::protocol::EventSubscribeReply;
-use wbf_sdk::{IncomingEvent, RecentPlan, Transport};
+use wbf_sdk::{IncomingEvent, Transport};
 
 use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
-use crate::error::{CoreError, CoreErrorKind};
-use crate::event::{EventSink, SyncState};
-use crate::link_pool::{LinkPool, LinkRole};
+use crate::error::CoreError;
+use crate::event::{EventSink, LinkState};
+use crate::link_pool::LinkRole;
 use crate::server_cache::ServerCache;
-use crate::sync_ops::{pull_recent, RecentSummary};
 use crate::{Core, CoreEvent, Target};
 
-/// 起始同步最多拿幾則（維護者 2026-09-22：「先建議短一點，可能設一千試試」）。到了還沒追平就停，水位仍推到最新；更舊的留給翻歷史。
-pub const STARTUP_SYNC_MAX_EVENTS: u64 = 1000;
-
-/// 等 `Subscribe` 的 Ack、等 `Unsubscribe` 的 Ack 最久多久。
+/// 等 `Subscribe` 的 Ack 最久多久。
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// 訂閱 task 每次等推播最久多久：到了只是「這段時間沒事」，繼續等（心跳另外在線上跑）。
 const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 關訂閱線時等 task 收攤最久多久；不肯就 abort。
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `start_room_sync` 的結果：訂到了什麼、補窗補了多少。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RoomSyncStart {
-    pub user: String,
-    /// server 在 Ack 那一刻最新的 `g_seq`。
-    pub latest_g_seq: i64,
-    /// 訂閱進了幾房、跳過哪些（不是成員的）。
-    pub joined: u32,
-    pub skipped: Vec<String>,
-    /// 補窗 job 的摘要（`caught_up: false` ＝ 到了起始總量還沒追平）。
-    pub recent: RecentSummary,
-}
-
-/// 一個帳號的跟上游 task。丟掉就 abort（`Core` 丟掉時）。
+/// 一個帳號的收推播 task。丟掉就 abort（`Core` 丟掉、或線重開換新的一個）。
 pub(crate) struct RoomSyncHandle {
     task: tokio::task::JoinHandle<()>,
-    /// 叫它說出口地退訂再結束（`stop_room_sync`）。
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -64,127 +46,107 @@ impl Drop for RoomSyncHandle {
     }
 }
 
-/// task 自己握著的東西——🚫 不握 `Core`（task 是 `'static` 的）。補 gap 時要線就跟池要；線死了池會叫 opener，
-/// 而這裡的 opener 一律回錯：線死了訂閱也死了，task 本來就該結束（重開是下一次 `start_room_sync` 的事）。
+/// task 自己握著的東西——🚫 不握 `Core`（task 是 `'static`），也不握線（線在池裡；訂閱是線上的一個會話，guard 放掉之後線照樣能用）。
 struct RoomSyncTask {
     me: String,
-    pool: Arc<LinkPool>,
     cache: Arc<ServerCache>,
     events: EventSink,
-    plan: RecentPlan,
+    /// §2：有洞時是那包的 `fs`——水位凍在洞之前，直到看到水位被 `Recent` 推過它。
+    hole_before: Option<i64>,
 }
 
 impl Core {
-    /// 跟上游（模組註解的 1–4 步），回來時補窗 job 已經做完、背景 task 已經在收推播。
+    /// 池開完一條線的通用初始化（維護者 2026-09-22）：看角色決定還要做什麼。
+    ///
+    /// | 角色 | 做什麼 |
+    /// |---|---|
+    /// | `Subscriptions` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了） |
+    /// | 其他 | 不做事 |
     ///
     /// Args:
-    ///     max_events: 起始同步最多拿幾則；None 用 [`STARTUP_SYNC_MAX_EVENTS`], example: Some(1000)
+    ///     role: 這條線的角色, example: LinkRole::Subscriptions
+    ///     client: 已經 hello 過的線
     /// Return:
-    ///     Ok(RoomSyncStart)
-    ///     Err(AccountBusy)   這個帳號已經在跟了
-    ///     Err(Usage)         沒登入、不是 wbf server（訂閱只有 wbf 講得出來）
-    ///     Err(Network)       線開不起來、Ack 沒等到
-    pub async fn start_room_sync(
-        &self,
-        max_events: Option<u64>,
-        target: &Target,
-    ) -> Result<RoomSyncStart, CoreError> {
-        let account = self.account_or_current(target)?;
-        self.start_room_sync_with(&account, max_events, || {
-            self.open_link(&account, LinkRole::Subscriptions)
-        })
-        .await
-    }
-
-    /// 同上，開線的方式由呼叫端給（測試用記憶體對接；生產路徑就是 `open_link`）。
-    pub(crate) async fn start_room_sync_with<F, Fut>(
+    ///     Ok(())
+    ///     Err(Network)    Ack 沒等到、線死了（池就當這條沒開成）
+    ///     Err(Server)     server 拒
+    pub(crate) async fn init_connection(
         &self,
         account: &AccountDir,
-        max_events: Option<u64>,
-        open: F,
-    ) -> Result<RoomSyncStart, CoreError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<
-            Output = Result<wbf_sdk::client::WbfClient<wbf_sdk::channel::Channel>, CoreError>,
-        >,
-    {
-        if self.is_room_syncing(account) {
-            return Err(CoreError::new(
-                CoreErrorKind::AccountBusy,
-                format!("{} is already following its homeserver", account.label()),
-            ));
+        role: LinkRole,
+        client: &mut WbfClient<Channel>,
+    ) -> Result<(), CoreError> {
+        if role != LinkRole::Subscriptions {
+            return Ok(());
         }
-        // 訂閱只有 wbf 講得出來：這一步替我們做「這台講不講 wbf」的判斷（不講就是 Usage）。
-        let speaks_wbf = self.get_backend_kind(account).await == crate::BackendKind::WbfSdk;
-        crate::get_backend_for(Transport::WebSocket, speaks_wbf, MethodHome::WbfSdkOnly)?;
         let (cache, me) = self.server_cache_and_me(account)?;
-        let pool = self.pool_of_account(account)?;
-        let plan = RecentPlan {
-            max_events: Some(max_events.unwrap_or(STARTUP_SYNC_MAX_EVENTS)),
-            ..RecentPlan::default()
-        };
-
-        // 1. 水位。
-        let cg_seq = cache.read().await.get_cg_seq(&me)?;
-        self.events.emit(CoreEvent::SyncState {
-            user: me.clone(),
-            state: SyncState::CatchingUp,
-            cg_seq,
-        });
-        // 2. 訂閱（先登記，之後的新事件都會推來）。
-        let mut client = pool.acquire(LinkRole::Subscriptions, open).await?;
         let subscription = client.room_subscription(None, ACK_TIMEOUT).await?;
-        // 3. 補窗 job：同一條線、同一個 guard。
-        let recent = pull_recent(&mut client, &cache, &self.events, &me, cg_seq, plan).await?;
-        drop(client);
-        self.events.emit(CoreEvent::SyncState {
-            user: me.clone(),
-            state: SyncState::CaughtUp,
-            cg_seq: recent.cg_seq_after,
-        });
-
-        let start = RoomSyncStart {
-            user: me.clone(),
-            latest_g_seq: subscription.ack.latest_g_seq,
-            joined: subscription.ack.joined,
-            skipped: subscription.ack.skipped.clone(),
-            recent,
-        };
-        // 4. 放手：背景 task 收推播。
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = RoomSyncTask {
             me,
-            pool,
             cache,
             events: self.events.clone(),
-            plan,
+            hole_before: None,
         };
         let handle = RoomSyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
             stop: Some(stop),
         };
-        let previous = self
+        // 舊的（線死了留下來的）在這裡被 Drop、abort。
+        let _previous = self
             .room_syncs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
-        // 上面已經擋過「在跟」；還是有一個的話（兩個 start 同時進來）收掉舊的，🚫 不讓兩個 task 寫同一份水位。
-        drop(previous);
-        Ok(start)
+        Ok(())
     }
 
-    /// 停止跟上游：叫 task 說出口地退訂（`Event/Unsubscribe`）再結束。線本身留在池裡。
+    /// 開訂閱線（開的時候 `init_connection` 就訂了）。已經開著就是 no-op。
     ///
     /// Return:
-    ///     Ok(true)    本來在跟，停了
-    ///     Ok(false)   本來就沒在跟
-    pub async fn stop_room_sync(&self, target: &Target) -> Result<bool, CoreError> {
+    ///     Ok(())
+    ///     Err(Usage)      沒登入、不是 wbf server（訂閱只有 wbf 講得出來）
+    ///     Err(Network)    線開不起來、Ack 沒等到
+    pub async fn open_subscriptions(&self, target: &Target) -> Result<(), CoreError> {
         let account = self.account_or_current(target)?;
-        Ok(self.stop_room_sync_of(&account).await)
+        let _line = self
+            .client_of(
+                &account,
+                Transport::WebSocket,
+                MethodHome::WbfSdkOnly,
+                LinkRole::Subscriptions,
+            )
+            .await?;
+        Ok(())
     }
 
-    /// 同上，給登出用（登出接著會關線，退不退訂都一樣；這裡只是把 task 收乾淨）。
+    /// 關訂閱線：先收 task，再關線（斷線 server 自動退訂）。
+    ///
+    /// Return:
+    ///     Ok(true)    本來開著，關了
+    ///     Ok(false)   本來就沒開
+    pub async fn close_subscriptions(&self, target: &Target) -> Result<bool, CoreError> {
+        let account = self.account_or_current(target)?;
+        self.stop_room_sync_of(&account).await;
+        let pool = self
+            .link_pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account.dir)
+            .cloned();
+        Ok(match pool {
+            Some(pool) => {
+                pool.close(LinkRole::Subscriptions, "closed on request")
+                    .await
+            }
+            None => false,
+        })
+    }
+
+    /// 收掉這個帳號的收推播 task（關線、登出用）。
+    ///
+    /// Return:
+    ///     bool  true ＝ 本來在跑
     pub(crate) async fn stop_room_sync_of(&self, account: &AccountDir) -> bool {
         let handle = self
             .room_syncs
@@ -194,20 +156,18 @@ impl Core {
         let Some(mut handle) = handle else {
             return false;
         };
-        // task 自己已經結束（線死了）：只是把 handle 收掉，🚫 不算「本來在跟」。
         if handle.task.is_finished() {
             return false;
         }
         if let Some(stop) = handle.stop.take() {
             let _ = stop.send(());
         }
-        // 給它 ACK_TIMEOUT 說再見；不肯就 abort（Drop）。
-        let _ = tokio::time::timeout(ACK_TIMEOUT, &mut handle.task).await;
+        let _ = tokio::time::timeout(STOP_TIMEOUT, &mut handle.task).await;
         true
     }
 
     /// Return:
-    ///     bool  true ＝ 這個帳號的跟上游 task 還在
+    ///     bool  true ＝ 這個帳號的收推播 task 還在
     pub(crate) fn is_room_syncing(&self, account: &AccountDir) -> bool {
         self.room_syncs
             .lock()
@@ -219,49 +179,52 @@ impl Core {
 
 impl RoomSyncTask {
     async fn run(
-        self,
+        mut self,
         mut subscription: RoomSubscription,
         mut stopped: tokio::sync::oneshot::Receiver<()>,
     ) {
         // Ack 之前就推來的：跟之後的一樣處理。
         let early: Vec<_> = subscription.early_pushes.drain(..).collect();
-        let mut need_recent = false;
         for (meta, events) in early {
-            need_recent |= self.on_push(meta.fs, meta.gap, events);
+            self.on_push(meta.fs, meta.gap, events).await;
         }
         loop {
-            if need_recent || subscription.take_gap() {
-                need_recent = false;
-                self.fill_gap().await;
+            // 本地收件匣滿過＝丟過包：跟 server 的 gap 一樣，洞在現在的水位之後、還沒處理的包之前。
+            if subscription.take_gap() {
+                self.freeze_before_next_push().await;
             }
             let next = tokio::select! {
-                _ = &mut stopped => {
-                    self.unsubscribe(subscription).await;
-                    return;
-                }
+                _ = &mut stopped => return,
                 next = subscription.next(PUSH_IDLE_TIMEOUT) => next,
             };
             match next {
                 Ok(Some(EventSubscribeReply::Push { meta, events })) => {
-                    need_recent = self.on_push(meta.fs, meta.gap, events);
+                    self.on_push(meta.fs, meta.gap, events).await;
                 }
                 // 金鑰那支才消費；這裡只確認它不會把 task 弄死。
-                Ok(Some(EventSubscribeReply::DeviceChanged(_))) => {}
-                Ok(Some(EventSubscribeReply::Acknowledged(_)))
+                Ok(Some(EventSubscribeReply::DeviceChanged(_)))
+                | Ok(Some(EventSubscribeReply::Acknowledged(_)))
                 | Ok(Some(EventSubscribeReply::Unsubscribed { .. })) => {}
                 Err(wbf_sdk::SdkError::Timeout(_)) => {}
-                // 一包壞了就是漏一包：補一次。
+                // 一包壞了就是漏一包：當成洞，水位凍住到 UI 補過為止。
                 Err(wbf_sdk::SdkError::Protocol(why)) => {
                     self.events.progress(format!(
-                        "room sync: a push could not be read ({why}); refilling"
+                        "room sync: a push could not be read ({why}); the watermark is frozen until the next sync.recent"
                     ));
-                    need_recent = true;
+                    self.freeze_before_next_push().await;
                 }
                 Ok(None) | Err(_) => {
-                    self.events.emit(CoreEvent::SyncState {
+                    let why = match next {
+                        Ok(None) => "the server ended the subscription".to_string(),
+                        Err(error) => error.to_string(),
+                        Ok(Some(_)) => unreachable!("handled above"),
+                    };
+                    // 線死了池要到下次取用才發現；這裡先講，UI 不必等。（下次取用時池會再發一次 Closed→Opened。）
+                    self.events.emit(CoreEvent::Link {
                         user: self.me.clone(),
-                        state: SyncState::Disconnected,
-                        cg_seq: None,
+                        role: LinkRole::Subscriptions,
+                        state: LinkState::Closed,
+                        reason: Some(format!("the room subscription ended: {why}")),
                     });
                     return;
                 }
@@ -269,14 +232,27 @@ impl RoomSyncTask {
         }
     }
 
-    /// 一包：原樣寫進 cache（照房分組）、水位只往前推到 `fs`、commit 之後發 `room.message`。
+    /// 洞在「現在的水位」之後：把凍結點設成現在的水位（之後的包不推，直到 UI 的 `Recent` 推過它）。
+    async fn freeze_before_next_push(&mut self) {
+        let me = self.me.clone();
+        match self.cache.run(move |cache| cache.get_cg_seq(&me)).await {
+            // 沒有水位就沒有洞可跨（UI 的第一次 Recent 從最新拿）。
+            Ok(Some(cg_seq)) => {
+                self.hole_before = Some(self.hole_before.map_or(cg_seq, |hole| hole.max(cg_seq)));
+            }
+            Ok(None) => {}
+            Err(error) => self
+                .events
+                .progress(format!("room sync: cannot read the watermark: {error}")),
+        }
+    }
+
+    /// 一包：原樣寫進 cache（照房分組）、水位往前推到 `fs`、commit 之後發 `room.message`。
     ///
-    /// 🚨 **帶 `gap` 的那包不推水位**：洞在舊水位跟這包之間，先推到 `fs` 再 `Recent(cg_seq)` 就會跨過它（server 的 `Recent` 只給比 `cg_seq` 新的）。
-    /// 事件照樣寫（冪等），水位由補窗 job 推（它拿舊水位起、推到第一窗的 `fs`，這包也在那窗裡）。
-    ///
-    /// Return:
-    ///     bool  true ＝ 這包說有洞（`gap`），呼叫端補窗
-    fn on_push(&self, fs: i64, gap: bool, events: Vec<serde_json::Value>) -> bool {
+    /// 🚨 §2 **水位不能跨過洞**：帶 `gap` 的包把凍結點設成它的 `fs`（洞在舊水位跟它之間），這包與**之後的**包都不推水位，
+    /// 直到看到水位已經 ≥ 凍結點——那只可能是 UI 叫的 `sync.recent` 推的（它從舊水位起、推到那一刻最新的 `fs`），洞補過了才解凍。
+    /// 判斷跟寫入在同一個 cache 工作裡，跟 `Recent` 的寫入排同一條 queue，🚫 不靠時序。
+    async fn on_push(&mut self, fs: i64, gap: bool, events: Vec<serde_json::Value>) {
         let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
             std::collections::BTreeMap::new();
         let mut skipped = 0usize;
@@ -295,7 +271,7 @@ impl RoomSyncTask {
                 "room sync: skipped {skipped} pushed event(s) without room_id"
             ));
         }
-        // 通知給折好的訊息（自己送的也發，呼叫端自己濾）；庫裡存原樣。
+        // 通知給折好的訊息（自己送的也發，收的人自己濾）；庫裡存原樣。
         let notices: Vec<CoreEvent> = by_room
             .iter()
             .flat_map(|(room, events)| {
@@ -308,96 +284,44 @@ impl RoomSyncTask {
             })
             .collect();
         let me = self.me.clone();
-        self.cache.post(
-            move |cache| {
+        let hole_before = self.hole_before;
+        let written = self
+            .cache
+            .run(move |cache| {
                 for (room, events) in &by_room {
                     cache.upsert_events(&me, room, events)?;
                 }
-                // 🚨 水位跟事件同一條 queue、同一個順序：事件還沒落地水位就前進的事不會發生。有洞的那包不推（上面的註解）。
-                if fs > 0 && !gap {
+                let hole_before = match (gap, hole_before) {
+                    (true, hole) => Some(hole.map_or(fs, |hole| hole.max(fs))),
+                    (false, Some(hole)) => {
+                        // 水位到了凍結點以上，只可能是 Recent 推的：洞補過了，解凍。
+                        if cache.get_cg_seq(&me)?.is_some_and(|cg_seq| cg_seq >= hole) {
+                            None
+                        } else {
+                            Some(hole)
+                        }
+                    }
+                    (false, None) => None,
+                };
+                if hole_before.is_none() && fs > 0 {
                     cache.advance_cg_seq(&me, fs)?;
                 }
-                Ok(())
-            },
-            notices,
-        );
-        gap
-    }
-
-    /// 補窗：跟池要線（死了就不補——訂閱也死了，`run` 下一輪會結束）。
-    async fn fill_gap(&self) {
-        let line = self
-            .pool
-            .acquire(LinkRole::Subscriptions, || async {
-                Err(CoreError::new(
-                    CoreErrorKind::Network,
-                    "the subscription line is gone; the room sync ends and must be started again",
-                ))
+                Ok(hole_before)
             })
             .await;
-        let mut client = match line {
-            Ok(client) => client,
-            Err(error) => {
-                self.events
-                    .progress(format!("room sync: cannot refill after a gap: {error}"));
-                return;
+        match written {
+            Ok(hole_before) => {
+                self.hole_before = hole_before;
+                // commit 之後才發（PR #32 的規矩）。
+                for notice in notices {
+                    self.events.emit(notice);
+                }
             }
-        };
-        let cg_seq = match self.cache.read().await.get_cg_seq(&self.me) {
-            Ok(cg_seq) => cg_seq,
-            Err(error) => {
-                self.events
-                    .progress(format!("room sync: cannot read the watermark: {error}"));
-                return;
-            }
-        };
-        self.events.emit(CoreEvent::SyncState {
-            user: self.me.clone(),
-            state: SyncState::CatchingUp,
-            cg_seq,
-        });
-        let outcome = pull_recent(
-            &mut client,
-            &self.cache,
-            &self.events,
-            &self.me,
-            cg_seq,
-            self.plan,
-        )
-        .await;
-        match outcome {
-            Ok(summary) => self.events.emit(CoreEvent::SyncState {
-                user: self.me.clone(),
-                state: SyncState::CaughtUp,
-                cg_seq: summary.cg_seq_after,
-            }),
+            // 寫失敗只報不擋（快取壞了的代價是重拉）；沒落地的就不通知。
             Err(error) => self
                 .events
-                .progress(format!("room sync: refill after a gap failed: {error}")),
+                .progress(format!("room sync: cache write failed (ignored): {error}")),
         }
-    }
-
-    async fn unsubscribe(&self, subscription: RoomSubscription) {
-        let line = self
-            .pool
-            .acquire(LinkRole::Subscriptions, || async {
-                Err(CoreError::new(
-                    CoreErrorKind::Network,
-                    "the subscription line is gone (nothing to unsubscribe from)",
-                ))
-            })
-            .await;
-        if let Ok(mut client) = line {
-            if let Err(error) = client.room_unsubscribe(subscription, ACK_TIMEOUT).await {
-                self.events
-                    .progress(format!("room sync: unsubscribe did not complete: {error}"));
-            }
-        }
-        self.events.emit(CoreEvent::SyncState {
-            user: self.me.clone(),
-            state: SyncState::Disconnected,
-            cg_seq: None,
-        });
     }
 }
 
@@ -411,13 +335,13 @@ mod tests {
     use wbf_sdk::client::WbfClient;
     use wbf_sdk::login::{Session, SessionBackend};
     use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
-    use wbf_sdk::WsLink;
+    use wbf_sdk::{RecentPlan, Transport, WsLink};
     use wbf_wire::pack::{control, event, flags};
     use wbf_wire::{Kind, Pack};
 
     use crate::accounts::AccountDir;
-    use crate::error::CoreErrorKind;
-    use crate::event::SyncState;
+    use crate::event::LinkState;
+    use crate::link_pool::LinkRole;
     use crate::{Core, CoreEvent, Target};
 
     const DEAD: &str = "http://127.0.0.1:1";
@@ -465,6 +389,12 @@ mod tests {
         })
     }
 
+    fn g_seq_of(event: &Value) -> i64 {
+        event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY]
+            .as_i64()
+            .unwrap()
+    }
+
     fn length_prefixed(events: &[Value]) -> Vec<u8> {
         let mut data = Vec::new();
         for event in events {
@@ -489,14 +419,7 @@ mod tests {
 
     /// 一包推播（server → client）：`fs`＝最新那則的 `g_seq`。
     fn push(subscription_id: u64, seq: u32, gap: bool, events: &[Value]) -> Pack {
-        let seqs: Vec<i64> = events
-            .iter()
-            .map(|event| {
-                event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY]
-                    .as_i64()
-                    .unwrap()
-            })
-            .collect();
+        let seqs: Vec<i64> = events.iter().map(g_seq_of).collect();
         response(
             Kind::Event,
             event::PUSH,
@@ -509,32 +432,19 @@ mod tests {
     }
 
     /// 假的 server 端：答 Hello、Subscribe、Recent（照 `cg_seq` 給比它新的，一窗一個 Batch）、Unsubscribe；
-    /// 測試從 `outbound` 塞 server 主動推的包。記下每次 `Recent` 帶的 `cg_seq` 與訂閱的 id。
+    /// 測試從 `outbound` 塞 server 主動推的包。記下每次 `Recent` 帶的 `cg_seq` 與訂閱的 id。事件清單可以跟別條線共用。
     struct FakeServer {
-        events: Arc<Mutex<Vec<Value>>>,
         recent_requests: Arc<Mutex<Vec<Option<i64>>>>,
         subscription_id: Arc<Mutex<Option<u64>>>,
-        unsubscribed: Arc<Mutex<bool>>,
-        /// true ＝ 扣住 `Recent` 的回覆（收到請求、記下來、但先不答），給「補窗還沒完成時水位在哪」的斷言用。
-        hold_recent: Arc<Mutex<bool>>,
         outbound: tokio::sync::mpsc::Sender<Pack>,
         task: tokio::task::JoinHandle<()>,
     }
 
-    fn start_fake_server(mut peer: MemoryEnd) -> FakeServer {
-        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value>>>) -> FakeServer {
         let recent_requests = Arc::new(Mutex::new(Vec::new()));
         let subscription_id = Arc::new(Mutex::new(None));
-        let unsubscribed = Arc::new(Mutex::new(false));
-        let hold_recent = Arc::new(Mutex::new(false));
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel::<Pack>(16);
-        let (events_t, recents_t, sub_t, unsub_t, hold_t) = (
-            events.clone(),
-            recent_requests.clone(),
-            subscription_id.clone(),
-            unsubscribed.clone(),
-            hold_recent.clone(),
-        );
+        let (recents_t, sub_t) = (recent_requests.clone(), subscription_id.clone());
         let task = tokio::spawn(async move {
             loop {
                 let pack = tokio::select! {
@@ -570,13 +480,11 @@ mod tests {
                     ),
                     (Kind::Event, event::SUBSCRIBE) => {
                         *sub_t.lock().unwrap() = Some(pack.id);
-                        let latest = events_t
+                        let latest = events
                             .lock()
                             .unwrap()
                             .iter()
-                            .filter_map(|event| {
-                                event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY].as_i64()
-                            })
+                            .map(g_seq_of)
                             .max()
                             .unwrap_or(0);
                         response(
@@ -588,57 +496,36 @@ mod tests {
                             Vec::new(),
                         )
                     }
-                    (Kind::Event, event::UNSUBSCRIBE) => {
-                        *unsub_t.lock().unwrap() = true;
-                        response(
-                            Kind::Control,
-                            control::ACK,
-                            pack.id,
-                            pack.seq,
-                            json!({}),
-                            Vec::new(),
-                        )
-                    }
+                    (Kind::Event, event::UNSUBSCRIBE) => response(
+                        Kind::Control,
+                        control::ACK,
+                        pack.id,
+                        pack.seq,
+                        json!({}),
+                        Vec::new(),
+                    ),
                     (Kind::Event, event::RECENT) => {
                         let meta: Value = serde_json::from_slice(&pack.meta).unwrap();
                         let cg_seq = meta["cg_seq"].as_i64();
                         let before = meta["before"].as_i64();
                         let limit = meta["limit"].as_u64().unwrap_or(320) as usize;
                         recents_t.lock().unwrap().push(cg_seq);
-                        while *hold_t.lock().unwrap() {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                        let mut window: Vec<Value> = events_t
+                        let mut window: Vec<Value> = events
                             .lock()
                             .unwrap()
                             .iter()
                             .filter(|event| {
-                                let g_seq = event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY]
-                                    .as_i64()
-                                    .unwrap();
+                                let g_seq = g_seq_of(event);
                                 cg_seq.is_none_or(|cg_seq| g_seq > cg_seq)
                                     && before.is_none_or(|before| g_seq < before)
                             })
                             .cloned()
                             .collect();
                         // 新到舊，最多 `limit` 則。
-                        window.sort_by_key(|event| {
-                            std::cmp::Reverse(
-                                event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY]
-                                    .as_i64()
-                                    .unwrap(),
-                            )
-                        });
+                        window.sort_by_key(|event| std::cmp::Reverse(g_seq_of(event)));
                         let more = window.len() > limit;
                         window.truncate(limit);
-                        let seqs: Vec<i64> = window
-                            .iter()
-                            .map(|event| {
-                                event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY]
-                                    .as_i64()
-                                    .unwrap()
-                            })
-                            .collect();
+                        let seqs: Vec<i64> = window.iter().map(g_seq_of).collect();
                         response(
                             Kind::Event,
                             event::BATCH,
@@ -655,34 +542,23 @@ mod tests {
             }
         });
         FakeServer {
-            events,
             recent_requests,
             subscription_id,
-            unsubscribed,
-            hold_recent,
             outbound,
             task,
         }
     }
 
-    /// 記憶體對接的線，已經 hello 過（生產路徑的 `open_link` 也是開完就 hello）。
-    async fn memory_client_with_hello() -> (WbfClient<Channel>, FakeServer) {
+    /// 記憶體對接的線，已經 hello 過（生產路徑的 `open_link` 也是開完就 hello、再 `init_connection`）。
+    async fn memory_client_with_hello(
+        events: Arc<Mutex<Vec<Value>>>,
+    ) -> (WbfClient<Channel>, FakeServer) {
         let (client_end, server_end) = memory_pair(64);
-        let fake = start_fake_server(server_end);
+        let fake = start_fake_server(server_end, events);
         let link = WsLink::start(client_end.source, client_end.sink, wbf_sdk::no_hook());
         let mut client = WbfClient::new(Channel::WebSocket(Box::new(WsChannel::from_link(link))));
         client.hello("room-sync test", &[]).await.unwrap();
         (client, fake)
-    }
-
-    async fn wait_for<F: FnMut() -> bool>(mut condition: F, what: &str) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !condition() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
     }
 
     async fn wait_for_async<F, Fut>(mut condition: F, what: &str)
@@ -713,149 +589,204 @@ mod tests {
         ids
     }
 
-    /// 模組註解的 1–5 步，對著假 server 走一遍：訂閱 → 補窗（拿到 5 則、水位到最新）→ 推播寫進去、水位前進、`room.message` 在 commit 之後 →
-    /// 帶 `gap` 的包觸發 `Recent(舊水位)` 把洞補回來 → 說出口地退訂。
+    async fn next_message(seen: &mut tokio::sync::broadcast::Receiver<CoreEvent>) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let CoreEvent::Message { message, .. } = seen.recv().await.unwrap() {
+                    return message.id;
+                }
+            }
+        })
+        .await
+        .expect("a room.message arrives")
+    }
+
+    /// 模組註解的形狀，對著假 server 走一遍：`init_connection` 訂了、🚫 沒補窗 → 推一包寫進去、水位前進、`room.message` 在 commit 之後 →
+    /// 帶 gap 的包：寫、水位凍住；**之後正常的包也不推**（不然跨過洞）→ UI 叫 `sync.recent`（從洞之前的水位起）補回洞、推水位 →
+    /// 再來一包才恢復推 → 關訂閱線。
     #[tokio::test]
-    async fn a_room_sync_subscribes_fills_the_window_then_follows_pushes_and_gaps() {
-        let dir = scratch("follow");
+    async fn the_watermark_never_crosses_a_hole_and_refilling_is_the_uis_job() {
+        let dir = scratch("hole");
         let (core, account) = core_with_wbf_account(&dir);
         let mut seen = core.subscribe();
-        let (client, fake) = memory_client_with_hello().await;
-        fake.events
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
+
+        // 池開線的最後一步。
+        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+            .await
+            .expect("subscribe");
+        let subscription_id = fake
+            .subscription_id
             .lock()
             .unwrap()
-            .extend((4701..=4705).map(text_event));
-
-        let start = core
-            .start_room_sync_with(&account, Some(1000), || async move { Ok(client) })
-            .await
-            .expect("subscribe + refill");
-        assert_eq!(start.latest_g_seq, 4705);
-        assert_eq!(start.recent.pulled, 5, "{start:?}");
-        assert!(start.recent.caught_up);
-        assert_eq!(start.recent.cg_seq_after, Some(4705));
-        assert_eq!(cg_seq_of(&core, &account).await, Some(4705));
-        assert_eq!(cached_ids(&core, &account).await.len(), 5);
-        assert_eq!(
-            *fake.recent_requests.lock().unwrap(),
-            vec![None],
-            "第一次沒有水位：從最新拿"
-        );
+            .expect("server got a Subscribe");
         assert!(core.is_room_syncing(&account));
-        // 第二次 start 被擋：一個帳號一個 task。
-        let (another, _fake2) = memory_client_with_hello().await;
-        let error = core
-            .start_room_sync_with(&account, None, || async move { Ok(another) })
-            .await
-            .expect_err("already syncing");
-        assert_eq!(error.kind, CoreErrorKind::AccountBusy);
+        let pool = core.pool_of_account(&account).unwrap();
+        drop(
+            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        assert!(
+            fake.recent_requests.lock().unwrap().is_empty(),
+            "補窗不是 daemon 的事：開線不叫 Recent"
+        );
+        assert_eq!(cg_seq_of(&core, &account).await, None);
 
         // 一包正常的推播：寫進去、水位前進、commit 之後才有 room.message。
-        let subscription_id = fake.subscription_id.lock().unwrap().unwrap();
+        events.lock().unwrap().push(text_event(4801));
         fake.outbound
             .send(push(subscription_id, 0, false, &[text_event(4801)]))
             .await
             .unwrap();
-        let message = loop {
-            match tokio::time::timeout(Duration::from_secs(10), seen.recv())
-                .await
-                .expect("a room.message arrives")
-                .unwrap()
-            {
-                CoreEvent::Message { user, message } => break (user, message),
-                _ => continue,
-            }
-        };
-        assert_eq!(message.0, ME);
-        assert_eq!(message.1.id, "$4801");
-        // 事件在 commit 之後才發，所以此刻庫裡一定有它、水位也已經到了。
+        assert_eq!(next_message(&mut seen).await, "$4801");
         assert!(cached_ids(&core, &account)
             .await
             .contains(&"$4801".to_string()));
         assert_eq!(cg_seq_of(&core, &account).await, Some(4801));
 
-        // 有洞：server 只推了 4900，4850 掉了 → 那包帶 gap → 拿**舊水位** 4801 去 Recent，4850 才補得回來。
-        // 假 server 先扣住 Recent 的回覆：補窗還沒完成時，水位必須還在洞之前（帶 gap 的包不推水位）——不然補窗中途斷線，洞就永遠補不回來。
-        fake.events
+        // 有洞：4850 掉了，server 推 4900 帶 gap → 寫、水位不動。
+        events
             .lock()
             .unwrap()
-            .extend([text_event(4850), text_event(4900)]);
-        *fake.hold_recent.lock().unwrap() = true;
+            .extend([text_event(4850), text_event(4900), text_event(4950)]);
         fake.outbound
             .send(push(subscription_id, 1, true, &[text_event(4900)]))
             .await
             .unwrap();
-        wait_for(
-            || fake.recent_requests.lock().unwrap().len() == 2,
-            "the gap triggers a Recent",
-        )
-        .await;
-        assert_eq!(
-            fake.recent_requests.lock().unwrap()[1],
-            Some(4801),
-            "🚨 補窗要從洞之前的水位起，不是這包的 fs"
-        );
-        // 這包的事件已經寫進去（它的寫入排在 Recent 請求之前），但水位沒動。
-        wait_for_async(
-            || async {
-                cached_ids(&core, &account)
-                    .await
-                    .contains(&"$4900".to_string())
-            },
-            "the gap push itself is written",
-        )
-        .await;
+        assert_eq!(next_message(&mut seen).await, "$4900");
         assert_eq!(
             cg_seq_of(&core, &account).await,
             Some(4801),
-            "🚨 帶 gap 的包不推水位：補窗完成之前水位要還在洞之前"
+            "🚨 帶 gap 的包不推水位"
         );
-        *fake.hold_recent.lock().unwrap() = false;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while cg_seq_of(&core, &account).await != Some(4900) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the watermark reaches 4900 after the refill");
-        let ids = cached_ids(&core, &account).await;
-        assert!(ids.contains(&"$4850".to_string()), "洞補回來了：{ids:?}");
-        assert!(ids.contains(&"$4900".to_string()));
-
-        // 說出口地退訂。
-        assert!(core.stop_room_sync(&Target::default()).await.unwrap());
-        assert!(
-            *fake.unsubscribed.lock().unwrap(),
-            "server 收到 Unsubscribe"
-        );
-        assert!(!core.is_room_syncing(&account));
-        let states: Vec<SyncState> = std::iter::from_fn(|| seen.try_recv().ok())
-            .filter_map(|event| match event {
-                CoreEvent::SyncState { state, .. } => Some(state),
-                _ => None,
-            })
-            .collect();
+        // 之後正常的一包也不推：推了就跨過 4850。
+        fake.outbound
+            .send(push(subscription_id, 2, false, &[text_event(4950)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$4950");
         assert_eq!(
-            states.last(),
-            Some(&SyncState::Disconnected),
-            "退訂之後告訴 UI 斷了：{states:?}"
+            cg_seq_of(&core, &account).await,
+            Some(4801),
+            "🚨 洞還沒補之前，後面的包也不能推水位"
         );
+
+        // UI 補窗：`sync.recent`（走 Misc 線；這裡先把一條記憶體對接的線放進那一格）。從 4801 起拿到 4850／4900／4950，水位到 4950。
+        let (misc, _fake_misc) = memory_client_with_hello(events.clone()).await;
+        drop(
+            pool.acquire(LinkRole::Misc, || async move { Ok(misc) })
+                .await
+                .unwrap(),
+        );
+        let summary = core
+            .recent(
+                RecentPlan {
+                    max_events: None,
+                    ..RecentPlan::default()
+                },
+                false,
+                Transport::WebSocket,
+                "ui refill",
+                &Target::default(),
+            )
+            .await
+            .expect("sync.recent");
+        assert_eq!(
+            (summary.pulled, summary.cg_seq_before, summary.cg_seq_after),
+            (3, Some(4801), Some(4950))
+        );
+        assert!(summary.caught_up);
         assert!(
-            states.contains(&SyncState::CatchingUp) && states.contains(&SyncState::CaughtUp),
-            "補窗前後各發一次：{states:?}"
+            cached_ids(&core, &account)
+                .await
+                .contains(&"$4850".to_string()),
+            "洞補回來了"
+        );
+        assert_eq!(cg_seq_of(&core, &account).await, Some(4950));
+
+        // 洞補過了：下一包恢復推水位。
+        events.lock().unwrap().push(text_event(5000));
+        fake.outbound
+            .send(push(subscription_id, 3, false, &[text_event(5000)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$5000");
+        wait_for_async(
+            || async { cg_seq_of(&core, &account).await == Some(5000) },
+            "the watermark moves again once the hole is filled",
+        )
+        .await;
+
+        // 關訂閱線：task 收掉、那一格 Idle、發 Closed。
+        assert!(core.close_subscriptions(&Target::default()).await.unwrap());
+        assert!(!core.is_room_syncing(&account));
+        assert_eq!(pool.open_count(), 1, "只關訂閱那條，misc 還開著");
+        let closed = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
+            matches!(
+                event,
+                CoreEvent::Link {
+                    role: LinkRole::Subscriptions,
+                    state: LinkState::Closed,
+                    ..
+                }
+            )
+        });
+        assert!(closed, "關線要發 link.state closed");
+        assert!(
+            !core.close_subscriptions(&Target::default()).await.unwrap(),
+            "再關一次：本來就沒開"
         );
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 對真的 wbfuwunel：alice 登入、跟上游；bob（另一個 `Core`、另一個資料目錄）用 `Event/Send` 送一則；alice 的 `room.message` 在時限內到、
-    /// cache 有它、水位前進；說出口地退訂；兩邊登出。
+    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。🚫 沒有背景重連。
+    #[tokio::test]
+    async fn a_dead_line_ends_the_task_and_says_so() {
+        let dir = scratch("dead");
+        let (core, account) = core_with_wbf_account(&dir);
+        let mut seen = core.subscribe();
+        let (mut client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+            .await
+            .expect("subscribe");
+        // 對方收攤。
+        fake.task.abort();
+        drop(fake.outbound);
+        wait_for_async(
+            || async { !core.is_room_syncing(&account) },
+            "the task ends",
+        )
+        .await;
+        let closed = std::iter::from_fn(|| seen.try_recv().ok()).find_map(|event| match event {
+            CoreEvent::Link {
+                role: LinkRole::Subscriptions,
+                state: LinkState::Closed,
+                reason,
+                ..
+            } => Some(reason),
+            _ => None,
+        });
+        assert!(
+            closed
+                .clone()
+                .flatten()
+                .is_some_and(|reason| reason.contains("subscription ended")),
+            "線死了要講：{closed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 對真的 wbfuwunel：alice 登入、開訂閱線；bob（另一個 `Core`、另一個資料目錄）用 `Event/Send` 送一則；alice 的 `room.message` 在時限內到、
+    /// cache 有它、水位前進；關訂閱線；兩邊登出。
     ///
     /// `--ignored`；環境變數：`WBF_E2E_SERVER`、`WBF_E2E_USER`（完整 mxid）、`WBF_E2E_PASSWORD_FILE`、`WBF_E2E_USER_B`、`WBF_E2E_PASSWORD_B_FILE`、
     /// `WBF_E2E_ROOM`（兩人都在的明文房）。
     #[tokio::test]
     #[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_USER_B, WBF_E2E_PASSWORD_B_FILE, WBF_E2E_ROOM"]
-    async fn a_room_sync_receives_what_another_account_sends_over_the_real_server() {
+    async fn a_subscription_receives_what_another_account_sends_over_the_real_server() {
         let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
         let password_of = |file: &str| {
             let text = std::fs::read_to_string(file).unwrap();
@@ -887,15 +818,13 @@ mod tests {
         let account_a = core_a.current_account().unwrap();
         let mut seen = core_a.subscribe();
 
-        let start = core_a
-            .start_room_sync(Some(1000), &Target::default())
+        core_a
+            .open_subscriptions(&Target::default())
             .await
-            .expect("subscribe + refill over the real server");
-        assert!(start.joined >= 1, "{start:?}");
+            .expect("subscribe over the real server");
         assert!(core_a.is_room_syncing(&account_a));
         let cg_seq_before = cg_seq_of(&core_a, &account_a).await;
 
-        // bob 送一則（wbf 帳號：Event/Send）；alice 的訂閱線要推來。
         let body = format!("room sync e2e {}", std::process::id());
         let event_id = core_b
             .send_text(&room, &body, &Target::default())
@@ -914,7 +843,7 @@ mod tests {
         .await
         .expect("alice gets bob's message as a push within 20 s");
         assert_eq!(arrived.conversation, room);
-        // 讀完就放：登出要關 cache.db，還有人握著它會被拒（那正是它該有的行為）。
+        // 讀完就放：登出要關 cache.db，還有人握著它會被拒。
         let cached = {
             let (cache, me) = core_a.server_cache_and_me(&account_a).unwrap();
             let reader = cache.read().await;
@@ -923,13 +852,15 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(cached.len(), 1, "commit 之後才發事件，所以此刻庫裡一定有");
-        let cg_seq_after = cg_seq_of(&core_a, &account_a).await;
         assert!(
-            cg_seq_after > cg_seq_before,
-            "水位往前推：{cg_seq_before:?} → {cg_seq_after:?}"
+            cg_seq_of(&core_a, &account_a).await > cg_seq_before,
+            "水位往前推"
         );
 
-        assert!(core_a.stop_room_sync(&Target::default()).await.unwrap());
+        assert!(core_a
+            .close_subscriptions(&Target::default())
+            .await
+            .unwrap());
         assert!(!core_a.is_room_syncing(&account_a));
         core_a
             .log_out(&user_a, None, true, true)
@@ -941,34 +872,5 @@ mod tests {
             .expect("bob logs out");
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
-    }
-
-    /// 線死了：task 結束、發 disconnected、`is_room_syncing` 變 false。🚫 沒有背景重連。
-    #[tokio::test]
-    async fn a_dead_line_ends_the_room_sync_and_says_so() {
-        let dir = scratch("dead");
-        let (core, account) = core_with_wbf_account(&dir);
-        let mut seen = core.subscribe();
-        let (client, fake) = memory_client_with_hello().await;
-        core.start_room_sync_with(&account, None, || async move { Ok(client) })
-            .await
-            .expect("subscribe");
-        // 對方收攤（丟掉它那端）。
-        fake.task.abort();
-        drop(fake.outbound);
-        wait_for(|| !core.is_room_syncing(&account), "the task ends").await;
-        let disconnected = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
-            matches!(
-                event,
-                CoreEvent::SyncState {
-                    state: SyncState::Disconnected,
-                    ..
-                }
-            )
-        });
-        assert!(disconnected, "線死了要講");
-        // 沒在跟：stop 是 no-op。
-        assert!(!core.stop_room_sync(&Target::default()).await.unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

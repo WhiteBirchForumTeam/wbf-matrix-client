@@ -35,9 +35,10 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 拿到 token 之後本地任一步失敗都撤 token（兩條路共用）。房間清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、送訊息與送檔走 `Event/Send`（附件宣告成立；加密房拒，問單項 `GetStateEvent`）；
 備份／watch／`/context` 對 wbf 帳號回 1100、登出閘門只認本機 recovery key（account-session.md §6 有表）。裝置金鑰還沒上傳，跟 E2EE 那支一起。
 
-**跟上游（2026-09-22，`design/room-sync.md`，維護者定：先明文房間、先純一點不接 RPC）**：`Core::start_room_sync` 讀水位 → `Event/Subscribe`（帳號層、不帶 cg_seq）→
-同一條訂閱線上 `Recent` 一窗一窗補到追平或 1000 則 → 背景 task 收 `Push` 寫 cache、水位只往前推、commit 後發 `room.message`；帶 `gap` 的包不推水位、拿舊水位再補；
-線死了發 `sync.state: disconnected`、不重連；`stop_room_sync` 說出口地退訂。sdk 的 codec 對著 server 向量；core 用記憶體對接的假 server 釘住順序與 gap；真 server 兩帳號 e2e 過。
+**訂閱線的內容（2026-09-22，`design/room-sync.md`，維護者定：先明文房間、不接 RPC、補窗交給 UI）**：池開線走通用的 `init_connection(account, role, client)`，
+`Subscriptions` 角色就送 `Event/Subscribe`（帳號層、不帶 cg_seq）、起收推播的 task：一包寫一包、水位往前推到 `fs`、commit 後發 `room.message`。
+**daemon 只管訂閱當下**：補窗全由 UI 叫 `sync.recent`（看 `caught_up` 決定再叫）；daemon 唯一要守的是**水位不跨過洞**（帶 `gap` 的包與之後的包都不推，直到 UI 的 Recent 推過凍結點）。
+線死了 task 發 `link.state: closed`、不重連。`open_subscriptions`／`close_subscriptions` 先只給 core 與測試用。sdk codec 對著 server 向量；core 用記憶體對接的假 server 釘住洞的規則；真 server 兩帳號 e2e 過。
 
 **還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；接在訂閱線上）、金鑰的訂閱（`Device/Subscribe`）、跟上游的起停接進 daemon（RPC）、監督者（背景重連、退避）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 
@@ -59,7 +60,7 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 
 server 端的權威在 wbfuwunel repo：`docs/design/chunked-upload-spec.md`（線上規格）、`room-seq-and-recent.md`、`media-attachments.md`（提案）、`wbf-vectors.json`（整份複製到本 repo，不手改）。
 
-📌 2026-09-22 多一份：`design/room-sync.md`（跟上游：訂閱、補窗 job、推播寫快取、gap）。
+📌 2026-09-22 多一份：`design/room-sync.md`（訂閱線的內容：`init_connection`、推播寫快取、水位不跨洞、補窗是 UI 的事）。
 
 ## 3. 程式碼在哪
 
@@ -102,7 +103,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
-  room_sync.rs           **跟上游**（room-sync.md）：`start_room_sync`（讀水位→訂閱→補窗 job→背景 task）、`stop_room_sync`、`RoomSyncHandle`；一帳號一 task，登出收。🚫 還沒接 RPC
+  room_sync.rs           **訂閱線的內容**（room-sync.md）：`init_connection`（池開線的通用初始化：訂閱線就訂、起收推播的 task）、`open_subscriptions`／`close_subscriptions`、水位不跨洞；一帳號一 task，登出收。🚫 還沒接 RPC
   wbf_rooms.rs           **wbf 帳號的房間**（account-session.md §6）：清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、`Event/Send` 送明文（加密房拒）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（link-pool.md）：`LinkRole` 四條線（misc／upload／download／subscriptions）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
                          `Core::client_of(…, role)` 是唯一閘門、`open_link`（session → Bearer 升級 → hello）、`close_links`（登出叫）、`received_hook`（pack → `CoreEvent::Received`）、
@@ -278,7 +279,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 4. 假的 wbf server 測試工具（老缺口；假 server 已經會橋、Device、Send，差的是在 core 層驅動）。
 5. PR #43 等 wbfuwunel #64 合併後重做；`Batch.more` 那項（server 未合分支）。
 6. server 批 4 的功能（推播規則、搜尋、公開房間目錄、TURN；本 repo issue #55）：都在橋上了，等 UI 需要才加 Kind 與包裝；坑見 §6。
-7. ✅ **跟上游（明文房間）**（2026-09-22，`design/room-sync.md`）。下一支：**訂閱金鑰**（`Device/Subscribe` 在同一條線上另一個會話、`pull_to_device`）；之後才是把起停接進 daemon（中繼：RPC 的訂閱與跟上游是兩件事）。
+7. ✅ **訂閱線的內容（明文房間）**（2026-09-22，`design/room-sync.md`：`init_connection`、補窗交給 UI、水位不跨洞）。下一支：**訂閱金鑰**（`init_connection` 裡多一個 `Device/Subscribe` 會話、`pull_to_device`）；之後才是把開／關訂閱線接進 daemon（中繼：RPC 的訂閱與跟上游是兩件事）。
 
 📍 **2026-09-14 的建議順序**：
 

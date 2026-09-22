@@ -588,7 +588,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（等 wbfuwunel #64） | ✅ wbf／🔁 一般 server |
 | `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
-| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22（⚠️ 起停還沒有 RPC：`Core::start_room_sync`／`stop_room_sync` 先只給 core 與測試用） |
+| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22（⚠️ 開／關訂閱線還沒有 RPC：`Core::open_subscriptions`／`close_subscriptions` 先只給 core 與測試用；補窗是 UI 叫 `sync.recent`） |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`--transport http` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
 | `media.save_to` | ✅ | **WS** `Read`＋媒體池 | ✅ |
@@ -596,7 +596,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*`、`recovery.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，account-session.md §6） | 🔁 搬到 crypto 層＋橋的 `/room_keys`，排在 E2EE 的 RPC 面之後 |
 | `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
-| `sync.state`／`vault.state` 推播 | `sync.state` ✅ `room_sync` 發（catching_up／caught_up 帶 cg_seq／disconnected）；`vault.state` ❌ | 本機 | ✅ `sync.state` 2026-09-22／❌ `vault.state` |
+| `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發（room-sync.md §3：追平與否是 UI 自己叫 `sync.recent` 的結果，線的開關看 `link.state`）；`vault.state` ❌ | — | ❌ |
 | `progress`／`note`／`room.message` 推播 | ✅ daemon 層接上了（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ 2026-09-21 |
 
 📎 讀法：✅ 那幾列是 wbf-sdk 第 2 步的產物（上傳／下載／`recent`／ping），它們從一開始就是 WS。
