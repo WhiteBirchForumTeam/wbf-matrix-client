@@ -30,7 +30,10 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 每條線自己一個**心跳**（照 WireGuard：24 秒一次、最近 20 秒有通訊就跳過、沒 Pong 就當死），閘著的線不會被 server 的 300 秒 idle 收掉。
 
 **帳號的會話（2026-09-21，`design/account-session.md`，維護者定的規矩）**：探活不帶 token（未登入的 WS Hello）、以 server 為鍵；登入登出只走標準 HTTP，WS 只用 token；
-登出是「封池 → HTTP 登出（只有成與不成）→ 成了關池（等在跑的做完）→ 清本地 → 解封；不成就解封、no-op」。**下一支（B）**：wbf 帳號不建 matrix-sdk 的 Client，`m/` 由 OlmEngine 開、房間與送訊息走 WS、備份暫擋。
+登出是「封池 → HTTP 登出（只有成與不成）→ 成了關池（等在跑的做完）→ 清本地 → 解封；不成就解封、no-op」（#54）。
+**B 也合了（#56，2026-09-22）：wbf 帳號不建 matrix-sdk 的 Client**——登入先探活，wbf 走自己包的 HTTP `/login`、`m/` 由 `OlmEngine` 開（只有 crypto store）、`Session::backend` 記住走哪邊；
+拿到 token 之後本地任一步失敗都撤 token（兩條路共用）。房間清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、送訊息與送檔走 `Event/Send`（附件宣告成立；加密房拒，問單項 `GetStateEvent`）；
+備份／watch／`/context` 對 wbf 帳號回 1100、登出閘門只認本機 recovery key（account-session.md §6 有表）。裝置金鑰還沒上傳，跟 E2EE 那支一起。
 
 **還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；接在 keys 那條線上）、`Event/Subscribe` 的 codec 與 rooms 那條線的內容、監督者（背景重連、退避）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 
@@ -222,14 +225,15 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
-| **E2EE 房送檔案沒宣告附件**（約定 §5.2） | server 的 `Event/Send` 是提案；matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清。CLI 送檔會印警告 |
+| **一般 Matrix 帳號送檔案沒宣告附件**（約定 §5.2） | matrix-sdk 的 `Room::send` 不能加 header。✅ wbf 帳號 2026-09-22 起走 `Event/Send`、宣告成立（#56） | 一般 Matrix 帳號：server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號的加密房還送不了（等 E2EE 的 RPC 面） |
 | ~~`RoomCrypto` trait 還沒有~~ | ✅ 引擎是 `crypto_engine::OlmEngine`（#48／#49），沒抽 trait（只有一個實作，抽了是儀式） | CLI 送訊息還走 matrix-sdk；引擎還沒接進 daemon |
 | ~~推播被通道丟在地上~~ | ✅ 第 4 階段 SDK 那半做了（`ws-receive-dispatch.md`）：會話表依 id 交付、`device_subscription` 長活收、`Superseded` 進訂閱當終點、鉤子給 RPC 面 | daemon 那半（推播封裝、`desync`、推來就叫 refresh）還沒接（§7 第 2 項） |
 | **E2EE 沒有產品路徑** | §7 第 2 項 | 沒有任何一條路在 Hello 宣告 `org.wbftw.device_versions`；引擎只有 e2e 在用 |
 | 交叉簽章沒 bootstrap | §7 第 3 項 | 分享策略只能 `AllDevices`；server 建議的 `IdentityBased` 現在等於發給零台 |
 | PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（Recent 收 `before_event_id`）合併後重做 | 跳到訊息還是兩個來回 |
 | ~~房間金鑰沒有任何備份~~ | ✅ PR #19 做了：server 端標準 backup、本地全量快照、`logout` 的兩關閘門、`r/` 獨立保管 | — |
-| `Session/*`（WS 上的 Login／Refresh／Logout）只加了 wire 常數 | client 登入仍走 HTTP `/login` 加 matrix-sdk | 沒影響；要把登入搬到 WS 時再做 |
+| `Session/*`（WS 上的 Login／Refresh／Logout）只加了 wire 常數 | 維護者 2026-09-21 定：登入登出**維持標準 HTTP**，WS 只用 token（account-session.md §0） | 不是洞，是決定；那幾個常數留著認 server 的向量 |
+| **server 批 4 的四個新 kind 沒接**（0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加（批 3 的 0x12／0x15／0x1C／0x1D 也還沒加；#56 為 m.direct 才加 0x11）。沒有破壞性改動、向量檔沒變 | 推播規則／搜尋／目錄／TURN 都還沒有；做的時候先讀 #55 列的十個坑（搜尋在加密房搜不到、push 的 `kind` 不是 pack kind、規則種類打錯是 404、account data 不能刪） |
 | 斷線後 `recent` 不自動續 | 命令 exit、下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪；UI 那版做自動從最後的 `ls` 續 |
 | **沒有假的 wbf server 可以在 core 層測「成功」路徑** | 還沒做 | 探測成功、`watch`、`log_in` 的探測接點都只有 `--ignored` 的真 server 測試走得到。#32／#33 的審查每一輪都碰到這個缺口 |
 
@@ -266,6 +270,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 3. 交叉簽章 bootstrap（`SigningKeysUpload` 已在橋上）→ 分享策略換 `IdentityBasedStrategy`（只改 `room_key_share_settings`）。
 4. 假的 wbf server 測試工具（老缺口；假 server 已經會橋、Device、Send，差的是在 core 層驅動）。
 5. PR #43 等 wbfuwunel #64 合併後重做；`Batch.more` 那項（server 未合分支）。
+6. server 批 4 的功能（推播規則、搜尋、公開房間目錄、TURN；本 repo issue #55）：都在橋上了，等 UI 需要才加 Kind 與包裝；坑見 §6。
 
 📍 **2026-09-14 的建議順序**：
 
