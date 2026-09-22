@@ -167,7 +167,8 @@ impl Core {
     }
 
     /// Return:
-    ///     bool  true ＝ 這個帳號的收推播 task 還在
+    ///     bool  true ＝ 這個帳號的收推播 task 還在（只給測試斷言用；生產路徑看 `link.state`）
+    #[cfg(test)]
     pub(crate) fn is_room_syncing(&self, account: &AccountDir) -> bool {
         self.room_syncs
             .lock()
