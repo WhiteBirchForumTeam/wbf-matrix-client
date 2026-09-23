@@ -76,7 +76,8 @@ Core::open_subscriptions(target) ＝ 拿一次訂閱線（開的時候就訂了�
 
 - RPC（開／關訂閱線的命令）：`open_subscriptions`／`close_subscriptions` 先只給 core 與測試用。
 - 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：第二支。
-- 背景重連、退避：第 8 階段。
+- 背景重連、退避：第 8 階段。task 內 panic 那條路也是（PR #58 審查 cirno #661 🟢）：panic 不走 `pool.close`，會留下「線活著、沒 task」而且沒有 `closed`——
+  文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime §11 第 8 階段）。
 - 密文解密：推來的密文原樣存（local-cache-db.md §7.2）。
 - `DeviceChanged`（同一個訂閱會話送來）：認得、不消費，E2EE 那支接。
 
