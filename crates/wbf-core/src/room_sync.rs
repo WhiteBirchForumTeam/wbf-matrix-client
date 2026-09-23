@@ -263,19 +263,19 @@ impl RoomSyncTask {
             std::collections::BTreeMap::new();
         let mut skipped = 0usize;
         for raw in events {
-            // 沒帶 room_id 的不猜、不寫（跟 `recent` 同一條規矩）。
-            match raw.get("room_id").and_then(|value| value.as_str()) {
-                Some(room) => by_room
-                    .entry(room.to_string())
-                    .or_default()
-                    .push(IncomingEvent::from_ws_json(raw)),
-                None => skipped += 1,
+            // 存不了的（沒 room_id：不猜房間；沒 event_id／sender：`upsert_events` 不寫）這裡就擋掉——
+            // 🚫 不進 `by_room`，所以下面的通知不會替一則不在庫裡的事件發 `room.message`。規則只有一份：`storable_identity`。
+            let room = raw
+                .get("room_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let incoming = IncomingEvent::from_ws_json(raw);
+            match room {
+                Some(room) if incoming.storable_identity().is_some() => {
+                    by_room.entry(room).or_default().push(incoming)
+                }
+                _ => skipped += 1,
             }
-        }
-        if skipped > 0 {
-            self.events.progress(format!(
-                "room sync: skipped {skipped} pushed event(s) without room_id"
-            ));
         }
         // 通知給折好的訊息（自己送的也發，收的人自己濾）；庫裡存原樣。
         let notices: Vec<CoreEvent> = by_room
@@ -294,8 +294,9 @@ impl RoomSyncTask {
         let written = self
             .cache
             .run(move |cache| {
+                let mut unstorable = 0usize;
                 for (room, events) in &by_room {
-                    cache.upsert_events(&me, room, events)?;
+                    unstorable += cache.upsert_events_counted(&me, room, events)?.unstorable;
                 }
                 let hole_before = match (gap, hole_before) {
                     (true, hole) => Some(hole.map_or(fs, |hole| hole.max(fs))),
@@ -312,15 +313,22 @@ impl RoomSyncTask {
                 if hole_before.is_none() && fs > 0 {
                     cache.advance_cg_seq(&me, fs)?;
                 }
-                Ok(hole_before)
+                Ok((hole_before, unstorable))
             })
             .await;
         match written {
-            Ok(hole_before) => {
+            Ok((hole_before, unstorable)) => {
                 self.hole_before = hole_before;
                 // commit 之後才發（PR #32 的規矩）。
                 for notice in notices {
                     self.events.emit(notice);
+                }
+                // 存不了的（缺 room_id／event_id／sender）：講出來、不凍結——它不是洞（§2：再拿一次還是同一則，凍了水位就永遠停在這裡）。
+                if unstorable > 0 || skipped > 0 {
+                    self.events.progress(format!(
+                        "room sync: {} pushed event(s) could not be stored (no room_id, event_id or sender) and are dropped on purpose: a refill would return the same event",
+                        unstorable + skipped
+                    ));
                 }
             }
             // 寫失敗只報不擋（快取壞了的代價是重拉）；沒落地的就不通知。
@@ -835,6 +843,66 @@ mod tests {
         wait_for_async(
             || async { cg_seq_of(&core, &account).await == Some(250) },
             "the watermark moves again once the hole is filled",
+        )
+        .await;
+        fake.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §2「什麼不算洞」：一包裡有一則存不了的（沒 `sender`）——寫得了的照寫、水位照推到 `fs`、講出來（`Note`）；🚫 不凍結
+    /// （凍了水位就永遠停在這裡：再拿一次還是同一則、還是存不了）。PR #58 審查 rumia #652 要求凍結，這裡刻意不凍，嚴重度由維護者定。
+    #[tokio::test]
+    async fn an_event_that_can_never_be_stored_is_reported_and_does_not_freeze_the_watermark() {
+        let dir = scratch("unstorable");
+        let (core, account) = core_with_wbf_account(&dir);
+        let mut seen = core.subscribe();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
+        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+            .await
+            .expect("subscribe");
+        let subscription_id = fake.subscription_id.lock().unwrap().unwrap();
+        let pool = core.pool_of_account(&account).unwrap();
+        drop(
+            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        // 400 正常；401 沒有 sender（server 給的完整 Pdu 一定有，這是防禦那條）。
+        let mut no_sender = text_event(401);
+        no_sender.as_object_mut().unwrap().remove("sender");
+        fake.outbound
+            .send(push(
+                subscription_id,
+                0,
+                false,
+                &[no_sender, text_event(400)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$400");
+        let ids = cached_ids(&core, &account).await;
+        assert!(ids.contains(&"$400".to_string()));
+        assert!(!ids.contains(&"$401".to_string()), "沒 sender 的不寫");
+        assert_eq!(
+            cg_seq_of(&core, &account).await,
+            Some(401),
+            "存不了的不是洞：水位照推到這包的 fs"
+        );
+        let reported = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
+            matches!(event, CoreEvent::Note { text, .. } if text.contains("1 pushed event(s) could not be stored"))
+        });
+        assert!(reported, "存不了的要講出來");
+        // 之後正常的一包照推：沒有凍結。
+        events.lock().unwrap().push(text_event(450));
+        fake.outbound
+            .send(push(subscription_id, 1, false, &[text_event(450)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$450");
+        wait_for_async(
+            || async { cg_seq_of(&core, &account).await == Some(450) },
+            "no freeze after an unstorable event",
         )
         .await;
         fake.task.abort();

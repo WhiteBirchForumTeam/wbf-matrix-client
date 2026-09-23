@@ -51,8 +51,8 @@ pub struct RecentSummary {
     pub cg_seq_before: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cg_seq_after: Option<i64>,
-    /// 沒帶 `room_id` 而被跳過的則數。🚫 不猜房間：猜錯會落到查不到的地方
-    /// （PR #13 審查 salvia🟢2）。
+    /// 存不了而被跳過的則數：沒帶 `room_id`（🚫 不猜房間：猜錯會落到查不到的地方，PR #13 審查 salvia🟢2）、
+    /// 或沒帶 `event_id`／`sender`（`upsert_events` 不寫）。水位照推：它們不是洞，再拿一次還是同一則。
     pub skipped_without_room: usize,
 }
 
@@ -235,15 +235,19 @@ pub(crate) async fn pull_recent(
         // 所以走 `run_blocking`：排進同一條 queue、等它 commit。
         // ⭐ 阻塞的程度跟以前一樣（以前也是在這裡同步寫），換到的是「順序與水位由一個地方管」。
         let me_here = me.to_string();
-        written += cache
+        let (written_here, unstorable_here) = cache
             .run_blocking(move |cache| {
-                let mut written_here = 0usize;
+                let (mut written_here, mut unstorable_here) = (0usize, 0usize);
                 for (room, events) in &by_room {
-                    written_here += cache.upsert_events(&me_here, room, events)?;
+                    let outcome = cache.upsert_events_counted(&me_here, room, events)?;
+                    written_here += outcome.written;
+                    unstorable_here += outcome.unstorable;
                 }
-                Ok(written_here)
+                Ok((written_here, unstorable_here))
             })
             .map_err(|error| wbf_sdk::SdkError::Usage(error.message))?;
+        written += written_here;
+        skipped_without_room += unstorable_here;
         events.progress(format!(
             "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",
             meta.bc, meta.tc, meta.r, meta.fs, meta.ls
@@ -252,8 +256,9 @@ pub(crate) async fn pull_recent(
     };
     let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
     if skipped_without_room > 0 {
+        // 存不了的（缺 room_id／event_id／sender）講出來；水位照推——它不是洞，再拿一次還是同一則（room-sync.md §2）。
         events.progress(format!(
-            "recent: skipped {skipped_without_room} event(s) without room_id"
+            "recent: {skipped_without_room} event(s) could not be stored (no room_id, event_id or sender) and are dropped on purpose"
         ));
     }
     if let Some(new_cg_seq) = summary.new_cg_seq {

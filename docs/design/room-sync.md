@@ -47,6 +47,10 @@ UI 補窗是從水位起 `Recent`（server 只給比 `cg_seq` 新的）。水位
 - 本地漏一包——收件匣滿過（`take_gap`）、一包解不開（`Protocol`）、cache 寫失敗（PR #58 審查 cirno 🟡1）——同理：凍結點 ＝ 現在的水位**＋1**
   （設成水位本身下一包一比就等於它、立刻解凍，抓過一次；漏掉的那包 `fs` ≥ 水位＋1，所以只有 Recent 真的推過去才算補過）。
 - 判斷跟寫入在同一個 cache 工作裡，跟 `Recent` 的寫入排同一條 queue（daemon-runtime §2）：🚫 不靠時序。
+- **什麼不算洞**：存不了的事件——缺 `room_id`、`event_id` 或 `sender`（`upsert_events` 不寫；server 給的完整 Pdu 一定有，這是防禦）。
+  跳過、**數出來、講出來**（`Note`），🚫 不凍結、水位照推。理由：洞的定義是「再拿一次拿得回來」，而這種事件再拿一次還是同一則、還是存不了——
+  凍了水位就永遠停在那裡，整個帳號之後的每一包都推不了（Recent 也不能推：它也存不了那一則）。一則壞資料換整個帳號停擺，方向錯了
+  （PR #58 審查 rumia #652 要求凍結；這裡選擇不凍、但把數字講出來，嚴重度由維護者定）。`Recent` 那條路同一個規則。
 
 測試 `the_watermark_never_crosses_a_hole_and_refilling_is_the_uis_job` 釘著：gap 包寫了、水位不動；之後正常的包也不動；UI 的 `sync.recent`
 從洞之前的水位起、補回洞、推水位；再來一包才恢復推。變異：把「有洞不推」拿掉 → 紅。
@@ -82,7 +86,9 @@ UI 補窗是從水位起 `Recent`（server 只給比 `cg_seq` 新的）。水位
   `bc` 對不上事件數是 Protocol；缺 `gap` 欄位當 true。
 - core `room_sync.rs`（記憶體對接的假 server：答 Hello、Subscribe、Recent 照 `cg_seq` 給窗；測試主動推 Push；兩條線可以共用同一份事件）：
   §2 那條；本地漏一包（`bc` 對不上的壞包）凍結、UI 的 Recent 補過才解凍（`a_pack_that_could_not_be_read_freezes_the_watermark_like_a_gap`；
-  cache 寫失敗那條走同一支 `freeze_before_next_push`，但寫失敗本身製造不出來，沒有直接測）；線死了 task 結束、`link.state: closed` 帶原因。
+  cache 寫失敗那條走同一支 `freeze_before_next_push`，但寫失敗本身製造不出來，沒有直接測）；存不了的事件（沒 `sender`）寫得了的照寫、
+  水位照推、有 `Note`、🚫 不替它發 `room.message`、之後不凍（`an_event_that_can_never_be_stored_is_reported_and_does_not_freeze_the_watermark`）；
+  線死了 task 結束、`link.state: closed` 帶原因。
 - 真 server（`--ignored`，`WBF_E2E_*`）：alice 登入、`open_subscriptions`；bob（另一個 Core）`Event/Send` 送一則；alice 的 `room.message` 在時限內到、
   cache 有它、水位前進；`close_subscriptions`；兩邊登出。
 - ⚠️ 沒測的：本地收件匣灌爆那條凍結；真 server 的 gap（要讓 server 的推送佇列滿）。
