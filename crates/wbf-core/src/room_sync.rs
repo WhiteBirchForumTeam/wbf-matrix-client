@@ -753,7 +753,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 本地漏一包（這裡用解不開的包：`bc` 跟事件數對不上）也是洞：凍結點＝現在的水位，之後正常的包不推，直到 UI 的 `sync.recent` 推過它。
+    /// 本地漏一包（這裡用解不開的包：`bc` 跟事件數對不上）也是洞：凍結點＝現在的水位**＋1**，之後正常的包不推，直到 UI 的 `sync.recent` 推過它。
     /// `freeze_before_next_push` 是 `Protocol`、收件匣滿、cache 寫失敗三條路共用的那一支（PR #58 審查 cirno 🟡1）。
     #[tokio::test]
     async fn a_pack_that_could_not_be_read_freezes_the_watermark_like_a_gap() {
