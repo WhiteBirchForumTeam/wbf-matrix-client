@@ -1,12 +1,12 @@
 //! 訂閱線的內容：房間事件的訂閱與推播寫進 `cache.db`（daemon-runtime 第 6／7 階段；server 的語意在 wbfuwunel `wbf-event-push.md`）。
 //!
-//! 維護者 2026-09-22 定的形狀（room-sync.md §0）：
+//! 維護者 2026-09-22／23 定的形狀（room-sync.md §0）：
 //!
 //! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Subscriptions` 就送 `Event/Subscribe`、起一個收推播的 task；其他角色不做事。
 //!   線死了、下次要用重開時自然重訂（link-pool.md §3）。
-//! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`、水位往前推到 `fs`。
-//! - **補窗全由 UI 叫 `sync.recent`**（冪等、隨時可叫）：UI 看回應的 `caught_up` 決定要不要再叫。daemon 沒有補窗 job、不發任何「有洞」的訊號。
-//! - daemon 唯一要守的：**水位不能跨過洞**（§2）——不然 UI 下次從水位起 `Recent`，洞就永遠補不回來。
+//! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`。**🚫 不碰水位、不記洞、不補窗**。
+//! - 水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動；推播漏掉的（server 的 `gap`、本地丟包、一包解不開、寫失敗）**都不管**：
+//!   UI 下次叫 `Recent` 會從它自己決定的起點重拉那一段（冪等），UI 不叫就不補，永遠拿不到也不管。誰記有沒有漏是 UI 層的事。
 //!
 //! 事件跟 `Recent` 那條路一樣**原樣**寫（密文不解，local-cache-db.md §7.2）；訂閱是純的，`seq` 跳號不管、`Subscribe` 不帶 `cg_seq`。
 
@@ -51,8 +51,6 @@ struct RoomSyncTask {
     me: String,
     cache: Arc<ServerCache>,
     events: EventSink,
-    /// §2：有洞時是那包的 `fs`——水位凍在洞之前，直到看到水位被 `Recent` 推過它。
-    hole_before: Option<i64>,
 }
 
 impl Core {
@@ -86,7 +84,6 @@ impl Core {
             me,
             cache,
             events: self.events.clone(),
-            hole_before: None,
         };
         let handle = RoomSyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
@@ -180,19 +177,20 @@ impl Core {
 
 impl RoomSyncTask {
     async fn run(
-        mut self,
+        self,
         mut subscription: RoomSubscription,
         mut stopped: tokio::sync::oneshot::Receiver<()>,
     ) {
         // Ack 之前就推來的：跟之後的一樣處理。
         let early: Vec<_> = subscription.early_pushes.drain(..).collect();
-        for (meta, events) in early {
-            self.on_push(meta.fs, meta.gap, events).await;
+        for (_meta, events) in early {
+            self.on_push(events).await;
         }
         loop {
-            // 本地收件匣滿過＝丟過包：跟 server 的 gap 一樣，洞在現在的水位之後、還沒處理的包之前。
+            // 本地收件匣滿過＝丟過包：講一聲就好——補不補是 UI 的事（模組註解）。
             if subscription.take_gap() {
-                self.freeze_before_next_push().await;
+                self.events
+                    .progress("room sync: the subscription inbox overflowed; some pushes were dropped (sync.recent refetches them)");
             }
             let next = tokio::select! {
                 _ = &mut stopped => return,
@@ -200,19 +198,23 @@ impl RoomSyncTask {
             };
             match next {
                 Ok(Some(EventSubscribeReply::Push { meta, events })) => {
-                    self.on_push(meta.fs, meta.gap, events).await;
+                    if meta.gap {
+                        self.events.progress(
+                            "room sync: the server dropped pushes before this one (sync.recent refetches them)",
+                        );
+                    }
+                    self.on_push(events).await;
                 }
                 // 金鑰那支才消費；這裡只確認它不會把 task 弄死。
                 Ok(Some(EventSubscribeReply::DeviceChanged(_)))
                 | Ok(Some(EventSubscribeReply::Acknowledged(_)))
                 | Ok(Some(EventSubscribeReply::Unsubscribed { .. })) => {}
                 Err(wbf_sdk::SdkError::Timeout(_)) => {}
-                // 一包壞了就是漏一包：當成洞，水位凍住到 UI 補過為止。
+                // 一包壞了就是漏一包：講一聲，繼續收。
                 Err(wbf_sdk::SdkError::Protocol(why)) => {
                     self.events.progress(format!(
-                        "room sync: a push could not be read ({why}); the watermark is frozen until the next sync.recent"
+                        "room sync: a push could not be read and is dropped ({why}); sync.recent refetches it"
                     ));
-                    self.freeze_before_next_push().await;
                 }
                 Ok(None) | Err(_) => {
                     let why = match next {
@@ -233,38 +235,15 @@ impl RoomSyncTask {
         }
     }
 
-    /// 本地漏了一包（收件匣滿、解不開、寫失敗）：洞在「現在的水位」之後。凍結點設成**水位＋1**——解凍的條件是「水位 ≥ 凍結點」，
-    /// 設成水位本身下一包一比就等於它、立刻解凍（🚨 抓過一次）；＋1 之後只有 UI 的 `Recent` 真的推過去才算補過（漏掉的那包 `fs` ≥ 水位＋1）。
-    async fn freeze_before_next_push(&mut self) {
-        let me = self.me.clone();
-        match self.cache.run(move |cache| cache.get_cg_seq(&me)).await {
-            // 沒有水位就沒有洞可跨（UI 的第一次 Recent 從最新拿）。
-            Ok(Some(cg_seq)) => {
-                let threshold = cg_seq.saturating_add(1);
-                self.hole_before = Some(
-                    self.hole_before
-                        .map_or(threshold, |hole| hole.max(threshold)),
-                );
-            }
-            Ok(None) => {}
-            Err(error) => self
-                .events
-                .progress(format!("room sync: cannot read the watermark: {error}")),
-        }
-    }
-
-    /// 一包：原樣寫進 cache（照房分組）、水位往前推到 `fs`、commit 之後發 `room.message`。
+    /// 一包：原樣寫進 cache（照房分組）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。
     ///
-    /// 🚨 §2 **水位不能跨過洞**：帶 `gap` 的包把凍結點設成它的 `fs`（洞在舊水位跟它之間），這包與**之後的**包都不推水位，
-    /// 直到看到水位已經 ≥ 凍結點——那只可能是 UI 叫的 `sync.recent` 推的（它從舊水位起、推到那一刻最新的 `fs`），洞補過了才解凍。
-    /// 判斷跟寫入在同一個 cache 工作裡，跟 `Recent` 的寫入排同一條 queue，🚫 不靠時序。
-    async fn on_push(&mut self, fs: i64, gap: bool, events: Vec<serde_json::Value>) {
+    /// 存不了的（沒 `room_id`：不猜房間；沒 `event_id`／`sender`：`upsert_events` 不寫）在分組時就擋掉——
+    /// 🚫 不進 `by_room`，所以不會替一則不在庫裡的事件發 `room.message`；數出來、講出來（`Note`）。規則只有一份：`storable_identity`。
+    async fn on_push(&self, events: Vec<serde_json::Value>) {
         let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
             std::collections::BTreeMap::new();
-        let mut skipped = 0usize;
+        let mut unstorable = 0usize;
         for raw in events {
-            // 存不了的（沒 room_id：不猜房間；沒 event_id／sender：`upsert_events` 不寫）這裡就擋掉——
-            // 🚫 不進 `by_room`，所以下面的通知不會替一則不在庫裡的事件發 `room.message`。規則只有一份：`storable_identity`。
             let room = raw
                 .get("room_id")
                 .and_then(|value| value.as_str())
@@ -274,7 +253,7 @@ impl RoomSyncTask {
                 Some(room) if incoming.storable_identity().is_some() => {
                     by_room.entry(room).or_default().push(incoming)
                 }
-                _ => skipped += 1,
+                _ => unstorable += 1,
             }
         }
         // 通知給折好的訊息（自己送的也發，收的人自己濾）；庫裡存原樣。
@@ -290,7 +269,6 @@ impl RoomSyncTask {
             })
             .collect();
         let me = self.me.clone();
-        let hole_before = self.hole_before;
         let written = self
             .cache
             .run(move |cache| {
@@ -298,48 +276,26 @@ impl RoomSyncTask {
                 for (room, events) in &by_room {
                     unstorable += cache.upsert_events_counted(&me, room, events)?.unstorable;
                 }
-                let hole_before = match (gap, hole_before) {
-                    (true, hole) => Some(hole.map_or(fs, |hole| hole.max(fs))),
-                    (false, Some(hole)) => {
-                        // 水位到了凍結點以上，只可能是 Recent 推的：洞補過了，解凍。
-                        if cache.get_cg_seq(&me)?.is_some_and(|cg_seq| cg_seq >= hole) {
-                            None
-                        } else {
-                            Some(hole)
-                        }
-                    }
-                    (false, None) => None,
-                };
-                if hole_before.is_none() && fs > 0 {
-                    cache.advance_cg_seq(&me, fs)?;
-                }
-                Ok((hole_before, unstorable))
+                Ok(unstorable)
             })
             .await;
         match written {
-            Ok((hole_before, unstorable)) => {
-                self.hole_before = hole_before;
+            Ok(unstorable_in_cache) => {
                 // commit 之後才發（PR #32 的規矩）。
                 for notice in notices {
                     self.events.emit(notice);
                 }
-                // 存不了的（缺 room_id／event_id／sender）：講出來、不凍結——它不是洞（§2：再拿一次還是同一則，凍了水位就永遠停在這裡）。
-                if unstorable > 0 || skipped > 0 {
+                let dropped = unstorable + unstorable_in_cache;
+                if dropped > 0 {
                     self.events.progress(format!(
-                        "room sync: {} pushed event(s) could not be stored (no room_id, event_id or sender) and are dropped on purpose: a refill would return the same event",
-                        unstorable + skipped
+                        "room sync: {dropped} pushed event(s) could not be stored (no room_id, event_id or sender) and are dropped"
                     ));
                 }
             }
-            // 寫失敗只報不擋（快取壞了的代價是重拉）；沒落地的就不通知。
-            // 🚨 但這包就是一個洞（本地漏的，跟 server 的 gap 同一類）：水位凍住，不然下一包寫成功就跨過它、UI 的 Recent 再也補不回來
-            //（PR #58 審查 cirno 🟡1）。
-            Err(error) => {
-                self.events.progress(format!(
-                    "room sync: cache write failed ({error}); the watermark is frozen until the next sync.recent"
-                ));
-                self.freeze_before_next_push().await;
-            }
+            // 寫失敗只報不擋（快取壞了的代價是重拉：UI 的 sync.recent）；沒落地的就不通知。
+            Err(error) => self
+                .events
+                .progress(format!("room sync: cache write failed (ignored): {error}")),
         }
     }
 }
@@ -580,6 +536,30 @@ mod tests {
         (client, fake)
     }
 
+    /// 訂好、線放回池裡；回訂閱的 id 與池。
+    async fn subscribed(
+        core: &Core,
+        account: &AccountDir,
+        events: &Arc<Mutex<Vec<Value>>>,
+    ) -> (u64, FakeServer, Arc<crate::link_pool::LinkPool>) {
+        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
+        core.init_connection(account, LinkRole::Subscriptions, &mut client)
+            .await
+            .expect("subscribe");
+        let subscription_id = fake
+            .subscription_id
+            .lock()
+            .unwrap()
+            .expect("server got a Subscribe");
+        let pool = core.pool_of_account(account).unwrap();
+        drop(
+            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        (subscription_id, fake, pool)
+    }
+
     async fn wait_for_async<F, Fut>(mut condition: F, what: &str)
     where
         F: FnMut() -> Fut,
@@ -620,40 +600,23 @@ mod tests {
         .expect("a room.message arrives")
     }
 
-    /// 模組註解的形狀，對著假 server 走一遍：`init_connection` 訂了、🚫 沒補窗 → 推一包寫進去、水位前進、`room.message` 在 commit 之後 →
-    /// 帶 gap 的包：寫、水位凍住；**之後正常的包也不推**（不然跨過洞）→ UI 叫 `sync.recent`（從洞之前的水位起）補回洞、推水位 →
-    /// 再來一包才恢復推 → 關訂閱線。
+    /// 模組註解的形狀：`init_connection` 訂了、🚫 沒叫 Recent → 推一包寫進去、`room.message` 在 commit 之後、**水位不動** →
+    /// 帶 gap 的包、壞包（`bc` 對不上）、下一包都一樣：寫得了的寫、講一聲、水位還是不動 → UI 叫 `sync.recent`（帶 `since`）才動水位、才補回漏的 →
+    /// 關訂閱線只關那一條。
     #[tokio::test]
-    async fn the_watermark_never_crosses_a_hole_and_refilling_is_the_uis_job() {
-        let dir = scratch("hole");
+    async fn the_task_only_writes_pushes_and_never_touches_the_watermark() {
+        let dir = scratch("pure");
         let (core, account) = core_with_wbf_account(&dir);
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
-
-        // 池開線的最後一步。
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
-            .await
-            .expect("subscribe");
-        let subscription_id = fake
-            .subscription_id
-            .lock()
-            .unwrap()
-            .expect("server got a Subscribe");
+        let (subscription_id, fake, pool) = subscribed(&core, &account, &events).await;
         assert!(core.is_room_syncing(&account));
-        let pool = core.pool_of_account(&account).unwrap();
-        drop(
-            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
-                .await
-                .unwrap(),
-        );
         assert!(
             fake.recent_requests.lock().unwrap().is_empty(),
             "補窗不是 daemon 的事：開線不叫 Recent"
         );
-        assert_eq!(cg_seq_of(&core, &account).await, None);
 
-        // 一包正常的推播：寫進去、水位前進、commit 之後才有 room.message。
+        // 一包正常的推播：寫進去、commit 之後才有 room.message、水位不動。
         events.lock().unwrap().push(text_event(4801));
         fake.outbound
             .send(push(subscription_id, 0, false, &[text_event(4801)]))
@@ -663,9 +626,9 @@ mod tests {
         assert!(cached_ids(&core, &account)
             .await
             .contains(&"$4801".to_string()));
-        assert_eq!(cg_seq_of(&core, &account).await, Some(4801));
+        assert_eq!(cg_seq_of(&core, &account).await, None, "🚫 推播不碰水位");
 
-        // 有洞：4850 掉了，server 推 4900 帶 gap → 寫、水位不動。
+        // server 說有洞（4850 掉了）、一包壞掉、再一包正常：都寫得了的寫、水位還是不動。
         events
             .lock()
             .unwrap()
@@ -675,24 +638,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_message(&mut seen).await, "$4900");
-        assert_eq!(
-            cg_seq_of(&core, &account).await,
-            Some(4801),
-            "🚨 帶 gap 的包不推水位"
-        );
-        // 之後正常的一包也不推：推了就跨過 4850。
+        let mut broken = push(subscription_id, 2, false, &[text_event(4925)]);
+        broken.meta = br#"{"bc":2,"fs":4925,"ls":4925,"gap":false}"#.to_vec();
+        fake.outbound.send(broken).await.unwrap();
         fake.outbound
-            .send(push(subscription_id, 2, false, &[text_event(4950)]))
+            .send(push(subscription_id, 3, false, &[text_event(4950)]))
             .await
             .unwrap();
         assert_eq!(next_message(&mut seen).await, "$4950");
         assert_eq!(
             cg_seq_of(&core, &account).await,
-            Some(4801),
-            "🚨 洞還沒補之前，後面的包也不能推水位"
+            None,
+            "🚫 有洞、壞包、之後的包：水位一樣不動"
         );
+        let ids = cached_ids(&core, &account).await;
+        assert!(!ids.contains(&"$4850".to_string()), "漏的 daemon 不補");
+        assert!(!ids.contains(&"$4925".to_string()), "壞包丟掉");
 
-        // UI 補窗：`sync.recent`（走 Misc 線；這裡先把一條記憶體對接的線放進那一格）。從 4801 起拿到 4850／4900／4950，水位到 4950。
+        // UI 補：`sync.recent` 帶自己的起點（它手上 room.message 最後一則的 g_seq 之前也行，這裡從頭）→ 4850 回來、水位到 4950。
         let (misc, _fake_misc) = memory_client_with_hello(events.clone()).await;
         drop(
             pool.acquire(LinkRole::Misc, || async move { Ok(misc) })
@@ -705,6 +668,7 @@ mod tests {
                     max_events: None,
                     ..RecentPlan::default()
                 },
+                Some(4801),
                 false,
                 Transport::WebSocket,
                 "ui refill",
@@ -714,29 +678,44 @@ mod tests {
             .expect("sync.recent");
         assert_eq!(
             (summary.pulled, summary.cg_seq_before, summary.cg_seq_after),
-            (3, Some(4801), Some(4950))
+            (3, Some(4801), Some(4950)),
+            "UI 給的起點就是起點"
         );
-        assert!(summary.caught_up);
-        assert!(
-            cached_ids(&core, &account)
-                .await
-                .contains(&"$4850".to_string()),
-            "洞補回來了"
+        assert!(cached_ids(&core, &account)
+            .await
+            .contains(&"$4850".to_string()));
+        assert_eq!(
+            cg_seq_of(&core, &account).await,
+            Some(4950),
+            "水位只由 Recent 動"
         );
-        assert_eq!(cg_seq_of(&core, &account).await, Some(4950));
-
-        // 洞補過了：下一包恢復推水位。
+        // 之後的推播照樣不碰它。
         events.lock().unwrap().push(text_event(5000));
         fake.outbound
-            .send(push(subscription_id, 3, false, &[text_event(5000)]))
+            .send(push(subscription_id, 4, false, &[text_event(5000)]))
             .await
             .unwrap();
         assert_eq!(next_message(&mut seen).await, "$5000");
-        wait_for_async(
-            || async { cg_seq_of(&core, &account).await == Some(5000) },
-            "the watermark moves again once the hole is filled",
-        )
-        .await;
+        assert_eq!(cg_seq_of(&core, &account).await, Some(4950));
+        // 沒帶 since：從 daemon 存的水位（4950）起。
+        let summary = core
+            .recent(
+                RecentPlan {
+                    max_events: None,
+                    ..RecentPlan::default()
+                },
+                None,
+                false,
+                Transport::WebSocket,
+                "ui refill",
+                &Target::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (summary.cg_seq_before, summary.cg_seq_after),
+            (Some(4950), Some(5000))
+        );
 
         // 關訂閱線：task 收掉、那一格 Idle、發 Closed。
         assert!(core.close_subscriptions(&Target::default()).await.unwrap());
@@ -761,114 +740,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 本地漏一包（這裡用解不開的包：`bc` 跟事件數對不上）也是洞：凍結點＝現在的水位**＋1**，之後正常的包不推，直到 UI 的 `sync.recent` 推過它。
-    /// `freeze_before_next_push` 是 `Protocol`、收件匣滿、cache 寫失敗三條路共用的那一支（PR #58 審查 cirno 🟡1）。
+    /// 存不了的事件（沒 `sender`）：寫得了的照寫、有 `Note`、🚫 不替它發 `room.message`。
     #[tokio::test]
-    async fn a_pack_that_could_not_be_read_freezes_the_watermark_like_a_gap() {
-        let dir = scratch("unreadable");
-        let (core, account) = core_with_wbf_account(&dir);
-        let mut seen = core.subscribe();
-        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
-            .await
-            .expect("subscribe");
-        let subscription_id = fake.subscription_id.lock().unwrap().unwrap();
-        let pool = core.pool_of_account(&account).unwrap();
-        drop(
-            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
-                .await
-                .unwrap(),
-        );
-        events.lock().unwrap().push(text_event(100));
-        fake.outbound
-            .send(push(subscription_id, 0, false, &[text_event(100)]))
-            .await
-            .unwrap();
-        assert_eq!(next_message(&mut seen).await, "$100");
-        assert_eq!(cg_seq_of(&core, &account).await, Some(100));
-
-        // 一包壞掉：說有 2 則、只帶 1 則。
-        let mut broken = push(subscription_id, 1, false, &[text_event(150)]);
-        broken.meta = br#"{"bc":2,"fs":150,"ls":150,"gap":false}"#.to_vec();
-        fake.outbound.send(broken).await.unwrap();
-        // 之後正常的一包：寫進去、但水位凍在 100。
-        events
-            .lock()
-            .unwrap()
-            .extend([text_event(150), text_event(200)]);
-        fake.outbound
-            .send(push(subscription_id, 2, false, &[text_event(200)]))
-            .await
-            .unwrap();
-        assert_eq!(next_message(&mut seen).await, "$200");
-        assert_eq!(
-            cg_seq_of(&core, &account).await,
-            Some(100),
-            "🚨 本地漏了一包，水位不能跨過它"
-        );
-        // UI 補窗從 100 起：150 回來了、水位到 200；再一包恢復推。
-        let (misc, _fake_misc) = memory_client_with_hello(events.clone()).await;
-        drop(
-            pool.acquire(LinkRole::Misc, || async move { Ok(misc) })
-                .await
-                .unwrap(),
-        );
-        let summary = core
-            .recent(
-                RecentPlan {
-                    max_events: None,
-                    ..RecentPlan::default()
-                },
-                false,
-                Transport::WebSocket,
-                "ui refill",
-                &Target::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            (summary.cg_seq_before, summary.cg_seq_after),
-            (Some(100), Some(200))
-        );
-        assert!(cached_ids(&core, &account)
-            .await
-            .contains(&"$150".to_string()));
-        events.lock().unwrap().push(text_event(250));
-        fake.outbound
-            .send(push(subscription_id, 3, false, &[text_event(250)]))
-            .await
-            .unwrap();
-        assert_eq!(next_message(&mut seen).await, "$250");
-        wait_for_async(
-            || async { cg_seq_of(&core, &account).await == Some(250) },
-            "the watermark moves again once the hole is filled",
-        )
-        .await;
-        fake.task.abort();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// §2「什麼不算洞」：一包裡有一則存不了的（沒 `sender`）——寫得了的照寫、水位照推到 `fs`、講出來（`Note`）；🚫 不凍結
-    /// （凍了水位就永遠停在這裡：再拿一次還是同一則、還是存不了）。PR #58 審查 rumia #652 要求凍結，這裡刻意不凍，嚴重度由維護者定。
-    #[tokio::test]
-    async fn an_event_that_can_never_be_stored_is_reported_and_does_not_freeze_the_watermark() {
+    async fn an_event_that_can_never_be_stored_is_reported_and_not_announced() {
         let dir = scratch("unstorable");
         let (core, account) = core_with_wbf_account(&dir);
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
-            .await
-            .expect("subscribe");
-        let subscription_id = fake.subscription_id.lock().unwrap().unwrap();
-        let pool = core.pool_of_account(&account).unwrap();
-        drop(
-            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
-                .await
-                .unwrap(),
-        );
-        // 400 正常；401 沒有 sender（server 給的完整 Pdu 一定有，這是防禦那條）。
+        let (subscription_id, fake, _pool) = subscribed(&core, &account, &events).await;
         let mut no_sender = text_event(401);
         no_sender.as_object_mut().unwrap().remove("sender");
         fake.outbound
@@ -880,31 +759,18 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(next_message(&mut seen).await, "$400");
+        assert_eq!(
+            next_message(&mut seen).await,
+            "$400",
+            "沒 sender 的那則不通知"
+        );
         let ids = cached_ids(&core, &account).await;
         assert!(ids.contains(&"$400".to_string()));
         assert!(!ids.contains(&"$401".to_string()), "沒 sender 的不寫");
-        assert_eq!(
-            cg_seq_of(&core, &account).await,
-            Some(401),
-            "存不了的不是洞：水位照推到這包的 fs"
-        );
         let reported = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
             matches!(event, CoreEvent::Note { text, .. } if text.contains("1 pushed event(s) could not be stored"))
         });
         assert!(reported, "存不了的要講出來");
-        // 之後正常的一包照推：沒有凍結。
-        events.lock().unwrap().push(text_event(450));
-        fake.outbound
-            .send(push(subscription_id, 1, false, &[text_event(450)]))
-            .await
-            .unwrap();
-        assert_eq!(next_message(&mut seen).await, "$450");
-        wait_for_async(
-            || async { cg_seq_of(&core, &account).await == Some(450) },
-            "no freeze after an unstorable event",
-        )
-        .await;
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -947,7 +813,7 @@ mod tests {
     }
 
     /// 對真的 wbfuwunel：alice 登入、開訂閱線；bob（另一個 `Core`、另一個資料目錄）用 `Event/Send` 送一則；alice 的 `room.message` 在時限內到、
-    /// cache 有它、水位前進；關訂閱線；兩邊登出。
+    /// cache 有它、水位不動；關訂閱線；兩邊登出。
     ///
     /// `--ignored`；環境變數：`WBF_E2E_SERVER`、`WBF_E2E_USER`（完整 mxid）、`WBF_E2E_PASSWORD_FILE`、`WBF_E2E_USER_B`、`WBF_E2E_PASSWORD_B_FILE`、
     /// `WBF_E2E_ROOM`（兩人都在的明文房）。
@@ -990,7 +856,6 @@ mod tests {
             .await
             .expect("subscribe over the real server");
         assert!(core_a.is_room_syncing(&account_a));
-        let cg_seq_before = cg_seq_of(&core_a, &account_a).await;
 
         let body = format!("room sync e2e {}", std::process::id());
         let event_id = core_b
@@ -1019,10 +884,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(cached.len(), 1, "commit 之後才發事件，所以此刻庫裡一定有");
-        assert!(
-            cg_seq_of(&core_a, &account_a).await > cg_seq_before,
-            "水位往前推"
-        );
+        assert_eq!(cg_seq_of(&core_a, &account_a).await, None, "推播不碰水位");
 
         assert!(core_a
             .close_subscriptions(&Target::default())

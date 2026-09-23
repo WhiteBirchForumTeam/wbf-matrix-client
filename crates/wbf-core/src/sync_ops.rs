@@ -154,11 +154,16 @@ impl Core {
     /// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（server 的
     /// pack-pipeline §6.4）；下次再跑會從水位重來。
     ///
+    /// 水位（`cg_seq`）**只由這支動**（room-sync.md）：推播不碰它。起點由 UI 定：帶 `since` 就從那裡起（UI 手上有每則 `room.message`
+    /// 的 `g_seq` 與上次回的 `cg_seq_after`），沒帶就用存的上一次 Recent 的水位；拉完把水位推到這次最新的 `fs`。
+    ///
     /// Args:
-    ///     from_scratch: 不帶 `cg_seq`（把快取水位當沒有），server 從最新往回給
+    ///     since: 從這個 `g_seq` 之後拿；None ＝ 用存的水位, example: Some(4801)
+    ///     from_scratch: 不帶 `cg_seq`（`since` 與存的水位都不用），server 從最新往回給
     pub async fn recent(
         &self,
         plan: RecentPlan,
+        since: Option<i64>,
         from_scratch: bool,
         transport: Transport,
         client_name: &str,
@@ -172,9 +177,10 @@ impl Core {
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         client.hello(client_name, &[]).await?;
-        let cg_seq = match from_scratch {
-            true => None,
-            false => cache.read().await.get_cg_seq(&me)?,
+        let cg_seq = match (from_scratch, since) {
+            (true, _) => None,
+            (false, Some(since)) => Some(since),
+            (false, None) => cache.read().await.get_cg_seq(&me)?,
         };
         pull_recent(&mut client, &cache, &self.events, &me, cg_seq, plan).await
     }

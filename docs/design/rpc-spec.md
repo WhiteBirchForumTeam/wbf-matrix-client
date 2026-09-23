@@ -342,10 +342,10 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 | method | params | result | core |
 |---|---|---|---|
-| `sync.recent` | `{ max_events?: 10000, window?: 320, batch?: 10, from_scratch?: bool, user?, server? }`（三層的意思在 CLI 規格 §3.5） | `RecentSummary`：`{ pulled, written, windows, batches, caught_up, cg_seq_before?, cg_seq_after?, skipped_without_room }` | `recent`。長工作：推 `progress` |
+| `sync.recent` | `{ max_events?: 10000, window?: 320, batch?: 10, since?: number, from_scratch?: bool, user?, server? }`（三層的意思在 CLI 規格 §3.5；`since` ＝ 從這個 `g_seq` 之後拿，UI 自己記的起點——沒帶用 daemon 存的上一次水位。水位**只由這支動**，訂閱線的推播不碰它，補不補、從哪補是 UI 的事，room-sync.md） | `RecentSummary`：`{ pulled, written, windows, batches, caught_up, cg_seq_before?, cg_seq_after?, skipped_without_room }` | `recent`。長工作：推 `progress` |
 
-📎 daemon 之後 `recent` 應該是**它自己排程跑**的（連上 server 就補洞），這條 method 是「現在就跑一輪」。
-排程怎麼訂還沒定，跟 architecture-v2 §6 的四條連線一起做。
+📎 ~~daemon 之後 `recent` 應該是它自己排程跑的~~ 維護者 2026-09-23 定：**daemon 不自己叫 `Recent`**——訂閱線只收新事件、寫進庫，
+什麼時候補、從哪補（`since`）、補到哪為止（看 `caught_up`）全是 UI 的事；推播漏掉的 UI 不叫就不補（room-sync.md §0）。
 
 ### 3.5 上傳（不進房間的裸上傳；有 `transport`）
 

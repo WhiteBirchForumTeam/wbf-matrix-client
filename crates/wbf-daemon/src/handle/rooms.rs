@@ -200,6 +200,9 @@ pub(super) async fn sync_recent(handle: &Handle, core: &Core, params: Value) -> 
         window: u32,
         #[serde(default)]
         batch: Option<u32>,
+        /// 從這個 `g_seq` 之後拿（UI 自己記的起點）；沒帶用 daemon 存的上一次水位（rpc-spec §3.5）。
+        #[serde(default)]
+        since: Option<i64>,
         #[serde(default)]
         from_scratch: bool,
         #[serde(flatten)]
@@ -223,6 +226,7 @@ pub(super) async fn sync_recent(handle: &Handle, core: &Core, params: Value) -> 
     to_result(
         core.recent(
             plan,
+            params.since,
             params.from_scratch,
             transport,
             &format!("{DAEMON_NAME} {DAEMON_VERSION}"),
