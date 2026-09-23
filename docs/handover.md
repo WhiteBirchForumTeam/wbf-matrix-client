@@ -38,7 +38,7 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 **訂閱線的內容（2026-09-22，`design/room-sync.md`，維護者定：先明文房間、不接 RPC、補窗交給 UI）**：池開線走通用的 `init_connection(account, role, client)`，
 `Subscriptions` 角色就送 `Event/Subscribe`（帳號層、不帶 cg_seq）、起收推播的 task：一包寫一包、commit 後發 `room.message`。
 **daemon 只管訂閱當下，不碰水位**：水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動（新參數 `since` 是 UI 自己記的起點）；推播漏掉的（gap／丟包／壞包／寫失敗）只講一聲，誰記有沒漏是 UI 的事（維護者 2026-09-23：永遠拿不到也不管）。
-線死了 task 發 `link.state: closed`、不重連。`open_subscriptions`／`close_subscriptions` 先只給 core 與測試用。sdk codec 對著 server 向量；core 用記憶體對接的假 server 釘住洞的規則；真 server 兩帳號 e2e 過。
+訂閱會話結束（含 socket 還活著的 `Error`）task 把那格線關掉、池發 `link.state: closed`；🚫 不重連、不重訂，下次 `open_subscriptions` 重開就重訂。`open_subscriptions`／`close_subscriptions` 先只給 core 與測試用。sdk codec 對著 server 向量；core 用記憶體對接的假 server 釘住「推播不碰水位、存不了的不通知、訂閱會話結束就關線、下次開才重訂」；真 server 兩帳號 e2e 過。
 
 **還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；接在訂閱線上）、金鑰的訂閱（`Device/Subscribe`）、跟上游的起停接進 daemon（RPC）、監督者（背景重連、退避）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 

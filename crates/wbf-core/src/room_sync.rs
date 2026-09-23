@@ -3,7 +3,8 @@
 //! 維護者 2026-09-22／23 定的形狀（room-sync.md §0）：
 //!
 //! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Subscriptions` 就送 `Event/Subscribe`、起一個收推播的 task；其他角色不做事。
-//!   線死了、下次要用重開時自然重訂（link-pool.md §3）。
+//!   線死了、下次要用重開時自然重訂（link-pool.md §3）。訂閱會話結束（server 送 `Error`）時 socket 可能還活著，池看不出來——
+//!   task 收攤時自己把那格關掉，「重開就重訂」在這條路才成立；🚫 關線不是重訂（to-device-client.md §5.1：被接手的不重訂），重訂要等下一個 `open_subscriptions`。
 //! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`。**🚫 不碰水位、不記洞、不補窗**。
 //! - 水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動；推播漏掉的（server 的 `gap`、本地丟包、一包解不開、寫失敗）**都不管**：
 //!   UI 下次叫 `Recent` 會從它自己決定的起點重拉那一段（冪等），UI 不叫就不補，永遠拿不到也不管。誰記有沒有漏是 UI 層的事。
@@ -16,14 +17,14 @@ use std::time::Duration;
 use wbf_sdk::channel::Channel;
 use wbf_sdk::client::{RoomSubscription, WbfClient};
 use wbf_sdk::event_json::messages_from_incoming;
-use wbf_sdk::protocol::EventSubscribeReply;
+use wbf_sdk::protocol::{EventSubscribeReply, PushMeta};
 use wbf_sdk::{IncomingEvent, Transport};
 
 use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
 use crate::error::CoreError;
 use crate::event::{EventSink, LinkState};
-use crate::link_pool::LinkRole;
+use crate::link_pool::{LinkPool, LinkRole};
 use crate::server_cache::ServerCache;
 use crate::{Core, CoreEvent, Target};
 
@@ -51,6 +52,8 @@ struct RoomSyncTask {
     me: String,
     cache: Arc<ServerCache>,
     events: EventSink,
+    /// 這個帳號的池：只為了收攤時把訂閱那格關掉（模組註解）。
+    pool: Arc<LinkPool>,
 }
 
 impl Core {
@@ -58,7 +61,7 @@ impl Core {
     ///
     /// | 角色 | 做什麼 |
     /// |---|---|
-    /// | `Subscriptions` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了） |
+    /// | `Subscriptions` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了）；訂閱結束時 task 關這格線 |
     /// | 其他 | 不做事 |
     ///
     /// Args:
@@ -68,6 +71,7 @@ impl Core {
     ///     Ok(())
     ///     Err(Network)    Ack 沒等到、線死了（池就當這條沒開成）
     ///     Err(Server)     server 拒
+    ///     Err(AccountBusy) 正在登出：不替它訂
     pub(crate) async fn init_connection(
         &self,
         account: &AccountDir,
@@ -78,12 +82,14 @@ impl Core {
             return Ok(());
         }
         let (cache, me) = self.server_cache_and_me(account)?;
+        let pool = self.pool_of_account(account)?;
         let subscription = client.room_subscription(None, ACK_TIMEOUT).await?;
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = RoomSyncTask {
             me,
             cache,
             events: self.events.clone(),
+            pool,
         };
         let handle = RoomSyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
@@ -183,8 +189,8 @@ impl RoomSyncTask {
     ) {
         // Ack 之前就推來的：跟之後的一樣處理。
         let early: Vec<_> = subscription.early_pushes.drain(..).collect();
-        for (_meta, events) in early {
-            self.on_push(events).await;
+        for (meta, events) in early {
+            self.on_push(meta, events).await;
         }
         loop {
             // 本地收件匣滿過＝丟過包：講一聲就好——補不補是 UI 的事（模組註解）。
@@ -198,12 +204,7 @@ impl RoomSyncTask {
             };
             match next {
                 Ok(Some(EventSubscribeReply::Push { meta, events })) => {
-                    if meta.gap {
-                        self.events.progress(
-                            "room sync: the server dropped pushes before this one (sync.recent refetches them)",
-                        );
-                    }
-                    self.on_push(events).await;
+                    self.on_push(meta, events).await
                 }
                 // 金鑰那支才消費；這裡只確認它不會把 task 弄死。
                 Ok(Some(EventSubscribeReply::DeviceChanged(_)))
@@ -222,24 +223,34 @@ impl RoomSyncTask {
                         Err(error) => error.to_string(),
                         Ok(Some(_)) => unreachable!("handled above"),
                     };
-                    // 線死了池要到下次取用才發現；這裡先講，UI 不必等。（下次取用時池會再發一次 Closed→Opened。）
-                    self.events.emit(CoreEvent::Link {
-                        user: self.me.clone(),
-                        role: LinkRole::Subscriptions,
-                        state: LinkState::Closed,
-                        reason: Some(format!("the room subscription ended: {why}")),
-                    });
+                    let reason = format!("the room subscription ended: {why}");
+                    // 訂閱會話結束了 socket 可能還活著（server 送 Error，例如被另一台裝置接手），池的殞死偵測看不出來：
+                    // 這裡把那格關掉、池發 closed；下次 open_subscriptions 才重開、重訂（🚫 不在這裡重訂）。
+                    // 線不在池裡（已經被別人關了）就只講一聲。
+                    if !self.pool.close(LinkRole::Subscriptions, &reason).await {
+                        self.events.emit(CoreEvent::Link {
+                            user: self.me.clone(),
+                            role: LinkRole::Subscriptions,
+                            state: LinkState::Closed,
+                            reason: Some(reason),
+                        });
+                    }
                     return;
                 }
             }
         }
     }
 
-    /// 一包：原樣寫進 cache（照房分組）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。
+    /// 一包（Ack 之前推來的也走這裡）：`gap` 只講一聲；原樣寫進 cache（照房分組）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。
     ///
     /// 存不了的（沒 `room_id`：不猜房間；沒 `event_id`／`sender`：`upsert_events` 不寫）在分組時就擋掉——
     /// 🚫 不進 `by_room`，所以不會替一則不在庫裡的事件發 `room.message`；數出來、講出來（`Note`）。規則只有一份：`storable_identity`。
-    async fn on_push(&self, events: Vec<serde_json::Value>) {
+    async fn on_push(&self, meta: PushMeta, events: Vec<serde_json::Value>) {
+        if meta.gap {
+            self.events.progress(
+                "room sync: the server dropped pushes before this one (sync.recent refetches them)",
+            );
+        }
         let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
             std::collections::BTreeMap::new();
         let mut unstorable = 0usize;
@@ -406,20 +417,31 @@ mod tests {
         )
     }
 
+    /// 假 server 在回 `Subscribe` 的 Ack 之前先推的那一包：(seq, gap, 事件)。
+    type EarlyPush = Arc<Mutex<Option<(u32, bool, Vec<Value>)>>>;
+
     /// 假的 server 端：答 Hello、Subscribe、Recent（照 `cg_seq` 給比它新的，一窗一個 Batch）、Unsubscribe；
     /// 測試從 `outbound` 塞 server 主動推的包。記下每次 `Recent` 帶的 `cg_seq` 與訂閱的 id。事件清單可以跟別條線共用。
     struct FakeServer {
         recent_requests: Arc<Mutex<Vec<Option<i64>>>>,
-        subscription_id: Arc<Mutex<Option<u64>>>,
+        /// 每個 `Subscribe` 的 id（照順序）。
+        subscription_ids: Arc<Mutex<Vec<u64>>>,
+        /// 設了就在回 `Subscribe` 的 Ack 之前先推這一包（seq、gap、事件）：造 Ack 之前就到的推播。
+        early_push: EarlyPush,
         outbound: tokio::sync::mpsc::Sender<Pack>,
         task: tokio::task::JoinHandle<()>,
     }
 
     fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value>>>) -> FakeServer {
         let recent_requests = Arc::new(Mutex::new(Vec::new()));
-        let subscription_id = Arc::new(Mutex::new(None));
+        let subscription_ids = Arc::new(Mutex::new(Vec::new()));
+        let early_push: EarlyPush = Arc::new(Mutex::new(None));
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel::<Pack>(16);
-        let (recents_t, sub_t) = (recent_requests.clone(), subscription_id.clone());
+        let (recents_t, sub_t, early_t) = (
+            recent_requests.clone(),
+            subscription_ids.clone(),
+            early_push.clone(),
+        );
         let task = tokio::spawn(async move {
             loop {
                 let pack = tokio::select! {
@@ -454,7 +476,12 @@ mod tests {
                         Vec::new(),
                     ),
                     (Kind::Event, event::SUBSCRIBE) => {
-                        *sub_t.lock().unwrap() = Some(pack.id);
+                        sub_t.lock().unwrap().push(pack.id);
+                        let early = early_t.lock().unwrap().take();
+                        if let Some((seq, gap, early_events)) = early {
+                            let pushed = push(pack.id, seq, gap, &early_events);
+                            peer.sink.send(pushed.encode().unwrap()).await.unwrap();
+                        }
                         let latest = events
                             .lock()
                             .unwrap()
@@ -518,7 +545,8 @@ mod tests {
         });
         FakeServer {
             recent_requests,
-            subscription_id,
+            subscription_ids,
+            early_push,
             outbound,
             task,
         }
@@ -547,9 +575,11 @@ mod tests {
             .await
             .expect("subscribe");
         let subscription_id = fake
-            .subscription_id
+            .subscription_ids
             .lock()
             .unwrap()
+            .last()
+            .copied()
             .expect("server got a Subscribe");
         let pool = core.pool_of_account(account).unwrap();
         drop(
@@ -809,6 +839,116 @@ mod tests {
                 .is_some_and(|reason| reason.contains("subscription ended")),
             "線死了要講：{closed:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// server 收掉訂閱會話、socket 還活著（例如被另一台裝置接手的 `Error`）：task 把那格關掉（池發 `closed` 帶原因）、🚫 不自己重訂；
+    /// 下一次開訂閱線走 `open` → `init_connection` → 第二個 `Subscribe`、新訂閱收得到（PR #58 審查 rumia #655／cirno #658：
+    /// 之前 task 只發事件不關線，池看 socket 還活著就把舊線交回去，永遠不再訂）。
+    #[tokio::test]
+    async fn an_ended_subscription_closes_the_line_so_the_next_open_subscribes_again() {
+        let dir = scratch("resubscribe");
+        let (core, account) = core_with_wbf_account(&dir);
+        let mut seen = core.subscribe();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (subscription_id, fake, pool) = subscribed(&core, &account, &events).await;
+        assert_eq!(pool.open_count(), 1);
+
+        fake.outbound
+            .send(response(
+                Kind::Control,
+                control::ERROR,
+                subscription_id,
+                0,
+                json!({ "code": "M_UNKNOWN", "message": "subscription superseded by another device" }),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        wait_for_async(
+            || async { !core.is_room_syncing(&account) },
+            "the task ends",
+        )
+        .await;
+        assert_eq!(
+            pool.open_count(),
+            0,
+            "訂閱會話死了就把那條線關掉，socket 活著也一樣"
+        );
+        let closed = std::iter::from_fn(|| seen.try_recv().ok()).find_map(|event| match event {
+            CoreEvent::Link {
+                role: LinkRole::Subscriptions,
+                state: LinkState::Closed,
+                reason,
+                ..
+            } => Some(reason),
+            _ => None,
+        });
+        assert!(
+            closed
+                .clone()
+                .flatten()
+                .is_some_and(|reason| reason.contains("subscription ended")),
+            "關線要帶原因：{closed:?}"
+        );
+
+        // 下一次開：那格是空的 → `open`（生產路徑的 open_link：hello 之後 init_connection）→ 第二個 Subscribe、新的 task。
+        let (mut client, fake_again) = memory_client_with_hello(events.clone()).await;
+        let (core_ref, account_ref) = (&core, &account);
+        drop(
+            pool.acquire(LinkRole::Subscriptions, || async move {
+                core_ref
+                    .init_connection(account_ref, LinkRole::Subscriptions, &mut client)
+                    .await?;
+                Ok(client)
+            })
+            .await
+            .unwrap(),
+        );
+        let again = fake_again.subscription_ids.lock().unwrap().last().copied();
+        let again = again.expect("重開就重訂：第二個 Subscribe");
+        assert!(core.is_room_syncing(&account));
+        events.lock().unwrap().push(text_event(9));
+        fake_again
+            .outbound
+            .send(push(again, 0, false, &[text_event(9)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$9", "新訂閱收得到");
+        fake.task.abort();
+        fake_again.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ack 之前就推來的包（server 先登記再回 Ack）跟之後的一樣：帶 `gap` 也要講一聲（PR #58 審查 salvia #656／cirno #658 🟢）。
+    #[tokio::test]
+    async fn a_gap_in_a_push_before_the_ack_is_reported_too() {
+        let dir = scratch("early-gap");
+        let (core, account) = core_with_wbf_account(&dir);
+        let mut seen = core.subscribe();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![text_event(7)]));
+        let (mut client, fake) = memory_client_with_hello(events).await;
+        *fake.early_push.lock().unwrap() = Some((0, true, vec![text_event(7)]));
+        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+            .await
+            .expect("subscribe");
+        let mut gap_reported = false;
+        let first = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match seen.recv().await.unwrap() {
+                    CoreEvent::Note { text, .. } if text.contains("the server dropped pushes") => {
+                        gap_reported = true
+                    }
+                    CoreEvent::Message { message, .. } => return message.id,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the early push arrives");
+        assert_eq!(first, "$7", "Ack 之前推來的照寫、照通知");
+        assert!(gap_reported, "Ack 之前的 gap 也要講");
+        fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

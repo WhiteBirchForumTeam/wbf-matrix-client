@@ -28,7 +28,7 @@
 收推播的 task（一帳號一個；線在池裡、task 只握訂閱的會話）
   Push{events} → 原樣 upsert（照房分組；存不了的擋掉、數出來）→ commit 之後發 room.message。🚫 不碰水位。
   gap／本地丟包／壞包／寫失敗 → 講一聲（Note），繼續收。🚫 不記洞、不補。
-  線死了 / server 送 Error → 發 link.state: closed（帶原因）、task 結束；🚫 不背景重連（下次要用重開就重訂）
+  線死了 / server 送 Error → task 把訂閱那格線關掉（socket 活著也一樣）、池發 link.state: closed（帶原因）、task 結束；🚫 不重訂、不背景重連（下次 open_subscriptions 重開就重訂）
 UI
   起來時 sync.recent（全局、g_seq 游標）：帶 since（它自己記的起點：上次的 cg_seq_after、或手上最後一則 room.message 的 g_seq），
   沒帶就用 daemon 存的上一次 Recent 的水位；回應 caught_up 是 false 就再叫。補不補、補到哪，全是 UI 的事。
@@ -44,7 +44,9 @@ Core::open_subscriptions(target) ＝ 拿一次訂閱線（開的時候就訂了�
 - **跟官方 Matrix 同形**：`Push` 是 `/sync` 迴圈只追加 server 給的、`sync.recent` 是 client 決定何時往回補的 `/messages`。
 - **`Subscribe` 不帶 `cg_seq`**：server 的補窗有上限、截斷只給一個 gap bit；反正補窗是 UI 的事，daemon 不要它。
 - **訂閱是純的**：一包來寫一包，`seq` 跳號不管。
-- 線死了池要到下次取用才發現；task 先發一次 `link.state: closed`（帶「the room subscription ended: …」），UI 不必等。下次取用時池會再發一次 Closed→Opened。
+- **訂閱會話結束＝那條線作廢**：server 送 `Error`（例如被另一台裝置接手的 1505）時 socket 可能還活著，池的殞死偵測（`is_closed`）看不出來——
+  task 收攤時自己 `LinkPool::close(Subscriptions, "the room subscription ended: …")`，`link.state: closed` 由池發、UI 不必等；下次 `open_subscriptions` 那格是空的才會重開、重訂
+  （PR #58 審查 rumia #655／cirno #658：之前 task 只發事件不關線，池把活著的舊線交回去、永遠不再訂）。🚫 關線不是重訂：to-device-client.md §5.1 被接手的不重訂。
 
 ## 2. 存不了的事件
 
@@ -58,7 +60,7 @@ Core::open_subscriptions(target) ＝ 拿一次訂閱線（開的時候就訂了�
 |---|---|
 | 每包 commit 之後 | 每則一個 `room.message`（自己送的也發，收的人自己濾；密文原樣、`decrypted: false`） |
 | 漏包（gap／丟包／壞包／寫失敗／存不了） | 一則 `Note`，只是講一聲 |
-| 線開／關 | 池的 `link.state`（`Subscriptions`）；task 因線死結束時多發一次 `closed` 帶原因 |
+| 線開／關 | 池的 `link.state`（`Subscriptions`）；task 因訂閱結束而關線時 `closed` 帶「the room subscription ended: …」 |
 
 🚫 不發 `sync.state`（追平與否是 UI 自己叫 `sync.recent` 的結果；variant 留著，還沒人發）。
 
@@ -66,7 +68,7 @@ Core::open_subscriptions(target) ＝ 拿一次訂閱線（開的時候就訂了�
 
 - 一個帳號一個 task（`Core::room_syncs`）；線重開時 `init_connection` 換掉舊的（舊的線已經死了）。
 - 登出：`stop_room_sync_of` 先收 task，再 `close_links`。`Core` 丟掉：handle 的 `Drop` abort task。
-- task 🚫 不握 `Core`、不握線：握 `Arc<ServerCache>`、`EventSink`、訂閱的會話。guard 放掉之後線照樣能用（`Misc` 之類的命令不受影響；
+- task 🚫 不握 `Core`、不握線：握 `Arc<ServerCache>`、`EventSink`、訂閱的會話、池的 `Arc`（只為了收攤時關那格）。guard 放掉之後線照樣能用（`Misc` 之類的命令不受影響；
   金鑰的 `Device/Subscribe` 是同一條線上另一個會話，下一支）。
 - `Event/Unsubscribe` 的 codec 與 `room_unsubscribe` 在 sdk 裡（對著向量），core 現在不用它：關訂閱線就是關線，server 斷線自動退訂。
 
@@ -85,7 +87,9 @@ Core::open_subscriptions(target) ＝ 拿一次訂閱線（開的時候就訂了�
 - core `room_sync.rs`（記憶體對接的假 server：答 Hello、Subscribe、Recent 照 `cg_seq` 給窗；測試主動推 Push；兩條線共用同一份事件）：
   `the_task_only_writes_pushes_and_never_touches_the_watermark`——訂了、沒叫 Recent；推一包寫進去、`room.message` 在 commit 之後、水位不動；
   gap 包、壞包、之後的包都一樣寫得了的寫、水位不動、漏的不補；UI 的 `sync.recent` 帶 `since` 才動水位、才補回；沒帶 `since` 從存的水位起；關訂閱線只關那一條。
-  `an_event_that_can_never_be_stored_is_reported_and_not_announced`；`a_dead_line_ends_the_task_and_says_so`。
+  `an_event_that_can_never_be_stored_is_reported_and_not_announced`；`a_dead_line_ends_the_task_and_says_so`；
+  `an_ended_subscription_closes_the_line_so_the_next_open_subscribes_again`（server 送 Error、socket 活著 → 那格關了、`closed` 帶原因 → 下次 `acquire` 走 `open` → 第二個 `Subscribe`、新訂閱收得到）；
+  `a_gap_in_a_push_before_the_ack_is_reported_too`（假 server 在 Ack 之前先推一包帶 gap 的）。
 - 真 server（`--ignored`，`WBF_E2E_*`）：alice 登入、`open_subscriptions`；bob（另一個 Core）`Event/Send` 送一則；alice 的 `room.message` 在時限內到、
   cache 有它、水位不動；`close_subscriptions`；兩邊登出。
 - ⚠️ 沒測的：本地收件匣灌爆那條 `Note`；真 server 的 gap。

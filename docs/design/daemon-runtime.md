@@ -16,7 +16,7 @@
 
 | 說法 | 意思 | 誰做 | 什麼時候 |
 |---|---|---|---|
-| **上游同步** | homeserver → `cache.db` | daemon（上游會話、`Recent`、進房 backfill） | 一直在跑，或 UI 明確要求 |
+| **上游同步** | homeserver → `cache.db` | daemon（上游會話收推播；`Recent` 與進房 backfill 由 UI 叫，§4.3） | 推播一直在收；`Recent` 只在 UI 叫的時候 |
 | **本地讀** | `cache.db` → UI | daemon 回答 RPC 的讀命令 | UI 每次要顯示東西 |
 | **matrix-sdk 的 `/sync`** | matrix-sdk 自己的長輪詢，寫它自己的 store（`m/`） | matrix-sdk | HTTP 那條路上一直在跑 |
 
@@ -26,7 +26,7 @@
 ```
 homeserver ──上游同步──> cache.db ──本地讀──> UI
      ↑                       │
-     └── UI 明確要求時 ──────┘   （sync.recent：補洞。⚠️ 這是例外，不是常態）
+     └── UI 明確要求時 ──────┘   （sync.recent：UI 起來時、以及它決定要補的時候叫；補不補是 UI 的事，§4.3）
 ```
 
 ## 1. 資料在哪：每帳號一份 vs 每 server 一份
@@ -302,7 +302,7 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
   🚫 不要「先去 server 拉完再顯示」——那是把毫秒變成秒。
 - 有沒有洞是**看得出來的**：`cache.db` 的 `events` 有 `r_seq`（房內序號），
   一段連續的 `r_seq` 中間缺號就是洞（local-cache-db §6）。有洞才發第二個 `sync: "both"`。
-- 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 daemon 自己的事（§4.3）。
+- 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 UI 起來時另外叫的 `sync.recent`（§4.3），🚫 不是 daemon 自己的事。
 - 🚨 **往回翻一律拿 `event_id`**（維護者 2026-09-14）：UI 拿手上最舊那則當 `before`，`both` **永遠問上游**、
   寫進去、照上游順序從本地讀回。daemon 換算：wbf 查本地 `g_seq` → `Recent{rooms, before}`；matrix `/context` → `/messages`。
   🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 rpc-spec §3.3「往回翻」。
@@ -441,11 +441,15 @@ struct Work {
 - 所以 §2.2 那個「一個 server 一個寫入者」不只是為了避免撞鎖，
   也是因為**兩個帳號寫的是同一批列**（`rooms`、`users`、`events` 都要 upsert）。
 
-### 4.3 daemon 自己的補洞
+### 4.3 補洞是 UI 的事（維護者 2026-09-23 改；room-sync.md §0 原話）
 
-- 連上（或重連）之後：先 `Recent` 從 `cg_seq` 補到追平，才發 `caught_up`（architecture-v2 §6.1）。
-- ⚠️ **`sync.recent` 這個 RPC method 是「現在就跑一輪」**，跟 daemon 自己的排程是同一段程式，
-  🚫 不是兩套。UI 幾乎不需要叫它 —— 它存在是為了除錯與「我知道有洞，補一下」。
+~~連上（或重連）之後：先 `Recent` 從 `cg_seq` 補到追平，才發 `caught_up`；`sync.recent` 跟 daemon 自己的排程是同一段程式，UI 幾乎不需要叫它~~
+**daemon 不自己叫 `Recent`**（「daemon 只有訂閱新事件，不主動叫 Recent。誰負責記有沒漏，是 UI 層的事」）：
+
+- daemon 開訂閱線就只訂（`init_connection`），推播一包寫一包、🚫 不碰水位。
+- UI 起來時叫 `sync.recent`（帶 `since`＝它自己記的起點，或不帶就用 daemon 存的上一次水位）；回應 `caught_up` 是 false 就再叫。
+  什麼時候補、補到哪、漏了要不要管，全是 UI 的事（推播漏掉的 UI 不叫就不補）。
+- `sync.recent` 是**唯一**動水位（`cg_seq`）的地方；🚫 沒有 daemon 自己的排程、沒有「追平了」的事件（`sync.state` 的 variant 留著，沒人發）。
 
 ## 5. 事件送給誰：多帳號的扇出
 
@@ -530,7 +534,7 @@ struct Work {
 
 | 層 | 存在哪 | 誰改它 | 意思 |
 |---|---|---|---|
-| **1. 快取水位** | `sync_state.cg_seq`（每帳號） | daemon 的上游會話 | 「這個帳號的事件我抓到哪裡了」。🚫 **跟人有沒有看過完全無關** |
+| **1. 快取水位** | `sync_state.cg_seq`（每帳號） | daemon 回答 UI 叫的 `sync.recent` 時（§4.3） | 「這個帳號的事件我抓到哪裡了」。🚫 **跟人有沒有看過完全無關** |
 | **2. 本地已讀** | `read_positions`（每帳號每房間） | **只有 UI 明講才會改** | 「這台機器上的這個人看到哪裡了」 |
 | **3. 遠端已讀** | homeserver 的 read receipt | UI 明講、而且要求送上游時 | 「其他裝置／其他人看得到的已讀」，又分 **private／public** |
 
