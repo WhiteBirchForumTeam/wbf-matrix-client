@@ -233,13 +233,18 @@ impl RoomSyncTask {
         }
     }
 
-    /// 洞在「現在的水位」之後：把凍結點設成現在的水位（之後的包不推，直到 UI 的 `Recent` 推過它）。
+    /// 本地漏了一包（收件匣滿、解不開、寫失敗）：洞在「現在的水位」之後。凍結點設成**水位＋1**——解凍的條件是「水位 ≥ 凍結點」，
+    /// 設成水位本身下一包一比就等於它、立刻解凍（🚨 抓過一次）；＋1 之後只有 UI 的 `Recent` 真的推過去才算補過（漏掉的那包 `fs` ≥ 水位＋1）。
     async fn freeze_before_next_push(&mut self) {
         let me = self.me.clone();
         match self.cache.run(move |cache| cache.get_cg_seq(&me)).await {
             // 沒有水位就沒有洞可跨（UI 的第一次 Recent 從最新拿）。
             Ok(Some(cg_seq)) => {
-                self.hole_before = Some(self.hole_before.map_or(cg_seq, |hole| hole.max(cg_seq)));
+                let threshold = cg_seq.saturating_add(1);
+                self.hole_before = Some(
+                    self.hole_before
+                        .map_or(threshold, |hole| hole.max(threshold)),
+                );
             }
             Ok(None) => {}
             Err(error) => self
@@ -319,9 +324,14 @@ impl RoomSyncTask {
                 }
             }
             // 寫失敗只報不擋（快取壞了的代價是重拉）；沒落地的就不通知。
-            Err(error) => self
-                .events
-                .progress(format!("room sync: cache write failed (ignored): {error}")),
+            // 🚨 但這包就是一個洞（本地漏的，跟 server 的 gap 同一類）：水位凍住，不然下一包寫成功就跨過它、UI 的 Recent 再也補不回來
+            //（PR #58 審查 cirno 🟡1）。
+            Err(error) => {
+                self.events.progress(format!(
+                    "room sync: cache write failed ({error}); the watermark is frozen until the next sync.recent"
+                ));
+                self.freeze_before_next_push().await;
+            }
         }
     }
 }
@@ -739,6 +749,94 @@ mod tests {
             !core.close_subscriptions(&Target::default()).await.unwrap(),
             "再關一次：本來就沒開"
         );
+        fake.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 本地漏一包（這裡用解不開的包：`bc` 跟事件數對不上）也是洞：凍結點＝現在的水位，之後正常的包不推，直到 UI 的 `sync.recent` 推過它。
+    /// `freeze_before_next_push` 是 `Protocol`、收件匣滿、cache 寫失敗三條路共用的那一支（PR #58 審查 cirno 🟡1）。
+    #[tokio::test]
+    async fn a_pack_that_could_not_be_read_freezes_the_watermark_like_a_gap() {
+        let dir = scratch("unreadable");
+        let (core, account) = core_with_wbf_account(&dir);
+        let mut seen = core.subscribe();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
+        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+            .await
+            .expect("subscribe");
+        let subscription_id = fake.subscription_id.lock().unwrap().unwrap();
+        let pool = core.pool_of_account(&account).unwrap();
+        drop(
+            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        events.lock().unwrap().push(text_event(100));
+        fake.outbound
+            .send(push(subscription_id, 0, false, &[text_event(100)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$100");
+        assert_eq!(cg_seq_of(&core, &account).await, Some(100));
+
+        // 一包壞掉：說有 2 則、只帶 1 則。
+        let mut broken = push(subscription_id, 1, false, &[text_event(150)]);
+        broken.meta = br#"{"bc":2,"fs":150,"ls":150,"gap":false}"#.to_vec();
+        fake.outbound.send(broken).await.unwrap();
+        // 之後正常的一包：寫進去、但水位凍在 100。
+        events
+            .lock()
+            .unwrap()
+            .extend([text_event(150), text_event(200)]);
+        fake.outbound
+            .send(push(subscription_id, 2, false, &[text_event(200)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$200");
+        assert_eq!(
+            cg_seq_of(&core, &account).await,
+            Some(100),
+            "🚨 本地漏了一包，水位不能跨過它"
+        );
+        // UI 補窗從 100 起：150 回來了、水位到 200；再一包恢復推。
+        let (misc, _fake_misc) = memory_client_with_hello(events.clone()).await;
+        drop(
+            pool.acquire(LinkRole::Misc, || async move { Ok(misc) })
+                .await
+                .unwrap(),
+        );
+        let summary = core
+            .recent(
+                RecentPlan {
+                    max_events: None,
+                    ..RecentPlan::default()
+                },
+                false,
+                Transport::WebSocket,
+                "ui refill",
+                &Target::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (summary.cg_seq_before, summary.cg_seq_after),
+            (Some(100), Some(200))
+        );
+        assert!(cached_ids(&core, &account)
+            .await
+            .contains(&"$150".to_string()));
+        events.lock().unwrap().push(text_event(250));
+        fake.outbound
+            .send(push(subscription_id, 3, false, &[text_event(250)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$250");
+        wait_for_async(
+            || async { cg_seq_of(&core, &account).await == Some(250) },
+            "the watermark moves again once the hole is filled",
+        )
+        .await;
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
