@@ -112,6 +112,20 @@ impl IncomingEvent {
             .and_then(|value| value.as_str())
     }
 
+    /// 存得進 `cache.db` 的最低條件：有 `event_id`（能被參照、能當游標）與 `sender`（能比對誰改了誰的訊息）。
+    /// 🚨 `upsert_events` 與進料口（推播、`Recent`）共用這一支：存不存得了只有一個答案，🚫 不在兩處各判一次。
+    ///
+    /// Return:
+    ///     Some((event_id, sender))  存得了
+    ///     None                       存不了——呼叫端跳過、數出來、講出來；🚫 不替它發通知（它不會在庫裡）
+    pub fn storable_identity(&self) -> Option<(&str, &str)> {
+        let sender = self
+            .envelope()
+            .get("sender")
+            .and_then(|value| value.as_str())?;
+        Some((self.find_event_id()?, sender))
+    }
+
     /// Return:
     ///     (r_seq, g_seq)  從 envelope 的 `unsigned` 讀；非 fork server 兩個都是 None
     pub fn seqs(&self) -> (Option<i64>, Option<i64>) {

@@ -19,6 +19,8 @@ pub async fn recent_command(
         .core()?
         .recent(
             plan,
+            // CLI 沒有 `--since`：起點是存的水位（rpc-spec §3.4 的 `since` 給 UI 用）。
+            None,
             from_scratch,
             context.transport,
             crate::commands::CLIENT_NAME,

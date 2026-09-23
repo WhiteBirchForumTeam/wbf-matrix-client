@@ -1083,3 +1083,114 @@ fn device_packs_reject_inconsistent_shapes() {
         "不是 8 的倍數"
     );
 }
+
+/// 房間事件的訂閱（wbfuwunel `wbf-event-push.md` §2）：`Subscribe`／`Unsubscribe` 逐 byte對向量，`Ack`／`Push` 解得回向量的值。
+#[test]
+fn event_subscribe_and_push_match_the_server_vectors() {
+    use wbf_sdk::protocol::{self, EventSubscribeReply, EventSubscribeRequest};
+    use wbf_wire::Pack;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+    let pack_named = |name: &str| -> Pack {
+        let entry = vectors["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("vector {name}"));
+        Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
+    };
+
+    let account_wide = pack_named("subscribe_account_wide");
+    let ours = protocol::event_subscribe(
+        &EventSubscribeRequest {
+            cg_seq: Some(4700),
+            rooms: None,
+        },
+        account_wide.id,
+        account_wide.seq,
+    );
+    assert_eq!(
+        ours.encode().unwrap(),
+        account_wide.encode().unwrap(),
+        "Subscribe（帳號層、帶 cg_seq）逐 byte"
+    );
+
+    let rooms = pack_named("subscribe_rooms");
+    let ours = protocol::event_subscribe(
+        &EventSubscribeRequest {
+            cg_seq: None,
+            rooms: Some(vec!["!r:localhost".into()]),
+        },
+        rooms.id,
+        rooms.seq,
+    );
+    assert_eq!(
+        ours.encode().unwrap(),
+        rooms.encode().unwrap(),
+        "Subscribe（點名）逐 byte"
+    );
+
+    let unsubscribe = pack_named("unsubscribe_all");
+    let ours = protocol::event_unsubscribe(None, unsubscribe.id, unsubscribe.seq);
+    assert_eq!(
+        ours.encode().unwrap(),
+        unsubscribe.encode().unwrap(),
+        "Unsubscribe（全退，meta 空）逐 byte"
+    );
+
+    // Ack 抄訂閱的 id 與 seq。
+    let ack = pack_named("ack_subscribe");
+    let request = protocol::event_subscribe(&EventSubscribeRequest::default(), ack.id, ack.seq);
+    match protocol::parse_event_subscribe_reply(&request, &ack).unwrap() {
+        EventSubscribeReply::Acknowledged(ack) => {
+            assert_eq!((ack.latest_g_seq, ack.joined), (4712, 3));
+            assert!(ack.skipped.is_empty());
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Push 抄 id、seq 自己數；data 是長度前綴的事件。
+    let push = pack_named("push_one");
+    assert_eq!(push.id, ack.id, "向量裡 Push 抄的是同一個訂閱 id");
+    match protocol::parse_event_subscribe_reply(&request, &push).unwrap() {
+        EventSubscribeReply::Push { meta, events } => {
+            assert_eq!(
+                (meta.bc, meta.fs, meta.ls, meta.gap),
+                (1, 4712, 4712, false)
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["room_id"], "!r:localhost");
+            assert_eq!(events[0]["content"]["body"], "b");
+        }
+        other => panic!("{other:?}"),
+    }
+    let gap = pack_named("push_gap");
+    match protocol::parse_event_subscribe_reply(&request, &gap).unwrap() {
+        EventSubscribeReply::Push { meta, events } => {
+            assert!(meta.gap, "被截斷／丟過包的那一包帶 gap");
+            assert_eq!((meta.fs, meta.ls, events.len()), (4720, 4720, 1));
+        }
+        other => panic!("{other:?}"),
+    }
+    // `DeviceChanged` 也走同一個訂閱 id：認得、不當錯。
+    let changed = pack_named("event_device_changed");
+    assert!(matches!(
+        protocol::parse_event_subscribe_reply(&request, &changed).unwrap(),
+        EventSubscribeReply::DeviceChanged(_)
+    ));
+    // 🚨 bc 跟事件數對不上是 Protocol，不是少一則算了。
+    let mut short = push.clone();
+    short.data.clear();
+    assert!(matches!(
+        protocol::parse_event_subscribe_reply(&request, &short),
+        Err(wbf_sdk::SdkError::Protocol(_))
+    ));
+    // 缺 gap 欄位當 true。
+    let mut no_gap = push.clone();
+    no_gap.meta = br#"{"bc":1,"fs":4712,"ls":4712}"#.to_vec();
+    match protocol::parse_event_subscribe_reply(&request, &no_gap).unwrap() {
+        EventSubscribeReply::Push { meta, .. } => assert!(meta.gap, "缺欄位往「有洞」倒"),
+        other => panic!("{other:?}"),
+    }
+}

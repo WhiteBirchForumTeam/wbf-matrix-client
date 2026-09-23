@@ -35,6 +35,15 @@ pub struct CacheIdentity {
     pub server: String,
 }
 
+/// [`Cache::upsert_events_counted`] 的結果。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpsertOutcome {
+    /// 寫進去（或已經在、記了同步紀錄）的則數。
+    pub written: usize,
+    /// 永遠存不了的則數：沒有 `event_id`／`sender`，或 `room_id` 跟參數不同。呼叫端要講出來。
+    pub unstorable: usize,
+}
+
 /// 開檔時做了什麼，給呼叫者印在 stderr（CLI）或 log（UI）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenOutcome {
@@ -263,26 +272,43 @@ impl Cache {
     ///     room_id: 這批事件的房間, example: "!abc:localhost"
     ///     events: 上游給的原樣
     /// Return:
-    ///     Ok(usize)   寫進去（或已經在、記了同步紀錄）的則數；不寫的不算
+    ///     Ok(usize)   寫進去（或已經在、記了同步紀錄）的則數；不寫的不算（要知道不寫了幾則用 [`Cache::upsert_events_counted`]）
     pub fn upsert_events(
         &mut self,
         user_id: &str,
         room_id: &str,
         events: &[IncomingEvent],
     ) -> Result<usize, SdkError> {
+        Ok(self
+            .upsert_events_counted(user_id, room_id, events)?
+            .written)
+    }
+
+    /// 同 [`Cache::upsert_events`]，但連「不寫的幾則」一起回：進料口（推播、`Recent`）要把這個數字講出來，🚫 不靜默跳過（PR #58 審查 rumia 🔴）。
+    ///
+    /// Return:
+    ///     Ok(UpsertOutcome)   `written` 寫進去的；`unstorable` 沒有 `event_id`／`sender`、或 `room_id` 跟參數不同的（永遠存不了，不是這次失敗）
+    pub fn upsert_events_counted(
+        &mut self,
+        user_id: &str,
+        room_id: &str,
+        events: &[IncomingEvent],
+    ) -> Result<UpsertOutcome, SdkError> {
         let transaction = self.connection.transaction().map_err(db_error)?;
         let reader = user_row_id(&transaction, user_id)?;
         let room = room_row_id(&transaction, room_id)?;
         let now = now_millis();
         let mut written = 0usize;
+        let mut unstorable = 0usize;
         for incoming in events {
             let envelope = incoming.envelope();
             let text = |key: &str| envelope.get(key).and_then(|value| value.as_str());
-            let (Some(event_id), Some(sender_mxid)) = (incoming.find_event_id(), text("sender"))
-            else {
+            let Some((event_id, sender_mxid)) = incoming.storable_identity() else {
+                unstorable += 1;
                 continue;
             };
             if text("room_id").is_some_and(|own_room| own_room != room_id) {
+                unstorable += 1;
                 continue;
             }
             let sender = user_row_id(&transaction, sender_mxid)?;
@@ -379,7 +405,10 @@ impl Cache {
             written += 1;
         }
         transaction.commit().map_err(db_error)?;
-        Ok(written)
+        Ok(UpsertOutcome {
+            written,
+            unstorable,
+        })
     }
 
     /// 歷史，從最新往回（CLI 規格 §3.4.1 的 `read`，只是來源是快取）。只回這個帳號同步過、而且沒藏的。

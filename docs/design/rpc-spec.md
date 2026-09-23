@@ -342,10 +342,10 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 | method | params | result | core |
 |---|---|---|---|
-| `sync.recent` | `{ max_events?: 10000, window?: 320, batch?: 10, from_scratch?: bool, user?, server? }`（三層的意思在 CLI 規格 §3.5） | `RecentSummary`：`{ pulled, written, windows, batches, caught_up, cg_seq_before?, cg_seq_after?, skipped_without_room }` | `recent`。長工作：推 `progress` |
+| `sync.recent` | `{ max_events?: 10000, window?: 320, batch?: 10, since?: number, from_scratch?: bool, user?, server? }`（三層的意思在 CLI 規格 §3.5；`since` ＝ 從這個 `g_seq` 之後拿，UI 自己記的起點——沒帶用 daemon 存的上一次水位。水位**只由這支動**，訂閱線的推播不碰它，補不補、從哪補是 UI 的事，room-sync.md） | `RecentSummary`：`{ pulled, written, windows, batches, caught_up, cg_seq_before?, cg_seq_after?, skipped_without_room }` | `recent`。長工作：推 `progress` |
 
-📎 daemon 之後 `recent` 應該是**它自己排程跑**的（連上 server 就補洞），這條 method 是「現在就跑一輪」。
-排程怎麼訂還沒定，跟 architecture-v2 §6 的四條連線一起做。
+📎 ~~daemon 之後 `recent` 應該是它自己排程跑的~~ 維護者 2026-09-23 定：**daemon 不自己叫 `Recent`**——訂閱線只收新事件、寫進庫，
+什麼時候補、從哪補（`since`）、補到哪為止（看 `caught_up`）全是 UI 的事；推播漏掉的 UI 不叫就不補（room-sync.md §0）。
 
 ### 3.5 上傳（不進房間的裸上傳；有 `transport`）
 
@@ -588,7 +588,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（等 wbfuwunel #64） | ✅ wbf／🔁 一般 server |
 | `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
-| `room.message` 推播 | ✅（`CoreEvent::Message`，來自 `watch`） | matrix-sdk `/sync` | 🔁 daemon 版要接 `Event/Subscribe`／`Push` |
+| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22（⚠️ 開／關訂閱線還沒有 RPC：`Core::open_subscriptions`／`close_subscriptions` 先只給 core 與測試用；補窗是 UI 叫 `sync.recent`） |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`--transport http` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
 | `media.save_to` | ✅ | **WS** `Read`＋媒體池 | ✅ |
@@ -596,7 +596,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*`、`recovery.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，account-session.md §6） | 🔁 搬到 crypto 層＋橋的 `/room_keys`，排在 E2EE 的 RPC 面之後 |
 | `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
-| `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發；`vault.state` ❌ | — | ❌ |
+| `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發（room-sync.md §3：追平與否是 UI 自己叫 `sync.recent` 的結果，線的開關看 `link.state`）；`vault.state` ❌ | — | ❌ |
 | `progress`／`note`／`room.message` 推播 | ✅ daemon 層接上了（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ 2026-09-21 |
 
 📎 讀法：✅ 那幾列是 wbf-sdk 第 2 步的產物（上傳／下載／`recent`／ping），它們從一開始就是 WS。

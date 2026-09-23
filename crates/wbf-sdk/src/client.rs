@@ -51,6 +51,45 @@ pub struct DeviceSubscription {
     pub subscription: Subscription,
 }
 
+/// `room_subscription` 的結果：Ack 的內容＋長活的訂閱。
+pub struct RoomSubscription {
+    /// server 這一刻最新的 `g_seq`、進了幾房、跳過哪些。
+    pub ack: protocol::EventSubscribeAck,
+    /// Ack 到之前就推來的包（server 先登記再回 Ack，中間有新事件就會這樣）。
+    pub early_pushes: Vec<(protocol::PushMeta, Vec<serde_json::Value>)>,
+    subscription: Subscription,
+    /// 送出去的那個 `Subscribe`：之後每個 pack 都拿它驗 id／seq。
+    request: Pack,
+}
+
+impl RoomSubscription {
+    /// 下一個推來的東西，已經解過。
+    ///
+    /// Return:
+    ///     Ok(Some(reply))   `Push`／`DeviceChanged`／退訂的 Ack
+    ///     Ok(None)          訂閱結束了（server 送了 `Error`）
+    ///     Err(Timeout)      連線活著、這段時間沒推
+    ///     Err(Network)      連線沒了
+    ///     Err(Protocol)     形狀不對（🚫 不吞：一包壞了就是漏一包，呼叫端用 `Recent` 補）
+    pub async fn next(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<protocol::EventSubscribeReply>, SdkError> {
+        match self.subscription.next(timeout).await? {
+            Some(pack) => Ok(Some(protocol::parse_event_subscribe_reply(
+                &self.request,
+                &pack,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 讀一次就清掉：true ＝ 收件匣滿過、丟過推播——跟 server 的 `gap` 一樣，用 `Recent` 補。
+    pub fn take_gap(&self) -> bool {
+        self.subscription.take_gap()
+    }
+}
+
 /// `Recent` 一窗的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecentWindow {
@@ -563,6 +602,95 @@ impl<C: PackChannel> WbfClient<C> {
             early_pushes,
             subscription,
         })
+    }
+
+    /// `Event/Subscribe` 然後**一直收**（wbfuwunel `wbf-event-push.md`）：等到 `Ack` 才回，之後的 `Push`／`DeviceChanged` 從 handle 來。
+    /// 🚫 這裡不帶 `cg_seq`（server 的補窗有上限、截斷只給一個 gap bit）：補窗由呼叫端自己用 `recent_sync` 做，在 Ack 之後、放手之前。
+    ///
+    /// Args:
+    ///     rooms: None ＝ 帳號層（之後新加入的房也自動跟）, example: None
+    ///     per_pack_timeout: 等 Ack 最久多久, example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(RoomSubscription)   訂到了：Ack 的內容、Ack 之前就推來的包、長活的 handle
+    ///     Err(Server)            server 拒（例：session 不算數）
+    ///     Err(Usage)             通道不能長活收
+    ///     Err(Protocol)          會話在 Ack 之前就結束
+    pub async fn room_subscription(
+        &mut self,
+        rooms: Option<&[String]>,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<RoomSubscription, SdkError> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let request = protocol::event_subscribe(
+            &protocol::EventSubscribeRequest {
+                cg_seq: None,
+                rooms: rooms.map(<[String]>::to_vec),
+            },
+            self.next_session_id(),
+            seq,
+        );
+        let mut subscription = self.channel.subscribe(request.clone()).await?;
+        let mut early_pushes = Vec::new();
+        loop {
+            let Some(reply) = subscription.next(per_pack_timeout).await? else {
+                return Err(SdkError::Protocol(
+                    "Subscribe session ended before the Ack".into(),
+                ));
+            };
+            match protocol::parse_event_subscribe_reply(&request, &reply)? {
+                protocol::EventSubscribeReply::Acknowledged(ack) => {
+                    return Ok(RoomSubscription {
+                        ack,
+                        early_pushes,
+                        subscription,
+                        request,
+                    });
+                }
+                protocol::EventSubscribeReply::Push { meta, events } => {
+                    early_pushes.push((meta, events));
+                }
+                // Ack 之前不該有這兩種；有就跳過（不是這裡的事）。
+                protocol::EventSubscribeReply::DeviceChanged(_)
+                | protocol::EventSubscribeReply::Unsubscribed { .. } => {}
+            }
+        }
+    }
+
+    /// `Event/Unsubscribe`（整個退）：用訂閱的 `id` 送，Ack 從訂閱的 handle 收。之後 server 不再推；handle 丟掉就沒了。
+    ///
+    /// Args:
+    ///     subscription: `room_subscription` 回的
+    ///     per_pack_timeout: 等 Ack 最久多久, example: Duration::from_secs(10)
+    /// Return:
+    ///     Ok(())          server 回了 Ack
+    ///     Err(Network)    線已經死了（那也就退了：斷線自動退訂）
+    ///     Err(Protocol)   等 Ack 期間會話結束
+    pub async fn room_unsubscribe(
+        &mut self,
+        mut subscription: RoomSubscription,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<(), SdkError> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let pack = protocol::event_unsubscribe(None, subscription.request.id, seq);
+        self.channel.send_only(pack).await?;
+        loop {
+            match subscription.next(per_pack_timeout).await? {
+                Some(protocol::EventSubscribeReply::Unsubscribed { seq: acked })
+                    if acked == seq =>
+                {
+                    return Ok(())
+                }
+                // 退訂送出到 Ack 回來之間還可能推幾包：呼叫端已經決定不要了，丟掉。
+                Some(_) => continue,
+                None => {
+                    return Err(SdkError::Protocol(
+                        "the subscription ended before the Unsubscribe was acknowledged".into(),
+                    ))
+                }
+            }
+        }
     }
 
     /// `Device/Unsubscribe`：下線前說出口的退出——解除這條連線對裝置佇列的持有（to-device-client.md §4）。沒訂也是 no-op。

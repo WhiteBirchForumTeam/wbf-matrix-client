@@ -763,6 +763,171 @@ pub struct SendAck {
     pub event_id: String,
 }
 
+// ---- 房間事件的訂閱（wbfuwunel `wbf-event-push.md` §2）：`Subscribe`／`Unsubscribe`／`Push` ----
+
+/// `Event/Subscribe` 的 meta。鍵序照向量（`cg_seq`、`rooms`），兩個都可省。
+/// - `rooms` 沒帶 ＝ 帳號層：現在加入的每個房，**之後新加入的也自動跟**；點名 ＝ 只那幾房（不是成員的列進 Ack 的 `skipped`）。
+/// - `cg_seq` 帶了 server 會在 Ack 之後先補一輪 `Push`（有上限、截斷時第一個 `Push` 帶 `gap`）；不帶 ＝ 只要新的。
+///   📎 core 的房間同步**不帶**：補窗自己用 `Recent` 做（翻窗到追平或總量），乾淨。
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct EventSubscribeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cg_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rooms: Option<Vec<String>>,
+}
+
+/// Args:
+///     request: example: &EventSubscribeRequest { cg_seq: Some(4700), rooms: None }
+///     id: client 選的會話號（`SESSION` 型別；之後每個 `Push` 抄它）
+pub fn event_subscribe(request: &EventSubscribeRequest, id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Event,
+        subtype: event::SUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta: serde_json::to_vec(request).expect("EventSubscribeRequest serializes"),
+        data: Vec::new(),
+    }
+}
+
+/// `Event/Unsubscribe`：`rooms` 沒帶 ＝ 整個忘掉這條連線的訂閱（含「跟進之後加入的房」），meta 是空的（向量 `unsubscribe_all`）；
+/// 點名 ＝ 只退那幾房（退不在裡面的是 no-op）。`id` 用訂閱時那個。
+///
+/// Args:
+///     rooms: example: None
+pub fn event_unsubscribe(rooms: Option<&[String]>, id: u64, seq: u32) -> Pack {
+    let meta = match rooms {
+        Some(rooms) => {
+            serde_json::to_vec(&serde_json::json!({ "rooms": rooms })).expect("rooms serialize")
+        }
+        None => Vec::new(),
+    };
+    Pack {
+        kind: Kind::Event,
+        subtype: event::UNSUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta,
+        data: Vec::new(),
+    }
+}
+
+/// `Event/Subscribe` 的 Ack meta（向量 `ack_subscribe`）。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct EventSubscribeAck {
+    /// server 這一刻最新的 `g_seq`。
+    pub latest_g_seq: i64,
+    /// 新進的**房**數（不是 topic 數）。
+    pub joined: u32,
+    /// 不是成員的房：點名時就不是的，加上登記後重讀才發現已經離開的。
+    #[serde(default)]
+    pub skipped: Vec<String>,
+}
+
+/// `Event/Push` 的 meta（向量 `push_one`／`push_gap`）。
+/// 🚨 水位只認 `fs`／`ls`，🚫 不拿 `seq` 的跳號算少了幾則（丟掉的包也佔號）。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct PushMeta {
+    /// 這一包幾則。
+    pub bc: u32,
+    /// 這一包最新那則的 `g_seq`。
+    pub fs: i64,
+    /// 這一包最舊那則的 `g_seq`。
+    pub ls: i64,
+    /// true ＝ 上一個 `Push` 之後有事件沒推到（佇列滿）、或這是被截斷的補窗的第一包 → 用 `Recent(cg_seq)` 補。
+    /// 🚨 缺欄位當 true（不確定就多補一次，🚫 不假設沒丟）。
+    #[serde(default = "gap_when_missing")]
+    pub gap: bool,
+}
+
+/// 房間訂閱那個會話上收到的東西（都抄訂閱的 `id`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventSubscribeReply {
+    /// 登記好了（Ack 的 `seq` 抄請求）。
+    Acknowledged(EventSubscribeAck),
+    /// 新事件一包，新到舊。
+    Push {
+        meta: PushMeta,
+        events: Vec<serde_json::Value>,
+    },
+    /// 某人的裝置版本號變了（同一個訂閱會話送來；E2EE 那支才消費）。
+    DeviceChanged(DeviceChangedMeta),
+    /// `Unsubscribe` 的 Ack（`seq` 不是訂閱那個）。
+    Unsubscribed { seq: u32 },
+}
+
+/// Args:
+///     request: 送出的 `Subscribe` pack
+///     response: 訂閱會話收到的 pack
+/// Return:
+///     Ok(EventSubscribeReply)
+///     Err(Server)      `Error`（含 `Forbidden`：點名了不是成員的房——那是 `Recent` 的規則；`Subscribe` 只會列進 `skipped`）
+///     Err(Protocol)    `id` 沒抄、沒有 `IS_RESPONSE`、`Push` 的 data 切不出 `bc` 則、或不認得的 kind／subtype
+pub fn parse_event_subscribe_reply(
+    request: &Pack,
+    response: &Pack,
+) -> Result<EventSubscribeReply, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "Subscribe reply id {} does not echo the request id {}",
+            response.id, request.id
+        )));
+    }
+    if response.flags & flags::IS_RESPONSE == 0 {
+        return Err(SdkError::Protocol(
+            "Subscribe reply without IS_RESPONSE".into(),
+        ));
+    }
+    match (response.kind, response.subtype) {
+        (Kind::Control, control::ACK) if response.seq == request.seq => {
+            Ok(EventSubscribeReply::Acknowledged(parse_meta(response)?))
+        }
+        (Kind::Control, control::ACK) => Ok(EventSubscribeReply::Unsubscribed {
+            seq: response.seq,
+        }),
+        (Kind::Event, event::PUSH) => {
+            let (meta, events) = parse_push(response)?;
+            Ok(EventSubscribeReply::Push { meta, events })
+        }
+        (Kind::Event, event::DEVICE_CHANGED) => {
+            Ok(EventSubscribeReply::DeviceChanged(parse_meta(response)?))
+        }
+        (kind, subtype) => Err(SdkError::Protocol(format!(
+            "expected Ack, Event/Push or Event/DeviceChanged on the room subscription, got kind {kind:?} subtype {subtype:#04x}"
+        ))),
+    }
+}
+
+/// `Event/Push` 的 meta 與事件：data 是 `bc` 則「u32 大端長度 ＋ 事件 JSON」，跟 `Batch` 同一個切法，新到舊。
+///
+/// Return:
+///     Ok((PushMeta, Vec<Value>))
+///     Err(Protocol)   meta 不是那個形狀、data 切不開、則數跟 `bc` 對不上（🚫 不吞：少一則就是漏一則）
+pub fn parse_push(pack: &Pack) -> Result<(PushMeta, Vec<serde_json::Value>), SdkError> {
+    let meta: PushMeta = parse_meta(pack)?;
+    let events = split_length_prefixed(&pack.data)?
+        .into_iter()
+        .map(|bytes| {
+            serde_json::from_slice(bytes)
+                .map_err(|error| SdkError::Protocol(format!("Push event is not JSON: {error}")))
+        })
+        .collect::<Result<Vec<serde_json::Value>, SdkError>>()?;
+    if events.len() != meta.bc as usize {
+        return Err(SdkError::Protocol(format!(
+            "Push says bc={} but carries {} events",
+            meta.bc,
+            events.len()
+        )));
+    }
+    Ok((meta, events))
+}
+
 /// `Event/DeviceChanged`（`0x14 0x07`，只有 server → client）的 meta（wbfuwunel `wbf-room-device-version.md` §6）。
 /// 某人的裝置版本號變了；`rooms` 是這條連線訂閱中、而且他在裡面的房間 → 各自新的房間版本號。
 /// 一條連線一次變動只收一個，不管共同幾個房。丟了由 `gap` 提醒，最後由送出時的 1506 擋。

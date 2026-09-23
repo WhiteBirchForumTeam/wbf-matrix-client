@@ -154,6 +154,26 @@ impl LinkPool {
         closed
     }
 
+    /// 關一條（等正在用它的命令做完）；那一格回到 Idle，下次要用再開。
+    ///
+    /// Args:
+    ///     role: example: LinkRole::Subscriptions
+    ///     reason: example: "closed on request"
+    /// Return:
+    ///     bool  true ＝ 本來開著、關了；false ＝ 本來就沒開
+    pub async fn close(&self, role: LinkRole, reason: &str) -> bool {
+        let slot = self.slot(role);
+        let mut guard = slot.lock().await;
+        match guard.take() {
+            Some(client) => {
+                drop(client);
+                self.emit_link(role, LinkState::Closed, Some(reason.to_string()));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Return:
     ///     usize   現在開著的線數（正在被用的也算開著）。給 `daemon.info`
     pub fn open_count(&self) -> usize {
@@ -313,6 +333,8 @@ impl crate::Core {
         .await?;
         let mut client = WbfClient::new(Channel::WebSocket(Box::new(channel)));
         client.hello(LINK_CLIENT_NAME, features_of(role)).await?;
+        // 通用的初始化（維護者 2026-09-22）：看角色決定開完線還要做什麼——訂閱線就是在這裡訂的（room-sync.md）。
+        self.init_connection(account, role, &mut client).await?;
         Ok(client)
     }
 
