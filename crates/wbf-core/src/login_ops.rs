@@ -241,7 +241,13 @@ impl Core {
                 ),
             ));
         }
-        std::fs::create_dir_all(canonical.dir.parent().expect("account dir has a parent"))
+        let accounts_dir = canonical.dir.parent().ok_or_else(|| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("account dir {} has no parent", canonical.dir.display()),
+            )
+        })?;
+        std::fs::create_dir_all(accounts_dir)
             .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
         std::fs::rename(&account.dir, &canonical.dir)
             .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;

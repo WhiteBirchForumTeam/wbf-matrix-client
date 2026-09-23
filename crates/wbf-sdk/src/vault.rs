@@ -328,7 +328,10 @@ impl Vault {
     /// Args:
     ///     path: example: "<data dir>/s/<b58>_<b58>/a/<b58>_<b58>/session.sealed"
     pub fn seal_session(&self, path: &Path, session: &Session) -> Result<(), SdkError> {
-        let plaintext = Zeroizing::new(serde_json::to_vec(session).expect("Session serializes"));
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(session)
+                .map_err(|error| crate::error::cannot_serialize("Session", error))?,
+        );
         let nonce = random_nonce()?;
         let sealed = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
             .encrypt(
@@ -346,7 +349,8 @@ impl Vault {
         };
         write_private(
             path,
-            &serde_json::to_vec_pretty(&file).expect("SealedFile serializes"),
+            &serde_json::to_vec_pretty(&file)
+                .map_err(|error| crate::error::cannot_serialize("SealedFile", error))?,
         )
     }
 
@@ -379,7 +383,8 @@ impl Vault {
         };
         write_private(
             path,
-            &serde_json::to_vec_pretty(&file).expect("SealedFile serializes"),
+            &serde_json::to_vec_pretty(&file)
+                .map_err(|error| crate::error::cannot_serialize("SealedFile", error))?,
         )
     }
 
@@ -525,7 +530,8 @@ impl Vault {
         };
         write_private(
             &self.dir.join(KEY_FILE_NAME),
-            &serde_json::to_vec_pretty(&file).expect("KeyFile serializes"),
+            &serde_json::to_vec_pretty(&file)
+                .map_err(|error| crate::error::cannot_serialize("KeyFile", error))?,
         )?;
         Ok(self)
     }

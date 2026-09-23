@@ -178,7 +178,12 @@ impl Core {
             .map_err(|error| CoreError::new(CoreErrorKind::Integrity, format!("{error}")))?;
         let description = ChunkedBlock::from_description_json(&json)
             .map_err(|error| CoreError::new(CoreErrorKind::Integrity, error))?;
-        result.description = Some(serde_json::to_value(&description).expect("block serializes"));
+        result.description = Some(serde_json::to_value(&description).map_err(|error| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("block description could not be serialized: {error}"),
+            )
+        })?);
         result.verified = Some(true);
         Ok(result)
     }
@@ -301,7 +306,8 @@ impl Core {
         let chunk_size = request
             .chunk_size
             .unwrap_or_else(|| choose_stream_chunk_size(link));
-        let file_cipher = FileCipher::generate(cipher, chunk_size);
+        let file_cipher =
+            FileCipher::generate(cipher, chunk_size).map_err(wbf_sdk::SdkError::from)?;
         let mut block = file_cipher.to_event_block(0);
         // ⚠️ 串流不知道總長，所以 `file_size` 是 `None` 而不是 0——那兩件事不一樣，
         // 收檔端要分得出「空檔」與「還不知道多大」。

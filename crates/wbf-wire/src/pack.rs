@@ -100,6 +100,17 @@ pub mod id {
         Some(((id_type as u64) << 56) | value)
     }
 
+    /// 跟 [`compose`] 一樣，但 `value` 超過 56 bit 就**截掉高位**而不是回 `None`——給「自己遞增、本來就想取模」的會話號用。
+    ///
+    /// Args:
+    ///     id_type: example: SESSION
+    ///     value: example: 0x22334455667788
+    /// Return:
+    ///     u64  `id_type` byte ‖ `value & MAX_VALUE`
+    pub fn compose_masked(id_type: u8, value: u64) -> u64 {
+        ((id_type as u64) << 56) | (value & MAX_VALUE)
+    }
+
     /// Args:
     ///     id: 線上的 id, example: 0x0322334455667788
     /// Return:
@@ -342,19 +353,22 @@ impl Pack {
         if bytes.len() < MIN_PACK_LEN {
             return Err(DecodeError::TooShort);
         }
-        if bytes[0] != VERSION {
-            return Err(DecodeError::UnsupportedVersion(bytes[0]));
+        // 長度已經驗過；這裡用 slice pattern 取標頭，🚫 不索引（索引越界是 panic，而這支程式不該有 panic 的路）。
+        let [version, kind_byte, subtype, flags, ..] = bytes else {
+            return Err(DecodeError::TooShort);
+        };
+        if *version != VERSION {
+            return Err(DecodeError::UnsupportedVersion(*version));
         }
-        let kind = Kind::from_byte(bytes[1]).ok_or(DecodeError::UnknownKind(bytes[1]))?;
-        let subtype = bytes[2];
-        let flags = bytes[3];
+        let kind = Kind::from_byte(*kind_byte).ok_or(DecodeError::UnknownKind(*kind_byte))?;
+        let (subtype, flags) = (*subtype, *flags);
         if flags & !flags::KNOWN != 0 {
             return Err(DecodeError::ReservedFlags(flags));
         }
-        let id = u64::from_be_bytes(bytes[4..12].try_into().expect("8 bytes"));
-        let seq = u32::from_be_bytes(bytes[12..16].try_into().expect("4 bytes"));
+        let id = read_u64(bytes, 4).ok_or(DecodeError::TooShort)?;
+        let seq = read_u32(bytes, 12).ok_or(DecodeError::TooShort)?;
 
-        let meta_len = read_len(bytes, 16);
+        let meta_len = read_len(bytes, 16).ok_or(DecodeError::Truncated)?;
         let meta_end = 20usize
             .checked_add(meta_len)
             .ok_or(DecodeError::Truncated)?;
@@ -362,8 +376,8 @@ impl Pack {
         if meta_end.checked_add(8).ok_or(DecodeError::Truncated)? > bytes.len() {
             return Err(DecodeError::Truncated);
         }
-        let meta_crc_expected = read_u32(bytes, meta_end);
-        let meta_crc_actual = crc32c(&bytes[..meta_end]);
+        let meta_crc_expected = read_u32(bytes, meta_end).ok_or(DecodeError::Truncated)?;
+        let meta_crc_actual = crc32c(bytes.get(..meta_end).ok_or(DecodeError::Truncated)?);
         if meta_crc_actual != meta_crc_expected {
             return Err(DecodeError::MetaCrc {
                 expected: meta_crc_expected,
@@ -371,7 +385,7 @@ impl Pack {
             });
         }
 
-        let data_len = read_len(bytes, meta_end + 4);
+        let data_len = read_len(bytes, meta_end + 4).ok_or(DecodeError::Truncated)?;
         let data_start = meta_end + 8;
         let data_end = data_start
             .checked_add(data_len)
@@ -380,8 +394,10 @@ impl Pack {
         if pack_end > bytes.len() {
             return Err(DecodeError::Truncated);
         }
-        let data = &bytes[data_start..data_end];
-        let data_crc_expected = read_u32(bytes, data_end);
+        let data = bytes
+            .get(data_start..data_end)
+            .ok_or(DecodeError::Truncated)?;
+        let data_crc_expected = read_u32(bytes, data_end).ok_or(DecodeError::Truncated)?;
         let data_crc_actual = crc32c(data);
         if data_crc_actual != data_crc_expected {
             return Err(DecodeError::DataCrc {
@@ -399,24 +415,34 @@ impl Pack {
             flags,
             id,
             seq,
-            meta: bytes[20..meta_end].to_vec(),
+            meta: bytes
+                .get(20..meta_end)
+                .ok_or(DecodeError::Truncated)?
+                .to_vec(),
             data: data.to_vec(),
         })
     }
 }
 
-/// 呼叫者要先確認 `bytes.len() >= at + 4`。
-fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    debug_assert!(
-        bytes.len() >= at + 4,
-        "caller must bounds-check before read_u32"
-    );
-    u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+/// Return:
+///     Some(u32)  `at` 起的 4 byte 大端
+///     None       不夠 4 byte
+fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let chunk = bytes.get(at..)?.first_chunk::<4>()?;
+    Some(u32::from_be_bytes(*chunk))
 }
 
-fn read_len(bytes: &[u8], at: usize) -> usize {
+/// Return:
+///     Some(u64)  `at` 起的 8 byte 大端
+///     None       不夠 8 byte
+fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    let chunk = bytes.get(at..)?.first_chunk::<8>()?;
+    Some(u64::from_be_bytes(*chunk))
+}
+
+fn read_len(bytes: &[u8], at: usize) -> Option<usize> {
     // u32 → usize 在 32-bit 目標上也不會截斷。
-    read_u32(bytes, at) as usize
+    read_u32(bytes, at).map(|len| len as usize)
 }
 
 #[cfg(test)]

@@ -58,6 +58,10 @@ pub enum CryptoError {
     TagInvalid,
     /// 明文長度超過 `chunk_size`（上傳端塞錯）。
     ChunkTooLong { chunk_size: u32, actual: usize },
+    /// AEAD 加密本身回錯（底層只有滿位會；輸入被 `chunk_size` 擋住，理論上到不了，但不是 panic 的理由）。
+    SealFailed,
+    /// OS 的 CSPRNG 給不出隨機數（沒有金鑰就不能加密，🚫 不拿假的頂）。
+    NoRandomness(String),
 }
 
 impl std::fmt::Display for CryptoError {
@@ -76,6 +80,8 @@ impl std::fmt::Display for CryptoError {
                     "plaintext chunk {actual} bytes exceeds chunk_size {chunk_size}"
                 )
             }
+            CryptoError::SealFailed => write!(formatter, "AEAD encrypt failed"),
+            CryptoError::NoRandomness(why) => write!(formatter, "no OS randomness: {why}"),
         }
     }
 }
@@ -138,26 +144,29 @@ impl FileCipher {
     ///     cipher: example: Cipher::default_for_this_machine()
     ///     chunk_size: example: choose_chunk_size(file_size)
     /// Return:
-    ///     FileCipher
-    pub fn generate(cipher: Cipher, chunk_size: u32) -> FileCipher {
+    ///     Ok(FileCipher)
+    ///     Err(NoRandomness)   OS 的 CSPRNG 回錯（沒金鑰就不加密，🚫 不拿假的頂）
+    pub fn generate(cipher: Cipher, chunk_size: u32) -> Result<FileCipher, CryptoError> {
         if !cipher.is_encrypting() {
-            return FileCipher {
+            return Ok(FileCipher {
                 chunk_size,
                 mode: Mode::Plain,
-            };
+            });
         }
         let mut key = [0u8; KEY_LEN];
         let mut nonce_base = [0u8; NONCE_BASE_LEN];
-        getrandom::getrandom(&mut key).expect("OS CSPRNG available");
-        getrandom::getrandom(&mut nonce_base).expect("OS CSPRNG available");
-        FileCipher {
+        getrandom::getrandom(&mut key)
+            .map_err(|error| CryptoError::NoRandomness(error.to_string()))?;
+        getrandom::getrandom(&mut nonce_base)
+            .map_err(|error| CryptoError::NoRandomness(error.to_string()))?;
+        Ok(FileCipher {
             chunk_size,
             mode: Mode::Encrypted {
                 cipher,
                 key,
                 nonce_base,
             },
-        }
+        })
     }
 
     /// 測試與向量用：固定的參數。`Cipher::None` 時 `key`／`nonce_base` 被忽略。
@@ -243,7 +252,7 @@ impl FileCipher {
                 actual: plain.len(),
             });
         }
-        Ok(self.seal_with_index(index, CHUNK_AAD, plain))
+        self.seal_with_index(index, CHUNK_AAD, plain)
     }
 
     /// 約定 §3.1 第 3、4 條：先驗長度，再驗標籤。長度不對就不碰密碼。
@@ -290,8 +299,13 @@ impl FileCipher {
     ///     slot: `Create` 或 `Seal`
     ///     description_json: `ChunkedBlock::to_description_json()` 的結果
     /// Return:
-    ///     Vec<u8>  `Create`／`Seal` 的 data
-    pub fn seal_description(&self, slot: DescriptionSlot, description_json: &[u8]) -> Vec<u8> {
+    ///     Ok(Vec<u8>)        `Create`／`Seal` 的 data
+    ///     Err(SealFailed)    AEAD 底層回錯
+    pub fn seal_description(
+        &self,
+        slot: DescriptionSlot,
+        description_json: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         self.seal_with_index(slot.nonce_index(), DESCRIPTION_AAD, description_json)
     }
 
@@ -321,9 +335,14 @@ impl FileCipher {
         }
     }
 
-    fn seal_with_index(&self, index: u32, aad: &[u8], plain: &[u8]) -> Vec<u8> {
+    fn seal_with_index(
+        &self,
+        index: u32,
+        aad: &[u8],
+        plain: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         match &self.mode {
-            Mode::Plain => plain.to_vec(),
+            Mode::Plain => Ok(plain.to_vec()),
             Mode::Encrypted {
                 cipher,
                 key,

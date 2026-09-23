@@ -133,8 +133,9 @@ async fn serve_connection(
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let notice = Response::close(None, CloseReason::ShuttingDown, "the daemon is shutting down");
-                    let bytes = connection.lock().await.seal_close(&notice);
-                    let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, CloseReason::ShuttingDown)).await;
+                    if let Some(bytes) = sealed_or_log(connection.lock().await.seal_close(&notice), "the close notice") {
+                        let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, CloseReason::ShuttingDown)).await;
+                    }
                     break;
                 }
                 continue;
@@ -151,10 +152,14 @@ async fn serve_connection(
                     CloseReason::BadFrame,
                     "text frames are not part of the protocol",
                 );
-                let bytes = connection.lock().await.seal_close(&notice);
-                let _ = outgoing_tx
-                    .send(Outgoing::CloseAfter(bytes, CloseReason::BadFrame))
-                    .await;
+                if let Some(bytes) = sealed_or_log(
+                    connection.lock().await.seal_close(&notice),
+                    "the close notice",
+                ) {
+                    let _ = outgoing_tx
+                        .send(Outgoing::CloseAfter(bytes, CloseReason::BadFrame))
+                        .await;
+                }
                 break;
             }
         };
@@ -162,22 +167,33 @@ async fn serve_connection(
         match inbound {
             Inbound::Close(notice) => {
                 let reason = close_reason_of(&notice);
-                let bytes = connection.lock().await.seal_close(&notice);
-                let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, reason)).await;
+                if let Some(bytes) = sealed_or_log(
+                    connection.lock().await.seal_close(&notice),
+                    "the close notice",
+                ) {
+                    let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, reason)).await;
+                }
                 break;
             }
             Inbound::Reply(response) => {
-                let bytes = connection.lock().await.seal_response(&response);
+                let Some(bytes) =
+                    sealed_or_log(connection.lock().await.seal_response(&response), "a reply")
+                else {
+                    continue;
+                };
                 if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
                     break;
                 }
             }
             Inbound::HelloAccepted { id, protocol } => {
                 let result = handle.hello_result(protocol).await;
-                let bytes = connection
+                let sealed = connection
                     .lock()
                     .await
                     .seal_response(&Response::ok(id, result));
+                let Some(bytes) = sealed_or_log(sealed, "the hello reply") else {
+                    continue;
+                };
                 if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
                     break;
                 }
@@ -186,7 +202,10 @@ async fn serve_connection(
                 // 訂閱是**這條連線**的事，不碰 core：在這裡就回，🚫 不進 handle。
                 if request.method == "subscribe" || request.method == "unsubscribe" {
                     let response = subscription_response(&subscriptions, &request);
-                    let bytes = connection.lock().await.seal_response(&response);
+                    let sealed = connection.lock().await.seal_response(&response);
+                    let Some(bytes) = sealed_or_log(sealed, "a subscribe reply") else {
+                        continue;
+                    };
                     if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
                         break;
                     }
@@ -214,8 +233,10 @@ async fn serve_connection(
                         }
                         None => handle.call(request).await,
                     };
-                    let bytes = connection.lock().await.seal_response(&response);
-                    let _ = outgoing_tx.send(Outgoing::Frame(bytes)).await;
+                    let sealed = connection.lock().await.seal_response(&response);
+                    if let Some(bytes) = sealed_or_log(sealed, "a response") {
+                        let _ = outgoing_tx.send(Outgoing::Frame(bytes)).await;
+                    }
                     // 回應已經排進 writer 了，這時才廣播 shutdown：close 通知一定排在它後面。
                     handle.begin_shutdown_if_requested();
                 });
@@ -225,6 +246,23 @@ async fn serve_connection(
     push_task.abort();
     drop(outgoing_tx);
     let _ = writer.await;
+}
+
+/// 封不起來（序列化不了、OS 給不出 nonce；理論上到不了）就講一聲、回 `None`：呼叫端當作沒東西可送，🚫 不炸掉這條連線。
+///
+/// Args:
+///     what: 封的是什麼，給人看, example: "a push"
+/// Return:
+///     Some(Vec<u8>)  封好的 frame
+///     None           封不起來，已經講過了
+fn sealed_or_log(sealed: Result<Vec<u8>, std::io::Error>, what: &str) -> Option<Vec<u8>> {
+    match sealed {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            eprintln!("rpc: cannot seal {what}: {error}");
+            None
+        }
+    }
 }
 
 /// 這條連線的推播 task（link-pool.md §6）：core 的每一則事件 → 要不要送由訂閱集合與「是不是自己發的工作」決定 → 封包送出。
@@ -270,7 +308,10 @@ async fn forward_pushes(
             }
             Err(broadcast::error::RecvError::Closed) => return,
         };
-        let bytes = connection.lock().await.seal_push(&request);
+        let Some(bytes) = sealed_or_log(connection.lock().await.seal_push(&request), "a push")
+        else {
+            continue;
+        };
         if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
             return;
         }

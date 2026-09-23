@@ -1,3 +1,17 @@
+// 維護者 2026-09-23：正式碼不用會讓整支程式收掉的方法（unwrap／expect／panic／索引）——每個失敗要有去處；測試建置放行（測試要看到它炸）。
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! `wbf-core`：常駐狀態。解鎖一次的 vault、資料目錄的佈局、多帳號。
 //!
 //! 這一層在 [`architecture-v2.md`](../../../docs/design/architecture-v2.md) §7 的位置：
@@ -216,7 +230,7 @@ impl Core {
     pub fn cache_queue_len(&self) -> usize {
         self.server_caches
             .lock()
-            .expect("the server-cache registry is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
             .map(|cache| cache.queued())
             .sum()
@@ -329,12 +343,8 @@ impl Core {
     /// **冪等**，跟 [`Core::unlock`] 一樣：已經有一把就把傳進來的丟掉、回原本那把。
     /// 📎 兩把都來自同一個資料目錄，所以是同一把主金鑰——丟掉的那把沒有資訊。
     pub(crate) fn adopt_unlocked_vault(&self, vault: Vault) -> &Vault {
-        let _ = self.vault.set(vault);
-        // 📎 `OnceLock::set` 只有兩種結果：裝進去了，或本來就有一個。兩種之後 `get()`
-        // 都是 `Some`，而 `OnceLock` 自己保證這件事沒有 race（rumia🟢1 要的那行註解）。
-        self.vault
-            .get()
-            .expect("set() either stored ours or found one already there")
+        // 📎 `OnceLock::get_or_init`：本來有一把就回它（傳進來的丟掉），沒有就裝這把——同一件事，而且沒有 race（rumia🟢1 要的那行註解）。
+        self.vault.get_or_init(|| vault)
     }
 
     /// 資料目錄現在有什麼（`s/*/a/*` 兩層與 `r/`）。⚠️ **快照，不是快取**：

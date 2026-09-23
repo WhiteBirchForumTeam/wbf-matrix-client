@@ -42,8 +42,11 @@ pub fn file_message_content(
         "url": attachment.mxc,
         CHUNKED_BLOCK_KEY: attachment.block,
     });
-    if let Some(caption) = caption {
-        content["caption"] = serde_json::Value::String(caption.to_string());
+    if let (Some(caption), Some(fields)) = (caption, content.as_object_mut()) {
+        fields.insert(
+            "caption".to_string(),
+            serde_json::Value::String(caption.to_string()),
+        );
     }
     Ok(content)
 }
@@ -362,12 +365,12 @@ pub(crate) fn aggregate(
             | Relation::Replace { target, .. }
             | Relation::Redaction { target, .. } => target.clone(),
         };
-        let Some(target_index) = messages.iter().position(|message| message.id == target) else {
+        let Some(target_message) = messages.iter_mut().find(|message| message.id == target) else {
             continue;
         };
         match relation {
             Relation::Reaction { key, .. } => {
-                let reactions = &mut messages[target_index].reactions;
+                let reactions = &mut target_message.reactions;
                 match reactions.iter_mut().find(|reaction| reaction.key == key) {
                     Some(reaction) => reaction.by.push(sender),
                     None => reactions.push(Reaction {
@@ -377,16 +380,18 @@ pub(crate) fn aggregate(
                 }
             }
             Relation::Replace { new_content, .. } => {
-                let target_message = &mut messages[target_index];
                 target_message.kind =
                     kind_from_content("m.room.message", &new_content, &serde_json::Value::Null);
                 target_message.edited_by = Some(sender);
             }
             Relation::Redaction { reason, .. } => {
-                messages[target_index].kind = MessageKind::Deleted { reason };
+                target_message.kind = MessageKind::Deleted { reason };
             }
         }
-        consumed[index] = true;
+        // `index` 是上面 push 進 `messages` 時的位置，`consumed` 跟它等長：`None` 到不了，靜默跳過是設計。
+        if let Some(flag) = consumed.get_mut(index) {
+            *flag = true;
+        }
     }
     messages
         .into_iter()

@@ -156,7 +156,10 @@ fn strip_comment(line: &str) -> &str {
     for (index, byte) in bytes.iter().enumerate() {
         match byte {
             b'"' => in_quotes = !in_quotes,
-            b';' | b'#' if !in_quotes && previous_is_space => return &line[..index],
+            // `index` 停在 ASCII 的 `;`／`#` 上，一定是 char 邊界；萬一不是（到不了）就當整行是註解——少一個設定用預設值，🚫 不 panic。
+            b';' | b'#' if !in_quotes && previous_is_space => {
+                return line.get(..index).unwrap_or("")
+            }
             _ => {}
         }
         previous_is_space = (*byte as char).is_whitespace();

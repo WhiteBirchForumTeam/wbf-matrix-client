@@ -25,7 +25,7 @@ pub async fn rooms_command(context: &Context) -> Result<(), CoreError> {
         .core()?
         .list_conversations(SyncMode::Both, &context.target())
         .await?;
-    print_json(&serde_json::to_value(conversations).expect("serializes"))
+    print_value(&conversations)
 }
 
 pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), CoreError> {
@@ -82,7 +82,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
         .await?;
     // ⚠️ manifest 含金鑰：給了路徑就用**私有權限**寫（CLI 規格 §5）。
     if let Some(path) = &args.manifest {
-        write_private(path, &result.manifest.to_json())?;
+        write_private(path, &result.manifest.to_json()?)?;
     }
     print_json(&json!({ "event_id": result.event_id, "mxc": result.mxc }))
 }
@@ -145,7 +145,7 @@ pub async fn read_command(
             &context.target(),
         )
         .await?;
-    print_json(&serde_json::to_value(page).expect("serializes"))
+    print_value(&page)
 }
 
 pub async fn files_command(
@@ -167,7 +167,7 @@ pub async fn files_command(
             &context.target(),
         )
         .await?;
-    print_json(&serde_json::to_value(page).expect("serializes"))
+    print_value(&page)
 }
 
 /// CLI 的 `--from-cache` 對到新的三種 `sync`（daemon-runtime §3.1）。
@@ -190,14 +190,10 @@ fn sync_of(from_cache: bool) -> SyncMode {
 pub fn emit_manifest(manifest: &wbf_sdk::Manifest, path: Option<&Path>) -> Result<(), CoreError> {
     match path {
         Some(path) => {
-            write_private(path, &manifest.to_json())?;
+            write_private(path, &manifest.to_json()?)?;
             print_json(&json!({ "manifest": path.display().to_string(), "mxc": manifest.mxc }))
         }
-        None => {
-            let value: serde_json::Value =
-                serde_json::from_slice(&manifest.to_json()).expect("manifest is json");
-            print_json(&value)
-        }
+        None => print_value(&manifest),
     }
 }
 
@@ -220,6 +216,38 @@ fn print_line(message: &Message) {
     let _ = serde_json::to_writer(&mut stdout, message);
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
+}
+
+/// 把一個結果變成 JSON：這些型別都是純欄位，理論上不會失敗——但那不是 panic 的理由（維護者 2026-09-23：CLI 炸了就炸了不是理由）。
+///
+/// Return:
+///     Ok(Value)
+///     Err(Io)     序列化不了
+pub fn json_value_of<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, CoreError> {
+    serde_json::to_value(value).map_err(|error| {
+        CoreError::new(
+            CoreErrorKind::Io,
+            format!("the result could not be serialized: {error}"),
+        )
+    })
+}
+
+/// 序列化再印（大多數命令的最後一行）。
+pub fn print_value<T: serde::Serialize>(value: &T) -> Result<(), CoreError> {
+    print_json(&json_value_of(value)?)
+}
+
+/// 往一個 JSON 物件裡加一個欄位。`Value` 的 `[]=` 在不是物件時會 panic，這裡不會：不是物件就不加——
+/// 呼叫端給的都是 struct `to_value` 出來的物件，「不是物件」到不了，所以靜默是設計，不是漏接。
+///
+/// Args:
+///     output: example: json!({ "user": "@a:x" })
+///     key: example: "ok"
+///     value: example: json!(true)
+pub fn set_field(output: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    if let Some(fields) = output.as_object_mut() {
+        fields.insert(key.to_string(), value);
+    }
 }
 
 pub fn print_json(value: &serde_json::Value) -> Result<(), CoreError> {

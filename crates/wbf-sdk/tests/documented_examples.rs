@@ -83,7 +83,7 @@ fn chunked_block_to_description_json() {
         sha256: None,
     };
     assert_eq!(
-        block.to_description_json(),
+        block.to_description_json().unwrap(),
         br#"{"v":1,"cipher":"none","chunk_size":16}"#
     );
 }
@@ -136,7 +136,7 @@ fn room_device_versions_from_members_body() {
 #[test]
 fn compute_device_keys_hash() {
     use wbf_sdk::device_version::{compute_device_keys_hash, HASH_HEX_LEN};
-    let hash = compute_device_keys_hash("@bob:localhost", &serde_json::json!({}));
+    let hash = compute_device_keys_hash("@bob:localhost", &serde_json::json!({})).unwrap();
     assert_eq!(hash.len(), HASH_HEX_LEN);
     assert!(hash
         .bytes()

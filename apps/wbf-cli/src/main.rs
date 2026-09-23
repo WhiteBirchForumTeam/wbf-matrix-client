@@ -1,3 +1,17 @@
+// 維護者 2026-09-23：正式碼不用會讓整支程式收掉的方法（unwrap／expect／panic／索引）——每個失敗要有去處；測試建置放行（測試要看到它炸）。
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! wbf-cli：介面照 `docs/design/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
 //! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
 //! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §7）。
@@ -337,18 +351,30 @@ const MAIN_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let worker = std::thread::Builder::new()
+    // 執行緒或 runtime 起不來就沒有這支程式（「必須要開」的層級）——但停也要講清楚、給 exit code，🚫 不 panic。
+    let spawned = std::thread::Builder::new()
         .name("wbf-cli-main".into())
         .stack_size(MAIN_THREAD_STACK_BYTES)
-        .spawn(move || {
+        .spawn(move || -> Result<(), wbf_core::CoreError> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(MAIN_THREAD_STACK_BYTES)
                 .build()
-                .expect("tokio runtime");
+                .map_err(|error| {
+                    wbf_core::CoreError::new(
+                        wbf_core::CoreErrorKind::Io,
+                        format!("cannot start the async runtime: {error}"),
+                    )
+                })?;
             runtime.block_on(commands::run(cli))
-        })
-        .expect("spawn main thread");
+        });
+    let worker = match spawned {
+        Ok(worker) => worker,
+        Err(error) => {
+            eprintln!("error: cannot start the main thread: {error}");
+            return ExitCode::from(1);
+        }
+    };
     match worker.join() {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(error)) => {

@@ -77,9 +77,9 @@ impl<C: PackChannel> WbfClient<C> {
             },
         };
         let description =
-            file_cipher.seal_description(DescriptionSlot::Create, &block.to_description_json());
+            file_cipher.seal_description(DescriptionSlot::Create, &block.to_description_json()?)?;
         let ack = self
-            .call(|seq| protocol::create(info, description, seq))
+            .call(|seq| Ok(protocol::create(info, description, seq)))
             .await?;
         let created: CreateAck = protocol::parse_meta(&ack)?;
         // 標頭 id 要嘛抄回 0（線上規格 §2），要嘛就是新發的上傳 id（wbfuwunel 的做法）；其他值是對方講錯話。
@@ -140,11 +140,17 @@ impl<C: PackChannel> WbfClient<C> {
         let mut buffer = vec![0u8; chunk_size as usize];
         let mut truncated = false;
         while index < total {
-            let plain_len =
-                expected_plain_len(file_size, chunk_size, index).expect("index < total");
+            let plain_len = expected_plain_len(file_size, chunk_size, index).ok_or_else(|| {
+                SdkError::Usage(format!("chunk {index} is past the end ({total} chunks)"))
+            })?;
+            let plain = buffer.get_mut(..plain_len).ok_or_else(|| {
+                SdkError::Usage(format!(
+                    "chunk {index} wants {plain_len} bytes but chunk_size is {chunk_size}"
+                ))
+            })?;
             source.seek(SeekFrom::Start(u64::from(index) * u64::from(chunk_size)))?;
-            source.read_exact(&mut buffer[..plain_len])?;
-            let sealed = file_cipher.seal_chunk(index, &buffer[..plain_len])?;
+            source.read_exact(plain)?;
+            let sealed = file_cipher.seal_chunk(index, plain)?;
             let is_last = index + 1 == total;
             match self
                 .send_one_chunk(state.upload_id, index, sealed, is_last)
@@ -159,8 +165,9 @@ impl<C: PackChannel> WbfClient<C> {
                 Err(error @ SdkError::Server { .. })
                     if error.wbf_code() == Some(WbfErrorCode::OutOfOrder) =>
                 {
-                    let SdkError::Server { meta, .. } = error else {
-                        unreachable!("the guard matched Server")
+                    let meta = match error {
+                        SdkError::Server { meta, .. } => meta,
+                        other => return Err(other),
                     };
                     let expected = meta
                         .get("expected_seq")
@@ -264,10 +271,10 @@ impl<C: PackChannel> WbfClient<C> {
     ) -> Result<Manifest, SdkError> {
         final_block.check_as_event_block()?;
         let file_cipher = state.file_cipher()?;
-        let description =
-            file_cipher.seal_description(DescriptionSlot::Seal, &final_block.to_description_json());
+        let description = file_cipher
+            .seal_description(DescriptionSlot::Seal, &final_block.to_description_json()?)?;
         let ack = self
-            .call(|seq| protocol::seal(state.upload_id, description, seq))
+            .call(|seq| Ok(protocol::seal(state.upload_id, description, seq)))
             .await?;
         let sealed: SealAck = protocol::parse_meta(&ack)?;
         if sealed.mxc != state.mxc {
@@ -306,7 +313,12 @@ fn read_up_to<R: Read>(reader: &mut R, want: usize) -> Result<Vec<u8>, SdkError>
     let mut buffer = vec![0u8; want];
     let mut filled = 0;
     while filled < want {
-        let got = reader.read(&mut buffer[filled..])?;
+        let Some(space) = buffer.get_mut(filled..) else {
+            return Err(SdkError::Usage(format!(
+                "read window {filled}.. is past the {want}-byte buffer"
+            )));
+        };
+        let got = reader.read(space)?;
         if got == 0 {
             break;
         }
@@ -324,8 +336,14 @@ fn hash_reader<R: Read + Seek>(source: &mut R, len: u64) -> Result<String, SdkEr
     let mut buffer = vec![0u8; 1 << 16];
     while remaining > 0 {
         let want = remaining.min(buffer.len() as u64) as usize;
-        source.read_exact(&mut buffer[..want])?;
-        hasher.update(&buffer[..want]);
+        let Some(window) = buffer.get_mut(..want) else {
+            return Err(SdkError::Usage(format!(
+                "hash window {want} is larger than the {}-byte buffer",
+                buffer.len()
+            )));
+        };
+        source.read_exact(window)?;
+        hasher.update(window);
         remaining -= want as u64;
     }
     Ok(hex::encode(hasher.finalize()))

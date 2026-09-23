@@ -76,23 +76,24 @@ impl Cipher {
     ///     aad: example: b"wbf-chunk-v1"
     ///     plain: 明文, example: b"hello"
     /// Return:
-    ///     Vec<u8>  密文 ‖ 16 byte 標籤；`None` 模式就是 `plain` 的複本
+    ///     Ok(Vec<u8>)             密文 ‖ 16 byte 標籤；`None` 模式就是 `plain` 的複本
+    ///     Err(SealFailed)         AEAD 底層回錯（只有滿位會；輸入被 chunk_size 擋住，理論上到不了）
     pub fn seal(
         self,
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],
         plain: &[u8],
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, crate::chunk_crypto::CryptoError> {
         let payload = Payload { msg: plain, aad };
         match self {
             Cipher::ChaCha20Poly1305 => chacha20poly1305::ChaCha20Poly1305::new(key.into())
                 .encrypt(nonce.into(), payload)
-                .expect("AEAD encrypt only fails on overflow, inputs are bounded by chunk_size"),
+                .map_err(|_| crate::chunk_crypto::CryptoError::SealFailed),
             Cipher::Aes256Gcm => aes_gcm::Aes256Gcm::new(key.into())
                 .encrypt(nonce.into(), payload)
-                .expect("AEAD encrypt only fails on overflow, inputs are bounded by chunk_size"),
-            Cipher::None => plain.to_vec(),
+                .map_err(|_| crate::chunk_crypto::CryptoError::SealFailed),
+            Cipher::None => Ok(plain.to_vec()),
         }
     }
 

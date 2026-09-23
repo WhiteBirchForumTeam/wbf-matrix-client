@@ -152,7 +152,7 @@ impl crate::Core {
         let cell = self
             .backends
             .lock()
-            .expect("the backend registry is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(key)
             .or_default()
             .clone();
@@ -202,7 +202,7 @@ impl crate::Core {
     pub(crate) fn count_probe_cells(&self) -> usize {
         self.backends
             .lock()
-            .expect("the backend registry is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
 
@@ -212,7 +212,7 @@ impl crate::Core {
         let cell = tokio::sync::OnceCell::new_with(Some(kind));
         self.backends
             .lock()
-            .expect("the backend registry is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
                 server.trim_end_matches('/').to_string(),
                 std::sync::Arc::new(cell),
@@ -228,7 +228,7 @@ impl crate::Core {
     pub(crate) fn get_remembered_backend(&self, server: &str) -> Option<BackendKind> {
         self.backends
             .lock()
-            .expect("the backend registry is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(server.trim_end_matches('/'))
             .and_then(|cell| cell.get().copied())
     }
@@ -243,7 +243,7 @@ impl crate::Core {
     pub fn forget_backend_probe(&self, server: &str) -> bool {
         self.backends
             .lock()
-            .expect("the backend registry is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(server.trim_end_matches('/'))
             .is_some()
     }

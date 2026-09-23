@@ -151,7 +151,13 @@ impl<C: PackChannel> WbfClient<C> {
             let chunk_start = u64::from(index) * chunk_size;
             let from = at.saturating_sub(chunk_start) as usize;
             let to = (end - chunk_start).min(plain.len() as u64) as usize;
-            bytes.extend_from_slice(&plain[from..to]);
+            let wanted = plain.get(from..to).ok_or_else(|| {
+                SdkError::Integrity(format!(
+                    "chunk {index} has {} bytes, wanted {from}..{to}",
+                    plain.len()
+                ))
+            })?;
+            bytes.extend_from_slice(wanted);
             chunks_read.push(index);
             index += 1;
         }

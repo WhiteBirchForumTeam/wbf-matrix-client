@@ -127,7 +127,7 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         "event_id": result.event_id,
         "mxc": result.mxc,
         "attachment_declared": result.attachment_declared,
-        "manifest": serde_json::from_slice::<Value>(&result.manifest.to_json())?,
+        "manifest": serde_json::to_value(&result.manifest)?,
     }))
 }
 

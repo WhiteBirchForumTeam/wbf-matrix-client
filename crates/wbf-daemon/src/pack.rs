@@ -104,8 +104,14 @@ pub enum Side {
 ///     pack_type: example: PackType::Cipher
 ///     json: 序列化好的 JSON bytes, example: br#"{"code":0}"#
 /// Return:
-///     Vec<u8>  `ver ‖ type ‖ data`；`Cipher` 時 data = nonce(24) ‖ 密文
-pub fn seal(keys: &RpcKeys, side: Side, pack_type: PackType, json: &[u8]) -> Vec<u8> {
+///     Ok(Vec<u8>)   `ver ‖ type ‖ data`；`Cipher` 時 data = nonce(24) ‖ 密文
+///     Err(io)       OS 給不出 nonce、或 AEAD 底層回錯（理論上到不了，但不是 panic 的理由）
+pub fn seal(
+    keys: &RpcKeys,
+    side: Side,
+    pack_type: PackType,
+    json: &[u8],
+) -> Result<Vec<u8>, std::io::Error> {
     let mut frame = Vec::with_capacity(2 + NONCE_LEN + json.len() + 16);
     frame.push(PACK_VERSION);
     frame.push(pack_type.to_byte());
@@ -113,7 +119,8 @@ pub fn seal(keys: &RpcKeys, side: Side, pack_type: PackType, json: &[u8]) -> Vec
         PackType::Plain => frame.extend_from_slice(json),
         PackType::Cipher => {
             let mut nonce = [0u8; NONCE_LEN];
-            getrandom::getrandom(&mut nonce).expect("OS randomness");
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| std::io::Error::other(format!("no OS randomness: {error}")))?;
             let cipher = XChaCha20Poly1305::new(sending_key(keys, side).into());
             let ciphertext = cipher
                 .encrypt(
@@ -123,12 +130,12 @@ pub fn seal(keys: &RpcKeys, side: Side, pack_type: PackType, json: &[u8]) -> Vec
                         aad: AAD,
                     },
                 )
-                .expect("XChaCha20-Poly1305 encrypt cannot fail on in-memory data");
+                .map_err(|_| std::io::Error::other("XChaCha20-Poly1305 encrypt failed"))?;
             frame.extend_from_slice(&nonce);
             frame.extend_from_slice(&ciphertext);
         }
     }
-    frame
+    Ok(frame)
 }
 
 /// 拆一包。
@@ -204,7 +211,8 @@ mod tests {
             Side::Client,
             PackType::Cipher,
             br#"{"method":"hello"}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(&frame[..2], &[0x01, 0x02]);
         let (pack_type, json) = open(&keys, Side::Daemon, &frame).unwrap();
         assert_eq!(pack_type, PackType::Cipher);
@@ -214,7 +222,7 @@ mod tests {
     #[test]
     fn a_plain_pack_is_just_the_prefix_and_the_json() {
         let keys = keys();
-        let frame = seal(&keys, Side::Daemon, PackType::Plain, b"{}");
+        let frame = seal(&keys, Side::Daemon, PackType::Plain, b"{}").unwrap();
         assert_eq!(frame, vec![0x01, 0x01, b'{', b'}']);
         assert_eq!(
             open(&keys, Side::Client, &frame).unwrap(),
@@ -225,7 +233,7 @@ mod tests {
     #[test]
     fn the_two_directions_use_different_keys_so_a_reply_cannot_be_reflected() {
         let keys = keys();
-        let from_daemon = seal(&keys, Side::Daemon, PackType::Cipher, b"{}");
+        let from_daemon = seal(&keys, Side::Daemon, PackType::Cipher, b"{}").unwrap();
         // 把 daemon 的回應原封送回去當請求：daemon 用 client→daemon 的鑰解，解不開。
         assert_eq!(
             open(&keys, Side::Daemon, &from_daemon),
@@ -235,7 +243,7 @@ mod tests {
 
     #[test]
     fn a_wrong_token_or_a_flipped_bit_is_cannot_decrypt() {
-        let frame = seal(&keys(), Side::Client, PackType::Cipher, b"{}");
+        let frame = seal(&keys(), Side::Client, PackType::Cipher, b"{}").unwrap();
         let other = RpcKeys::from_token(&[8u8; 256]);
         assert_eq!(
             open(&other, Side::Daemon, &frame),

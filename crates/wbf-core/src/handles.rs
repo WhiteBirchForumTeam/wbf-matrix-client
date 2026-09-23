@@ -91,7 +91,7 @@ impl Core {
         {
             *RAW_CACHE_OPENS
                 .lock()
-                .expect("the raw-open counter is never poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry(account.server_dir())
                 .or_insert(0) += 1;
         }
@@ -174,7 +174,7 @@ impl Core {
         let mut registry = self
             .server_caches
             .lock()
-            .expect("the server-cache registry is never poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = registry.get(&dir) {
             return Ok(Some(existing.clone()));
         }
@@ -231,7 +231,7 @@ impl Core {
         let mut registry = self
             .server_caches
             .lock()
-            .expect("the server-cache registry is never poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(shared) = registry.remove(server_dir) else {
             return Ok(false);
         };
@@ -284,7 +284,7 @@ static RAW_CACHE_OPENS: std::sync::LazyLock<
 pub(crate) fn get_raw_cache_opens_for(server_dir: &std::path::Path) -> usize {
     RAW_CACHE_OPENS
         .lock()
-        .expect("the raw-open counter is never poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(server_dir)
         .copied()
         .unwrap_or(0)

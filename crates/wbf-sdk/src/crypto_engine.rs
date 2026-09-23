@@ -300,20 +300,21 @@ impl OlmEngine {
     /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 server §3.4 重算的比。
     ///
     /// Return:
-    ///     Vec<String>  對不上的人（排序）。沒查過的人、`unhashable` 的人不算（算不出來不是對不上）
+    ///     Vec<String>  對不上的人（排序）。沒查過的人、server 說 `unhashable` 的人不算；我們自己算不出來的（到不了）**算對不上**——寬可多查一次，不拿舊金鑰送
     pub fn mismatched_device_hashes(&self, versions: &RoomDeviceVersions) -> Vec<String> {
         let answers = self
             .last_keys_query
             .lock()
-            .expect("keys query cache poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         versions
             .members
             .iter()
             .filter(|(user_id, version)| {
                 version.is_hashable()
-                    && answers
-                        .get(*user_id)
-                        .is_some_and(|body| compute_device_keys_hash(user_id, body) != version.hash)
+                    && answers.get(*user_id).is_some_and(|body| {
+                        compute_device_keys_hash(user_id, body)
+                            .is_none_or(|hash| hash != version.hash)
+                    })
             })
             .map(|(user_id, _)| user_id.clone())
             .collect()
@@ -632,7 +633,7 @@ impl OlmEngine {
                     let mut answers = self
                         .last_keys_query
                         .lock()
-                        .expect("keys query cache poisoned");
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     for user_id in query.device_keys.keys() {
                         answers.insert(user_id.to_string(), body.clone());
                     }
@@ -682,7 +683,7 @@ impl OlmEngine {
         request: &ToDeviceRequest,
     ) -> Result<(), SdkError> {
         let body = serde_json::to_vec(&serde_json::json!({ "messages": request.messages }))
-            .expect("to-device messages serialize");
+            .map_err(|error| crate::error::cannot_serialize("to-device messages", error))?;
         client
             .send_to_device(
                 &request.event_type.to_string(),

@@ -14,8 +14,16 @@ pub(super) async fn backup_status(handle: &Handle, core: &Core, params: Value) -
     let status = core.backup_status(&handle.target(&target)).await?;
     let mut output = serde_json::to_value(status)?;
     // conf 的兩個開關是這台機器的設定，core 不知道有 conf——所以在這裡加。
-    output["server_backup_setting"] = json!(on_off(handle.settings().server_backup));
-    output["local_room_keys_setting"] = json!(on_off(handle.settings().local_room_keys));
+    crate::push::insert_field(
+        &mut output,
+        "server_backup_setting",
+        json!(on_off(handle.settings().server_backup)),
+    );
+    crate::push::insert_field(
+        &mut output,
+        "local_room_keys_setting",
+        json!(on_off(handle.settings().local_room_keys)),
+    );
     Ok(output)
 }
 

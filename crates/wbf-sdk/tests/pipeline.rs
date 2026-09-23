@@ -118,7 +118,7 @@ async fn roundtrip_every_cipher() {
 async fn manifest_roundtrips_through_json_and_keeps_key_secret_shape() {
     let mut server = FakeServer::new();
     let manifest = upload_fixed(&mut server, Cipher::ChaCha20Poly1305, 16, &sample(40)).await;
-    let json = manifest.to_json();
+    let json = manifest.to_json().unwrap();
     assert!(String::from_utf8_lossy(&json).contains("\"key\""));
     let parsed = Manifest::from_json(&json).expect("parses");
     assert_eq!(parsed, manifest);
@@ -195,7 +195,7 @@ async fn resume_after_dropped_ack_continues_from_status() {
             .await
             .unwrap()
     };
-    let state_json = state.to_json();
+    let state_json = state.to_json().unwrap();
     server.drop_ack_once_at = Some((state.upload_id, 3));
 
     let first_try = {
@@ -924,7 +924,8 @@ async fn recent_over_a_single_response_channel_is_unsupported() {
         },
         7,
         0,
-    );
+    )
+    .unwrap();
     let response = server.request(pack.clone()).await.unwrap();
     match wbf_sdk::protocol::expect_batch(&pack, response, 0) {
         Err(SdkError::Server { code, .. }) => assert_eq!(code, "Unsupported"),
@@ -1471,7 +1472,7 @@ mod with_crypto_engine {
 
     /// 假 server 的 KeysQuery 回「什麼金鑰都沒有」：這個人的裝置雜湊就是三項全空的那個值。
     fn hash_of_no_keys(user_id: &str) -> String {
-        wbf_sdk::device_version::compute_device_keys_hash(user_id, &serde_json::json!({}))
+        wbf_sdk::device_version::compute_device_keys_hash(user_id, &serde_json::json!({})).unwrap()
     }
 
     async fn engine_and_server(

@@ -9,7 +9,7 @@ use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMappedMutexGuard, OwnedMutexGuard};
 use wbf_sdk::channel::Channel;
 use wbf_sdk::client::WbfClient;
 use wbf_sdk::sessions::Received;
@@ -125,7 +125,18 @@ impl LinkPool {
             *guard = Some(open().await?);
             self.emit_link(role, LinkState::Opened, None);
         }
-        Ok(PooledClient::Pooled(guard))
+        // 交出去的是「那格裡的 client」的 guard，不是 `Option`：空格在這裡就回錯，🚫 不到 deref 才炸。
+        OwnedMutexGuard::try_map(guard, |slot| slot.as_mut())
+            .map(PooledClient::Pooled)
+            .map_err(|_| {
+                CoreError::new(
+                    crate::CoreErrorKind::Io,
+                    format!(
+                        "the {} link slot is empty right after opening it",
+                        role.name()
+                    ),
+                )
+            })
     }
 
     /// 登出、destroy、換 session：全關（token 撤了，留著也是死的）。**等正在用線的命令做完**才關那條（維護者 2026-09-21：還在處理的要處理完）；
@@ -240,8 +251,8 @@ impl Drop for LoggingOutGuard<'_> {
 
 /// 池裡拿出來的一條線。丟掉就是還回去（線不關）。
 pub enum PooledClient {
-    /// 池裡那格的 guard：同一條線的下一個命令等它被丟掉。
-    Pooled(OwnedMutexGuard<Option<WbfClient<Channel>>>),
+    /// 池裡那格的 guard（已經映到裡面的 client）：同一條線的下一個命令等它被丟掉。
+    Pooled(OwnedMappedMutexGuard<Option<WbfClient<Channel>>, WbfClient<Channel>>),
     /// 不進池的（`Transport::Http` 那種一次性的）。
     Own(WbfClient<Channel>),
 }
@@ -251,9 +262,7 @@ impl Deref for PooledClient {
 
     fn deref(&self) -> &WbfClient<Channel> {
         match self {
-            PooledClient::Pooled(guard) => guard
-                .as_ref()
-                .expect("a pooled slot is filled before it is handed out"),
+            PooledClient::Pooled(guard) => guard,
             PooledClient::Own(client) => client,
         }
     }
@@ -262,9 +271,7 @@ impl Deref for PooledClient {
 impl DerefMut for PooledClient {
     fn deref_mut(&mut self) -> &mut WbfClient<Channel> {
         match self {
-            PooledClient::Pooled(guard) => guard
-                .as_mut()
-                .expect("a pooled slot is filled before it is handed out"),
+            PooledClient::Pooled(guard) => guard,
             PooledClient::Own(client) => client,
         }
     }

@@ -27,8 +27,12 @@ impl Manifest {
         Ok(manifest)
     }
 
-    pub fn to_json(&self) -> Vec<u8> {
-        serde_json::to_vec_pretty(self).expect("Manifest serializes: only plain fields")
+    /// Return:
+    ///     Ok(Vec<u8>)  pretty JSON
+    ///     Err(Usage)   序列化不了（純欄位，理論上到不了）
+    pub fn to_json(&self) -> Result<Vec<u8>, crate::error::SdkError> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| crate::error::cannot_serialize("Manifest", error))
     }
 
     pub fn file_cipher(&self) -> Result<FileCipher, SdkError> {
@@ -67,8 +71,12 @@ impl UploadState {
         Ok(state)
     }
 
-    pub fn to_json(&self) -> Vec<u8> {
-        serde_json::to_vec_pretty(self).expect("UploadState serializes: only plain fields")
+    /// Return:
+    ///     Ok(Vec<u8>)  pretty JSON
+    ///     Err(Usage)   序列化不了（純欄位，理論上到不了）
+    pub fn to_json(&self) -> Result<Vec<u8>, crate::error::SdkError> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| crate::error::cannot_serialize("UploadState", error))
     }
 
     /// CLI 規格 §3.2：狀態檔的 server 與 user 跟現在的不一樣就拒絕，不拿 A server 的上傳去打 B server。

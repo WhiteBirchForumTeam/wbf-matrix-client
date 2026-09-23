@@ -202,42 +202,40 @@ impl RoomSyncTask {
                 _ = &mut stopped => return,
                 next = subscription.next(PUSH_IDLE_TIMEOUT) => next,
             };
-            match next {
+            // 訂閱還活著的那幾種都 `continue`；走到下面的只有「訂閱結束了」，帶著原因。
+            let why = match next {
                 Ok(Some(EventSubscribeReply::Push { meta, events })) => {
-                    self.on_push(meta, events).await
+                    self.on_push(meta, events).await;
+                    continue;
                 }
                 // 金鑰那支才消費；這裡只確認它不會把 task 弄死。
                 Ok(Some(EventSubscribeReply::DeviceChanged(_)))
                 | Ok(Some(EventSubscribeReply::Acknowledged(_)))
-                | Ok(Some(EventSubscribeReply::Unsubscribed { .. })) => {}
-                Err(wbf_sdk::SdkError::Timeout(_)) => {}
+                | Ok(Some(EventSubscribeReply::Unsubscribed { .. })) => continue,
+                Err(wbf_sdk::SdkError::Timeout(_)) => continue,
                 // 一包壞了就是漏一包：講一聲，繼續收。
                 Err(wbf_sdk::SdkError::Protocol(why)) => {
                     self.events.progress(format!(
                         "room sync: a push could not be read and is dropped ({why}); sync.recent refetches it"
                     ));
+                    continue;
                 }
-                Ok(None) | Err(_) => {
-                    let why = match next {
-                        Ok(None) => "the server ended the subscription".to_string(),
-                        Err(error) => error.to_string(),
-                        Ok(Some(_)) => unreachable!("handled above"),
-                    };
-                    let reason = format!("the room subscription ended: {why}");
-                    // 訂閱會話結束了 socket 可能還活著（server 送 Error，例如被另一台裝置接手），池的殞死偵測看不出來：
-                    // 這裡把那格關掉、池發 closed；下次 open_subscriptions 才重開、重訂（🚫 不在這裡重訂）。
-                    // 線不在池裡（已經被別人關了）就只講一聲。
-                    if !self.pool.close(LinkRole::Subscriptions, &reason).await {
-                        self.events.emit(CoreEvent::Link {
-                            user: self.me.clone(),
-                            role: LinkRole::Subscriptions,
-                            state: LinkState::Closed,
-                            reason: Some(reason),
-                        });
-                    }
-                    return;
-                }
+                Ok(None) => "the server ended the subscription".to_string(),
+                Err(error) => error.to_string(),
+            };
+            let reason = format!("the room subscription ended: {why}");
+            // 訂閱會話結束了 socket 可能還活著（server 送 Error，例如被另一台裝置接手），池的殞死偵測看不出來：
+            // 這裡把那格關掉、池發 closed；下次 open_subscriptions 才重開、重訂（🚫 不在這裡重訂）。
+            // 線不在池裡（已經被別人關了）就只講一聲。
+            if !self.pool.close(LinkRole::Subscriptions, &reason).await {
+                self.events.emit(CoreEvent::Link {
+                    user: self.me.clone(),
+                    role: LinkRole::Subscriptions,
+                    state: LinkState::Closed,
+                    reason: Some(reason),
+                });
             }
+            return;
         }
     }
 

@@ -207,7 +207,7 @@ impl WriteAccess {
         let mut held = self
             .held
             .lock()
-            .expect("the write-access mutex is never poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if held.is_some() {
             return Ok(());
         }

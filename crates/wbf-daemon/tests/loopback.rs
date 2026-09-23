@@ -54,7 +54,7 @@ async fn connect(port: u16) -> Socket {
 }
 
 async fn send(socket: &mut Socket, keys: &RpcKeys, pack_type: PackType, json: Value) {
-    let frame = pack::seal(keys, Side::Client, pack_type, json.to_string().as_bytes());
+    let frame = pack::seal(keys, Side::Client, pack_type, json.to_string().as_bytes()).unwrap();
     socket.send(Message::Binary(frame.into())).await.unwrap();
 }
 

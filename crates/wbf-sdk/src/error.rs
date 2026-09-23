@@ -86,6 +86,16 @@ impl From<EncodeError> for SdkError {
     }
 }
 
+/// 我們自己的值序列化不了（serde 回錯）。理論上到不了：這裡的型別都是純欄位——但那不是 panic 的理由（維護者 2026-09-23）。
+///
+/// Args:
+///     what: 序列化的是什麼，給人看, example: "Session"
+/// Return:
+///     SdkError::Usage
+pub(crate) fn cannot_serialize(what: &str, error: serde_json::Error) -> SdkError {
+    SdkError::Usage(format!("{what} could not be serialized: {error}"))
+}
+
 impl From<std::io::Error> for SdkError {
     fn from(error: std::io::Error) -> Self {
         SdkError::Io(error)

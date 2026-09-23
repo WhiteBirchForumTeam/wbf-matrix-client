@@ -210,7 +210,9 @@ impl Cache {
                     .execute(params![
                         room,
                         user,
-                        serde_json::to_string(conversation).expect("Conversation serializes"),
+                        serde_json::to_string(conversation).map_err(|error| {
+                            crate::error::cannot_serialize("Conversation", error)
+                        })?,
                         now,
                     ])
                     .map_err(db_error)?;

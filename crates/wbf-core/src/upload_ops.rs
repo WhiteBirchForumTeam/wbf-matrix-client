@@ -192,7 +192,8 @@ impl Core {
                 let chunk_size = request
                     .chunk_size
                     .unwrap_or_else(|| choose_chunk_size(file_size));
-                let file_cipher = FileCipher::generate(cipher, chunk_size);
+                let file_cipher =
+                    FileCipher::generate(cipher, chunk_size).map_err(wbf_sdk::SdkError::from)?;
                 let mut block = file_cipher.to_event_block(file_size);
                 block.name = Some(match &request.name {
                     Some(name) => name.clone(),
@@ -206,7 +207,7 @@ impl Core {
                 let state = client
                     .create_upload(&session.server, &session.user_id, &file_cipher, &block)
                     .await?;
-                write_private(&state_path, &state.to_json())?;
+                write_private(&state_path, &state.to_json()?)?;
                 (state, 0)
             }
             Err(error) => return Err(CoreError::new(CoreErrorKind::Io, format!("{error}"))),

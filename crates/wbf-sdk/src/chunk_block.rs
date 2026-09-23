@@ -143,10 +143,11 @@ impl ChunkedBlock {
     /// 讓向量檔可以逐 byte 比。
     ///
     /// Return:
-    ///     Vec<u8>  compact JSON，UTF-8，example: {"v":1,"cipher":"none","chunk_size":16}
-    pub fn to_description_json(&self) -> Vec<u8> {
+    ///     Ok(Vec<u8>)  compact JSON，UTF-8，example: {"v":1,"cipher":"none","chunk_size":16}
+    ///     Err(Usage)   序列化不了（純欄位，理論上到不了）
+    pub fn to_description_json(&self) -> Result<Vec<u8>, crate::error::SdkError> {
         serde_json::to_vec(&self.to_description())
-            .expect("ChunkedBlock serializes: only plain fields")
+            .map_err(|error| crate::error::cannot_serialize("ChunkedBlock description", error))
     }
 
     /// Args:

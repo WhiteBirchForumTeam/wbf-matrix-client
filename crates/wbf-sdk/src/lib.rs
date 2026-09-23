@@ -1,3 +1,17 @@
+// 維護者 2026-09-23：正式碼不用會讓整支程式收掉的方法（unwrap／expect／panic／索引）——每個失敗要有去處；測試建置放行（測試要看到它炸）。
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! wbfuwunel 的 client SDK。權威是 `docs/design/wbf-client-convention-for-chunk.md`（約定規格書）
 //! 與 server repo 的 `chunked-upload-spec.md`（線上規格）；`tests/client_vectors.rs` 對著
 //! `docs/design/wbf-client-vectors.json` 跑。
