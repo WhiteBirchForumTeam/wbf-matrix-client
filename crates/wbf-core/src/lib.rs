@@ -8,7 +8,8 @@
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::string_slice
     )
 )]
 //! `wbf-core`：常駐狀態。解鎖一次的 vault、資料目錄的佈局、多帳號。

@@ -8,7 +8,8 @@
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::string_slice
     )
 )]
 //! wbf-daemon：client 本體的 RPC 那一面（architecture-v2 §2、rpc-spec）。

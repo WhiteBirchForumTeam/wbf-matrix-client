@@ -388,6 +388,7 @@ pub(crate) fn aggregate(
                 target_message.kind = MessageKind::Deleted { reason };
             }
         }
+        // `index` 是上面 push 進 `messages` 時的位置，`consumed` 跟它等長：`None` 到不了，靜默跳過是設計。
         if let Some(flag) = consumed.get_mut(index) {
             *flag = true;
         }

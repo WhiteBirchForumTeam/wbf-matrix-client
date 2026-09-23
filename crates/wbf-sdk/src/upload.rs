@@ -314,7 +314,9 @@ fn read_up_to<R: Read>(reader: &mut R, want: usize) -> Result<Vec<u8>, SdkError>
     let mut filled = 0;
     while filled < want {
         let Some(space) = buffer.get_mut(filled..) else {
-            break;
+            return Err(SdkError::Usage(format!(
+                "read window {filled}.. is past the {want}-byte buffer"
+            )));
         };
         let got = reader.read(space)?;
         if got == 0 {
@@ -335,7 +337,10 @@ fn hash_reader<R: Read + Seek>(source: &mut R, len: u64) -> Result<String, SdkEr
     while remaining > 0 {
         let want = remaining.min(buffer.len() as u64) as usize;
         let Some(window) = buffer.get_mut(..want) else {
-            break;
+            return Err(SdkError::Usage(format!(
+                "hash window {want} is larger than the {}-byte buffer",
+                buffer.len()
+            )));
         };
         source.read_exact(window)?;
         hasher.update(window);

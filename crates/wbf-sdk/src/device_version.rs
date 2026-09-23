@@ -183,7 +183,7 @@ impl RoomDeviceVersions {
 ///     keys_query: `POST /keys/query` 的回應 JSON（`master_keys`、`self_signing_keys`、`device_keys` 三張都以 user_id 為鍵）
 /// Return:
 ///     Some(String)  10 個小寫十六進位字元, example: "810b7c3be4"；這個人一把金鑰都沒有也是一個雜湊（三項全空）
-///     None          算不出來（某把金鑰序列化不了、或大到裝不進 u32 的長度）：算不出來不是對不上，呼叫端當「沒查過」
+///     None          算不出來（某把金鑰序列化不了、或大到裝不進 u32 的長度；到不了）：呼叫端當「對不上」要重查，🚫 不當對得上
 pub fn compute_device_keys_hash(user_id: &str, keys_query: &Value) -> Option<String> {
     // 🚨 用 `get` 逐層查，🚫 不把 user_id 拼進 JSON Pointer：Matrix 的 localpart 可以含 `/`（`@ops/team:x`）與 `~`，
     // Pointer 會把它切成多層路徑、查不到 →當成沒金鑰 → 雜湊對不上 → 合法成員永遠被拒發（PR #49 審查 rumia 🔴）。

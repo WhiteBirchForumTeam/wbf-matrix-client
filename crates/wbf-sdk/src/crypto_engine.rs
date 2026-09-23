@@ -300,7 +300,7 @@ impl OlmEngine {
     /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 server §3.4 重算的比。
     ///
     /// Return:
-    ///     Vec<String>  對不上的人（排序）。沒查過的人、`unhashable` 的人不算（算不出來不是對不上）
+    ///     Vec<String>  對不上的人（排序）。沒查過的人、server 說 `unhashable` 的人不算；我們自己算不出來的（到不了）**算對不上**——寬可多查一次，不拿舊金鑰送
     pub fn mismatched_device_hashes(&self, versions: &RoomDeviceVersions) -> Vec<String> {
         let answers = self
             .last_keys_query
@@ -313,7 +313,7 @@ impl OlmEngine {
                 version.is_hashable()
                     && answers.get(*user_id).is_some_and(|body| {
                         compute_device_keys_hash(user_id, body)
-                            .is_some_and(|hash| hash != version.hash)
+                            .is_none_or(|hash| hash != version.hash)
                     })
             })
             .map(|(user_id, _)| user_id.clone())

@@ -8,7 +8,8 @@
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::string_slice
     )
 )]
 //! wbfuwunel 的 client SDK。權威是 `docs/design/wbf-client-convention-for-chunk.md`（約定規格書）

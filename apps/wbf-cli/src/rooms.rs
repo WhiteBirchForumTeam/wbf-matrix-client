@@ -237,7 +237,8 @@ pub fn print_value<T: serde::Serialize>(value: &T) -> Result<(), CoreError> {
     print_json(&json_value_of(value)?)
 }
 
-/// 往一個 JSON 物件裡加一個欄位。`Value` 的 `[]=` 在不是物件時會 panic，這裡不會：不是物件就不加。
+/// 往一個 JSON 物件裡加一個欄位。`Value` 的 `[]=` 在不是物件時會 panic，這裡不會：不是物件就不加——
+/// 呼叫端給的都是 struct `to_value` 出來的物件，「不是物件」到不了，所以靜默是設計，不是漏接。
 ///
 /// Args:
 ///     output: example: json!({ "user": "@a:x" })

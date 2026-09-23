@@ -168,9 +168,10 @@ fn cached_copy_matches(pool: &MediaPool, entry: &MediaEntry, manifest: &Manifest
         return false;
     }
     match (&entry.hash, &manifest.block.sha256) {
-        (Some(stored), Some(sha256)) if stored.starts_with("sha256:") => {
-            stored[7..].eq_ignore_ascii_case(sha256)
-        }
+        // 存的不是 `sha256:` 開頭（別種雜湊）就不比；是就逐字比。
+        (Some(stored), Some(sha256)) => stored
+            .strip_prefix("sha256:")
+            .is_none_or(|digest| digest.eq_ignore_ascii_case(sha256)),
         _ => true,
     }
 }

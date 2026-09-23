@@ -984,10 +984,9 @@ async fn seek_command(
     stdout.write_all(&result.bytes)?;
     stdout.flush()?;
     // ⚠️ 摘要是**結果**不是進度，所以 `--quiet` 也印（CLI 規格 §3.3.1）。
-    match serde_json::to_value(result.summary(at, len)) {
-        Ok(summary) => eprintln!("{summary}"),
-        Err(error) => eprintln!("error: the summary could not be serialized: {error}"),
-    }
+    // bytes 已經寫出去了；摘要印不出來就用 exit code 講，🚫 不假裝成功。
+    let summary = json_value_of(&result.summary(at, len))?;
+    eprintln!("{summary}");
     Ok(())
 }
 

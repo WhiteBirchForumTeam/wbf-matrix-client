@@ -8,7 +8,8 @@
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::string_slice
     )
 )]
 //! `wbf-matrix-client-daemon`：這一版只有 `-s`（常駐）。單發命令（`daemon <命令>`，architecture-v2 §0.2）

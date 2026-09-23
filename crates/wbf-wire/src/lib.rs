@@ -8,7 +8,8 @@
         clippy::unreachable,
         clippy::todo,
         clippy::unimplemented,
-        clippy::indexing_slicing
+        clippy::indexing_slicing,
+        clippy::string_slice
     )
 )]
 //! wbfuwunel 線上協議的 codec。權威是 server repo 的 `docs/design/chunked-upload-spec.md`；

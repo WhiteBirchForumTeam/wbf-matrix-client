@@ -74,7 +74,10 @@ impl MediaPool {
                 "pool file name {pool_file:?} is not a hex hash"
             )));
         }
-        Ok(self.dir.join(&pool_file[..2]).join(pool_file))
+        let shard = pool_file.get(..2).ok_or_else(|| {
+            SdkError::Usage(format!("pool file name {pool_file:?} is shorter than 2"))
+        })?;
+        Ok(self.dir.join(shard).join(pool_file))
     }
 
     /// 下載中的暫存檔位置。
