@@ -105,7 +105,8 @@ impl Client {
             Side::Client,
             PackType::Cipher,
             request.to_string().as_bytes(),
-        );
+        )
+        .unwrap();
         self.socket
             .send(Message::Binary(frame.into()))
             .await

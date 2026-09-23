@@ -154,7 +154,13 @@ impl MediaPool {
                     plain.len()
                 )));
             }
-            buffer.extend_from_slice(&plain[..tail]);
+            let trusted = plain.get(..tail).ok_or_else(|| {
+                pool_error(format!(
+                    "last segment has {} bytes, trusted length needs {tail}",
+                    plain.len()
+                ))
+            })?;
+            buffer.extend_from_slice(trusted);
             hasher.update(&buffer);
         }
         // 檔截到第 full_segments 段的起點；buffer 裡的短段等湊滿或 finish 再封。
@@ -184,7 +190,10 @@ impl MediaPool {
             std::fs::remove_file(&pending)?;
             return Ok(false);
         }
-        std::fs::create_dir_all(target.parent().expect("pool file has a parent"))?;
+        let pool_dir = target
+            .parent()
+            .ok_or_else(|| std::io::Error::other("pool file path has no parent directory"))?;
+        std::fs::create_dir_all(pool_dir)?;
         std::fs::rename(&pending, &target)?;
         Ok(true)
     }
@@ -360,10 +369,15 @@ impl Write for PoolWriter {
         while !remaining.is_empty() {
             let room = self.header.segment_size as usize - self.buffer.len();
             let take = room.min(remaining.len());
-            self.buffer.extend_from_slice(&remaining[..take]);
-            self.hasher.update(&remaining[..take]);
+            let Some((piece, rest)) = remaining.split_at_checked(take) else {
+                return Err(std::io::Error::other(
+                    "media pool: write split past the end",
+                ));
+            };
+            self.buffer.extend_from_slice(piece);
+            self.hasher.update(piece);
             self.plain_len += take as u64;
-            remaining = &remaining[take..];
+            remaining = rest;
             if self.buffer.len() == self.header.segment_size as usize {
                 self.seal_buffer().map_err(io_error)?;
             }
@@ -397,7 +411,10 @@ impl PoolReader {
                 .map_err(io_error)?;
             self.loaded_segment = Some((index, plain));
         }
-        Ok(&self.loaded_segment.as_ref().expect("just loaded").1)
+        match &self.loaded_segment {
+            Some((_, plain)) => Ok(plain),
+            None => Err(std::io::Error::other("media pool: segment was not loaded")),
+        }
     }
 }
 
@@ -414,7 +431,14 @@ impl Read for PoolReader {
             return Ok(0);
         }
         let take = (segment.len() - offset).min(out.len());
-        out[..take].copy_from_slice(&segment[offset..offset + take]);
+        let (Some(destination), Some(source)) =
+            (out.get_mut(..take), segment.get(offset..offset + take))
+        else {
+            return Err(std::io::Error::other(
+                "media pool: read window past the end",
+            ));
+        };
+        destination.copy_from_slice(source);
         self.position += take as u64;
         Ok(take)
     }
@@ -463,7 +487,11 @@ fn read_header(file: &mut File) -> Result<Header, SdkError> {
             bytes[4]
         )));
     }
-    let segment_size = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+    let segment_size = bytes
+        .get(8..12)
+        .and_then(|field| field.first_chunk::<4>())
+        .map(|field| u32::from_le_bytes(*field))
+        .ok_or_else(|| pool_error("pool header is shorter than its segment_size field".into()))?;
     if segment_size == 0 {
         return Err(pool_error("media pool file has segment_size 0".into()));
     }

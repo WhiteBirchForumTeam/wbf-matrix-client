@@ -294,16 +294,17 @@ pub fn bridge_request(
     variables: &impl Serialize,
     body: Vec<u8>,
     seq: u32,
-) -> Pack {
-    Pack {
+) -> Result<Pack, SdkError> {
+    Ok(Pack {
         kind: endpoint.kind,
         subtype: endpoint.subtype,
         flags: flags::IS_BRIDGED,
         id: 0,
         seq,
-        meta: serde_json::to_vec(variables).expect("bridge variables serialize"),
+        meta: serde_json::to_vec(variables)
+            .map_err(|error| crate::error::cannot_serialize("bridge variables", error))?,
         data: body,
-    }
+    })
 }
 
 /// 走橋成功回覆（`Control/Ack` ＋ `IS_BRIDGED`）的 meta。
@@ -537,16 +538,17 @@ pub struct RecentRequest {
 ///     request: example: RecentRequest { rooms: None, limit: 320, cg_seq: Some(4700), before: None, batch: Some(10) }
 ///     id: client 自己選的，回應（一串 `Batch`）抄它；不能是靠 seq 對回應的 0
 ///     seq: 請求號
-pub fn recent(request: &RecentRequest, id: u64, seq: u32) -> Pack {
-    Pack {
+pub fn recent(request: &RecentRequest, id: u64, seq: u32) -> Result<Pack, SdkError> {
+    Ok(Pack {
         kind: Kind::Event,
         subtype: event::RECENT,
         flags: 0,
         id,
         seq,
-        meta: serde_json::to_vec(request).expect("RecentRequest serializes"),
+        meta: serde_json::to_vec(request)
+            .map_err(|error| crate::error::cannot_serialize("RecentRequest", error))?,
         data: Vec::new(),
-    }
+    })
 }
 
 /// `Event/Batch` 的 meta（pack-pipeline §6.2）。
@@ -663,22 +665,21 @@ pub fn split_length_prefixed(data: &[u8]) -> Result<Vec<&[u8]>, SdkError> {
     let mut items = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
-        if rest.len() < 4 {
+        let Some((len_bytes, after_len)) = rest.split_first_chunk::<4>() else {
             return Err(SdkError::Protocol(format!(
                 "length-prefixed data ends with {} stray byte(s)",
                 rest.len()
             )));
-        }
-        let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        rest = &rest[4..];
-        if rest.len() < len {
+        };
+        let len = u32::from_be_bytes(*len_bytes) as usize;
+        let Some((item, after_item)) = after_len.split_at_checked(len) else {
             return Err(SdkError::Protocol(format!(
                 "length prefix {len} runs past the end ({} bytes left)",
-                rest.len()
+                after_len.len()
             )));
-        }
-        items.push(&rest[..len]);
-        rest = &rest[len..];
+        };
+        items.push(item);
+        rest = after_item;
     }
     Ok(items)
 }
@@ -745,16 +746,17 @@ pub fn new_txn_id() -> Result<String, SdkError> {
 /// Args:
 ///     request: example: SendRequest { room_id: "!r:localhost".into(), event_type: "m.room.encrypted".into(), txn_id: "t1".into(), attachments: vec!["mxc://localhost/1122334455667788".into()], room_version: Some(81234) }
 ///     content: 事件 content 的 JSON bytes（E2EE 就是 `m.room.encrypted` 的 content）
-pub fn send_event(request: &SendRequest, content: Vec<u8>, seq: u32) -> Pack {
-    Pack {
+pub fn send_event(request: &SendRequest, content: Vec<u8>, seq: u32) -> Result<Pack, SdkError> {
+    Ok(Pack {
         kind: Kind::Event,
         subtype: event::SEND,
         flags: 0,
         id: 0,
         seq,
-        meta: serde_json::to_vec(request).expect("SendRequest serializes"),
+        meta: serde_json::to_vec(request)
+            .map_err(|error| crate::error::cannot_serialize("SendRequest", error))?,
         data: content,
-    }
+    })
 }
 
 /// `Event/Send` 的 Ack meta（server 向量 `ack_send`）：`event_id`。
@@ -780,16 +782,21 @@ pub struct EventSubscribeRequest {
 /// Args:
 ///     request: example: &EventSubscribeRequest { cg_seq: Some(4700), rooms: None }
 ///     id: client 選的會話號（`SESSION` 型別；之後每個 `Push` 抄它）
-pub fn event_subscribe(request: &EventSubscribeRequest, id: u64, seq: u32) -> Pack {
-    Pack {
+pub fn event_subscribe(
+    request: &EventSubscribeRequest,
+    id: u64,
+    seq: u32,
+) -> Result<Pack, SdkError> {
+    Ok(Pack {
         kind: Kind::Event,
         subtype: event::SUBSCRIBE,
         flags: 0,
         id,
         seq,
-        meta: serde_json::to_vec(request).expect("EventSubscribeRequest serializes"),
+        meta: serde_json::to_vec(request)
+            .map_err(|error| crate::error::cannot_serialize("EventSubscribeRequest", error))?,
         data: Vec::new(),
-    }
+    })
 }
 
 /// `Event/Unsubscribe`：`rooms` 沒帶 ＝ 整個忘掉這條連線的訂閱（含「跟進之後加入的房」），meta 是空的（向量 `unsubscribe_all`）；
@@ -797,14 +804,13 @@ pub fn event_subscribe(request: &EventSubscribeRequest, id: u64, seq: u32) -> Pa
 ///
 /// Args:
 ///     rooms: example: None
-pub fn event_unsubscribe(rooms: Option<&[String]>, id: u64, seq: u32) -> Pack {
+pub fn event_unsubscribe(rooms: Option<&[String]>, id: u64, seq: u32) -> Result<Pack, SdkError> {
     let meta = match rooms {
-        Some(rooms) => {
-            serde_json::to_vec(&serde_json::json!({ "rooms": rooms })).expect("rooms serialize")
-        }
+        Some(rooms) => serde_json::to_vec(&serde_json::json!({ "rooms": rooms }))
+            .map_err(|error| crate::error::cannot_serialize("Unsubscribe rooms", error))?,
         None => Vec::new(),
     };
-    Pack {
+    Ok(Pack {
         kind: Kind::Event,
         subtype: event::UNSUBSCRIBE,
         flags: 0,
@@ -812,7 +818,7 @@ pub fn event_unsubscribe(rooms: Option<&[String]>, id: u64, seq: u32) -> Pack {
         seq,
         meta,
         data: Vec::new(),
-    }
+    })
 }
 
 /// `Event/Subscribe` 的 Ack meta（向量 `ack_subscribe`）。
@@ -983,16 +989,17 @@ pub struct DeviceFetchRequest {
 /// Args:
 ///     request: example: DeviceFetchRequest { cd_seq: Some(4711), limit: Some(1000) }
 ///     id: client 選的會話號（型別 `SESSION`）, example: pack::id::compose(pack::id::SESSION, 31)
-pub fn device_fetch(request: &DeviceFetchRequest, id: u64, seq: u32) -> Pack {
-    Pack {
+pub fn device_fetch(request: &DeviceFetchRequest, id: u64, seq: u32) -> Result<Pack, SdkError> {
+    Ok(Pack {
         kind: Kind::Device,
         subtype: device::FETCH,
         flags: 0,
         id,
         seq,
-        meta: serde_json::to_vec(request).expect("DeviceFetchRequest serializes"),
+        meta: serde_json::to_vec(request)
+            .map_err(|error| crate::error::cannot_serialize("DeviceFetchRequest", error))?,
         data: Vec::new(),
-    }
+    })
 }
 
 /// `Device/Subscribe` 的 meta。鍵序照向量 `device_subscribe`（`cd_seq`、`device_id`）。
@@ -1004,16 +1011,21 @@ pub struct DeviceSubscribeRequest {
     pub device_id: String,
 }
 
-pub fn device_subscribe(request: &DeviceSubscribeRequest, id: u64, seq: u32) -> Pack {
-    Pack {
+pub fn device_subscribe(
+    request: &DeviceSubscribeRequest,
+    id: u64,
+    seq: u32,
+) -> Result<Pack, SdkError> {
+    Ok(Pack {
         kind: Kind::Device,
         subtype: device::SUBSCRIBE,
         flags: 0,
         id,
         seq,
-        meta: serde_json::to_vec(request).expect("DeviceSubscribeRequest serializes"),
+        meta: serde_json::to_vec(request)
+            .map_err(|error| crate::error::cannot_serialize("DeviceSubscribeRequest", error))?,
         data: Vec::new(),
-    }
+    })
 }
 
 /// `Device/Subscribe`（不帶 `cd_seq`）的回覆，照 server 送來的順序：先 `Ack`（登記好了），再 `CryptoState`（自己的金鑰存量）。
@@ -1196,13 +1208,17 @@ pub fn parse_device_batch(
     }
     if meta.bc > 0 {
         // 舊→新、count 嚴格遞增；`ot`／`nt` 就是頭尾。錯一個就是 server 或通道壞了，🚫 不猜。
-        if meta.counts.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if meta
+            .counts
+            .windows(2)
+            .any(|pair| matches!(pair, [older, newer] if older >= newer))
+        {
             return Err(SdkError::Protocol(format!(
                 "Device/Batch counts are not strictly increasing: {:?}",
                 meta.counts
             )));
         }
-        if meta.counts[0] != meta.ot || meta.counts[meta.counts.len() - 1] != meta.nt {
+        if meta.counts.first() != Some(&meta.ot) || meta.counts.last() != Some(&meta.nt) {
             return Err(SdkError::Protocol(format!(
                 "Device/Batch ot {} / nt {} do not match counts {:?}",
                 meta.ot, meta.nt, meta.counts
@@ -1304,8 +1320,12 @@ pub fn decode_counts(data: &[u8]) -> Result<Vec<u64>, SdkError> {
             data.len()
         )));
     }
-    Ok(data
-        .chunks_exact(8)
-        .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("chunks_exact(8)")))
-        .collect())
+    data.chunks_exact(8)
+        .map(|chunk| {
+            chunk
+                .first_chunk::<8>()
+                .map(|count| u64::from_be_bytes(*count))
+        })
+        .collect::<Option<Vec<u64>>>()
+        .ok_or_else(|| SdkError::Protocol("a count list chunk is shorter than 8 bytes".into()))
 }

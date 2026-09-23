@@ -92,7 +92,7 @@ async fn upload_download_seek_resume_stream_against_real_server() {
     let plaintext = random_bytes(300 * 1024 + 123);
     let expected_sha = hex::encode(Sha256::digest(&plaintext));
     for cipher in [Cipher::ChaCha20Poly1305, Cipher::Aes256Gcm, Cipher::None] {
-        let file_cipher = FileCipher::generate(cipher, 64 * 1024);
+        let file_cipher = FileCipher::generate(cipher, 64 * 1024).unwrap();
         let state = ws
             .create_upload(
                 &session.server,
@@ -156,7 +156,7 @@ async fn upload_download_seek_resume_stream_against_real_server() {
     }
 
     // 5. 續傳：送一半、換一條連線問 Status、接著送。
-    let file_cipher = FileCipher::generate(Cipher::ChaCha20Poly1305, 64 * 1024);
+    let file_cipher = FileCipher::generate(Cipher::ChaCha20Poly1305, 64 * 1024).unwrap();
     let state = ws
         .create_upload(
             &session.server,
@@ -209,7 +209,7 @@ async fn upload_download_seek_resume_stream_against_real_server() {
     assert_eq!(out, plaintext);
 
     // 6. 串流：0/0 哨兵、IS_LAST、Seal 帶最終描述。
-    let file_cipher = FileCipher::generate(Cipher::Aes256Gcm, 64 * 1024);
+    let file_cipher = FileCipher::generate(Cipher::Aes256Gcm, 64 * 1024).unwrap();
     let state = ws2
         .create_upload(
             &session.server,

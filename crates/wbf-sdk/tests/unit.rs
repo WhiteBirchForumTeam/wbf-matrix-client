@@ -25,7 +25,9 @@ fn chacha20_poly1305_matches_rfc_8439() {
          3ff4def08e4b7a9de576d26586cec64b6116\
          1ae10b594f09e26a7e902ecbd0600691",
     );
-    let sealed = Cipher::ChaCha20Poly1305.seal(&key, &nonce, &aad, plain);
+    let sealed = Cipher::ChaCha20Poly1305
+        .seal(&key, &nonce, &aad, plain)
+        .unwrap();
     assert_eq!(sealed, expected);
     assert_eq!(
         Cipher::ChaCha20Poly1305
@@ -55,7 +57,7 @@ fn aes_256_gcm_matches_nist_test_case_16() {
          8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662\
          76fc6ece0f4e1768cddf8853bb2d551b",
     );
-    let sealed = Cipher::Aes256Gcm.seal(&key, &nonce, &aad, &plain);
+    let sealed = Cipher::Aes256Gcm.seal(&key, &nonce, &aad, &plain).unwrap();
     assert_eq!(sealed, expected);
     assert_eq!(
         Cipher::Aes256Gcm.open(&key, &nonce, &aad, &sealed).unwrap(),
@@ -95,7 +97,9 @@ fn chunk_opened_under_wrong_index_is_rejected() {
 fn chunk_opened_with_description_nonce_is_rejected() {
     // 描述與塊的 AAD 不同，拿描述密文當塊解必須失敗（約定 §3：網域分開）。
     let file_cipher = fixed(Cipher::Aes256Gcm);
-    let sealed = file_cipher.seal_description(DescriptionSlot::Create, b"0123456789abcdef");
+    let sealed = file_cipher
+        .seal_description(DescriptionSlot::Create, b"0123456789abcdef")
+        .unwrap();
     assert!(file_cipher
         .open_description(DescriptionSlot::Seal, &sealed)
         .is_err());
@@ -170,11 +174,11 @@ fn oversized_and_reserved_indices_are_rejected() {
 
 #[test]
 fn generate_never_reuses_key_or_nonce_base() {
-    let first = FileCipher::generate(Cipher::ChaCha20Poly1305, 65536);
-    let second = FileCipher::generate(Cipher::ChaCha20Poly1305, 65536);
+    let first = FileCipher::generate(Cipher::ChaCha20Poly1305, 65536).unwrap();
+    let second = FileCipher::generate(Cipher::ChaCha20Poly1305, 65536).unwrap();
     assert_ne!(first, second);
     assert_ne!(first.nonce_base(), second.nonce_base());
-    let plaintext_mode = FileCipher::generate(Cipher::None, 65536);
+    let plaintext_mode = FileCipher::generate(Cipher::None, 65536).unwrap();
     assert_eq!(plaintext_mode.nonce_base(), None);
     assert!(plaintext_mode.to_event_block(1).key.is_none());
 }
@@ -285,7 +289,7 @@ fn event_recent_and_batch_match_server_vectors() {
     ];
     for (name, request) in expected {
         let vector = pack_named(name);
-        let ours = protocol::recent(&request, vector.id, vector.seq);
+        let ours = protocol::recent(&request, vector.id, vector.seq).unwrap();
         assert_eq!(ours, vector, "{name}");
         assert_eq!(
             ours.encode().unwrap(),
@@ -310,7 +314,8 @@ fn event_recent_and_batch_match_server_vectors() {
         },
         vector.id,
         vector.seq,
-    );
+    )
+    .unwrap();
     let meta_of =
         |pack: &Pack| -> serde_json::Value { serde_json::from_slice(&pack.meta).unwrap() };
     assert_eq!(
@@ -501,7 +506,8 @@ fn event_send_meta_shape() {
         &request,
         br#"{"algorithm":"m.megolm.v1.aes-sha2"}"#.to_vec(),
         7,
-    );
+    )
+    .unwrap();
     assert_eq!(pack.kind, wbf_wire::Kind::Event);
     assert_eq!(pack.subtype, wbf_wire::pack::event::SEND);
     assert_eq!(
@@ -543,7 +549,7 @@ fn room_device_version_packs_match_server_vectors() {
         attachments: vec![],
         room_version: Some(81234),
     };
-    let ours = protocol::send_event(&request, vector.data.clone(), vector.seq);
+    let ours = protocol::send_event(&request, vector.data.clone(), vector.seq).unwrap();
     assert_eq!(ours.encode().unwrap(), vector.encode().unwrap());
 
     // 1506：認碼只看 code_id；目前的號碼從 meta 讀。
@@ -691,7 +697,8 @@ fn bridge_request_and_replies_match_server_vectors() {
         &variables,
         br#"{"topic":"hello"}"#.to_vec(),
         50,
-    );
+    )
+    .unwrap();
     assert_eq!(
         request.encode().unwrap(),
         bytes_named("bridge_set_state_event"),
@@ -712,7 +719,7 @@ fn bridge_request_and_replies_match_server_vectors() {
     );
 
     let forbidden = Pack::decode(&bytes_named("bridge_error_forbidden")).unwrap();
-    let request_51 = protocol::bridge_request(set_state_event, &variables, Vec::new(), 51);
+    let request_51 = protocol::bridge_request(set_state_event, &variables, Vec::new(), 51).unwrap();
     match protocol::expect_bridge_reply(&request_51, forbidden) {
         Err(error @ SdkError::Server { .. }) => {
             assert_eq!(error.matrix_status(), Some(403));
@@ -728,7 +735,7 @@ fn bridged_endpoints_and_variables_follow_the_specs_index() {
     use wbf_sdk::protocol::{self, MembersVariables, NoVariables, SendToDeviceVariables};
     use wbf_wire::Kind;
     let first_four_bytes = |endpoint: protocol::BridgedEndpoint| {
-        let pack = protocol::bridge_request(endpoint, &NoVariables {}, Vec::new(), 1);
+        let pack = protocol::bridge_request(endpoint, &NoVariables {}, Vec::new(), 1).unwrap();
         pack.encode().unwrap()[..4].to_vec()
     };
     // index.md：「前 4 個 byte 就決定了這是哪個操作」：01 KK SS 10。
@@ -806,7 +813,8 @@ fn a_bridge_reply_without_the_bridge_bit_or_a_2xx_is_not_success() {
         },
         Vec::new(),
         7,
-    );
+    )
+    .unwrap();
     let response = |subtype: u8, response_flags: u8, meta: &str| Pack {
         kind: Kind::Control,
         subtype,
@@ -896,7 +904,8 @@ fn device_packs_match_server_vectors() {
         },
         fetch.id,
         fetch.seq,
-    );
+    )
+    .unwrap();
     assert_eq!(
         ours.encode().unwrap(),
         fetch.encode().unwrap(),
@@ -911,7 +920,8 @@ fn device_packs_match_server_vectors() {
         },
         subscribe.id,
         subscribe.seq,
-    );
+    )
+    .unwrap();
     assert_eq!(
         ours.encode().unwrap(),
         subscribe.encode().unwrap(),
@@ -1109,7 +1119,8 @@ fn event_subscribe_and_push_match_the_server_vectors() {
         },
         account_wide.id,
         account_wide.seq,
-    );
+    )
+    .unwrap();
     assert_eq!(
         ours.encode().unwrap(),
         account_wide.encode().unwrap(),
@@ -1124,7 +1135,8 @@ fn event_subscribe_and_push_match_the_server_vectors() {
         },
         rooms.id,
         rooms.seq,
-    );
+    )
+    .unwrap();
     assert_eq!(
         ours.encode().unwrap(),
         rooms.encode().unwrap(),
@@ -1132,7 +1144,7 @@ fn event_subscribe_and_push_match_the_server_vectors() {
     );
 
     let unsubscribe = pack_named("unsubscribe_all");
-    let ours = protocol::event_unsubscribe(None, unsubscribe.id, unsubscribe.seq);
+    let ours = protocol::event_unsubscribe(None, unsubscribe.id, unsubscribe.seq).unwrap();
     assert_eq!(
         ours.encode().unwrap(),
         unsubscribe.encode().unwrap(),
@@ -1141,7 +1153,8 @@ fn event_subscribe_and_push_match_the_server_vectors() {
 
     // Ack 抄訂閱的 id 與 seq。
     let ack = pack_named("ack_subscribe");
-    let request = protocol::event_subscribe(&EventSubscribeRequest::default(), ack.id, ack.seq);
+    let request =
+        protocol::event_subscribe(&EventSubscribeRequest::default(), ack.id, ack.seq).unwrap();
     match protocol::parse_event_subscribe_reply(&request, &ack).unwrap() {
         EventSubscribeReply::Acknowledged(ack) => {
             assert_eq!((ack.latest_g_seq, ack.joined), (4712, 3));

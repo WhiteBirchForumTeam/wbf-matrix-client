@@ -77,6 +77,18 @@ pub struct Push {
     pub job: Option<u64>,
 }
 
+/// 往一個 JSON 物件裡加一個欄位。`Value` 的 `[]=` 在不是物件時會 panic，這裡不會：不是物件就不加（這裡的 params 都是 `json!({...})`）。
+///
+/// Args:
+///     params: example: json!({ "note": "hi" })
+///     key: example: "id"
+///     value: example: json!(7)
+pub(crate) fn insert_field(params: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    if let Some(fields) = params.as_object_mut() {
+        fields.insert(key.to_string(), value);
+    }
+}
+
 /// core 的事件 → 推播。名字與欄位照 rpc-spec §4。
 pub fn push_of(event: &CoreEvent) -> Push {
     match event {
@@ -84,7 +96,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
         CoreEvent::Note { job, text } => {
             let mut params = json!({ "note": text });
             if let Some(job) = job {
-                params["id"] = json!(job);
+                insert_field(&mut params, "id", json!(job));
             }
             Push {
                 request: Request::push("note", params),
@@ -100,10 +112,10 @@ pub fn push_of(event: &CoreEvent) -> Push {
         } => {
             let mut params = json!({ "done": done, "note": text });
             if let Some(job) = job {
-                params["id"] = json!(job);
+                insert_field(&mut params, "id", json!(job));
             }
             if let Some(total) = total {
-                params["total"] = json!(total);
+                insert_field(&mut params, "total", json!(total));
             }
             Push {
                 request: Request::push("progress", params),
@@ -126,7 +138,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
         } => {
             let mut params = json!({ "user": user, "state": state });
             if let Some(cg_seq) = cg_seq {
-                params["cg_seq"] = json!(cg_seq);
+                insert_field(&mut params, "cg_seq", json!(cg_seq));
             }
             Push {
                 request: Request::push("sync.state", params),
@@ -142,7 +154,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
         } => {
             let mut params = json!({ "user": user, "role": role, "state": state });
             if let Some(reason) = reason {
-                params["reason"] = json!(reason);
+                insert_field(&mut params, "reason", json!(reason));
             }
             Push {
                 request: Request::push("link.state", params),

@@ -203,29 +203,39 @@ impl Connection {
         }
     }
 
-    pub fn seal_response(&self, response: &Response) -> Vec<u8> {
+    /// Return:
+    ///     Ok(Vec<u8>)   封好的 frame
+    ///     Err(io)       序列化不了、或封不起來（`pack::seal`）：呼叫端講一聲、不送，🚫 不炸
+    pub fn seal_response(&self, response: &Response) -> Result<Vec<u8>, std::io::Error> {
         self.seal(
             self.outbound_type(),
-            &serde_json::to_vec(response).expect("Response serialises"),
+            &Self::serialize_json(response, "Response")?,
         )
     }
 
-    pub fn seal_push(&self, push: &Request) -> Vec<u8> {
+    pub fn seal_push(&self, push: &Request) -> Result<Vec<u8>, std::io::Error> {
         self.seal(
             self.outbound_type(),
-            &serde_json::to_vec(push).expect("Request serialises"),
+            &Self::serialize_json(push, "Request")?,
         )
     }
 
     /// 協議層的 close 通知**一律明文**（rpc-spec §1.4）：對方可能沒有金鑰。
-    pub fn seal_close(&self, notice: &Response) -> Vec<u8> {
-        self.seal(
-            PackType::Plain,
-            &serde_json::to_vec(notice).expect("Response serialises"),
-        )
+    pub fn seal_close(&self, notice: &Response) -> Result<Vec<u8>, std::io::Error> {
+        self.seal(PackType::Plain, &Self::serialize_json(notice, "Response")?)
     }
 
-    fn seal(&self, pack_type: PackType, json: &[u8]) -> Vec<u8> {
+    /// 這幾個型別都是純欄位，序列化理論上不會失敗——但那不是 panic 的理由（維護者 2026-09-23）：回 io 錯，呼叫端講一聲、不送。
+    fn serialize_json<T: serde::Serialize>(
+        value: &T,
+        what: &str,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        serde_json::to_vec(value).map_err(|error| {
+            std::io::Error::other(format!("{what} could not be serialized: {error}"))
+        })
+    }
+
+    fn seal(&self, pack_type: PackType, json: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         pack::seal(&self.keys, Side::Daemon, pack_type, json)
     }
 }
@@ -248,7 +258,7 @@ mod tests {
     }
 
     fn client_frame(keys: &RpcKeys, pack_type: PackType, json: &str) -> Vec<u8> {
-        pack::seal(keys, Side::Client, pack_type, json.as_bytes())
+        pack::seal(keys, Side::Client, pack_type, json.as_bytes()).expect("seal")
     }
 
     fn hello_json() -> &'static str {
@@ -304,7 +314,7 @@ mod tests {
         let Inbound::Close(notice) = inbound else {
             unreachable!()
         };
-        let bytes = connection.seal_close(&notice);
+        let bytes = connection.seal_close(&notice).unwrap();
         // 明文：前綴之後就是 JSON，任何人都讀得到。
         assert_eq!(&bytes[..2], &[0x01, 0x01]);
         let json: Value = serde_json::from_slice(&bytes[2..]).unwrap();
@@ -327,7 +337,9 @@ mod tests {
             Inbound::HelloAccepted { .. }
         ));
         // 降級後對明文請求用明文回。
-        let bytes = connection.seal_response(&Response::ok(Some(0), Value::Null));
+        let bytes = connection
+            .seal_response(&Response::ok(Some(0), Value::Null))
+            .unwrap();
         assert_eq!(&bytes[..2], &[0x01, 0x01]);
     }
 
@@ -336,7 +348,9 @@ mod tests {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
         connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
-        let bytes = connection.seal_response(&Response::ok(Some(0), serde_json::json!({ "x": 1 })));
+        let bytes = connection
+            .seal_response(&Response::ok(Some(0), serde_json::json!({ "x": 1 })))
+            .unwrap();
         assert_eq!(&bytes[..2], &[0x01, 0x02]);
         let (_, json) = pack::open(&keys, Side::Client, &bytes).unwrap();
         let response: Response = serde_json::from_slice(&json).unwrap();

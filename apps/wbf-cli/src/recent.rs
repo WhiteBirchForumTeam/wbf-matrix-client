@@ -27,5 +27,5 @@ pub async fn recent_command(
             &context.target(),
         )
         .await?;
-    crate::rooms::print_json(&serde_json::to_value(summary).expect("serializes"))
+    crate::rooms::print_value(&summary)
 }

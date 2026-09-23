@@ -166,10 +166,13 @@ impl<C: PackChannel> WbfClient<C> {
     /// Return:
     ///     Ok(Pack)          Ack
     ///     Err(SdkError)     `Server`、`Network`、`Protocol`、`Integrity`
-    pub(crate) async fn call(&mut self, build: impl FnOnce(u32) -> Pack) -> Result<Pack, SdkError> {
+    pub(crate) async fn call(
+        &mut self,
+        build: impl FnOnce(u32) -> Result<Pack, SdkError>,
+    ) -> Result<Pack, SdkError> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let request = build(seq);
+        let request = build(seq)?;
         self.send_and_expect_ack(request).await
     }
 
@@ -188,7 +191,7 @@ impl<C: PackChannel> WbfClient<C> {
         features: &[&str],
     ) -> Result<HelloAck, SdkError> {
         let ack = self
-            .call(|seq| protocol::hello(client_name, features, seq))
+            .call(|seq| Ok(protocol::hello(client_name, features, seq)))
             .await?;
         let hello: HelloAck = protocol::parse_meta(&ack)?;
         self.features = Some(hello.features.clone());
@@ -243,7 +246,7 @@ impl<C: PackChannel> WbfClient<C> {
         self.require_feature(protocol::BRIDGE_FEATURE)?;
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let request = protocol::bridge_request(endpoint, variables, body, seq);
+        let request = protocol::bridge_request(endpoint, variables, body, seq)?;
         let response = self.channel.request(request.clone()).await?;
         protocol::expect_bridge_reply(&request, response)
     }
@@ -427,8 +430,7 @@ impl<C: PackChannel> WbfClient<C> {
     fn next_session_id(&mut self) -> u64 {
         self.next_stream_id =
             self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
-        wbf_wire::pack::id::compose(wbf_wire::pack::id::SESSION, self.next_stream_id)
-            .expect("masked to 56 bits above")
+        wbf_wire::pack::id::compose_masked(wbf_wire::pack::id::SESSION, self.next_stream_id)
     }
 
     /// `Device/Fetch` 一窗：從 `cd_seq` 之後拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
@@ -450,7 +452,7 @@ impl<C: PackChannel> WbfClient<C> {
         self.require_feature(protocol::DEVICE_FEATURE)?;
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let pack = protocol::device_fetch(request, self.next_session_id(), seq);
+        let pack = protocol::device_fetch(request, self.next_session_id(), seq)?;
         let mut window = DeviceWindow::default();
         let mut expected_seq = 0u32;
         let mut sent = 0u32;
@@ -528,7 +530,7 @@ impl<C: PackChannel> WbfClient<C> {
             },
             self.next_session_id(),
             seq,
-        );
+        )?;
         let mut acknowledged = false;
         let mut crypto_state = None;
         let mut on_pack = |response: Pack| -> Result<bool, SdkError> {
@@ -579,7 +581,7 @@ impl<C: PackChannel> WbfClient<C> {
             },
             self.next_session_id(),
             seq,
-        );
+        )?;
         let mut subscription = self.channel.subscribe(pack.clone()).await?;
         let mut acknowledged = false;
         let mut crypto_state = None;
@@ -597,8 +599,13 @@ impl<C: PackChannel> WbfClient<C> {
                 protocol::SubscribeReply::LivePush => early_pushes.push(reply),
             }
         }
+        let Some(crypto_state) = crypto_state else {
+            return Err(SdkError::Protocol(
+                "Subscribe session acknowledged without a CryptoState".into(),
+            ));
+        };
         Ok(DeviceSubscription {
-            crypto_state: crypto_state.expect("loop ends only with a state"),
+            crypto_state,
             early_pushes,
             subscription,
         })
@@ -629,7 +636,7 @@ impl<C: PackChannel> WbfClient<C> {
             },
             self.next_session_id(),
             seq,
-        );
+        )?;
         let mut subscription = self.channel.subscribe(request.clone()).await?;
         let mut early_pushes = Vec::new();
         loop {
@@ -673,7 +680,7 @@ impl<C: PackChannel> WbfClient<C> {
     ) -> Result<(), SdkError> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let pack = protocol::event_unsubscribe(None, subscription.request.id, seq);
+        let pack = protocol::event_unsubscribe(None, subscription.request.id, seq)?;
         self.channel.send_only(pack).await?;
         loop {
             match subscription.next(per_pack_timeout).await? {
@@ -701,7 +708,7 @@ impl<C: PackChannel> WbfClient<C> {
     pub async fn device_unsubscribe(&mut self) -> Result<(), SdkError> {
         self.require_feature(protocol::DEVICE_FEATURE)?;
         let session_id = self.next_session_id();
-        self.call(|seq| protocol::device_unsubscribe(session_id, seq))
+        self.call(|seq| Ok(protocol::device_unsubscribe(session_id, seq)))
             .await?;
         Ok(())
     }
@@ -747,17 +754,19 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     pub async fn ping(&mut self) -> Result<(), SdkError> {
-        self.call(protocol::ping).await?;
+        self.call(|seq| Ok(protocol::ping(seq))).await?;
         Ok(())
     }
 
     pub async fn upload_status(&mut self, upload_id: u64) -> Result<StatusAck, SdkError> {
-        let ack = self.call(|seq| protocol::status(upload_id, seq)).await?;
+        let ack = self
+            .call(|seq| Ok(protocol::status(upload_id, seq)))
+            .await?;
         protocol::parse_meta(&ack)
     }
 
     pub async fn abort_upload(&mut self, upload_id: u64) -> Result<(), SdkError> {
-        self.call(|seq| protocol::abort(upload_id, seq)).await?;
+        self.call(|seq| Ok(protocol::abort(upload_id, seq))).await?;
         Ok(())
     }
 
@@ -766,7 +775,7 @@ impl<C: PackChannel> WbfClient<C> {
     /// Return:
     ///     Ok((InfoAck, Vec<u8>))   meta 與 data（server 存的那份描述，原樣）
     pub async fn fetch_info(&mut self, mxc: &str) -> Result<(InfoAck, Vec<u8>), SdkError> {
-        let ack = self.call(|seq| protocol::info(mxc, seq)).await?;
+        let ack = self.call(|seq| Ok(protocol::info(mxc, seq))).await?;
         let info = protocol::parse_meta(&ack)?;
         Ok((info, ack.data))
     }
@@ -778,7 +787,7 @@ impl<C: PackChannel> WbfClient<C> {
         index: u32,
     ) -> Result<(ReadAck, Vec<u8>), SdkError> {
         let ack = self
-            .call(|seq| protocol::read_chunk(mxc, index, seq))
+            .call(|seq| Ok(protocol::read_chunk(mxc, index, seq)))
             .await?;
         let read: ReadAck = protocol::parse_meta(&ack)?;
         if read.len != ack.data.len() as u64 {
@@ -818,7 +827,7 @@ impl<C: PackChannel> WbfClient<C> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let session_id = self.next_session_id();
-        let pack = protocol::recent(request, session_id, seq);
+        let pack = protocol::recent(request, session_id, seq)?;
         let mut window = RecentWindow::default();
         let mut expected_seq = 0u32;
         let mut sent = 0u32;

@@ -31,11 +31,16 @@ impl EncryptedFileInfo {
     ///     Some(EncryptedFileInfo)  長度剛好 16
     ///     None                     長度不是 16（server 對這種 Create 回 Conflict）
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let bytes: &[u8; ENCRYPTED_FILE_INFO_LEN] = bytes.try_into().ok()?;
+        if bytes.len() != ENCRYPTED_FILE_INFO_LEN {
+            return None;
+        }
+        let (file_size, rest) = bytes.split_first_chunk::<8>()?;
+        let (chunk_size, rest) = rest.split_first_chunk::<4>()?;
+        let (chunk_count, _) = rest.split_first_chunk::<4>()?;
         Some(Self {
-            file_size: u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes")),
-            chunk_size: u32::from_be_bytes(bytes[8..12].try_into().expect("4 bytes")),
-            chunk_count: u32::from_be_bytes(bytes[12..16].try_into().expect("4 bytes")),
+            file_size: u64::from_be_bytes(*file_size),
+            chunk_size: u32::from_be_bytes(*chunk_size),
+            chunk_count: u32::from_be_bytes(*chunk_count),
         })
     }
 

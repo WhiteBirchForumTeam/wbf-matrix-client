@@ -46,7 +46,7 @@ pub(super) async fn upload_file(handle: &Handle, core: &Core, params: Value) -> 
     let manifest = core
         .upload_file(&request, transport, &handle.target(&params.target))
         .await?;
-    Ok(serde_json::from_slice(&manifest.to_json())?)
+    Ok(serde_json::to_value(&manifest)?)
 }
 
 #[derive(Deserialize)]

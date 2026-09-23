@@ -255,13 +255,18 @@ impl Core {
                         .trim_start_matches('$')
                         .replace(['/', '\\', ':'], "_")
                 );
-                wbf_sdk::vault::write_private(&dir.join(file_name), &manifest.to_json())?;
+                wbf_sdk::vault::write_private(&dir.join(file_name), &manifest.to_json()?)?;
             }
             files.push(FileEntry {
                 event_id: message.id.clone(),
                 sender: message.sender.clone(),
                 ts: message.sent_at,
-                manifest: serde_json::from_slice(&manifest.to_json()).expect("manifest is json"),
+                manifest: serde_json::to_value(&manifest).map_err(|error| {
+                    CoreError::new(
+                        CoreErrorKind::Io,
+                        format!("manifest could not be serialized: {error}"),
+                    )
+                })?,
             });
         }
         Ok(FilePage { files, next })

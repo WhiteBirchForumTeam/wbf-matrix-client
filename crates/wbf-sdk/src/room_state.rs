@@ -81,16 +81,20 @@ pub fn conversation_from_state(
     };
 
     let name = find_state(state, "m.room.name", "")
-        .and_then(|event| non_empty_string(&event["content"]["name"]))
+        .and_then(|event| event.pointer("/content/name"))
+        .and_then(non_empty_string)
         .or_else(|| {
             find_state(state, "m.room.canonical_alias", "")
-                .and_then(|event| non_empty_string(&event["content"]["alias"]))
+                .and_then(|event| event.pointer("/content/alias"))
+                .and_then(non_empty_string)
         })
         .or_else(|| name_from_members(state, me));
     let topic = find_state(state, "m.room.topic", "")
-        .and_then(|event| non_empty_string(&event["content"]["topic"]));
-    let encrypted = find_state(state, "m.room.encryption", "")
-        .is_some_and(|event| is_encryption_content(&event["content"]));
+        .and_then(|event| event.pointer("/content/topic"))
+        .and_then(non_empty_string);
+    let encrypted = find_state(state, "m.room.encryption", "").is_some_and(|event| {
+        is_encryption_content(event.get("content").unwrap_or(&serde_json::Value::Null))
+    });
 
     Ok(Conversation {
         id: room_id.to_string(),
@@ -190,7 +194,9 @@ fn name_from_members(state: &[Value], me: &str) -> Option<String> {
                 return None;
             }
             Some(
-                non_empty_string(&event["content"]["displayname"])
+                event
+                    .pointer("/content/displayname")
+                    .and_then(non_empty_string)
                     .unwrap_or_else(|| user.to_string()),
             )
         })

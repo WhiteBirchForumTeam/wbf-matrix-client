@@ -57,7 +57,8 @@ impl ToDeviceState {
         let scratch_path = path.with_extension("json.tmp");
         std::fs::write(
             &scratch_path,
-            serde_json::to_vec(self).expect("ToDeviceState serializes"),
+            serde_json::to_vec(self)
+                .map_err(|error| crate::error::cannot_serialize("ToDeviceState", error))?,
         )?;
         std::fs::rename(&scratch_path, &path)?;
         Ok(())

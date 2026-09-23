@@ -77,13 +77,18 @@ fn overwrite(file: &mut File, length: u64) -> std::io::Result<()> {
         let mut written = 0u64;
         while written < length {
             let piece = std::cmp::min(CHUNK as u64, length - written) as usize;
+            let Some(window) = buffer.get_mut(..piece) else {
+                return Err(std::io::Error::other(
+                    "wipe window is larger than the buffer",
+                ));
+            };
             match pass {
                 // 失敗就整個失敗：寫一段假的隨機（例如全 0）比不寫更糟——它看起來像做過了。
-                Pass::Random => getrandom::getrandom(&mut buffer[..piece])
+                Pass::Random => getrandom::getrandom(window)
                     .map_err(|error| std::io::Error::other(format!("no OS randomness: {error}")))?,
-                Pass::Fill(byte) => buffer[..piece].fill(byte),
+                Pass::Fill(byte) => window.fill(byte),
             }
-            file.write_all(&buffer[..piece])?;
+            file.write_all(window)?;
             written += piece as u64;
         }
         file.flush()?;

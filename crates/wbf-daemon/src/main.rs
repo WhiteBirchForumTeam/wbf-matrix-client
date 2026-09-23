@@ -1,3 +1,16 @@
+// 維護者 2026-09-23：正式碼不用會讓整支程式收掉的方法（unwrap／expect／panic／索引）——每個失敗要有去處；測試建置放行（測試要看到它炸）。
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
 //! `wbf-matrix-client-daemon`：這一版只有 `-s`（常駐）。單發命令（`daemon <命令>`，architecture-v2 §0.2）
 //! 與資料平面在下一支 PR。
 //!
@@ -140,7 +153,14 @@ fn main() -> ExitCode {
     drop(token);
 
     let ready_path = cli.data_dir.join("daemon.json");
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // 沒有 runtime 就沒有這支 daemon（維護者的規矩裡「必須要開」的那個層級）——但停也要講清楚、給 exit code，🚫 不 panic。
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("cannot start the async runtime: {error}");
+            return ExitCode::from(1);
+        }
+    };
     runtime.block_on(async move {
         let settings = match Settings::load(cli.config.as_deref(), &cli.data_dir) {
             Ok(settings) => settings,

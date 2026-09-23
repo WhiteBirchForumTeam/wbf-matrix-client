@@ -1,3 +1,16 @@
+// 維護者 2026-09-23：正式碼不用會讓整支程式收掉的方法（unwrap／expect／panic／索引）——每個失敗要有去處；測試建置放行（測試要看到它炸）。
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing
+    )
+)]
 //! wbfuwunel 線上協議的 codec。權威是 server repo 的 `docs/design/chunked-upload-spec.md`；
 //! `tests/vectors.rs` 對著複製來的 `docs/design/wbf-vectors.json` 跑，向量沒跟上就紅。
 //!

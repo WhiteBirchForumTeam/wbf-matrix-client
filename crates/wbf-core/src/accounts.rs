@@ -137,15 +137,16 @@ impl AccountDir {
     pub fn delete_matrix_store(&self) -> Result<(), SdkError> {
         const TRIES: u32 = 10;
         const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
-        for remaining in (0..TRIES).rev() {
+        let mut tries_left = TRIES;
+        loop {
+            tries_left = tries_left.saturating_sub(1);
             match std::fs::remove_dir_all(self.matrix_store_dir()) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) if remaining == 0 => return Err(error.into()),
+                Err(error) if tries_left == 0 => return Err(error.into()),
                 Err(_) => std::thread::sleep(WAIT),
             }
         }
-        unreachable!("the loop returns on the last try")
     }
 }
 

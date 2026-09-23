@@ -305,15 +305,16 @@ impl OlmEngine {
         let answers = self
             .last_keys_query
             .lock()
-            .expect("keys query cache poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         versions
             .members
             .iter()
             .filter(|(user_id, version)| {
                 version.is_hashable()
-                    && answers
-                        .get(*user_id)
-                        .is_some_and(|body| compute_device_keys_hash(user_id, body) != version.hash)
+                    && answers.get(*user_id).is_some_and(|body| {
+                        compute_device_keys_hash(user_id, body)
+                            .is_some_and(|hash| hash != version.hash)
+                    })
             })
             .map(|(user_id, _)| user_id.clone())
             .collect()
@@ -632,7 +633,7 @@ impl OlmEngine {
                     let mut answers = self
                         .last_keys_query
                         .lock()
-                        .expect("keys query cache poisoned");
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     for user_id in query.device_keys.keys() {
                         answers.insert(user_id.to_string(), body.clone());
                     }
@@ -682,7 +683,7 @@ impl OlmEngine {
         request: &ToDeviceRequest,
     ) -> Result<(), SdkError> {
         let body = serde_json::to_vec(&serde_json::json!({ "messages": request.messages }))
-            .expect("to-device messages serialize");
+            .map_err(|error| crate::error::cannot_serialize("to-device messages", error))?;
         client
             .send_to_device(
                 &request.event_type.to_string(),

@@ -12,6 +12,7 @@ use wbf_core::{CoreError, CoreErrorKind};
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{Channel, Manifest, Session, Transport, WbfClient};
 
+use crate::rooms::{json_value_of, print_value, set_field};
 use crate::unlock::{
     default_data_dir, prompt_new_passphrase, prompt_password_on_terminal, read_passphrase_file,
     read_password_file, UnlockOptions,
@@ -75,14 +76,14 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
                 }
                 None => context.core()?.whoami(&context.target()).await?,
             };
-            print_json(&serde_json::to_value(who).expect("serializes"))
+            print_value(&who)
         }
         Command::Ping => {
             let hello = context
                 .core()?
                 .ping(context.transport, CLIENT_NAME, &context.target())
                 .await?;
-            print_json(&serde_json::to_value(hello).expect("serializes"))
+            print_value(&hello)
         }
         Command::Upload(args) => upload_command(context, &args).await,
         Command::Status { upload_id } => {
@@ -90,7 +91,7 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
                 .core()?
                 .upload_status(upload_id, context.transport, &context.target())
                 .await?;
-            print_json(&serde_json::to_value(status).expect("serializes"))
+            print_value(&status)
         }
         Command::Abort { upload_id, file } => {
             context
@@ -535,7 +536,7 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), CoreEr
         .core()?
         .log_in(&server, user, &password, device_name, context.server_backup)
         .await?;
-    print_json(&serde_json::to_value(result).expect("serializes"))
+    print_value(&result)
 }
 
 /// `account <action>`（CLI 規格 §3.1）。多帳號是前提：一台機器上可以同時登入好幾個，
@@ -550,7 +551,7 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
             if let Some(hint) = &status.undecryptable_hint {
                 context.progress(hint.clone());
             }
-            print_json(&serde_json::to_value(status.accounts).expect("serializes"))
+            print_value(&status.accounts)
         }
         AccountAction::Switch { user } => {
             let result = context
@@ -648,10 +649,18 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
     match action {
         KeyBackupAction::Status => {
             let status = core.backup_status(&target).await?;
-            let mut output = serde_json::to_value(status).expect("serializes");
+            let mut output = json_value_of(&status)?;
             // conf 的兩個開關是**前端的值**，core 不知道有 conf 這種東西——所以在這裡加。
-            output["server_backup_setting"] = json!(on_off(context.server_backup));
-            output["local_room_keys_setting"] = json!(on_off(context.local_room_keys));
+            set_field(
+                &mut output,
+                "server_backup_setting",
+                json!(on_off(context.server_backup)),
+            );
+            set_field(
+                &mut output,
+                "local_room_keys_setting",
+                json!(on_off(context.local_room_keys)),
+            );
             print_json(&output)
         }
         KeyBackupAction::Upload => {
@@ -665,7 +674,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             let result = core
                 .upload_room_keys(&target, context.local_room_keys)
                 .await?;
-            print_json(&serde_json::to_value(result).expect("serializes"))
+            print_value(&result)
         }
         KeyBackupAction::Save => {
             // 🚫 明說要存卻被設定關掉：拒絕並說是誰關的，不要假裝存了。
@@ -680,7 +689,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
         }
         KeyBackupAction::Import => {
             let result = core.import_room_key_snapshot(&target).await?;
-            print_json(&serde_json::to_value(result).expect("serializes"))
+            print_value(&result)
         }
         KeyBackupAction::Restore => {
             let result =
@@ -693,8 +702,8 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
                         ),
                         _ => error,
                     })?;
-            let mut output = serde_json::to_value(result).expect("serializes");
-            output["ok"] = json!(true);
+            let mut output = json_value_of(&result)?;
+            set_field(&mut output, "ok", json!(true));
             print_json(&output)
         }
         KeyBackupAction::Recovery => {
@@ -747,8 +756,8 @@ async fn destroy_account_command(
         .destroy_account(user, server, accept_history_loss, context.server_backup)
         .await
         .map_err(with_recovery_hint)?;
-    let mut output = serde_json::to_value(result).expect("serializes");
-    output["ok"] = json!(true);
+    let mut output = json_value_of(&result)?;
+    set_field(&mut output, "ok", json!(true));
     print_json(&output)
 }
 
@@ -880,7 +889,7 @@ async fn info_command(
             &context.target(),
         )
         .await?;
-    print_json(&serde_json::to_value(info).expect("serializes"))
+    print_value(&info)
 }
 
 async fn download_command(
@@ -902,7 +911,7 @@ async fn download_command(
             .core()?
             .download_to(&manifest, &out, context.transport, &target)
             .await?;
-        return print_json(&serde_json::to_value(result).expect("serializes"));
+        return print_value(&result);
     }
     if let Some(client) = token_client(context).await {
         return download_with_raw_client(context, client?, &manifest, &out).await;
@@ -911,7 +920,7 @@ async fn download_command(
         .core()?
         .download_direct(&manifest, &out, context.transport, &target)
         .await?;
-    print_json(&serde_json::to_value(result).expect("serializes"))
+    print_value(&result)
 }
 
 /// `--token` 模式的下載：沒有 vault、沒有池，逐塊寫進 `-o`。
@@ -945,7 +954,7 @@ async fn download_with_raw_client(
 
 async fn media_stats_command(context: &Context) -> Result<(), CoreError> {
     let stats = context.core()?.media_stats(&context.target())?;
-    print_json(&serde_json::to_value(stats).expect("serializes"))
+    print_value(&stats)
 }
 
 async fn media_gc_command(
@@ -957,7 +966,7 @@ async fn media_gc_command(
         context
             .core()?
             .collect_media_garbage(quota_mib, protect_days, &context.target())?;
-    print_json(&serde_json::to_value(report).expect("serializes"))
+    print_value(&report)
 }
 
 async fn seek_command(
@@ -975,10 +984,10 @@ async fn seek_command(
     stdout.write_all(&result.bytes)?;
     stdout.flush()?;
     // ⚠️ 摘要是**結果**不是進度，所以 `--quiet` 也印（CLI 規格 §3.3.1）。
-    eprintln!(
-        "{}",
-        serde_json::to_value(result.summary(at, len)).expect("serializes")
-    );
+    match serde_json::to_value(result.summary(at, len)) {
+        Ok(summary) => eprintln!("{summary}"),
+        Err(error) => eprintln!("error: the summary could not be serialized: {error}"),
+    }
     Ok(())
 }
 

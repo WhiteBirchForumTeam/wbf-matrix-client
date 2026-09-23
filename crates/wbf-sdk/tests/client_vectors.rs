@@ -126,7 +126,7 @@ fn build_file_vector(cipher: Cipher) -> FileVector {
         ..event_block.to_description()
     };
     let create_json = serde_json::to_vec(&create_description).expect("serializes");
-    let seal_json = event_block.to_description_json();
+    let seal_json = event_block.to_description_json().unwrap();
 
     FileVector {
         name: format!("{} 40 bytes in 16-byte chunks", cipher.name()),
@@ -146,11 +146,15 @@ fn build_file_vector(cipher: Cipher) -> FileVector {
         chunks,
         create_description_json: String::from_utf8(create_json.clone()).expect("utf-8"),
         create_description_data_hex: hex::encode(
-            file_cipher.seal_description(DescriptionSlot::Create, &create_json),
+            file_cipher
+                .seal_description(DescriptionSlot::Create, &create_json)
+                .unwrap(),
         ),
         seal_description_json: String::from_utf8(seal_json.clone()).expect("utf-8"),
         seal_description_data_hex: hex::encode(
-            file_cipher.seal_description(DescriptionSlot::Seal, &seal_json),
+            file_cipher
+                .seal_description(DescriptionSlot::Seal, &seal_json)
+                .unwrap(),
         ),
         event_block_json: serde_json::to_string(&event_block).expect("serializes"),
     }
@@ -403,7 +407,7 @@ fn descriptions_seal_and_open() {
                 &file.seal_description_data_hex,
             ),
         ] {
-            let sealed = file_cipher.seal_description(slot, json.as_bytes());
+            let sealed = file_cipher.seal_description(slot, json.as_bytes()).unwrap();
             assert_eq!(
                 hex::encode(&sealed),
                 *data_hex,
@@ -434,7 +438,7 @@ fn descriptions_seal_and_open() {
         assert!(event_block.is_consistent_with_description(&seal_description));
         assert!(event_block.is_consistent_with_description(&create_description));
         assert_eq!(
-            event_block.to_description_json(),
+            event_block.to_description_json().unwrap(),
             file.seal_description_json.as_bytes()
         );
         assert_eq!(

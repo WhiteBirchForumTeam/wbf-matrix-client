@@ -102,7 +102,8 @@ async fn call(port: u16, keys: &RpcKeys, requests: &[Value]) -> Vec<Value> {
             Side::Client,
             PackType::Cipher,
             request.to_string().as_bytes(),
-        );
+        )
+        .unwrap();
         socket.send(Message::Binary(frame.into())).await.unwrap();
         loop {
             match socket.next().await.unwrap().unwrap() {

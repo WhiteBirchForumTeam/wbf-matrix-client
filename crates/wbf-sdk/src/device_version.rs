@@ -182,8 +182,9 @@ impl RoomDeviceVersions {
 ///     user_id: example: "@bob:localhost"
 ///     keys_query: `POST /keys/query` 的回應 JSON（`master_keys`、`self_signing_keys`、`device_keys` 三張都以 user_id 為鍵）
 /// Return:
-///     String  10 個小寫十六進位字元, example: "810b7c3be4"；這個人一把金鑰都沒有也是一個雜湊（三項全空）
-pub fn compute_device_keys_hash(user_id: &str, keys_query: &Value) -> String {
+///     Some(String)  10 個小寫十六進位字元, example: "810b7c3be4"；這個人一把金鑰都沒有也是一個雜湊（三項全空）
+///     None          算不出來（某把金鑰序列化不了、或大到裝不進 u32 的長度）：算不出來不是對不上，呼叫端當「沒查過」
+pub fn compute_device_keys_hash(user_id: &str, keys_query: &Value) -> Option<String> {
     // 🚨 用 `get` 逐層查，🚫 不把 user_id 拼進 JSON Pointer：Matrix 的 localpart 可以含 `/`（`@ops/team:x`）與 `~`，
     // Pointer 會把它切成多層路徑、查不到 →當成沒金鑰 → 雜湊對不上 → 合法成員永遠被拒發（PR #49 審查 rumia 🔴）。
     let key_of = |table: &str| {
@@ -206,14 +207,15 @@ pub fn compute_device_keys_hash(user_id: &str, keys_query: &Value) -> String {
     for item in items {
         let canonical = match item {
             None => Vec::new(),
-            Some(key) => serde_json::to_vec(&only_what_everyone_sees(user_id, key))
-                .expect("a serde_json::Value always serializes"),
+            Some(key) => serde_json::to_vec(&only_what_everyone_sees(user_id, key)).ok()?,
         };
-        let len = u32::try_from(canonical.len()).expect("a key is far smaller than 4 GiB");
+        let len = u32::try_from(canonical.len()).ok()?;
         framed.extend_from_slice(&len.to_be_bytes());
         framed.extend_from_slice(&canonical);
     }
-    hex::encode(Sha256::digest(&framed))[..HASH_HEX_LEN].to_string()
+    hex::encode(Sha256::digest(&framed))
+        .get(..HASH_HEX_LEN)
+        .map(str::to_string)
 }
 
 /// Args:
@@ -313,7 +315,7 @@ mod tests {
     #[test]
     fn the_documented_vector() {
         assert_eq!(
-            compute_device_keys_hash("@bob:localhost", &the_documented_input()),
+            compute_device_keys_hash("@bob:localhost", &the_documented_input()).unwrap(),
             "810b7c3be4"
         );
     }
@@ -325,7 +327,7 @@ mod tests {
         signed_by_alice["master_keys"]["@bob:localhost"]["signatures"]["@alice:localhost"] =
             json!({ "ed25519:ALICE_USK": "YWxpY2U" });
         assert_eq!(
-            compute_device_keys_hash("@bob:localhost", &signed_by_alice),
+            compute_device_keys_hash("@bob:localhost", &signed_by_alice).unwrap(),
             "810b7c3be4"
         );
     }
@@ -358,7 +360,8 @@ mod tests {
             ("signatures 是空物件", empty_signatures),
         ] {
             assert_eq!(
-                compute_device_keys_hash("@bob:localhost", &keys_query(Some(master), None, &[])),
+                compute_device_keys_hash("@bob:localhost", &keys_query(Some(master), None, &[]))
+                    .unwrap(),
                 expected,
                 "{label}"
             );
@@ -379,8 +382,8 @@ mod tests {
             "master_keys": { user_id: master },
             "device_keys": { user_id: { "DEV1": device } }
         });
-        let with_keys = compute_device_keys_hash(user_id, &response);
-        let without_keys = compute_device_keys_hash(user_id, &json!({}));
+        let with_keys = compute_device_keys_hash(user_id, &response).unwrap();
+        let without_keys = compute_device_keys_hash(user_id, &json!({})).unwrap();
         assert_ne!(with_keys, without_keys, "金鑰要被看到，不能算成三項全空");
         // 同一組金鑰掛在一個普通帳號下，除了 user_id 字串不同外其餘一樣 → 雜湊不同（user_id 進規範化 JSON），但一樣不是「沒金鑰」。
         assert_ne!(with_keys, "810b7c3be4");
@@ -392,7 +395,7 @@ mod tests {
         with_display_name["device_keys"]["@bob:localhost"]["DEV1"]["unsigned"] =
             json!({ "device_display_name": "手機" });
         assert_eq!(
-            compute_device_keys_hash("@bob:localhost", &with_display_name),
+            compute_device_keys_hash("@bob:localhost", &with_display_name).unwrap(),
             "810b7c3be4"
         );
     }
@@ -406,14 +409,14 @@ mod tests {
             &[("DEV1", device("DEV1", "b25l"))],
         );
         let master_no_device = keys_query(Some(master()), Some(self_signing()), &[]);
-        let no_master = compute_device_keys_hash("@bob:localhost", &no_master_one_device);
+        let no_master = compute_device_keys_hash("@bob:localhost", &no_master_one_device).unwrap();
         assert_ne!(
             no_master,
-            compute_device_keys_hash("@bob:localhost", &master_no_device)
+            compute_device_keys_hash("@bob:localhost", &master_no_device).unwrap()
         );
         assert_ne!(no_master, "810b7c3be4");
         // 一把都沒有也是一個雜湊：三個長度 0 的項目。
-        let nothing = compute_device_keys_hash("@bob:localhost", &json!({}));
+        let nothing = compute_device_keys_hash("@bob:localhost", &json!({})).unwrap();
         assert_eq!(nothing.len(), HASH_HEX_LEN);
         assert_eq!(
             nothing,
@@ -426,14 +429,14 @@ mod tests {
         let mut third_device = the_documented_input();
         third_device["device_keys"]["@bob:localhost"]["DEV3"] = device("DEV3", "dGhyZWU");
         assert_ne!(
-            compute_device_keys_hash("@bob:localhost", &third_device),
+            compute_device_keys_hash("@bob:localhost", &third_device).unwrap(),
             "810b7c3be4"
         );
         let mut resigned = the_documented_input();
         resigned["master_keys"]["@bob:localhost"]["signatures"]["@bob:localhost"]["ed25519:DEV2"] =
             json!("c2lnMg");
         assert_ne!(
-            compute_device_keys_hash("@bob:localhost", &resigned),
+            compute_device_keys_hash("@bob:localhost", &resigned).unwrap(),
             "810b7c3be4"
         );
     }

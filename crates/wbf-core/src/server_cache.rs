@@ -85,7 +85,7 @@ static WRITERS_STARTED: std::sync::LazyLock<
 pub(crate) fn get_writers_started_for(server_dir: &Path) -> usize {
     WRITERS_STARTED
         .lock()
-        .expect("the writer counter is never poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(server_dir)
         .copied()
         .unwrap_or(0)
@@ -138,7 +138,7 @@ impl ServerCache {
             })?;
         *WRITERS_STARTED
             .lock()
-            .expect("the writer counter is never poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(server_dir.to_path_buf())
             .or_insert(0) += 1;
         Ok((
