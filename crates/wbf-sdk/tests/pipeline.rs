@@ -1357,7 +1357,7 @@ async fn device_calls_need_the_device_feature() {
         .all(|request| request.0 == wbf_wire::Kind::Control));
 }
 
-// ---- 引擎的 import_window／pull_to_device：順序鎖死（feature matrix 才有 OlmMachine）----
+// ---- 引擎的 import_items／pull_to_device：順序鎖死（feature matrix 才有 OlmMachine）----
 
 #[cfg(feature = "matrix")]
 mod with_crypto_engine {
@@ -1382,7 +1382,7 @@ mod with_crypto_engine {
     /// 🚨 匯入與落地在前、銷毀在後：銷毀被拒（沒訂閱 → `Forbidden`）時 `td.json` 已經有水位與待銷毀清單；
     /// 訂閱後再走一次（空窗）把上次沒銷成的補送掉。
     #[tokio::test]
-    async fn import_window_persists_before_it_destroys_and_retries_leftovers() {
+    async fn import_items_persist_before_it_destroys_and_retries_leftovers() {
         let dir = scratch_store("import-window");
         let engine = OlmEngine::open(&dir, &Key32([7u8; 32]), "@alice:localhost", "DEV1")
             .await
@@ -1399,7 +1399,7 @@ mod with_crypto_engine {
             .await
             .unwrap();
         let error = engine
-            .import_window(&mut client, window, timeout)
+            .import_items(&mut client, window.items, timeout)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1445,7 +1445,7 @@ mod with_crypto_engine {
             .await
             .unwrap();
         let error = engine
-            .import_window(&mut client, window, timeout)
+            .import_items(&mut client, window.items, timeout)
             .await
             .unwrap_err();
         assert_eq!(

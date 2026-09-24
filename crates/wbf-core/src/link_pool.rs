@@ -139,6 +139,28 @@ impl LinkPool {
             })
     }
 
+    /// 拿那條線來用，**但只在它已經開著的時候**：沒開、或死了，就回 `None`——🚫 不開、🚫 不發事件。
+    /// 給背景 task 用（`key_sync.rs`）：它握得到池，但「開線」是 `open_link` 的事（會再跑一次 `init_connection`、換掉 task 自己），task 不該從裡面觸發。
+    ///
+    /// Args:
+    ///     role: example: LinkRole::Subscriptions
+    /// Return:
+    ///     Some(PooledClient)  開著的線；丟掉 guard 就是還回去
+    ///     None                那格沒開、或線已經死了（下次有人 `acquire` 會重開）
+    pub async fn reuse(&self, role: LinkRole) -> Option<PooledClient> {
+        let slot = self.slot(role);
+        let guard = slot.lock_owned().await;
+        let is_alive = guard
+            .as_ref()
+            .is_some_and(|client| !client.channel().is_closed());
+        if !is_alive {
+            return None;
+        }
+        OwnedMutexGuard::try_map(guard, |slot| slot.as_mut())
+            .ok()
+            .map(PooledClient::Pooled)
+    }
+
     /// 登出、destroy、換 session：全關（token 撤了，留著也是死的）。**等正在用線的命令做完**才關那條（維護者 2026-09-21：還在處理的要處理完）；
     /// 正在開的那一條也一樣（開的人握著鎖）。關完這個池還能再用，但 `Core` 會把它從註冊表拿掉，下一個命令用新 session 建新池。
     ///

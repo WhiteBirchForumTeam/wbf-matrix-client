@@ -217,10 +217,10 @@ Session/Login
 | 1 | `Kind::Device = 0x16` 進 pack 的 kind 表 | `crates/wbf-wire/src/pack.rs` | ✅ 含八個 subtype 常數（`pack::device`） |
 | 2 | 八個 subtype 的 meta 型別與 `counts`／`tc × 8 byte` 的編解碼 | `wbf-sdk/src/protocol.rs` 的 Device 段：`device_fetch`／`device_subscribe`／`device_items_destroy`、`parse_device_batch`、`parse_items_destroyed`、`parse_subscribe_reply`、`CryptoStateMeta` | ✅ 對 server 向量逐 byte；`WbfClient::device_fetch_window`／`device_subscribe`／`device_items_destroy` |
 | 3 | `cd_seq` 與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），🚫 不進 `cache.db` | ✅ |
-| 4 | 訂閱／補洞／匯入／銷毀的狀態機 | ⚠️ **daemon 才有意義**——「一個命令一個程序」的東西沒有人在線上收（architecture-v2 §1）；匯入用 `crypto_engine::OlmEngine::receive_to_device` | 🔧 「拉」的那半（Fetch → 匯入 → 銷毀）在 `tests/e2e_crypto_engine.rs` 對真 server 走通；通道收得到 `Push` ✅ 第 4 階段（`WbfClient::device_subscription` 的 handle，`ws-receive-dispatch.md`）；「推來就匯入」的狀態機與 `Subscribe` 帶 `cd_seq` 補窗在 daemon（第 6、7 階段） |
-| 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點、訂閱項從表裡拿掉（`Subscription::next` 回那則 Error 再回 None） | ✅ 通道（第 4 階段）；「通知上層、不重訂」是 daemon 收到 None 之後的事 |
-| 6 | 說出口的退出（§4）：下線前 `Unsubscribe` 解除持有 | `WbfClient::device_unsubscribe()` | ✅ |
-| 7 | 「匯入 → 落地 → 銷毀」鎖成一步，呼叫者拿不到錯的順序 | `crypto_engine::OlmEngine::import_window`／`pull_to_device` | ✅ 對真 server 走通 |
+| 4 | 訂閱／補洞／匯入／銷毀的狀態機 | core `key_sync.rs`（[key-sync.md](key-sync.md)）：訂閱線開好就 `Device/Subscribe` → `pull_to_device` 追平 → 收金鑰的 task；推來的與拉的都走 `OlmEngine::import_items`（維護者 2026-09-24：同一支） | ✅ 2026-09-24；🚫 `Subscribe` 不帶 `cd_seq`（補窗由 `pull_to_device` 做） |
+| 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點；core 的 task 收到就停、發 `keys.state: stopped`，🚫 不重訂、🚫 不關線 | ✅ 2026-09-24 |
+| 6 | 說出口的退出（§4）：下線前 `Unsubscribe` 解除持有 | `WbfClient::device_unsubscribe()`；core 登出前叫（`unsubscribe_keys_of`） | ✅ 2026-09-24 |
+| 7 | 「匯入 → 落地 → 銷毀」鎖成一步，呼叫者拿不到錯的順序 | `crypto_engine::OlmEngine::import_items`（吃「一批 items」：`Fetch` 的一窗、或推來的一包）／`pull_to_device` | ✅ 對真 server 走通 |
 
 ⚠️ 實跑補的一條：**`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs` 回 `Forbidden`），所以順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，跟 §7 一致；🚫 不能只 Fetch 不 Subscribe 就想銷毀。
 

@@ -284,6 +284,9 @@ impl Core {
                 logout(&session).await?;
                 // 成了：先收掉跟上游的 task（它握著訂閱線的 handle），再關線——順序反了 task 會看到 Network 才結束，一樣收得掉，但這樣乾淨。
                 self.stop_room_sync_of(account).await;
+                self.stop_key_sync_of(account).await;
+                // 說出口的退出（wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
+                self.unsubscribe_keys_of(account).await;
                 // token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（link-pool.md §3）。
                 // `close_all` 等正在用線的命令做完才收那條；遠端先關了的只是丟掉，不二次跳錯。
                 // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed；「登出中」是帳號的狀態。
@@ -299,6 +302,8 @@ impl Core {
         // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：session 沒了不影響它，這裡不再忘掉探測結果。
         // 已經登出但目錄還在那條分支：池照理說是空的（沒 session 開不了線），還是掃一次——消費端自己再問一次。
         self.close_links(account, "logged out").await;
+        // 長活的引擎握著 `m/` 的 sqlite：先丟掉才刪得掉（Windows）。
+        self.forget_crypto_engine(account);
         account.delete_matrix_store()?;
         // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（§10.7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。

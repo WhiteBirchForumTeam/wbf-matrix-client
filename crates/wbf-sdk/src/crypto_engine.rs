@@ -330,7 +330,7 @@ impl OlmEngine {
         ToDeviceState::load(&self.store_dir)
     }
 
-    /// 一窗 to-device 的完整處理，**順序鎖死**（to-device-client.md §4、§7）：
+    /// 一批 to-device 的完整處理（`Fetch` 的一窗、或推來的一包 `Push`：同一支，維護者 2026-09-24），**順序鎖死**（to-device-client.md §4、§7）：
     /// 匯進 crypto store（sqlite commit 了才回）→ 水位與待銷毀清單落地（`m/td.json`，原子寫）→ 才叫 server 銷毀
     /// （連上次沒銷成的一起）→ 只清 `ItemsDestroyed` 回來的。
     /// 🚨 呼叫者拿不到「先銷毀再匯入」的路，這就是這個函式存在的理由。中途任何一步失敗，已落地的照樣有效：
@@ -338,22 +338,21 @@ impl OlmEngine {
     ///
     /// Args:
     ///     client: 要先 `device_subscribe` 過的連線（沒訂閱，銷毀那一步被 `Forbidden`，但匯入與落地已經完成）
-    ///     window: `device_fetch_window` 拉到的（可以是空窗：那就只補送上次沒銷成的）
+    ///     items: `(count, 事件)` 舊→新：`DeviceWindow::items` 或 `SubscribeReply::Push` 的 `items`（可以是空的：那就只補送上次沒銷成的）
     ///     per_pack_timeout: example: Duration::from_secs(30)
     /// Return:
     ///     Ok(ImportReport)
     ///     Err(Protocol)   某則不是合法的 to-device 事件、store 寫入失敗——水位不動、不銷毀
     ///     Err(Server)     銷毀被拒（例：沒訂閱的 `Forbidden`）——匯入與落地已完成，清單留著下次再送
-    pub async fn import_window<C: PackChannel>(
+    pub async fn import_items<C: PackChannel>(
         &self,
         client: &mut WbfClient<C>,
-        window: DeviceWindow,
+        items: Vec<(u64, serde_json::Value)>,
         per_pack_timeout: std::time::Duration,
     ) -> Result<ImportReport, SdkError> {
         let mut state = ToDeviceState::load(&self.store_dir)?;
-        let counts: Vec<u64> = window.items.iter().map(|(count, _)| *count).collect();
-        let events: Vec<serde_json::Value> =
-            window.items.into_iter().map(|(_, event)| event).collect();
+        let counts: Vec<u64> = items.iter().map(|(count, _)| *count).collect();
+        let events: Vec<serde_json::Value> = items.into_iter().map(|(_, event)| event).collect();
         // 1. 匯入：Ok 就是 crypto store 的交易 commit 了（上游 receive_sync_changes 的最後兩行）。
         let room_keys = self.receive_to_device(events, None, None).await?;
         // 2. 落地：水位前進、這些 count 進待銷毀清單。
@@ -376,7 +375,7 @@ impl OlmEngine {
         })
     }
 
-    /// 從水位起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它。每一窗都走 `import_window`。
+    /// 從水位起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap` 也是它。每一窗都走 `import_items`。
     /// 空窗也走一次（把上次沒銷成的補送）。
     ///
     /// Args:
@@ -403,7 +402,10 @@ impl OlmEngine {
                 )
                 .await?;
             let more = more_is_only_meaningful_with_items(&window);
-            reports.push(self.import_window(client, window, per_pack_timeout).await?);
+            reports.push(
+                self.import_items(client, window.items, per_pack_timeout)
+                    .await?,
+            );
             if !more {
                 return Ok(reports);
             }

@@ -61,6 +61,7 @@ pub mod event;
 mod handles;
 /// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
 pub mod job;
+mod key_sync;
 /// 連線池（link-pool.md）：一個帳號五條線。
 pub mod link_pool;
 mod login_ops;
@@ -72,6 +73,8 @@ mod rooms_ops;
 mod server_cache;
 mod session_ops;
 mod sync_ops;
+#[cfg(test)]
+mod test_support;
 mod upload_ops;
 mod wbf_rooms;
 
@@ -88,7 +91,7 @@ pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};
 use event::EventSink;
-pub use event::{CoreEvent, LinkState, SyncState};
+pub use event::{CoreEvent, KeysState, LinkState, SyncState};
 pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
@@ -193,6 +196,13 @@ pub struct Core {
     /// 登出、`stop_room_sync`、`Core` 丟掉都收。key 跟池一樣是帳號目錄。
     pub(crate) room_syncs:
         std::sync::Mutex<std::collections::HashMap<PathBuf, room_sync::RoomSyncHandle>>,
+    /// 正在收金鑰的帳號（`key_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Device/Push` 匯進 crypto store。收法跟 `room_syncs` 一樣。
+    pub(crate) key_syncs:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, key_sync::KeySyncHandle>>,
+    /// wbf 帳號長活的 crypto 引擎（`m/` 的 OlmMachine）：第一次要用才開，之後共用；登出拿掉（store 跟著刪）。key 是帳號目錄。
+    pub(crate) crypto_engines: std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<wbf_sdk::crypto_engine::OlmEngine>>,
+    >,
 }
 
 impl Core {
@@ -213,6 +223,8 @@ impl Core {
             link_pools: std::sync::Mutex::new(std::collections::HashMap::new()),
             logging_out: std::sync::Mutex::new(std::collections::HashSet::new()),
             room_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            key_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            crypto_engines: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

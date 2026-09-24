@@ -61,7 +61,7 @@ impl Core {
     ///
     /// | 角色 | 做什麼 |
     /// |---|---|
-    /// | `Subscriptions` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了）；訂閱結束時 task 關這格線 |
+    /// | `Subscriptions` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了）；訂閱結束時 task 關這格線。再來金鑰那半：`Device/Subscribe` → 追平 → 收金鑰的 task（`key_sync.rs`） |
     /// | 其他 | 不做事 |
     ///
     /// Args:
@@ -101,6 +101,8 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
+        // 金鑰那半：同一條線上另一個會話（key_sync.rs）。失敗就是這條線沒開成：房間那個 task 會因線被丟掉而自己結束。
+        self.init_keys(account, client).await?;
         Ok(())
     }
 
@@ -131,6 +133,7 @@ impl Core {
     pub async fn close_subscriptions(&self, target: &Target) -> Result<bool, CoreError> {
         let account = self.account_or_current(target)?;
         self.stop_room_sync_of(&account).await;
+        self.stop_key_sync_of(&account).await;
         let pool = self
             .link_pools
             .lock()
@@ -315,318 +318,14 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::{json, Value};
-    use wbf_sdk::channel::{Channel, WsChannel};
-    use wbf_sdk::client::WbfClient;
-    use wbf_sdk::login::{Session, SessionBackend};
-    use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
-    use wbf_sdk::{RecentPlan, Transport, WsLink};
-    use wbf_wire::pack::{control, event, flags};
-    use wbf_wire::{Kind, Pack};
+    use wbf_sdk::{RecentPlan, Transport};
+    use wbf_wire::pack::control;
+    use wbf_wire::Kind;
 
-    use crate::accounts::AccountDir;
     use crate::event::LinkState;
     use crate::link_pool::LinkRole;
+    use crate::test_support::*;
     use crate::{Core, CoreEvent, Target};
-
-    const DEAD: &str = "http://127.0.0.1:1";
-    const ME: &str = "@a:localhost";
-    const ROOM: &str = "!r:localhost";
-
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("wbf-core-roomsync-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn core_with_wbf_account(dir: &std::path::Path) -> (Core, AccountDir) {
-        wbf_sdk::vault::Vault::create(dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
-        let core = Core::open(dir);
-        core.unlock(None).unwrap();
-        let vault = core.vault().unwrap();
-        let account = AccountDir::locate(dir, &vault.account_dir_key(), DEAD, ME).unwrap();
-        std::fs::create_dir_all(&account.dir).unwrap();
-        vault
-            .seal_session(
-                &account.session_path(),
-                &Session {
-                    server: DEAD.to_string(),
-                    user_id: ME.to_string(),
-                    device_id: "DEV".to_string(),
-                    access_token: "syt_memory".to_string(),
-                    store_dir: None,
-                    backend: Some(SessionBackend::WbfSdk),
-                },
-            )
-            .unwrap();
-        crate::accounts::write_current(dir, &account).unwrap();
-        (core, account)
-    }
-
-    /// 一則文字事件，`g_seq` 就是它的號碼（`r_seq` 同號，夠用）。
-    fn text_event(g_seq: i64) -> Value {
-        json!({
-            "type": "m.room.message", "event_id": format!("${g_seq}"), "room_id": ROOM, "sender": "@b:localhost",
-            "origin_server_ts": g_seq, "content": { "msgtype": "m.text", "body": format!("event {g_seq}") },
-            "unsigned": { wbf_sdk::protocol::R_SEQ_KEY: g_seq, wbf_sdk::protocol::G_SEQ_KEY: g_seq },
-        })
-    }
-
-    fn g_seq_of(event: &Value) -> i64 {
-        event["unsigned"][wbf_sdk::protocol::G_SEQ_KEY]
-            .as_i64()
-            .unwrap()
-    }
-
-    fn length_prefixed(events: &[Value]) -> Vec<u8> {
-        let mut data = Vec::new();
-        for event in events {
-            let bytes = serde_json::to_vec(event).unwrap();
-            data.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            data.extend_from_slice(&bytes);
-        }
-        data
-    }
-
-    fn response(kind: Kind, subtype: u8, id: u64, seq: u32, meta: Value, data: Vec<u8>) -> Pack {
-        Pack {
-            kind,
-            subtype,
-            flags: flags::IS_RESPONSE,
-            id,
-            seq,
-            meta: meta.to_string().into_bytes(),
-            data,
-        }
-    }
-
-    /// 一包推播（server → client）：`fs`＝最新那則的 `g_seq`。
-    fn push(subscription_id: u64, seq: u32, gap: bool, events: &[Value]) -> Pack {
-        let seqs: Vec<i64> = events.iter().map(g_seq_of).collect();
-        response(
-            Kind::Event,
-            event::PUSH,
-            subscription_id,
-            seq,
-            json!({ "bc": events.len(), "fs": seqs.iter().max().copied().unwrap_or(0),
-                    "ls": seqs.iter().min().copied().unwrap_or(0), "gap": gap }),
-            length_prefixed(events),
-        )
-    }
-
-    /// 假 server 在回 `Subscribe` 的 Ack 之前先推的那一包：(seq, gap, 事件)。
-    type EarlyPush = Arc<Mutex<Option<(u32, bool, Vec<Value>)>>>;
-
-    /// 假的 server 端：答 Hello、Subscribe、Recent（照 `cg_seq` 給比它新的，一窗一個 Batch）、Unsubscribe；
-    /// 測試從 `outbound` 塞 server 主動推的包。記下每次 `Recent` 帶的 `cg_seq` 與訂閱的 id。事件清單可以跟別條線共用。
-    struct FakeServer {
-        recent_requests: Arc<Mutex<Vec<Option<i64>>>>,
-        /// 每個 `Subscribe` 的 id（照順序）。
-        subscription_ids: Arc<Mutex<Vec<u64>>>,
-        /// 設了就在回 `Subscribe` 的 Ack 之前先推這一包（seq、gap、事件）：造 Ack 之前就到的推播。
-        early_push: EarlyPush,
-        outbound: tokio::sync::mpsc::Sender<Pack>,
-        task: tokio::task::JoinHandle<()>,
-    }
-
-    fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value>>>) -> FakeServer {
-        let recent_requests = Arc::new(Mutex::new(Vec::new()));
-        let subscription_ids = Arc::new(Mutex::new(Vec::new()));
-        let early_push: EarlyPush = Arc::new(Mutex::new(None));
-        let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel::<Pack>(16);
-        let (recents_t, sub_t, early_t) = (
-            recent_requests.clone(),
-            subscription_ids.clone(),
-            early_push.clone(),
-        );
-        let task = tokio::spawn(async move {
-            loop {
-                let pack = tokio::select! {
-                    frame = peer.source.receive() => match frame {
-                        Ok(Some(bytes)) => Pack::decode(&bytes).unwrap(),
-                        _ => return,
-                    },
-                    pushed = outbound_rx.recv() => match pushed {
-                        Some(pack) => {
-                            peer.sink.send(pack.encode().unwrap()).await.unwrap();
-                            continue;
-                        }
-                        None => return,
-                    },
-                };
-                let reply = match (pack.kind, pack.subtype) {
-                    (Kind::Control, control::HELLO) => response(
-                        Kind::Control,
-                        control::ACK,
-                        0,
-                        pack.seq,
-                        json!({ "protocol": wbf_sdk::protocol::PROTOCOL_VERSION, "server": "fake", "features": ["recent"],
-                                "chunk_size_default": 16, "chunk_size_large": 16, "data_max_bytes": 1048576 }),
-                        Vec::new(),
-                    ),
-                    (Kind::Control, control::PING) => response(
-                        Kind::Control,
-                        control::PONG,
-                        0,
-                        pack.seq,
-                        json!({}),
-                        Vec::new(),
-                    ),
-                    (Kind::Event, event::SUBSCRIBE) => {
-                        sub_t.lock().unwrap().push(pack.id);
-                        let early = early_t.lock().unwrap().take();
-                        if let Some((seq, gap, early_events)) = early {
-                            let pushed = push(pack.id, seq, gap, &early_events);
-                            peer.sink.send(pushed.encode().unwrap()).await.unwrap();
-                        }
-                        let latest = events
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .map(g_seq_of)
-                            .max()
-                            .unwrap_or(0);
-                        response(
-                            Kind::Control,
-                            control::ACK,
-                            pack.id,
-                            pack.seq,
-                            json!({ "latest_g_seq": latest, "joined": 1, "skipped": [] }),
-                            Vec::new(),
-                        )
-                    }
-                    (Kind::Event, event::UNSUBSCRIBE) => response(
-                        Kind::Control,
-                        control::ACK,
-                        pack.id,
-                        pack.seq,
-                        json!({}),
-                        Vec::new(),
-                    ),
-                    (Kind::Event, event::RECENT) => {
-                        let meta: Value = serde_json::from_slice(&pack.meta).unwrap();
-                        let cg_seq = meta["cg_seq"].as_i64();
-                        let before = meta["before"].as_i64();
-                        let limit = meta["limit"].as_u64().unwrap_or(320) as usize;
-                        recents_t.lock().unwrap().push(cg_seq);
-                        let mut window: Vec<Value> = events
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .filter(|event| {
-                                let g_seq = g_seq_of(event);
-                                cg_seq.is_none_or(|cg_seq| g_seq > cg_seq)
-                                    && before.is_none_or(|before| g_seq < before)
-                            })
-                            .cloned()
-                            .collect();
-                        // 新到舊，最多 `limit` 則。
-                        window.sort_by_key(|event| std::cmp::Reverse(g_seq_of(event)));
-                        let more = window.len() > limit;
-                        window.truncate(limit);
-                        let seqs: Vec<i64> = window.iter().map(g_seq_of).collect();
-                        response(
-                            Kind::Event,
-                            event::BATCH,
-                            pack.id,
-                            0,
-                            json!({ "tc": window.len(), "bc": window.len(), "fs": seqs.first().copied().unwrap_or(0),
-                                    "ls": seqs.last().copied().unwrap_or(0), "r": 0, "more": more }),
-                            length_prefixed(&window),
-                        )
-                    }
-                    other => panic!("fake server got {other:?}"),
-                };
-                peer.sink.send(reply.encode().unwrap()).await.unwrap();
-            }
-        });
-        FakeServer {
-            recent_requests,
-            subscription_ids,
-            early_push,
-            outbound,
-            task,
-        }
-    }
-
-    /// 記憶體對接的線，已經 hello 過（生產路徑的 `open_link` 也是開完就 hello、再 `init_connection`）。
-    async fn memory_client_with_hello(
-        events: Arc<Mutex<Vec<Value>>>,
-    ) -> (WbfClient<Channel>, FakeServer) {
-        let (client_end, server_end) = memory_pair(64);
-        let fake = start_fake_server(server_end, events);
-        let link = WsLink::start(client_end.source, client_end.sink, wbf_sdk::no_hook());
-        let mut client = WbfClient::new(Channel::WebSocket(Box::new(WsChannel::from_link(link))));
-        client.hello("room-sync test", &[]).await.unwrap();
-        (client, fake)
-    }
-
-    /// 訂好、線放回池裡；回訂閱的 id 與池。
-    async fn subscribed(
-        core: &Core,
-        account: &AccountDir,
-        events: &Arc<Mutex<Vec<Value>>>,
-    ) -> (u64, FakeServer, Arc<crate::link_pool::LinkPool>) {
-        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
-        core.init_connection(account, LinkRole::Subscriptions, &mut client)
-            .await
-            .expect("subscribe");
-        let subscription_id = fake
-            .subscription_ids
-            .lock()
-            .unwrap()
-            .last()
-            .copied()
-            .expect("server got a Subscribe");
-        let pool = core.pool_of_account(account).unwrap();
-        drop(
-            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
-                .await
-                .unwrap(),
-        );
-        (subscription_id, fake, pool)
-    }
-
-    async fn wait_for_async<F, Fut>(mut condition: F, what: &str)
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !condition().await {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
-    }
-
-    async fn cg_seq_of(core: &Core, account: &AccountDir) -> Option<i64> {
-        let (cache, me) = core.server_cache_and_me(account).unwrap();
-        let cg_seq = cache.read().await.get_cg_seq(&me).unwrap();
-        cg_seq
-    }
-
-    async fn cached_ids(core: &Core, account: &AccountDir) -> Vec<String> {
-        let (cache, me) = core.server_cache_and_me(account).unwrap();
-        let messages = cache.read().await.history(&me, ROOM, None, 100).unwrap();
-        let mut ids: Vec<String> = messages.into_iter().map(|message| message.id).collect();
-        ids.sort();
-        ids
-    }
-
-    async fn next_message(seen: &mut tokio::sync::broadcast::Receiver<CoreEvent>) -> String {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let CoreEvent::Message { message, .. } = seen.recv().await.unwrap() {
-                    return message.id;
-                }
-            }
-        })
-        .await
-        .expect("a room.message arrives")
-    }
 
     /// 模組註解的形狀：`init_connection` 訂了、🚫 沒叫 Recent → 推一包寫進去、`room.message` 在 commit 之後、**水位不動** →
     /// 帶 gap 的包、壞包（`bc` 對不上）、下一包都一樣：寫得了的寫、講一聲、水位還是不動 → UI 叫 `sync.recent`（帶 `since`）才動水位、才補回漏的 →
@@ -634,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn the_task_only_writes_pushes_and_never_touches_the_watermark() {
         let dir = scratch("pure");
-        let (core, account) = core_with_wbf_account(&dir);
+        let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (subscription_id, fake, pool) = subscribed(&core, &account, &events).await;
@@ -772,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn an_event_that_can_never_be_stored_is_reported_and_not_announced() {
         let dir = scratch("unstorable");
-        let (core, account) = core_with_wbf_account(&dir);
+        let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (subscription_id, fake, _pool) = subscribed(&core, &account, &events).await;
@@ -807,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_line_ends_the_task_and_says_so() {
         let dir = scratch("dead");
-        let (core, account) = core_with_wbf_account(&dir);
+        let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let (mut client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
         core.init_connection(&account, LinkRole::Subscriptions, &mut client)
@@ -846,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn an_ended_subscription_closes_the_line_so_the_next_open_subscribes_again() {
         let dir = scratch("resubscribe");
-        let (core, account) = core_with_wbf_account(&dir);
+        let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (subscription_id, fake, pool) = subscribed(&core, &account, &events).await;
@@ -922,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn a_gap_in_a_push_before_the_ack_is_reported_too() {
         let dir = scratch("early-gap");
-        let (core, account) = core_with_wbf_account(&dir);
+        let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![text_event(7)]));
         let (mut client, fake) = memory_client_with_hello(events).await;

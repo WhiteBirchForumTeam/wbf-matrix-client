@@ -163,6 +163,29 @@ pub fn push_of(event: &CoreEvent) -> Push {
                 job: None,
             }
         }
+        CoreEvent::Keys {
+            user,
+            state,
+            imported,
+            room_keys,
+            reason,
+        } => {
+            let mut params = json!({ "user": user, "state": state });
+            if let Some(imported) = imported {
+                insert_field(&mut params, "imported", json!(imported));
+            }
+            if let Some(room_keys) = room_keys {
+                insert_field(&mut params, "room_keys", json!(room_keys));
+            }
+            if let Some(reason) = reason {
+                insert_field(&mut params, "reason", json!(reason));
+            }
+            Push {
+                request: Request::push("keys.state", params),
+                user: Some(user.clone()),
+                job: None,
+            }
+        }
         CoreEvent::Received {
             user,
             role,
@@ -270,6 +293,31 @@ mod tests {
         assert_eq!(
             link.request.params,
             json!({ "user": "@a:x", "role": "subscriptions", "state": "closed", "reason": "logged out" })
+        );
+        // keys.state（rpc-spec §4、key-sync.md §2）：數字只在 caught_up 帶、理由只在 stopped 帶。
+        let caught_up = push_of(&CoreEvent::Keys {
+            user: "@a:x".into(),
+            state: wbf_core::KeysState::CaughtUp,
+            imported: Some(3),
+            room_keys: Some(1),
+            reason: None,
+        });
+        assert_eq!(caught_up.request.method, "keys.state");
+        assert_eq!(caught_up.user.as_deref(), Some("@a:x"));
+        assert_eq!(
+            caught_up.request.params,
+            json!({ "user": "@a:x", "state": "caught_up", "imported": 3, "room_keys": 1 })
+        );
+        let stopped = push_of(&CoreEvent::Keys {
+            user: "@a:x".into(),
+            state: wbf_core::KeysState::Stopped,
+            imported: None,
+            room_keys: None,
+            reason: Some("taken over".into()),
+        });
+        assert_eq!(
+            stopped.request.params,
+            json!({ "user": "@a:x", "state": "stopped", "reason": "taken over" })
         );
         let progress = push_of(&CoreEvent::Progress {
             job: Some(7),

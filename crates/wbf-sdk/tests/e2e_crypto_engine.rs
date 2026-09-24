@@ -198,7 +198,7 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .await
         .expect("B feeds its OTK counts");
 
-    // 5. B 從頭拉到追平（Fetch → 匯入 → 落地 → 銷毀，順序在 import_window 裡鎖死）：
+    // 5. B 從頭拉到追平（Fetch → 匯入 → 落地 → 銷毀，順序在 import_items 裡鎖死）：
     //    拿到 A 發的 Olm 密文 → 匯進狀態機 → 就是那個房間的房間金鑰；銷毀回來的 count ＝ 送的；清單清空。
     let reports = b
         .engine

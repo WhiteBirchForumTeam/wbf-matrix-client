@@ -14,12 +14,13 @@
 
 | 角色 `LinkRole` | 只做 | 誰開它 | 為什麼單獨一條 |
 |---|---|---|---|
-| `Misc` | 一問一答：`Hello`／`Ping`、`Info`、橋、`Event/Send`、`Recent`（拉窗）、`Device/Fetch`／`ItemsDestroy`（拉、銷毀） | 第一個要用的命令 | 一問一答的東西不該排在別人的長佇列後面 |
+| `Misc` | 一問一答：`Hello`／`Ping`、`Info`、橋、`Event/Send`、`Recent`（拉窗） | 第一個要用的命令 | 一問一答的東西不該排在別人的長佇列後面 |
 | `Upload` | `Upload/*` | 第一個上傳 | 資料平面，長時間高頻寫，最會塞爆佇列——只能塞爆自己 |
 | `Download` | `Download/*`（`Read`、串流） | 第一個下載 | 同上；跟上傳分開，一邊塞爆不拖另一邊（維護者 2026-09-21：媒體開兩條） |
-| `Subscriptions` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件）**與** `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件） | **只有訂閱命令** | 推播線，不跟資料平面共享佇列。📌 房間與金鑰暫時共用（維護者 2026-09-21：server 每台裝置預設 4 條 WS，先不動 server）；設計上金鑰該自己一條安靜的線（🚨 掉了就沒了），要分就是多一個角色 |
+| `Subscriptions` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件）**與** `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件），以及 `Device/Fetch`／`ItemsDestroy`（拉、銷毀：server 只讓持有裝置佇列的那條連線銷毀，維護者 2026-09-24 同意） | **只有訂閱命令** | 推播線，不跟資料平面共享佇列。📌 房間與金鑰暫時共用（維護者 2026-09-21：server 每台裝置預設 4 條 WS，先不動 server）；設計上金鑰該自己一條安靜的線（🚨 掉了就沒了），要分就是多一個角色 |
 
-- ⭐ 分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind：`Misc` 收各種 kind；`Device/Fetch` 走 `Misc`（它是拉窗，不是訂閱）。
+- ⭐ 分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind：`Misc` 收各種 kind。例外是 `Device/Fetch`／`ItemsDestroy`：它們是拉窗、不是訂閱，
+  但 server 只讓**持有這台裝置佇列的那條連線**銷毀（to-device-client §8 實跑補的），所以跟著訂閱走：收金鑰的 task 用線時跟池 `reuse` 訂閱那一格（key-sync.md §1）。
 - 訂閱線**綁裝置**（server 的 `Device/Subscribe` 一台裝置一條連線在收、後來的接手），所以它就是那個帳號**唯一**在收推播的連線；
   🚫 不要在 `Misc` 上訂閱。
 - 一個帳號一個池；兩個帳號登在同一台 server 也各自四條（token 不同，共用會讓一個帳號塞爆另一個）。
@@ -61,7 +62,7 @@
   🚫 不歸池管——池只管 socket。📌 2026-09-22 起（維護者定）開線多一步通用的 `Core::init_connection(account, role, client)`：hello 之後看角色，`Subscriptions` 就在這裡送 `Event/Subscribe`、
   起收推播的 task（`room-sync.md`）；所以「開這條線」＝「訂了」，重開就重訂。訂閱會話結束而 socket 還活著（server 送 `Error`）時池的殞死偵測看不出來，
   所以收推播的 task 收攤時自己 `close` 那格（room-sync.md §4）——「重開就重訂」在那條路才成立。`Core::open_subscriptions`／`close_subscriptions` 是開／關它的入口（還沒接 RPC）。
-  金鑰那半（`Device/Subscribe`）是下一支，`init_connection` 裡多一個會話。
+  金鑰那半（`Device/Subscribe` → 追平 → 收金鑰的 task）是 `init_connection` 裡的另一個會話（key-sync.md）；它結束（被接手）不關線。
 - **登出**（維護者 2026-09-21 定）：登出的 RPC 就是一次 HTTP `/logout`（或 fallback 到 matrix-sdk），**只有成與不成**。不成就到此為止，什麼都不動；
   成了就把這個帳號的池**直接關掉、釋放資源**（`close_all`），然後才刪本地的 `session.sealed`、`m/`…。順序：
 

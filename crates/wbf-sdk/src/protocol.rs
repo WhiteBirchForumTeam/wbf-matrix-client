@@ -1028,16 +1028,34 @@ pub fn device_subscribe(
     })
 }
 
-/// `Device/Subscribe`（不帶 `cd_seq`）的回覆，照 server 送來的順序：先 `Ack`（登記好了），再 `CryptoState`（自己的金鑰存量）。
-/// 📎 帶 `cd_seq` 的訂閱會在兩者之間補一輪 `Push`——那要通道能收推播，還沒有（daemon-runtime 第 4 階段），所以這裡不認 `Push`。
+/// `Device/Subscribe` 之後這條會話上會來的每一種（wbf-to-device.md §3）：先 `Ack`（登記好了）、再 `CryptoState`（自己的金鑰存量），
+/// 之後佇列有新東西就 `Push`（跟 `Batch` 同一種切法，這裡解好：吹推來的與主動拉的走同一支匯入，維護者 2026-09-24）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscribeReply {
     /// 登記好了：這條連線現在持有這台裝置的佇列（之後才能 `ItemsDestroy`）。
     Acknowledged,
-    /// 自己這台裝置的 OTK 存量；每個 `Subscribe` 之後一定跟一個。
+    /// 自己這台裝置的 OTK 存量；每個 `Subscribe` 之後一定跟一個，之後存量變了也推。
     CryptoState(CryptoStateMeta),
-    /// 訂閱生效的瞬間剛好有新的 to-device，server 推了一則 `Push`（id 同訂閱）。這一版不吃推播：佇列裡的東西下次 `Fetch` 還在。
-    LivePush,
+    /// 佇列有新的 to-device：`(count, 事件)` 舊→新，跟 `Fetch` 的 `Batch` 一樣的形狀；`meta.gap` 真⑐ server 在這一包之前丟過推送（`Fetch` 補）。
+    Push {
+        meta: DevicePushMeta,
+        items: Vec<(u64, serde_json::Value)>,
+    },
+}
+
+/// `Device/Push` 的 meta（wbf-to-device.md §3）：跟 `Batch` 少了 `tc`／`r`／`more`，多了 `gap`。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DevicePushMeta {
+    /// 這一包幾則。
+    pub bc: u32,
+    /// 最舊／最新的 count（舊→新）。
+    pub ot: u64,
+    pub nt: u64,
+    /// 每則的 count，跟 data 一一對應。
+    pub counts: Vec<u64>,
+    /// server 在這一包之前丟過推送（佇列滿）；🚨 缺欄位當 true。
+    #[serde(default = "gap_when_missing")]
+    pub gap: bool,
 }
 
 /// Args:
@@ -1070,9 +1088,20 @@ pub fn parse_subscribe_reply(request: &Pack, response: &Pack) -> Result<Subscrib
         (Kind::Device, device::CRYPTO_STATE) => {
             Ok(SubscribeReply::CryptoState(parse_meta(response)?))
         }
-        (Kind::Device, device::PUSH) => Ok(SubscribeReply::LivePush),
+        (Kind::Device, device::PUSH) => {
+            let meta: DevicePushMeta = parse_meta(response)?;
+            let items = parse_device_items(
+                "Device/Push",
+                meta.bc,
+                meta.ot,
+                meta.nt,
+                &meta.counts,
+                &response.data,
+            )?;
+            Ok(SubscribeReply::Push { meta, items })
+        }
         (kind, subtype) => Err(SdkError::Protocol(format!(
-            "expected Ack or Device/CryptoState after Subscribe, got kind {kind:?} subtype {subtype:#04x}"
+            "expected Ack, Device/CryptoState or Device/Push after Subscribe, got kind {kind:?} subtype {subtype:#04x}"
         ))),
     }
 }
@@ -1191,42 +1220,69 @@ pub fn parse_device_batch(
     batch: &Pack,
 ) -> Result<(DeviceBatchMeta, Vec<(u64, serde_json::Value)>), SdkError> {
     let meta: DeviceBatchMeta = parse_meta(batch)?;
-    let items = split_length_prefixed(&batch.data)?;
-    if items.len() as u32 != meta.bc || meta.counts.len() as u32 != meta.bc {
-        return Err(SdkError::Protocol(format!(
-            "Device/Batch meta says bc {} but data holds {} events and counts has {}",
-            meta.bc,
-            items.len(),
-            meta.counts.len()
-        )));
-    }
     if meta.tc < meta.bc.saturating_add(meta.r) {
         return Err(SdkError::Protocol(format!(
             "Device/Batch meta inconsistent: tc {} < bc {} + r {}",
             meta.tc, meta.bc, meta.r
         )));
     }
-    if meta.bc > 0 {
+    let events = parse_device_items(
+        "Device/Batch",
+        meta.bc,
+        meta.ot,
+        meta.nt,
+        &meta.counts,
+        &batch.data,
+    )?;
+    Ok((meta, events))
+}
+
+/// `Batch` 與 `Push` 共用的那半：data 的長度前置切法、`counts` 與則數對得上、舊→新嚴格遞增、`ot`／`nt` 是頭尾、每則是 JSON 物件。
+///
+/// Args:
+///     what: 錯訊裡的名字, example: "Device/Push"
+///     bc: meta 說的則數, example: 2
+///     ot: example: 4712
+///     nt: example: 4713
+///     counts: example: &[4712, 4713]
+///     data: 長度前置的事件 JSON 串
+/// Return:
+///     Ok(Vec<(u64, Value)>)  `(count, 事件)` 舊→新
+///     Err(Protocol)          任一項不過（server 或通道壞了，🚫 不猜）
+fn parse_device_items(
+    what: &str,
+    bc: u32,
+    ot: u64,
+    nt: u64,
+    counts: &[u64],
+    data: &[u8],
+) -> Result<Vec<(u64, serde_json::Value)>, SdkError> {
+    let items = split_length_prefixed(data)?;
+    if items.len() as u32 != bc || counts.len() as u32 != bc {
+        return Err(SdkError::Protocol(format!(
+            "{what} meta says bc {bc} but data holds {} events and counts has {}",
+            items.len(),
+            counts.len()
+        )));
+    }
+    if bc > 0 {
         // 舊→新、count 嚴格遞增；`ot`／`nt` 就是頭尾。錯一個就是 server 或通道壞了，🚫 不猜。
-        if meta
-            .counts
+        if counts
             .windows(2)
             .any(|pair| matches!(pair, [older, newer] if older >= newer))
         {
             return Err(SdkError::Protocol(format!(
-                "Device/Batch counts are not strictly increasing: {:?}",
-                meta.counts
+                "{what} counts are not strictly increasing: {counts:?}"
             )));
         }
-        if meta.counts.first() != Some(&meta.ot) || meta.counts.last() != Some(&meta.nt) {
+        if counts.first() != Some(&ot) || counts.last() != Some(&nt) {
             return Err(SdkError::Protocol(format!(
-                "Device/Batch ot {} / nt {} do not match counts {:?}",
-                meta.ot, meta.nt, meta.counts
+                "{what} ot {ot} / nt {nt} do not match counts {counts:?}"
             )));
         }
     }
     let mut events = Vec::with_capacity(items.len());
-    for (count, item) in meta.counts.iter().zip(items) {
+    for (count, item) in counts.iter().zip(items) {
         let event: serde_json::Value = serde_json::from_slice(item).map_err(|error| {
             SdkError::Protocol(format!("to-device item {count} is not JSON: {error}"))
         })?;
@@ -1237,7 +1293,7 @@ pub fn parse_device_batch(
         }
         events.push((*count, event));
     }
-    Ok((meta, events))
+    Ok(events)
 }
 
 /// `ItemsDestroy` 的兩個回應（to-device-client.md §4）：先 `Control/Ack`（只是命令收到），再 `Device/ItemsDestroyed`（真的沒了的那些）。

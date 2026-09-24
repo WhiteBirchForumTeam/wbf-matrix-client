@@ -951,6 +951,33 @@ fn device_packs_match_server_vectors() {
         "m.olm.v1.curve25519-aes-sha2"
     );
 
+    // `Push` 跟 `Batch` 同一種切法（key-sync.md）：對著向量解得回 `(count, 事件)`，meta 是 `{bc, ot, nt, counts, gap}`。
+    let push = pack_named("device_push");
+    match protocol::parse_subscribe_reply(&subscribe, &push).unwrap() {
+        protocol::SubscribeReply::Push { meta, items } => {
+            assert_eq!(
+                (meta.bc, meta.ot, meta.nt, meta.gap, meta.counts.clone()),
+                (1, 4713, 4713, false, vec![4713])
+            );
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].0, 4713);
+            assert_eq!(
+                items[0].1["content"]["algorithm"],
+                "m.olm.v1.curve25519-aes-sha2"
+            );
+        }
+        other => panic!("expected a Push, got {other:?}"),
+    }
+    let mut broken_push = push.clone();
+    broken_push.meta = br#"{"bc":2,"ot":4713,"nt":4713,"counts":[4713],"gap":false}"#.to_vec();
+    assert!(
+        matches!(
+            protocol::parse_subscribe_reply(&subscribe, &broken_push),
+            Err(wbf_sdk::SdkError::Protocol(_))
+        ),
+        "bc 跟 data 對不上是 Protocol，跟 Batch 同一條規則"
+    );
+
     let destroyed = pack_named("device_items_destroyed");
     assert_eq!(
         protocol::parse_items_destroyed(&destroy, &destroyed, &[0x1268, 0x1269]).unwrap(),
