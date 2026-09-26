@@ -165,6 +165,8 @@ pub(crate) fn push(subscription_id: u64, seq: u32, gap: bool, events: &[Value]) 
 
 /// 假 server 在回 `Subscribe` 的 Ack 之前先推的那一包：(seq, gap, 事件)。
 pub(crate) type EarlyPush = Arc<Mutex<Option<(u32, bool, Vec<Value>)>>>;
+/// 假 server 在回 `Device/Subscribe` 的 Ack 之前先推的那一包：(seq, gap, items)。
+pub(crate) type DeviceEarlyPush = Arc<Mutex<Option<(u32, bool, Vec<(u64, Value)>)>>>;
 
 /// 假的 server 端：答 Hello、Subscribe、Recent（照 `cg_seq` 給比它新的，一窗一個 Batch）、Unsubscribe；
 /// 測試從 `outbound` 塞 server 主動推的包。記下每次 `Recent` 帶的 `cg_seq` 與訂閱的 id。事件清單可以跟別條線共用。
@@ -183,6 +185,14 @@ pub(crate) struct FakeServer {
     pub(crate) to_device: Arc<Mutex<Vec<(u64, Value)>>>,
     /// `ItemsDestroy` 銷毀過的 count（照順序）。
     pub(crate) destroyed: Arc<Mutex<Vec<u64>>>,
+    /// 每次 `Device/Fetch` 帶的 `cd_seq`（照順序；被注入失敗的那次也算）。
+    pub(crate) fetch_requests: Arc<Mutex<Vec<Option<u64>>>>,
+    /// 設了就在回 `Device/Subscribe` 的 Ack 之前先推這一包（seq、gap、items）：造 Ack 之前就到的金鑰推播。
+    pub(crate) device_early_push: DeviceEarlyPush,
+    /// 下一次 `Device/Fetch` 回 Error（一次性）。
+    pub(crate) fail_next_fetch: Arc<std::sync::atomic::AtomicBool>,
+    /// 下一次 `ItemsDestroy` 回 Error（一次性；佇列不動）。
+    pub(crate) fail_next_destroy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value>>>) -> FakeServer {
@@ -202,6 +212,16 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         device_subscription_ids.clone(),
         to_device.clone(),
         destroyed.clone(),
+    );
+    let fetch_requests: Arc<Mutex<Vec<Option<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+    let device_early_push: DeviceEarlyPush = Arc::new(Mutex::new(None));
+    let fail_next_fetch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail_next_destroy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (fetches_t, device_early_t, fail_fetch_t, fail_destroy_t) = (
+        fetch_requests.clone(),
+        device_early_push.clone(),
+        fail_next_fetch.clone(),
+        fail_next_destroy.clone(),
     );
     let task = tokio::spawn(async move {
         loop {
@@ -302,6 +322,11 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                 // 金鑰那半（wbf-to-device.md）：訂閱回 Ack 再 CryptoState；Fetch 給佇列裡比 cd_seq 新的；ItemsDestroy 從佇列刪、回 Ack 再 ItemsDestroyed。
                 (Kind::Device, device::SUBSCRIBE) => {
                     device_subs_t.lock().unwrap().push(pack.id);
+                    let early = device_early_t.lock().unwrap().take();
+                    if let Some((seq, gap, items)) = early {
+                        let pushed = device_push(pack.id, seq, gap, &items);
+                        peer.sink.send(pushed.encode().unwrap()).await.unwrap();
+                    }
                     let ack = response(
                         Kind::Control,
                         control::ACK,
@@ -323,6 +348,14 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                 (Kind::Device, device::FETCH) => {
                     let meta: Value = serde_json::from_slice(&pack.meta).unwrap();
                     let cd_seq = meta["cd_seq"].as_u64();
+                    fetches_t.lock().unwrap().push(cd_seq);
+                    if fail_fetch_t.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        peer.sink
+                            .send(injected_error(pack.id, pack.seq).encode().unwrap())
+                            .await
+                            .unwrap();
+                        continue;
+                    }
                     let window: Vec<(u64, Value)> = to_device_t
                         .lock()
                         .unwrap()
@@ -333,6 +366,13 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     device_batch(pack.id, &window)
                 }
                 (Kind::Device, device::ITEMS_DESTROY) => {
+                    if fail_destroy_t.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        peer.sink
+                            .send(injected_error(pack.id, pack.seq).encode().unwrap())
+                            .await
+                            .unwrap();
+                        continue;
+                    }
                     let counts: Vec<u64> = pack
                         .data
                         .chunks_exact(8)
@@ -387,7 +427,23 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         device_subscription_ids,
         to_device,
         destroyed,
+        fetch_requests,
+        device_early_push,
+        fail_next_fetch,
+        fail_next_destroy,
     }
+}
+
+/// 假 server 注入的失敗：一則 `Control/Error`（`Internal`）。
+fn injected_error(id: u64, seq: u32) -> Pack {
+    response(
+        Kind::Control,
+        control::ERROR,
+        id,
+        seq,
+        json!({ "code": "Internal", "code_id": 1000, "message": "injected failure" }),
+        Vec::new(),
+    )
 }
 
 /// 記憶體對接的線，已經 hello 過（生產路徑的 `open_link` 也是開完就 hello、再 `init_connection`）。

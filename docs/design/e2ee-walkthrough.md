@@ -368,7 +368,7 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 | 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；通道收得到推播 ✅ 第 4 階段（`WbfClient::device_subscription` 的 handle；收件匣滿了丟並標 `gap`） | ✅ 通道；❌ 「推來就叫 `refresh_room_devices`」那半在 daemon（§16.6 最後一列）。正確性仍由第 6 步的 1506 守——跟 server 的設計一致：推播是加速，不是正確性來源 |
 | 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()` | ✅ #48（假 server ＋ 真 server）。房間事件的 `Event/Unsubscribe` 跟第 4 階段一起（現在沒訂房間事件） |
 | 10 | **同一台裝置只有一條連線在收**；被接手的那條收到 `Superseded` 要停、不重訂 | `WbfErrorCode::Superseded` 認得 ✅；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點（`Subscription::next` 先回那則 Error、再回 None），訂閱項從表裡拿掉 ✅ 第 4 階段 | ✅ 通道；「通知上層、不重訂」是 daemon 收到 None 之後的事 |
-| 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_window` 把「匯入 → 落地 → 銷毀」鎖成一步，UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
+| 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_items` 把「匯入 → 落地 → 銷毀」鎖成一步（推來的一包與 `Fetch` 的一窗同一支），UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
 
 **核對結論**：第 1–7、9 步的方法都在而且對真 server 驗過（3b 把 4、6 補齊），走的就是 server 設計的那條「版本號變了 → 看誰不一樣 → 只查那個人 → 狀態機比裝置 → 補發 → 帶號碼送 → 1506 回到第 1 步」的路；
 第 8、10 步（推播、Superseded）的通道那半第 4 階段做了（`ws-receive-dispatch.md`），剩下「收到之後做什麽」在 daemon。**在那之前這套邏輯已經是正確的，只是慢一拍**——

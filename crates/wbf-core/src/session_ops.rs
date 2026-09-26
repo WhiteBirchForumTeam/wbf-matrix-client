@@ -303,7 +303,7 @@ impl Core {
         // 已經登出但目錄還在那條分支：池照理說是空的（沒 session 開不了線），還是掃一次——消費端自己再問一次。
         self.close_links(account, "logged out").await;
         // 長活的引擎握著 `m/` 的 sqlite：先丟掉才刪得掉（Windows）。
-        self.forget_crypto_engine(account);
+        self.forget_crypto_engine(account).await;
         account.delete_matrix_store()?;
         // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（§10.7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。

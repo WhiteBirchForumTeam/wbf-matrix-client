@@ -200,7 +200,8 @@ pub struct Core {
     pub(crate) key_syncs:
         std::sync::Mutex<std::collections::HashMap<PathBuf, key_sync::KeySyncHandle>>,
     /// wbf 帳號長活的 crypto 引擎（`m/` 的 OlmMachine）：第一次要用才開，之後共用；登出拿掉（store 跟著刪）。key 是帳號目錄。
-    pub(crate) crypto_engines: std::sync::Mutex<
+    /// ⚠️ tokio 的 Mutex：開 store 是 async，鎖要持的跨過那一段，兩個同時進來的才不會各開一次同一個 `m/`（PR #60 審查 cirno 🟢）。
+    pub(crate) crypto_engines: tokio::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<wbf_sdk::crypto_engine::OlmEngine>>,
     >,
 }
@@ -224,7 +225,7 @@ impl Core {
             logging_out: std::sync::Mutex::new(std::collections::HashSet::new()),
             room_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
-            crypto_engines: std::sync::Mutex::new(std::collections::HashMap::new()),
+            crypto_engines: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
