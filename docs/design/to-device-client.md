@@ -50,7 +50,7 @@ server 的 `add_to_device_event` 用的是 `globals.next_count()`——**跟 PDU
 | | client 存的 | 意思 | 前進的條件 |
 |---|---|---|---|
 | 房間事件 | `cg_seq` | 我快取到哪 | 追平那一窗（可重讀，錯了重拉） |
-| **to-device** | **`cd_seq`** | 我**已經處理完**到哪 | 匯進 crypto store 成功 |
+| **to-device** | **`cd_seq`** | 我**已經處理完**到哪（2026-09-26 起只是紀錄，🚫 不當 `Fetch` 的游標，見 §7） | 匯進 crypto store 成功 |
 
 ⚠️ **to-device 的 count 沒有地方放在事件裡**（它不是 PDU，存的就是 `{type, sender, content}`），
 所以每一則的 count 由 pack 的 meta 用 `counts` 陣列帶——這也是為什麼下一節那三件事很重要。
@@ -192,18 +192,22 @@ wbfuwunel PR #42／#44 定的規則，對我們是**直接的約束**：
 
 ```
 Session/Login
-  → Device/Subscribe { device_id, cd_seq: 上次存的 }   ← 先登記，再補洞
-  → Device/Fetch   { cd_seq }                          ← 離線期間漏的，一窗 1000 則
+  → Device/Subscribe { device_id }                    ← 先登記，再補洞（🚫 不帶 cd_seq）
+  → Device/Fetch   { }                                 ← 🚫 不帶 cd_seq：server 從佇列最舊還沒銷毀的給，一窗 1000 則
   → 逐則匯進 crypto store（OlmMachine::receive_sync_changes，舊→新）
-      每匯成功一則：cd_seq = 那則的 count；那個 count 進待銷毀清單（durable）
+      匯成功：那些 count 進待銷毀清單（durable）；cd_seq 記一下處理到哪（只是紀錄）
   → Device/ItemsDestroy { tc } + counts
   → 收 Ack（只是收到）→ 收 ItemsDestroyed → 把真的沒了的從清單移除
-  → r > 0 就再 Fetch（cd_seq = 上一窗的 nt）；r == 0 這一窗結束
-  → 之後靠 Push；meta 的 gap: true 就再 Fetch 一次補
+  → more: true 就再 Fetch（一樣不帶 cd_seq：銷掉的不會再回來，自然是下一窗）；more: false 追平
+  → 之後推來一包就匯銷那一包；gap、匯失敗、壞包 → 再 Fetch 一次（從頭，沒銷的都在）
 ```
 
 - **先 `Subscribe` 再 `Fetch`**：反過來的話，兩者之間到的那幾則沒有人收。重複拿到無害
   （匯入與銷毀都冪等），漏掉是永久的。
+- 🚨 **`Fetch` 不帶 `cd_seq`：佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）。這份原提案寫的是「帶上次存的 `cd_seq`」，
+  但 client 的游標只要跑到一則還沒進 store 的 item 前面，那則就再也問不到——PR #60 首審抓出三條會這樣的路
+  （Ack 前推來的先匯、推播匯失敗後下一包成功、`CryptoState.gap` 沒接）。佇列本身沒有洞（銷毀前不刪），
+  所以讓 server 從最舊還沒銷毀的給，`ItemsDestroy` 就是唯一的「處理完了」（也就是 ACK）。代價是「匯了但還沒銷成」的那幾則會再回來一次。
 - `OlmMachine::receive_sync_changes` 是 matrix-sdk 的公開 API，吃的就是一串 to-device 事件。
   📎 **server 對內容是瞎的**（只存 `type`／`sender`／`content`），這套不改變那件事。
 - ⚠️ **保留期是無窮 TTL**：沒被銷毀的永遠留著，`ItemsDestroy` 是唯一的刪除入口。
@@ -217,7 +221,7 @@ Session/Login
 | 1 | `Kind::Device = 0x16` 進 pack 的 kind 表 | `crates/wbf-wire/src/pack.rs` | ✅ 含八個 subtype 常數（`pack::device`） |
 | 2 | 八個 subtype 的 meta 型別與 `counts`／`tc × 8 byte` 的編解碼 | `wbf-sdk/src/protocol.rs` 的 Device 段：`device_fetch`／`device_subscribe`／`device_items_destroy`、`parse_device_batch`、`parse_items_destroyed`、`parse_subscribe_reply`、`CryptoStateMeta` | ✅ 對 server 向量逐 byte；`WbfClient::device_fetch_window`／`device_subscribe`／`device_items_destroy` |
 | 3 | `cd_seq` 與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），🚫 不進 `cache.db` | ✅ |
-| 4 | 訂閱／補洞／匯入／銷毀的狀態機 | core `key_sync.rs`（[key-sync.md](key-sync.md)）：訂閱線開好就 `Device/Subscribe` → `pull_to_device` 追平 → 收金鑰的 task；推來的與拉的都走 `OlmEngine::import_items`（維護者 2026-09-24：同一支） | ✅ 2026-09-24；🚫 `Subscribe` 不帶 `cd_seq`（補窗由 `pull_to_device` 做） |
+| 4 | 訂閱／補洞／匯入／銷毀的狀態機 | core `key_sync.rs`（[key-sync.md](key-sync.md)）：訂閱線開好就 `Device/Subscribe` → `pull_to_device` 追平 → 收金鑰的 task；推來的與拉的都走 `OlmEngine::import_items`（維護者 2026-09-24：同一支）；gap／匯失敗／壞包就從佇列頭再拉 | ✅ 2026-09-24；🚫 `Subscribe`／`Fetch` 都不帶 `cd_seq`（2026-09-26，wbfuwunel #87） |
 | 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點；core 的 task 收到就停、發 `keys.state: stopped`，🚫 不重訂、🚫 不關線 | ✅ 2026-09-24 |
 | 6 | 說出口的退出（§4）：下線前 `Unsubscribe` 解除持有 | `WbfClient::device_unsubscribe()`；core 登出前叫（`unsubscribe_keys_of`） | ✅ 2026-09-24 |
 | 7 | 「匯入 → 落地 → 銷毀」鎖成一步，呼叫者拿不到錯的順序 | `crypto_engine::OlmEngine::import_items`（吃「一批 items」：`Fetch` 的一窗、或推來的一包）／`pull_to_device` | ✅ 對真 server 走通 |

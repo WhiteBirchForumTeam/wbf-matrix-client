@@ -1417,13 +1417,14 @@ mod with_crypto_engine {
         client.device_subscribe("DEV1", timeout).await.unwrap();
         let reports = engine.pull_to_device(&mut client, timeout).await.unwrap();
         assert_eq!(reports.len(), 1, "{reports:?}");
+        // `Fetch` 不帶游標（wbfuwunel #87）：沒銷成的 7、8 還在佇列頭，會再回來、重複匯入一次（冪等），然後這次銷掉。
         assert_eq!(
             (
                 reports[0].imported,
                 reports[0].destroyed.clone(),
                 reports[0].still_to_destroy
             ),
-            (0, vec![7, 8], 0)
+            (2, vec![7, 8], 0)
         );
         assert_eq!(reports[0].cd_seq, Some(8));
         assert!(ToDeviceState::load(&dir).unwrap().to_destroy.is_empty());

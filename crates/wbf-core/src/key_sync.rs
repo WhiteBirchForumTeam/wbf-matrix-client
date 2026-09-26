@@ -1,4 +1,4 @@
-//! 訂閱線的金鑰那半：`Device/Subscribe`、上線追平、推來一包就匯（key-sync.md）。
+//! 訂閱線的金鑰那半：`Device/Subscribe`、上線追平、推來的匯進 store、任何異常就從佇列頭拉一次（key-sync.md）。
 //!
 //! 維護者 2026-09-24 定的形狀：
 //!
@@ -9,9 +9,10 @@
 //!   🚫 不主動重開線（等 server 支援更多連線再做）。線死了房間那半（`room_sync.rs`）會關那格。
 //! - `keys.state` 留著（「有點多餘，但傾向保留——不然 RPC 無從知道」）。
 //!
-//! 🚨 水位（`m/td.json` 的 `cd_seq`）只會前進、沒有回退，而金鑰掉了就是永遠解不開那些訊息。所以這裡的不變式是：
-//! **水位不越過任何還沒匯進 store 的 item**——Ack 前推來的不先匯（先追平）；`gap` 的包不先匯（從水位拉）；匯失敗就退回從水位拉，
-//! 拉也失敗就標「落後中」，之後的推播一律走拉到拉成為止（PR #60 審查 rumia／cirno／salvia 三條 🔴）。
+//! 🚨 **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）：server 的佇列沒有洞（每一則存到我們 `ItemsDestroy` 才刪），
+//! `Fetch` 🚫 不帶 `cd_seq`、讓 server 從最舊還沒銷毀的起給。所以沒有「client 的游標越過一則沒匯的」這種事：
+//! 匯失敗、gap、壞包、收件匣滿、Ack 前推來的，全部沒銷掉的都還在佇列裡，從頭拉一次就回來（重複匯入無害）。
+//! 之前那套「不先匯、落後中、水位不越過」是在補自己挖的坑（PR #60 審查 rumia／cirno／salvia 三條 🔴），拿掉了。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,26 +120,25 @@ impl Core {
         client: &mut WbfClient<Channel>,
     ) -> Result<(), CoreError> {
         let session = self.session_of(account)?;
-        let engine = match self.olm_engine_of(account).await {
-            Ok(engine) => engine,
-            Err(error) if error.kind == CoreErrorKind::Usage => {
-                self.events.progress(format!(
-                    "keys: not subscribing for {}: {error}",
-                    account.label()
-                ));
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
+        // 不是 wbf 帳號：金鑰在 matrix-sdk 的 Client 裡，這裡不訂、講一聲，房間那半照常。
+        // 判準跟 `olm_engine_of` 同一條（session 的 backend），🚫 不靠錯誤種類分桶（PR #60 審查 cirno 🟡：`Usage` 桶裡還有真的開不起來）。
+        if session.backend != Some(SessionBackend::WbfSdk) {
+            self.events.progress(format!(
+                "keys: not subscribing for {}: its keys live in the matrix-sdk client, not here",
+                account.label()
+            ));
+            return Ok(());
+        }
+        let engine = self.olm_engine_of(account).await?;
         let pool = self.pool_of_account(account)?;
         let me = session.user_id.clone();
         let mut subscription = client
             .device_subscription(&session.device_id, REPLY_TIMEOUT)
             .await?;
-        // Ack 之前推來的（early pushes）🚫 不匯：它們的 count 比佇列裡離線期的舊項新，先匯會把水位推過舊項（永遠拉不到）。
-        // 它們在佇列裡還在（沒銷毀前不會掉），下面的追平連同舊的一起拉回來；gap 訊號也不用算：本來就要從水位拉。
+        // Ack 之前推來的（early pushes）不用單獨匯：它們還沒銷，還在佇列裡，下面的追平會連同更舊的一起拉回來。
         subscription.early_pushes.clear();
-        // 上線追平（to-device-client.md §7）：從 m/td.json 的水位起一窗一窗拉到 more=false；空窗也走一次（補送上次沒銷成的）。
+        // 上線追平（to-device-client.md §7）：從佇列最舊還沒銷毀的起一窗一窗拉到 more=false；空窗也走一次（補送上次沒銷成的）。
+        // 這裡失敗＝整條訂閱線沒開成；沒進 store 的還在佇列裡，下次開線的追平會拉回（key-sync.md §1、PR #60 審查 rumia 🟡）。
         let reports = engine.pull_to_device(client, REPLY_TIMEOUT).await?;
         emit_caught_up(&self.events, &me, &reports);
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -223,62 +223,60 @@ impl KeySyncTask {
         mut subscription: DeviceSubscription,
         mut stopped: tokio::sync::oneshot::Receiver<()>,
     ) {
-        // 落後中：上一輪匯或拉失敗過，水位可能停在一則還沒匯進去的 item 之前。在這之後推來的包🚫 不能直接匯（匯了水位就越過那則，
-        // 它永遠拉不回來），一律改成從水位拉，拉成了才解除。
-        let mut behind = false;
+        // 要拉一次：有東西可能還留在佇列裡沒進 store（gap、壞包、收件匣滿、匯失敗）。拉失敗就留著這個旗，
+        // 下一個事件或下一次閒置逸時（60 秒）再拉——🚫 不在原地狂試。佇列頭就是水位，所以中間照樣匯推來的包也不會越過什麼。
+        let mut needs_pull = false;
         loop {
-            // 本地收件匣滿過＝丟過推播：東西還在 server 佇列裡（沒銷毀前不會掉），拉一次補回。
+            // 本地收件匣滿過＝丟過推播：東西還在 server 佇列裡（沒銷毀前不會掉）。
             if subscription.take_gap() {
-                behind = !self.pull("the subscription inbox overflowed").await;
+                needs_pull = true;
             }
             let next = tokio::select! {
                 _ = &mut stopped => return,
                 next = subscription.next(PUSH_IDLE_TIMEOUT) => next,
             };
-            // 訂閱還活著的那幾種都 `continue`；走到下面的只有「訂閱結束了」，帶著原因。
-            let why = match next {
+            // 訂閱還活著的那幾種回 `None`；「訂閱結束了」回原因。
+            let ended = match next {
                 Ok(Some(SubscribeReply::Push { meta, items })) => {
-                    // gap：這包之前有被丟掉的（count 比它小、還在佇列裡）。🚫 不能先匯這包——水位一過它們就拉不到了；
-                    // 從水位起拉一次，這包連同漏的一起回來（重複拿到無害：匯入與銷毀冪等）。落後中也一樣。
-                    if meta.gap || behind {
-                        behind = !self.pull("the server dropped pushes before this one").await;
-                    } else if !self.import(items).await {
-                        // 匯不進去（或銷不掉）：退回從水位拉——沒落地的那則還在佇列裡，從水位拉才拿得回來；
-                        // 拉也失敗就標落後，下一包🚫 不能越過它。
-                        behind = !self.pull("importing a pushed batch failed").await;
+                    // gap：這包之前有沒推到的，從佇列頭拉一次（這包也在裡面）。匯不進去（或銷不掉）也是。
+                    if meta.gap || !self.import(items).await {
+                        needs_pull = true;
                     }
-                    continue;
+                    None
                 }
                 // OTK 存量：用途是補上傳金鑰，那是 E2EE 的 RPC 面那支；這裡只講一聲。
-                // 但它跟 `Push` 共用這條訂閱的 gap 旗（server 給一次就清掉）：gap 真就是有推送被丟了，一樣從水位拉。
+                // 但它跟 `Push` 共用這條訂閱的 gap 旗（server 給一次就清掉）：gap 真就是有推送沒到，一樣拉。
                 Ok(Some(SubscribeReply::CryptoState(state))) => {
                     if state.gap {
-                        behind = !self
-                            .pull("the server dropped pushes before this crypto state")
-                            .await;
+                        needs_pull = true;
                     }
                     self.events.progress(format!(
                         "keys: one-time key stock is now {:?} (uploading keys is not wired yet)",
                         state.otk_counts
                     ));
-                    continue;
+                    None
                 }
-                Ok(Some(SubscribeReply::Acknowledged)) => continue,
-                Err(wbf_sdk::SdkError::Timeout(_)) => continue,
+                Ok(Some(SubscribeReply::Acknowledged)) | Err(wbf_sdk::SdkError::Timeout(_)) => None,
                 // 一包壞了：它還在 server 佇列裡，拉一次就回來。
                 Err(wbf_sdk::SdkError::Protocol(why)) => {
                     self.events.progress(format!(
                         "keys: a push could not be read ({why}); pulling the queue instead"
                     ));
-                    behind = !self.pull("a push could not be read").await;
-                    continue;
+                    needs_pull = true;
+                    None
                 }
                 // server 對這段會話送了 Error（被另一台裝置接手的 1505 就是這樣來的）：會話到此為止。
                 Err(error @ wbf_sdk::SdkError::Server { .. }) => {
-                    format!("the server ended the key subscription: {error}")
+                    Some(format!("the server ended the key subscription: {error}"))
                 }
-                Ok(None) => "the server ended the key subscription".to_string(),
-                Err(error) => error.to_string(),
+                Ok(None) => Some("the server ended the key subscription".to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            let Some(why) = ended else {
+                if needs_pull {
+                    needs_pull = !self.pull().await;
+                }
+                continue;
             };
             // 🚫 不重訂（to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）；🚫 不關線（房間訂閱還在同一條線上；線真死了房間那半會關）。
             self.events.emit(CoreEvent::Keys {
@@ -295,8 +293,8 @@ impl KeySyncTask {
     /// 推來的一包：跟 `Fetch` 的一窗走同一支（匯入 → 落地 → 銷毀那一包）。
     ///
     /// Return:
-    ///     bool  true ＝ 這包完整走完；false ＝ 線不在、或匯入／銷毀回錯（呼叫端要退回從水位拉：沒落地的那則還在 server 佇列裡，
-    ///           但**不會再推一次**，只有從水位拉才拿得回來）
+    ///     bool  true ＝ 這包完整走完；false ＝ 線不在、或匯入／銷毀回錯（呼叫端要拉一次：沒銷掉的還在 server 佇列裡，
+    ///           但**不會再推一次**，只有從佇列頭拉才拿得回來）
     async fn import(&self, items: Vec<(u64, serde_json::Value)>) -> bool {
         let Some(mut line) = self.pool.reuse(LinkRole::Subscriptions).await else {
             self.events.progress(format!(
@@ -314,25 +312,25 @@ impl KeySyncTask {
                 emit_caught_up(&self.events, &self.me, &[report]);
                 true
             }
-            // 匯入或銷毀失敗：已落地的照樣有效（import_items 的順序鎖死）；沒落地的由呼叫端從水位拉回。
+            // 匯入或銷毀失敗：已落地的照樣有效（import_items 的順序鎖死）；沒銷掉的還在佇列裡，呼叫端從佇列頭拉回。
             Err(error) => {
                 self.events.progress(format!(
-                    "keys: importing a pushed batch failed; pulling from the watermark instead: {error}"
+                    "keys: importing a pushed batch failed; pulling the queue instead: {error}"
                 ));
                 false
             }
         }
     }
 
-    /// 從水位起拉到追平（gap、本地丟包、壞包、匯失敗都走這裡）。
+    /// 從佇列頭拉到追平（gap、本地丟包、壞包、匯失敗都走這裡）。
     ///
     /// Return:
-    ///     bool  true ＝ 追平了；false ＝ 線不在或拉失敗（呼叫端標落後，下一包再拉）
-    async fn pull(&self, why: &str) -> bool {
+    ///     bool  true ＝ 追平了；false ＝ 線不在或拉失敗（呼叫端留著「要拉」，下一個事件或閒置逾時再拉）
+    async fn pull(&self) -> bool {
         let Some(mut line) = self.pool.reuse(LinkRole::Subscriptions).await else {
-            self.events.progress(format!(
-                "keys: {why}, but the subscriptions line is gone; the queue is pulled when the line is reopened"
-            ));
+            self.events.progress(
+                "keys: the subscriptions line is gone; the queue is pulled when the line is reopened",
+            );
             return false;
         };
         match self.engine.pull_to_device(&mut line, REPLY_TIMEOUT).await {
@@ -342,7 +340,7 @@ impl KeySyncTask {
             }
             Err(error) => {
                 self.events.progress(format!(
-                    "keys: {why}; pulling the queue failed (retried on the next push): {error}"
+                    "keys: pulling the queue failed (retried on the next event or within a minute): {error}"
                 ));
                 false
             }
@@ -408,7 +406,7 @@ mod tests {
     }
 
     /// 開訂閱線之前佇列裡已經有東西（離線期間到的）：`init_connection` 訂了金鑰、追平（Fetch → 匯入 → 銷毀）、發 `caught_up`；
-    /// 之後推來一包走同一支（銷毀那一包、水位跟著走）；帶 `gap` 的包不先匯、從水位起拉一次，漏的那則一起回來；關訂閱線 task 收掉。
+    /// 之後推來一包走同一支（銷毀那一包）；帶 `gap` 的包從佇列頭拉一次，漏的那則一起回來；關訂閱線 task 收掉。
     #[tokio::test]
     async fn the_line_subscribes_keys_catches_up_and_imports_pushes_through_one_path() {
         let dir = scratch("keys");
@@ -554,12 +552,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Ack 之前推來的（early push）🚫 不先匯：佇列裡還有離線期更舊的 1、2，先匯 3 水位就越過它們（永遠拉不到）。
-    /// 追平從水位拉，1、2、3 一起匯、一起銷毀（PR #60 審查 rumia／cirno／salvia 🔴1）。
+    /// 追平從佇列頭拉，🚫 不看 `td.json` 的記錄：就算記錄說「處理過到 99」（還有 Ack 前推來一包 3），佇列裡沒銷的 1、2、3 全部回來。
+    /// 帶游標的話 `Fetch{99}` 拉到空、三則永遠問不到（PR #60 審查 🔴1、wbfuwunel #87）。
     #[tokio::test]
     async fn an_early_push_does_not_let_the_catch_up_skip_older_queued_keys() {
         let dir = scratch("keys-early");
         let (core, account) = core_with_wbf_account(&dir).await;
+        wbf_sdk::to_device_state::ToDeviceState {
+            cd_seq: Some(99),
+            to_destroy: Vec::new(),
+        }
+        .save(&account.matrix_store_dir())
+        .unwrap();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (mut client, fake) = memory_client_with_hello(events).await;
         fake.to_device.lock().unwrap().extend([
@@ -574,19 +578,23 @@ mod tests {
         assert_eq!(
             *fake.destroyed.lock().unwrap(),
             vec![1, 2, 3],
-            "early push 不先匯：追平從水位拉，三則一起回來"
+            "追平從佇列頭拉，三則一起回來"
         );
-        assert_eq!(cd_seq_of(&account), Some(3));
+        assert_eq!(
+            cd_seq_of(&account),
+            Some(99),
+            "記錄只升不降，但它不影響拉什麼"
+        );
         assert_eq!(
             *fake.fetch_requests.lock().unwrap(),
             vec![None],
-            "追平從存的水位（沒有）起"
+            "追平不帶游標"
         );
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `CryptoState` 跟 `Push` 共用這條訂閱的 gap 旗：gap 真就是有推送被丟了，要從水位拉（🔴3）。
+    /// `CryptoState` 跟 `Push` 共用這條訂閱的 gap 旗：gap 真就是有推送沒到，要從佇列頭拉（🔴3）。
     #[tokio::test]
     async fn a_crypto_state_with_gap_pulls_the_queue() {
         let dir = scratch("keys-crypto-state-gap");
@@ -622,12 +630,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 匯失敗不能被下一包越過（🔴2）：假 server 讓這包的 `ItemsDestroy` 失敗（`import_items` 回錯），退回從水位拉的那次 `Fetch` 也失敗 → 標落後；
-    /// 下一包推播🚫 不匯、改走 `Fetch`（fetch 次數 +1），拉成了兩則都銷毀。
-    /// 📎 注入的是銷毀那步的失敗（匯入與落地已完成），走的是同一條「import_items 回錯」的路；真正的匯入失敗在假 server 上造不出來。
+    /// 佇列頭就是水位（維護者 2026-09-26，wbfuwunel #87）：後到的推播匯成功，🚫 不會讓更早還在佇列裡的那則變得拉不到——
+    /// 之前帶 `cd_seq` 的 `Fetch` 會（游標一過就問不到）。拉失敗的留著「要拉」，下一個事件再拉；而且每一次 `Fetch` 都不帶游標。
     #[tokio::test]
-    async fn a_failed_import_falls_back_to_the_watermark_and_later_pushes_pull_until_it_succeeds() {
-        let dir = scratch("keys-behind");
+    async fn a_later_push_never_makes_an_earlier_queued_key_unreachable_and_failed_pulls_are_retried(
+    ) {
+        let dir = scratch("keys-head-is-watermark");
         let (core, account) = core_with_wbf_account(&dir).await;
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (_room_subscription_id, fake, _pool) = subscribed(&core, &account, &events).await;
@@ -640,59 +648,79 @@ mod tests {
             .expect("server got a Device/Subscribe");
         assert_eq!(fake.fetch_requests.lock().unwrap().len(), 1, "上線追平那次");
 
-        // 這包匯得進、落得了地，但銷毀被拒 → import_items 回錯 → 退回從水位拉 → 那次 Fetch 也壞 → 落後。
-        fake.fail_next_destroy
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        fake.fail_next_fetch
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        fake.to_device.lock().unwrap().push(to_device_item(1));
+        // 佇列裡有 1、2，但只有 2 推到了（1 的推播沒到、也沒有 gap）：2 照樣匯、銷毀；1 還在佇列裡。
+        fake.to_device
+            .lock()
+            .unwrap()
+            .extend([to_device_item(1), to_device_item(2)]);
         fake.outbound
             .send(device_push(
                 device_subscription_id,
                 0,
-                false,
-                &[to_device_item(1)],
-            ))
-            .await
-            .unwrap();
-        wait_for_async(
-            || async { fake.fetch_requests.lock().unwrap().len() == 2 },
-            "the failed import falls back to a Fetch from the watermark",
-        )
-        .await;
-        assert!(
-            fake.destroyed.lock().unwrap().is_empty(),
-            "銷毀被拒，什麼都還沒銷"
-        );
-        assert_eq!(
-            cd_seq_of(&account),
-            Some(1),
-            "匯入與落地已經完成（import_items 的順序）"
-        );
-
-        // 落後中：下一包推播🚫 不直接匯，改從水位拉（這次 Fetch 成功）：2 拉回、連上次沒銷成的 1 一起銷毀。
-        fake.to_device.lock().unwrap().push(to_device_item(2));
-        fake.outbound
-            .send(device_push(
-                device_subscription_id,
-                1,
                 false,
                 &[to_device_item(2)],
             ))
             .await
             .unwrap();
         wait_for_async(
-            || async { fake.destroyed.lock().unwrap().len() == 2 },
-            "the next push pulls instead of importing, and both get destroyed",
+            || async { fake.destroyed.lock().unwrap().contains(&2) },
+            "the pushed item is imported and destroyed",
         )
         .await;
-        assert_eq!(*fake.destroyed.lock().unwrap(), vec![1, 2]);
-        assert_eq!(
-            fake.fetch_requests.lock().unwrap().len(),
-            3,
-            "落後中的推播走的是 Fetch，不是直接匯"
+        assert_eq!(cd_seq_of(&account), Some(2), "紀錄上處理過的最新是 2");
+
+        // 有訊號說要拉（CryptoState 帶 gap），但那次 Fetch 失敗：1 還沒回來，「要拉」留著。
+        fake.fail_next_fetch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.outbound
+            .send(response(
+                Kind::Device,
+                device::CRYPTO_STATE,
+                device_subscription_id,
+                1,
+                json!({ "otk_counts": { "signed_curve25519": 49 }, "unused_fallback_key_types": [], "gap": true }),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        wait_for_async(
+            || async { fake.fetch_requests.lock().unwrap().len() == 2 },
+            "the gap triggers a Fetch (which is made to fail)",
+        )
+        .await;
+        assert!(!fake.destroyed.lock().unwrap().contains(&1));
+
+        // 下一個事件（推 3）：3 照樣匯，然後重拉——不帶游標，所以 1 回來了（帶 cd_seq=3 的話永遠問不到）。
+        fake.to_device.lock().unwrap().push(to_device_item(3));
+        fake.outbound
+            .send(device_push(
+                device_subscription_id,
+                2,
+                false,
+                &[to_device_item(3)],
+            ))
+            .await
+            .unwrap();
+        wait_for_async(
+            || async { fake.destroyed.lock().unwrap().contains(&1) },
+            "the retried pull brings back the earlier item",
+        )
+        .await;
+        let destroyed = fake.destroyed.lock().unwrap().clone();
+        assert!(
+            [1, 2, 3].iter().all(|count| destroyed.contains(count)),
+            "{destroyed:?}"
         );
-        assert_eq!(cd_seq_of(&account), Some(2));
+        assert!(fake.to_device.lock().unwrap().is_empty(), "佇列清空");
+        assert!(
+            fake.fetch_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(Option::is_none),
+            "🚫 Fetch 從不帶 cd_seq：{:?}",
+            fake.fetch_requests.lock().unwrap()
+        );
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

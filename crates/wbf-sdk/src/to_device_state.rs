@@ -5,6 +5,11 @@
 //! 那段區間**永遠不會再拉**，而那些是金鑰。
 //!
 //! 兩個數字🚫 不合成一個：「處理到哪」是水位，「可以刪哪些」是清單——批次中間匯入失敗時，清單不是水位的前綴。
+//!
+//! 🚨 2026-09-26 起（維護者，wbfuwunel #87）：`cd_seq` **只是紀錄，🚫 不拿去當 `Fetch`／`Subscribe` 的游標**。
+//! `Fetch` 不帶游標、讓 server 從佇列最舊還沒銷毀的起給；佇列頭就是水位，`ItemsDestroy` 是唯一的「處理完了」。
+//! 帶游標的話，游標只要跑到一則還沒進 store 的 item 前面，那則就再也問不到（PR #60 審查抓出的三條路）。
+//! 待銷毀清單照舊有用：銷毀失敗的下次補送。
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +22,7 @@ pub const TO_DEVICE_STATE_FILE_NAME: &str = "td.json";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToDeviceState {
-    /// 匯進 crypto store 成功的最新 count；None ＝ 還沒處理過任何一則（下次 `Fetch` 從頭）。
+    /// 匯進 crypto store 成功的最新 count；None ＝ 還沒處理過任何一則。🚫 不是 `Fetch` 的游標（模組註解）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cd_seq: Option<u64>,
     /// 匯入成功、但 server 還沒回 `ItemsDestroyed` 說沒了的 count。命令冪等，重送安全。

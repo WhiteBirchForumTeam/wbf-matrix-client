@@ -396,7 +396,7 @@ wbf-sdk 只提供方法，不在這兩者之間選邊。
 | 每房「上次那份成員清單」（發上一輪房間金鑰時依據的那份） | **daemon** 存 | 每次 refresh 拿到新的就換 | `RoomDeviceVersions`（可序列化待加） | 定案；落在哪（記憶體或 cache.db）待定 |
 | 上線：to-device 追平 | **daemon** 自動 | 訂閱線開好（`init_connection`） | `device_subscription` → `pull_to_device`（key-sync.md） | ✅ 2026-09-24 core 接了 |
 | 下線：退訂 | **daemon** 自動 | 登出前 | `device_unsubscribe`（core `unsubscribe_keys_of`） | ✅ 2026-09-24 core 接了 |
-| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | core `key_sync.rs` 的 task：`Push` 走 `import_items`（跟拉的同一支）、`Superseded` 停不重訂、`CryptoState` 先講一聲；每個 pack 也經 `ReceivedHook` 給 RPC 面 | ✅ 2026-09-24 `Push`／`Superseded`；❌ `DeviceChanged` → `refresh_room_devices`、`CryptoState` → 補上傳（E2EE 的 RPC 面） |
+| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | core `key_sync.rs` 的 task：`Push` 走 `import_items`（跟拉的同一支）；gap（`Push` 或 `CryptoState` 帶的）／匯失敗／壞包就從佇列頭再拉（`Fetch` 不帶 `cd_seq`，key-sync.md §1）；`Superseded` 停不重訂；`CryptoState` 的 OTK 數先講一聲；每個 pack 也經 `ReceivedHook` 給 RPC 面 | ✅ 2026-09-24 `Push`／`Superseded`；❌ `DeviceChanged` → `refresh_room_devices`、`CryptoState` → 補上傳（E2EE 的 RPC 面） |
 
 ⭐ **一支例行程序、三個觸發點**：`refresh_room_devices(room)` 被 UI 點進房間叫、被 1506 叫、將來被 `DeviceChanged` 叫。內容一樣，只有「誰按下去」不同。
 

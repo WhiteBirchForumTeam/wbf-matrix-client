@@ -191,8 +191,6 @@ pub(crate) struct FakeServer {
     pub(crate) device_early_push: DeviceEarlyPush,
     /// 下一次 `Device/Fetch` 回 Error（一次性）。
     pub(crate) fail_next_fetch: Arc<std::sync::atomic::AtomicBool>,
-    /// 下一次 `ItemsDestroy` 回 Error（一次性；佇列不動）。
-    pub(crate) fail_next_destroy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value>>>) -> FakeServer {
@@ -216,12 +214,10 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let fetch_requests: Arc<Mutex<Vec<Option<u64>>>> = Arc::new(Mutex::new(Vec::new()));
     let device_early_push: DeviceEarlyPush = Arc::new(Mutex::new(None));
     let fail_next_fetch = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fail_next_destroy = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (fetches_t, device_early_t, fail_fetch_t, fail_destroy_t) = (
+    let (fetches_t, device_early_t, fail_fetch_t) = (
         fetch_requests.clone(),
         device_early_push.clone(),
         fail_next_fetch.clone(),
-        fail_next_destroy.clone(),
     );
     let task = tokio::spawn(async move {
         loop {
@@ -366,13 +362,6 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     device_batch(pack.id, &window)
                 }
                 (Kind::Device, device::ITEMS_DESTROY) => {
-                    if fail_destroy_t.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        peer.sink
-                            .send(injected_error(pack.id, pack.seq).encode().unwrap())
-                            .await
-                            .unwrap();
-                        continue;
-                    }
                     let counts: Vec<u64> = pack
                         .data
                         .chunks_exact(8)
@@ -430,7 +419,6 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         fetch_requests,
         device_early_push,
         fail_next_fetch,
-        fail_next_destroy,
     }
 }
 

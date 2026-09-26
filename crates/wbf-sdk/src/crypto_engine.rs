@@ -56,7 +56,7 @@ pub struct ImportReport {
     pub imported: usize,
     /// 這一輪 server 說已經沒了的 count（含上次沒銷成、這次補送的）。
     pub destroyed: Vec<u64>,
-    /// 落地後的水位。
+    /// 落地後的「處理過的最新 count」（紀錄，🚫 不是 `Fetch` 的游標）。
     pub cd_seq: Option<u64>,
     /// 還留在待銷毀清單上的（server 這輪沒回來的，下次再送）。
     pub still_to_destroy: usize,
@@ -375,7 +375,8 @@ impl OlmEngine {
         })
     }
 
-    /// 從水位起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap` 也是它。每一窗都走 `import_items`。
+    /// 從佇列最舊還沒銷毀的起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap`、匯失敗也是它。
+    /// 每一窗都走 `import_items`。🚫 不帶 `cd_seq`：佇列頭就是水位，`ItemsDestroy` 是唯一的「處理完了」（wbfuwunel #87）。
     /// 空窗也走一次（把上次沒銷成的補送）。
     ///
     /// Args:
@@ -391,11 +392,13 @@ impl OlmEngine {
     ) -> Result<Vec<ImportReport>, SdkError> {
         let mut reports = Vec::new();
         for _ in 0..PULL_WINDOWS_LIMIT {
-            let cd_seq = ToDeviceState::load(&self.store_dir)?.cd_seq;
+            // 🚫 不帶 `cd_seq`（維護者 2026-09-26，wbfuwunel #87）：讓 server 從這台裝置佇列裡**最舊還沒銷毀的**起給。
+            // 佇列本身就是沒有洞的（銷毀前不刪），洞只會是 client 自己的游標造出來的：游標跑到一則還沒進 store 的 item 前面，那則就再也問不到。
+            // 這一窗匯完、銷掉的不會再回來，所以下一次不帶游標的 `Fetch` 自然是下一窗；銷不掉的會再回來一次（重複匯入無害）。
             let window = client
                 .device_fetch_window(
                     &DeviceFetchRequest {
-                        cd_seq,
+                        cd_seq: None,
                         limit: None,
                     },
                     per_pack_timeout,
