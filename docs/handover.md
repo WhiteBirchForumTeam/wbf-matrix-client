@@ -212,8 +212,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
   `&mut (dyn FnMut(…) + Send)`。新加回呼型別漏了 `+ Send`，錯會在 daemon 的 `dispatch` 那一行爆，不在 sdk。
   📎 同一行還會撞 E0275（matrix-sdk 的 future 太深、推 `Send` 爆遞迴上限）：`dispatch` 每個分支 `Box::pin` 就是為了這個。
 
-- 🚨 **server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號不分裝置**（wbfuwunel #78，`wbf/send.rs` 傳 `sender_device: None`）：同帳號另一台裝置、甚至另一個房重用 txn_id，
-  會拿到上次那則的 event_id（HTTP `GET /event` 還會回 200）。e2e 因此曾誤判「帶 room_version 的加密訊息進不了 Recent」——追了一個小時。測試的 txn_id 一律帶每輪唯一後綴。
+- ✅ ~~server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號不分裝置~~（wbfuwunel #78，2026-09-26 在 PR #88 修了：現在按 `(user, device, txn)` 算，跟 HTTP 一樣）。
+  當時同帳號另一台裝置重用 txn_id 會拿到上次那則的 event_id，e2e 因此誤判過一次。client 的 `new_txn_id` 照舊是 128 位元隨機——修了之後也無害，不改。
 - **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server 回 `Forbidden`）：順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，🚫 不能只 Fetch 不 Subscribe。
   訂了之後 server 隨時推東西進來（別人 claim 你一把 OTK 就推 CryptoState），而通道現在只有「送一個等一個」——這就是第 4 階段要解的事。
 - **已追蹤的人只靠 `update_tracked_users` 不會再查**：要「這個人變了、重查」用 `OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口）。

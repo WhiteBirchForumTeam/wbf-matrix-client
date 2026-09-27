@@ -57,7 +57,8 @@
   帶游標的話，游標只要跑到一則還沒進 store 的 item 前面，那則就再也問不到：Ack 前推來的先匯、推播匯失敗後下一包成功、`CryptoState.gap` 沒接，
   三條都會（PR #60 首審 rumia／cirno／salvia 的三條 🔴；中間那版用「不先匯、落後中」補，是在補自己挖的坑）。不帶游標之後這三條在結構上消失，
   代價是「匯了但還沒銷成」的那幾則下次會再回來、重複匯入一次（冪等）。
-- ⚠️ **一則永遠匯不進去的 item 會擋住後面全部**：`import_items` 整批匯，它讓所在那一窗每次都回錯、一則都沒銷，而佇列頭永遠是它。寧可卡也不越過（越過是永遠解不開），但卡住要有人看得到、有出口：`keys.state` 不會再發 `caught_up`、`Note` 每分鐘講一次；server 端的逃生口（admin 手動銷、或 `ItemsDestroy` 帶「跳過」語意）在 wbfuwunel #87 第 4 點，等維護者定。📎 `receive_to_device` 只有在某則根本不是 to-device 事件的形狀時才回錯（OlmMachine 對解不開的是略過不是報錯），所以這條靠的是 server 給的形狀本來就對。
+  ✅ server 端 PR #88（2026-09-28 合）把這條寫成承諾：`Fetch{}` 是正確叫法、翻頁靠銷毀；`cd_seq` 欄位 server 還收（不做 breaking）但 client 不該送。client 這邊**型別直接拿掉** `DeviceFetchRequest.cd_seq`／`DeviceSubscribeRequest.cd_seq`，🚫 不靠「記得填 None」。server 的黃金向量 `device_fetch`／`device_subscribe` 還帶 `cd_seq`，client 的向量測試先拿掉它再比（`tests/unit.rs`），補不帶游標的向量開在 wbfuwunel #91。
+- **單則壞掉的 item 不會卡住佇列**（2026-09-28 更正；前一版這裡寫錯了）：上游狀態機遇到解不出形狀的 to-device 是記成 `Invalid` 跳過（`receive_to_device_event` 的 "Skip invalid events"），不是整批報錯；它跟著那一窗被銷掉。會讓 `import_items` 整批回錯的只有本地 crypto store 寫不進去——那種時候本來就什麼都匯不了，task 每分鐘重拉一次、`Note` 講一聲，`keys.state` 不再發 `caught_up`。server 端**刻意不給逃生口**（wbfuwunel #88：卡住是 client 端要處理的事，「跳過」等於把「永遠解不開」交給最不知情的那一層）——而 client 端本來就不會卡在單則上。📎 解不開的加密 to-device（Olm session 壞了）也是「處理過了」、會被銷：那則裡的房間金鑰要靠金鑰請求或備份補，跟一般 Matrix client 一樣。
 - **長活的引擎**：`Core::crypto_engines` 一帳號一個 `Arc<OlmEngine>`，第一次要用才開（鑰匙就是 login 用的 `vault.matrix_store_key()`），
   只給 wbf 帳號（matrix-sdk 帳號的金鑰在它自己的 Client 裡）。登出丟掉（Windows 上開著刪不掉 store）。
 
@@ -73,7 +74,7 @@
 
 - `DeviceChanged`（房間訂閱那個會話送來）→ `refresh_room_devices`：core 還沒有那支例行程序（e2ee-walkthrough §16.6），E2EE 的 RPC 面接。
 - OTK／裝置金鑰上傳、`org.wbftw.device_versions` 的宣告：同上。
-- 金鑰獨立一條線（設計上五條）與訂閱線死了主動重開：等 server 支援更多連線（維護者）。
+- 金鑰獨立一條線（設計上五條）與訂閱線死了主動重開：等 server 支援更多連線（維護者）。📌 server 在 wbfuwunel #85 已把每台裝置的 WS 上限從 4 拉到 8，條件有了，另一支做。
 - 訂閱線被關的自動重開：同上。
 
 ## 4. 測試

@@ -1226,10 +1226,7 @@ async fn device_fetch_window_reassembles_batches_oldest_first() {
     client.hello("test", &[]).await.unwrap();
     let window = client
         .device_fetch_window(
-            &wbf_sdk::protocol::DeviceFetchRequest {
-                cd_seq: Some(4711),
-                limit: Some(1000),
-            },
+            &wbf_sdk::protocol::DeviceFetchRequest { limit: Some(1000) },
             std::time::Duration::from_secs(1),
         )
         .await
@@ -1247,18 +1244,15 @@ async fn device_fetch_window_reassembles_batches_oldest_first() {
     assert_eq!(window.nt, Some(4720));
     assert!(!window.more);
 
-    // 帶 cd_seq = nt 再拉：空窗。
-    let empty = client
+    // 不帶游標再拉：沒銷毀的同一窗原樣回來——翻頁靠銷毀，不靠 `nt`（wbfuwunel #87／#88）。
+    let again = client
         .device_fetch_window(
-            &wbf_sdk::protocol::DeviceFetchRequest {
-                cd_seq: Some(4720),
-                limit: None,
-            },
+            &wbf_sdk::protocol::DeviceFetchRequest { limit: None },
             std::time::Duration::from_secs(1),
         )
         .await
         .unwrap();
-    assert_eq!((empty.tc, empty.nt, empty.items.len()), (0, None, 0));
+    assert_eq!((again.tc, again.nt), (3, Some(4720)));
     drop(client);
     assert!(server
         .requests
@@ -1437,10 +1431,7 @@ mod with_crypto_engine {
         client.hello("test", &[]).await.unwrap();
         let window = client
             .device_fetch_window(
-                &wbf_sdk::protocol::DeviceFetchRequest {
-                    cd_seq: Some(8),
-                    limit: None,
-                },
+                &wbf_sdk::protocol::DeviceFetchRequest { limit: None },
                 timeout,
             )
             .await

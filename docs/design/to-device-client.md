@@ -102,7 +102,7 @@ server 的 `add_to_device_event` 用的是 `globals.next_count()`——**跟 PDU
   要嘛冒險銷毀還沒處理好的。
 
 📎 翻頁把手也不同：`Recent` 用 `before` 往舊的翻，`Device/Fetch` **沒有** `before`，
-下一窗帶上一窗的 `nt` 當 `cd_seq`（`cd_seq` 同時是底與把手）。原提案有個 `to`，**server 拿掉了**。
+~~下一窗帶上一窗的 `nt` 當 `cd_seq`~~——2026-09-26 起**翻頁靠銷毀**：這窗 `ItemsDestroy` 完再不帶 `cd_seq` 叫下一次（§7；wbfuwunel #87／#88）。原提案有個 `to`，**server 拿掉了**。
 
 ## 4. 銷毀是**帶結果的命令**，不是回執（🚨 最容易寫錯的地方）
 

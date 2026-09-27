@@ -80,7 +80,7 @@
 | 功能 | 一般 Matrix（走 Client） | wbf 帳號（不建 Client） |
 |---|---|---|
 | `room.list`／`room.get` 的 `server`／`both` | Client 的 /sync | 橋 `JoinedRooms`（0x13/0x28）＋`m.direct`（`GetAccountData` 0x11/0x25）＋每房 `GetState`（0x14/0x21）組 `Conversation`，`both` 寫進 `room_list`；`local` 不變。⚠️ N 間房是 N＋2 次往返；狀態超過 2 MiB 的房 server 回 `TooLarge`，整個呼叫失敗（講出來比少列一間好） |
-| `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機：server 去重鍵在帳號、不分裝置，wbfuwunel #78）；**加密房拒絕**（1100，問的是這一刻的單項 `GetStateEvent` `m.room.encryption`（0x14/0x22，不會像全量 `GetState` 在大房間被 `TooLarge` 擋）、🚫 不用快取），E2EE 那支接 `encrypt_and_send` |
+| `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機；wbfuwunel #78 之前 server 去重不分裝置，2026-09-26 已修，隨機照舊）；**加密房拒絕**（1100，問的是這一刻的單項 `GetStateEvent` `m.room.encryption`（0x14/0x22，不會像全量 `GetState` 在大房間被 `TooLarge` 擋）、🚫 不用快取），E2EE 那支接 `encrypt_and_send` |
 | `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（約定 §5.2 的宣告終於成立，`attachment_declared: true`）；加密房在**上傳之前**就拒。兩邊的 content 同一份（`event_json::file_message_content`） |
 | `room.history` 錨點不在本地 | `/context` | 拒絕（1100），等 wbfuwunel #64 的 `before_event_id`；`sync=both` 先把錨點寫進快取就翻得下去 |
 | `watch`（CLI） | /sync 的迴圈 | 拒絕（1100）：daemon 的新訊息走訂閱＋推播（第 6 階段） |

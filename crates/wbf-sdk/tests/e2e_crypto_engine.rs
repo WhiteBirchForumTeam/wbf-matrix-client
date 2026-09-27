@@ -343,10 +343,7 @@ async fn a_live_subscription_receives_the_push_for_a_room_key_shared_while_it_is
     // 同一條連線上再拉一窗（串流會話）：Push 已經在訂閱那邊，Fetch 拿到的是佇列裡那一則本體，兩邊不打架。
     let window =
         b.ws.device_fetch_window(
-            &wbf_sdk::protocol::DeviceFetchRequest {
-                cd_seq: None,
-                limit: None,
-            },
+            &wbf_sdk::protocol::DeviceFetchRequest { limit: None },
             Duration::from_secs(30),
         )
         .await

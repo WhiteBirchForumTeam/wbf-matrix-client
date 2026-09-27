@@ -730,8 +730,8 @@ pub struct SendRequest {
 }
 
 /// 一個新的 `txn_id`（128 位元的隨機十六進位）。
-/// 🚨 server 的 WS `Send` 把 txn 去重鍵在**帳號**、不分裝置（wbfuwunel #78）：重用會拿到舊的 event_id 而不是送出一則新的，
-/// 所以要跨裝置、跨重開都不撞——不能用計數器或時間戳。重試同一則才重用同一個。
+/// server 的 WS `Send` 按 `(user, device, txn)` 去重（wbfuwunel #78 在 2026-09-26 修好；之前只鍵在帳號，另一台裝置重用會拿到舊的 event_id）。
+/// 隨機照舊：跨重開不撞、不依賴計數器或時間戳。重試同一則才重用同一個。
 ///
 /// Return:
 ///     Ok(String)   example: "wbf-3f9a…"（32 個十六進位字）
@@ -975,19 +975,20 @@ fn gap_when_missing() -> bool {
 // 📎 訂閱（`Subscribe`／`Push`／`CryptoState`）要能收非回應的 pack，通道還沒有那個能力（daemon-runtime 第 4 階段）；
 // 這裡先只有 `Fetch`／`Batch`／`ItemsDestroy`／`ItemsDestroyed` 這條「拉」的路，`Subscribe` 只有編碼。
 
-/// `Device/Fetch` 的請求 meta。鍵序照 server 向量 `device_fetch`（`cd_seq` 在 `limit` 前）。
+/// `Device/Fetch` 的請求 meta。
+///
+/// 🚫 **沒有 `cd_seq`**（維護者 2026-09-26，wbfuwunel #87／#88）：server 從佇列最舊還沒銷毀的起給，翻頁靠銷毀。
+/// server 還收這個欄位（不做 breaking），但帶了就只給比它大的，游標一跑到還沒進 store 的那則前面就再也問不到——
+/// 所以 client 這邊讓型別本身送不出它，🚫 不靠「記得填 None」。
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct DeviceFetchRequest {
-    /// 只要比它新的：我**已經處理完**到哪（to-device-client.md §2）；None ＝ 從頭。下一窗帶上一窗的 `nt`。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cd_seq: Option<u64>,
     /// 這一窗最多幾則；None 用 server 預設（1000）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
 
 /// Args:
-///     request: example: DeviceFetchRequest { cd_seq: Some(4711), limit: Some(1000) }
+///     request: example: DeviceFetchRequest { limit: Some(1000) }
 ///     id: client 選的會話號（型別 `SESSION`）, example: pack::id::compose(pack::id::SESSION, 31)
 pub fn device_fetch(request: &DeviceFetchRequest, id: u64, seq: u32) -> Result<Pack, SdkError> {
     Ok(Pack {
@@ -1002,12 +1003,11 @@ pub fn device_fetch(request: &DeviceFetchRequest, id: u64, seq: u32) -> Result<P
     })
 }
 
-/// `Device/Subscribe` 的 meta。鍵序照向量 `device_subscribe`（`cd_seq`、`device_id`）。
+/// `Device/Subscribe` 的 meta。
 /// ⚠️ `device_id` 是明示意圖，server 會跟 session 的比對，不合回 `Forbidden`（to-device-client.md §5）。
+/// 🚫 **沒有 `cd_seq`**（同 `DeviceFetchRequest`）：訂閱完自己 `Fetch{}` 一次就好，不要 server 的補窗。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DeviceSubscribeRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cd_seq: Option<u64>,
     pub device_id: String,
 }
 

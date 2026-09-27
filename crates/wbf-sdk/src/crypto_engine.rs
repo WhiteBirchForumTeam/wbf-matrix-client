@@ -342,7 +342,7 @@ impl OlmEngine {
     ///     per_pack_timeout: example: Duration::from_secs(30)
     /// Return:
     ///     Ok(ImportReport)
-    ///     Err(Protocol)   某則不是合法的 to-device 事件、store 寫入失敗——水位不動、不銷毀
+    ///     Err(Protocol)   crypto store 寫入失敗（整批；單則壞的狀態機會跳過、不會讓這裡回錯）——不銷毀，整批還在佇列裡
     ///     Err(Server)     銷毀被拒（例：沒訂閱的 `Forbidden`）——匯入與落地已完成，清單留著下次再送
     pub async fn import_items<C: PackChannel>(
         &self,
@@ -396,13 +396,7 @@ impl OlmEngine {
             // 佇列本身就是沒有洞的（銷毀前不刪），洞只會是 client 自己的游標造出來的：游標跑到一則還沒進 store 的 item 前面，那則就再也問不到。
             // 這一窗匯完、銷掉的不會再回來，所以下一次不帶游標的 `Fetch` 自然是下一窗；銷不掉的會再回來一次（重複匯入無害）。
             let window = client
-                .device_fetch_window(
-                    &DeviceFetchRequest {
-                        cd_seq: None,
-                        limit: None,
-                    },
-                    per_pack_timeout,
-                )
+                .device_fetch_window(&DeviceFetchRequest { limit: None }, per_pack_timeout)
                 .await?;
             let more = more_is_only_meaningful_with_items(&window);
             reports.push(
@@ -427,7 +421,9 @@ impl OlmEngine {
     ///     unused_fallback_key_types: ⚠️ `Some(&[])` 是「都用掉了，該換」、None 是「沒給」，兩者不同
     /// Return:
     ///     Ok(Vec<RoomKeyInfo>)  這一批帶進來的**新房間金鑰**（呼叫者拿它決定重解哪些密文）
-    ///     Err(Protocol)         某則不是合法的 to-device 事件、或 store 寫入失敗
+    ///     Err(Protocol)         crypto store 的交易寫不進去（整批，跟哪一則無關）。
+    ///                           📎 單則壞掉的**不會**讓整批回錯：上游狀態機對解不出形狀的 to-device 是記成 `Invalid` 跳過
+    ///                           （`receive_to_device_event` 的 "Skip invalid events"），所以沒有「一則壞 item 卡住佇列」這回事
     pub async fn receive_to_device(
         &self,
         events: Vec<serde_json::Value>,

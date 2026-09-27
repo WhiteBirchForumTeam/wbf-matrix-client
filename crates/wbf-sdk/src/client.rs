@@ -460,11 +460,11 @@ impl<C: PackChannel> WbfClient<C> {
         wbf_wire::pack::id::compose_masked(wbf_wire::pack::id::SESSION, self.next_stream_id)
     }
 
-    /// `Device/Fetch` 一窗：從 `cd_seq` 之後拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
+    /// `Device/Fetch` 一窗：從佇列最舊還沒銷毀的起拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
     /// 拉到的還沒匯進 crypto store，🚫 不推水位、🚫 不銷毀：那是呼叫者匯入成功之後的事。
     ///
     /// Args:
-    ///     request: example: &DeviceFetchRequest { cd_seq: Some(4711), limit: Some(1000) }
+    ///     request: example: &DeviceFetchRequest { limit: Some(1000) }
     ///     per_pack_timeout: 每個 Batch 之間最多等多久, example: Duration::from_secs(30)
     /// Return:
     ///     Ok(DeviceWindow)  這一窗（可能是空的）
@@ -552,7 +552,6 @@ impl<C: PackChannel> WbfClient<C> {
         self.next_seq = self.next_seq.wrapping_add(1);
         let pack = protocol::device_subscribe(
             &protocol::DeviceSubscribeRequest {
-                cd_seq: None,
                 device_id: device_id.to_string(),
             },
             self.next_session_id(),
@@ -603,7 +602,6 @@ impl<C: PackChannel> WbfClient<C> {
         self.next_seq = self.next_seq.wrapping_add(1);
         let pack = protocol::device_subscribe(
             &protocol::DeviceSubscribeRequest {
-                cd_seq: None,
                 device_id: device_id.to_string(),
             },
             self.next_session_id(),

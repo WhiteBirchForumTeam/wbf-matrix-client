@@ -35,6 +35,9 @@ pub enum WbfErrorCode {
     RateLimited = 1401,
     /// 這個 device 的 WS 名額滿了（meta 有 `max_connections`）。
     TooManyConnections = 1402,
+    /// 這個**來源位址**的 WS 名額滿了（meta 有 `max_connections`；IPv6 按 `/64` 算；在讀 token 之前就擋，wbfuwunel #85）。
+    /// ⚠️ 🚫 不要叫使用者「關掉一條舊的」：撞到的連線可能一條都不是他開的（同一個 NAT／代理後面的別人）。等一下再試，或換一條網路。
+    TooManyConnectionsFromAddress = 1403,
     /// 指名的東西不存在。
     NotFound = 1501,
     /// 請求合法，但跟 server 目前的狀態衝突。先讀狀態再決定。
@@ -72,6 +75,7 @@ impl WbfErrorCode {
             1302 => Forbidden,
             1401 => RateLimited,
             1402 => TooManyConnections,
+            1403 => TooManyConnectionsFromAddress,
             1501 => NotFound,
             1502 => Conflict,
             1503 => OutOfOrder,
@@ -110,6 +114,7 @@ mod tests {
             Forbidden,
             RateLimited,
             TooManyConnections,
+            TooManyConnectionsFromAddress,
             NotFound,
             Conflict,
             OutOfOrder,
