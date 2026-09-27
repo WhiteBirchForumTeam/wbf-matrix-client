@@ -40,7 +40,11 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 **daemon 只管訂閱當下，不碰水位**：水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動（新參數 `since` 是 UI 自己記的起點）；推播漏掉的（gap／丟包／壞包／寫失敗）只講一聲，誰記有沒漏是 UI 的事（維護者 2026-09-23：永遠拿不到也不管）。
 訂閱會話結束（含 socket 還活著的 `Error`）task 把那格線關掉、池發 `link.state: closed`；🚫 不重連、不重訂，下次 `open_subscriptions` 重開就重訂。`open_subscriptions`／`close_subscriptions` 先只給 core 與測試用。sdk codec 對著 server 向量；core 用記憶體對接的假 server 釘住「推播不碰水位、存不了的不通知、訂閱會話結束就關線、下次開才重訂」；真 server 兩帳號 e2e 過。
 
-**還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；接在訂閱線上）、金鑰的訂閱（`Device/Subscribe`）、跟上游的起停接進 daemon（RPC）、監督者（背景重連、退避）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
+**訂閱線的金鑰那半（2026-09-24，`design/key-sync.md`，維護者定：推的與拉的走同一支）**：`init_connection` 裡多一個 `Device/Subscribe` 會話 → `pull_to_device` 追平 → 收金鑰的 task；
+推來一包與 `Fetch` 的一窗都走 `OlmEngine::import_items`（匯入 → 落地 → 銷毀那一包）；gap、匯失敗、壞包就從佇列頭再拉一次——`Fetch` 🚫 不帶 `cd_seq`，佇列頭就是水位（維護者 2026-09-26，wbfuwunel #87）；被接手（1505）就停、發 `keys.state: stopped`、🚫 不重訂不關線；
+`Device/Fetch`／`ItemsDestroy` 走訂閱線（池的 `reuse`）；登出前 `Device/Unsubscribe`；長活的 `OlmEngine` 在 `Core::crypto_engines`。新推播 `keys.state`（rpc-spec §4）。
+
+**還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；`DeviceChanged` → `refresh_room_devices`、`CryptoState` → 補上傳金鑰、裝置金鑰上傳）、跟上游的起停接進 daemon（RPC）、監督者（背景重連、退避；訂閱線被關不主動重開，等 server 支援更多連線）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -81,7 +85,7 @@ crates/wbf-sdk/src/
   crypto_engine.rs       另一個碰上游的地方（feature `matrix`）：`OlmEngine` —— 同一個 sqlite crypto store（`m/`）上的 `OlmMachine` 只當狀態機用。
                          `send_outgoing_requests`（KeysUpload／Query／Claim／Signatures／發 to-device 全走橋）、`refresh_room_devices`（一支例行程序：
                          成員清單 → diff → 只重查變的人 → 雜湊對一次、不對再查、還不對就拒發 → `share_room_key`）、`encrypt_and_send(&RoomRefresh, …)`（🚨 只收 RoomRefresh：
-                         上游沒 outbound session 是 panic）、`decrypt_room_event`、`import_window`／`pull_to_device`（匯入 → 落地 → 銷毀鎖死）。
+                         上游沒 outbound session 是 panic）、`decrypt_room_event`、`import_items`／`pull_to_device`（匯入 → 落地 → 銷毀鎖死；推來的一包與 Fetch 的一窗同一支）。
                          分享策略 `room_key_share_settings()` 明確選 AllDevices，交叉簽章做好後換 IdentityBased 只改那裡
   device_version.rs      裝置版本號（`序號-雜湊`）與房間版本號：成員清單怎麼讀（沒號碼是錯不是 0）、`diff_from`（誰要重查、誰離開）、
                          `compute_device_keys_hash`（照 server §3.4 重算，黃金向量 810b7c3be4；🚨 user_id 用 get 逐層查、不拼 JSON Pointer）。沒網路
@@ -208,8 +212,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
   `&mut (dyn FnMut(…) + Send)`。新加回呼型別漏了 `+ Send`，錯會在 daemon 的 `dispatch` 那一行爆，不在 sdk。
   📎 同一行還會撞 E0275（matrix-sdk 的 future 太深、推 `Send` 爆遞迴上限）：`dispatch` 每個分支 `Box::pin` 就是為了這個。
 
-- 🚨 **server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號不分裝置**（wbfuwunel #78，`wbf/send.rs` 傳 `sender_device: None`）：同帳號另一台裝置、甚至另一個房重用 txn_id，
-  會拿到上次那則的 event_id（HTTP `GET /event` 還會回 200）。e2e 因此曾誤判「帶 room_version 的加密訊息進不了 Recent」——追了一個小時。測試的 txn_id 一律帶每輪唯一後綴。
+- ✅ ~~server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號不分裝置~~（wbfuwunel #78，2026-09-26 在 PR #88 修了：現在按 `(user, device, txn)` 算，跟 HTTP 一樣）。
+  當時同帳號另一台裝置重用 txn_id 會拿到上次那則的 event_id，e2e 因此誤判過一次。client 的 `new_txn_id` 照舊是 128 位元隨機——修了之後也無害，不改。
 - **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server 回 `Forbidden`）：順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，🚫 不能只 Fetch 不 Subscribe。
   訂了之後 server 隨時推東西進來（別人 claim 你一把 OTK 就推 CryptoState），而通道現在只有「送一個等一個」——這就是第 4 階段要解的事。
 - **已追蹤的人只靠 `update_tracked_users` 不會再查**：要「這個人變了、重查」用 `OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口）。
@@ -279,7 +283,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 4. 假的 wbf server 測試工具（老缺口；假 server 已經會橋、Device、Send，差的是在 core 層驅動）。
 5. PR #43 等 wbfuwunel #64 合併後重做；`Batch.more` 那項（server 未合分支）。
 6. server 批 4 的功能（推播規則、搜尋、公開房間目錄、TURN；本 repo issue #55）：都在橋上了，等 UI 需要才加 Kind 與包裝；坑見 §6。
-7. ✅ **訂閱線的內容（明文房間）**（2026-09-22，`design/room-sync.md`：`init_connection`、補窗與漏包交給 UI、daemon 不碰水位、`sync.recent` 多 `since`）。下一支：**訂閱金鑰**（`init_connection` 裡多一個 `Device/Subscribe` 會話、`pull_to_device`）；之後才是把開／關訂閱線接進 daemon（中繼：RPC 的訂閱與跟上游是兩件事）。
+7. ✅ **訂閱線的內容（明文房間）**（2026-09-22，`design/room-sync.md`：`init_connection`、補窗與漏包交給 UI、daemon 不碰水位、`sync.recent` 多 `since`）。✅ **訂閱金鑰**（2026-09-24，`design/key-sync.md`：`init_connection` 裡多一個 `Device/Subscribe` 會話、`pull_to_device` 追平、推的與拉的走同一支 `import_items`、`keys.state`）。
+   下一支：把開／關訂閱線接進 daemon（中繼：RPC 的訂閱與跟上游是兩件事）；再來 E2EE 的 RPC 面（`refresh_room_devices`、裝置／OTK 上傳、`encrypt_and_send`）。
 
 📍 **2026-09-14 的建議順序**：
 

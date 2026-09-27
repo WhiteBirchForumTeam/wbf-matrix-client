@@ -45,10 +45,37 @@ pub struct DeviceWindow {
 pub struct DeviceSubscription {
     /// `Subscribe` 後面那則 `CryptoState`（自己的 OTK 存量）。
     pub crypto_state: protocol::CryptoStateMeta,
-    /// `CryptoState` 到之前就推來的 `Device/Push`（訂閱那一刻剛好有新的 to-device）；佇列裡還在，`Fetch` 也拉得到。
-    pub early_pushes: Vec<Pack>,
-    /// 之後的 `Push`／`CryptoState`／`DeviceChanged`／`Superseded` 都從這裡來。
+    /// `CryptoState` 到之前就推來的 `Device/Push`（訂閱那一刻剛好有新的 to-device），已經解好；佇列裡還在，`Fetch` 也拉得到。
+    pub early_pushes: Vec<(protocol::DevicePushMeta, Vec<(u64, serde_json::Value)>)>,
+    /// 之後的 `Push`／`CryptoState`／`Superseded` 都從這裡來；解好的用 [`DeviceSubscription::next`]。
     pub subscription: Subscription,
+    /// 送出去的那個 `Subscribe`：之後每個 pack 都拿它驗 id。
+    request: Pack,
+}
+
+impl DeviceSubscription {
+    /// 下一個推來的東西，已經解過。
+    ///
+    /// Return:
+    ///     Ok(Some(reply))   `Push`（解好的 `(count, 事件)` 串）／`CryptoState`／遲到的 `Acknowledged`
+    ///     Ok(None)          訂閱結束了（server 送了 `Error`，例如被另一台裝置接手的 1505）
+    ///     Err(Timeout)      連線活著、這段時間沒推
+    ///     Err(Network)      連線沒了
+    ///     Err(Protocol)     形狀不對（🚫 不吞：一包壞了就是漏一包，呼叫端用 `Fetch` 補）
+    pub async fn next(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<protocol::SubscribeReply>, SdkError> {
+        match self.subscription.next(timeout).await? {
+            Some(pack) => Ok(Some(protocol::parse_subscribe_reply(&self.request, &pack)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 讀一次就清掉：true ＝ 本地收件匣滿過、丟過推播——跟 server 的 `gap` 一樣，用 `Fetch` 補。
+    pub fn take_gap(&self) -> bool {
+        self.subscription.take_gap()
+    }
 }
 
 /// `room_subscription` 的結果：Ack 的內容＋長活的訂閱。
@@ -433,11 +460,11 @@ impl<C: PackChannel> WbfClient<C> {
         wbf_wire::pack::id::compose_masked(wbf_wire::pack::id::SESSION, self.next_stream_id)
     }
 
-    /// `Device/Fetch` 一窗：從 `cd_seq` 之後拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
+    /// `Device/Fetch` 一窗：從佇列最舊還沒銷毀的起拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
     /// 拉到的還沒匯進 crypto store，🚫 不推水位、🚫 不銷毀：那是呼叫者匯入成功之後的事。
     ///
     /// Args:
-    ///     request: example: &DeviceFetchRequest { cd_seq: Some(4711), limit: Some(1000) }
+    ///     request: example: &DeviceFetchRequest { limit: Some(1000) }
     ///     per_pack_timeout: 每個 Batch 之間最多等多久, example: Duration::from_secs(30)
     /// Return:
     ///     Ok(DeviceWindow)  這一窗（可能是空的）
@@ -525,7 +552,6 @@ impl<C: PackChannel> WbfClient<C> {
         self.next_seq = self.next_seq.wrapping_add(1);
         let pack = protocol::device_subscribe(
             &protocol::DeviceSubscribeRequest {
-                cd_seq: None,
                 device_id: device_id.to_string(),
             },
             self.next_session_id(),
@@ -537,8 +563,8 @@ impl<C: PackChannel> WbfClient<C> {
             match protocol::parse_subscribe_reply(&pack, &response)? {
                 protocol::SubscribeReply::Acknowledged => acknowledged = true,
                 protocol::SubscribeReply::CryptoState(state) => crypto_state = Some(state),
-                // 訂閱那一刻剛好推來的 to-device：這一版不吃推播，佇列裡的下次 Fetch 還在。
-                protocol::SubscribeReply::LivePush => {}
+                // 訂閱那一刻剛好推來的 to-device：一次走完的流程不吃推播，佇列裡的下次 Fetch 還在。
+                protocol::SubscribeReply::Push { .. } => {}
             }
             Ok(!(acknowledged && crypto_state.is_some()))
         };
@@ -576,7 +602,6 @@ impl<C: PackChannel> WbfClient<C> {
         self.next_seq = self.next_seq.wrapping_add(1);
         let pack = protocol::device_subscribe(
             &protocol::DeviceSubscribeRequest {
-                cd_seq: None,
                 device_id: device_id.to_string(),
             },
             self.next_session_id(),
@@ -596,7 +621,7 @@ impl<C: PackChannel> WbfClient<C> {
             match protocol::parse_subscribe_reply(&pack, &reply)? {
                 protocol::SubscribeReply::Acknowledged => acknowledged = true,
                 protocol::SubscribeReply::CryptoState(state) => crypto_state = Some(state),
-                protocol::SubscribeReply::LivePush => early_pushes.push(reply),
+                protocol::SubscribeReply::Push { meta, items } => early_pushes.push((meta, items)),
             }
         }
         let Some(crypto_state) = crypto_state else {
@@ -608,6 +633,7 @@ impl<C: PackChannel> WbfClient<C> {
             crypto_state,
             early_pushes,
             subscription,
+            request: pack,
         })
     }
 

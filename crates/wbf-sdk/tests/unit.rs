@@ -896,26 +896,36 @@ fn device_packs_match_server_vectors() {
         Pack::decode(&hex::decode(entry["bytes_hex"].as_str().unwrap()).unwrap()).unwrap()
     };
 
+    // server 的向量 `device_fetch`／`device_subscribe` 還帶 `"cd_seq":4711`，而 client 送不出它了（wbfuwunel #87／#88：
+    // 欄位 server 還收、但 client 不該送；client 的型別直接拿掉）。所以期望值＝向量拿掉 `cd_seq` 的那一包，其餘標頭與 data 照舊逐 byte。
+    // 📎 server 補不帶游標的向量之後（wbfuwunel #91），這兩段改回直接比向量。
+    let without_cursor = |mut pack: Pack| -> Pack {
+        let mut meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&pack.meta).unwrap();
+        assert!(
+            meta.remove("cd_seq").is_some(),
+            "server 向量還帶 cd_seq；補了新向量就該拿掉這個轉換"
+        );
+        pack.meta = serde_json::to_vec(&meta).unwrap();
+        pack
+    };
     let fetch = pack_named("device_fetch");
     let ours = protocol::device_fetch(
-        &DeviceFetchRequest {
-            cd_seq: Some(4711),
-            limit: Some(1000),
-        },
+        &DeviceFetchRequest { limit: Some(1000) },
         fetch.id,
         fetch.seq,
     )
     .unwrap();
+    assert_eq!(ours.meta, br#"{"limit":1000}"#, "Fetch 不帶 cd_seq");
     assert_eq!(
         ours.encode().unwrap(),
-        fetch.encode().unwrap(),
-        "Fetch 逐 byte"
+        without_cursor(fetch.clone()).encode().unwrap(),
+        "Fetch 除了 cd_seq 逐 byte"
     );
 
     let subscribe = pack_named("device_subscribe");
     let ours = protocol::device_subscribe(
         &DeviceSubscribeRequest {
-            cd_seq: Some(4711),
             device_id: "RJYKSTBOIE".into(),
         },
         subscribe.id,
@@ -923,9 +933,13 @@ fn device_packs_match_server_vectors() {
     )
     .unwrap();
     assert_eq!(
+        ours.meta, br#"{"device_id":"RJYKSTBOIE"}"#,
+        "Subscribe 不帶 cd_seq"
+    );
+    assert_eq!(
         ours.encode().unwrap(),
-        subscribe.encode().unwrap(),
-        "Subscribe 逐 byte"
+        without_cursor(subscribe.clone()).encode().unwrap(),
+        "Subscribe 除了 cd_seq 逐 byte"
     );
 
     let destroy = pack_named("device_items_destroy");
@@ -949,6 +963,33 @@ fn device_packs_match_server_vectors() {
     assert_eq!(
         items[0].1["content"]["algorithm"],
         "m.olm.v1.curve25519-aes-sha2"
+    );
+
+    // `Push` 跟 `Batch` 同一種切法（key-sync.md）：對著向量解得回 `(count, 事件)`，meta 是 `{bc, ot, nt, counts, gap}`。
+    let push = pack_named("device_push");
+    match protocol::parse_subscribe_reply(&subscribe, &push).unwrap() {
+        protocol::SubscribeReply::Push { meta, items } => {
+            assert_eq!(
+                (meta.bc, meta.ot, meta.nt, meta.gap, meta.counts.clone()),
+                (1, 4713, 4713, false, vec![4713])
+            );
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].0, 4713);
+            assert_eq!(
+                items[0].1["content"]["algorithm"],
+                "m.olm.v1.curve25519-aes-sha2"
+            );
+        }
+        other => panic!("expected a Push, got {other:?}"),
+    }
+    let mut broken_push = push.clone();
+    broken_push.meta = br#"{"bc":2,"ot":4713,"nt":4713,"counts":[4713],"gap":false}"#.to_vec();
+    assert!(
+        matches!(
+            protocol::parse_subscribe_reply(&subscribe, &broken_push),
+            Err(wbf_sdk::SdkError::Protocol(_))
+        ),
+        "bc 跟 data 對不上是 Protocol，跟 Batch 同一條規則"
     );
 
     let destroyed = pack_named("device_items_destroyed");

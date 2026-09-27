@@ -198,7 +198,7 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .await
         .expect("B feeds its OTK counts");
 
-    // 5. B 從頭拉到追平（Fetch → 匯入 → 落地 → 銷毀，順序在 import_window 裡鎖死）：
+    // 5. B 從頭拉到追平（Fetch → 匯入 → 落地 → 銷毀，順序在 import_items 裡鎖死）：
     //    拿到 A 發的 Olm 密文 → 匯進狀態機 → 就是那個房間的房間金鑰；銷毀回來的 count ＝ 送的；清單清空。
     let reports = b
         .engine
@@ -343,10 +343,7 @@ async fn a_live_subscription_receives_the_push_for_a_room_key_shared_while_it_is
     // 同一條連線上再拉一窗（串流會話）：Push 已經在訂閱那邊，Fetch 拿到的是佇列裡那一則本體，兩邊不打架。
     let window =
         b.ws.device_fetch_window(
-            &wbf_sdk::protocol::DeviceFetchRequest {
-                cd_seq: None,
-                limit: None,
-            },
+            &wbf_sdk::protocol::DeviceFetchRequest { limit: None },
             Duration::from_secs(30),
         )
         .await

@@ -56,7 +56,7 @@ pub struct ImportReport {
     pub imported: usize,
     /// 這一輪 server 說已經沒了的 count（含上次沒銷成、這次補送的）。
     pub destroyed: Vec<u64>,
-    /// 落地後的水位。
+    /// 落地後的「處理過的最新 count」（紀錄，🚫 不是 `Fetch` 的游標）。
     pub cd_seq: Option<u64>,
     /// 還留在待銷毀清單上的（server 這輪沒回來的，下次再送）。
     pub still_to_destroy: usize,
@@ -330,7 +330,7 @@ impl OlmEngine {
         ToDeviceState::load(&self.store_dir)
     }
 
-    /// 一窗 to-device 的完整處理，**順序鎖死**（to-device-client.md §4、§7）：
+    /// 一批 to-device 的完整處理（`Fetch` 的一窗、或推來的一包 `Push`：同一支，維護者 2026-09-24），**順序鎖死**（to-device-client.md §4、§7）：
     /// 匯進 crypto store（sqlite commit 了才回）→ 水位與待銷毀清單落地（`m/td.json`，原子寫）→ 才叫 server 銷毀
     /// （連上次沒銷成的一起）→ 只清 `ItemsDestroyed` 回來的。
     /// 🚨 呼叫者拿不到「先銷毀再匯入」的路，這就是這個函式存在的理由。中途任何一步失敗，已落地的照樣有效：
@@ -338,22 +338,21 @@ impl OlmEngine {
     ///
     /// Args:
     ///     client: 要先 `device_subscribe` 過的連線（沒訂閱，銷毀那一步被 `Forbidden`，但匯入與落地已經完成）
-    ///     window: `device_fetch_window` 拉到的（可以是空窗：那就只補送上次沒銷成的）
+    ///     items: `(count, 事件)` 舊→新：`DeviceWindow::items` 或 `SubscribeReply::Push` 的 `items`（可以是空的：那就只補送上次沒銷成的）
     ///     per_pack_timeout: example: Duration::from_secs(30)
     /// Return:
     ///     Ok(ImportReport)
-    ///     Err(Protocol)   某則不是合法的 to-device 事件、store 寫入失敗——水位不動、不銷毀
+    ///     Err(Protocol)   crypto store 寫入失敗（整批；單則壞的狀態機會跳過、不會讓這裡回錯）——不銷毀，整批還在佇列裡
     ///     Err(Server)     銷毀被拒（例：沒訂閱的 `Forbidden`）——匯入與落地已完成，清單留著下次再送
-    pub async fn import_window<C: PackChannel>(
+    pub async fn import_items<C: PackChannel>(
         &self,
         client: &mut WbfClient<C>,
-        window: DeviceWindow,
+        items: Vec<(u64, serde_json::Value)>,
         per_pack_timeout: std::time::Duration,
     ) -> Result<ImportReport, SdkError> {
         let mut state = ToDeviceState::load(&self.store_dir)?;
-        let counts: Vec<u64> = window.items.iter().map(|(count, _)| *count).collect();
-        let events: Vec<serde_json::Value> =
-            window.items.into_iter().map(|(_, event)| event).collect();
+        let counts: Vec<u64> = items.iter().map(|(count, _)| *count).collect();
+        let events: Vec<serde_json::Value> = items.into_iter().map(|(_, event)| event).collect();
         // 1. 匯入：Ok 就是 crypto store 的交易 commit 了（上游 receive_sync_changes 的最後兩行）。
         let room_keys = self.receive_to_device(events, None, None).await?;
         // 2. 落地：水位前進、這些 count 進待銷毀清單。
@@ -376,7 +375,8 @@ impl OlmEngine {
         })
     }
 
-    /// 從水位起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它。每一窗都走 `import_window`。
+    /// 從佇列最舊還沒銷毀的起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap`、匯失敗也是它。
+    /// 每一窗都走 `import_items`。🚫 不帶 `cd_seq`：佇列頭就是水位，`ItemsDestroy` 是唯一的「處理完了」（wbfuwunel #87）。
     /// 空窗也走一次（把上次沒銷成的補送）。
     ///
     /// Args:
@@ -392,18 +392,17 @@ impl OlmEngine {
     ) -> Result<Vec<ImportReport>, SdkError> {
         let mut reports = Vec::new();
         for _ in 0..PULL_WINDOWS_LIMIT {
-            let cd_seq = ToDeviceState::load(&self.store_dir)?.cd_seq;
+            // 🚫 不帶 `cd_seq`（維護者 2026-09-26，wbfuwunel #87）：讓 server 從這台裝置佇列裡**最舊還沒銷毀的**起給。
+            // 佇列本身就是沒有洞的（銷毀前不刪），洞只會是 client 自己的游標造出來的：游標跑到一則還沒進 store 的 item 前面，那則就再也問不到。
+            // 這一窗匯完、銷掉的不會再回來，所以下一次不帶游標的 `Fetch` 自然是下一窗；銷不掉的會再回來一次（重複匯入無害）。
             let window = client
-                .device_fetch_window(
-                    &DeviceFetchRequest {
-                        cd_seq,
-                        limit: None,
-                    },
-                    per_pack_timeout,
-                )
+                .device_fetch_window(&DeviceFetchRequest { limit: None }, per_pack_timeout)
                 .await?;
             let more = more_is_only_meaningful_with_items(&window);
-            reports.push(self.import_window(client, window, per_pack_timeout).await?);
+            reports.push(
+                self.import_items(client, window.items, per_pack_timeout)
+                    .await?,
+            );
             if !more {
                 return Ok(reports);
             }
@@ -422,7 +421,9 @@ impl OlmEngine {
     ///     unused_fallback_key_types: ⚠️ `Some(&[])` 是「都用掉了，該換」、None 是「沒給」，兩者不同
     /// Return:
     ///     Ok(Vec<RoomKeyInfo>)  這一批帶進來的**新房間金鑰**（呼叫者拿它決定重解哪些密文）
-    ///     Err(Protocol)         某則不是合法的 to-device 事件、或 store 寫入失敗
+    ///     Err(Protocol)         crypto store 的交易寫不進去（整批，跟哪一則無關）。
+    ///                           📎 單則壞掉的**不會**讓整批回錯：上游狀態機對解不出形狀的 to-device 是記成 `Invalid` 跳過
+    ///                           （`receive_to_device_event` 的 "Skip invalid events"），所以沒有「一則壞 item 卡住佇列」這回事
     pub async fn receive_to_device(
         &self,
         events: Vec<serde_json::Value>,

@@ -64,6 +64,18 @@ pub enum CoreEvent {
         /// 關的理由；開的時候是 `None`。
         reason: Option<String>,
     },
+    /// 這個帳號的金鑰訂閱（`key_sync.rs`）怎麼了：追平了幾把、或停了（被另一台裝置接手、線死了）。
+    /// 維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」這台裝置還在不在收金鑰。
+    Keys {
+        user: String,
+        state: KeysState,
+        /// 這一輪匯進 crypto store 的 to-device 則數（`caught_up` 才有）。
+        imported: Option<usize>,
+        /// 這一輪帶進來的新房間金鑰數（`caught_up` 才有；UI 拿它決定要不要重解密文）。
+        room_keys: Option<usize>,
+        /// 停的理由（`stopped` 才有）。
+        reason: Option<String>,
+    },
     /// 這條線收到一個 pack（`ReceivedHook` 的那一頭）。**只有標頭**，🚫 不帶 meta／data：它是 broadcast、每條 RPC 連線一份，
     /// 而 data 可能是幾 MiB 的媒體塊或密文。要內容的由型別化的事件發（`Message` 那種）。
     Received {
@@ -85,6 +97,16 @@ pub enum CoreEvent {
 pub enum LinkState {
     Opened,
     Closed,
+}
+
+/// 金鑰訂閱的狀態（`CoreEvent::Keys`，rpc-spec §4 的 `keys.state`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeysState {
+    /// 一批 to-device 匯完、銷毀完（上線追平、或推來一包處理完）：crypto store 現在有這些金鑰。
+    CaughtUp,
+    /// 這台裝置不再收金鑰：被另一台裝置接手（1505）、或線死了。🚫 不自動重訂（to-device-client.md §5.1）。
+    Stopped,
 }
 
 /// 一個帳號跟它的 homeserver 之間現在是什麼狀態（rpc-spec §4 的 `sync.state`）。

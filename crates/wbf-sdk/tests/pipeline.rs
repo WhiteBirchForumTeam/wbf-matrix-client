@@ -1226,10 +1226,7 @@ async fn device_fetch_window_reassembles_batches_oldest_first() {
     client.hello("test", &[]).await.unwrap();
     let window = client
         .device_fetch_window(
-            &wbf_sdk::protocol::DeviceFetchRequest {
-                cd_seq: Some(4711),
-                limit: Some(1000),
-            },
+            &wbf_sdk::protocol::DeviceFetchRequest { limit: Some(1000) },
             std::time::Duration::from_secs(1),
         )
         .await
@@ -1247,18 +1244,15 @@ async fn device_fetch_window_reassembles_batches_oldest_first() {
     assert_eq!(window.nt, Some(4720));
     assert!(!window.more);
 
-    // 帶 cd_seq = nt 再拉：空窗。
-    let empty = client
+    // 不帶游標再拉：沒銷毀的同一窗原樣回來——翻頁靠銷毀，不靠 `nt`（wbfuwunel #87／#88）。
+    let again = client
         .device_fetch_window(
-            &wbf_sdk::protocol::DeviceFetchRequest {
-                cd_seq: Some(4720),
-                limit: None,
-            },
+            &wbf_sdk::protocol::DeviceFetchRequest { limit: None },
             std::time::Duration::from_secs(1),
         )
         .await
         .unwrap();
-    assert_eq!((empty.tc, empty.nt, empty.items.len()), (0, None, 0));
+    assert_eq!((again.tc, again.nt), (3, Some(4720)));
     drop(client);
     assert!(server
         .requests
@@ -1357,7 +1351,7 @@ async fn device_calls_need_the_device_feature() {
         .all(|request| request.0 == wbf_wire::Kind::Control));
 }
 
-// ---- 引擎的 import_window／pull_to_device：順序鎖死（feature matrix 才有 OlmMachine）----
+// ---- 引擎的 import_items／pull_to_device：順序鎖死（feature matrix 才有 OlmMachine）----
 
 #[cfg(feature = "matrix")]
 mod with_crypto_engine {
@@ -1382,7 +1376,7 @@ mod with_crypto_engine {
     /// 🚨 匯入與落地在前、銷毀在後：銷毀被拒（沒訂閱 → `Forbidden`）時 `td.json` 已經有水位與待銷毀清單；
     /// 訂閱後再走一次（空窗）把上次沒銷成的補送掉。
     #[tokio::test]
-    async fn import_window_persists_before_it_destroys_and_retries_leftovers() {
+    async fn import_items_persist_before_it_destroys_and_retries_leftovers() {
         let dir = scratch_store("import-window");
         let engine = OlmEngine::open(&dir, &Key32([7u8; 32]), "@alice:localhost", "DEV1")
             .await
@@ -1399,7 +1393,7 @@ mod with_crypto_engine {
             .await
             .unwrap();
         let error = engine
-            .import_window(&mut client, window, timeout)
+            .import_items(&mut client, window.items, timeout)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1417,13 +1411,14 @@ mod with_crypto_engine {
         client.device_subscribe("DEV1", timeout).await.unwrap();
         let reports = engine.pull_to_device(&mut client, timeout).await.unwrap();
         assert_eq!(reports.len(), 1, "{reports:?}");
+        // `Fetch` 不帶游標（wbfuwunel #87）：沒銷成的 7、8 還在佇列頭，會再回來、重複匯入一次（冪等），然後這次銷掉。
         assert_eq!(
             (
                 reports[0].imported,
                 reports[0].destroyed.clone(),
                 reports[0].still_to_destroy
             ),
-            (0, vec![7, 8], 0)
+            (2, vec![7, 8], 0)
         );
         assert_eq!(reports[0].cd_seq, Some(8));
         assert!(ToDeviceState::load(&dir).unwrap().to_destroy.is_empty());
@@ -1436,16 +1431,13 @@ mod with_crypto_engine {
         client.hello("test", &[]).await.unwrap();
         let window = client
             .device_fetch_window(
-                &wbf_sdk::protocol::DeviceFetchRequest {
-                    cd_seq: Some(8),
-                    limit: None,
-                },
+                &wbf_sdk::protocol::DeviceFetchRequest { limit: None },
                 timeout,
             )
             .await
             .unwrap();
         let error = engine
-            .import_window(&mut client, window, timeout)
+            .import_items(&mut client, window.items, timeout)
             .await
             .unwrap_err();
         assert_eq!(

@@ -368,7 +368,7 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 | 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；通道收得到推播 ✅ 第 4 階段（`WbfClient::device_subscription` 的 handle；收件匣滿了丟並標 `gap`） | ✅ 通道；❌ 「推來就叫 `refresh_room_devices`」那半在 daemon（§16.6 最後一列）。正確性仍由第 6 步的 1506 守——跟 server 的設計一致：推播是加速，不是正確性來源 |
 | 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()` | ✅ #48（假 server ＋ 真 server）。房間事件的 `Event/Unsubscribe` 跟第 4 階段一起（現在沒訂房間事件） |
 | 10 | **同一台裝置只有一條連線在收**；被接手的那條收到 `Superseded` 要停、不重訂 | `WbfErrorCode::Superseded` 認得 ✅；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點（`Subscription::next` 先回那則 Error、再回 None），訂閱項從表裡拿掉 ✅ 第 4 階段 | ✅ 通道；「通知上層、不重訂」是 daemon 收到 None 之後的事 |
-| 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_window` 把「匯入 → 落地 → 銷毀」鎖成一步，UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
+| 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_items` 把「匯入 → 落地 → 銷毀」鎖成一步（推來的一包與 `Fetch` 的一窗同一支），UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
 
 **核對結論**：第 1–7、9 步的方法都在而且對真 server 驗過（3b 把 4、6 補齊），走的就是 server 設計的那條「版本號變了 → 看誰不一樣 → 只查那個人 → 狀態機比裝置 → 補發 → 帶號碼送 → 1506 回到第 1 步」的路；
 第 8、10 步（推播、Superseded）的通道那半第 4 階段做了（`ws-receive-dispatch.md`），剩下「收到之後做什麽」在 daemon。**在那之前這套邏輯已經是正確的，只是慢一拍**——
@@ -394,9 +394,9 @@ wbf-sdk 只提供方法，不在這兩者之間選邊。
 | 送出被 1506 擋 | **daemon** 自動補金鑰，然後把錯誤**原樣**回給 UI | 每次收到 1506 | 跑一次 `refresh_room_devices`（同一支例行程序）→ 回 1506 給 UI（附 server 說的目前號碼）→ **補齊完再送一則 RPC 狀態訊息給 UI：這個房的版本已更新到 V、可以送了** | ✅ 定案；3b |
 | 重送 | **UI** 決定要不要、幾次 | 收到上面那則「可以送了」之後 | 再叫一次同一個 send RPC，**同一個 `txn_id`**（server 冪等：已收下的回原本的 `event_id`，不會送兩次） | ✅ 定案 |
 | 每房「上次那份成員清單」（發上一輪房間金鑰時依據的那份） | **daemon** 存 | 每次 refresh 拿到新的就換 | `RoomDeviceVersions`（可序列化待加） | 定案；落在哪（記憶體或 cache.db）待定 |
-| 上線：to-device 追平 | **daemon** 自動 | 連線建好、登入完 | `device_subscribe` → `pull_to_device` | ✅ 方法在；daemon 還沒接 |
-| 下線：退訂 | **daemon** 自動 | 登出、關連線前 | `device_unsubscribe` | ✅ 方法在 |
-| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | `WbfClient::device_subscription` 的 handle 一直 `next()`；每個收到的 pack 同時經過 `ReceivedHook`（`WsChannel::connect_with_hook`）給 RPC 面決定要不要送 UI | ✅ 通道能收（第 4 階段）；❌ daemon 還沒接 |
+| 上線：to-device 追平 | **daemon** 自動 | 訂閱線開好（`init_connection`） | `device_subscription` → `pull_to_device`（key-sync.md） | ✅ 2026-09-24 core 接了 |
+| 下線：退訂 | **daemon** 自動 | 登出前 | `device_unsubscribe`（core `unsubscribe_keys_of`） | ✅ 2026-09-24 core 接了 |
+| 收推播（`DeviceChanged`、`Push`、`CryptoState`、`Superseded`）後的處理 | **daemon** 自動 | 推來就做；`DeviceChanged` 就是又一個叫 `refresh_room_devices` 的觸發點 | core `key_sync.rs` 的 task：`Push` 走 `import_items`（跟拉的同一支）；gap（`Push` 或 `CryptoState` 帶的）／匯失敗／壞包就從佇列頭再拉（`Fetch` 不帶 `cd_seq`，key-sync.md §1）；`Superseded` 停不重訂；`CryptoState` 的 OTK 數先講一聲；每個 pack 也經 `ReceivedHook` 給 RPC 面 | ✅ 2026-09-24 `Push`／`Superseded`；❌ `DeviceChanged` → `refresh_room_devices`、`CryptoState` → 補上傳（E2EE 的 RPC 面） |
 
 ⭐ **一支例行程序、三個觸發點**：`refresh_room_devices(room)` 被 UI 點進房間叫、被 1506 叫、將來被 `DeviceChanged` 叫。內容一樣，只有「誰按下去」不同。
 
