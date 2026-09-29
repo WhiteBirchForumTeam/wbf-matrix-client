@@ -714,6 +714,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 等這個 `Core` 發出 `event_id` 那則**解開了的** `room.message`（先到密文、之後補解再發一次也算），回它的內文。
+    async fn decrypted_body_of(
+        seen: &mut tokio::sync::broadcast::Receiver<CoreEvent>,
+        event_id: &str,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(CoreEvent::Message { message, .. }) = seen.recv().await {
+                    if message.id == event_id && message.decrypted == Some(true) {
+                        if let MessageKind::Text { body, .. } = &message.kind {
+                            return body.clone();
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{event_id} arrives decrypted within 30 s"))
+    }
+
+    /// e2ee-rpc.md 整條對真的 wbfuwunel（#45 的驗收，這次走 daemon 的形狀）：
+    /// alice、bob 各一個 `Core`（各自的資料目錄）登入、鉤子開五條線（`Keys` 線上傳裝置金鑰）→ alice `refresh` 拿到 UI 要存的 `RoomDevices`
+    /// → 帶著它送加密訊息 → bob 收到的 `room.message` 是解開的；
+    /// bob 再登一台新裝置（第三個 `Core`）→ alice 帶**舊的** `RoomDevices` 送 → 被 server 擋（1506），`RoomDevicesChanged` 的 `data` 是 daemon 自動重拿的新狀態、訊息沒送
+    /// → alice 帶新狀態、同一個 `txn_id` 重送 → bob 的新裝置解得開（金鑰是 1506 之後那次 refresh 補給它的）。
+    ///
+    /// `--ignored`；環境變數：`WBF_E2E_SERVER`、`WBF_E2E_USER`（完整 mxid）、`WBF_E2E_PASSWORD_FILE`、`WBF_E2E_USER_B`、`WBF_E2E_PASSWORD_B_FILE`、
+    /// `WBF_E2E_ENCRYPTED_ROOM`（兩人都在的加密房）。
+    #[tokio::test]
+    #[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_USER_B, WBF_E2E_PASSWORD_B_FILE, WBF_E2E_ENCRYPTED_ROOM"]
+    async fn an_encrypted_conversation_survives_a_new_device_over_the_real_server() {
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        let password_of = |file: &str| {
+            std::fs::read_to_string(file)
+                .unwrap()
+                .trim_end_matches(['\r', '\n'])
+                .to_string()
+        };
+        let server = env("WBF_E2E_SERVER");
+        let room = env("WBF_E2E_ENCRYPTED_ROOM");
+        let (alice, alice_password) = (
+            env("WBF_E2E_USER"),
+            password_of(&env("WBF_E2E_PASSWORD_FILE")),
+        );
+        let (bob, bob_password) = (
+            env("WBF_E2E_USER_B"),
+            password_of(&env("WBF_E2E_PASSWORD_B_FILE")),
+        );
+        let signed_in = |name: &'static str, user: String, password: String| {
+            let server = server.clone();
+            async move {
+                let dir = scratch(name);
+                let core = Core::open(&dir);
+                core.create_vault(None).unwrap();
+                core.log_in(&server, &user, &password, name, true)
+                    .await
+                    .unwrap_or_else(|error| panic!("{name} logs in: {error}"));
+                let ensured = core.ensure_links().await;
+                assert!(ensured.failed.is_empty(), "{name}: {ensured:?}");
+                (core, dir)
+            }
+        };
+        let target = Target::default();
+        let (core_a, dir_a) = signed_in("real-e2ee-alice", alice.clone(), alice_password).await;
+        let (core_b, dir_b) = signed_in("real-e2ee-bob", bob.clone(), bob_password.clone()).await;
+        let mut seen_b = core_b.subscribe();
+
+        let first = core_a
+            .refresh_room_devices(&room, None, &target)
+            .await
+            .unwrap();
+        assert!(
+            first.devices.members.contains_key(&bob),
+            "bob 在成員裡：{first:?}"
+        );
+        let body_1 = format!("e2ee rpc 1 {}", std::process::id());
+        let event_1 = core_a
+            .send_text(
+                &room,
+                &body_1,
+                &options(&first.devices, &format!("t1-{}", std::process::id())),
+                &target,
+            )
+            .await
+            .expect("alice sends encrypted");
+        assert_eq!(
+            decrypted_body_of(&mut seen_b, &event_1).await,
+            body_1,
+            "bob 解得開"
+        );
+
+        // bob 登一台新裝置：他的裝置版本號變了，房間版本號跟著變。
+        let (core_c, dir_c) = signed_in("real-e2ee-bob-2", bob.clone(), bob_password).await;
+        let mut seen_c = core_c.subscribe();
+        let body_2 = format!("e2ee rpc 2 {}", std::process::id());
+        let txn_2 = format!("t2-{}", std::process::id());
+        let blocked = core_a
+            .send_text(&room, &body_2, &options(&first.devices, &txn_2), &target)
+            .await
+            .expect_err("the stale room version is refused by the server");
+        assert_eq!(
+            blocked.kind,
+            CoreErrorKind::RoomDevicesChanged,
+            "{blocked:?}"
+        );
+        let data = blocked.data.clone().expect("1506 帶新的房間狀態");
+        assert_eq!(data["txn_id"], txn_2.as_str());
+        let fresh: RoomDevices = serde_json::from_value(data).unwrap();
+        assert_ne!(fresh.room_version, first.devices.room_version, "號碼變了");
+        assert_ne!(
+            fresh.members.get(&bob),
+            first.devices.members.get(&bob),
+            "bob 的裝置版本號變了"
+        );
+
+        let event_2 = core_a
+            .send_text(&room, &body_2, &options(&fresh, &txn_2), &target)
+            .await
+            .expect("resending with the fresh state and the same txn_id goes through");
+        assert_eq!(
+            decrypted_body_of(&mut seen_c, &event_2).await,
+            body_2,
+            "bob 的新裝置解得開"
+        );
+        assert_eq!(
+            decrypted_body_of(&mut seen_b, &event_2).await,
+            body_2,
+            "bob 的舊裝置也是"
+        );
+
+        for (core, user, dir) in [
+            (core_c, &bob, dir_c),
+            (core_b, &bob, dir_b),
+            (core_a, &alice, dir_a),
+        ] {
+            let _ = core.log_out(user, None, true, true).await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// 收到時就有金鑰：`to_incoming` 直接解（密文照帶）；沒引擎（開不起來）就原樣、標成沒解。
     #[tokio::test]
     async fn an_incoming_ciphertext_is_decrypted_when_the_key_is_here() {

@@ -595,8 +595,8 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |
 | `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | 🔁 |
 | `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋 `JoinedRooms`＋`GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（account-session.md §6） |
-| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房先分金鑰、加密、帶 `room_version`，e2ee-rpc.md §3）；一般 Matrix：`Room::send` | ✅ wbf（加密 2026-09-29，🔁 還沒對真 server 跑）／🔁 一般 server |
-| `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** 橋 `Members`＋`/keys/query`＋`/keys/claim`＋`sendToDevice` | ✅ 2026-09-29（🔁 還沒對真 server 跑） |
+| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房先分金鑰、加密、帶 `room_version`，e2ee-rpc.md §3）；一般 Matrix：`Room::send` | ✅ wbf（加密 2026-09-29，2026-09-30 真 server 驗過）／🔁 一般 server |
+| `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** 橋 `Members`＋`/keys/query`＋`/keys/claim`＋`sendToDevice` | ✅ 2026-09-29（2026-09-30 真 server 驗過） |
 | `devices.changed` 推播 | ✅ `CoreEvent::DeviceChanged` | **WS** `Event/DeviceChanged`（`Rooms` 線宣告 `org.wbftw.device_versions`） | ✅ 2026-09-29 |
 | `room.send_file` | ✅ | 上傳 **WS** ＋ 事件：wbf 帳號 **WS** `Event/Send` 帶 `attachments`（`attachment_declared: true`）；一般 Matrix matrix-sdk | ✅ wbf／🔁 一般 server |
 | `room.send_attachment`、`media.create` | ❌ | — | ❌ |

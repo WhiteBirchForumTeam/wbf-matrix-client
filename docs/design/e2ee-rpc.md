@@ -142,7 +142,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 - **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，e2ee-walkthrough §16）。
 - **補解寫失敗的那批不會自動重試**（PR #62 審查 rumia 🟡1）：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
   那把金鑰已經匯入，之後不會再觸發補解（只有同一把金鑰再來才會）。要不要加一個觸發點（例如 `room.history` 讀到未解的就試一次）待維護者決定。
-- 沒對真 server 跑過（寫這支時本機的 wbfuwunel build 被清掉了）：§9 的測試全是假 server；真 server 的 e2e 等 server 重編後補跑。
+- ~~沒對真 server 跑過~~：2026-09-30 server 重編後跑過了，見 §9 最後一項。
 
 ## 9. 測試
 
@@ -158,3 +158,8 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
   - `to_incoming` 有引擎就解、沒引擎原樣。
 - core `key_sync.rs`：開線上傳一次（裝置金鑰＋一次性金鑰＋fallback key）；存量滿的 `CryptoState` 不上傳、剩 10 把的上傳一次。
 - daemon：錯誤的 `data` 原樣進回應、沒有就不在；`devices.changed` 推播的形狀；`room.refresh_devices` 在方法表上、參數錯是 102。
+- 真 server（`--ignored`，2026-09-30 對本機 wbfuwunel 跑過）：
+  - core `an_encrypted_conversation_survives_a_new_device_over_the_real_server`：alice、bob 各一個 `Core` 登入、鉤子開五條線 → alice refresh、帶 `RoomDevices` 送 → bob 的 `room.message` 是解開的；bob 登第二台裝置 → alice 帶舊的送 → `RoomDevicesChanged`、`data` 是新狀態、訊息沒送 → 帶新狀態同一個 `txn_id` 重送 → bob 的新舊兩台都解得開。
+  - daemon `real_server`：加密房沒帶 `room_devices` 是 1100；`room.refresh_devices` 回的整份當 `room_devices` 帶回去送，成功。
+  - 原有的 sdk `e2e_crypto_engine`（#45 驗收）、`e2e_local_server`、core 房間／金鑰兩條、daemon 兩條都照跑、都過。
+  - ⚠️ 當時那顆 server 是從 wbfuwunel 還沒合併的 `docs/room-version-prev` 分支編的：房間版本號從「只增不減的位置」改成「成員集合的雜湊」（外部審查 #5）。client 本來就把號碼當不透明的值、只比相不相等，所以照常運作；sdk 的 #45 驗收原本寫死「新號碼比舊的大」，改成「不相等」，兩種定義下都成立。

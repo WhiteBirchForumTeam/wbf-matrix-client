@@ -288,12 +288,13 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 ///
 /// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗沒帶 `room_devices` 的送出被拒、🚫 不送明文——1100）。
 ///
-/// ⭐ 刻意讓**兩條上游路線都被真的打到**：
+/// ⭐ 原本刻意讓**兩條上游路線都被真的打到**；#61 起訂閱線常開、自己送的會被推回來寫進本地，`/context` 那條在這個流程裡到不了了
+/// （改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 單元測試守）：
 ///
 /// | 步驟 | 走哪條 | 為什麼一定是它 |
 /// |---|---|---|
 /// | `sync=server` 第一頁 | wbf `Recent{rooms}` | 沒帶 `before`，而 server 講 wbf |
-/// | `sync=server` 第二頁 | **matrix `/context`** | `server` 不寫庫 → 錨點本地查不到 `g_seq` → 只能走 `/context` |
+/// | `sync=server` 第二頁 | wbf `Recent{rooms, before: g_seq}` | 訂閱線推來的已經寫進本地，錨點查得到 `g_seq`（#61 之前這一格是 `/context`） |
 /// | `sync=both` 兩頁 | wbf `Recent{rooms, before: g_seq}` | 第一頁寫進去了，第二頁的錨點本地查得到 |
 /// | `sync=local` | 本地 | 驗 `both` 真的寫進去了，而且本地也能拿 `event_id` 接著翻 |
 ///
@@ -323,6 +324,8 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         )
         .await;
     assert_eq!(reply["code"], 0, "account.add: {reply}");
+    // 訂閱線在背景開（link-pool.md §3.1）：等五條都開好再送，下面送的 7 則才一定會被推回來（訂閱不補訂閱之前的，那是 UI 叫 `sync.recent` 的事）。
+    wait_for_links(&mut client, 5).await;
 
     // wbf 帳號的送訊息走 `Event/Send` 明文：加密房要被拒（1100），而且是送之前問這一刻的 `m.room.encryption`（account-session.md §6）。
     // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
@@ -334,6 +337,22 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
             )
             .await;
         assert_eq!(reply["code"], 1100, "加密房的明文送出要被拒：{reply}");
+        // e2ee-rpc.md 的 RPC 形狀：`room.refresh_devices` 回的整份原樣當 `room_devices` 帶回來，送出去的是密文、帶那個號碼。
+        let refreshed = client
+            .call("room.refresh_devices", json!({ "room": encrypted_room }))
+            .await;
+        assert_eq!(refreshed["code"], 0, "room.refresh_devices: {refreshed}");
+        assert!(
+            refreshed["result"]["members"].get(&user).is_some(),
+            "{refreshed}"
+        );
+        let reply = client
+            .call(
+                "room.send_text",
+                json!({ "room": encrypted_room, "body": "encrypted over the daemon", "room_devices": refreshed["result"] }),
+            )
+            .await;
+        assert_eq!(reply["code"], 0, "加密房帶 room_devices 送得出去：{reply}");
     }
 
     // 送 7 則，記下它們的 event_id（舊到新）。
@@ -377,7 +396,34 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         (ids, next)
     }
 
-    // ── sync=server：第一頁走 wbf，第二頁因為沒寫庫、只能走 /context ──
+    // ── 訂閱線（#61 起 account.add 之後 daemon 自己開）把剛送的 7 則推回來、寫進本地：等它們都到了再往下，🚫 不賭時序 ──
+    let mut local_newest = Vec::new();
+    for _ in 0..100 {
+        let reply = client
+            .call(
+                "room.history",
+                json!({ "room": room, "limit": 7, "sync": "local" }),
+            )
+            .await;
+        local_newest = reply["result"]["events"]
+            .as_array()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(|event| event["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if local_newest == newest_first {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(local_newest, newest_first, "訂閱線推來的 7 則都寫進本地了");
+
+    // ── sync=server：第一頁走 wbf；第二頁的錨點本地查得到（推播寫進去的）→ 也走 wbf `Recent{rooms, before: g_seq}` ──
+    // 📎 #61 之前這裡測的是「錨點不在本地 → 要走 /context → wbf 帳號沒有 Client → 1100」；訂閱線常開之後，自己送的訊息一定會被推回來，
+    //    那條路在這個流程裡到不了了（改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
     let (first, next) = page(&mut client, &room, "server", None).await;
     assert_eq!(first, newest_first[0..3], "server 第一頁（wbf）");
     assert_eq!(
@@ -385,28 +431,11 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         Some(newest_first[2].as_str()),
         "next 是這頁最舊那則"
     );
-    // wbf 帳號沒有 Client 可以走 `/context`：錮點不在本地就明講拒絕（1100；account-session.md §6，等 wbfuwunel #64）。
-    let reply = client
-        .call(
-            "room.history",
-            json!({ "room": room, "limit": 3, "sync": "server", "before": next }),
-        )
-        .await;
+    let (second, _) = page(&mut client, &room, "server", next.as_deref()).await;
     assert_eq!(
-        reply["code"], 1100,
-        "server 第二頁要走 /context，wbf 帳號沒有它：{reply}"
-    );
-
-    // ── sync=local：server 模式不寫庫，所以本地什麼都沒有 → 錨點不在本地要拒答 ──
-    let reply = client
-        .call(
-            "room.history",
-            json!({ "room": room, "limit": 3, "sync": "local", "before": newest_first[2] }),
-        )
-        .await;
-    assert_ne!(
-        reply["code"], 0,
-        "server 模式不寫庫，本地不該有這個錨: {reply}"
+        second,
+        newest_first[3..6],
+        "server 第二頁：錨點本地查得到，走 wbf 接著翻"
     );
 
     // ── sync=both：寫進去；第二頁的錨點本地查得到 → wbf Recent{rooms, before: g_seq} ──

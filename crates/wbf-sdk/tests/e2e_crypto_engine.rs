@@ -654,11 +654,9 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         panic!("stale version must be refused: {stale:?}")
     };
     let current_room_version = current_room_version.expect("1506 carries the current room version");
-    assert!(
-        current_room_version > first.versions.room_version,
-        "{current_room_version} > {}",
-        first.versions.room_version
-    );
+    // 🚫 不比大小：client 把房間版本號當不透明的值，只比相不相等（e2ee-rpc.md）。
+    // server 原本的定義是只增不減的位置，外部審查 #5 之後可能改成成員集合的雜湊（wbfuwunel `docs/room-version-prev` 分支）——兩種定義下「變了」都成立。
+    assert_ne!(current_room_version, first.versions.room_version);
 
     // 6. 修：refresh（跟上一份比 → 只有 Bob 變了 → 只重查 Bob → 房間金鑰補給 B2）。
     let second = alice
@@ -672,8 +670,8 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         "{second:?}"
     );
     assert!(second.diff.left.is_empty());
-    assert!(
-        second.versions.room_version >= current_room_version,
+    assert_ne!(
+        second.versions.room_version, first.versions.room_version,
         "{second:?}"
     );
     assert!(
