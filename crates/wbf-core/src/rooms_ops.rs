@@ -460,8 +460,16 @@ impl Core {
             )
             .await?;
         // 回來的是新到舊（g_seq 遞減），跟 `/messages` 往回翻同一個方向。
-        // 加密的有金鑰就解（維護者 2026-09-29，room_crypto.rs）；引擎開不起來就原樣交出去。
-        let engine = self.olm_engine_of(account).await.ok();
+        // 加密的有金鑰就解（維護者 2026-09-29，room_crypto.rs）；引擎開不起來講一聲、原樣交出去（跟推播、`sync.recent` 兩個入口一樣，PR #62 審查 cirno 🟢）。
+        let engine = match self.olm_engine_of(account).await {
+            Ok(engine) => Some(engine),
+            Err(error) => {
+                self.events.progress(format!(
+                    "history: encrypted messages of {room} stay encrypted: {error}"
+                ));
+                None
+            }
+        };
         let mut incoming = Vec::with_capacity(raws.len());
         for raw in raws {
             incoming.push(crate::room_crypto::to_incoming(engine.as_deref(), room, raw).await);

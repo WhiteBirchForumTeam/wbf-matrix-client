@@ -363,9 +363,9 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 | 3 | **只重查變了的人的裝置**；哪台裝置新了／沒了由狀態機自己比 | `OlmEngine::mark_users_changed(diff.changed)` → `send_outgoing_requests`（KeysQuery 走橋 `0x17 0x21`） | ✅ #48（真 server 驗過：A 靠它才看到 B）。上游 `OlmMachine` 對每台裝置逐台追蹤，回應進來自己算差 |
 | 4 | **自己驗雜湊**：查回來的金鑰照 §3.4 重算 ＝ 清單上那個人的雜湊 → 看到的是同一組 | `OlmEngine::mismatched_device_hashes`（`refresh_room_devices` 裡：對不上再查一次，還不對就 `Protocol` 拒發；`unhashable` 與沒查過的不算） | ✅ 3b（真 server 驗過：第一次就對上，`rechecked` 空） |
 | 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | `OlmEngine::share_room_key(room, users, settings)`（缺 Olm session 先 claim，全走橋） | ✅ #48（真 server 驗過）。分享策略 3b 明確選了 `AllDevices`（`crypto_engine::room_key_share_settings`；交叉簽章做好後換 `IdentityBased`，那是唯一要改的地方） |
-| 6 | **帶房間版本號送出**；對不上 1506 → **daemon 自動補齊金鑰、把錯誤原樣回給 UI 並發「可以送了」的狀態；重送由 UI 決定**（維護者 2026-09-21，§16.6） | `OlmEngine::encrypt_and_send` → `SendOutcome::{Sent, RoomDevicesChanged}`；補金鑰是 `refresh_room_devices(previous)`；重送是再叫一次 `encrypt_and_send`（同 `txn_id`） | ✅ 3b（真 server 驗過整條）；daemon 的 RPC 面未露 |
+| 6 | **帶房間版本號送出**；對不上 1506 → **daemon 自動補齊金鑰、把新的房間狀態放進錯誤的 `data` 一起回給 UI；重送由 UI 決定**（維護者 2026-09-29 精確化，e2ee-rpc.md §3；09-21 版的「另發可以送了的狀態」拿掉了） | `OlmEngine::encrypt_and_send` → `SendOutcome::{Sent, RoomDevicesChanged}`；補金鑰是 `refresh_room_devices(previous)`；重送是再叫一次 `encrypt_and_send`（同 `txn_id`） | ✅ 3b（真 server 驗過整條）；✅ daemon 的 RPC 面 2026-09-29（`room.send_text`＋1401，e2ee-rpc.md） |
 | 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（訂閱 → 拉到追平 → 匯入 → 落地 → 銷毀）✅ #48；成員清單就是第 1 步 | ✅ 方法都在，**什麼時候叫由 UI 決定** |
-| 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；通道收得到推播 ✅ 第 4 階段（`WbfClient::device_subscription` 的 handle；收件匣滿了丟並標 `gap`） | ✅ 通道；❌ 「推來就叫 `refresh_room_devices`」那半在 daemon（§16.6 最後一列）。正確性仍由第 6 步的 1506 守——跟 server 的設計一致：推播是加速，不是正確性來源 |
+| 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta` 解得開 ✅ #46；通道收得到推播 ✅ 第 4 階段（`WbfClient::device_subscription` 的 handle；收件匣滿了丟並標 `gap`） | ✅ 通道；✅ 2026-09-29 daemon 把 `DeviceChanged` 原樣轉成 `devices.changed` 推播，**要不要叫 `refresh_room_devices` 是 UI 的事**（e2ee-rpc.md §4；09-21 版的「daemon 推來就叫」拿掉了）。正確性仍由第 6 步的 1506 守——跟 server 的設計一致：推播是加速，不是正確性來源 |
 | 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()` | ✅ #48（假 server ＋ 真 server）。房間事件的 `Event/Unsubscribe` 跟第 4 階段一起（現在沒訂房間事件） |
 | 10 | **同一台裝置只有一條連線在收**；被接手的那條收到 `Superseded` 要停、不重訂 | `WbfErrorCode::Superseded` 認得 ✅；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點（`Subscription::next` 先回那則 Error、再回 None），訂閱項從表裡拿掉 ✅ 第 4 階段 | ✅ 通道；「通知上層、不重訂」是 daemon 收到 None 之後的事 |
 | 11 | **UI 主導、SDK 自動**：SDK 收到東西自己搞定，UI 只決定什麼時候叫哪個方法 | 上面每一列都是可呼叫的方法；`import_items` 把「匯入 → 落地 → 銷毀」鎖成一步（推來的一包與 `Fetch` 的一窗同一支），UI 拿不到錯的順序 | ✅ 方法層；❌ daemon 的 RPC 面（rpc-spec）還沒把它們露出去 |
@@ -374,11 +374,11 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 第 8、10 步（推播、Superseded）的通道那半第 4 階段做了（`ws-receive-dispatch.md`），剩下「收到之後做什麽」在 daemon。**在那之前這套邏輯已經是正確的，只是慢一拍**——
 被擋一次才知道要重查，而 server 的設計本來就把正確性放在 1506、不放在推播。
 
-🚫 一個刻意沒放在 wbf-sdk 裡的：「上次那份成員清單」不在 SDK 層存——它跟「這輪金鑰發給誰」綁在一起，是 daemon 的狀態（§16.6），放 SDK 會變成第二份會漂移的名單。
+🚫 一個刻意沒放在 wbf-sdk 裡的：「上次那份成員清單」不在 SDK 層存。📌 2026-09-29 維護者定：它**存在 UI**（e2ee-rpc.md §1，`RoomDevices`），送出與 refresh 時帶回來；daemon 也🚫 不存（09-21 這裡寫「是 daemon 的狀態」，作廢）。「這輪金鑰發給誰」由 crypto store 裡上游自己記。
 
 ### 16.6 誰呼叫：UI 與 daemon 的分界（維護者 2026-09-21 定）
 
-> 📌 **2026-09-29 維護者精確化了這一節，權威改在 [e2ee-rpc.md](e2ee-rpc.md)**。下面是 09-21 的版本，留著當歷史；跟 e2ee-rpc.md 不同的地方以那邊為準：
+> 📌 **2026-09-29 維護者精確化了這一節（上面 §16.5 表裡講 daemon 那半的三句也一起就地改了），權威改在 [e2ee-rpc.md](e2ee-rpc.md)**。下面是 09-21 的版本，留著當歷史；跟 e2ee-rpc.md 不同的地方以那邊為準：
 > - **房間版本號與成員的裝置版本號存在 UI**，送出時 UI 自帶（`room.send_text` 的 `room_devices`）；daemon 🚫 不存每房的快照（下表「每房上次那份成員清單由 daemon 存」作廢）。
 > - 被 1506 擋：daemon 自動 refresh，**把新狀態放進錯誤的 `data` 一起回**（RPC 1401）；🚫 不另發「可以送了」的狀態推播。
 > - 送出前一律先分金鑰（第一次、該換、多了裝置三種），daemon 自動做。

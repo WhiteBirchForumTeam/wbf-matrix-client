@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::event_seqs;
 
-/// 解不開的事件沒有更細的原因時用的字（WS 那條路根本不解密）。
+/// 沒有引擎可以解時（`from_ws_json` 那條 fallback）標的原因。有引擎的入口走 `OlmEngine::to_incoming`，解不開帶上游的原因。
 pub const NOT_DECRYPTED_HERE: &str = "NotDecryptedHere";
 
 /// 上游給的一則事件，照**拿到的樣子**分三種。
@@ -32,7 +32,8 @@ pub enum IncomingEvent {
 }
 
 impl IncomingEvent {
-    /// WS（`Event/Recent`）拿到的原始 JSON：這條路不解密，`m.room.encrypted` 就是還沒解的。
+    /// WS（`Event/Recent`／`Push`）拿到的原始 JSON、**沒有引擎可以解時**的 fallback：`m.room.encrypted` 就標成還沒解。
+    /// 有引擎的入口（推播、`room.history`、`sync.recent`）走 `OlmEngine::to_incoming`，有金鑰就當場解（e2ee-rpc.md §6）。
     ///
     /// Args:
     ///     event: example: {"type":"m.room.message","event_id":"$a","sender":"@a:x","origin_server_ts":1,"content":{"body":"hi"}}

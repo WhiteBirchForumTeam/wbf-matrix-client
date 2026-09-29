@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use wbf_sdk::channel::{Channel, WsChannel};
 use wbf_sdk::client::WbfClient;
 use wbf_sdk::login::{Session, SessionBackend};
+use wbf_sdk::protocol::{
+    BridgedEndpoint, BRIDGE_KEYS_CLAIM, BRIDGE_KEYS_QUERY, BRIDGE_KEYS_UPLOAD, BRIDGE_MEMBERS,
+    BRIDGE_SEND_TO_DEVICE, BRIDGE_STATE_EVENT,
+};
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
 use wbf_sdk::WsLink;
 use wbf_wire::pack::{control, device, event, flags};
@@ -193,7 +197,7 @@ pub(crate) struct FakeServer {
     pub(crate) fail_next_fetch: Arc<std::sync::atomic::AtomicBool>,
     /// 走橋的呼叫：(kind, subtype)，照收到的順序。
     pub(crate) bridge_calls: Arc<Mutex<Vec<(Kind, u8)>>>,
-    /// 橋 `Members`（`0x13/0x29`）回的 body；None → `Forbidden`。
+    /// 橋 `Members`（`BRIDGE_MEMBERS`）回的 body；None → `Forbidden`。
     pub(crate) members: Arc<Mutex<Option<Value>>>,
     /// 橋 `GetStateEvent` 問 `m.room.encryption` 時：true 回 megolm 的 content，false 回 404（沒加密）。
     pub(crate) room_is_encrypted: Arc<std::sync::atomic::AtomicBool>,
@@ -531,34 +535,39 @@ fn bridged_reply(
                 .into_bytes(),
         )
     };
-    match (pack.kind, pack.subtype) {
-        (Kind::Room, 0x29) => match members.lock().unwrap().clone() {
+    // 編號用 sdk 的具名常數（wbfuwunel bridge-specs），🚫 不手寫 hex：常數改了這裡跟著走（PR #62 審查 rumia／cirno 🟡2）。
+    let is =
+        |endpoint: BridgedEndpoint| (pack.kind, pack.subtype) == (endpoint.kind, endpoint.subtype);
+    if is(BRIDGE_MEMBERS) {
+        match members.lock().unwrap().clone() {
             Some(body) => ok(body),
             None => rejected("Forbidden", 1302, 403, "M_FORBIDDEN"),
-        },
-        (Kind::Event, 0x22) => {
-            if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
-                ok(json!({ "algorithm": "m.megolm.v1.aes-sha2" }))
-            } else {
-                rejected("NotFound", 1501, 404, "M_NOT_FOUND")
-            }
         }
-        (Kind::Keys, 0x20) => ok(json!({ "one_time_key_counts": { "signed_curve25519": 50 } })),
-        (Kind::Keys, 0x21) => {
-            // 問到的每個人都要有一個條目（哪怕是空的）：上游對沒回答的人會一直重查。
-            let asked: Value = serde_json::from_slice(&pack.data).unwrap_or_default();
-            let device_keys: serde_json::Map<String, Value> = asked["device_keys"]
-                .as_object()
-                .map(|users| users.keys().map(|user| (user.clone(), json!({}))).collect())
-                .unwrap_or_default();
-            ok(
-                json!({ "device_keys": device_keys, "failures": {}, "master_keys": {},
-                       "self_signing_keys": {}, "user_signing_keys": {} }),
-            )
+    } else if is(BRIDGE_STATE_EVENT) {
+        if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
+            ok(json!({ "algorithm": "m.megolm.v1.aes-sha2" }))
+        } else {
+            rejected("NotFound", 1501, 404, "M_NOT_FOUND")
         }
-        (Kind::Keys, 0x22) => ok(json!({ "one_time_keys": {}, "failures": {} })),
-        (Kind::Device, 0x25) => ok(json!({})),
-        _ => rejected("UnknownKind", 1101, 400, "M_UNRECOGNIZED"),
+    } else if is(BRIDGE_KEYS_UPLOAD) {
+        ok(json!({ "one_time_key_counts": { "signed_curve25519": 50 } }))
+    } else if is(BRIDGE_KEYS_QUERY) {
+        // 問到的每個人都要有一個條目（哪怕是空的）：上游對沒回答的人會一直重查。
+        let asked: Value = serde_json::from_slice(&pack.data).unwrap_or_default();
+        let device_keys: serde_json::Map<String, Value> = asked["device_keys"]
+            .as_object()
+            .map(|users| users.keys().map(|user| (user.clone(), json!({}))).collect())
+            .unwrap_or_default();
+        ok(
+            json!({ "device_keys": device_keys, "failures": {}, "master_keys": {},
+                   "self_signing_keys": {}, "user_signing_keys": {} }),
+        )
+    } else if is(BRIDGE_KEYS_CLAIM) {
+        ok(json!({ "one_time_keys": {}, "failures": {} }))
+    } else if is(BRIDGE_SEND_TO_DEVICE) {
+        ok(json!({}))
+    } else {
+        rejected("UnknownKind", 1101, 400, "M_UNRECOGNIZED")
     }
 }
 

@@ -132,6 +132,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 | cache 裡還沒解的要怎麼補解、要不要通知 | `room_crypto::decrypt_stored` | 金鑰到了（`announce: true`）與 `Recent` 拉完（`false`）共用 |
 | 被 1506 擋之後做什麼 | `Core::wbf_send_encrypted` | 自動 refresh、組 `data` |
 | 這個房加密了沒 | `Core::wbf_is_room_encrypted`（問 `m.room.encryption` 這一項，🚫 不用快取） | 問不到就是錯，🚫 不當成沒加密 |
+| 走橋的每支端點是哪個 kind／subtype | sdk `protocol.rs` 的 `BRIDGE_*` 常數（對 wbfuwunel `docs/design/bridge-specs/`） | core 的假 server（`test_support::bridged_reply`）也吃這些常數，🚫 不手寫 hex |
 
 ## 8. 不在這支（已知的缺口）
 
@@ -139,6 +140,8 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
 - **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，e2ee-walkthrough §16）。
+- **補解寫失敗的那批不會自動重試**（PR #62 審查 rumia 🟡1）：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
+  那把金鑰已經匯入，之後不會再觸發補解（只有同一把金鑰再來才會）。要不要加一個觸發點（例如 `room.history` 讀到未解的就試一次）待維護者決定。
 - 沒對真 server 跑過（寫這支時本機的 wbfuwunel build 被清掉了）：§9 的測試全是假 server；真 server 的 e2e 等 server 重編後補跑。
 
 ## 9. 測試

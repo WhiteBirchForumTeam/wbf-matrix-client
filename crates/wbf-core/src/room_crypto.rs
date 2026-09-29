@@ -294,9 +294,16 @@ pub(crate) async fn decrypt_stored(
     };
     let count = opened.len();
     let (me_here, room_here) = (me.to_string(), room.to_string());
+    // 寫失敗：這批解開的明文沒存進去、也不發 `room.message`（沒落地的不通知）。密文還在 cache，錯誤帶上則數回給呼叫端講出來（PR #62 審查 rumia 🟡1）。
     cache
         .run(move |cache| cache.upsert_events(&me_here, &room_here, &opened))
-        .await?;
+        .await
+        .map_err(|error| {
+            CoreError::new(
+                error.kind,
+                format!("{count} newly decrypted message(s) in {room} could not be stored (they stay encrypted in the cache): {error}"),
+            )
+        })?;
     // commit 之後才發（PR #32 的規矩）。
     for notice in notices {
         events.emit(notice);

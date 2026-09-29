@@ -719,7 +719,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|call| **call == (Kind::Keys, 0x20))
+                .filter(|call| {
+                    **call
+                        == (
+                            wbf_sdk::protocol::BRIDGE_KEYS_UPLOAD.kind,
+                            wbf_sdk::protocol::BRIDGE_KEYS_UPLOAD.subtype,
+                        )
+                })
                 .count()
         };
         // 開線上傳一次（裝置金鑰＋一次性金鑰＋fallback key）。等 server 跟著 Subscribe 推的第一個 `CryptoState` 也處理完再數：

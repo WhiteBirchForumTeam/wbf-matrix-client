@@ -250,7 +250,8 @@ pub(crate) async fn pull_recent(
                 .is_some()
         });
         skipped_without_room += without_room.len();
-        // `upsert_events` 一次一個房間：照 room_id 分組，原樣寫（這條路不解密，local-cache-db.md §7.2）。
+        // `upsert_events` 一次一個房間：照 room_id 分組。這個回呼是同步的、不能等解密，所以先原樣寫；
+        // 整輪 `recent_sync` 回來之後，下面用 `decrypt_stored(… EventIds …)` 把這輪的密文補解（e2ee-rpc.md §6）。
         let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
             std::collections::BTreeMap::new();
         for raw in with_room {

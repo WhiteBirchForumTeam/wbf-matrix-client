@@ -286,7 +286,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
 /// 🚨 **房間歷史往回翻，定位一律是 `event_id`**（wbfuwunel #51；維護者 2026-09-14）。
 ///
-/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗明文送出被拒）。
+/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗沒帶 `room_devices` 的送出被拒、🚫 不送明文——1100）。
 ///
 /// ⭐ 刻意讓**兩條上游路線都被真的打到**：
 ///

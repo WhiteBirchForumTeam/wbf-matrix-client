@@ -487,7 +487,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 | code | `data` |
 |---|---|
-| 1401 `room_devices_changed` | 重拿成功：`{ room_version, members, shared, txn_id }`——前三個就是新的 `room_devices`（UI 存下、重送時帶回來），`txn_id` 是這則用的（UI 沒給的話是 daemon 產的，重送用同一個）。重拿也失敗：`{ txn_id, current_room_version }`，UI 自己叫 `room.refresh_devices` |
+| 1401 `room_devices_changed` | 重拿成功：`{ room_version: u64, members: { mxid: "序號-雜湊" }, shared: 非負整數, txn_id: string }`——前三個就是新的 `room_devices`（UI 存下、重送時帶回來），`txn_id` 是這則用的（UI 沒給的話是 daemon 產的，重送用同一個）。重拿也失敗：`{ txn_id: string, current_room_version: u64 或 null }`（server 沒給號碼時是 null），UI 自己叫 `room.refresh_devices` |
 
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）
 
