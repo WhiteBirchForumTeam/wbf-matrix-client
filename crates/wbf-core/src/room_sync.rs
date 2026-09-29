@@ -2,9 +2,9 @@
 //!
 //! 維護者 2026-09-22／23 定的形狀（room-sync.md §0）：
 //!
-//! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Subscriptions` 就送 `Event/Subscribe`、起一個收推播的 task；其他角色不做事。
-//!   線死了、下次要用重開時自然重訂（link-pool.md §3）。訂閱會話結束（server 送 `Error`）時 socket 可能還活著，池看不出來——
-//!   task 收攤時自己把那格關掉，「重開就重訂」在這條路才成立；🚫 關線不是重訂（to-device-client.md §5.1：被接手的不重訂），重訂要等下一個 `open_subscriptions`。
+//! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Rooms` 就送 `Event/Subscribe`、起一個收推播的 task；`Keys` 是金鑰那半（`key_sync.rs`）。
+//!   線死了、重開時自然重訂（link-pool.md §3）。訂閱會話結束（server 送 `Error`）時 socket 可能還活著，池看不出來——
+//!   task 收攤時自己把那格關掉，「重開就重訂」在這條路才成立；🚫 關線不是重訂，重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
 //! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`。**🚫 不碰水位、不記洞、不補窗**。
 //! - 水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動；推播漏掉的（server 的 `gap`、本地丟包、一包解不開、寫失敗）**都不管**：
 //!   UI 下次叫 `Recent` 會從它自己決定的起點重拉那一段（冪等），UI 不叫就不補，永遠拿不到也不管。誰記有沒有漏是 UI 層的事。
@@ -18,15 +18,14 @@ use wbf_sdk::channel::Channel;
 use wbf_sdk::client::{RoomSubscription, WbfClient};
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::protocol::{EventSubscribeReply, PushMeta};
-use wbf_sdk::{IncomingEvent, Transport};
+use wbf_sdk::IncomingEvent;
 
 use crate::accounts::AccountDir;
-use crate::backend_choice::MethodHome;
 use crate::error::CoreError;
 use crate::event::{EventSink, LinkState};
 use crate::link_pool::{LinkPool, LinkRole};
 use crate::server_cache::ServerCache;
-use crate::{Core, CoreEvent, Target};
+use crate::{Core, CoreEvent};
 
 /// 等 `Subscribe` 的 Ack 最久多久。
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,11 +60,12 @@ impl Core {
     ///
     /// | 角色 | 做什麼 |
     /// |---|---|
-    /// | `Subscriptions` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了）；訂閱結束時 task 關這格線。再來金鑰那半：`Device/Subscribe` → 追平 → 收金鑰的 task（`key_sync.rs`） |
+    /// | `Rooms` | `Event/Subscribe`（帳號層、不帶 `cg_seq`）→ Ack 之後起收推播的 task（之前有的話換掉：它的線已經死了）；訂閱結束時 task 關這格線 |
+    /// | `Keys` | `Device/Subscribe` → 追平 → 收金鑰的 task（`key_sync.rs`）；訂閱結束時 task 關這格線 |
     /// | 其他 | 不做事 |
     ///
     /// Args:
-    ///     role: 這條線的角色, example: LinkRole::Subscriptions
+    ///     role: 這條線的角色, example: LinkRole::Rooms
     ///     client: 已經 hello 過的線
     /// Return:
     ///     Ok(())
@@ -78,9 +78,19 @@ impl Core {
         role: LinkRole,
         client: &mut WbfClient<Channel>,
     ) -> Result<(), CoreError> {
-        if role != LinkRole::Subscriptions {
-            return Ok(());
+        match role {
+            LinkRole::Rooms => self.init_rooms(account, client).await,
+            LinkRole::Keys => self.init_keys(account, client).await,
+            LinkRole::Misc | LinkRole::Upload | LinkRole::Download => Ok(()),
         }
+    }
+
+    /// 房間那條線開好之後：`Event/Subscribe` → 起收推播的 task。
+    async fn init_rooms(
+        &self,
+        account: &AccountDir,
+        client: &mut WbfClient<Channel>,
+    ) -> Result<(), CoreError> {
         let (cache, me) = self.server_cache_and_me(account)?;
         let pool = self.pool_of_account(account)?;
         let subscription = client.room_subscription(None, ACK_TIMEOUT).await?;
@@ -101,52 +111,7 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
-        // 金鑰那半：同一條線上另一個會話（key_sync.rs）。失敗就是這條線沒開成：房間那個 task 會因線被丟掉而自己結束。
-        self.init_keys(account, client).await?;
         Ok(())
-    }
-
-    /// 開訂閱線（開的時候 `init_connection` 就訂了）。已經開著就是 no-op。
-    ///
-    /// Return:
-    ///     Ok(())
-    ///     Err(Usage)      沒登入、不是 wbf server（訂閱只有 wbf 講得出來）
-    ///     Err(Network)    線開不起來、Ack 沒等到
-    pub async fn open_subscriptions(&self, target: &Target) -> Result<(), CoreError> {
-        let account = self.account_or_current(target)?;
-        let _line = self
-            .client_of(
-                &account,
-                Transport::WebSocket,
-                MethodHome::WbfSdkOnly,
-                LinkRole::Subscriptions,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// 關訂閱線：先收 task，再關線（斷線 server 自動退訂）。
-    ///
-    /// Return:
-    ///     Ok(true)    本來開著，關了
-    ///     Ok(false)   本來就沒開
-    pub async fn close_subscriptions(&self, target: &Target) -> Result<bool, CoreError> {
-        let account = self.account_or_current(target)?;
-        self.stop_room_sync_of(&account).await;
-        self.stop_key_sync_of(&account).await;
-        let pool = self
-            .link_pools
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&account.dir)
-            .cloned();
-        Ok(match pool {
-            Some(pool) => {
-                pool.close(LinkRole::Subscriptions, "closed on request")
-                    .await
-            }
-            None => false,
-        })
     }
 
     /// 收掉這個帳號的收推播 task（關線、登出用）。
@@ -228,12 +193,12 @@ impl RoomSyncTask {
             };
             let reason = format!("the room subscription ended: {why}");
             // 訂閱會話結束了 socket 可能還活著（server 送 Error，例如被另一台裝置接手），池的殞死偵測看不出來：
-            // 這裡把那格關掉、池發 closed；下次 open_subscriptions 才重開、重訂（🚫 不在這裡重訂）。
+            // 這裡把那格關掉、池發 closed；下次鉤子（link_keeper.rs）才重開、重訂（🚫 不在這裡重訂）。
             // 線不在池裡（已經被別人關了）就只講一聲。
-            if !self.pool.close(LinkRole::Subscriptions, &reason).await {
+            if !self.pool.close(LinkRole::Rooms, &reason).await {
                 self.events.emit(CoreEvent::Link {
                     user: self.me.clone(),
-                    role: LinkRole::Subscriptions,
+                    role: LinkRole::Rooms,
                     state: LinkState::Closed,
                     reason: Some(reason),
                 });
@@ -444,25 +409,7 @@ mod tests {
             (Some(4950), Some(5000))
         );
 
-        // 關訂閱線：task 收掉、那一格 Idle、發 Closed。
-        assert!(core.close_subscriptions(&Target::default()).await.unwrap());
-        assert!(!core.is_room_syncing(&account));
-        assert_eq!(pool.open_count(), 1, "只關訂閱那條，misc 還開著");
-        let closed = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
-            matches!(
-                event,
-                CoreEvent::Link {
-                    role: LinkRole::Subscriptions,
-                    state: LinkState::Closed,
-                    ..
-                }
-            )
-        });
-        assert!(closed, "關線要發 link.state closed");
-        assert!(
-            !core.close_subscriptions(&Target::default()).await.unwrap(),
-            "再關一次：本來就沒開"
-        );
+        assert!(core.is_room_syncing(&account), "UI 叫 Recent 不影響訂閱");
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -509,7 +456,7 @@ mod tests {
         let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let (mut client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+        core.init_connection(&account, LinkRole::Rooms, &mut client)
             .await
             .expect("subscribe");
         // 對方收攤。
@@ -522,7 +469,7 @@ mod tests {
         .await;
         let closed = std::iter::from_fn(|| seen.try_recv().ok()).find_map(|event| match event {
             CoreEvent::Link {
-                role: LinkRole::Subscriptions,
+                role: LinkRole::Rooms,
                 state: LinkState::Closed,
                 reason,
                 ..
@@ -540,7 +487,7 @@ mod tests {
     }
 
     /// server 收掉訂閱會話、socket 還活著（例如被另一台裝置接手的 `Error`）：task 把那格關掉（池發 `closed` 帶原因）、🚫 不自己重訂；
-    /// 下一次開訂閱線走 `open` → `init_connection` → 第二個 `Subscribe`、新訂閱收得到（PR #58 審查 rumia #655／cirno #658：
+    /// 下一次開這條線（鉤子的 `ensure_open`，底下是同一支 `acquire`）走 `open` → `init_connection` → 第二個 `Subscribe`、新訂閱收得到（PR #58 審查 rumia #655／cirno #658：
     /// 之前 task 只發事件不關線，池看 socket 還活著就把舊線交回去，永遠不再訂）。
     #[tokio::test]
     async fn an_ended_subscription_closes_the_line_so_the_next_open_subscribes_again() {
@@ -574,7 +521,7 @@ mod tests {
         );
         let closed = std::iter::from_fn(|| seen.try_recv().ok()).find_map(|event| match event {
             CoreEvent::Link {
-                role: LinkRole::Subscriptions,
+                role: LinkRole::Rooms,
                 state: LinkState::Closed,
                 reason,
                 ..
@@ -593,9 +540,9 @@ mod tests {
         let (mut client, fake_again) = memory_client_with_hello(events.clone()).await;
         let (core_ref, account_ref) = (&core, &account);
         drop(
-            pool.acquire(LinkRole::Subscriptions, || async move {
+            pool.acquire(LinkRole::Rooms, || async move {
                 core_ref
-                    .init_connection(account_ref, LinkRole::Subscriptions, &mut client)
+                    .init_connection(account_ref, LinkRole::Rooms, &mut client)
                     .await?;
                 Ok(client)
             })
@@ -626,7 +573,7 @@ mod tests {
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![text_event(7)]));
         let (mut client, fake) = memory_client_with_hello(events).await;
         *fake.early_push.lock().unwrap() = Some((0, true, vec![text_event(7)]));
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+        core.init_connection(&account, LinkRole::Rooms, &mut client)
             .await
             .expect("subscribe");
         let mut gap_reported = false;
@@ -649,8 +596,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 對真的 wbfuwunel：alice 登入、開訂閱線；bob（另一個 `Core`、另一個資料目錄）用 `Event/Send` 送一則；alice 的 `room.message` 在時限內到、
-    /// cache 有它、水位不動；關訂閱線；兩邊登出。
+    /// 對真的 wbfuwunel：alice 登入、鉤子開五條線（`ensure_links`）；bob（另一個 `Core`、另一個資料目錄）用 `Event/Send` 送一則；alice 的 `room.message` 在時限內到、
+    /// cache 有它、水位不動；兩邊登出（task 跟著收掉）。
     ///
     /// `--ignored`；環境變數：`WBF_E2E_SERVER`、`WBF_E2E_USER`（完整 mxid）、`WBF_E2E_PASSWORD_FILE`、`WBF_E2E_USER_B`、`WBF_E2E_PASSWORD_B_FILE`、
     /// `WBF_E2E_ROOM`（兩人都在的明文房）。
@@ -688,10 +635,9 @@ mod tests {
         let account_a = core_a.current_account().unwrap();
         let mut seen = core_a.subscribe();
 
-        core_a
-            .open_subscriptions(&Target::default())
-            .await
-            .expect("subscribe over the real server");
+        let ensured = core_a.ensure_links().await;
+        assert!(ensured.failed.is_empty(), "五條都開得起來：{ensured:?}");
+        assert_eq!(ensured.opened.len(), 5, "五條都是這次開的：{ensured:?}");
         assert!(core_a.is_room_syncing(&account_a));
 
         let body = format!("room sync e2e {}", std::process::id());
@@ -723,15 +669,11 @@ mod tests {
         assert_eq!(cached.len(), 1, "commit 之後才發事件，所以此刻庫裡一定有");
         assert_eq!(cg_seq_of(&core_a, &account_a).await, None, "推播不碰水位");
 
-        assert!(core_a
-            .close_subscriptions(&Target::default())
-            .await
-            .unwrap());
-        assert!(!core_a.is_room_syncing(&account_a));
         core_a
             .log_out(&user_a, None, true, true)
             .await
             .expect("alice logs out");
+        assert!(!core_a.is_room_syncing(&account_a), "登出收掉 task");
         core_b
             .log_out(&user_b, None, true, true)
             .await

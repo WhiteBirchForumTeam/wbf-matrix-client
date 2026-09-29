@@ -151,6 +151,10 @@ id = 它自己當初 Subscribe 用的 id
   但**它仍然是活的**：重連只會再觸發一次搶佔。
 - 🚨 **絕對不要自動重訂**：對面也會被我們踢掉，然後它也重訂，兩條互踢到天荒地老。
   正確的反應是**停掉這條的 to-device 收取，並讓上層知道**（另一個地方接手了）。
+- 📌 **2026-09-29 起的實際做法**（維護者：「如果哪個被 close，應該嘗試再開」，link-pool.md §3.1）：收金鑰的 task 收到 1505 就停、發 `keys.state: stopped`、
+  **關掉金鑰那條線**；daemon 的看線迴圈下一輪（15 秒後）重開、重訂。這不是上面那種「原地馬上重訂」：
+  同一個裝置 id 只有這個資料目錄的 session 有，而資料目錄同時只有一個 daemon 能寫——真正會接手我們的，是我們自己那條已經半死、server 還沒發現的舊連線。
+  要是真有兩個程式拿同一個 session（資料目錄被整份複製），兩邊會每 15 秒互相接手一次，而不是無間斷地互踢；那是複製資料目錄的錯。
 
 📎 為什麼 server 選搶佔而不是拒絕：**卡死的代價不對稱**。搶佔最壞是重推一次**還在佇列裡**
 的東西（那些項目沒被銷毀）；拒絕最壞是先來的其實已經死了（半開連線），於是到 idle timeout
@@ -222,7 +226,7 @@ Session/Login
 | 2 | 八個 subtype 的 meta 型別與 `counts`／`tc × 8 byte` 的編解碼 | `wbf-sdk/src/protocol.rs` 的 Device 段：`device_fetch`／`device_subscribe`／`device_items_destroy`、`parse_device_batch`、`parse_items_destroyed`、`parse_subscribe_reply`、`CryptoStateMeta` | ✅ 對 server 向量逐 byte；`WbfClient::device_fetch_window`／`device_subscribe`／`device_items_destroy` |
 | 3 | `cd_seq` 與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），🚫 不進 `cache.db` | ✅ |
 | 4 | 訂閱／補洞／匯入／銷毀的狀態機 | core `key_sync.rs`（[key-sync.md](key-sync.md)）：訂閱線開好就 `Device/Subscribe` → `pull_to_device` 追平 → 收金鑰的 task；推來的與拉的都走 `OlmEngine::import_items`（維護者 2026-09-24：同一支）；gap／匯失敗／壞包就從佇列頭再拉 | ✅ 2026-09-24；🚫 `Subscribe`／`Fetch` 都不帶 `cd_seq`（2026-09-26，wbfuwunel #87） |
-| 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點；core 的 task 收到就停、發 `keys.state: stopped`，🚫 不重訂、🚫 不關線 | ✅ 2026-09-24 |
+| 5 | `Superseded`(1505) 的處理（§5.1） | 錯誤詞表已有 1505；它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點；core 的 task 收到就停、發 `keys.state: stopped`，🚫 不原地重訂；2026-09-29 起關掉金鑰那條線、由看線迴圈下一輪重開（§5.1 的📌） | ✅ 2026-09-24 |
 | 6 | 說出口的退出（§4）：下線前 `Unsubscribe` 解除持有 | `WbfClient::device_unsubscribe()`；core 登出前叫（`unsubscribe_keys_of`） | ✅ 2026-09-24 |
 | 7 | 「匯入 → 落地 → 銷毀」鎖成一步，呼叫者拿不到錯的順序 | `crypto_engine::OlmEngine::import_items`（吃「一批 items」：`Fetch` 的一窗、或推來的一包）／`pull_to_device` | ✅ 對真 server 走通 |
 

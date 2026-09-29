@@ -62,6 +62,7 @@ mod handles;
 /// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
 pub mod job;
 mod key_sync;
+mod link_keeper;
 /// 連線池（link-pool.md）：一個帳號五條線。
 pub mod link_pool;
 mod login_ops;
@@ -92,6 +93,7 @@ pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, Uplo
 pub use error::{CoreError, CoreErrorKind};
 use event::EventSink;
 pub use event::{CoreEvent, KeysState, LinkState, SyncState};
+pub use link_keeper::EnsuredLinks;
 pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};

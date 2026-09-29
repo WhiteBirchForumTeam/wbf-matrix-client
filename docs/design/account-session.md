@@ -69,9 +69,10 @@
 - 🚫 池裡不存「登出了沒」：真相是 server 的 token 表與本地的 `session.sealed`；「登出中」是**帳號**的狀態，記在 `Core`（跟生命週期鎖同一層），不是池的。
 - WS 過期或被撤由 server 每個 message 重驗、關 1008；client 不特別處理，池下次取用看到 `is_closed` 就重開（開不起來就是 hello 被拒 → 錯原樣回）。
 
-## 5. 四條線（暫時）
+## 5. 五條線
 
-`Misc`、`Upload`、`Download`、`Subscriptions`（房間事件與金鑰事件共用）。server 每台裝置預設 4 條 WS（`wbf_ws_max_connections_per_device`），先不動 server；將來要分開就是多一個角色（link-pool.md §1）。
+`Misc`、`Upload`、`Download`、`Rooms`、`Keys`（link-pool.md §1）。2026-09-21 落地時房間與金鑰共用一條（`Subscriptions`，server 那時每台裝置預設 4 條 WS）；
+server #85 把上限放到 8 之後，2026-09-29 拆成兩條，而且由 daemon 在解鎖／登入之後全開、常駐時看著（link-pool.md §3.1）。
 
 ## 6. wbf 帳號暫時做不到的（PR B 落地後、E2EE 與備份搬家之前）
 

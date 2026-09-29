@@ -663,7 +663,7 @@ let response = tokio::select! {
 | 5 | `cancel`（§9） | ❌ |
 | 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ✅ 2026-09-22：codec 對著 server 向量、`WbfClient::room_subscription`／core `room_sync.rs`（`design/room-sync.md`：池開線的 `init_connection` 訂、背景收推播寫快取、不碰水位；補窗與漏包都是 UI 叫 `sync.recent`（多 `since`）的事；🚫 還沒接 RPC） |
 | 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | 🔧 連線的部分 2026-09-21 做了（`link-pool.md`：一個帳號五條線的池、要用才開、斷了下次再開、登出全關、每個收到的 pack 變 `CoreEvent::Received`）；收事件迴圈→寫庫→發 `room.message` 還沒（要第 6 階段的 codec） |
-| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | ❌ |
+| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 🔁 線的那半做了（2026-09-29，link-pool.md §3.1：解鎖／登入後開、背景每 15 秒看、失敗加倍）；task panic 收攤、重探 backend 還沒 |
 | 9 | **已讀三層**（§6）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | ❌ |
 
 ⚠️ 順序有兩條刻意的：**階段 2 排在推播前面**（先確定兩個帳號一起寫不會炸，再談把事件送出去）；
