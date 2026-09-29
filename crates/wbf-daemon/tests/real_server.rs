@@ -5,7 +5,7 @@
 //!   WBF_E2E_USER          example: @alice:localhost
 //!   WBF_E2E_PASSWORD_FILE 整檔就是密碼（去掉結尾一個換行）
 //!
-//! 流程：vault.create（**passphrase 模式**）→ account.add → account.whoami → server.ping（WS）
+//! 流程：vault.create（**passphrase 模式**）→ account.add（鉤子在背景開五條線）→ account.whoami → server.ping（WS）
 //! → room.list（local 與 both，後者走橋）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
 //! → account.del。每一步看 code，🚫 不看 msg。
 //!
@@ -51,6 +51,18 @@ async fn start_daemon(data_dir: &std::path::Path) -> Daemon {
 /// 然後確認舊 port 真的不收連線了。
 ///
 /// ⭐ 這裡刻意不用「丟掉 task」那種便宜作法：那樣就算 shutdown 整條壞掉測試也會綠。
+/// 鉤子在背景開線（`vault.unlock`／`account.add` 之後，link-pool.md §3.1）：等 `daemon.info` 的線數到 `want`。
+async fn wait_for_links(client: &mut Client, want: u64) -> Value {
+    for _ in 0..150 {
+        let info = client.call("daemon.info", Value::Null).await;
+        if info["result"]["links"] == want {
+            return info;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("the daemon never reached {want} open links");
+}
+
 async fn stop_daemon(daemon: Daemon, mut client: Client) {
     let reply = client.call("daemon.shutdown", Value::Null).await;
     assert_eq!(reply["code"], 0, "daemon.shutdown: {reply}");
@@ -171,20 +183,15 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "whoami: {reply}");
     assert_eq!(reply["result"]["user_id"], user);
 
-    // 還沒碰過上游的 WS：連線池是空的（link-pool.md §3：要用才開）。
-    assert_eq!(info["result"]["links"], 0, "{info}");
+    // 登入成功就觸發鉤子：五條線（misc、upload、download、rooms、keys）在背景開起來（link-pool.md §3.1）。
+    wait_for_links(&mut client, 5).await;
 
-    // WS：Hello／Ping。
+    // WS：Hello／Ping。走已經開著的 misc，🚫 不再開一條。
     let reply = client.call("server.ping", json!({})).await;
     assert_eq!(reply["code"], 0, "ping: {reply}");
     assert!(reply["result"]["features"].is_array(), "{reply}");
-    // 開了一條（misc）；再 ping 一次走同一條，不是再開一條。
     let info = client.call("daemon.info", Value::Null).await;
-    assert_eq!(info["result"]["links"], 1, "{info}");
-    let reply = client.call("server.ping", json!({})).await;
-    assert_eq!(reply["code"], 0, "second ping: {reply}");
-    let info = client.call("daemon.info", Value::Null).await;
-    assert_eq!(info["result"]["links"], 1, "同一條 misc 線：{info}");
+    assert_eq!(info["result"]["links"], 5, "同一條 misc 線：{info}");
 
     let reply = client.call("room.list", json!({})).await;
     assert_eq!(reply["code"], 0, "room.list: {reply}");
@@ -248,13 +255,10 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     // 沒 recovery key：閘門擋（1021）；accept_history_loss 才過。
     let reply = client.call("account.del", json!({ "user": user })).await;
     assert_eq!(reply["code"], 1021, "gate: {reply}");
-    // 重開之後的 daemon 還沒碰上游：池是空的；ping 一次就開一條。
-    let info = client.call("daemon.info", Value::Null).await;
-    assert_eq!(info["result"]["links"], 0, "{info}");
+    // 重開之後解鎖就觸發鉤子：五條線又開起來。
+    wait_for_links(&mut client, 5).await;
     let reply = client.call("server.ping", json!({})).await;
     assert_eq!(reply["code"], 0, "ping after restart: {reply}");
-    let info = client.call("daemon.info", Value::Null).await;
-    assert_eq!(info["result"]["links"], 1, "{info}");
 
     let reply = client
         .call(

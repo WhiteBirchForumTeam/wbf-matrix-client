@@ -62,6 +62,7 @@ mod handles;
 /// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
 pub mod job;
 mod key_sync;
+mod link_keeper;
 /// 連線池（link-pool.md）：一個帳號五條線。
 pub mod link_pool;
 mod login_ops;
@@ -92,6 +93,7 @@ pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, Uplo
 pub use error::{CoreError, CoreErrorKind};
 use event::EventSink;
 pub use event::{CoreEvent, KeysState, LinkState, SyncState};
+pub use link_keeper::EnsuredLinks;
 pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
@@ -204,6 +206,8 @@ pub struct Core {
     pub(crate) crypto_engines: tokio::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<wbf_sdk::crypto_engine::OlmEngine>>,
     >,
+    /// 「該開的線都開著嗎」的鉤子正在跑一輪（`link_keeper.rs`）：同時只跑一輪，後到的跳過（PR #61 審查 salvia／cirno 🟢）。
+    pub(crate) ensuring_links: std::sync::atomic::AtomicBool,
 }
 
 impl Core {
@@ -226,6 +230,7 @@ impl Core {
             room_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
             crypto_engines: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ensuring_links: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

@@ -24,7 +24,7 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
 | **連線** | `link.rs` | 把上面兩個接起來：`WsLink` 起兩個 task、給呼叫端「登記 → 送 → 等」的 API；關線時把表清掉 | 重連。那是第 8 階段監督者的事 |
 | 通道 | `channel.rs`（既有） | `WsChannel` 變成 `WsLink` 的薄殼，`PackChannel` 介面**不動**：`HttpChannel`、假 server、`WbfClient` 一個字不改 | |
 
-⭐ 四條線的設計（architecture-v2 §6.1.1：房間、金鑰、媒體、雜項）**不進這一層**。一條 `WsLink` 一張表；daemon 開四條就是四個實例，
+⭐ 分線的設計（architecture-v2 §6.1.1：房間、金鑰、媒體、雜項；落地是五條，link-pool.md §1）**不進這一層**。一條 `WsLink` 一張表；daemon 開五條就是五個實例，
 哪個命令走哪條線由 daemon 決定，link 自己不知道它是做什麼的。這就是「通用」：只用一條線也行，只是擠。
 
 ## 2. 會話表的鍵：`id` 是會話的名字，`seq` 是會話內的計數

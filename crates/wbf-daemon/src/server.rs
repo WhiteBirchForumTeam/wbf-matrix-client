@@ -48,9 +48,11 @@ impl RpcServer {
         self.listener.local_addr()
     }
 
-    /// 一直 accept，直到 `daemon.shutdown`。
+    /// 一直 accept，直到 `daemon.shutdown`。常駐的這段期間，背景還有一個看線的迴圈（`Handle::keep_links_open`），跟著一起停。
     pub async fn run(self) {
         let mut shutdown = self.handle.shutdown_signal();
+        let keeper = tokio::spawn(self.handle.clone().keep_links_open());
+        let _stop_keeper_on_return = AbortOnDrop(keeper);
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
@@ -69,6 +71,15 @@ impl RpcServer {
                 }
             }
         }
+    }
+}
+
+/// 丟掉就 abort 那個 task：`run` 不管怎麼結束（shutdown、或整個 future 被丟掉），看線的迴圈都跟著停，🚫 不留一個握著 `Handle` 的孤兒。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

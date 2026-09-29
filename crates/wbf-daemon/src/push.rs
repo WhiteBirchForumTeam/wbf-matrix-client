@@ -283,7 +283,7 @@ mod tests {
     fn every_core_event_has_a_push_name_from_the_spec() {
         let link = push_of(&CoreEvent::Link {
             user: "@a:x".into(),
-            role: LinkRole::Subscriptions,
+            role: LinkRole::Keys,
             state: LinkState::Closed,
             reason: Some("logged out".into()),
         });
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(link.user.as_deref(), Some("@a:x"));
         assert_eq!(
             link.request.params,
-            json!({ "user": "@a:x", "role": "subscriptions", "state": "closed", "reason": "logged out" })
+            json!({ "user": "@a:x", "role": "keys", "state": "closed", "reason": "logged out" })
         );
         // keys.state（rpc-spec §4、key-sync.md §2）：數字只在 caught_up 帶、理由只在 stopped 帶。
         let caught_up = push_of(&CoreEvent::Keys {

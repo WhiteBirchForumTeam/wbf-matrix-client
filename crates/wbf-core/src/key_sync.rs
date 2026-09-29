@@ -4,9 +4,9 @@
 //!
 //! - **推來的（`Push`）與主動拉的（`Fetch` 的 `Batch`）封包大同小異，最根本的處理是同一支**：sdk 的 `OlmEngine::import_items`
 //!   ——匯進 crypto store、水位與待銷毀清單落地、對 server 銷毀那一包。這裡不解封包、不碰 store，只把 items 交給它。
-//! - `Device/Fetch`／`ItemsDestroy` 走訂閱線（server：只有持有這台裝置佇列的連線能銷毀），所以 task 要用線時跟池拿同一格。
-//! - 訂閱結束（被另一台裝置接手的 1505、線死了）就停、發 `keys.state: stopped`；🚫 不重訂（to-device-client.md §5.1：兩台會互踢），
-//!   🚫 不主動重開線（等 server 支援更多連線再做）。線死了房間那半（`room_sync.rs`）會關那格。
+//! - 金鑰自己一條線（`LinkRole::Keys`，維護者 2026-09-29）。`Device/Fetch`／`ItemsDestroy` 也走它（server：只有持有這台裝置佇列的連線能銷毀），所以 task 要用線時跟池拿同一格。
+//! - 訂閱結束（被另一台裝置接手的 1505、線死了）就停、發 `keys.state: stopped`、關掉這格線（跟房間那半同一個做法）；
+//!   🚫 不在這裡重訂（to-device-client.md §5.1：兩台會互踢）。重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
 //! - `keys.state` 留著（「有點多餘，但傾向保留——不然 RPC 無從知道」）。
 //!
 //! 🚨 **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）：server 的佇列沒有洞（每一則存到我們 `ItemsDestroy` 才刪），
@@ -102,10 +102,10 @@ impl Core {
         self.crypto_engines.lock().await.remove(&account.dir);
     }
 
-    /// 訂閱線開好之後金鑰那半（`room_sync::init_connection` 叫）：`Device/Subscribe` → 上線追平（先訂再拉，中間到的沒人漏）→ 起收金鑰的 task。
+    /// 金鑰那條線開好之後（`room_sync::init_connection` 叫）：`Device/Subscribe` → 上線追平（先訂再拉，中間到的沒人漏）→ 起收金鑰的 task。
     ///
-    /// ⚠️ 這裡回錯就是整條訂閱線沒開成（房間那半也一起）：fail loud，因為「金鑰沒在收」靠 UI 看不出來，而線開不起來看得出來（key-sync.md §1）。
-    /// 唯一的例外是「這不是 wbf 帳號」：金鑰不在這裡，講一聲、跳過，房間那半照常。
+    /// ⚠️ 這裡回錯就是這條線沒開成：fail loud，因為「金鑰沒在收」靠 UI 看不出來，而線開不起來看得出來（key-sync.md §1）。
+    /// 唯一的例外是「這不是 wbf 帳號」：金鑰不在這裡，講一聲、跳過（鉤子本來就只替 wbf 帳號開線，這條是多一道防線）。
     ///
     /// Args:
     ///     client: 已經 hello 過、還沒放進池的訂閱線
@@ -195,7 +195,7 @@ impl Core {
         let Some(pool) = pool else {
             return;
         };
-        let Some(mut line) = pool.reuse(LinkRole::Subscriptions).await else {
+        let Some(mut line) = pool.reuse(LinkRole::Keys).await else {
             return;
         };
         if let Err(error) = line.device_unsubscribe().await {
@@ -278,14 +278,23 @@ impl KeySyncTask {
                 }
                 continue;
             };
-            // 🚫 不重訂（to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）；🚫 不關線（房間訂閱還在同一條線上；線真死了房間那半會關）。
+            // 🚫 不重訂（to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）。
+            // 關掉這格（跟房間那半一樣）：socket 可能還活著，不關的話鉤子看它活著就不會重開，金鑰就永遠沒人收。
             self.events.emit(CoreEvent::Keys {
                 user: self.me.clone(),
                 state: KeysState::Stopped,
                 imported: None,
                 room_keys: None,
-                reason: Some(why),
+                reason: Some(why.clone()),
             });
+            if !self.pool.close(LinkRole::Keys, &why).await {
+                self.events.emit(CoreEvent::Link {
+                    user: self.me.clone(),
+                    role: LinkRole::Keys,
+                    state: crate::event::LinkState::Closed,
+                    reason: Some(why),
+                });
+            }
             return;
         }
     }
@@ -296,9 +305,9 @@ impl KeySyncTask {
     ///     bool  true ＝ 這包完整走完；false ＝ 線不在、或匯入／銷毀回錯（呼叫端要拉一次：沒銷掉的還在 server 佇列裡，
     ///           但**不會再推一次**，只有從佇列頭拉才拿得回來）
     async fn import(&self, items: Vec<(u64, serde_json::Value)>) -> bool {
-        let Some(mut line) = self.pool.reuse(LinkRole::Subscriptions).await else {
+        let Some(mut line) = self.pool.reuse(LinkRole::Keys).await else {
             self.events.progress(format!(
-                "keys: the subscriptions line is gone; {} pushed item(s) stay queued on the server until the line is reopened",
+                "keys: the keys line is gone; {} pushed item(s) stay queued on the server until the line is reopened",
                 items.len()
             ));
             return false;
@@ -327,9 +336,9 @@ impl KeySyncTask {
     /// Return:
     ///     bool  true ＝ 追平了；false ＝ 線不在或拉失敗（呼叫端留著「要拉」，下一個事件或閒置逾時再拉）
     async fn pull(&self) -> bool {
-        let Some(mut line) = self.pool.reuse(LinkRole::Subscriptions).await else {
+        let Some(mut line) = self.pool.reuse(LinkRole::Keys).await else {
             self.events.progress(
-                "keys: the subscriptions line is gone; the queue is pulled when the line is reopened",
+                "keys: the keys line is gone; the queue is pulled when the line is reopened",
             );
             return false;
         };
@@ -375,7 +384,7 @@ mod tests {
     use crate::event::KeysState;
     use crate::link_pool::LinkRole;
     use crate::test_support::*;
-    use crate::{Core, CoreEvent, Target};
+    use crate::{Core, CoreEvent};
 
     fn cd_seq_of(account: &AccountDir) -> Option<u64> {
         wbf_sdk::to_device_state::ToDeviceState::load(&account.matrix_store_dir())
@@ -406,7 +415,7 @@ mod tests {
     }
 
     /// 開訂閱線之前佇列裡已經有東西（離線期間到的）：`init_connection` 訂了金鑰、追平（Fetch → 匯入 → 銷毀）、發 `caught_up`；
-    /// 之後推來一包走同一支（銷毀那一包）；帶 `gap` 的包從佇列頭拉一次，漏的那則一起回來；關訂閱線 task 收掉。
+    /// 之後推來一包走同一支（銷毀那一包）；帶 `gap` 的包從佇列頭拉一次，漏的那則一起回來；收 task（登出那條路）收得掉。
     #[tokio::test]
     async fn the_line_subscribes_keys_catches_up_and_imports_pushes_through_one_path() {
         let dir = scratch("keys");
@@ -418,12 +427,12 @@ mod tests {
             .lock()
             .unwrap()
             .extend([to_device_item(1), to_device_item(2)]);
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+        core.init_connection(&account, LinkRole::Keys, &mut client)
             .await
             .expect("subscribe");
         let pool = core.pool_of_account(&account).unwrap();
         drop(
-            pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+            pool.acquire(LinkRole::Keys, || async move { Ok(client) })
                 .await
                 .unwrap(),
         );
@@ -486,29 +495,23 @@ mod tests {
         assert_eq!(*fake.destroyed.lock().unwrap(), vec![1, 2, 3, 4, 5]);
         assert_eq!(cd_seq_of(&account), Some(5));
 
-        assert!(core.close_subscriptions(&Target::default()).await.unwrap());
+        assert!(core.stop_key_sync_of(&account).await);
         assert!(!core.is_key_syncing(&account));
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 被另一台裝置接手（server 對金鑰訂閱送 Error）：task 停、發 `keys.state: stopped` 帶原因；🚫 不重訂、🚫 不關線——
-    /// 房間訂閱還在同一條線上活著。
+    /// 被另一台裝置接手（server 對金鑰訂閱送 Error）：task 停、發 `keys.state: stopped` 帶原因、關掉金鑰那格（發 `link.state: closed`）；🚫 不重訂。
+    /// 關線是為了讓鉤子下次看得出它不在（socket 還活著的話池看不出來，金鑰就永遠沒人收）。
     #[tokio::test]
-    async fn a_taken_over_key_subscription_stops_and_says_so_but_keeps_the_line() {
+    async fn a_taken_over_key_subscription_stops_says_so_and_closes_its_line() {
         let dir = scratch("keys-superseded");
         let (core, account) = core_with_wbf_account(&dir).await;
         let mut seen = core.subscribe();
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (_room_subscription_id, fake, pool) = subscribed(&core, &account, &events).await;
-        let device_subscription_id = fake
-            .device_subscription_ids
-            .lock()
-            .unwrap()
-            .last()
-            .copied()
-            .expect("server got a Device/Subscribe");
+        let (device_subscription_id, fake, pool) = subscribed_keys(&core, &account, &events).await;
         assert!(core.is_key_syncing(&account));
+        assert_eq!(pool.open_count(), 1);
 
         fake.outbound
             .send(response(
@@ -526,12 +529,13 @@ mod tests {
             "the key task ends",
         )
         .await;
-        let stopped = std::iter::from_fn(|| seen.try_recv().ok()).find_map(|event| match event {
+        let seen_events: Vec<CoreEvent> = std::iter::from_fn(|| seen.try_recv().ok()).collect();
+        let stopped = seen_events.iter().find_map(|event| match event {
             CoreEvent::Keys {
                 state: KeysState::Stopped,
                 reason,
                 ..
-            } => Some(reason),
+            } => Some(reason.clone()),
             _ => None,
         });
         assert!(
@@ -541,8 +545,18 @@ mod tests {
                 .is_some_and(|reason| reason.contains("ended the key subscription")),
             "停了要講原因：{stopped:?}"
         );
-        assert!(core.is_room_syncing(&account), "房間那半照收");
-        assert_eq!(pool.open_count(), 1, "線不關：被接手不是斷線");
+        let closed = seen_events.iter().any(|event| {
+            matches!(
+                event,
+                CoreEvent::Link {
+                    role: LinkRole::Keys,
+                    state: crate::event::LinkState::Closed,
+                    ..
+                }
+            )
+        });
+        assert!(closed, "關線要發 link.state closed：{seen_events:?}");
+        assert_eq!(pool.open_count(), 0, "金鑰那格關了，socket 活著也一樣");
         assert_eq!(
             fake.device_subscription_ids.lock().unwrap().len(),
             1,
@@ -572,7 +586,7 @@ mod tests {
             to_device_item(3),
         ]);
         *fake.device_early_push.lock().unwrap() = Some((0, false, vec![to_device_item(3)]));
-        core.init_connection(&account, LinkRole::Subscriptions, &mut client)
+        core.init_connection(&account, LinkRole::Keys, &mut client)
             .await
             .expect("subscribe");
         assert_eq!(
@@ -600,14 +614,7 @@ mod tests {
         let dir = scratch("keys-crypto-state-gap");
         let (core, account) = core_with_wbf_account(&dir).await;
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (_room_subscription_id, fake, _pool) = subscribed(&core, &account, &events).await;
-        let device_subscription_id = fake
-            .device_subscription_ids
-            .lock()
-            .unwrap()
-            .last()
-            .copied()
-            .expect("server got a Device/Subscribe");
+        let (device_subscription_id, fake, _pool) = subscribed_keys(&core, &account, &events).await;
         fake.to_device.lock().unwrap().push(to_device_item(6));
         fake.outbound
             .send(response(
@@ -638,14 +645,7 @@ mod tests {
         let dir = scratch("keys-head-is-watermark");
         let (core, account) = core_with_wbf_account(&dir).await;
         let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (_room_subscription_id, fake, _pool) = subscribed(&core, &account, &events).await;
-        let device_subscription_id = fake
-            .device_subscription_ids
-            .lock()
-            .unwrap()
-            .last()
-            .copied()
-            .expect("server got a Device/Subscribe");
+        let (device_subscription_id, fake, _pool) = subscribed_keys(&core, &account, &events).await;
         assert_eq!(fake.fetch_requests.lock().unwrap().len(), 1, "上線追平那次");
 
         // 佇列裡有 1、2，但只有 2 推到了（1 的推播沒到、也沒有 gap）：2 照樣匯、銷毀；1 還在佇列裡。
@@ -725,7 +725,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 對真的 wbfuwunel（同一個帳號兩台裝置）：B 是 core 那台（登入、上傳裝置金鑰、`open_subscriptions`）；A 是 sdk 層的另一台裝置，
+    /// 對真的 wbfuwunel（同一個帳號兩台裝置）：B 是 core 那台（登入、上傳裝置金鑰、鉤子開五條線）；A 是 sdk 層的另一台裝置，
     /// 查到 B 之後把一個房的房間金鑰用 to-device 分給 B → B 的收金鑰 task 收到 `Push`、匯進 crypto store → `keys.state: caught_up` 帶 `room_keys ≥ 1`。
     /// 最後 B 登出（走退訂那條）。
     ///
@@ -743,7 +743,7 @@ mod tests {
             .trim_end_matches(['\r', '\n'])
             .to_string();
 
-        // B：core 那台。登入、上傳裝置金鑰（A 才查得到它）、開訂閱線（房間＋金鑰、追平）。
+        // B：core 那台。登入、上傳裝置金鑰（A 才查得到它）、鉤子開五條線（金鑰那條訂了、追平）。
         let dir_b = scratch("real-keys-b");
         let core_b = Core::open(&dir_b);
         core_b.create_vault(None).unwrap();
@@ -769,10 +769,8 @@ mod tests {
                 .expect("B uploads its device keys");
         }
         let mut seen = core_b.subscribe();
-        core_b
-            .open_subscriptions(&Target::default())
-            .await
-            .expect("B subscribes over the real server");
+        let ensured = core_b.ensure_links().await;
+        assert!(ensured.failed.is_empty(), "五條都開得起來：{ensured:?}");
         assert!(core_b.is_key_syncing(&account_b));
         let (state, _, _, _) = next_keys_state(&mut seen).await;
         assert_eq!(state, KeysState::CaughtUp, "上線追平那則");

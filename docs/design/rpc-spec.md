@@ -12,7 +12,7 @@
 > 其餘（欄位可以加、推播可以加、新的 method 可以加）永遠是相容的變動，不動 `protocol` 版號。
 >
 > ⭐ **「做完」的判準：底層走的是我們自己跟 homeserver 的 WS（wbf-pack）才算**。走 matrix-sdk 的 HTTP
-> 只是現在能動，未來要全面遷移到 WS（architecture-v2 §6.1 的四條線）；HTTP fallback 也一樣不算。
+> 只是現在能動，未來要全面遷移到 WS（architecture-v2 §6.1；落地是一個帳號五條線，link-pool.md §1）；HTTP fallback 也一樣不算。
 > 每個 method 的現況在 §10。
 
 ## 0. 一句話
@@ -244,12 +244,12 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | method | params | result | core |
 |---|---|---|---|
 | `hello` | §1.3 | §1.3 | — |
-| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
+| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, links, cache_queue, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；`links` ＝ 所有帳號加起來現在開著幾條上游的線（link-pool.md；一個 wbf 帳號五條都開好就是 5，daemon 的看線迴圈會把它補回去）；`cache_queue` ＝ cache 寫入者還有幾件在排隊（一直漲＝寫得比收得慢）；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
 | `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：🚫 不斷上游會話、🚫 不掉連線）。⭐ 前端改設定（例如已讀要不要公開，daemon-runtime §6.3）之後叫它，🚫 不必重開 daemon |
 | `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
-| `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock` |
+| `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶；`passphrase` 模式帶**原始 bytes** 的 base64（local-cache-db §12） | `{ ok: true, key_mode }` | `unlock`。成功之後 daemon 在背景把每個登入的 wbf 帳號的五條線開起來（link-pool.md §3.1），🚫 不等它回應就先回；已經解鎖再叫一次也會觸發 |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
 | `vault.remove_passphrase` | — | `{ ok: true, key_mode: "plain" }` | `set_passphrase(None)` |
 
@@ -286,7 +286,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 | method | params | result | core |
 |---|---|---|---|
-| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。⚠️ **要先 `vault.create`**：🚫 它不替前端建 vault |
+| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。⚠️ **要先 `vault.create`**：🚫 它不替前端建 vault。成功之後同 `vault.unlock`：背景開線 |
 | `account.list` | — | `AccountStatus`：`{ accounts: [{ user_id?, server, localpart, logged_in, current }], undecryptable_hint? }` | `account_status` |
 | `account.switch` | `{ user, server? }` | `SwitchResult`：`{ current, switched_from?, logged_in }` | `switch_current` |
 | `account.whoami` | `{ user?, server? }` | `{ user_id, device_id, server }` | `whoami` |
@@ -412,8 +412,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
 | `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事。⚠️ **這是連線層的訊號**：它只保證「這條連線漏了某些事件」，🚫 不保證漏掉的裡面有它訂的那些（daemon 不替每條訂閱各記一份 lag）；寧可多報一次重讀，🚫 不假裝沒漏。什麼都沒訂的連線不收它 |
 | `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
-| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"subscriptions", state: "opened"\|"closed", reason? }`（`subscriptions` 暫時同時收房間與金鑰的推播，account-session.md §5） | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用那條線才發 |
-| `keys.state` | `{ user, state: "caught_up"\|"stopped", imported?, room_keys?, reason? }`（key-sync.md §2） | 這個帳號的金鑰訂閱：`caught_up`＝一批 to-device 匯完、銷毀完（`imported` 則、`room_keys` 把新房間金鑰——UI 拿它決定要不要重解密文）；`stopped`＝這台裝置不再收金鑰（被另一台裝置接手、線死了），🚫 daemon 不自動重訂。維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」 |
+| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }`（2026-09-29 起房間與金鑰的訂閱各自一條；之前的 `subscriptions` 不再出現） | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。五條線由 daemon 在 `vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（link-pool.md §3.1）。⚠️ 「關了」不是即時的：線死後大約一分鐘內才被看到 |
+| `keys.state` | `{ user, state: "caught_up"\|"stopped", imported?, room_keys?, reason? }`（key-sync.md §2） | 這個帳號的金鑰訂閱：`caught_up`＝一批 to-device 匯完、銷毀完（`imported` 則、`room_keys` 把新房間金鑰——UI 拿它決定要不要重解密文）；`stopped`＝這條訂閱結束了（被同一裝置後來的連線接手、線死了）：金鑰那條線跟著關，daemon 的看線迴圈下一輪（最多 15 秒）重開、重訂，重訂完會再來一則 `caught_up`。維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」 |
 | `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
 - 推播**要先 `subscribe`**（§4.6）。`progress` 例外：**發出長工作的那條連線自動收到自己請求的 `progress`**，不必訂——不然每個前端都要多寫一步。
@@ -589,7 +589,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（等 wbfuwunel #64） | ✅ wbf／🔁 一般 server |
 | `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
-| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22（⚠️ 開／關訂閱線還沒有 RPC：`Core::open_subscriptions`／`close_subscriptions` 先只給 core 與測試用；補窗是 UI 叫 `sync.recent`） |
+| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22；訂閱線 2026-09-29 起由 daemon 自己開、看著、重開（link-pool.md §3.1），🚫 沒有開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`--transport http` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
 | `media.save_to` | ✅ | **WS** `Read`＋媒體池 | ✅ |
@@ -601,4 +601,4 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `progress`／`note`／`room.message` 推播 | ✅ daemon 層接上了（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ 2026-09-21 |
 
 📎 讀法：✅ 那幾列是 wbf-sdk 第 2 步的產物（上傳／下載／`recent`／ping），它們從一開始就是 WS。
-🔁 那些全部掛在 matrix-sdk 上，遷移的順序跟 architecture-v2 §6.1 四條線一致：房間（`Subscribe`／`Push`）→ 金鑰（`Device`）→ session（`Session/*`）。
+🔁 那些全部掛在 matrix-sdk 上，遷移的順序跟 architecture-v2 §6.1 的分線一致：房間（`Subscribe`／`Push`）→ 金鑰（`Device`）→ session（`Session/*`）。

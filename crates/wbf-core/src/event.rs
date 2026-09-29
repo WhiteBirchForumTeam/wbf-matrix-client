@@ -56,7 +56,7 @@ pub enum CoreEvent {
         /// 房間事件的水位；不知道就 `None`。
         cg_seq: Option<i64>,
     },
-    /// 這個帳號的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：沒有監督者在看，死了要到下一次有人用才知道。
+    /// 這個帳號的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：死了要到下一次有人用、或 daemon 的看線迴圈下一輪看到才知道（大約一分鐘內，link-pool.md §3.1）。
     Link {
         user: String,
         role: crate::link_pool::LinkRole,
@@ -105,7 +105,7 @@ pub enum LinkState {
 pub enum KeysState {
     /// 一批 to-device 匯完、銷毀完（上線追平、或推來一包處理完）：crypto store 現在有這些金鑰。
     CaughtUp,
-    /// 這台裝置不再收金鑰：被另一台裝置接手（1505）、或線死了。🚫 不自動重訂（to-device-client.md §5.1）。
+    /// 這台裝置不再收金鑰：被另一台裝置接手（1505）、或線死了。task 不原地重訂；金鑰那條線跟著關，daemon 的看線迴圈下一輪重開、重訂（to-device-client.md §5.1 的📌、link-pool.md §3.1）。
     Stopped,
 }
 

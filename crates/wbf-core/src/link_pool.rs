@@ -1,8 +1,8 @@
-//! 連線池（link-pool.md）：一個帳號五條線，各司其職、要用才開、斷了下次要用再開。
+//! 連線池（link-pool.md）：一個帳號五條線，各司其職；daemon 在解鎖、登入之後把五條都開起來（`link_keeper.rs`），平常要用時發現死了也重開。
 //!
 //! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，§7 的接縫）——
 //! 正式的在 `Core::open_link`（session → `Channel::connect` → `hello`），測試的用記憶體對接。
-//! 🚫 沒有背景重連（第 8 階段的監督者）；🚫 不知道訂閱的內容（那是用線的人的事）。
+//! 池自己🚫 不在背景做事：定時看線、重開是 `link_keeper.rs` 的鉤子（daemon 叫）；🚫 不知道訂閱的內容（那是用線的人的事）。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,8 +17,8 @@ use wbf_sdk::sessions::Received;
 use crate::error::CoreError;
 use crate::event::{CoreEvent, EventSink, LinkState};
 
-/// 四條線的角色（link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
-/// 📌 房間事件與金鑰事件的訂閱**暫時共用一條**（維護者 2026-09-21：server 每台裝置預設 4 條 WS，先不動 server）；將來要分就是多一個角色。
+/// 五條線的角色（link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
+/// 📌 房間與金鑰的訂閱 2026-09-29 起各自一條（維護者定；server #85 把每台裝置的 WS 上限放到 8）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkRole {
@@ -28,16 +28,19 @@ pub enum LinkRole {
     Upload,
     /// Download/*。
     Download,
-    /// 訂閱線：全局房間事件（Event/Subscribe／Push／DeviceChanged）與全局金鑰事件（Device/Subscribe／Push／CryptoState）。只有訂閱命令會開它。
-    Subscriptions,
+    /// 房間的訂閱線：全局房間事件（Event/Subscribe／Push／DeviceChanged）。
+    Rooms,
+    /// 金鑰的訂閱線：全局金鑰事件（Device/Subscribe／Push／CryptoState），以及 Device/Fetch／ItemsDestroy（server 只讓持有裝置佇列的那條連線銷毀）。
+    Keys,
 }
 
 impl LinkRole {
-    pub const ALL: [LinkRole; 4] = [
+    pub const ALL: [LinkRole; 5] = [
         LinkRole::Misc,
         LinkRole::Upload,
         LinkRole::Download,
-        LinkRole::Subscriptions,
+        LinkRole::Rooms,
+        LinkRole::Keys,
     ];
 
     /// Return:
@@ -47,13 +50,9 @@ impl LinkRole {
             LinkRole::Misc => "misc",
             LinkRole::Upload => "upload",
             LinkRole::Download => "download",
-            LinkRole::Subscriptions => "subscriptions",
+            LinkRole::Rooms => "rooms",
+            LinkRole::Keys => "keys",
         }
-    }
-
-    /// 這條線是不是訂閱線（預設不開、只有訂閱命令會開，§3）。
-    pub fn is_subscription(&self) -> bool {
-        matches!(self, LinkRole::Subscriptions)
     }
 }
 
@@ -143,7 +142,7 @@ impl LinkPool {
     /// 給背景 task 用（`key_sync.rs`）：它握得到池，但「開線」是 `open_link` 的事（會再跑一次 `init_connection`、換掉 task 自己），task 不該從裡面觸發。
     ///
     /// Args:
-    ///     role: example: LinkRole::Subscriptions
+    ///     role: example: LinkRole::Keys
     /// Return:
     ///     Some(PooledClient)  開著的線；丟掉 guard 就是還回去
     ///     None                那格沒開、或線已經死了（下次有人 `acquire` 會重開）
@@ -159,6 +158,34 @@ impl LinkPool {
         OwnedMutexGuard::try_map(guard, |slot| slot.as_mut())
             .ok()
             .map(PooledClient::Pooled)
+    }
+
+    /// 確保那條線開著（`link_keeper.rs` 的鉤子用）：開著就不動、沒開或死了就開一條。
+    /// 有命令正在用它（鎖在別人手上）就當它開著：🚫 不排在一個長下載後面等。
+    ///
+    /// Args:
+    ///     role: example: LinkRole::Rooms
+    ///     open: 怎麼開一條這個角色的線, example: || core.open_link(&account, role)
+    /// Return:
+    ///     Ok(true)    本來沒開或死了，這次開了
+    ///     Ok(false)   本來就開著（或正在被用），沒動
+    ///     Err(...)    `open` 的錯原樣；那格維持沒開
+    pub async fn ensure_open<F, Fut>(&self, role: LinkRole, open: F) -> Result<bool, CoreError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<WbfClient<Channel>, CoreError>>,
+    {
+        let is_open = match self.slot(role).try_lock_owned() {
+            Ok(guard) => guard
+                .as_ref()
+                .is_some_and(|client| !client.channel().is_closed()),
+            Err(_) => true,
+        };
+        if is_open {
+            return Ok(false);
+        }
+        drop(self.acquire(role, open).await?);
+        Ok(true)
     }
 
     /// 登出、destroy、換 session：全關（token 撤了，留著也是死的）。**等正在用線的命令做完**才關那條（維護者 2026-09-21：還在處理的要處理完）；
@@ -190,7 +217,7 @@ impl LinkPool {
     /// 關一條（等正在用它的命令做完）；那一格回到 Idle，下次要用再開。
     ///
     /// Args:
-    ///     role: example: LinkRole::Subscriptions
+    ///     role: example: LinkRole::Rooms
     ///     reason: example: "closed on request"
     /// Return:
     ///     bool  true ＝ 本來開著、關了；false ＝ 本來就沒開
@@ -306,7 +333,11 @@ pub const LINK_CLIENT_NAME: &str = "wbf-core/0.1";
 /// ⚠️ `Keys` 之後宣告 `org.wbftw.device_versions`（那時 `Event/Send` 也一起接上，宣告了就得帶 `room_version`）；現在全部是空的。
 pub fn features_of(role: LinkRole) -> &'static [&'static str] {
     match role {
-        LinkRole::Misc | LinkRole::Upload | LinkRole::Download | LinkRole::Subscriptions => &[],
+        LinkRole::Misc
+        | LinkRole::Upload
+        | LinkRole::Download
+        | LinkRole::Rooms
+        | LinkRole::Keys => &[],
     }
 }
 
@@ -523,7 +554,7 @@ mod tests {
         let (client, peer) = memory_client(wbf_sdk::no_hook());
         let first = connection_id_of(
             &pool
-                .acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+                .acquire(LinkRole::Rooms, || async move { Ok(client) })
                 .await
                 .unwrap(),
         );
@@ -537,7 +568,7 @@ mod tests {
         let (client, _peer) = memory_client(wbf_sdk::no_hook());
         let second = connection_id_of(
             &pool
-                .acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+                .acquire(LinkRole::Rooms, || async move { Ok(client) })
                 .await
                 .unwrap(),
         );
@@ -553,6 +584,63 @@ mod tests {
             states,
             vec![(LinkState::Closed, true), (LinkState::Opened, false)]
         );
+    }
+
+    /// `ensure_open`（鉤子用）：沒開的開、開著的不動、有命令正在用的當開著（🚫 不等它）、死了的重開。
+    #[tokio::test]
+    async fn ensure_open_opens_only_what_is_missing_or_dead() {
+        let pool = LinkPool::new("@alice:localhost", EventSink::new());
+        let (client, _misc_peer) = memory_client(wbf_sdk::no_hook());
+        assert!(pool
+            .ensure_open(LinkRole::Misc, || async move { Ok(client) })
+            .await
+            .unwrap());
+        let never_opened = || async {
+            Err::<WbfClient<Channel>, CoreError>(CoreError::new(
+                CoreErrorKind::Io,
+                "must not be opened",
+            ))
+        };
+        assert!(
+            !pool
+                .ensure_open(LinkRole::Misc, never_opened)
+                .await
+                .unwrap(),
+            "開著的不動"
+        );
+
+        let (client, _download_peer) = memory_client(wbf_sdk::no_hook());
+        let in_use = pool
+            .acquire(LinkRole::Download, || async move { Ok(client) })
+            .await
+            .unwrap();
+        let checked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.ensure_open(LinkRole::Download, never_opened),
+        )
+        .await
+        .expect("有命令在用的不等它");
+        assert!(!checked.unwrap(), "有命令在用的算開著");
+        drop(in_use);
+
+        let (client, keys_peer) = memory_client(wbf_sdk::no_hook());
+        drop(
+            pool.acquire(LinkRole::Keys, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        drop(keys_peer);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let (client, _keys_peer) = memory_client(wbf_sdk::no_hook());
+        assert!(
+            pool.ensure_open(LinkRole::Keys, || async move { Ok(client) })
+                .await
+                .unwrap(),
+            "死了的重開"
+        );
+        assert_eq!(pool.open_count(), 3);
     }
 
     /// 開不起來（沒 session、連不上）：錯原樣回、那格維持沒開、🚫 不發事件；下一次再試。
@@ -632,7 +720,7 @@ mod tests {
         let mut seen = events.subscribe();
         let pool = LinkPool::new("@alice:localhost", events);
         let mut peers = Vec::new();
-        for role in [LinkRole::Misc, LinkRole::Download, LinkRole::Subscriptions] {
+        for role in [LinkRole::Misc, LinkRole::Download, LinkRole::Rooms] {
             let (client, peer) = memory_client(wbf_sdk::no_hook());
             peers.push(peer);
             pool.acquire(role, || async move { Ok(client) })
@@ -655,7 +743,7 @@ mod tests {
             })
             .collect();
         assert_eq!(closed.len(), 3);
-        assert!(closed.contains(&LinkRole::Subscriptions));
+        assert!(closed.contains(&LinkRole::Rooms));
         // 關過之後再要就是重開，不是拿到一條死的（池不記「登出了沒」：那是 session 與 server 的事）。
         let (client, _peer) = memory_client(wbf_sdk::no_hook());
         pool.acquire(LinkRole::Misc, || async move { Ok(client) })
@@ -681,7 +769,7 @@ mod tests {
     fn the_hook_turns_a_pack_into_a_header_only_event_with_the_role() {
         let sink = EventSink::new();
         let mut seen = sink.subscribe();
-        let hook = received_hook(sink, "@alice:localhost".into(), LinkRole::Subscriptions);
+        let hook = received_hook(sink, "@alice:localhost".into(), LinkRole::Rooms);
         hook(&Received {
             connection_id: 9,
             session: None,
@@ -692,7 +780,7 @@ mod tests {
             seen.try_recv().unwrap(),
             CoreEvent::Received {
                 user: "@alice:localhost".into(),
-                role: LinkRole::Subscriptions,
+                role: LinkRole::Rooms,
                 kind: 0x16,
                 subtype: wbf_wire::pack::device::PUSH,
                 id: 0x0100_0000_0000_0001,
@@ -707,15 +795,11 @@ mod tests {
     async fn a_pack_arriving_on_a_pooled_line_becomes_a_received_event() {
         let events = EventSink::new();
         let mut seen = events.subscribe();
-        let hook = received_hook(
-            events.clone(),
-            "@alice:localhost".into(),
-            LinkRole::Subscriptions,
-        );
+        let hook = received_hook(events.clone(), "@alice:localhost".into(), LinkRole::Rooms);
         let (client, mut peer) = memory_client(hook);
         let pool = LinkPool::new("@alice:localhost", events);
         let _line = pool
-            .acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+            .acquire(LinkRole::Rooms, || async move { Ok(client) })
             .await
             .unwrap();
         use wbf_sdk::transport::FrameSink;
@@ -737,7 +821,7 @@ mod tests {
             matches!(
                 received,
                 CoreEvent::Received {
-                    role: LinkRole::Subscriptions,
+                    role: LinkRole::Rooms,
                     kind: 0x16,
                     seq: 3,
                     ..

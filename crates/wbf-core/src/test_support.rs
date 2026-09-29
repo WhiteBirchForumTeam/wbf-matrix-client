@@ -446,14 +446,14 @@ pub(crate) async fn memory_client_with_hello(
     (client, fake)
 }
 
-/// 訂好、線放回池裡；回訂閱的 id 與池。
+/// 房間那條線訂好、線放回池裡；回 `Event/Subscribe` 的 id 與池。
 pub(crate) async fn subscribed(
     core: &Core,
     account: &AccountDir,
     events: &Arc<Mutex<Vec<Value>>>,
 ) -> (u64, FakeServer, Arc<crate::link_pool::LinkPool>) {
     let (mut client, fake) = memory_client_with_hello(events.clone()).await;
-    core.init_connection(account, LinkRole::Subscriptions, &mut client)
+    core.init_connection(account, LinkRole::Rooms, &mut client)
         .await
         .expect("subscribe");
     let subscription_id = fake
@@ -465,11 +465,37 @@ pub(crate) async fn subscribed(
         .expect("server got a Subscribe");
     let pool = core.pool_of_account(account).unwrap();
     drop(
-        pool.acquire(LinkRole::Subscriptions, || async move { Ok(client) })
+        pool.acquire(LinkRole::Rooms, || async move { Ok(client) })
             .await
             .unwrap(),
     );
     (subscription_id, fake, pool)
+}
+
+/// 金鑰那條線訂好（含上線追平）、線放回池裡；回 `Device/Subscribe` 的 id 與池。
+pub(crate) async fn subscribed_keys(
+    core: &Core,
+    account: &AccountDir,
+    events: &Arc<Mutex<Vec<Value>>>,
+) -> (u64, FakeServer, Arc<crate::link_pool::LinkPool>) {
+    let (mut client, fake) = memory_client_with_hello(events.clone()).await;
+    core.init_connection(account, LinkRole::Keys, &mut client)
+        .await
+        .expect("subscribe keys");
+    let device_subscription_id = fake
+        .device_subscription_ids
+        .lock()
+        .unwrap()
+        .last()
+        .copied()
+        .expect("server got a Device/Subscribe");
+    let pool = core.pool_of_account(account).unwrap();
+    drop(
+        pool.acquire(LinkRole::Keys, || async move { Ok(client) })
+            .await
+            .unwrap(),
+    );
+    (device_subscription_id, fake, pool)
 }
 
 pub(crate) async fn wait_for_async<F, Fut>(mut condition: F, what: &str)

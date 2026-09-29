@@ -42,6 +42,11 @@ pub const DAEMON_NAME: &str = "wbf-matrix-client-daemon";
 
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 背景迴圈（[`Handle::keep_links_open`]）多久看一次線。心跳 24 秒一次、10 秒沒回就當死，所以線死後最久大約一分鐘內會被重開。
+pub const KEEP_LINKS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// 一直開不起來時，間隔最長拉到多久。
+pub const KEEP_LINKS_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 未解鎖時也接受的 method（architecture-v2 §4.5）。其他一律 `1001`。
 /// 這個 method **保證不碰資料目錄**嗎？
 ///
@@ -295,7 +300,13 @@ impl Handle {
             "daemon.set_encryption" => Box::pin(async { self.daemon_set_encryption(params) }),
             "daemon.shutdown" => Box::pin(async { self.daemon_shutdown() }),
             "vault.create" => Box::pin(async { local::vault_create(core, params) }),
-            "vault.unlock" => Box::pin(async { local::vault_unlock(core, params) }),
+            "vault.unlock" => Box::pin(async {
+                let unlocked = local::vault_unlock(core, params);
+                if unlocked.is_ok() {
+                    self.start_ensuring_links().await;
+                }
+                unlocked
+            }),
             "vault.set_passphrase" => Box::pin(async { local::vault_set_passphrase(core, params) }),
             "vault.remove_passphrase" => Box::pin(async { local::vault_remove_passphrase(core) }),
             "account.list" => Box::pin(async { local::account_list(core) }),
@@ -304,7 +315,13 @@ impl Handle {
             "media.gc" => Box::pin(async { local::media_gc(self, core, params) }),
             "recovery.list" => Box::pin(async { local::recovery_list(core) }),
             "recovery.show" => Box::pin(async { local::recovery_show(core, params) }),
-            "account.add" => Box::pin(accounts::account_add(self, core, params)),
+            "account.add" => Box::pin(async {
+                let added = accounts::account_add(self, core, params).await;
+                if added.is_ok() {
+                    self.start_ensuring_links().await;
+                }
+                added
+            }),
             "account.whoami" => Box::pin(accounts::account_whoami(self, core, params)),
             "account.del" => Box::pin(accounts::account_del(self, core, params)),
             "account.destroy" => Box::pin(accounts::account_destroy(self, core, params)),
@@ -371,6 +388,52 @@ impl Handle {
         let params: Params = parse_params(params)?;
         self.policy.set_enforced(params.enforced);
         Ok(json!({ "encryption_enforced": self.policy.is_enforced() }))
+    }
+
+    /// 「該開的線都開著嗎」的鉤子（`Core::ensure_links`，link-pool.md §3.1，維護者 2026-09-29）：`vault.unlock`、`account.add` 成功之後叫。
+    /// 背景跑，🚫 不擋那個 RPC 的回應（五條線×每個帳號、金鑰還要追平）；開關各自發 `link.state`，開不起來的發 `Note`。
+    /// conf 的 `TRANSPORT = http` 是上限（architecture-v2 §6.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
+    /// 已經有一輪在跑時，core 那邊自己跳過（`ensuring_links` 旗），這裡不必再擋。
+    async fn start_ensuring_links(&self) {
+        if self.settings.transport == Transport::Http || self.is_shutting_down() {
+            return;
+        }
+        let core = self.core().await;
+        tokio::spawn(async move {
+            core.ensure_links().await;
+        });
+    }
+
+    /// 常駐時的背景迴圈（維護者 2026-09-29，link-pool.md §3.1）：每隔一段時間叫一次同一支鉤子，被關掉、死掉的線就在這裡重開。
+    /// 很輕：鎖著、或正在登入／登出／摧毀，那一輪什麼都不做；開著的線只是看一眼。
+    /// 開不起來（server 不在）就拉長間隔（每次加倍，上限 [`KEEP_LINKS_MAX_INTERVAL`]），一輪全順就回到 [`KEEP_LINKS_INTERVAL`]：🚫 不對一台不在的 server 每 15 秒敲五次門。
+    /// `daemon.shutdown` 一廣播就停。`TRANSPORT = http` 不開 WS 線，所以整個不跑。
+    pub async fn keep_links_open(self: Arc<Handle>) {
+        if self.settings.transport == Transport::Http {
+            return;
+        }
+        let mut shutdown = self.shutdown_signal();
+        let mut interval = KEEP_LINKS_INTERVAL;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if self.is_shutting_down() {
+                return;
+            }
+            let ensured = self.core().await.ensure_links().await;
+            interval = if ensured.failed.is_empty() {
+                KEEP_LINKS_INTERVAL
+            } else {
+                (interval * 2).min(KEEP_LINKS_MAX_INTERVAL)
+            };
+        }
     }
 
     /// 只記下「要關了」；廣播等回應送出去之後（見 [`Handle::begin_shutdown_if_requested`]）。
@@ -814,6 +877,34 @@ mod tests {
         assert_eq!(response.code, code::DAEMON_SHUTTING_DOWN);
         handle.begin_shutdown_if_requested();
         assert!(*signal.borrow());
+    }
+
+    /// 看線的背景迴圈：`daemon.shutdown` 一廣播就停（在睡的那段也一樣，🚫 不等到下一輪）；`TRANSPORT = http` 根本不跑。
+    #[tokio::test]
+    async fn the_link_keeper_stops_on_shutdown_and_never_runs_over_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        let keeper = tokio::spawn(handle.clone().keep_links_open());
+        tokio::task::yield_now().await;
+        assert!(!keeper.is_finished(), "常駐期間一直在");
+        handle.call(request("daemon.shutdown", Value::Null)).await;
+        handle.begin_shutdown_if_requested();
+        tokio::time::timeout(std::time::Duration::from_secs(5), keeper)
+            .await
+            .expect("shutdown 之後馬上停，🚫 不等 15 秒的下一輪")
+            .unwrap();
+
+        let settings = Settings {
+            transport: Transport::Http,
+            ..Settings::default()
+        };
+        let over_http = Handle::new(dir.path(), EncryptionPolicy::enforced(), settings);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            over_http.keep_links_open(),
+        )
+        .await
+        .expect("http 不開 WS 線：迴圈直接結束");
     }
 
     #[tokio::test]

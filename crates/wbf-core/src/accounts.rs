@@ -368,24 +368,19 @@ impl DataDirMap {
         let current = read_current(&self.data_dir)?;
         let current = current.as_deref();
         let mut summaries: Vec<AccountSummary> = self
-            .servers
-            .iter()
-            .flat_map(|server| {
-                server.accounts.iter().map(move |account| {
-                    let dir = self.account_dir_of(server, account);
-                    AccountSummary {
-                        // 解不開的 session 不擋掉整份清單：那個帳號就當登出的看待（fail closed）。
-                        user_id: vault
-                            .unseal_session(&dir.session_path())
-                            .ok()
-                            .flatten()
-                            .map(|session| session.user_id),
-                        logged_in: dir.is_logged_in(),
-                        current: current == Some(dir.key().as_str()),
-                        server: dir.server_host,
-                        localpart: dir.localpart,
-                    }
-                })
+            .list_account_dirs()
+            .into_iter()
+            .map(|dir| AccountSummary {
+                // 解不開的 session 不擋掉整份清單：那個帳號就當登出的看待（fail closed）。
+                user_id: vault
+                    .unseal_session(&dir.session_path())
+                    .ok()
+                    .flatten()
+                    .map(|session| session.user_id),
+                logged_in: dir.is_logged_in(),
+                current: current == Some(dir.key().as_str()),
+                server: dir.server_host,
+                localpart: dir.localpart,
             })
             .collect();
         summaries.sort_by(|left, right| {
@@ -394,6 +389,22 @@ impl DataDirMap {
                 .then(left.localpart.cmp(&right.localpart))
         });
         Ok(summaries)
+    }
+
+    /// 這台機器上每個帳號的目錄，🚫 不管登入了沒（要登入的自己問 `is_logged_in`）。
+    ///
+    /// Return:
+    ///     Vec<AccountDir>   一個都沒有就是空的
+    pub fn list_account_dirs(&self) -> Vec<AccountDir> {
+        self.servers
+            .iter()
+            .flat_map(|server| {
+                server
+                    .accounts
+                    .iter()
+                    .map(move |account| self.account_dir_of(server, account))
+            })
+            .collect()
     }
 
     /// `s/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
