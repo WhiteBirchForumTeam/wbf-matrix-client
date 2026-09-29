@@ -424,7 +424,10 @@ impl Core {
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
-        let hello = client.hello(client_name, &[]).await?;
+        // 🚨 帶這條線自己的 features：server 把宣告記在連線上、下一個 Hello 覆蓋（沒帶就收回），空的會把 misc 的 `device_versions` 宣告收掉。
+        let hello = client
+            .hello(client_name, crate::link_pool::features_of(LinkRole::Misc))
+            .await?;
         client.ping().await?;
         Ok(ServerHello {
             protocol: hello.protocol,

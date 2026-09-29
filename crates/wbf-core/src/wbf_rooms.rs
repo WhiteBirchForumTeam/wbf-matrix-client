@@ -1,7 +1,7 @@
 //! wbf 帳號的房間（account-session.md §6）：沒有 matrix-sdk 的 Client，房間清單走橋（`JoinedRooms` ＋ 每房 `GetState` ＋ `m.direct`），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，約定 §5.2）。
 //!
-//! 🚫 **加密房這裡不送**：這條路送的是明文 content，E2EE 的 RPC 面接上 `encrypt_and_send` 之前，加密房一律拒絕。
+//! 加密房的文字走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）；加密房的**檔案**還送不了（加密附件沒接，e2ee-rpc.md §6）。
 //! ⚠️ 「加不加密」問的是**這一刻的狀態**（`GetState`），🚫 不用快取：過期的「沒加密」會把明文送進已經加密的房。
 
 use serde_json::Value;
@@ -15,6 +15,7 @@ use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::link_pool::LinkRole;
+use crate::room_crypto::SendOptions;
 use crate::Core;
 
 impl Core {
@@ -69,38 +70,76 @@ impl Core {
         Ok(conversation_from_state(room, &me, &state, &peers)?)
     }
 
-    /// 送一則明文文字（`m.room.message`／`m.text`）。加密房拒絕（模組註解）。
+    /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
     ///
+    /// Args:
+    ///     options: 加密房要 `room_devices`；`txn_id` 重送用, example: &SendOptions::default()
     /// Return:
-    ///     Ok(String)   event_id
-    ///     Err(Usage)   房間加密了
+    ///     Ok(String)                 event_id
+    ///     Err(Usage)                 加密房但沒帶 `room_devices`
+    ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
     pub(crate) async fn wbf_send_text(
         &self,
         account: &AccountDir,
         room: &str,
         body: &str,
+        options: &SendOptions,
     ) -> Result<String, CoreError> {
-        self.wbf_refuse_if_encrypted(account, room).await?;
-        self.wbf_send_event(
-            account,
-            room,
-            "m.room.message",
-            serde_json::json!({ "msgtype": "m.text", "body": body }),
-            Vec::new(),
-        )
-        .await
+        let content = serde_json::json!({ "msgtype": "m.text", "body": body });
+        let txn_id = match &options.txn_id {
+            Some(txn_id) => txn_id.clone(),
+            None => wbf_sdk::protocol::new_txn_id()?,
+        };
+        if !self.wbf_is_room_encrypted(account, room).await? {
+            return self
+                .wbf_send_event(account, room, "m.room.message", content, Vec::new(), txn_id)
+                .await;
+        }
+        let Some(devices) = &options.room_devices else {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "{room} is encrypted: pass room_devices (what room.refresh_devices returned for this room) \
+                     so the message carries the room version the server checks"
+                ),
+            ));
+        };
+        self.wbf_send_encrypted(account, room, "m.room.message", content, devices, txn_id)
+            .await
     }
 
-    /// 這個房間現在加密了就拒絕：明文的 `Event/Send` 不該進加密房。
+    /// 這個房間現在加密了就拒絕：送檔還沒有加密那條（加密附件是另一件事），明文的 `Event/Send` 不該進加密房。
     ///
     /// Return:
     ///     Ok(())       沒加密
-    ///     Err(Usage)   加密了（E2EE 的 RPC 面接 `encrypt_and_send` 之後才送得了）
+    ///     Err(Usage)   加密了
     pub(crate) async fn wbf_refuse_if_encrypted(
         &self,
         account: &AccountDir,
         room: &str,
     ) -> Result<(), CoreError> {
+        if self.wbf_is_room_encrypted(account, room).await? {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "{room} is encrypted, and wbf accounts cannot send files there yet: this path sends a plaintext \
+                     attachment over Event/Send, and encrypted attachments are not wired (e2ee-rpc.md §6)"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 這個房間現在加密了嗎。
+    ///
+    /// Return:
+    ///     Ok(bool)   true ＝ 有 `m.room.encryption` 而且形狀認得
+    ///     Err(...)   問不到（線開不起來、server 拒）——🚫 不當成沒加密：不確定就不送明文
+    async fn wbf_is_room_encrypted(
+        &self,
+        account: &AccountDir,
+        room: &str,
+    ) -> Result<bool, CoreError> {
         // 只問 `m.room.encryption` 這一項（`GetStateEvent`）：全量 `GetState` 在大房間會被 server `TooLarge` 擋，
         // 送訊息就跟著送不了（PR #56 審查 cirno 🟡1）。沒有這一項（404）＝沒加密。
         let mut client = self
@@ -111,20 +150,10 @@ impl Core {
                 LinkRole::Misc,
             )
             .await?;
-        let encrypted = client
+        Ok(client
             .state_event(room, "m.room.encryption", "")
             .await?
-            .is_some_and(|content| is_encryption_content(&content));
-        if encrypted {
-            return Err(CoreError::new(
-                CoreErrorKind::Usage,
-                format!(
-                    "{room} is encrypted, and wbf accounts cannot send encrypted messages yet: this path sends \
-                     plaintext over Event/Send, and encrypting first arrives with the E2EE work (e2ee-walkthrough §16.6)"
-                ),
-            ));
-        }
-        Ok(())
+            .is_some_and(|content| is_encryption_content(&content)))
     }
 
     /// `Event/Send` 一則事件（明文 content），附件在 meta 裡宣告（約定 §5.2）。
@@ -134,6 +163,7 @@ impl Core {
     ///     event_type: example: "m.room.message"
     ///     content: 事件 content
     ///     attachments: 這則用到的 mxc, example: vec!["mxc://localhost/1122334455667788".into()]
+    ///     txn_id: 重送用同一個, example: "wbf-1727600000-3"
     /// Return:
     ///     Ok(String)   server 收下的 event_id
     ///     Err(Server)  `Conflict`：某個 mxc 不是本站的、找不到、不是自己傳的、或有墓碑；整則沒送
@@ -144,6 +174,7 @@ impl Core {
         event_type: &str,
         content: Value,
         attachments: Vec<String>,
+        txn_id: String,
     ) -> Result<String, CoreError> {
         let mut client = self
             .client_of(
@@ -156,7 +187,7 @@ impl Core {
         let request = SendRequest {
             room_id: room.to_string(),
             event_type: event_type.to_string(),
-            txn_id: wbf_sdk::protocol::new_txn_id()?,
+            txn_id,
             attachments,
             room_version: None,
         };
@@ -231,9 +262,14 @@ mod tests {
             core.conversation("!r:localhost", SyncMode::Server, &target)
                 .await
                 .map(|_| ()),
-            core.send_text("!r:localhost", "hi", &target)
-                .await
-                .map(|_| ()),
+            core.send_text(
+                "!r:localhost",
+                "hi",
+                &crate::SendOptions::default(),
+                &target,
+            )
+            .await
+            .map(|_| ()),
         ] {
             let error = outcome.expect_err("nobody is listening");
             assert_eq!(error.kind, CoreErrorKind::Network, "{error:?}");

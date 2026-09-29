@@ -62,6 +62,9 @@ pub enum CoreErrorKind {
     Network,
     /// server 拒絕或不講協議。
     Server,
+    /// 加密訊息被 server 擋下：帶的房間版本號過期了（server 的 1506 `RoomDevicesChanged`）。訊息沒送。
+    /// daemon 已經自動重拿了房間狀態、補了金鑰，新的狀態在 [`CoreError::data`]（e2ee-rpc.md §3）；重不重送是 UI 的事。
+    RoomDevicesChanged,
     /// 完整性檢查不過（CRC、AEAD 標籤）。
     Integrity,
     Timeout,
@@ -92,17 +95,21 @@ impl CoreErrorKind {
             CoreErrorKind::Io => 1200,
             CoreErrorKind::Network => 1300,
             CoreErrorKind::Server => 1400,
+            CoreErrorKind::RoomDevicesChanged => 1401,
             CoreErrorKind::Integrity => 1500,
             CoreErrorKind::Timeout => 1600,
         }
     }
 }
 
-/// core 吐出去的錯誤：**種類**給程式判斷，**訊息**給人看。
+/// core 吐出去的錯誤：**種類**給程式判斷，**訊息**給人看，**資料**給程式接著用（只有少數種類帶）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CoreError {
     pub kind: CoreErrorKind,
     pub message: String,
+    /// 這個錯誤順手帶回來的東西，例：`RoomDevicesChanged` 帶 daemon 自動重拿的房間狀態（e2ee-rpc.md §3）。大多數錯誤是 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 impl CoreError {
@@ -110,7 +117,15 @@ impl CoreError {
         CoreError {
             kind,
             message: message.into(),
+            data: None,
         }
+    }
+
+    /// Args:
+    ///     data: example: json!({"room_version": 9, "members": {"@bob:localhost": "4-0a1b2c3d4e"}})
+    pub fn with_data(mut self, data: serde_json::Value) -> CoreError {
+        self.data = Some(data);
+        self
     }
 
     pub fn locked(data_dir: &std::path::Path) -> CoreError {
@@ -192,6 +207,7 @@ mod tests {
             (CoreErrorKind::Io, 1200),
             (CoreErrorKind::Network, 1300),
             (CoreErrorKind::Server, 1400),
+            (CoreErrorKind::RoomDevicesChanged, 1401),
             (CoreErrorKind::Integrity, 1500),
             (CoreErrorKind::Timeout, 1600),
         ];

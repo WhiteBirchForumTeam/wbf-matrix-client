@@ -176,13 +176,35 @@ impl Core {
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
-        client.hello(client_name, &[]).await?;
+        // 帶這條線自己的 features（同 `ping`：空的會收回 misc 的 `device_versions` 宣告）。
+        client
+            .hello(client_name, crate::link_pool::features_of(LinkRole::Misc))
+            .await?;
         let cg_seq = match (from_scratch, since) {
             (true, _) => None,
             (false, Some(since)) => Some(since),
             (false, None) => cache.read().await.get_cg_seq(&me)?,
         };
-        pull_recent(&mut client, &cache, &self.events, &me, cg_seq, plan).await
+        // 解密用（維護者 2026-09-29：收到時有金鑰就解）；開不起來講一聲，密文照存、之後金鑰那半補解。
+        let engine = match self.olm_engine_of(&account).await {
+            Ok(engine) => Some(engine),
+            Err(error) => {
+                self.events.progress(format!(
+                    "recent: encrypted messages stay encrypted in the cache: {error}"
+                ));
+                None
+            }
+        };
+        pull_recent(
+            &mut client,
+            &cache,
+            &self.events,
+            &me,
+            cg_seq,
+            plan,
+            engine.as_deref(),
+        )
+        .await
     }
 }
 
@@ -194,6 +216,7 @@ impl Core {
 ///     client: 已經 hello 過的線（`Recent` 要 `recent` feature）
 ///     cg_seq: 起點；None ＝ 沒有快取，從最新拿, example: Some(4700)
 ///     plan: 總量／一窗幾則／一批幾則, example: RecentPlan { max_events: Some(1000), window: 320, batch: None }
+///     engine: 解密用；None ＝ 密文照存（之後金鑰那半補解）
 /// Return:
 ///     Ok(RecentSummary)   `caught_up: false` ＝ 撞到總量停下
 ///     Err(Network)        線死了
@@ -205,11 +228,15 @@ pub(crate) async fn pull_recent(
     me: &str,
     cg_seq: Option<i64>,
     plan: RecentPlan,
+    engine: Option<&wbf_sdk::crypto_engine::OlmEngine>,
 ) -> Result<RecentSummary, CoreError> {
     let mut pulled = 0usize;
     let mut written = 0usize;
     let mut batches = 0u32;
     let mut skipped_without_room = 0usize;
+    // 這一輪寫進去的密文（房 → event_id）：收批回呼是同步的、不能等解密，拉完再一起解（room_crypto.rs）。
+    let mut encrypted_by_room: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     let mut on_batch = |meta: &wbf_sdk::protocol::BatchMeta,
                         raws: Vec<serde_json::Value>|
      -> Result<(), wbf_sdk::SdkError> {
@@ -232,6 +259,14 @@ pub(crate) async fn pull_recent(
                 .and_then(|value| value.as_str())
                 .unwrap_or_default()
                 .to_string();
+            if raw.get("type").and_then(|value| value.as_str()) == Some("m.room.encrypted") {
+                if let Some(event_id) = raw.get("event_id").and_then(|value| value.as_str()) {
+                    encrypted_by_room
+                        .entry(room.clone())
+                        .or_default()
+                        .push(event_id.to_string());
+                }
+            }
             by_room
                 .entry(room)
                 .or_default()
@@ -261,6 +296,20 @@ pub(crate) async fn pull_recent(
         Ok(())
     };
     let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
+    // 回給 UI 之前把這一輪的密文解開、補存明文（🚫 不發 `room.message`：`Recent` 本來就不推，UI 拉完自己讀）。
+    if let Some(engine) = engine {
+        for (room, event_ids) in encrypted_by_room {
+            let which = crate::room_crypto::StoredToDecrypt::EventIds(event_ids);
+            if let Err(error) =
+                crate::room_crypto::decrypt_stored(engine, cache, events, me, &room, which, false)
+                    .await
+            {
+                events.progress(format!(
+                    "recent: decrypting the pulled messages of {room} failed (they stay encrypted): {error}"
+                ));
+            }
+        }
+    }
     if skipped_without_room > 0 {
         // 存不了的（缺 room_id／event_id／sender）講出來；水位照推——它不是洞，再拿一次還是同一則（room-sync.md §2）。
         events.progress(format!(

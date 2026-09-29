@@ -165,16 +165,23 @@ impl Core {
     }
 
     /// 送一則文字。
+    ///
+    /// Args:
+    ///     options: wbf 帳號在加密房要 `room_devices`（UI 存的那份）；`txn_id` 重送用。一般 Matrix 帳號不看它, example: &SendOptions::default()
+    /// Return:
+    ///     Ok(String)                 event_id
+    ///     Err(RoomDevicesChanged)    wbf 加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
     pub async fn send_text(
         &self,
         room: &str,
         body: &str,
+        options: &crate::room_crypto::SendOptions,
         target: &Target,
     ) -> Result<String, CoreError> {
         let account = self.account_or_current(target)?;
         if self.is_wbf_account(&account)? {
-            // 明文走 `Event/Send`；加密房被拒（wbf_rooms.rs）。
-            return self.wbf_send_text(&account, room, body).await;
+            // 明文走 `Event/Send`；加密房先分金鑰再加密（wbf_rooms.rs → room_crypto.rs）。
+            return self.wbf_send_text(&account, room, body, options).await;
         }
         let backend = self
             .synced_backend_of(&account, target.server_backup)
@@ -423,7 +430,13 @@ impl Core {
                 LinkRole::Misc,
             )
             .await?;
-        client.hello(HISTORY_CLIENT_NAME, &[]).await?;
+        // 帶這條線自己的 features（同 `ping`：空的會收回 misc 的 `device_versions` 宣告）。
+        client
+            .hello(
+                HISTORY_CLIENT_NAME,
+                crate::link_pool::features_of(LinkRole::Misc),
+            )
+            .await?;
         let request = wbf_sdk::protocol::RecentRequest {
             rooms: Some(vec![room.to_string()]),
             // server 在上限以上會 clamp，client 先 clamp 才算得出「窗滿了沒」（protocol.rs）。
@@ -447,10 +460,13 @@ impl Core {
             )
             .await?;
         // 回來的是新到舊（g_seq 遞減），跟 `/messages` 往回翻同一個方向。
-        // WS 這條路不解密：密文原樣交出去（local-cache-db.md §7.2）。
-        Ok(EventPage::from_upstream_order(
-            raws.into_iter().map(IncomingEvent::from_ws_json).collect(),
-        ))
+        // 加密的有金鑰就解（維護者 2026-09-29，room_crypto.rs）；引擎開不起來就原樣交出去。
+        let engine = self.olm_engine_of(account).await.ok();
+        let mut incoming = Vec::with_capacity(raws.len());
+        for raw in raws {
+            incoming.push(crate::room_crypto::to_incoming(engine.as_deref(), room, raw).await);
+        }
+        Ok(EventPage::from_upstream_order(incoming))
     }
 
     /// 純本地的一頁。

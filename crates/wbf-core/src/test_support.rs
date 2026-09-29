@@ -191,7 +191,19 @@ pub(crate) struct FakeServer {
     pub(crate) device_early_push: DeviceEarlyPush,
     /// 下一次 `Device/Fetch` 回 Error（一次性）。
     pub(crate) fail_next_fetch: Arc<std::sync::atomic::AtomicBool>,
+    /// 走橋的呼叫：(kind, subtype)，照收到的順序。
+    pub(crate) bridge_calls: Arc<Mutex<Vec<(Kind, u8)>>>,
+    /// 橋 `Members`（`0x13/0x29`）回的 body；None → `Forbidden`。
+    pub(crate) members: Arc<Mutex<Option<Value>>>,
+    /// 橋 `GetStateEvent` 問 `m.room.encryption` 時：true 回 megolm 的 content，false 回 404（沒加密）。
+    pub(crate) room_is_encrypted: Arc<std::sync::atomic::AtomicBool>,
+    /// `Event/Send`：學 server 的 F4——設了就是這個房目前的房間版本號，加密事件帶的號碼對不上就 1506（帶目前的號碼）。
+    pub(crate) current_room_version: Arc<Mutex<Option<u64>>>,
+    /// `Event/Send` 收下的：(room_id, type, room_version, txn_id, content)。
+    pub(crate) sent_events: SentEvents,
 }
+
+pub(crate) type SentEvents = Arc<Mutex<Vec<(String, String, Option<u64>, String, Vec<u8>)>>>;
 
 pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value>>>) -> FakeServer {
     let recent_requests = Arc::new(Mutex::new(Vec::new()));
@@ -219,6 +231,18 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         device_early_push.clone(),
         fail_next_fetch.clone(),
     );
+    let bridge_calls: Arc<Mutex<Vec<(Kind, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+    let members: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let room_is_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let current_room_version: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let sent_events: SentEvents = Arc::new(Mutex::new(Vec::new()));
+    let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
+        bridge_calls.clone(),
+        members.clone(),
+        room_is_encrypted.clone(),
+        current_room_version.clone(),
+        sent_events.clone(),
+    );
     let task = tokio::spawn(async move {
         loop {
             let pack = tokio::select! {
@@ -234,13 +258,61 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     None => return,
                 },
             };
+            if pack.flags & flags::IS_BRIDGED != 0 {
+                bridge_t.lock().unwrap().push((pack.kind, pack.subtype));
+                let reply = bridged_reply(&pack, &members_t, &encrypted_t);
+                peer.sink.send(reply.encode().unwrap()).await.unwrap();
+                continue;
+            }
             let reply = match (pack.kind, pack.subtype) {
+                (Kind::Event, event::SEND) => {
+                    let meta: Value = serde_json::from_slice(&pack.meta).unwrap();
+                    let room_id = meta["room_id"].as_str().unwrap_or_default().to_string();
+                    let event_type = meta["type"].as_str().unwrap_or_default().to_string();
+                    let txn_id = meta["txn_id"].as_str().unwrap_or_default().to_string();
+                    let room_version = meta["room_version"].as_u64();
+                    let current = *room_version_t.lock().unwrap();
+                    match current {
+                        Some(current)
+                            if event_type == "m.room.encrypted"
+                                && room_version != Some(current) =>
+                        {
+                            response(
+                                Kind::Control,
+                                control::ERROR,
+                                pack.id,
+                                pack.seq,
+                                json!({ "code": "RoomDevicesChanged", "code_id": 1506,
+                                        "message": "the room devices changed", "room_version": current }),
+                                Vec::new(),
+                            )
+                        }
+                        _ => {
+                            let mut sent = sent_t.lock().unwrap();
+                            sent.push((
+                                room_id,
+                                event_type,
+                                room_version,
+                                txn_id,
+                                pack.data.to_vec(),
+                            ));
+                            response(
+                                Kind::Control,
+                                control::ACK,
+                                pack.id,
+                                pack.seq,
+                                json!({ "event_id": format!("$sent-{}", sent.len()) }),
+                                Vec::new(),
+                            )
+                        }
+                    }
+                }
                 (Kind::Control, control::HELLO) => response(
                     Kind::Control,
                     control::ACK,
                     0,
                     pack.seq,
-                    json!({ "protocol": wbf_sdk::protocol::PROTOCOL_VERSION, "server": "fake", "features": ["recent", "device"],
+                    json!({ "protocol": wbf_sdk::protocol::PROTOCOL_VERSION, "server": "fake", "features": ["recent", "device", "bridge", "attachments"],
                             "chunk_size_default": 16, "chunk_size_large": 16, "data_max_bytes": 1048576 }),
                     Vec::new(),
                 ),
@@ -419,6 +491,74 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         fetch_requests,
         device_early_push,
         fail_next_fetch,
+        bridge_calls,
+        members,
+        room_is_encrypted,
+        current_room_version,
+        sent_events,
+    }
+}
+
+/// 走橋的回答（bridge-specs index.md §1.2）：成功 `Control/Ack`、失敗 `Control/Error`，都帶 bit4。只認加密那條路用到的幾支，
+/// 回的是「形狀對」的答案讓狀態機往下走：不存金鑰，查金鑰一律回空的、claim 一律回沒有。
+fn bridged_reply(
+    pack: &Pack,
+    members: &Arc<Mutex<Option<Value>>>,
+    room_is_encrypted: &Arc<std::sync::atomic::AtomicBool>,
+) -> Pack {
+    let reply = |subtype: u8, meta: Value, data: Vec<u8>| Pack {
+        kind: Kind::Control,
+        subtype,
+        flags: flags::IS_RESPONSE | flags::IS_BRIDGED,
+        id: pack.id,
+        seq: pack.seq,
+        meta: meta.to_string().into_bytes(),
+        data,
+    };
+    let ok = |body: Value| {
+        reply(
+            control::ACK,
+            json!({ "headers": { "content-type": "application/json" }, "status": 200 }),
+            body.to_string().into_bytes(),
+        )
+    };
+    let rejected = |code: &str, code_id: u64, status: u16, errcode: &str| {
+        reply(
+            control::ERROR,
+            json!({ "code": code, "code_id": code_id, "errcode": errcode, "message": errcode, "status": status }),
+            json!({ "errcode": errcode, "error": errcode })
+                .to_string()
+                .into_bytes(),
+        )
+    };
+    match (pack.kind, pack.subtype) {
+        (Kind::Room, 0x29) => match members.lock().unwrap().clone() {
+            Some(body) => ok(body),
+            None => rejected("Forbidden", 1302, 403, "M_FORBIDDEN"),
+        },
+        (Kind::Event, 0x22) => {
+            if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
+                ok(json!({ "algorithm": "m.megolm.v1.aes-sha2" }))
+            } else {
+                rejected("NotFound", 1501, 404, "M_NOT_FOUND")
+            }
+        }
+        (Kind::Keys, 0x20) => ok(json!({ "one_time_key_counts": { "signed_curve25519": 50 } })),
+        (Kind::Keys, 0x21) => {
+            // 問到的每個人都要有一個條目（哪怕是空的）：上游對沒回答的人會一直重查。
+            let asked: Value = serde_json::from_slice(&pack.data).unwrap_or_default();
+            let device_keys: serde_json::Map<String, Value> = asked["device_keys"]
+                .as_object()
+                .map(|users| users.keys().map(|user| (user.clone(), json!({}))).collect())
+                .unwrap_or_default();
+            ok(
+                json!({ "device_keys": device_keys, "failures": {}, "master_keys": {},
+                       "self_signing_keys": {}, "user_signing_keys": {} }),
+            )
+        }
+        (Kind::Keys, 0x22) => ok(json!({ "one_time_keys": {}, "failures": {} })),
+        (Kind::Device, 0x25) => ok(json!({})),
+        _ => rejected("UnknownKind", 1101, 400, "M_UNRECOGNIZED"),
     }
 }
 
@@ -472,16 +612,25 @@ pub(crate) async fn subscribed(
     (subscription_id, fake, pool)
 }
 
-/// 金鑰那條線訂好（含上線追平）、線放回池裡；回 `Device/Subscribe` 的 id 與池。
+/// 金鑰那條線訂好（含上線追平）、線放進池裡；回 `Device/Subscribe` 的 id 與池。
+/// ⚠️ 跟正式路徑（`open_link`）同一個順序：`init_connection` 在 `acquire` 的開線閉包裡跑、握著那一格——
+/// 收金鑰的 task 一起來就 `reuse` 那格時會等到線放進去，🚫 不會先看到空格（先 init 再放的話，第一個 `CryptoState` 的補上傳會落空）。
 pub(crate) async fn subscribed_keys(
     core: &Core,
     account: &AccountDir,
     events: &Arc<Mutex<Vec<Value>>>,
 ) -> (u64, FakeServer, Arc<crate::link_pool::LinkPool>) {
     let (mut client, fake) = memory_client_with_hello(events.clone()).await;
-    core.init_connection(account, LinkRole::Keys, &mut client)
+    let pool = core.pool_of_account(account).unwrap();
+    drop(
+        pool.acquire(LinkRole::Keys, || async move {
+            core.init_connection(account, LinkRole::Keys, &mut client)
+                .await?;
+            Ok(client)
+        })
         .await
-        .expect("subscribe keys");
+        .expect("subscribe keys"),
+    );
     let device_subscription_id = fake
         .device_subscription_ids
         .lock()
@@ -489,12 +638,6 @@ pub(crate) async fn subscribed_keys(
         .last()
         .copied()
         .expect("server got a Device/Subscribe");
-    let pool = core.pool_of_account(account).unwrap();
-    drop(
-        pool.acquire(LinkRole::Keys, || async move { Ok(client) })
-            .await
-            .unwrap(),
-    );
     (device_subscription_id, fake, pool)
 }
 

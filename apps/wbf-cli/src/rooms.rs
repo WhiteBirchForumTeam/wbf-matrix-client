@@ -33,7 +33,9 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
     let core = context.core()?;
     let target = context.target();
     if let Some(text) = &args.text {
-        let event_id = core.send_text(&args.room, text, &target).await?;
+        let event_id = core
+            .send_text(&args.room, text, &wbf_core::SendOptions::default(), &target)
+            .await?;
         return print_json(&json!({ "event_id": event_id }));
     }
     let Some(file) = &args.file else {

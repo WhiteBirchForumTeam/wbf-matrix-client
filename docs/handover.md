@@ -49,7 +49,9 @@ refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → �
 daemon 在 `vault.unlock`、`account.add` 成功後背景叫一次，常駐時 `Handle::keep_links_open` 每 15 秒一輪（開不起來就加倍、上限 5 分鐘；`daemon.shutdown` 就停；`TRANSPORT = http` 不跑）。
 🚫 沒有開／關訂閱線的 RPC：UI 要不要收推播就是 `subscribe`（維護者：「sync.open、sync.close 應該是指是否要推到 RPC UI 端的一個 flag」）。`Core::open_subscriptions`／`close_subscriptions` 拿掉了。
 
-**還沒有：UI、E2EE 接進 daemon／CLI 的產品路徑（沒有任何一條路宣告 feature；`DeviceChanged` → `refresh_room_devices`、`CryptoState` → 補上傳金鑰、裝置金鑰上傳）、監督者的其他部分（task panic 收攤、重連時重探 backend）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
+**E2EE 的 RPC 面（2026-09-29，`design/e2ee-rpc.md`，維護者定：狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再一起回）**：房間版本號與成員的裝置版本號（`RoomDevices`）存在 UI，`room.refresh_devices` 拿、`room.send_text` 的 `room_devices` 帶回來；送出前一律先分金鑰（第一次、該換、多了裝置）再加密帶號碼送；被 1506 擋 → daemon 自動 refresh，回 **1401** 帶 `data`（新狀態＋`txn_id`），🚫 不自動重送；`Misc`／`Rooms` 宣告 `org.wbftw.device_versions`（重 hello 的三處改成帶這份）；`DeviceChanged` 原樣轉 `devices.changed`；開 `Keys` 線上傳裝置金鑰、`CryptoState` 一到就補一次性金鑰；收到時有金鑰就解（密文明文一起存），金鑰晚到就補解、再發 `room.message`。⚠️ **還沒對真 server 跑過**（寫這支時本機 wbfuwunel 的 build 被清掉），測試全是假 server。
+
+**還沒有：UI、加密附件、wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀舊訊息）、房間自設的換金鑰期限、監督者的其他部分（task panic 收攤、重連時重探 backend）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -113,6 +115,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
   room_sync.rs           **房間那條線的內容**（room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
+  room_crypto.rs         **房間的加解密**（e2ee-rpc.md）：`refresh_room_devices`、加密送出與 1506 之後自動重拿（`wbf_send_encrypted`）、收到時解（`to_incoming`）、補解（`decrypt_stored`）；`RoomDevices`／`SendOptions` 是 DTO
   link_keeper.rs         **「該開的線都開著嗎」的鉤子**（link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
   wbf_rooms.rs           **wbf 帳號的房間**（account-session.md §6）：清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、`Event/Send` 送明文（加密房拒）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
@@ -282,7 +285,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    ✅ **B**（2026-09-21）：wbf 帳號不建 matrix-sdk 的 Client——登入先探活，wbf 走自己包的 HTTP `/login`、`m/` 由 `OlmEngine` 開（只有 crypto store）、`Session::backend` 記住走哪邊；
    `room.list`／`get` 走橋（`JoinedRooms`＋`GetState`＋`m.direct` → sdk `room_state.rs` 組 `Conversation`）、`send_text`／`send_file` 走 `Event/Send`（加密房拒；附件宣告成立）；
    備份／watch／`/context` 對 wbf 帳號回 1100（`handles::no_matrix_client_error`），登出閘門只認本機 recovery key；§6 有表。裝置金鑰的上傳跟 E2EE 那支一起。
-2. **E2EE 接進 daemon**（e2ee-walkthrough §16.6 的 RPC 面；金鑰走 `LinkRole::Keys`，`Misc`（送 Event/Send）與 `Rooms`（收 DeviceChanged）宣告 `org.wbftw.device_versions`）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
+2. ✅ **E2EE 接進 daemon**（2026-09-29，權威改在 `design/e2ee-rpc.md`；下面是 09-21 的原始說法，「daemon 存快照、發可以送了的狀態訊息」已被精確化掉）（e2ee-walkthrough §16.6 的 RPC 面；金鑰走 `LinkRole::Keys`，`Misc`（送 Event/Send）與 `Rooms`（收 DeviceChanged）宣告 `org.wbftw.device_versions`）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
    被 1506 擋時 daemon 自動 refresh 再把錯原樣回 UI 並發「這個房版本到 V、可以送了」的狀態訊息（daemon 🚫 不自動重送）、每房 `RoomRefresh` 的落地（記憶體還是 cache.db 待定）、
    上線 `device_subscribe` → `pull_to_device`、下線 `device_unsubscribe`。這是第一條宣告 `org.wbftw.device_versions` 的產品路徑。
 3. 交叉簽章 bootstrap（`SigningKeysUpload` 已在橋上）→ 分享策略換 `IdentityBasedStrategy`（只改 `room_key_share_settings`）。
@@ -291,7 +294,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 6. server 批 4 的功能（推播規則、搜尋、公開房間目錄、TURN；本 repo issue #55）：都在橋上了，等 UI 需要才加 Kind 與包裝；坑見 §6。
 7. ✅ **訂閱線的內容（明文房間）**（2026-09-22，`design/room-sync.md`：`init_connection`、補窗與漏包交給 UI、daemon 不碰水位、`sync.recent` 多 `since`）。✅ **訂閱金鑰**（2026-09-24，`design/key-sync.md`：`init_connection` 裡多一個 `Device/Subscribe` 會話、`pull_to_device` 追平、推的與拉的走同一支 `import_items`、`keys.state`）。
    ✅ **訂閱線由 daemon 搞定**（2026-09-29，link-pool.md §1、§3.1）：房間與金鑰各一條、解鎖／登入後全開、常駐時背景看著重開；🚫 沒有開／關訂閱線的 RPC（UI 收不收是 `subscribe`）。
-   下一支：E2EE 的 RPC 面（`refresh_room_devices`、裝置／OTK 上傳、`encrypt_and_send`）。
+   ✅ **E2EE 的 RPC 面**（2026-09-29，`design/e2ee-rpc.md`）。下一步待維護者排：對真 server 補跑 e2e（等 server 重編）、加密附件、wbf 帳號的金鑰備份、交叉簽章。
 
 📍 **2026-09-14 的建議順序**：
 

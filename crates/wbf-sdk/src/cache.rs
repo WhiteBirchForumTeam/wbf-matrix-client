@@ -35,6 +35,15 @@ pub struct CacheIdentity {
     pub server: String,
 }
 
+/// [`Cache::list_undecrypted_ciphertexts`] 要哪一些還沒解開的密文。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndecryptedFilter<'a> {
+    /// 用這把房間金鑰（Megolm session）加密的：收到那把金鑰時。
+    BySession(&'a str),
+    /// 這幾則：`Recent` 拉完、把剛寫進去的密文補解時。
+    ByEventIds(&'a [String]),
+}
+
 /// [`Cache::upsert_events_counted`] 的結果。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpsertOutcome {
@@ -581,6 +590,72 @@ impl Cache {
             }
         }
         Ok(messages)
+    }
+
+    /// 這個讀者同步過、**還沒解開**的密文（原樣的 `raw_event`），舊→新：收到新的房間金鑰、或 `Recent` 拉完之後拿去重解
+    /// （維護者 2026-09-29：金鑰到了就找出那些訊息立刻解；已經解了的不管）。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     which: 哪一些, example: &UndecryptedFilter::BySession("SESSIONID")
+    /// Return:
+    ///     Ok(Vec<Value>)   密文事件；一則都沒有就是空的
+    ///     Err(Integrity)   某一列存的密文不是 JSON（它是我們自己寫進去的，壞了就是庫壞了）
+    pub fn list_undecrypted_ciphertexts(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        which: &UndecryptedFilter<'_>,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
+        const UNDECRYPTED_OF_READER: &str = "SELECT e.raw_event
+             FROM events e
+             JOIN events_synced_log l ON l.event = e.id
+             JOIN users reader ON reader.id = l.user
+             JOIN rooms r ON r.id = e.room
+             WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.decrypted = 0 AND e.raw_event IS NOT NULL";
+        let mut texts: Vec<String> = Vec::new();
+        match which {
+            UndecryptedFilter::BySession(session_id) => {
+                let mut statement = self
+                    .connection
+                    .prepare_cached(&format!(
+                        "{UNDECRYPTED_OF_READER}
+                           AND json_extract(e.raw_event, '$.content.session_id') = ?3
+                         ORDER BY e.origin_server_ts, e.id"
+                    ))
+                    .map_err(db_error)?;
+                let rows = statement
+                    .query_map(params![user_id, room_id, session_id], |row| row.get(0))
+                    .map_err(db_error)?;
+                for row in rows {
+                    texts.push(row.map_err(db_error)?);
+                }
+            }
+            UndecryptedFilter::ByEventIds(event_ids) => {
+                let mut statement = self
+                    .connection
+                    .prepare_cached(&format!("{UNDECRYPTED_OF_READER} AND e.event_id = ?3"))
+                    .map_err(db_error)?;
+                for event_id in event_ids.iter() {
+                    if let Some(text) = statement
+                        .query_row(params![user_id, room_id, event_id], |row| row.get(0))
+                        .optional()
+                        .map_err(db_error)?
+                    {
+                        texts.push(text);
+                    }
+                }
+            }
+        }
+        texts
+            .iter()
+            .map(|text| {
+                serde_json::from_str(text).map_err(|error| {
+                    SdkError::Integrity(format!("cache: a stored ciphertext is not JSON: {error}"))
+                })
+            })
+            .collect()
     }
 
     /// 一列 → 顯示用的 `Message`（§7.5 的讀取順序）：
@@ -2640,6 +2715,92 @@ mod tests {
         let message = cache.history(ALICE, "!r", None, 1).unwrap().remove(0);
         assert_eq!(message.decrypted, Some(true));
         assert!(matches!(&message.kind, MessageKind::Text { body, .. } if body == "secret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 補解要找的密文：只回**這個讀者**同步過、**還沒解開**、而且是指定那把 session（或那幾則）的；解開之後就不再出現。
+    #[test]
+    fn undecrypted_ciphertexts_are_found_by_session_or_event_id_and_vanish_once_decrypted() {
+        let (mut cache, dir) = open("undecrypted-lookup");
+        let ciphertext = |event_id: &str, session_id: &str, ts: i64| {
+            serde_json::json!({
+                "type": "m.room.encrypted", "event_id": event_id, "room_id": "!r", "sender": CAROL,
+                "origin_server_ts": ts,
+                "content": { "algorithm": "m.megolm.v1.aes-sha2", "session_id": session_id, "ciphertext": "AAA" },
+            })
+        };
+        let undecrypted = |event: serde_json::Value| IncomingEvent::Undecrypted {
+            ciphertext: event,
+            reason: "MissingRoomKey".into(),
+        };
+        cache
+            .upsert_events(
+                BOB,
+                "!r",
+                &[
+                    undecrypted(ciphertext("$b", "S1", 2)),
+                    undecrypted(ciphertext("$a", "S1", 1)),
+                    undecrypted(ciphertext("$c", "S2", 3)),
+                ],
+            )
+            .unwrap();
+        let ids = |events: Vec<serde_json::Value>| -> Vec<String> {
+            events
+                .iter()
+                .map(|event| event["event_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            ids(cache
+                .list_undecrypted_ciphertexts(BOB, "!r", &UndecryptedFilter::BySession("S1"))
+                .unwrap()),
+            vec!["$a", "$b"],
+            "只要 S1 的，舊→新"
+        );
+        assert_eq!(
+            ids(cache
+                .list_undecrypted_ciphertexts(
+                    BOB,
+                    "!r",
+                    &UndecryptedFilter::ByEventIds(&["$c".to_string(), "$nope".to_string()])
+                )
+                .unwrap()),
+            vec!["$c"]
+        );
+        assert!(
+            cache
+                .list_undecrypted_ciphertexts(ALICE, "!r", &UndecryptedFilter::BySession("S1"))
+                .unwrap()
+                .is_empty(),
+            "別的帳號沒同步過就不是它的"
+        );
+
+        let cleartext = event_json(
+            "!r",
+            "$a",
+            CAROL,
+            None,
+            1,
+            serde_json::json!({ "msgtype": "m.text", "body": "hi" }),
+        );
+        cache
+            .upsert_events(
+                BOB,
+                "!r",
+                &[IncomingEvent::Decrypted {
+                    ciphertext: Some(ciphertext("$a", "S1", 1)),
+                    cleartext,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            ids(cache
+                .list_undecrypted_ciphertexts(BOB, "!r", &UndecryptedFilter::BySession("S1"))
+                .unwrap()),
+            vec!["$b"],
+            "解開了就不再找"
+        );
+        drop(cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

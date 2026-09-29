@@ -8,6 +8,8 @@
 //! - 訂閱結束（被另一台裝置接手的 1505、線死了）就停、發 `keys.state: stopped`、關掉這格線（跟房間那半同一個做法）；
 //!   🚫 不在這裡重訂（to-device-client.md §5.1：兩台會互踢）。重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
 //! - `keys.state` 留著（「有點多餘，但傾向保留——不然 RPC 無從知道」）。
+//! - 維護者 2026-09-29（e2ee-rpc.md §2、§5）：開線時上傳自己的裝置金鑰與一次性金鑰；`CryptoState` 一到就把存量交給狀態機、它要補就補
+//!   （上游一律補到 50 把＋一把 fallback key，vodozemac 的上限）；每匯進一批帶新房間金鑰，就去 cache 找那把 session 還沒解的訊息立刻解、發 `room.message`。
 //!
 //! 🚨 **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）：server 的佇列沒有洞（每一則存到我們 `ItemsDestroy` 才刪），
 //! `Fetch` 🚫 不帶 `cd_seq`、讓 server 從最舊還沒銷毀的起給。所以沒有「client 的游標越過一則沒匯的」這種事：
@@ -21,12 +23,14 @@ use wbf_sdk::channel::Channel;
 use wbf_sdk::client::{DeviceSubscription, WbfClient};
 use wbf_sdk::crypto_engine::{ImportReport, OlmEngine};
 use wbf_sdk::login::SessionBackend;
-use wbf_sdk::protocol::SubscribeReply;
+use wbf_sdk::protocol::{CryptoStateMeta, SubscribeReply};
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::event::{EventSink, KeysState};
 use crate::link_pool::{LinkPool, LinkRole};
+use crate::room_crypto::{decrypt_stored, StoredToDecrypt};
+use crate::server_cache::ServerCache;
 use crate::{Core, CoreEvent};
 
 /// 等 `Subscribe` 的 Ack／`Fetch` 的每個 Batch／`ItemsDestroy` 的回覆最久多久。
@@ -54,6 +58,8 @@ struct KeySyncTask {
     engine: Arc<OlmEngine>,
     events: EventSink,
     pool: Arc<LinkPool>,
+    /// 金鑰到了補解那些訊息用。
+    cache: Arc<ServerCache>,
 }
 
 impl Core {
@@ -131,6 +137,7 @@ impl Core {
         }
         let engine = self.olm_engine_of(account).await?;
         let pool = self.pool_of_account(account)?;
+        let (cache, _) = self.server_cache_and_me(account)?;
         let me = session.user_id.clone();
         let mut subscription = client
             .device_subscription(&session.device_id, REPLY_TIMEOUT)
@@ -141,12 +148,36 @@ impl Core {
         // 這裡失敗＝整條訂閱線沒開成；沒進 store 的還在佇列裡，下次開線的追平會拉回（key-sync.md §1、PR #60 審查 rumia 🟡）。
         let reports = engine.pull_to_device(client, REPLY_TIMEOUT).await?;
         emit_caught_up(&self.events, &me, &reports);
+        decrypt_what_the_keys_open(&engine, &cache, &self.events, &me, &reports).await;
+        // 訂閱時 server 跟著推的那個 `CryptoState`（sdk 收在 `subscription.crypto_state`）：先把存量交給狀態機，
+        // 下面那一次上傳才知道要補幾把一次性金鑰、要不要補 fallback key（e2ee-rpc.md 那支的測試抓到：沒交的話要等到下一個 `CryptoState` 才補）。
+        let initial = &subscription.crypto_state;
+        if let Err(error) = engine
+            .receive_to_device(
+                Vec::new(),
+                Some(&initial.otk_counts),
+                Some(&initial.unused_fallback_key_types),
+            )
+            .await
+        {
+            self.events.progress(format!(
+                "keys: the one-time key stock {:?} could not be recorded: {error}",
+                initial.otk_counts
+            ));
+        }
+        // 上傳自己的裝置金鑰、補一次性金鑰（第一次開線就是這一步讓別人查得到這台）。失敗只講一聲：收金鑰照常，下一個 `CryptoState` 再補。
+        if let Err(error) = engine.send_outgoing_requests(client).await {
+            self.events.progress(format!(
+                "keys: uploading this device's keys failed (retried on the next key-stock update): {error}"
+            ));
+        }
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = KeySyncTask {
             me,
             engine,
             events: self.events.clone(),
             pool,
+            cache,
         };
         let handle = KeySyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
@@ -244,16 +275,13 @@ impl KeySyncTask {
                     }
                     None
                 }
-                // OTK 存量：用途是補上傳金鑰，那是 E2EE 的 RPC 面那支；這裡只講一聲。
-                // 但它跟 `Push` 共用這條訂閱的 gap 旗（server 給一次就清掉）：gap 真就是有推送沒到，一樣拉。
+                // OTK 存量變了：交給狀態機、它要補就補（模組註解）。
+                // 它跟 `Push` 共用這條訂閱的 gap 旗（server 給一次就清掉）：gap 真就是有推送沒到，一樣拉。
                 Ok(Some(SubscribeReply::CryptoState(state))) => {
                     if state.gap {
                         needs_pull = true;
                     }
-                    self.events.progress(format!(
-                        "keys: one-time key stock is now {:?} (uploading keys is not wired yet)",
-                        state.otk_counts
-                    ));
+                    self.top_up_one_time_keys(&state).await;
                     None
                 }
                 Ok(Some(SubscribeReply::Acknowledged)) | Err(wbf_sdk::SdkError::Timeout(_)) => None,
@@ -318,7 +346,17 @@ impl KeySyncTask {
             .await
         {
             Ok(report) => {
-                emit_caught_up(&self.events, &self.me, &[report]);
+                let reports = [report];
+                emit_caught_up(&self.events, &self.me, &reports);
+                drop(line);
+                decrypt_what_the_keys_open(
+                    &self.engine,
+                    &self.cache,
+                    &self.events,
+                    &self.me,
+                    &reports,
+                )
+                .await;
                 true
             }
             // 匯入或銷毀失敗：已落地的照樣有效（import_items 的順序鎖死）；沒銷掉的還在佇列裡，呼叫端從佇列頭拉回。
@@ -328,6 +366,37 @@ impl KeySyncTask {
                 ));
                 false
             }
+        }
+    }
+
+    /// `CryptoState` 說了自己在 server 上還剩幾把一次性金鑰：交給狀態機，它要補（不到 50 把、或 fallback key 用掉了）就上傳。
+    /// 失敗只講一聲：下一個 `CryptoState`（有人再領一把、或下次開線）會再試；領光了還有 fallback key 撐著。
+    async fn top_up_one_time_keys(&self, state: &CryptoStateMeta) {
+        if let Err(error) = self
+            .engine
+            .receive_to_device(
+                Vec::new(),
+                Some(&state.otk_counts),
+                Some(&state.unused_fallback_key_types),
+            )
+            .await
+        {
+            self.events.progress(format!(
+                "keys: the one-time key stock {:?} could not be recorded: {error}",
+                state.otk_counts
+            ));
+            return;
+        }
+        let Some(mut line) = self.pool.reuse(LinkRole::Keys).await else {
+            self.events.progress(
+                "keys: the keys line is gone; one-time keys are topped up when the line is reopened",
+            );
+            return;
+        };
+        if let Err(error) = self.engine.send_outgoing_requests(&mut line).await {
+            self.events.progress(format!(
+                "keys: topping up one-time keys failed (retried on the next key-stock update): {error}"
+            ));
         }
     }
 
@@ -345,6 +414,15 @@ impl KeySyncTask {
         match self.engine.pull_to_device(&mut line, REPLY_TIMEOUT).await {
             Ok(reports) => {
                 emit_caught_up(&self.events, &self.me, &reports);
+                drop(line);
+                decrypt_what_the_keys_open(
+                    &self.engine,
+                    &self.cache,
+                    &self.events,
+                    &self.me,
+                    &reports,
+                )
+                .await;
                 true
             }
             Err(error) => {
@@ -353,6 +431,26 @@ impl KeySyncTask {
                 ));
                 false
             }
+        }
+    }
+}
+
+/// 這幾窗帶進來的每一把新房間金鑰：去 cache 找用它加密、還沒解的訊息，解開、補存、發 `room.message`（維護者 2026-09-29）。
+/// 失敗只講一聲：密文還在 cache，下一次同一把金鑰再來（或 UI 重讀）時還有機會。
+async fn decrypt_what_the_keys_open(
+    engine: &OlmEngine,
+    cache: &Arc<ServerCache>,
+    events: &EventSink,
+    me: &str,
+    reports: &[ImportReport],
+) {
+    for key in reports.iter().flat_map(|report| report.room_keys.iter()) {
+        let room = key.room_id.as_str();
+        let which = StoredToDecrypt::Session(key.session_id.clone());
+        if let Err(error) = decrypt_stored(engine, cache, events, me, room, which, true).await {
+            events.progress(format!(
+                "keys: a new room key for {room} arrived, but decrypting the stored messages failed: {error}"
+            ));
         }
     }
 }
@@ -604,6 +702,51 @@ mod tests {
             vec![None],
             "追平不帶游標"
         );
+        fake.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 維護者 2026-09-29（e2ee-rpc.md §5）：開金鑰那條線時上傳這台裝置的金鑰（別人才查得到它）；`CryptoState` 說一次性金鑰剩不多 → 補上傳。
+    /// 存量是滿的（50 把）就不上傳。
+    #[tokio::test]
+    async fn the_keys_line_uploads_this_devices_keys_and_tops_up_one_time_keys() {
+        let dir = scratch("keys-upload");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (device_subscription_id, fake, _pool) = subscribed_keys(&core, &account, &events).await;
+        let uploads = |fake: &FakeServer| {
+            fake.bridge_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == (Kind::Keys, 0x20))
+                .count()
+        };
+        // 開線上傳一次（裝置金鑰＋一次性金鑰＋fallback key）。等 server 跟著 Subscribe 推的第一個 `CryptoState` 也處理完再數：
+        // 上游的 fallback key 要到期才換，那一則不會再觸發上傳。
+        assert_eq!(uploads(&fake), 1, "開線就上傳這台裝置的金鑰");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after_open = uploads(&fake);
+
+        let crypto_state = |seq: u32, count: u64| {
+            response(
+                Kind::Device,
+                device::CRYPTO_STATE,
+                device_subscription_id,
+                seq,
+                json!({ "otk_counts": { "signed_curve25519": count }, "unused_fallback_key_types": ["signed_curve25519"], "gap": false }),
+                Vec::new(),
+            )
+        };
+        fake.outbound.send(crypto_state(1, 50)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(uploads(&fake), after_open, "存量滿的不上傳");
+        fake.outbound.send(crypto_state(2, 10)).await.unwrap();
+        wait_for_async(
+            || async { uploads(&fake) > after_open },
+            "a low one-time key stock makes the task upload more",
+        )
+        .await;
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

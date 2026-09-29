@@ -357,6 +357,7 @@ server 事件 JSON ──messages_from_json──> Vec<Message> ──upsert_mes
   目標那一列只記「目前要顯示哪個 edit」（`ref_event_id`）與「最後一次變動的 server 時間」（`modified_timestamp`），顯示時引用（§7.5）；
   redact 只在目標打勾 `is_redacted`。
 - ⭐ **先解密再寫入**：寫進去的時候就已經處理過，只有解不開的才停在「未處理」。
+  wbf 帳號 2026-09-29 起照這條做：收到時有金鑰就解；解不開的，金鑰晚到時由金鑰那半找出來補解、補寫 `content_json`（`raw_event` 的密文不動，e2ee-rpc.md §6）。
 - 📎 **redact 要不要真的清掉本地的唯一快取，是裝置端的選擇，🚫 不是協議保證**（維護者 2026-09-14）。
   client 選擇不清，redact 對它就是「標記」而不是「抹除」—— 在這個 client 上不算 bug。
 

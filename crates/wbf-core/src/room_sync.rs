@@ -9,13 +9,15 @@
 //! - 水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動；推播漏掉的（server 的 `gap`、本地丟包、一包解不開、寫失敗）**都不管**：
 //!   UI 下次叫 `Recent` 會從它自己決定的起點重拉那一段（冪等），UI 不叫就不補，永遠拿不到也不管。誰記有沒有漏是 UI 層的事。
 //!
-//! 事件跟 `Recent` 那條路一樣**原樣**寫（密文不解，local-cache-db.md §7.2）；訂閱是純的，`seq` 跳號不管、`Subscribe` 不帶 `cg_seq`。
+//! 加密的事件收到時有金鑰就解（密文明文一起存），沒金鑰只存密文（維護者 2026-09-29，room_crypto.rs）；訂閱是純的，`seq` 跳號不管、`Subscribe` 不帶 `cg_seq`。
+//! `DeviceChanged` 原樣轉成 `CoreEvent::DeviceChanged` 給 UI，要不要 refresh 是 UI 的事（e2ee-rpc.md §4）。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use wbf_sdk::channel::Channel;
 use wbf_sdk::client::{RoomSubscription, WbfClient};
+use wbf_sdk::crypto_engine::OlmEngine;
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::protocol::{EventSubscribeReply, PushMeta};
 use wbf_sdk::IncomingEvent;
@@ -24,6 +26,7 @@ use crate::accounts::AccountDir;
 use crate::error::CoreError;
 use crate::event::{EventSink, LinkState};
 use crate::link_pool::{LinkPool, LinkRole};
+use crate::room_crypto;
 use crate::server_cache::ServerCache;
 use crate::{Core, CoreEvent};
 
@@ -53,6 +56,8 @@ struct RoomSyncTask {
     events: EventSink,
     /// 這個帳號的池：只為了收攤時把訂閱那格關掉（模組註解）。
     pool: Arc<LinkPool>,
+    /// 解密用；None ＝ 引擎開不起來（講過一聲），密文照存、之後金鑰那半補解。
+    engine: Option<Arc<OlmEngine>>,
 }
 
 impl Core {
@@ -93,6 +98,16 @@ impl Core {
     ) -> Result<(), CoreError> {
         let (cache, me) = self.server_cache_and_me(account)?;
         let pool = self.pool_of_account(account)?;
+        let engine = match self.olm_engine_of(account).await {
+            Ok(engine) => Some(engine),
+            Err(error) => {
+                self.events.progress(format!(
+                    "room sync: pushed encrypted messages stay encrypted in the cache for {}: {error}",
+                    account.label()
+                ));
+                None
+            }
+        };
         let subscription = client.room_subscription(None, ACK_TIMEOUT).await?;
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = RoomSyncTask {
@@ -100,6 +115,7 @@ impl Core {
             cache,
             events: self.events.clone(),
             pool,
+            engine,
         };
         let handle = RoomSyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
@@ -176,9 +192,18 @@ impl RoomSyncTask {
                     self.on_push(meta, events).await;
                     continue;
                 }
-                // 金鑰那支才消費；這裡只確認它不會把 task 弄死。
-                Ok(Some(EventSubscribeReply::DeviceChanged(_)))
-                | Ok(Some(EventSubscribeReply::Acknowledged(_)))
+                // 原樣轉給 UI；要不要 refresh 是 UI 的事（e2ee-rpc.md §4）。
+                Ok(Some(EventSubscribeReply::DeviceChanged(changed))) => {
+                    self.events.emit(CoreEvent::DeviceChanged {
+                        user: self.me.clone(),
+                        changed_user: changed.user_id,
+                        device_version: changed.device_version,
+                        rooms: changed.rooms,
+                        gap: changed.gap,
+                    });
+                    continue;
+                }
+                Ok(Some(EventSubscribeReply::Acknowledged(_)))
                 | Ok(Some(EventSubscribeReply::Unsubscribed { .. })) => continue,
                 Err(wbf_sdk::SdkError::Timeout(_)) => continue,
                 // 一包壞了就是漏一包：講一聲，繼續收。
@@ -207,7 +232,7 @@ impl RoomSyncTask {
         }
     }
 
-    /// 一包（Ack 之前推來的也走這裡）：`gap` 只講一聲；原樣寫進 cache（照房分組）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。
+    /// 一包（Ack 之前推來的也走這裡）：`gap` 只講一聲；寫進 cache（照房分組；加密的有金鑰就解）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。
     ///
     /// 存不了的（沒 `room_id`：不猜房間；沒 `event_id`／`sender`：`upsert_events` 不寫）在分組時就擋掉——
     /// 🚫 不進 `by_room`，所以不會替一則不在庫裡的事件發 `room.message`；數出來、講出來（`Note`）。規則只有一份：`storable_identity`。
@@ -225,7 +250,10 @@ impl RoomSyncTask {
                 .get("room_id")
                 .and_then(|value| value.as_str())
                 .map(str::to_string);
-            let incoming = IncomingEvent::from_ws_json(raw);
+            let incoming = match &room {
+                Some(room) => room_crypto::to_incoming(self.engine.as_deref(), room, raw).await,
+                None => IncomingEvent::from_ws_json(raw),
+            };
             match room {
                 Some(room) if incoming.storable_identity().is_some() => {
                     by_room.entry(room).or_default().push(incoming)
@@ -642,7 +670,12 @@ mod tests {
 
         let body = format!("room sync e2e {}", std::process::id());
         let event_id = core_b
-            .send_text(&room, &body, &Target::default())
+            .send_text(
+                &room,
+                &body,
+                &crate::SendOptions::default(),
+                &Target::default(),
+            )
             .await
             .expect("bob sends over Event/Send");
         let arrived = tokio::time::timeout(Duration::from_secs(20), async {

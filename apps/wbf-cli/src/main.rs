@@ -404,7 +404,7 @@ fn exit_code(error: &CoreError) -> u8 {
         Usage | Io | Locked | NoKeyFile | NeedPassphrase | UnexpectedPassphrase
         | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | AccountBusy
         | ServerPendingRemoval | NoRecoveryKeyHere | HistoryWouldBeLost => 1,
-        Server => 2,
+        Server | RoomDevicesChanged => 2,
         Integrity => 3,
         Network => 4,
         Timeout => 5,

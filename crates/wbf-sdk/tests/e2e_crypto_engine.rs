@@ -573,7 +573,9 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         .engine
         .encrypt_and_send(
             &mut alice.ws,
-            &first,
+            &first.room_id,
+            first.versions.room_version,
+            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi bob" }),
@@ -632,7 +634,9 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         .engine
         .encrypt_and_send(
             &mut alice.ws,
-            &first,
+            &first.room_id,
+            first.versions.room_version,
+            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),
@@ -692,7 +696,9 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         .engine
         .encrypt_and_send(
             &mut alice.ws,
-            &second,
+            &second.room_id,
+            second.versions.room_version,
+            &second.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),

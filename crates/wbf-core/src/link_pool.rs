@@ -330,14 +330,17 @@ impl DerefMut for PooledClient {
 pub const LINK_CLIENT_NAME: &str = "wbf-core/0.1";
 
 /// 開一條某個角色的線要向 server 宣告哪些 feature（link-pool.md §7）。
-/// ⚠️ `Keys` 之後宣告 `org.wbftw.device_versions`（那時 `Event/Send` 也一起接上，宣告了就得帶 `room_version`）；現在全部是空的。
+/// `org.wbftw.device_versions`（e2ee-rpc.md §1）：
+/// - `Misc`：加密訊息從這條 `Event/Send`——宣告了，server 對**加密**事件一律要 `room_version`（漏帶是 `InvalidRequest`），明文不受影響。
+///   我們的加密送出本來就一定帶（`encrypt_and_send`），宣告是把「漏帶」變成 server 擋得下的錯。
+/// - `Rooms`：宣告了 server 才推 `Event/DeviceChanged`。
+/// - 其他三條不送事件也不收房間推播，不宣告。
+///
+/// ⚠️ 同一條線再 `hello` 會蓋掉宣告：重 hello 的呼叫點（`ping`、`room.history`、`sync.recent`）都要帶這裡回的那份。
 pub fn features_of(role: LinkRole) -> &'static [&'static str] {
     match role {
-        LinkRole::Misc
-        | LinkRole::Upload
-        | LinkRole::Download
-        | LinkRole::Rooms
-        | LinkRole::Keys => &[],
+        LinkRole::Misc | LinkRole::Rooms => &[wbf_sdk::protocol::DEVICE_VERSIONS_FEATURE],
+        LinkRole::Upload | LinkRole::Download | LinkRole::Keys => &[],
     }
 }
 
@@ -584,6 +587,16 @@ mod tests {
             states,
             vec![(LinkState::Closed, true), (LinkState::Opened, false)]
         );
+    }
+
+    /// e2ee-rpc.md §2：送加密訊息的 `Misc` 與收 `DeviceChanged` 的 `Rooms` 宣告 `org.wbftw.device_versions`，其他三條不宣告。
+    #[test]
+    fn only_the_misc_and_rooms_lines_declare_device_versions() {
+        let declared: Vec<LinkRole> = LinkRole::ALL
+            .into_iter()
+            .filter(|role| features_of(*role).contains(&wbf_sdk::protocol::DEVICE_VERSIONS_FEATURE))
+            .collect();
+        assert_eq!(declared, vec![LinkRole::Misc, LinkRole::Rooms]);
     }
 
     /// `ensure_open`（鉤子用）：沒開的開、開著的不動、有命令正在用的當開著（🚫 不等它）、死了的重開。

@@ -378,6 +378,13 @@ server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2�
 
 ### 16.6 誰呼叫：UI 與 daemon 的分界（維護者 2026-09-21 定）
 
+> 📌 **2026-09-29 維護者精確化了這一節，權威改在 [e2ee-rpc.md](e2ee-rpc.md)**。下面是 09-21 的版本，留著當歷史；跟 e2ee-rpc.md 不同的地方以那邊為準：
+> - **房間版本號與成員的裝置版本號存在 UI**，送出時 UI 自帶（`room.send_text` 的 `room_devices`）；daemon 🚫 不存每房的快照（下表「每房上次那份成員清單由 daemon 存」作廢）。
+> - 被 1506 擋：daemon 自動 refresh，**把新狀態放進錯誤的 `data` 一起回**（RPC 1401）；🚫 不另發「可以送了」的狀態推播。
+> - 送出前一律先分金鑰（第一次、該換、多了裝置三種），daemon 自動做。
+> - `DeviceChanged` 原樣轉成 `devices.changed` 推播給 UI，daemon 自己🚫 不叫 refresh。
+> - 收到時有金鑰就解（密文明文一起存）；金鑰晚到就補解、再發一次 `room.message`。上傳裝置金鑰、補一次性金鑰由 daemon 自動做。
+
 原則一句話：**訊息是 UI 的，金鑰是 daemon 的。** UI 決定什麼時候確認、什麼時候送、要不要重送；daemon 負責金鑰永遠補齊，補齊了就用 RPC 訊息告訴 UI。
 wbf-sdk 只提供方法，不在這兩者之間選邊。
 

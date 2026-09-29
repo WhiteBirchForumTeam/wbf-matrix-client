@@ -162,7 +162,7 @@ pub trait LinkOpener: Send + Sync {
 
 - 正式的實作在 `Core`：session → `Channel::connect` → `hello(features_of(role))`。
 - 測試的實作用 `transport::memory_pair` 起 `WsLink`：池的生命週期（要用才開、死了重開、登出全關、事件有沒有發）不用真 server 就測得到。
-- `features_of(role)`：現在 `Misc`／`Upload`／`Download`／`Rooms` 都是空的；`Keys` 之後宣告 `org.wbftw.device_versions`（PR 2，宣告了就得帶 `room_version`，那時 `Event/Send` 也在 PR 2 接上）。
+- `features_of(role)`：`Misc`（加密訊息從這條送）與 `Rooms`（收 `DeviceChanged`）宣告 `org.wbftw.device_versions`，其他三條空的（e2ee-rpc.md §2）。⚠️ 同一條線重 `hello` 會蓋掉宣告，重 hello 的呼叫點要帶 `features_of` 回的那份。
 
 ## 8. 測試
 

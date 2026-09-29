@@ -163,6 +163,26 @@ pub fn push_of(event: &CoreEvent) -> Push {
                 job: None,
             }
         }
+        CoreEvent::DeviceChanged {
+            user,
+            changed_user,
+            device_version,
+            rooms,
+            gap,
+        } => Push {
+            request: Request::push(
+                "devices.changed",
+                json!({
+                    "user": user,
+                    "changed_user": changed_user,
+                    "device_version": device_version,
+                    "rooms": rooms,
+                    "gap": gap,
+                }),
+            ),
+            user: Some(user.clone()),
+            job: None,
+        },
         CoreEvent::Keys {
             user,
             state,
@@ -357,6 +377,20 @@ mod tests {
         assert_eq!(received.request.method, "pack.received");
         assert_eq!(received.request.params["route"], json!("subscription"));
         assert_eq!(desync(44).params, json!({ "missed": 44 }));
+        // devices.changed（e2ee-rpc.md §4）：原樣轉 server 的 DeviceChanged，給 UI 決定要不要 refresh。
+        let changed = push_of(&CoreEvent::DeviceChanged {
+            user: "@a:x".into(),
+            changed_user: "@b:x".into(),
+            device_version: "4-0a1b2c3d4e".into(),
+            rooms: [("!r:x".to_string(), 9)].into(),
+            gap: false,
+        });
+        assert_eq!(changed.request.method, "devices.changed");
+        assert_eq!(changed.user.as_deref(), Some("@a:x"));
+        assert_eq!(
+            changed.request.params,
+            json!({ "user": "@a:x", "changed_user": "@b:x", "device_version": "4-0a1b2c3d4e", "rooms": { "!r:x": 9 }, "gap": false })
+        );
     }
 
     #[test]
