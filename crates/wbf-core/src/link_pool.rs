@@ -2,7 +2,7 @@
 //!
 //! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，§7 的接縫）——
 //! 正式的在 `Core::open_link`（session → `Channel::connect` → `hello`），測試的用記憶體對接。
-//! 🚫 沒有背景重連迴圈（第 8 階段的監督者）；🚫 不知道訂閱的內容（那是用線的人的事）。
+//! 池自己🚫 不在背景做事：定時看線、重開是 `link_keeper.rs` 的鉤子（daemon 叫）；🚫 不知道訂閱的內容（那是用線的人的事）。
 
 use std::collections::HashMap;
 use std::future::Future;

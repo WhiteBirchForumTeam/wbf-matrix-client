@@ -32,7 +32,7 @@
 | 探到 | backend | 登入登出 | 房間、訊息、媒體、金鑰 |
 |---|---|---|---|
 | 一般 Matrix | `MatrixBackend`（matrix-sdk 的 Client） | Client 的 login／logout | 全部原生（/sync、Room::send、她的 OlmMachine、她的備份） |
-| wbf | wbf-sdk | **標準 HTTP** `/login`、`/logout`（`wbf_sdk::login`，自己包的兩支，不經 Client） | 全部 WS：連線池四條線、`Event/Recent`／`Send`、橋、`Device/*`；金鑰是 `OlmEngine` 開的 `m/`（**唯一主人**） |
+| wbf | wbf-sdk | **標準 HTTP** `/login`、`/logout`（`wbf_sdk::login`，自己包的兩支，不經 Client） | 全部 WS：連線池五條線（link-pool.md §1）、`Event/Recent`／`Send`、橋、`Device/*`；金鑰是 `OlmEngine` 開的 `m/`（**唯一主人**） |
 
 誰記得這個帳號走哪一邊：`Session::backend`（`matrix_sdk_client`／`wbf_sdk`，封在 `session.sealed` 裡）。登入時定、之後不再探：wbf 帳號的 `get_backend_kind` 直接回 `WbfSdk`（server 暫時不通時把它探成「一般 Matrix」會讓池那條路回「接錯線」而不是 `Network`）。
 `None`（舊版封的、`--token` 接的）照舊：探活＋`store_dir`。消費端用 `Core::is_wbf_account` 問；`backend_of`（開 Client 的唯一入口）對 wbf 帳號一律拒（`no_matrix_client_error`）。

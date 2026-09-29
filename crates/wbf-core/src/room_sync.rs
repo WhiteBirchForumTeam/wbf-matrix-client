@@ -449,7 +449,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。🚫 沒有背景重連。
+    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。task 自己🚫 不重連（重開是看線迴圈的事，link-pool.md §3.1）。
     #[tokio::test]
     async fn a_dead_line_ends_the_task_and_says_so() {
         let dir = scratch("dead");

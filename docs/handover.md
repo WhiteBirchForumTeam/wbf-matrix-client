@@ -274,7 +274,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    - 做完之後 e2ee-walkthrough §16.5 第 8、10 列、to-device-client §8 第 4、5 列才能勾。✅ 勾了（通道那半）。
    - 維護者加的一條：**每個收到的 pack 都經過一個鉤子**（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI；link 只呼叫不判斷。
      還有：送與收分開（兩個 task）；會話項是 trait（`PackSink`）好接特規 spec；重送靠 id 表（`AckPolicy`，預設關、冪等的呼叫點自己開）。
-     四條線（architecture-v2 §6.1.1）不進這層：一條 `WsLink` 一張表，daemon 開四條就是四個實例。
+     多條線（architecture-v2 §6.1.1；落地是一個帳號五條，link-pool.md §1）不進這層：一條 `WsLink` 一張表，開五條就是五個實例。
 1b. ✅ **連線生命週期**（維護者 2026-09-21 定：五條線各司其職，落地時房間與金鑰的訂閱暫時共用一條→四條、連線池按種類挑線、預設不起訂閱、斷了下次要用再開；`design/link-pool.md`）：
    core 的 `link_pool.rs`（`LinkPool`／`LinkRole`／`client_of(…, role)`／`open_link`／`close_links`）、`CoreEvent::Link`／`Received`；daemon 的 `push.rs`（訂閱集合、事件→推播）與 `server.rs` 的推播 task。
    訂閱線（`Subscriptions`，房間與金鑰暫共用）這支只保證開得起來、關得掉、有人收；內容在第 2、3 項。📌 2026-09-29 拆成 `Rooms`／`Keys`、由 daemon 自己開（link-pool.md §3.1）。

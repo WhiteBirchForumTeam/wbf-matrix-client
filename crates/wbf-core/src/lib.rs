@@ -206,6 +206,8 @@ pub struct Core {
     pub(crate) crypto_engines: tokio::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<wbf_sdk::crypto_engine::OlmEngine>>,
     >,
+    /// 「該開的線都開著嗎」的鉤子正在跑一輪（`link_keeper.rs`）：同時只跑一輪，後到的跳過（PR #61 審查 salvia／cirno 🟢）。
+    pub(crate) ensuring_links: std::sync::atomic::AtomicBool,
 }
 
 impl Core {
@@ -228,6 +230,7 @@ impl Core {
             room_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
             crypto_engines: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ensuring_links: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

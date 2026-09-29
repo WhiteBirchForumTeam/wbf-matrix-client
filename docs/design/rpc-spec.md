@@ -12,7 +12,7 @@
 > 其餘（欄位可以加、推播可以加、新的 method 可以加）永遠是相容的變動，不動 `protocol` 版號。
 >
 > ⭐ **「做完」的判準：底層走的是我們自己跟 homeserver 的 WS（wbf-pack）才算**。走 matrix-sdk 的 HTTP
-> 只是現在能動，未來要全面遷移到 WS（architecture-v2 §6.1 的四條線）；HTTP fallback 也一樣不算。
+> 只是現在能動，未來要全面遷移到 WS（architecture-v2 §6.1；落地是一個帳號五條線，link-pool.md §1）；HTTP fallback 也一樣不算。
 > 每個 method 的現況在 §10。
 
 ## 0. 一句話
@@ -244,7 +244,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | method | params | result | core |
 |---|---|---|---|
 | `hello` | §1.3 | §1.3 | — |
-| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
+| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, links, cache_queue, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；`links` ＝ 所有帳號加起來現在開著幾條上游的線（link-pool.md；一個 wbf 帳號五條都開好就是 5，daemon 的看線迴圈會把它補回去）；`cache_queue` ＝ cache 寫入者還有幾件在排隊（一直漲＝寫得比收得慢）；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（architecture-v2 §8 第 4 點），這條只是「有人能把它關掉」的最低限度 |
 | `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：🚫 不斷上游會話、🚫 不掉連線）。⭐ 前端改設定（例如已讀要不要公開，daemon-runtime §6.3）之後叫它，🚫 不必重開 daemon |
@@ -601,4 +601,4 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `progress`／`note`／`room.message` 推播 | ✅ daemon 層接上了（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ 2026-09-21 |
 
 📎 讀法：✅ 那幾列是 wbf-sdk 第 2 步的產物（上傳／下載／`recent`／ping），它們從一開始就是 WS。
-🔁 那些全部掛在 matrix-sdk 上，遷移的順序跟 architecture-v2 §6.1 四條線一致：房間（`Subscribe`／`Push`）→ 金鑰（`Device`）→ session（`Session/*`）。
+🔁 那些全部掛在 matrix-sdk 上，遷移的順序跟 architecture-v2 §6.1 的分線一致：房間（`Subscribe`／`Push`）→ 金鑰（`Device`）→ session（`Session/*`）。

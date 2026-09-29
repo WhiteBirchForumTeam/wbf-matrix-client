@@ -26,7 +26,8 @@
   但 server 只讓**持有這台裝置佇列的那條連線**銷毀（to-device-client §8 實跑補的），所以跟著金鑰的訂閱走：收金鑰的 task 用線時跟池 `reuse` 那一格（key-sync.md §1）。
 - `Keys` **綁裝置**（server 的 `Device/Subscribe` 一台裝置一條連線在收、後來的接手），所以它就是那個帳號**唯一**在收金鑰的連線；🚫 不要在別條線上訂。
   `Rooms` 沒有這個限制（server 的房間 topic 是 `Occupancy::Many`），但一個帳號也只訂一次。
-- 一個帳號一個池；兩個帳號登在同一台 server 也各自五條（token 不同，共用會讓一個帳號塞爆另一個）。server 的上限是每台裝置 8 條、每個來源位址另有上限（1403）。
+- 一個帳號一個池；兩個帳號登在同一台 server 也各自五條（token 不同，共用會讓一個帳號塞爆另一個）。server 的上限是每台裝置 8 條、每個來源位址預設 40 條（超過回 1403）。
+  常駐五條之後的容量：**同一台機器（同一個位址）最多 8 個常駐的 wbf 帳號**，第 9 個開始會有線開不起來（PR #61 審查 cirno 🟢3）。
 
 ## 2. 命令怎麼挑線：角色是**呼叫點**的屬性
 
@@ -59,7 +60,7 @@
 - **用**：`client_of` 回一個 `PooledClient`（一條線一次一個命令，§5）。呼叫端照舊 `client.xxx().await`。
 - **死**：`WsLink::is_closed()` 為 true（讀取或送出 task 走過 `shut_down`：對方關、寫失敗、**心跳沒回**）。池在**下一次**取用時看到就丟掉舊的、重開、再把命令做下去。
   📎 **心跳**（ws-receive-dispatch.md §5.1，維護者 2026-09-21）：每條線自己一個，24 秒一次、最近 20 秒有通訊就跳過、10 秒沒 `Pong` 就當死。
-  所以閒著的線不會被 server 的 300 秒 idle 收掉，而對方悄悄不在了也會在半分鐘內變成 `is_closed()`——但**仍然是下一次取用才重開**，心跳不重連。
+  所以閒著的線不會被 server 的 300 秒 idle 收掉，而對方悄悄不在了也會在半分鐘內變成 `is_closed()`——心跳本身不重連：重開的是下一次取用，或背景看線迴圈的下一輪（§3.1）。
   🚨 **命令做到一半死了不重做**：錯誤原樣回呼叫端（`Network`），要不要重來是呼叫端的事（跟 1506 的原則一樣：重送是 UI 的）。
   ⭐ 這條跟維護者說的「萬一斷掉，就主動打開再執行 RPC 要的命令」一致：是**這次 RPC 開頭**發現死了就重開，不是替上一個死掉的 RPC 補做。
 - **訂閱線**（`Rooms`、`Keys`）：沒有命令會「用」它們，所以開它們的是 §3.1 的鉤子。訂閱的內容（`cd_seq` 在哪、收了什麼）🚫 不歸池管——池只管 socket。
@@ -90,10 +91,13 @@
 **鉤子**是 core 的一支 `Core::ensure_links()`（`link_keeper.rs`），看一次、補一次：
 
 1. vault 還鎖著 → 什麼都不做。
-2. 資料目錄的帳號生命週期鎖（`account_lock`）在別人手上 ＝ 有**登入、登出或摧毀**正在進行 → **整輪跳過**（`skipped_busy`），下一輪再看。
+2. 已經有一輪在跑（`Core::ensuring_links` 旗；例如迴圈那輪還沒完又來一次 `vault.unlock`）→ 這次跳過（`skipped_already_running`），🚫 不疊第二輪。
+   資料目錄的帳號生命週期鎖（`account_lock`）在別人手上 ＝ 有**登入、登出或摧毀**正在進行 → **整輪跳過**（`skipped_busy`），下一輪再看。
    拿到就馬上放：🚫 不握著它開線（開線要幾秒，server 不在時更久；握著會把使用者的登入／登出擋成 `AccountBusy`）。
    之後才開始的登出由封池擋（`pool_of_account` 回 `AccountBusy`）；之後才開始的登入會自己 `close_links` 舊 session 的線，下一輪用新 session 重開。
-3. 一個一個帳號：沒登入的跳過；不是 wbf 的跳過（`get_backend_kind`：探不到當一般 Matrix，🚫 不對不確定的 server 開 WS）；登出中的跳過（封池）。
+3. 一個一個帳號：沒登入的跳過；登出中的跳過（封池）；不是 wbf 的跳過——判準只看登入時記下的 `session.backend == Some(WbfSdk)`（跟 `init_keys`／`olm_engine_of` 同一條），
+   🚫 不探 server（維護者 2026-09-29 選的，PR #61 審查 cirno 🟡1：探測沒有逾時、失敗不記，每 15 秒一輪會對一般 Matrix 帳號一直敲門、server 黑洞時卡住整輪）。
+   代價：沒記 backend 的舊 session（PR #56 之前登入的）不會自動開線，重新登入一次就有。
 4. 五個角色照 `LinkRole::ALL` 的順序 `LinkPool::ensure_open`：開著的不動、**有命令正在用的算開著**（🚫 不排在一個長下載後面等）、沒開或死了的開一條（死的先發 `closed`）。
    開不起來：發 `Note`、記進 `failed`、繼續下一條（一條不擋其他條、其他帳號）。
 
@@ -101,7 +105,7 @@
 
 | 什麼時候 | 怎麼叫 |
 |---|---|
-| `vault.unlock` 成功（起 daemon 之後的第一步，所以這就是「daemon 起來後」） | 背景 spawn 一次，🚫 不擋那個 RPC 的回應。已經解鎖再叫一次 `vault.unlock` 也會觸發——等於手動要它馬上看一次 |
+| `vault.unlock` 成功（起 daemon 之後的第一步，所以這就是「daemon 起來後」） | 背景 spawn 一次，🚫 不擋那個 RPC 的回應；正在關機就不叫。已經解鎖再叫一次 `vault.unlock` 也會觸發——等於手動要它馬上看一次 |
 | `account.add` 成功 | 同上 |
 | 常駐期間 | `Handle::keep_links_open`：`RpcServer::run` 起的背景迴圈，每 15 秒一輪；那一輪有開不起來的就把間隔加倍（上限 5 分鐘），一輪全順就回到 15 秒。`daemon.shutdown` 一廣播就停（睡到一半也停），`run` 結束也 abort 它 |
 
@@ -166,7 +170,8 @@ pub trait LinkOpener: Send + Sync {
   沒 session 回 `Usage` 且不發事件；`close_all` 五條都關、發五則 `Closed`；**登出撞上正在 `open` 的 acquire**（oneshot 定順序）：`close_all` 等它開完、命令做完才收那條，事件是 Opened 再 Closed；
   `Received` 事件帶對的 role 與標頭；`ensure_open`：沒開的開、開著的不動、有命令在用的算開著而且不等、死了的重開。`Transport::Http` 不進池這條沒有測試（core 從不開 Http）。
 - `link_keeper.rs` 單元（server 是一個沒人聽的位址，所以「開」一定失敗——看的是**試了哪幾條**）：鎖著什麼都不做；登入的 wbf 帳號五條照順序都試、每條開不起來講一聲；
-  生命週期鎖在別人手上整輪跳過、放手後照常；開著的 `Misc` 不動、死掉的 `Upload` 先發 `closed` 再重開；一般 Matrix（探不到）與沒登入的帳號一條都不開。
+  已經有一輪在跑就跳過、跑完放旗子；生命週期鎖在別人手上整輪跳過、放手後照常；開著的 `Misc` 不動、死掉的 `Upload` 先發 `closed` 再重開；
+  沒記 `backend: WbfSdk` 的 session 與沒登入的帳號一條都不開、而且🚫 沒探 server（探測註冊表是空的）。
 - `room_sync.rs`／`key_sync.rs`：兩個 task 的訂閱會話結束（socket 還活著）都關自己那格、發 `closed`、🚫 不自己重訂。
 - daemon：`subscribe`／`unsubscribe` 回剩下的集合；沒訂就收不到；訂了 `"*"` 全收；`user` 過濾；Lagged → `desync`；`progress` 不訂也收得到自己的；
   看線的迴圈 `daemon.shutdown` 一廣播就停、`TRANSPORT = http` 根本不跑。

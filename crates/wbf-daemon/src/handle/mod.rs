@@ -392,9 +392,10 @@ impl Handle {
 
     /// 「該開的線都開著嗎」的鉤子（`Core::ensure_links`，link-pool.md §3.1，維護者 2026-09-29）：`vault.unlock`、`account.add` 成功之後叫。
     /// 背景跑，🚫 不擋那個 RPC 的回應（五條線×每個帳號、金鑰還要追平）；開關各自發 `link.state`，開不起來的發 `Note`。
-    /// conf 的 `TRANSPORT = http` 是上限（architecture-v2 §6.1）：一律 HTTP，🚫 不開 WS 線。
+    /// conf 的 `TRANSPORT = http` 是上限（architecture-v2 §6.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
+    /// 已經有一輪在跑時，core 那邊自己跳過（`ensuring_links` 旗），這裡不必再擋。
     async fn start_ensuring_links(&self) {
-        if self.settings.transport == Transport::Http {
+        if self.settings.transport == Transport::Http || self.is_shutting_down() {
             return;
         }
         let core = self.core().await;
