@@ -84,7 +84,8 @@ impl Core {
 
     /// 這個帳號所屬 server 的 `cache.db`（/docs/design/storage/local-cache-db.md §5，同 server 的帳號共用）。
     ///
-    /// server 不符、解不開就重建（/docs/design/storage/local-cache-db.md §1），重建時發一個 `Progress` 事件說一聲——
+    /// 解不開、舊 schema 就重建（/docs/design/storage/local-cache-db.md §1）；既有的庫照它自己記的 server 開，host 不同就拒絕、🚫 不重建
+    /// （[`Core::find_recorded_cache_identity`]）。重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
         #[cfg(test)]
@@ -95,9 +96,11 @@ impl Core {
                 .entry(account.server_dir())
                 .or_insert(0) += 1;
         }
-        let identity = CacheIdentity {
-            server: server.to_string(),
-        };
+        let identity = self
+            .find_recorded_cache_identity(&account.server_dir(), server)?
+            .unwrap_or_else(|| CacheIdentity {
+                server: server.to_string(),
+            });
         let (cache, outcome) =
             Cache::open(&account.server_dir(), &self.vault()?.cache_key(), &identity)?;
         match outcome {
@@ -106,7 +109,7 @@ impl Core {
                 .events
                 .progress(format!("created {}", cache.path().display())),
             OpenOutcome::Rebuilt => self.events.progress(format!(
-                "rebuilt {} (it was for another server, or could not be opened)",
+                "rebuilt {} (it could not be opened, or its schema was out of date)",
                 cache.path().display()
             )),
         }
@@ -152,9 +155,15 @@ impl Core {
     /// 用在「只是要處理既有資料」的路徑（`destroy` 的忘掉鏈），🚫 不先 `exists()` 再另外呼叫開庫。
     /// ⚠️ 還剩的窗口：`log_out` 的 `close_server_cache` 與刪檔之間沒有同一把鎖（既有行為，不在這裡）。
     ///
+    /// 🚨 **既有的庫照它自己記的 server 開，🚫 不拿 `server` 參數去比對**：參數可能是使用者打的 `--server`，
+    /// 拼法（scheme、大小寫、結尾的 `/`）跟庫裡記的不同時，[`wbf_sdk::cache::Cache::open`] 會當成別台 server 的庫
+    /// 整份刪掉重建——同 server 其他帳號的快取、只存在本機的已讀與隱藏標記一起沒了。
+    /// 目錄本來就是照正規化的 host 找到的；連 host 都對不上就拒絕（fail closed），🚫 不猜、🚫 不重建。
+    ///
     /// Return:
     ///     Ok(Some(Arc<ServerCache>))  已經開著、或檔案在而開起來了
-    ///     Ok(None)                    沒開著、而且沒有 `cache.db`
+    ///     Ok(None)                    沒開著、而且沒有 `cache.db`（或解不開、不是這一版的 schema：這裡不動它）
+    ///     Err(Usage)                  庫裡記的 server 跟 `server` 的 host 不同
     ///     Err(...)                    開不了（磁碟、金鑰）
     pub(crate) fn find_server_cache_if_present(
         &self,
@@ -162,6 +171,42 @@ impl Core {
         server: &str,
     ) -> Result<Option<std::sync::Arc<crate::server_cache::ServerCache>>, CoreError> {
         self.open_server_cache(account, server, OpenWhen::FileExists)
+    }
+
+    /// 開 `cache.db` 用哪個身分：**既有的庫照它自己 `meta` 記的**，🚫 不拿呼叫端的字串逐字比對。
+    /// 三條開庫的路（[`Core::cache_of`]、`OpenWhen::Always`、`OpenWhen::FileExists`）都在這裡決定，只有這一處。
+    ///
+    /// ⚠️ 為什麼：`session.server` 只去掉結尾的 `/`，scheme、大小寫照存；同一台 server 的兩個帳號拼法不同
+    /// （`http://localhost:6167` 與 `localhost:6167`）時，目錄照正規化的 host 是同一個，
+    /// 但逐字比對會把那份庫當成別台 server 的、整份刪掉重建——另一個帳號的快取與只存在本機的已讀、隱藏標記一起沒了
+    /// （PR #66 審查 cirno 🟡1；destroy 那條是同一個形狀）。
+    ///
+    /// Args:
+    ///     dir: `<data dir>/s/<加密的 server 名>`
+    ///     server: 呼叫端手上的 server 字串, example: "localhost:6167"
+    /// Return:
+    ///     Ok(Some(CacheIdentity))  有可用的庫（檔在、解得開、schema 對），而且 host 跟 `server` 同一台
+    ///     Ok(None)                 沒有可用的庫（沒檔、解不開、舊 schema）：要開的話照 `server` 建或重建
+    ///     Err(Usage)               庫記的 host 跟 `server` 不同：拒絕，🚫 不重建（fail closed）
+    fn find_recorded_cache_identity(
+        &self,
+        dir: &std::path::Path,
+        server: &str,
+    ) -> Result<Option<CacheIdentity>, CoreError> {
+        let Some(recorded) = Cache::read_identity(dir, &self.vault()?.cache_key())? else {
+            return Ok(None);
+        };
+        if crate::accounts::server_host_of(&recorded.server) != crate::accounts::server_host_of(server) {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "the cache in {} belongs to {}, not {server}; it was left untouched",
+                    dir.display(),
+                    recorded.server
+                ),
+            ));
+        }
+        Ok(Some(recorded))
     }
 
     fn open_server_cache(
@@ -178,11 +223,13 @@ impl Core {
         if let Some(existing) = registry.get(&dir) {
             return Ok(Some(existing.clone()));
         }
-        if when == OpenWhen::FileExists && !dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists() {
-            return Ok(None);
-        }
-        let identity = CacheIdentity {
-            server: server.to_string(),
+        let identity = match (self.find_recorded_cache_identity(&dir, server)?, when) {
+            (Some(recorded), _) => recorded,
+            // 只是要處理既有資料，而沒有可用的庫：🚫 不為了它建一個空的。
+            (None, OpenWhen::FileExists) => return Ok(None),
+            (None, OpenWhen::Always) => CacheIdentity {
+                server: server.to_string(),
+            },
         };
         let (cache, outcome) = crate::server_cache::ServerCache::open(
             &dir,
@@ -196,7 +243,7 @@ impl Core {
                 .events
                 .progress(format!("created {}", dir.join("cache.db").display())),
             OpenOutcome::Rebuilt => self.events.progress(format!(
-                "rebuilt {} (it was for another server, or could not be opened)",
+                "rebuilt {} (it could not be opened, or its schema was out of date)",
                 dir.join("cache.db").display()
             )),
         }

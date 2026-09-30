@@ -237,15 +237,28 @@ impl Core {
         Ok((removal.account_dir_removed, removal.server_dir_removed))
     }
 
-    /// 這個帳號在哪個 server：`--server` 覆蓋優先，否則問它封著的 session。
+    /// 這個帳號在哪個 server：**它自己封著的 session 優先**；已經登出（沒有 session）才用 `--server`。
+    ///
+    /// 🚫 `--server` 🚫 不蓋過 session：它只是用來**找帳號目錄**的（照正規化的 host 比對），
+    /// 拼法可以跟 session 裡記的不同，拿它去開 `cache.db` 就會被當成別台 server 的庫。
+    ///
+    /// Args:
+    ///     override_: 使用者打的 `--server`, example: Some("localhost:6167")
+    /// Return:
+    ///     Ok(String)          session 裡的 server；沒有 session 時是 `override_`
+    ///     Err(NotLoggedIn)    沒有 session、也沒給 `--server`
+    ///     Err(...)            session 解不開
     fn server_of(
         &self,
         account: &AccountDir,
         override_: Option<&str>,
     ) -> Result<String, CoreError> {
-        match override_ {
-            Some(server) => Ok(server.to_string()),
-            None => Ok(self.session_of(account)?.server),
+        match self.session_of(account) {
+            Ok(session) => Ok(session.server),
+            Err(error) if error.kind == crate::error::CoreErrorKind::NotLoggedIn => {
+                override_.map(str::to_string).ok_or(error)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -763,6 +776,93 @@ mod tests {
             .unwrap();
         assert_eq!(bob_view.len(), 1, "別的帳號的東西不動");
         drop(bob_view);
+        core.close_server_cache(&server_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 `--server` 拼法跟庫裡記的不同（scheme 大寫、結尾多一個 `/`）：目錄照正規化的 host 找得到，
+    /// 但 🚫 不准拿那串字去開 `cache.db`——那會被當成別台 server 的庫整份重建，bob 的快取跟著沒了。
+    /// 快取先關掉，模擬 CLI 那種每個命令一個程序、還沒開過這份庫的情形（daemon 裡已經開著的會直接沿用，碰不到）。
+    #[tokio::test]
+    async fn a_destroy_with_the_server_spelled_differently_keeps_the_other_accounts_cache() {
+        let (dir, core) = scratch_unlocked("spelled-differently");
+        let alice = account_of(&core, &dir, "@alice:localhost");
+        let bob = account_of(&core, &dir, "@bob:localhost");
+        let server_dir = alice.server_dir();
+        std::fs::write(bob.session_path(), b"not a real session").unwrap();
+        seed_events(&core, &alice, "@alice:localhost", "$a");
+        seed_events(&core, &bob, "@bob:localhost", "$b");
+        core.close_server_cache(&server_dir).unwrap();
+
+        let result = core
+            .destroy_account("@alice:localhost", Some("HTTP://LOCALHOST:6167/"), true, false)
+            .await
+            .expect("destroy 要成功");
+
+        assert_eq!(result.events_removed, 1, "alice 的那則要被忘掉（庫沒被重建成空的）");
+        let bob_view = core
+            .server_cache_of(&bob, SERVER)
+            .unwrap()
+            .read()
+            .await
+            .history("@bob:localhost", "!r", None, 10)
+            .unwrap();
+        assert_eq!(bob_view.len(), 1, "🚨 同 server 別的帳號的快取不准被清掉");
+        drop(bob_view);
+        core.close_server_cache(&server_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🚨 一般開庫那條路也一樣（PR #66 審查 cirno 🟡1）：同一台 server 的第二個帳號用別的拼法（沒有 scheme）第一次開庫，
+    /// 🚫 不准把第一個帳號寫下的那份當成別台 server 的整份重建；唯一寫入者與繞過它的連線（`cache_of`）都照庫記的身分開。
+    #[tokio::test]
+    async fn opening_the_cache_with_another_spelling_of_the_same_server_keeps_it() {
+        let (dir, core) = scratch_unlocked("open-spelled-differently");
+        let alice = account_of(&core, &dir, "@alice:localhost");
+        let bob = account_of(&core, &dir, "@bob:localhost");
+        let server_dir = alice.server_dir();
+        seed_events(&core, &alice, "@alice:localhost", "$a");
+        core.close_server_cache(&server_dir).unwrap();
+
+        let raw = core.cache_of(&bob, "localhost:6167").unwrap();
+        assert_eq!(raw.history("@alice:localhost", "!r", None, 10).unwrap().len(), 1, "cache_of 不准重建");
+        drop(raw);
+        let alice_view = core
+            .server_cache_of(&bob, "LOCALHOST:6167")
+            .unwrap()
+            .read()
+            .await
+            .history("@alice:localhost", "!r", None, 10)
+            .unwrap();
+        assert_eq!(alice_view.len(), 1, "🚨 唯一寫入者也不准重建：alice 的快取要留著");
+        drop(alice_view);
+        core.close_server_cache(&server_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 既有的庫記的 host 跟要處理的 server 不同：拒絕，🚫 不重建、🚫 不動它（fail closed）。
+    #[tokio::test]
+    async fn processing_an_existing_cache_of_another_host_is_refused_and_leaves_it_alone() {
+        let (dir, core) = scratch_unlocked("other-host");
+        let alice = account_of(&core, &dir, "@alice:localhost");
+        let server_dir = alice.server_dir();
+        seed_events(&core, &alice, "@alice:localhost", "$a");
+        core.close_server_cache(&server_dir).unwrap();
+
+        let error = match core.find_server_cache_if_present(&alice, "http://elsewhere:6167") {
+            Ok(_) => panic!("host 不同要拒絕"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, CoreErrorKind::Usage);
+        let alice_view = core
+            .server_cache_of(&alice, SERVER)
+            .unwrap()
+            .read()
+            .await
+            .history("@alice:localhost", "!r", None, 10)
+            .unwrap();
+        assert_eq!(alice_view.len(), 1, "被拒絕的那一次🚫 不准動到庫");
+        drop(alice_view);
         core.close_server_cache(&server_dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

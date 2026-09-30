@@ -670,8 +670,9 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         "{second:?}"
     );
     assert!(second.diff.left.is_empty());
-    assert_ne!(
-        second.versions.room_version, first.versions.room_version,
+    // refresh 拿到的就是 server 在 1506 裡報的那個號碼（中間沒有人再動房間）——比「跟舊的不同」更強，一樣不比大小（PR #62 審查 cirno 🟢）。
+    assert_eq!(
+        second.versions.room_version, current_room_version,
         "{second:?}"
     );
     assert!(

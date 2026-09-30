@@ -39,6 +39,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 ### 3.1 帳號：`account` 一族（維護者 2026-09-09 定）
 
 **多帳號是前提，不是附加功能**（維護者 2026-09-09）：CLI 與 UI 都要能同時登入多個帳號，甚至同時跑起來。
+📌 現況（過渡）：`wbf-cli` 還不走 RPC，所以它跟 daemon 🚫 不能同時對同一個資料目錄跑——它先拿 `daemon.lock`，daemon 在跑就整個拒絕，兩個 `wbf-cli` 也不能並發（/docs/design/overview/architecture-v2.md §0.2）。改走 RPC 之後才能跟 daemon 同時用。
 所以帳號目錄一帳號一套（§7），`m/`（matrix-sdk 的 store，裝置狀態）也一帳號一套 —— 這正是拿帳號當那個 store 分界的理由。
 `current` 只回答一個問題：**沒帶 `--account` 時用誰**。
 
@@ -237,7 +238,8 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 ### 3.5 本地快取（/docs/design/storage/local-cache-db.md §5）
 
-`cache.db` 在 `s/<b58>_<b58>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：server 不符、schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
+`cache.db` 在 `s/<b58>_<b58>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
+既有的庫照它自己記的 server 開（`--server` 拼法不同也沿用）；記的 host 跟這次的不是同一台就拒絕、庫不動：`the cache in … belongs to …, not …; it was left untouched`（exit 1，/docs/design/storage/local-cache-db.md §1）。
 
 多帳號混存怎麼不漏（維護者 2026-09-07 定，細節在 /docs/design/storage/local-cache-db.md §5）：
 
@@ -251,7 +253,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的，排序照 `r_seq`。`--before` 跟不帶時一樣是**上一頁印的 `next`（那頁最舊那則的 `event_id`）**。🚫 **沒有 `r_seq` 的房間（一般 Matrix server）不答**、錨點不在快取也不答（1100，exit 1）：那種房不從快取回答，拿掉 `--from-cache` 去問 server（/docs/design/rpc-specs/rpc-spec.md §3.3） | 與不帶時同形 |
 | `account destroy <user> [--yes]` | 忘掉鏈（裝置層那一半在 §3.1）：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**這個帳號的 `k/` 也一起刪**（它就是「摧毀本機紀錄」，跟 `logout` 一致，/docs/design/keys/room-key-backup.md §7）；沒 `--yes` 的確認提示要把這件事講出來 | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
-| `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 /docs/design/media/media-pool.md §5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
+| `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 /docs/design/media/media-pool.md §5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪、還有把手開著的檔這一輪跳過（`files_in_use`）。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "files_in_use", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
 
 寫穿：`rooms` 把房間列表、`read`／`files`／`watch` 把印過的事件順手寫進快取（帶著這個帳號的 mxid）。**寫穿失敗只在 stderr 說一聲，命令照樣成功**（快取壞了的代價是重拉）。`--token` 模式沒有 vault 也沒有帳號目錄，沒有快取：`--from-cache` 與 `recent` 會 exit 1。
 

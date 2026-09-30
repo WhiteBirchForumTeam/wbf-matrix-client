@@ -12,7 +12,7 @@
 
 | 因為它是快取，所以 | 具體做法 |
 |---|---|
-| 可以整個丟掉 | schema 版本不對、server 換了、解不開：刪檔重建，不寫遷移。一個 server 一份、多帳號混存（§5），user 換了不丟 |
+| 可以整個丟掉 | 沒有可用的庫（沒檔、解不開、schema 版本不對）：建或刪檔重建，不寫遷移。一個 server 一份、多帳號混存（§5），user 換了不丟。<br>既有而且解得開的庫**照它 `meta` 記的 server 開**，🚫 不拿呼叫端的字串逐字比對（同一台 server 的拼法會不同：`http://localhost:6167`、`localhost:6167`）；記的 host 跟要開的不是同一台就**拒絕（`Usage`：`the cache in … belongs to …, not …; it was left untouched`）、庫不動**（`Core::find_recorded_cache_identity`） |
 | 不需要衝突解決 | 同一個 event_id 再寫一次就覆蓋；server 說的算 |
 | 事件快取只長不刪 | **500 是同步視窗，不是上限**（維護者 2026-09-05 訂正）：進房時把最新 500 則同步進快取；往舊滑超過就再 load 更舊的存進去；下次重讀那一段從快取拿，不重拉。事件小，不設上限。500 則／房與初開全域 10000 則是預設值，可調 |
 | 媒體快取有配額，但是 best effort | **2 GiB**（維護者 2026-09-05 定），不是 hard limit；另有 **7 天保護期**，期內用過的檔不自動刪（/docs/design/media/media-pool.md §5） |
@@ -67,8 +67,10 @@ matrix-sdk 的 store 也連到它，但不下 `PRAGMA key`，行為就是普通 
 `m/` 裡有什麼看帳號走哪條路（/docs/design/daemon/account-session.md §2）：
 
 - **wbf 帳號**：只有 crypto store，由 `OlmEngine::open` 建（`crypto_engine.rs`），加上 `td.json`（/docs/design/keys/to-device-client.md §2）。不建 `Client`。
-- **matrix-sdk `Client` 那條**（一般 Matrix、舊 session）：`build_client` 用 `sqlite_store_with_config_and_cache_path(config, None)`，
-  上游 builder 把四個 store 都開成 sqlite 檔、放在 `m/`、用同一把子金鑰。event_cache 與 media 那兩個檔在，但我們不讀。
+- **matrix-sdk `Client` 那條**（一般 Matrix、舊 session）：`build_client` 自己組 `StoreConfig`，**只把 state 與 crypto 開成 sqlite 檔**、放在 `m/`、用同一把子金鑰；
+  event_cache 與 media 用上游預設的記憶體版（維護者 2026-09-30：終極目標是只依賴 crypto，聊天紀錄與媒體用自己的）。
+  🚫 不用 `sqlite_store_with_config_and_cache_path`：它四個都開成檔。我們用到的（`sync_once`、`room.messages`、`event_with_context`、`TimelineEvent` 的解密）都不靠那兩個落地。
+  真 server 測試 `the_matrix_sdk_client_keeps_only_state_and_crypto_on_disk` 守著「只有兩個檔」。
 
 ### 4.2 它怎麼加密
 
@@ -97,7 +99,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   對著它做要嘛繞它的 API、要嘛直接讀它的表（等於綁死上游內部結構，上游改 migration 我們就壞）。
 - 它的加密是每值加密、檔案結構外露；我們的快取要整檔加密（§3）。
 - 它存不存、存多少由 SDK 決定；§1 的配額與「整個丟掉」政策要自己掌控。
-- 代價：matrix-sdk `Client` 那條多一份「事件」的複本（它的 event_cache，§4.1）。可接受：我們不讀它，權威是 `cache.db`。wbf 帳號沒有這份。
+- 所以 matrix-sdk `Client` 那條的 event_cache 只放記憶體（§4.1），🚫 不落地第二份事件；權威是 `cache.db`。
 
 ### 4.5 為什麼不讓 SDK 也用 SQLCipher（方案 C）
 
@@ -145,7 +147,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
--- schema_version、server（URL）、created_at。身份只有 server：不符就重建（§1）。
+-- schema_version、server（URL，第一個開這份庫的帳號寫下的拼法）、created_at。之後照它開、host 不同就拒絕（§1）。
 
 -- 看過的任何 mxid（本機帳號、事件的 sender 都在這）。哪些是本機帳號由資料目錄的 a/ 決定，不在表裡標。
 CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);

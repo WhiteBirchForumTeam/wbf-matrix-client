@@ -96,6 +96,42 @@ impl AccountDir {
         })
     }
 
+    /// 建目錄（或往裡面寫）之前，確認磁碟上「同名」的目錄真的是這個 server／這個帳號的
+    /// （/docs/design/storage/vault-and-keys.md §2.4）。
+    ///
+    /// ⚠️ Base58 區分大小寫、Windows 的檔名不區分：兩個只差大小寫的名字在 Windows 上是**同一個目錄**。
+    /// 實際上碰不到（密文 40 byte 以上的熵），但 🚫 不靠「不可能碰撞」：上層目錄裡只差大小寫的名字
+    /// 一律解密比對，不是同一個 host／localpart 就拒絕——🚫 不覆蓋、🚫 不加後綴自己找空位。
+    ///
+    /// Args:
+    ///     key: example: vault.account_dir_key()
+    /// Return:
+    ///     Ok(())       沒有同名的，或同名的就是這一個
+    ///     Err(Usage)   有個只差大小寫的目錄屬於別的 server／帳號（或解不開）
+    ///     Err(Io)      上層目錄讀不了
+    pub fn verify_names_on_disk(&self, key: &Key32) -> Result<(), SdkError> {
+        let server_dir = self.server_dir();
+        if let Some(servers_dir) = server_dir.parent() {
+            verify_name_on_disk(servers_dir, &self.server_dir_name, &self.server_host, |name| {
+                find_dir_name_plaintext(key, DirScope::Server, name)
+            })?;
+        }
+        verify_name_on_disk(
+            &server_dir.join(ACCOUNTS_DIR_NAME),
+            &self.account_dir_name,
+            &self.localpart,
+            |name| {
+                find_dir_name_plaintext(
+                    key,
+                    DirScope::Account {
+                        server_host: &self.server_host,
+                    },
+                    name,
+                )
+            },
+        )
+    }
+
     pub fn session_path(&self) -> PathBuf {
         self.dir.join(SEALED_SESSION_FILE_NAME)
     }
@@ -578,6 +614,48 @@ pub fn find_account_of_current(data_dir: &Path, key: &Key32, current: &str) -> O
     })
 }
 
+/// [`AccountDir::verify_names_on_disk`] 的一層：`parent` 裡跟 `name` 只差大小寫的每一個目錄，都要解得回 `expected`。
+///
+/// Args:
+///     parent: example: "<data dir>/s"
+///     name: 這一層算出來的加密名字
+///     expected: 明文, example: "localhost:6167"
+///     decrypt: 目錄名 → 明文（解不開是 None）
+/// Return:
+///     Ok(())       沒有同名的，或同名的都解得回 `expected`（上層目錄不存在也算沒有）
+///     Err(Usage)   有一個解不開、或解出來是別的東西
+///     Err(Io)      讀不了 `parent`
+fn verify_name_on_disk(
+    parent: &Path,
+    name: &str,
+    expected: &str,
+    decrypt: impl Fn(&str) -> Option<String>,
+) -> Result<(), SdkError> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(SdkError::Io(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(SdkError::Io)?;
+        let file_name = entry.file_name();
+        let Some(existing) = file_name.to_str() else {
+            continue;
+        };
+        if !existing.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if decrypt(existing).as_deref() != Some(expected) {
+            return Err(SdkError::Usage(format!(
+                "{} already holds a directory named like this one's but it is not {expected}; \
+                 refusing to use it (it would be the same directory on a case-insensitive file system)",
+                parent.join(existing).display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `http://localhost:6167` → `localhost:6167`；`https://matrix.example.org` → `matrix.example.org`（預設 port 不帶）。
 ///
 /// ⚠️ 這是**加密的輸入**（/docs/design/storage/vault-and-keys.md §2.3），不是檔名了：所以要正規化到底（小寫），
@@ -671,6 +749,33 @@ mod tests {
             server_host_of("HTTP://localhost:6167"),
             server_host_of("http://localhost:6167")
         );
+    }
+
+    /// 🚨 上層目錄裡有個只差大小寫、卻不是這個 server 的目錄（在 Windows 上就是同一個目錄）：拒絕，🚫 不沿用。
+    /// 自己的目錄已經在，照常過。（/docs/design/storage/vault-and-keys.md §2.4）
+    #[test]
+    fn a_directory_that_differs_only_in_case_but_is_someone_else_is_refused() {
+        let (data_dir, vault) = scratch_dir_with_vault("case-names");
+        let key = vault.account_dir_key();
+        let alice =
+            AccountDir::locate(&data_dir, &key, "http://localhost:6167", "@alice:localhost").unwrap();
+        assert!(alice.verify_names_on_disk(&key).is_ok(), "目錄還不存在：沒有同名的");
+
+        std::fs::create_dir_all(&alice.dir).unwrap();
+        assert!(alice.verify_names_on_disk(&key).is_ok(), "同名的就是自己");
+
+        // 只差大小寫的冒牌目錄：翻轉 server 那段名字的大小寫，解不回 localhost:6167。
+        let servers_dir = alice.server_dir().parent().unwrap().to_path_buf();
+        let impostor: String = alice
+            .server_dir_name
+            .chars()
+            .map(|c| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() })
+            .collect();
+        std::fs::remove_dir_all(alice.server_dir()).unwrap();
+        std::fs::create_dir_all(servers_dir.join(&impostor)).unwrap();
+        let error = alice.verify_names_on_disk(&key).unwrap_err();
+        assert!(matches!(error, SdkError::Usage(_)), "{error}");
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

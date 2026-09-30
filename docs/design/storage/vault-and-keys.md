@@ -145,7 +145,7 @@ hash 前 96 bit 相同——生日界是 2^48 個明文，而這裡的明文是�
 
 - **建目錄前先檢查**：目標名字已經存在時，把它解密出來比對 —— 是同一個 host／localpart 才用，不是就報錯，
   🚫 不覆蓋、🚫 不加後綴自己找一個空位。
-  還沒做：`AccountDir::locate` 直接算路徑、不碰磁碟，登入時沒有這一步解密比對。
+  `AccountDir::locate` 只算路徑、不碰磁碟；登入時接著叫 `AccountDir::verify_names_on_disk`：上層目錄裡只差大小寫的名字逐一解密比對，對不上就 `Usage`。
 - 每一段名字上限 **200 字元**（Windows 單一路徑元件是 255）。Base58 大約是 byte 數的 1.37 倍，
   nonce 那段固定 17 字元，所以密文那段大約 130 byte 以上才會踩到 —— Matrix 的 localpart 上限是 255 byte，
   踩得到，要有這個檢查。超過就報錯，🚫 不截斷（截斷等於不可逆）。
@@ -153,7 +153,7 @@ hash 前 96 bit 相同——生日界是 2^48 個明文，而這裡的明文是�
 #### 2.4.1 ⚠️ 真正咬人的不是單段長度，是**整條路徑**（2026-09-09 實測）
 
 Windows 的 `MAX_PATH` 是 **260**，而加密把兩段目錄名從 19 字元（`localhost_6167` ＋ `alice`）
-撐到 106。實測 `matrix-sdk-event-cache.sqlite3`（`m/` 裡最長的檔名）的完整路徑：
+撐到 106。當時實測 `matrix-sdk-event-cache.sqlite3` 的完整路徑（那時 `m/` 裡最長的檔名；現在 `m/` 只開 state 與 crypto，最長是 `matrix-sdk-crypto.sqlite3-wal`，29 字元，比下表短）：
 
 | | 加密名字合計 | 最長路徑（data dir 39 字元） |
 |---|---|---|

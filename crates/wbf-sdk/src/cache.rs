@@ -2,7 +2,9 @@
 //!
 //! **一個 server 一個檔、多帳號混存**（維護者 2026-09-07 定）：事件只存一份；誰看得到哪一則由 `events_synced_log` 逐則記
 //! （server 經任一條路給過這個 user 的才算），沒有列就看不到——fail closed，不用 r_seq 下界去猜可見性。
-//! **快取不是權威**（/docs/design/storage/local-cache-db.md §1）：server 不符、schema 版本不對、解不開，一律刪檔重建，不寫遷移；讀到壞資料當成沒有快取。
+//! **快取不是權威**（/docs/design/storage/local-cache-db.md §1）：schema 版本不對、解不開，一律刪檔重建，不寫遷移；讀到壞資料當成沒有快取。
+//! [`Cache::open`] 本身逐字比對 `CacheIdentity`、不符就重建；產品層在呼叫它之前先用 [`Cache::read_identity`] 照庫記的身分開，
+//! host 不同就拒絕（wbf-core 的 `find_recorded_cache_identity`），所以「server 不符」在產品裡不會變成重建。
 //!
 //! schema 風格：實體表 `INTEGER PRIMARY KEY` 加識別碼的 UNIQUE 索引；關聯表整數複合主鍵 `WITHOUT ROWID`；
 //! 字串識別碼（mxid、room_id、event_id）各只存一次，其餘全走整數外鍵。整數 id 不出這個檔。
@@ -60,7 +62,7 @@ pub enum OpenOutcome {
     Reused,
     /// 沒有檔，新建。
     Created,
-    /// 有檔但解不開／server 不符／版本不對，刪掉重建。
+    /// 有檔但解不開／版本不對（或 `identity` 跟檔裡記的不符——產品層不會這樣呼叫，見模組註解），刪掉重建。
     Rebuilt,
 }
 
@@ -1814,6 +1816,46 @@ fn media_row_id(
 }
 
 // ---- 開檔 ----
+
+impl Cache {
+    /// 這份既有的 `cache.db` 說自己是哪個 server 的；🚫 不建、🚫 不重建、🚫 不動它。
+    /// 給「只是要處理既有資料」的路徑用（destroy 的忘掉鏈）：那種路徑拿使用者打的 server 字串去開，
+    /// 拼法一不同就會被 [`Cache::open`] 當成別台 server 的庫而整份刪掉重建（同 server 的其他帳號一起沒了）。
+    ///
+    /// Args:
+    ///     dir: example: "<data dir>/s/<b58 nonce>_<b58 密文>"
+    ///     key: example: vault.cache_key()
+    /// Return:
+    ///     Ok(Some(CacheIdentity))  檔在、解得開、schema 是這一版
+    ///     Ok(None)                 沒有檔、解不開、或不是這一版的 schema（下一次正常開會重建，這裡不動它）
+    ///     Err(Usage)               這個 build 沒有 SQLCipher
+    pub fn read_identity(dir: &Path, key: &Key32) -> Result<Option<CacheIdentity>, SdkError> {
+        let path = dir.join(CACHE_FILE_NAME);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let connection = match open_with_key(&path, key) {
+            Ok(connection) => connection,
+            Err(SdkError::Io(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let read_meta = |key: &str| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        };
+        if read_meta("schema_version").as_deref() != Some(&SCHEMA_VERSION.to_string()) {
+            return Ok(None);
+        }
+        Ok(read_meta("server").map(|server| CacheIdentity { server }))
+    }
+}
 
 /// Return:
 ///     Ok(Some(Cache))   開得起來、server 與版本都對

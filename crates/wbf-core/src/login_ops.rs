@@ -79,6 +79,8 @@ impl Core {
         let dir_key = vault.account_dir_key();
         // 帳號目錄由 server host 加 localpart 決定（store 在 login 前就要有路徑）。
         let account = AccountDir::locate(&self.data_dir, &dir_key, server, user)?;
+        // 建東西之前確認磁碟上只差大小寫的同名目錄是這一個（/docs/design/storage/vault-and-keys.md §2.4）。
+        account.verify_names_on_disk(&dir_key)?;
         // 🚨 這台 server 的目錄正在（或上次刪到一半停在）被刪：🚫 不准在上面建東西（維護者 2026-09-15）。
         let server_lock = account
             .server_dir()
@@ -229,6 +231,7 @@ impl Core {
         canonical_user_id: &str,
     ) -> Result<AccountDir, CoreError> {
         let canonical = AccountDir::locate(&self.data_dir, dir_key, server, canonical_user_id)?;
+        canonical.verify_names_on_disk(dir_key)?;
         if canonical.dir == account.dir {
             return Ok(account);
         }

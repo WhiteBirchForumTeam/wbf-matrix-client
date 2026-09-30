@@ -208,6 +208,33 @@ fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
 }
 
+/// 拿資料目錄的排他鎖；有 daemon 在用這個目錄就拒絕，🚫 不越過它寫檔。
+///
+/// Args:
+///     data_dir: example: "C:\\Users\\me\\AppData\\Roaming\\wbf-matrix-client"
+/// Return:
+///     Ok(DataDirLock)   拿到了；丟掉就放手
+///     Err(Usage)        別的程序（多半是常駐的 daemon）握著這個目錄
+///     Err(Io)           鎖檔開不了
+fn lock_data_dir(data_dir: &std::path::Path) -> Result<wbf_core::data_dir_lock::DataDirLock, CoreError> {
+    use wbf_core::data_dir_lock::{lock_for_writing, LockError};
+    lock_for_writing(data_dir).map_err(|error| match error {
+        LockError::HeldByAnother(_) => CoreError::new(
+            CoreErrorKind::Usage,
+            format!(
+                "another program (a running daemon, or another wbf-cli command) holds {}; \
+                 this wbf-cli cannot talk to the daemon over RPC yet, so it refuses rather than write behind its back - \
+                 stop the daemon (or wait for the other command) first",
+                data_dir.display()
+            ),
+        ),
+        LockError::Io(path, error) => CoreError::new(
+            CoreErrorKind::Io,
+            format!("cannot open the lock file {}: {error}", path.display()),
+        ),
+    })
+}
+
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
 pub struct Context {
     pub unlock: UnlockOptions,
@@ -234,6 +261,9 @@ pub struct Context {
     data_dir_was_given: bool,
     /// 備份關掉的警告一個命令只印一次（`rooms::backend` 可能被叫不只一次）。
     warned_about_backups: std::sync::OnceLock<()>,
+    /// 資料目錄的排他鎖，跟 daemon 同一把（`<data dir>/daemon.lock`）。⚠️ **活著就是鎖著**：命令跑完、Context 丟掉才放。
+    /// 🚨 這支程式直接叫 core 寫資料目錄；沒拿這把鎖就寫是非法侵占（維護者 2026-09-30，/docs/design/overview/architecture-v2.md §0.2）。
+    _data_dir_lock: wbf_core::data_dir_lock::DataDirLock,
 }
 
 /// conf 認得的鍵。⚠️ 加新鍵時要回來加一筆，不然它會被當成「認不得」印警告（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）——
@@ -264,6 +294,8 @@ impl Context {
             Some(path) => path.clone(),
             None => default_data_dir()?,
         };
+        // 🚨 碰資料目錄的任何東西之前先拿鎖（連 conf 都還沒讀）。
+        let data_dir_lock = lock_data_dir(&data_dir)?;
         let conf = wbf_core::conf::load(cli.config.as_deref(), &data_dir)?;
         let mut warnings = conf.warnings().to_vec();
         warnings.extend(conf.warn_about_unknown_keys(KNOWN_CONF_KEYS));
@@ -327,6 +359,7 @@ impl Context {
         .filter(|entry: &Entry| !entry.value.is_empty())
         .collect();
         Ok(Context {
+            _data_dir_lock: data_dir_lock,
             warned_about_backups: std::sync::OnceLock::new(),
             core: Core::open(&data_dir),
             account_override: cli
@@ -1028,6 +1061,33 @@ mod conf_precedence_tests {
         dir
     }
 
+    /// 🚨 有 daemon 握著這個資料目錄時，命令列 🚫 不越過它寫檔：Context 都建不起來（維護者 2026-09-30）。
+    #[test]
+    fn a_command_is_refused_while_a_daemon_owns_the_data_dir() {
+        let dir = scratch("daemon-owns");
+        let daemon = wbf_core::data_dir_lock::lock_for_writing(&dir).unwrap();
+        let error = match Context::from(&cli_with(&dir)) {
+            Ok(_) => panic!("daemon 握著鎖時要拒絕"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, CoreErrorKind::Usage);
+        assert!(error.message.contains("stop the daemon"), "{}", error.message);
+        drop(daemon);
+        assert!(Context::from(&cli_with(&dir)).is_ok(), "daemon 放手之後照常");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一時間只有一個命令列能拿到：第二個被拒，第一個結束（Context 丟掉）才放手。
+    #[test]
+    fn the_lock_is_held_for_the_whole_command_and_released_after() {
+        let dir = scratch("held");
+        let first = Context::from(&cli_with(&dir)).unwrap();
+        assert!(Context::from(&cli_with(&dir)).is_err(), "第一個還活著時第二個要被拒");
+        drop(first);
+        assert!(Context::from(&cli_with(&dir)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn conf_fills_in_what_the_flags_did_not_give() {
         let dir = scratch("conf");
@@ -1049,6 +1109,8 @@ mod conf_precedence_tests {
         assert!(!context.server_backup);
         // 🚫 沒寫的鍵落到安全值，不是落到 false。
         assert!(context.local_room_keys);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1070,6 +1132,8 @@ mod conf_precedence_tests {
         );
         // conf 說 http、旗標說 ws → 旗標贏。
         assert_eq!(context.transport, Transport::WebSocket);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1081,6 +1145,8 @@ mod conf_precedence_tests {
         assert_eq!(context.transport, Transport::WebSocket);
         // 兩個開關的安全值都是「開著」。
         assert!(context.server_backup && context.local_room_keys);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1117,9 +1183,14 @@ PASSWORD_FILE=/tmp/from-conf
             Some(std::path::PathBuf::from("/tmp/from-flag"))
         );
         // 兩邊都沒有就是 None（呼叫端會去問終端）。
-        let empty = Context::from(&cli_with(&scratch("pwfile-empty"))).unwrap();
+        let empty_dir = scratch("pwfile-empty");
+        let empty = Context::from(&cli_with(&empty_dir)).unwrap();
         assert_eq!(find_password_file(&login_args(None), &empty.conf), None);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
+        drop(empty);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
     }
 
     #[test]
@@ -1135,6 +1206,8 @@ PASSWORD_FILE=/tmp/from-conf
             context.token_override, None,
             "🚫 token 不從 conf 來（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）"
         );
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1156,12 +1229,15 @@ PASSWORD_FILE=/tmp/from-conf
         // 🚫 秘密與「秘密在哪」的路徑都不寫（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）。
         assert!(!written.contains("ACCESS_TOKEN") && !written.contains("PASSPHRASE_FILE"));
 
-        // 讀回來就是同一組值。
+        // 讀回來就是同一組值。前一個命令先結束（放掉資料目錄的鎖），一個程序本來就只跑一個命令。
+        drop(context);
         let again = Context::from(&cli_with(&dir)).unwrap();
         assert_eq!(
             again.server_override.as_deref(),
             Some("http://from-flag:6167")
         );
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(again);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1177,6 +1253,8 @@ PASSWORD_FILE=/tmp/from-conf
             std::fs::read_to_string(&path).unwrap(),
             "[general]\nSERVER=http://mine:6167\n"
         );
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1190,6 +1268,8 @@ PASSWORD_FILE=/tmp/from-conf
         context.data_dir_was_given = false;
         context.write_conf_if_asked_for().unwrap();
         assert!(!dir.join(wbf_core::conf::CONF_FILE_NAME).exists());
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

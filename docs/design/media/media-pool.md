@@ -65,7 +65,8 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 - 單一檔就超過配額（一個 2 GiB 的分塊檔）：照樣下、照樣存；下一個檔進來時，它若已出保護期就是第一個被刪的，若還在保護期就留著。多個小檔超過配額、刪最舊的（7 天外），是正常情形。
 - 整檔進整檔出。先刪檔再把列 reset 成「還沒下載」（列本身留著：事件還指著它），中途死掉留下的「說完整但檔不在」的列在下次啟動掃一次 reset；`complete = 0` 且沒有下載在跑的半成品也在啟動時掃，超過保護期就清。
 - 有把手打開的檔不刪；讀一次就更新 `last_used_at`，所以正在看的東西自然在保護期內。
-  還沒做：`collect_garbage` 不查有沒有把手開著，現在只靠 `last_used_at` 與保護期擋。
+  「有沒有把手開著」記在程序層級（`media_pool` 的 `OPEN_READERS`：`PoolReader` 開檔時計數、drop 時扣回）；`collect_garbage` 跳過它們（報告的 `files_in_use`）、列也不動，`sweep` 也不收。
+  只看這個程序就夠：資料目錄綁定 daemon（/docs/design/overview/architecture-v2.md §0.2）。
 - 事件快取不受這個配額（/docs/design/storage/local-cache-db.md §1）。
 
 **實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now)` 啟動掃：DB 說完整但檔不在 → reset；半成品超過保護期 → 刪暫存檔加 reset；`pending/` 裡沒有列認領的 → 刪；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後留下的）→ 刪。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。

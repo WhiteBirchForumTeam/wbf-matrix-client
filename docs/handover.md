@@ -23,8 +23,7 @@ PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照�
 **還沒有**：UI；加密附件（加密房送檔仍拒）；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
 已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面 HTTP；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
-⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8）；
-matrix-sdk `Client` 那條要不要改回只開 crypto 與 state 兩個 store（`/docs/design/storage/local-cache-db.md` §4）。
+⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8；§7 第 1 項先照預設做）。
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -224,7 +223,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
 | **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 排在 §7 第 1 項 | 加密房送檔仍拒；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
-| 交叉簽章沒 bootstrap | 要跟 server 一起設計 | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
+| 交叉簽章沒 bootstrap | client 還沒接；server 的橋都有了（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`／`0x25`，驗證訊息走 to-device） | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
 | PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（`Recent` 收 `before_event_id`） | 跳到訊息還是兩個來回 |
 | server 批 3、批 4 的新 kind 沒接（0x12／0x15／0x1C／0x1D、0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加；沒有破壞性改動、向量檔沒變 | 推播規則、搜尋、目錄、TURN 都還沒有。做的時候先讀 #55 列的十個坑 |
@@ -239,9 +238,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
    讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
 2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
-   `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡先讓它拿 `daemon.lock`，最終改走 RPC。
+   `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
-之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章（要跟 server 一起設計）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
+之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
 資料平面 HTTP 與附件訊息的完整流程（`/docs/design/rpc-specs/local-interface.md` §9）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC；
 UI 框架比較；串流／seek 對著媒體池讀（`/docs/design/media/media-pool.md` §6）。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
