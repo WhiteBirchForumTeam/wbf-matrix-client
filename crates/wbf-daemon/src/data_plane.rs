@@ -2,20 +2,22 @@
 //!
 //! | 這裡 | 別處 |
 //! |---|---|
-//! | capability 表（[`Capabilities`]）：token → 這一個上傳、有效期、現在有沒有 PUT 在收 | `media.create` 鑄 token、`room.send_attachment` 查上傳（`handle`） |
-//! | HTTP listener（[`DataServer`]）：路徑、狀態碼、把 body 交給 core | 怎麼切塊、加密、上傳（`Core::receive_upload`） |
+//! | access key（[`AccessKeys`]）：URL 裡那段，用共享 token 加密的上傳狀態 | `media.create` 鑄（`handle/media.rs`） |
+//! | HTTP listener（[`DataServer`]）：路徑、Host、狀態碼、把 body 交給 core | 怎麼切塊、加密、上傳（`Core::receive_upload`） |
 //!
-//! 🚫 沒有全域 token：URL 本身就是 capability（/docs/design/rpc-specs/data-plane.md §2）。🚫 這裡不印東西。
+//! 🚫 沒有 token 表、沒有 TTL（維護者 2026-09-30）：URL 自己帶著上傳的一切，daemon 解得開就是它發的；
+//! 能活多久、要不要拒，是 server 的事。唯一的表是「正在收的上傳」，只活在那條連線的期間。🚫 這裡不印東西。
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -27,208 +29,189 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::StreamReader;
 use wbf_core::{Core, CoreError, CoreErrorKind, Target};
 use wbf_sdk::{Manifest, UploadState};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::handle::Handle;
 use crate::message::code;
 
-/// 一張 token 活多久（/docs/design/rpc-specs/data-plane.md §2）。進行中的 PUT 過期也不打斷，過期只擋新的請求。
-pub const CAPABILITY_TTL: Duration = Duration::from_secs(3600);
+/// 上傳的路徑前綴；後面接 access key（/docs/design/rpc-specs/data-plane.md §3）。
+pub const UPLOAD_PATH: &str = "/upload/mxc/";
+/// access key 從共享 token 導鑰的 context（跟 RPC 的兩把分開，/docs/design/rpc-specs/local-interface.md §4）。
+const ACCESS_CONTEXT: &str = "wbf-matrix-client data plane v1";
+const ACCESS_AAD: &[u8] = b"wbf-data v1";
+const NONCE_LEN: usize = 24;
+/// 加密模式：`e_` ＋ base58(nonce ‖ 密文)。
+const ENCRYPTED_PREFIX: &str = "e_";
+/// 明文模式（`daemon.set_encryption` 關掉時）：`c_` ＋ base58(明文)。
+const PLAIN_PREFIX: &str = "c_";
+/// 明文裡的第一個 byte：這把 key 是做什麼的。下載的 key 拿來上傳要被拒。
+const PURPOSE_UPLOAD: u8 = 0x01;
 
-/// token 的隨機 bytes 數（URL 裡是它的 hex）。
-const TOKEN_BYTES: usize = 32;
+/// 從共享 token 導出的那一把，只拿來封／開 access key。
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct AccessKeys {
+    key: [u8; 32],
+}
 
-/// 所有有效的 capability。現在只有上傳；`media.open` 的讀取之後加在這裡。
+impl AccessKeys {
+    /// Args:
+    ///     token: `daemon.token` 的內容（跟 RPC 同一份）, example: 256 個隨機 byte
+    pub fn from_token(token: &[u8]) -> AccessKeys {
+        AccessKeys {
+            key: blake3::derive_key(ACCESS_CONTEXT, token),
+        }
+    }
+
+    /// 一個上傳的 access key（URL 裡 `/upload/mxc/` 後面那段）。
+    ///
+    /// Args:
+    ///     upload: `Core::create_upload` 回的（含檔案金鑰）
+    ///     encrypted: daemon 現在是不是加密模式；是就 `e_`（token 加密），不是就 `c_`（明文、只給除錯）
+    /// Return:
+    ///     Ok(String)       example: "e_3mJr7AoUXx2Wqd…"
+    ///     Err(CoreError)   OS 給不出亂數、序列化不了（`Io`）
+    pub fn to_upload_access(
+        &self,
+        upload: &UploadState,
+        encrypted: bool,
+    ) -> Result<String, CoreError> {
+        let mut plain = Zeroizing::new(vec![PURPOSE_UPLOAD]);
+        let json = Zeroizing::new(serde_json::to_vec(upload).map_err(|error| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("cannot serialise the upload: {error}"),
+            )
+        })?);
+        plain.extend_from_slice(&json);
+        if !encrypted {
+            return Ok(format!(
+                "{PLAIN_PREFIX}{}",
+                bs58::encode(&*plain).into_string()
+            ));
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce).map_err(|error| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("no randomness for an access key: {error}"),
+            )
+        })?;
+        let sealed = XChaCha20Poly1305::new(&self.key.into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: ACCESS_AAD,
+                },
+            )
+            .map_err(|_| CoreError::new(CoreErrorKind::Io, "cannot seal an access key"))?;
+        let mut bytes = nonce.to_vec();
+        bytes.extend_from_slice(&sealed);
+        Ok(format!(
+            "{ENCRYPTED_PREFIX}{}",
+            bs58::encode(bytes).into_string()
+        ))
+    }
+
+    /// 開一個上傳的 access key。
+    ///
+    /// Args:
+    ///     access: URL 裡那段, example: "e_3mJr7AoUXx2Wqd…"
+    ///     encryption_enforced: daemon 現在是不是加密模式；是的話 `c_` 一律不收（fail closed）
+    /// Return:
+    ///     Some(UploadState)   這個 daemon 發的上傳 key
+    ///     None                不是我們發的、被改過、別的 daemon（token 不同）發的、用途不對、形狀不對、加密模式下的 `c_`
+    pub fn open_upload_access(
+        &self,
+        access: &str,
+        encryption_enforced: bool,
+    ) -> Option<UploadState> {
+        let plain = if let Some(encoded) = access.strip_prefix(ENCRYPTED_PREFIX) {
+            let bytes = bs58::decode(encoded).into_vec().ok()?;
+            let nonce = bytes.get(..NONCE_LEN)?;
+            let sealed = bytes.get(NONCE_LEN..)?;
+            Zeroizing::new(
+                XChaCha20Poly1305::new(&self.key.into())
+                    .decrypt(
+                        XNonce::from_slice(nonce),
+                        Payload {
+                            msg: sealed,
+                            aad: ACCESS_AAD,
+                        },
+                    )
+                    .ok()?,
+            )
+        } else if let Some(encoded) = access.strip_prefix(PLAIN_PREFIX) {
+            if encryption_enforced {
+                return None;
+            }
+            Zeroizing::new(bs58::decode(encoded).into_vec().ok()?)
+        } else {
+            return None;
+        };
+        let (purpose, json) = plain.split_first()?;
+        if *purpose != PURPOSE_UPLOAD {
+            return None;
+        }
+        serde_json::from_slice(json).ok()
+    }
+}
+
+/// 正在收的上傳（server、上傳 id）：同一個上傳同時只收一條 PUT（兩條交錯送，串流的塊會亂）。只活在連線期間。
 #[derive(Default)]
-pub struct Capabilities {
-    uploads: Mutex<HashMap<String, UploadCapability>>,
+struct UploadsReceiving {
+    uploads: Mutex<HashSet<(String, u64)>>,
 }
 
-struct UploadCapability {
-    /// ⚠️ 含檔案金鑰：只在記憶體裡，🚫 不落地、不給前端。
-    upload: UploadState,
-    expires_at: Instant,
-    phase: UploadPhase,
-}
-
-#[derive(Clone)]
-enum UploadPhase {
-    /// 沒有 PUT 在收（新的、或上一次斷了的固定大小上傳）。
-    Idle,
-    Receiving,
-    /// 傳完了：再 PUT 直接回這份，`room.send_attachment` 也用它的區塊（多了 `sha256`，串流的多了 `file_size`）。
-    Sealed(Manifest),
-    /// 串流上傳斷了：server 不能續傳串流，這張 token 只能作廢。
-    Broken,
-}
-
-/// `room.send_attachment` 照 mxc 找不到傳完的上傳時，是哪一種（[`Capabilities::find_finished_upload`]）。
-#[derive(Debug, PartialEq, Eq)]
-pub enum MissingUpload {
-    /// 有這個上傳，但 PUT 還沒回 200
-    NotFinished,
-    /// 沒有、過期了、或是別的帳號的
-    Unknown,
-}
-
-/// 一個 PUT 進來時，這張 token 的狀況。
-enum PutStart {
-    NotFound,
-    Busy,
-    Broken,
-    Sealed(Manifest),
-    Receive(UploadState),
-}
-
-impl Capabilities {
-    fn uploads(&self) -> MutexGuard<'_, HashMap<String, UploadCapability>> {
+impl UploadsReceiving {
+    fn uploads(&self) -> MutexGuard<'_, HashSet<(String, u64)>> {
         self.uploads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 替一個剛建好的上傳鑄一張 token。
-    ///
-    /// Args:
-    ///     upload: `Core::create_upload` 回的
     /// Return:
-    ///     Ok(String)       64 個 hex 字元，放進 `/upload/<token>`
-    ///     Err(CoreError)   OS 給不出亂數（`Io`）
-    pub fn issue_upload(&self, upload: UploadState) -> Result<String, CoreError> {
-        let token = new_token()?;
-        let now = Instant::now();
-        let mut uploads = self.uploads();
-        uploads.retain(|_, capability| {
-            capability.expires_at > now || matches!(capability.phase, UploadPhase::Receiving)
-        });
-        uploads.insert(
-            token.clone(),
-            UploadCapability {
-                upload,
-                expires_at: now + CAPABILITY_TTL,
-                phase: UploadPhase::Idle,
-            },
-        );
-        Ok(token)
-    }
-
-    /// 這個帳號傳完的那個 mxc（`room.send_attachment`，/docs/design/rpc-specs/data-plane.md §5）。一定帶帳號一起找：
-    /// 兩台 server 的 `server_name` 一樣時 mxc 也會撞，而上傳 id 本來就是各台自己發的。
-    ///
-    /// Args:
-    ///     mxc: PUT 回的 manifest 裡那個, example: "mxc://localhost/000000000000004d"
-    ///     server: 帳號的 homeserver, example: "http://127.0.0.1:6167"
-    ///     user_id: example: "@alice:localhost"
-    /// Return:
-    ///     Ok((UploadState, Manifest))       傳完了：建檔那份（核對帳號用）與 manifest（事件用它的區塊）
-    ///     Err(MissingUpload::NotFinished)   有這個上傳，但 PUT 還沒回 200
-    ///     Err(MissingUpload::Unknown)       沒有、過期了、或是別的帳號的
-    pub fn find_finished_upload(
-        &self,
-        mxc: &str,
-        server: &str,
-        user_id: &str,
-    ) -> Result<(UploadState, Manifest), MissingUpload> {
-        let now = Instant::now();
-        let uploads = self.uploads();
-        let found = uploads.values().find(|capability| {
-            capability.expires_at > now
-                && capability.upload.mxc == mxc
-                && capability.upload.is_for(server, user_id)
-        });
-        match found {
-            None => Err(MissingUpload::Unknown),
-            Some(capability) => match &capability.phase {
-                UploadPhase::Sealed(manifest) => Ok((capability.upload.clone(), manifest.clone())),
-                _ => Err(MissingUpload::NotFinished),
-            },
+    ///     Some(ReceivingGuard)   登記好了；丟掉 guard 就解除
+    ///     None                   這個上傳已經有一條 PUT 在收
+    fn begin(self: &Arc<Self>, upload: &UploadState) -> Option<ReceivingGuard> {
+        let key = (upload.server.clone(), upload.upload_id);
+        if !self.uploads().insert(key.clone()) {
+            return None;
         }
-    }
-
-    /// 撤銷一個帳號的全部 token（`account.del`／`destroy` 之後，/docs/design/rpc-specs/data-plane.md §2）。
-    /// 進行中的 PUT 不打斷（core 那邊沒有 session 就會失敗），之後的請求一律 404。
-    pub fn revoke_account(&self, server: &str, user_id: &str) {
-        self.uploads()
-            .retain(|_, capability| !capability.upload.is_for(server, user_id));
-    }
-
-    fn begin_put(&self, token: &str) -> PutStart {
-        let now = Instant::now();
-        let mut uploads = self.uploads();
-        let Some(capability) = uploads.get_mut(token) else {
-            return PutStart::NotFound;
-        };
-        match &capability.phase {
-            UploadPhase::Receiving => PutStart::Busy,
-            // 過期跟不存在一樣 404：🚫 不分辨兩者（那會變成探測工具）。
-            _ if capability.expires_at <= now => PutStart::NotFound,
-            UploadPhase::Broken => PutStart::Broken,
-            UploadPhase::Sealed(manifest) => PutStart::Sealed(manifest.clone()),
-            UploadPhase::Idle => {
-                capability.phase = UploadPhase::Receiving;
-                PutStart::Receive(capability.upload.clone())
-            }
-        }
-    }
-
-    fn end_put(&self, token: &str, sealed: Option<&Manifest>) {
-        let mut uploads = self.uploads();
-        let Some(capability) = uploads.get_mut(token) else {
-            return;
-        };
-        capability.phase = match sealed {
-            Some(manifest) => UploadPhase::Sealed(manifest.clone()),
-            None if capability.upload.block.file_size.is_some() => UploadPhase::Idle,
-            None => UploadPhase::Broken,
-        };
+        Some(ReceivingGuard {
+            receiving: self.clone(),
+            key,
+        })
     }
 }
 
-/// 一個進行中的 PUT。🚨 丟掉（連線斷了、future 被 hyper 丟掉）就把狀態放回去——不然那張 token 永遠回 409。
-struct PutInProgress {
-    handle: Arc<Handle>,
-    token: String,
-    ended: bool,
+/// 🚨 丟掉就解除登記——PUT 怎麼結束都一樣（回了、失敗、連線斷了、future 被 hyper 丟掉），🚫 不留一個永遠 409 的上傳。
+struct ReceivingGuard {
+    receiving: Arc<UploadsReceiving>,
+    key: (String, u64),
 }
 
-impl PutInProgress {
-    fn end(mut self, sealed: Option<&Manifest>) {
-        self.handle.capabilities().end_put(&self.token, sealed);
-        self.ended = true;
-    }
-}
-
-impl Drop for PutInProgress {
+impl Drop for ReceivingGuard {
     fn drop(&mut self) {
-        if !self.ended {
-            self.handle.capabilities().end_put(&self.token, None);
-        }
+        self.receiving.uploads().remove(&self.key);
     }
-}
-
-/// Return:
-///     Ok(String)   `TOKEN_BYTES` 個 OS 亂數的 hex
-///     Err(Io)      OS 給不出亂數
-fn new_token() -> Result<String, CoreError> {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    getrandom::getrandom(&mut bytes).map_err(|error| {
-        CoreError::new(
-            CoreErrorKind::Io,
-            format!("no randomness for a data plane token: {error}"),
-        )
-    })?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub struct DataServer {
     listener: TcpListener,
     handle: Arc<Handle>,
+    receiving: Arc<UploadsReceiving>,
 }
 
 impl DataServer {
     /// 綁 loopback。`port` 給 0 就是隨機 port（`local_addr` 才知道）。
     pub async fn bind(port: u16, handle: Arc<Handle>) -> std::io::Result<DataServer> {
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-        Ok(DataServer { listener, handle })
+        Ok(DataServer {
+            listener,
+            handle,
+            receiving: Arc::default(),
+        })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -246,7 +229,7 @@ impl DataServer {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
-                    tokio::spawn(serve_connection(stream, self.handle.clone()));
+                    tokio::spawn(serve_connection(stream, self.handle.clone(), self.receiving.clone()));
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -260,10 +243,14 @@ impl DataServer {
 
 type Reply = Response<Full<Bytes>>;
 
-async fn serve_connection(stream: TcpStream, handle: Arc<Handle>) {
+async fn serve_connection(
+    stream: TcpStream,
+    handle: Arc<Handle>,
+    receiving: Arc<UploadsReceiving>,
+) {
     let service = service_fn(move |request| {
-        let handle = handle.clone();
-        async move { Ok::<Reply, Infallible>(route(handle, request).await) }
+        let (handle, receiving) = (handle.clone(), receiving.clone());
+        async move { Ok::<Reply, Infallible>(route(handle, receiving, request).await) }
     });
     // 連線層的錯（對方亂送、半路斷）只影響這一條，🚫 不往上丟。
     let _ = http1::Builder::new()
@@ -272,11 +259,18 @@ async fn serve_connection(stream: TcpStream, handle: Arc<Handle>) {
 }
 
 /// /docs/design/rpc-specs/data-plane.md §3 的路徑表。
-async fn route(handle: Arc<Handle>, request: Request<Incoming>) -> Reply {
-    let token = match request.uri().path().strip_prefix("/upload/") {
-        Some(token) if is_token_shaped(token) => token.to_string(),
-        _ => return not_found(),
+async fn route(
+    handle: Arc<Handle>,
+    receiving: Arc<UploadsReceiving>,
+    request: Request<Incoming>,
+) -> Reply {
+    if !is_loopback_host(&request) {
+        return empty_reply(StatusCode::FORBIDDEN);
+    }
+    let Some(access) = request.uri().path().strip_prefix(UPLOAD_PATH) else {
+        return not_found();
     };
+    let access = access.to_string();
     if request.method() != Method::PUT {
         return method_not_allowed("PUT");
     }
@@ -289,43 +283,33 @@ async fn route(handle: Arc<Handle>, request: Request<Incoming>) -> Reply {
             "the vault is locked; call vault.unlock first",
         );
     }
-    put_upload(handle, &core, token, request).await
+    let Some(keys) = handle.access_keys() else {
+        return not_found();
+    };
+    let Some(upload) = keys.open_upload_access(&access, handle.is_encryption_enforced()) else {
+        return not_found();
+    };
+    let Some(_receiving) = receiving.begin(&upload) else {
+        return error_reply(
+            StatusCode::CONFLICT,
+            code::BUSY,
+            "this upload already has a PUT in progress",
+        );
+    };
+    put_upload(&handle, &core, &upload, request).await
 }
 
 /// 一個 PUT：body 是明文，一條連線送到底；回應在 `Seal` 之後才到，body 是 manifest（/docs/design/rpc-specs/data-plane.md §4）。
 async fn put_upload(
-    handle: Arc<Handle>,
+    handle: &Handle,
     core: &Core,
-    token: String,
+    upload: &UploadState,
     request: Request<Incoming>,
 ) -> Reply {
-    let upload =
-        match handle.capabilities().begin_put(&token) {
-            PutStart::NotFound => return not_found(),
-            PutStart::Busy => {
-                return error_reply(
-                    StatusCode::CONFLICT,
-                    code::BUSY,
-                    "this upload already has a PUT in progress",
-                )
-            }
-            PutStart::Broken => return error_reply(
-                StatusCode::CONFLICT,
-                code::BUSY,
-                "a streamed upload cannot resume after its PUT broke off: call media.create again",
-            ),
-            PutStart::Sealed(manifest) => return manifest_reply(&manifest),
-            PutStart::Receive(upload) => upload,
-        };
-    let in_progress = PutInProgress {
-        handle: handle.clone(),
-        token,
-        ended: false,
-    };
     if let Err(message) = check_content_length(&request, upload.block.file_size) {
         return error_reply(StatusCode::BAD_REQUEST, code::INVALID_PARAMS, message);
     }
-    // 上傳綁的是建它的那個帳號；core 會再核對一次（/docs/design/rpc-specs/data-plane.md §5）。
+    // 上傳綁的是建它的那個帳號；core 會再核對一次（/docs/design/rpc-specs/data-plane.md §1）。
     let target = Target {
         user: Some(upload.user_id.clone()),
         server: Some(upload.server.clone()),
@@ -338,17 +322,30 @@ async fn put_upload(
     let mut body = StreamReader::new(frames);
     // ⚠️ 裝箱：matrix-sdk 的 future 很深，讓編譯器一路推 `Send` 會撞 E0275（遞迴上限）；handle 的 dispatch 也是這樣切的。
     let receiving: Pin<Box<dyn Future<Output = Result<Manifest, CoreError>> + Send + '_>> =
-        Box::pin(core.receive_upload(&upload, &mut body, &target));
+        Box::pin(core.receive_upload(upload, &mut body, &target));
     match receiving.await {
-        Ok(manifest) => {
-            in_progress.end(Some(&manifest));
-            manifest_reply(&manifest)
-        }
-        Err(error) => {
-            in_progress.end(None);
-            core_error_reply(&error)
-        }
+        Ok(manifest) => manifest_reply(&manifest),
+        Err(error) => core_error_reply(&error),
     }
+}
+
+/// `Host` 是 loopback 嗎（擋 DNS rebinding：網頁把自己的網域指到 127.0.0.1 之後，瀏覽器送的 Host 是那個網域）。
+///
+/// Return:
+///     bool  1 ＝ `127.0.0.1`、`localhost`、`[::1]`（帶不帶 port 都可以）；沒有 Host 或其他 → 0
+fn is_loopback_host(request: &Request<Incoming>) -> bool {
+    let Some(host) = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let name = match host.strip_prefix("[::1]") {
+        Some(rest) => return rest.is_empty() || rest.starts_with(':'),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
 }
 
 /// `Content-Length` 有帶就要跟 `media.create` 的 `size` 一樣；沒帶（chunked）交給 core 數。
@@ -373,19 +370,11 @@ fn check_content_length(request: &Request<Incoming>, size: Option<u64>) -> Resul
     }
 }
 
-/// token 的形狀：`TOKEN_BYTES` 個 byte 的小寫 hex。形狀不對就不去查表。
-fn is_token_shaped(text: &str) -> bool {
-    text.len() == TOKEN_BYTES * 2
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// core 的錯誤 → HTTP 狀態碼（/docs/design/rpc-specs/data-plane.md §4 的表）；body 是 `{ code, msg }`，code 同 RPC。
+/// core 的錯誤 → HTTP 狀態碼（/docs/design/rpc-specs/data-plane.md §4.2 的表）；body 是 `{ code, msg }`，code 同 RPC。
 fn core_error_reply(error: &CoreError) -> Reply {
     let status = match error.kind {
         CoreErrorKind::Usage => StatusCode::BAD_REQUEST,
-        // 帳號登出了：那張 token 形同撤銷。（找不到帳號的是 `Usage`，落在上面那格。）
+        // 帳號登出了：那個 URL 形同作廢。（找不到帳號的是 `Usage`，落在上面那格。）
         CoreErrorKind::NoSuchAccount | CoreErrorKind::NotLoggedIn => StatusCode::NOT_FOUND,
         CoreErrorKind::Locked | CoreErrorKind::NoKeyFile => StatusCode::SERVICE_UNAVAILABLE,
         CoreErrorKind::Network | CoreErrorKind::Server | CoreErrorKind::Timeout => {
@@ -447,13 +436,14 @@ mod tests {
     const SERVER: &str = "http://127.0.0.1:6167";
     const ALICE: &str = "@alice:localhost";
 
-    fn upload(upload_id: u64, user_id: &str, size: Option<u64>) -> UploadState {
+    fn upload(upload_id: u64, size: Option<u64>) -> UploadState {
         let cipher = wbf_sdk::FileCipher::generate(wbf_sdk::Cipher::ChaCha20Poly1305, 16).unwrap();
         let mut block = cipher.to_event_block(size.unwrap_or(0));
         block.file_size = size;
+        block.name = Some("v.bin".into());
         UploadState {
             server: SERVER.into(),
-            user_id: user_id.into(),
+            user_id: ALICE.into(),
             upload_id,
             mxc: format!("mxc://localhost/{upload_id:016x}"),
             chunk_max_bytes: 1 << 20,
@@ -461,188 +451,84 @@ mod tests {
         }
     }
 
-    fn manifest_of(upload: &UploadState) -> Manifest {
-        let mut block = upload.block.clone();
-        block.file_size = Some(40);
-        block.sha256 = Some("ab".repeat(32));
-        Manifest {
-            server: upload.server.clone(),
-            mxc: upload.mxc.clone(),
-            block,
+    /// 同一把 token 封的開得回同一份上傳（含檔案金鑰）；每次封都不一樣（nonce 隨機），但都能重複開——URL 可以重用。
+    #[test]
+    fn an_access_key_opens_back_to_the_same_upload_as_many_times_as_asked() {
+        let keys = AccessKeys::from_token(&[7u8; 256]);
+        let original = upload(7, Some(40));
+        let first = keys.to_upload_access(&original, true).unwrap();
+        let second = keys.to_upload_access(&original, true).unwrap();
+        assert!(first.starts_with("e_"), "{first}");
+        assert_ne!(first, second, "nonce 每次隨機");
+        for access in [&first, &first, &second] {
+            assert_eq!(
+                keys.open_upload_access(access, true),
+                Some(original.clone())
+            );
         }
-    }
-
-    #[test]
-    fn a_token_is_64_lowercase_hex_and_every_one_is_new() {
-        let capabilities = Capabilities::default();
-        let first = capabilities
-            .issue_upload(upload(1, ALICE, Some(40)))
-            .unwrap();
-        let second = capabilities
-            .issue_upload(upload(1, ALICE, Some(40)))
-            .unwrap();
-        assert!(is_token_shaped(&first), "{first}");
-        assert_ne!(first, second, "同一個上傳鑄兩次也是兩張");
-        assert!(!is_token_shaped(&first.to_uppercase()));
-        assert!(!is_token_shaped("../etc/passwd"));
-        assert!(!is_token_shaped(""));
-    }
-
-    /// hyper 可能直接丟掉處理 PUT 的 future（不走我們的錯誤路）：guard 被丟掉也要把「收著」解除，🚫 不留一張永遠 409 的 token。
-    #[test]
-    fn a_dropped_put_hands_the_token_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let handle = Handle::new(
-            dir.path(),
-            crate::connection::EncryptionPolicy::enforced(),
-            crate::settings::Settings::default(),
-        );
-        let token = handle
-            .capabilities()
-            .issue_upload(upload(1, ALICE, Some(40)))
-            .unwrap();
-        assert!(matches!(
-            handle.capabilities().begin_put(&token),
-            PutStart::Receive(_)
-        ));
-        drop(PutInProgress {
-            handle: handle.clone(),
-            token: token.clone(),
-            ended: false,
-        });
         assert!(
-            matches!(handle.capabilities().begin_put(&token), PutStart::Receive(_)),
+            !first.contains(&original.mxc) && !first.contains("localhost"),
+            "加密模式的 URL 看不出是哪個檔"
+        );
+    }
+
+    /// 不是這個 daemon 發的一律不認（A5：不是正面認得就拒）：別的 token、改過一個字、截斷、亂寫、別的前綴。
+    #[test]
+    fn a_key_that_this_daemon_did_not_issue_is_refused() {
+        let keys = AccessKeys::from_token(&[7u8; 256]);
+        let access = keys.to_upload_access(&upload(7, Some(40)), true).unwrap();
+        let other_daemon = AccessKeys::from_token(&[8u8; 256]);
+        assert_eq!(other_daemon.open_upload_access(&access, true), None);
+
+        let mut tampered = access.clone().into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'2' { b'3' } else { b'2' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert_eq!(keys.open_upload_access(&tampered, true), None);
+        assert_eq!(
+            keys.open_upload_access(&access[..access.len() - 5], true),
+            None
+        );
+        for junk in ["", "e_", "e_0OIl", "x_abc", "../../etc/passwd", "e_111"] {
+            assert_eq!(keys.open_upload_access(junk, true), None, "{junk}");
+        }
+
+        // 用途不對（例如之後的下載 key）：解得開也不收。
+        let mut plain = vec![0x02];
+        plain.extend(serde_json::to_vec(&upload(7, Some(40))).unwrap());
+        let wrong_purpose = format!("c_{}", bs58::encode(plain).into_string());
+        assert_eq!(keys.open_upload_access(&wrong_purpose, false), None);
+    }
+
+    /// 明文模式（`c_`）只在 daemon 關掉加密時收；加密模式下拿 `c_` 來一律拒（fail closed）。
+    #[test]
+    fn a_plain_key_is_taken_only_while_encryption_is_off() {
+        let keys = AccessKeys::from_token(&[7u8; 256]);
+        let original = upload(9, None);
+        let plain = keys.to_upload_access(&original, false).unwrap();
+        assert!(plain.starts_with("c_"), "{plain}");
+        assert_eq!(
+            keys.open_upload_access(&plain, false),
+            Some(original.clone())
+        );
+        assert_eq!(keys.open_upload_access(&plain, true), None);
+        // 加密的那種兩個模式都收。
+        let encrypted = keys.to_upload_access(&original, true).unwrap();
+        assert_eq!(keys.open_upload_access(&encrypted, false), Some(original));
+    }
+
+    /// 同一個上傳同時只收一條 PUT；guard 丟掉（PUT 怎麼結束都一樣，含 future 被 hyper 丟掉）就解除。
+    #[test]
+    fn one_put_per_upload_at_a_time_and_dropping_the_guard_releases_it() {
+        let receiving = Arc::new(UploadsReceiving::default());
+        let first = receiving.begin(&upload(1, Some(40))).unwrap();
+        assert!(receiving.begin(&upload(1, Some(40))).is_none(), "409");
+        let other = receiving.begin(&upload(2, Some(40)));
+        assert!(other.is_some(), "別的上傳不受影響");
+        drop(first);
+        assert!(
+            receiving.begin(&upload(1, Some(40))).is_some(),
             "丟掉之後可以再 PUT"
-        );
-    }
-
-    /// 一張 token 同時只收一個 PUT；PUT 斷了（guard 被丟掉）固定大小的放回去可以續傳，串流的作廢；傳完的再 PUT 直接回 manifest。
-    #[test]
-    fn a_put_holds_the_token_and_what_is_left_after_it_depends_on_how_it_ended() {
-        let capabilities = Capabilities::default();
-        let sized = capabilities
-            .issue_upload(upload(1, ALICE, Some(40)))
-            .unwrap();
-        assert!(matches!(
-            capabilities.begin_put(&sized),
-            PutStart::Receive(_)
-        ));
-        assert!(
-            matches!(capabilities.begin_put(&sized), PutStart::Busy),
-            "409"
-        );
-        capabilities.end_put(&sized, None);
-        assert!(
-            matches!(capabilities.begin_put(&sized), PutStart::Receive(_)),
-            "固定大小斷了可以再 PUT（續傳）"
-        );
-        let manifest = manifest_of(&upload(1, ALICE, Some(40)));
-        capabilities.end_put(&sized, Some(&manifest));
-        match capabilities.begin_put(&sized) {
-            PutStart::Sealed(again) => assert_eq!(again, manifest),
-            _ => panic!("傳完的再 PUT 要回同一份 manifest"),
-        }
-
-        let streamed = capabilities.issue_upload(upload(2, ALICE, None)).unwrap();
-        assert!(matches!(
-            capabilities.begin_put(&streamed),
-            PutStart::Receive(_)
-        ));
-        capabilities.end_put(&streamed, None);
-        assert!(
-            matches!(capabilities.begin_put(&streamed), PutStart::Broken),
-            "串流斷了 server 接不回去"
-        );
-        assert!(matches!(
-            capabilities.begin_put(&"0".repeat(64)),
-            PutStart::NotFound
-        ));
-    }
-
-    /// 過期跟不存在一樣（404）；但進行中的 PUT 不被過期打斷，也不被清掉。
-    #[test]
-    fn an_expired_token_is_not_found_and_a_running_put_outlives_it() {
-        let capabilities = Capabilities::default();
-        let idle = capabilities
-            .issue_upload(upload(1, ALICE, Some(40)))
-            .unwrap();
-        let running = capabilities
-            .issue_upload(upload(2, ALICE, Some(40)))
-            .unwrap();
-        assert!(matches!(
-            capabilities.begin_put(&running),
-            PutStart::Receive(_)
-        ));
-        let past = Instant::now() - Duration::from_secs(1);
-        for capability in capabilities.uploads().values_mut() {
-            capability.expires_at = past;
-        }
-        assert!(matches!(capabilities.begin_put(&idle), PutStart::NotFound));
-        assert_eq!(
-            capabilities
-                .find_finished_upload(&upload(1, ALICE, None).mxc, SERVER, ALICE)
-                .err(),
-            Some(MissingUpload::Unknown)
-        );
-        // 鑄新的會順手清掉過期的，但🚫 不清正在收的那張。
-        capabilities
-            .issue_upload(upload(3, ALICE, Some(40)))
-            .unwrap();
-        assert!(!capabilities.uploads().contains_key(&idle));
-        assert!(capabilities.uploads().contains_key(&running));
-    }
-
-    /// `room.send_attachment` 只拿傳完的；一定照帳號找——兩台 server 的 `server_name` 一樣時 mxc 也會撞（A5：不是正面認得就不給）。
-    #[test]
-    fn only_a_finished_upload_of_the_same_account_is_found_by_its_mxc() {
-        let capabilities = Capabilities::default();
-        let alices = upload(7, ALICE, Some(40));
-        let mxc = alices.mxc.clone();
-        let token = capabilities.issue_upload(alices.clone()).unwrap();
-        let bobs_token = capabilities
-            .issue_upload(upload(7, "@bob:localhost", Some(40)))
-            .unwrap();
-        let find = |user_id: &str| capabilities.find_finished_upload(&mxc, SERVER, user_id);
-        assert!(
-            find(ALICE).err() == Some(MissingUpload::NotFinished),
-            "還沒 PUT"
-        );
-        assert!(matches!(
-            capabilities.begin_put(&token),
-            PutStart::Receive(_)
-        ));
-        assert!(
-            find(ALICE).err() == Some(MissingUpload::NotFinished),
-            "PUT 進行中也還不算"
-        );
-        let manifest = manifest_of(&alices);
-        capabilities.end_put(&token, Some(&manifest));
-        let (found, found_manifest) = find(ALICE).expect("傳完了就找得到");
-        assert_eq!(found.user_id, ALICE);
-        assert_eq!(found_manifest, manifest);
-        assert!(
-            find("@bob:localhost").err() == Some(MissingUpload::NotFinished),
-            "bob 那個同名 mxc 的還沒傳完——🚫 不是拿 alice 的給他"
-        );
-        assert_eq!(
-            capabilities
-                .find_finished_upload(&mxc, "http://other:6167", ALICE)
-                .err(),
-            Some(MissingUpload::Unknown)
-        );
-        assert_eq!(
-            capabilities
-                .find_finished_upload("mxc://localhost/0000000000000008", SERVER, ALICE)
-                .err(),
-            Some(MissingUpload::Unknown)
-        );
-
-        capabilities.revoke_account(SERVER, ALICE);
-        assert!(find(ALICE).err() == Some(MissingUpload::Unknown));
-        assert!(matches!(capabilities.begin_put(&token), PutStart::NotFound));
-        assert!(
-            matches!(capabilities.begin_put(&bobs_token), PutStart::Receive(_)),
-            "只撤那一個帳號的"
         );
     }
 }

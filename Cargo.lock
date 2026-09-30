@@ -4256,6 +4256,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "bs58",
  "bytes",
  "chacha20poly1305 0.10.1",
  "clap",

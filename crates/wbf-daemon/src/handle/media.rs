@@ -14,11 +14,12 @@ use super::{
     invalid_params, parse_params, to_result, Fail, Handle, Outcome, TargetParams, TransportParam,
     DAEMON_NAME, DAEMON_VERSION,
 };
-use crate::data_plane::CAPABILITY_TTL;
+use crate::data_plane::UPLOAD_PATH;
 use crate::message::code;
 
-/// 資料平面的上傳第一步（/docs/design/rpc-specs/data-plane.md §4）：去 server 建檔、鑄一張 PUT 的 URL。
-/// 發訊息是 UI 在 PUT 回 manifest 之後另外叫的 `room.send_attachment`（帶 `mxc`），🚫 不是這裡的事。
+/// 資料平面的上傳第一步（/docs/design/rpc-specs/data-plane.md §4.1）：去 server 建檔、回一個 PUT 的 URL。
+/// URL 裡的 access key 帶著整個上傳狀態、用共享 token 加密，daemon 🚫 不另外記。
+/// 發訊息是 UI 在 PUT 回 manifest 之後另外叫的 `room.send_attachment`，🚫 不是這裡的事。
 pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
@@ -29,7 +30,7 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
     }
     let params: Params = parse_params(params)?;
     // 沒有資料平面（單發命令）就不去 server 建檔：建了也沒有地方收 bytes。
-    let Some(data_port) = handle.data_port().await else {
+    let (Some(data_port), Some(keys)) = (handle.data_port().await, handle.access_keys()) else {
         return Err(Fail::Rpc(
             code::BAD_REQUEST,
             "this daemon has no data plane (it was not started with -s), so nothing could receive the bytes".into(),
@@ -38,13 +39,11 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
     let upload = core
         .create_upload(&params.upload, &handle.target(&params.target))
         .await?;
-    let (upload_id, mxc) = (upload.upload_id, upload.mxc.clone());
-    let token = handle.capabilities().issue_upload(upload)?;
+    let access = keys.to_upload_access(&upload, handle.is_encryption_enforced())?;
     Ok(json!({
-        "upload_id": upload_id,
-        "mxc": mxc,
-        "url": format!("http://127.0.0.1:{data_port}/upload/{token}"),
-        "expires_in": CAPABILITY_TTL.as_secs(),
+        "upload_id": upload.upload_id,
+        "mxc": upload.mxc,
+        "url": format!("http://127.0.0.1:{data_port}{UPLOAD_PATH}{access}"),
     }))
 }
 

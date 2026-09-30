@@ -140,19 +140,6 @@ impl Core {
         Ok(self.session_of(&account)?.server)
     }
 
-    /// 這個 target 指到的帳號是誰：本機的 `session.sealed`，🚫 不問網路。
-    ///
-    /// Return:
-    ///     Ok((String, String))   (homeserver URL, 完整 mxid), example: ("http://127.0.0.1:6167", "@alice:localhost")
-    ///     Err(NoSuchAccount／NotLoggedIn／AmbiguousAccount)
-    ///
-    /// 📎 給 daemon 挑「這個帳號的」資料平面上傳用：上傳 id 是各台 server 自己發的，兩個帳號可能撞號。
-    pub fn server_and_user_of(&self, target: &Target) -> Result<(String, String), CoreError> {
-        let account = self.account_or_current(target)?;
-        let session = self.session_of(&account)?;
-        Ok((session.server, session.user_id))
-    }
-
     // ---- 以下 pub(crate)：回傳裡有 `AccountDir`，不過邊界 ----
 
     /// `switch`／`del`／`destroy` 的 `<user>`：**一律完整 mxid**（/docs/design/rpc-specs/wbf-cli-spec.md §3.1）——

@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use wbf_daemon::connection::EncryptionPolicy;
-use wbf_daemon::data_plane::DataServer;
+use wbf_daemon::data_plane::{AccessKeys, DataServer};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::RpcKeys;
 use wbf_daemon::server::RpcServer;
@@ -155,6 +155,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // 資料平面的 URL 也用同一份 token 導鑰（/docs/design/rpc-specs/data-plane.md §2），導完 token 就不留。
+    let access_keys = AccessKeys::from_token(&token);
     drop(token);
 
     let ready_path = cli.data_dir.join("daemon.json");
@@ -179,6 +181,7 @@ fn main() -> ExitCode {
         }
         let policy = EncryptionPolicy::enforced();
         let handle = Handle::new(&cli.data_dir, policy.clone(), settings);
+        handle.set_access_keys(access_keys);
 
         // 🚨 **`-s` 的第一件事：拿寫權**（/docs/design/overview/architecture-v2.md §0.2）。`-s` 就是「我要寫」的意思，
         // 所以🚫 不等到第一個寫請求才拿 —— 拿不到就不該啟動（fail closed）。

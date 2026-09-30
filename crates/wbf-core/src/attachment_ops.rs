@@ -1,7 +1,7 @@
 //! 資料平面的上傳（/docs/design/rpc-specs/data-plane.md）：建檔、收 bytes、把傳完的檔當附件送出——三步分開，
 //! 前兩步是 UI 打 HTTP（`media.create` 拿 URL、PUT bytes 拿回 manifest），第三步是 UI 另外叫的 RPC（`room.send_attachment`）。
 //!
-//! core 不知道 HTTP：bytes 從一個 `AsyncRead` 進來；建好的上傳（[`UploadState`]）由呼叫端（daemon 的資料平面）記著，
+//! core 不知道 HTTP：bytes 從一個 `AsyncRead` 進來；建好的上傳（[`UploadState`]）由呼叫端帶著（daemon 把它加密進 PUT 的 URL），
 //! 每一步再交回來。每一步都自己核對「這個上傳是不是這個帳號的」，🚫 不靠呼叫端記得查。
 //!
 //! 只有 wbf 帳號：一般 Matrix 帳號要走傳統上傳（`/_matrix/media`），還沒接。
@@ -144,38 +144,38 @@ impl Core {
         Ok(manifest)
     }
 
-    /// 把一個**傳完的**資料平面上傳當附件送進房間（`room.send_attachment`，/docs/design/rpc-specs/data-plane.md §5）。
+    /// 把一個**傳完的**檔當附件送進房間（`room.send_attachment`，/docs/design/rpc-specs/data-plane.md §5）。
     /// 附件在同一個送訊息請求裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）；加密房的事件是密文，區塊（含檔案金鑰）在密文裡。
     ///
-    /// ⚠️ 要傳完：server 只認 `Seal` 過的媒體，宣告一個還在傳的 mxc 會被整則拒送。所以要的是 `receive_upload` 回的 manifest，🚫 不是建檔時那份區塊。
+    /// ⚠️ 要傳完：server 只認 `Seal` 過的媒體，宣告一個還在傳的 mxc 會被整則拒送。所以要的是 manifest（`Seal` 之後才有），🚫 不是建檔時那份區塊。
+    /// 「上傳者是不是 sender」由 server 驗（不是就 `Conflict`）；這裡先擋掉「不是這台 server 的 manifest」。
     ///
     /// Args:
-    ///     upload: `create_upload` 回的那份（核對是不是這個帳號的）
-    ///     manifest: `receive_upload` 回的那份；事件用它的區塊（有 `file_size`、`sha256`）
+    ///     manifest: PUT 回的那份（或 `upload.file` 的）；事件用它的區塊
     ///     caption: example: Some("看這個")
     ///     options: 加密房要 `room_devices`；`txn_id` 重送用
     /// Return:
     ///     Ok(String)                 event_id
-    ///     Err(Usage)                 不是這個帳號的上傳；manifest 不是這個上傳的；區塊跟房間對不上（明文房帶金鑰、加密房不加密）；加密房沒帶 `room_devices`
-    ///     Err(RoomDevicesChanged)    加密房被 1506 擋；帶新的 `room_devices`、同一個 `txn_id` 重送，檔案🚫 不必重傳
+    ///     Err(Usage)                 不是 wbf 帳號；manifest 是別台 server 的；區塊不能進事件；區塊跟房間對不上（明文房帶金鑰、加密房不加密）；加密房沒帶 `room_devices`
+    ///     Err(RoomDevicesChanged)    加密房被 1506 擋；帶新的 `room_devices`、同一份 manifest 與 `txn_id` 重送，檔案🚫 不必重傳
     ///     Err(Server)／Err(Network)
     pub async fn send_attachment(
         &self,
         room: &str,
-        upload: &UploadState,
         manifest: &Manifest,
         caption: Option<&str>,
         options: &SendOptions,
         target: &Target,
     ) -> Result<String, CoreError> {
         let account = self.account_or_current(target)?;
-        self.refuse_unless_upload_of(&account, upload)?;
-        if manifest.mxc != upload.mxc {
+        self.refuse_unless_wbf_upload(&account)?;
+        let session = self.session_of(&account)?;
+        if manifest.server.trim_end_matches('/') != session.server.trim_end_matches('/') {
             return Err(CoreError::new(
                 CoreErrorKind::Usage,
                 format!(
-                    "the manifest is for {}, not for upload {} ({})",
-                    manifest.mxc, upload.upload_id, upload.mxc
+                    "the manifest is for {} on {}, but this account is on {}",
+                    manifest.mxc, manifest.server, session.server
                 ),
             ));
         }
@@ -282,6 +282,7 @@ impl Core {
     }
 
     /// 串流：讀到 EOF，每滿一塊送一塊，最後一塊帶 `IS_LAST`（/docs/design/media/wbf-client-convention-for-chunk.md §6）。
+    /// 🚫 不能續傳：server 已經收過塊的串流再 PUT 一次，新 body 跟舊的塊對不上（例如現錄的串流），拒絕。
     ///
     /// Return:
     ///     Ok((u64, bool))   (明文總長, server 有沒有截斷)
@@ -293,6 +294,22 @@ impl Core {
         body: &mut R,
         hasher: &mut Sha256,
     ) -> Result<(u64, bool), CoreError> {
+        let already = self
+            .upload_link(account)
+            .await?
+            .upload_status(upload.upload_id)
+            .await?
+            .received;
+        if already != 0 {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "{} is a streamed upload that already has {already} chunks on the server, and a stream cannot resume: \
+                     call media.create again",
+                    upload.mxc
+                ),
+            ));
+        }
         let chunk_size = upload.block.chunk_size as usize;
         // 要知道「這是最後一塊」得先看下一塊有沒有東西，所以永遠留一塊在手上。
         let mut pending = read_chunk(body, chunk_size).await?;
@@ -581,14 +598,7 @@ mod tests {
         assert_eq!(decrypted(&upload, &manifest), original);
 
         let refused = core
-            .send_attachment(
-                ROOM,
-                &state,
-                &manifest,
-                None,
-                &SendOptions::default(),
-                &target,
-            )
+            .send_attachment(ROOM, &manifest, None, &SendOptions::default(), &target)
             .await
             .unwrap_err();
         assert!(refused.message.contains("room_devices"), "{refused:?}");
@@ -602,7 +612,7 @@ mod tests {
             txn_id: Some("t1".into()),
         };
         let event_id = core
-            .send_attachment(ROOM, &state, &manifest, Some("看這個"), &options, &target)
+            .send_attachment(ROOM, &manifest, Some("看這個"), &options, &target)
             .await
             .unwrap();
         assert_eq!(event_id, "$sent-1");
@@ -636,7 +646,7 @@ mod tests {
             "明文房的區塊帶金鑰＝金鑰公開"
         );
 
-        let (plain, plain_manifest) =
+        let (_, plain_manifest) =
             uploaded(&core, &new_upload(Some(ROOM), Some(40)), &original, &target).await;
         assert_eq!(plain_manifest.block.cipher, Cipher::None);
         assert!(plain_manifest.block.key.is_none());
@@ -646,7 +656,6 @@ mod tests {
         let refused = core
             .send_attachment(
                 ROOM,
-                &plain,
                 &plain_manifest,
                 None,
                 &SendOptions::default(),
@@ -670,14 +679,13 @@ mod tests {
             "加密房的附件🚫 不能是明文"
         );
 
-        let (encrypted, encrypted_manifest) =
+        let (_, encrypted_manifest) =
             uploaded(&core, &new_upload(Some(ROOM), Some(40)), &original, &target).await;
         misc.room_is_encrypted
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let refused = core
             .send_attachment(
                 ROOM,
-                &encrypted,
                 &encrypted_manifest,
                 None,
                 &SendOptions::default(),
@@ -694,7 +702,6 @@ mod tests {
         let event_id = core
             .send_attachment(
                 ROOM,
-                &plain,
                 &plain_manifest,
                 None,
                 &SendOptions::default(),
@@ -706,7 +713,7 @@ mod tests {
         assert_eq!(misc.sent_events.lock().unwrap()[0].1, "m.room.message");
         assert_eq!(
             *misc.sent_attachments.lock().unwrap(),
-            vec![vec![plain.mxc.clone()]],
+            vec![vec![plain_manifest.mxc.clone()]],
             "明文房也一律宣告"
         );
     }
@@ -781,50 +788,34 @@ mod tests {
             .unwrap_err();
         assert_eq!(refused.kind, CoreErrorKind::Usage, "空的串流沒有零塊的上傳");
 
-        let (state, manifest) =
+        let (_, manifest) =
             uploaded(&core, &new_upload(Some(ROOM), None), &body(40), &target).await;
         assert_eq!(manifest.block.file_size, Some(40));
         assert_eq!(decrypted(&upload, &manifest), body(40));
-        core.send_attachment(
-            ROOM,
-            &state,
-            &manifest,
-            None,
-            &SendOptions::default(),
-            &target,
-        )
-        .await
-        .unwrap();
+        core.send_attachment(ROOM, &manifest, None, &SendOptions::default(), &target)
+            .await
+            .unwrap();
         assert_eq!(misc.sent_events.lock().unwrap().len(), 1);
     }
 
-    /// 別的帳號的上傳一律不碰：塊會進到別人的上傳裡、事件會宣告別人的媒體（A6：消費端自己再問一次）；
-    /// 別的上傳的 manifest 也不收（事件會帶錯的金鑰）。
+    /// 別的帳號的上傳一律不碰：塊會進到別人的上傳裡（A6：消費端自己再問一次）；別台 server 的 manifest 不送（附件宣告會指著別台的媒體）。
     #[tokio::test]
-    async fn an_upload_of_another_account_or_a_foreign_manifest_is_refused() {
+    async fn an_upload_of_another_account_or_a_manifest_of_another_server_is_refused() {
         let dir = scratch("attach-owner");
         let (core, account) = core_with_wbf_account(&dir).await;
         let (misc, upload) = misc_and_upload(&core, &account, false).await;
         let target = Target::default();
         let original = body(40);
 
-        let (mine, _) =
+        let (_, mut manifest) =
             uploaded(&core, &new_upload(Some(ROOM), Some(40)), &original, &target).await;
-        let (other, other_manifest) =
-            uploaded(&core, &new_upload(Some(ROOM), Some(40)), &original, &target).await;
+        manifest.server = "http://elsewhere:6167".into();
         let refused = core
-            .send_attachment(
-                ROOM,
-                &mine,
-                &other_manifest,
-                None,
-                &SendOptions::default(),
-                &target,
-            )
+            .send_attachment(ROOM, &manifest, None, &SendOptions::default(), &target)
             .await
             .unwrap_err();
         assert!(
-            refused.message.contains("the manifest is for"),
+            refused.message.contains("but this account is on"),
             "{refused:?}"
         );
 
@@ -841,24 +832,29 @@ mod tests {
             refused.message.contains("belongs to another account"),
             "{refused:?}"
         );
-        assert!(upload.uploads.lock().unwrap()[&3].chunks.is_empty());
-        let mut not_mine = other.clone();
-        not_mine.user_id = "@b:localhost".into();
+        assert!(upload.uploads.lock().unwrap()[&2].chunks.is_empty());
+        assert!(misc.sent_events.lock().unwrap().is_empty());
+    }
+
+    /// 串流不能續傳：server 已經收過塊的串流再 PUT，新 body 對不上舊的塊，拒絕（要重新 `create_upload`）。
+    #[tokio::test]
+    async fn a_streamed_upload_is_not_put_twice() {
+        let dir = scratch("attach-stream-twice");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (_misc, upload) = misc_and_upload(&core, &account, false).await;
+        let target = Target::default();
+
+        let (state, _) = uploaded(&core, &new_upload(None, None), &body(40), &target).await;
         let refused = core
-            .send_attachment(
-                ROOM,
-                &not_mine,
-                &other_manifest,
-                None,
-                &SendOptions::default(),
-                &target,
-            )
+            .receive_upload(&state, &mut &body(40)[..], &target)
             .await
             .unwrap_err();
-        assert!(
-            refused.message.contains("belongs to another account"),
-            "{refused:?}"
+        assert_eq!(refused.kind, CoreErrorKind::Usage);
+        assert!(refused.message.contains("cannot resume"), "{refused:?}");
+        assert_eq!(
+            upload.uploads.lock().unwrap()[&1].chunks.len(),
+            3,
+            "🚫 沒有多送"
         );
-        assert!(misc.sent_events.lock().unwrap().is_empty());
     }
 }

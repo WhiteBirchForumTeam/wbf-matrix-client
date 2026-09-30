@@ -97,7 +97,7 @@
 - 重拿也失敗：`data` 只有 `{ txn_id, current_room_version }`，`msg` 說明，UI 自己叫 `room.refresh_devices`。
 - 🚫 **daemon 不自動重送**：使用者可能已經撤回或改了，重送的政策在 UI。
 
-加密房的**檔案**走資料平面：UI 先 `media.create` ＋ `PUT` 傳完，再 `room.send_attachment` 帶 `mxc` 與同一份 `room_devices`，1506 的處理跟文字一樣（/docs/design/rpc-specs/data-plane.md §5）。路徑版的 `room.send_file` 在加密房仍拒（§8）。
+加密房的**檔案**走資料平面：UI 先 `media.create` ＋ `PUT` 傳完，再 `room.send_attachment` 帶 PUT 回的 manifest 與同一份 `room_devices`，1506 的處理跟文字一樣（/docs/design/rpc-specs/data-plane.md §5）。路徑版的 `room.send_file` 在加密房仍拒（§8）。
 
 ## 4. `devices.changed` 推播
 

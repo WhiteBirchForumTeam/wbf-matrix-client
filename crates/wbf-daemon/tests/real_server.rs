@@ -19,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 use wbf_daemon::connection::EncryptionPolicy;
-use wbf_daemon::data_plane::DataServer;
+use wbf_daemon::data_plane::{AccessKeys, DataServer};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
 use wbf_daemon::server::RpcServer;
@@ -42,6 +42,7 @@ struct Daemon {
 async fn start_daemon(data_dir: &std::path::Path) -> Daemon {
     let policy = EncryptionPolicy::enforced();
     let handle = Handle::new(data_dir, policy.clone(), Settings::default());
+    handle.set_access_keys(AccessKeys::from_token(&TOKEN));
     let rpc = RpcServer::bind(
         0,
         Arc::new(RpcKeys::from_token(&TOKEN)),
@@ -485,10 +486,9 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
 ///
 /// | 步驟 | 驗什麼 |
 /// |---|---|
-/// | PUT 之前就送附件 | 1100：server 只認 `Seal` 過的媒體（宣告一個還在傳的 mxc 會被整則拒） |
-/// | 明文房：建檔 → PUT → 送附件 | 區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
+/// | 明文房：建檔 → PUT → 送附件（帶 manifest） | URL 是 `e_` 加密的、看不出 mxc；區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
 /// | 加密房：建檔 → PUT → 送附件（帶 `room_devices`） | 區塊有金鑰；送出去的是密文、附件在同一個請求宣告 |
-/// | 傳完再 PUT 一次 | 同一份 manifest（冪等），🚫 不重傳 |
+/// | 同一個 URL 傳完再 PUT 一次 | 🚫 不是 200：server 已經收掉這個上傳 |
 /// | `media.save_to` 那份 manifest | 從 server 拉回來、解開，跟 PUT 的 bytes 一樣 |
 /// | `room.files`（`both`） | 加密房那則解得開、認得出是檔案、mxc 對得上 |
 /// | 加密房串流（沒給大小） | 傳完拿到真的大小，送得出去 |
@@ -536,10 +536,12 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
         .await;
     assert_eq!(created["code"], 0, "media.create: {created}");
     let mxc = created["result"]["mxc"].clone();
-    let early = client
-        .call("room.send_attachment", json!({ "room": room, "mxc": mxc }))
-        .await;
-    assert_eq!(early["code"], 1100, "PUT 完成之前不能送：{early}");
+    let url = created["result"]["url"].as_str().unwrap().to_string();
+    assert!(url.contains("/upload/mxc/e_"), "{url}");
+    assert!(
+        !url.contains(mxc.as_str().unwrap().trim_start_matches("mxc://")),
+        "加密的 URL 看不出是哪個檔：{url}"
+    );
     let (status, manifest) = put(daemon.data_port, &created["result"]["url"], &body).await;
     assert_eq!(status, 200, "{manifest}");
     assert_eq!(manifest["mxc"], mxc);
@@ -547,7 +549,7 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     let sent = client
         .call(
             "room.send_attachment",
-            json!({ "room": room, "mxc": manifest["mxc"], "caption": "plain e2e" }),
+            json!({ "room": room, "manifest": manifest, "caption": "plain e2e" }),
         )
         .await;
     assert_eq!(sent["code"], 0, "傳完就送得出去：{sent}");
@@ -572,11 +574,14 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     assert_ne!(manifest["block"]["cipher"], "none", "加密房的附件要加密");
     assert!(manifest["block"]["key"].is_string());
     let (status, again) = put(daemon.data_port, &url, &body).await;
-    assert_eq!((status, &again), (200, &manifest), "傳完的再 PUT 回同一份");
+    assert_eq!(
+        status, 502,
+        "傳完的再 PUT 一次，server 那邊已經沒有這個上傳：{again}"
+    );
     let sent = client
         .call(
             "room.send_attachment",
-            json!({ "room": encrypted_room, "mxc": manifest["mxc"], "room_devices": refreshed["result"] }),
+            json!({ "room": encrypted_room, "manifest": manifest, "room_devices": refreshed["result"] }),
         )
         .await;
     assert_eq!(sent["code"], 0, "加密房的附件：{sent}");
@@ -630,7 +635,7 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     let sent = client
         .call(
             "room.send_attachment",
-            json!({ "room": encrypted_room, "mxc": manifest["mxc"], "room_devices": refreshed["result"] }),
+            json!({ "room": encrypted_room, "manifest": manifest, "room_devices": refreshed["result"] }),
         )
         .await;
     assert_eq!(sent["code"], 0, "串流傳完就送得出去：{sent}");

@@ -298,7 +298,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | `room.send_text` | `{ room, body, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（/docs/design/keys/e2ee-rpc.md §3） | `{ event_id }` | `send_text`。加密房：先分金鑰、加密、帶 `room_version` 送；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3），🚫 不自動重送 |
 | `room.refresh_devices` | `{ room, previous?, user?, server? }`。`previous` 是 UI 手上的上一份（`{ room_version, members }`）：帶了只重查裝置版本號變了的人 | `{ room_version, members: { mxid: "序號-雜湊" }, shared }`——**UI 存下來**，送出時整份當 `room_devices` 帶回來；`shared` 是這輪補發了幾個 to-device | `refresh_room_devices`：拿成員清單與版本號 → 只重查變了的人 → 雜湊對不上重查一次、還不對就拒（fail closed）→ 把房間金鑰補給還沒有的裝置（/docs/design/keys/e2ee-rpc.md §2）。wbf 帳號才有；一般 Matrix 1100 |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（/docs/design/rpc-specs/wbf-cli-spec.md §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
-| `room.send_attachment` | `{ room, mxc, caption?, room_devices?, txn_id?, user?, server? }`。**資料平面版**的最後一步：UI 打 HTTP 傳完（`PUT` 回 manifest）之後，帶 manifest 的 `mxc` 叫（/docs/design/rpc-specs/data-plane.md §5）。加密房同 `room.send_text` 要 `room_devices` | `{ event_id, mxc, attachment_declared }` | `send_attachment`：daemon 照帳號與 `mxc` 找自己封存的上傳（區塊含金鑰，🚫 不從前端收回來）；還沒傳完或找不到回 1100；加密房被擋回 1401 |
+| `room.send_attachment` | `{ room, manifest, caption?, room_devices?, txn_id?, user?, server? }`。**資料平面版**的最後一步：UI 打 HTTP 傳完（`PUT` 回 manifest）之後，把那份 manifest 原樣帶回來（/docs/design/rpc-specs/data-plane.md §5）。加密房同 `room.send_text` 要 `room_devices` | `{ event_id, mxc, attachment_declared }` | `send_attachment`：核對 manifest 是這個帳號那台 server 的、區塊跟房間對得上；加密房被擋回 1401 |
 | `room.history` | `{ room, limit?: 50, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「往回翻：`before` 與 `next`」 |
 | `room.files` | `{ room, limit?: 50, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
 | `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（read-receipts） |
@@ -356,8 +356,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | method | params | result | core |
 |---|---|---|---|
 | `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 答得出 `file_size`／`chunk_size`／`content_type`，加上上游答不出來的 `cached: { complete, chunks_written, bytes_on_disk }`。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
-| `media.open` | `{ manifest, user?, server? }` 或 `{ event_id, room, user?, server? }`（daemon 從快取找 manifest） | `{ url, mimetype?, size, expires_in }`。`url` 是資料平面的 capability URL（/docs/design/rpc-specs/data-plane.md §8） | ⚠️ core 缺「給一個 reader」的形狀：現在 `download_to` 直接寫檔、`seek_read` 一次回整段 bytes。daemon 要的是 `PoolReader`（/docs/design/media/media-pool.md §6）接到 HTTP Range 上 |
-| `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, user?, server? }` | `{ upload_id, mxc, url, expires_in }`。`url` 是資料平面的 PUT URL（/docs/design/rpc-specs/data-plane.md §4） | `create_upload`：有 `room` 就照房間決定加不加密；daemon 沒開資料平面回 100 |
+| `media.open` | `{ manifest, user?, server? }` 或 `{ event_id, room, user?, server? }`（daemon 從快取找 manifest） | `{ url, mimetype?, size }`。`url` 是資料平面的 URL（/docs/design/rpc-specs/data-plane.md §8） | ⚠️ core 缺「給一個 reader」的形狀：現在 `download_to` 直接寫檔、`seek_read` 一次回整段 bytes。daemon 要的是 `PoolReader`（/docs/design/media/media-pool.md §6）接到 HTTP Range 上 |
+| `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, user?, server? }` | `{ upload_id, mxc, url }`。`url` 是資料平面的 PUT URL（access key 帶著整個上傳狀態、用共享 token 加密）（/docs/design/rpc-specs/data-plane.md §4） | `create_upload`：有 `room` 就照房間決定加不加密；daemon 沒開資料平面回 100 |
 | `media.save_to` | `{ manifest, out: path, no_cache?: bool, transport?, user?, server? }` | `DownloadResult` 或（`no_cache`）`DirectDownloadResult` | `download_to`／`download_direct`。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
 | `media.stats` | `{ user?, server? }` | `MediaStats` | `media_stats` |
 | `media.gc` | `{ quota_mib?: 2048, protect_days?: 7, user?, server? }` | `MediaGcReport` | `collect_media_garbage` |
@@ -482,7 +482,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）
 
-權威是 /docs/design/rpc-specs/data-plane.md：路徑、capability token、狀態碼、上傳的兩步、續傳、附件宣告、一般 Matrix 的傳統上傳、`GET /media` 的 Range。
+權威是 /docs/design/rpc-specs/data-plane.md：路徑、用共享 token 加密的 URL、狀態碼、上傳的兩步、續傳、附件宣告、一般 Matrix 的傳統上傳、`GET /media` 的 Range。
 🚨 **媒體本身的 bytes 只走那裡**（維護者 2026-09-30 再確認）：上傳是 UI HTTP `PUT` 給 daemon、下載是 `GET`；
 RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachment` 送事件），🚫 不傳 bytes，進度也不走 RPC（§4）。
 
@@ -490,19 +490,19 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 
 ```jsonc
 → { "method": "media.create", "params": { "room": "!r:localhost", "name": "v.mkv", "size": 2147483648, "mimetype": "video/x-matroska" }, "id": 12 }
-← { "code": 0, "msg": "ok", "id": 12, "result": { "upload_id": 77, "mxc": "mxc://localhost/000000000000004d", "url": "http://127.0.0.1:51235/upload/7c1b…", "expires_in": 3600 } }
+← { "code": 0, "msg": "ok", "id": 12, "result": { "upload_id": 77, "mxc": "mxc://localhost/000000000000004d", "url": "http://127.0.0.1:51235/upload/mxc/e_3mJr7AoUXx2Wqd…" } }
 
-   PUT http://127.0.0.1:51235/upload/7c1b…   ← bytes 開始流；進度看這個 PUT 自己送出去多少
+   PUT http://127.0.0.1:51235/upload/mxc/e_3mJr7AoUXx2Wqd…   ← bytes 開始流；進度看這個 PUT 自己送出去多少
    …
    200，body 是 manifest（mxc、含金鑰的區塊）→ 傳完
 
-→ { "method": "room.send_attachment", "params": { "room": "!r:localhost", "mxc": "mxc://localhost/000000000000004d", "caption": "看這個",
+→ { "method": "room.send_attachment", "params": { "room": "!r:localhost", "manifest": { … PUT 回的那份 … }, "caption": "看這個",
     "room_devices": { … room.refresh_devices 回的那份 … } }, "id": 13 }
 ← { "code": 0, "msg": "ok", "id": 13, "result": { "event_id": "$e1", "mxc": "mxc://localhost/000000000000004d", "attachment_declared": true } }
 ```
 
 兩步都由 UI 發動，順序固定（server 只認傳完的媒體，/docs/design/rpc-specs/data-plane.md §0）。PUT 失敗就沒有訊息；
-`room.send_attachment` 被 1401 擋，帶新的 `room_devices`、同一個 `mxc` 重送，檔案🚫 不必重傳。
+`room.send_attachment` 被 1401 擋，帶新的 `room_devices`、同一份 manifest 重送，檔案🚫 不必重傳。
 
 ## 8. 跟 core 的差距
 

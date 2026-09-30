@@ -20,6 +20,8 @@ blake3 = "1"
 getrandom = "0.2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# 資料平面 URL 裡的 access key（/docs/design/rpc-specs/data-plane.md §2）；跟 wbf-sdk 目錄名的 Base58 同一份。
+bs58 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
 tokio-tungstenite = "0.29"

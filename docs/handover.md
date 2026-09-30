@@ -114,7 +114,7 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
   token.rs               token 檔的三遍覆蓋抹除（隨機 → 0xFF → 0x00 → 刪）與權限檢查；⚠️ daemon 預設不動 token，誰起的誰動
   main.rs                `-s` 常駐（先拿寫權、讀 token 與 conf、寫 daemon.json）。沒有 `-s` ＝單發，⚠️ **還沒實作**（會報錯講清楚）；
                          兩個都帶也報錯。控制平面與資料平面一起開、一起停
-  data_plane.rs          資料平面：capability 表（token → 上傳、TTL、PUT 進行中）與 hyper 的 HTTP listener（`PUT /upload/<token>`）
+  data_plane.rs          資料平面：access key（共享 token 加密的上傳狀態，URL 裡 `e_`／`c_` 那段）與 hyper 的 HTTP listener（`PUT /upload/mxc/…`、Host 檢查）
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
   tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、
                          token 檔 daemon 不動、shutdown 之後程序結束並收走 daemon.json

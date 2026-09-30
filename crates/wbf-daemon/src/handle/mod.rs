@@ -12,7 +12,7 @@
 //! | `media` | `upload.*`、`media.create`／`info`／`save_to`、`server.ping` |
 //! | `backup` | `backup.*` |
 //!
-//! 推播與 `subscribe` 在 `push.rs`／`server.rs`；資料平面的 HTTP 在 `data_plane.rs`，這裡只替它鑄 token（`media.create`）、查上傳（`room.send_attachment`）。
+//! 推播與 `subscribe` 在 `push.rs`／`server.rs`；資料平面的 HTTP 在 `data_plane.rs`，這裡只在 `media.create` 把上傳狀態封進它的 URL；`room.send_attachment` 收 UI 帶回來的 manifest。
 //! 還沒有：`cancel`、`media.open`（/docs/design/rpc-specs/rpc-spec.md §10）。
 
 mod accounts;
@@ -35,7 +35,7 @@ use wbf_core::{Core, CoreError, CoreErrorKind, Target};
 use wbf_sdk::Transport;
 
 use crate::connection::{params_or_empty_object, EncryptionPolicy};
-use crate::data_plane::Capabilities;
+use crate::data_plane::AccessKeys;
 use crate::lock::WriteAccess;
 use crate::message::{code, Request, Response};
 use crate::settings::Settings;
@@ -133,8 +133,8 @@ pub struct Handle {
     connections: AtomicUsize,
     /// 「我有沒有寫這個資料目錄的能力」（維護者 2026-09-13）。🚨 預設**沒有**。
     write_access: WriteAccess,
-    /// 資料平面的 capability（/docs/design/rpc-specs/data-plane.md §2）：`media.create` 鑄、HTTP 那邊收、`room.send_attachment` 查。只在記憶體。
-    capabilities: Capabilities,
+    /// 封／開資料平面 URL 的那把（從共享 token 導出，/docs/design/rpc-specs/data-plane.md §2）。`-s` 起來時設一次；沒設（單發命令）就沒有資料平面。
+    access_keys: std::sync::OnceLock<AccessKeys>,
     /// 這個 daemon 實例的身分（維護者 2026-09-13）：起來時鑄一次，活著的期間**不變**。
     /// 生產環境一個程序就是一個 `Handle`（`main.rs` 只建一個），所以它也就是那個程序的身分。
     instance: String,
@@ -154,7 +154,7 @@ impl Handle {
             ports: RwLock::new(None),
             connections: AtomicUsize::new(0),
             write_access: WriteAccess::none(),
-            capabilities: Capabilities::default(),
+            access_keys: std::sync::OnceLock::new(),
             instance: new_instance_id(),
         })
     }
@@ -192,8 +192,21 @@ impl Handle {
             .filter(|port| *port != 0)
     }
 
-    pub fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
+    /// 設資料平面的鑰（`main.rs` 讀完 token 之後）。只設得了一次：第二次被忽略，🚫 不換鑰（發出去的 URL 會全部失效）。
+    pub fn set_access_keys(&self, keys: AccessKeys) {
+        let _ = self.access_keys.set(keys);
+    }
+
+    /// Return:
+    ///     Some(&AccessKeys)   `-s` 起來、有資料平面
+    ///     None                單發命令、或還沒設
+    pub fn access_keys(&self) -> Option<&AccessKeys> {
+        self.access_keys.get()
+    }
+
+    /// RPC 現在是不是加密模式（`daemon.set_encryption`）。資料平面照它決定發 `e_` 還是 `c_` 的 URL、收不收 `c_`。
+    pub fn is_encryption_enforced(&self) -> bool {
+        self.policy.is_enforced()
     }
 
     /// `daemon.shutdown` 之後變 `true`。server 用它停止 accept 並送 `SHUTTING_DOWN`。
@@ -774,6 +787,7 @@ mod tests {
         handle.core().await.create_vault(None).unwrap();
         // `media.create` 要有資料平面才去 core（沒有的另一條測試驗）。
         handle.set_ports(1, 2).await;
+        handle.set_access_keys(crate::data_plane::AccessKeys::from_token(&[7u8; 256]));
         let manifest = json!({ "server": "http://127.0.0.1:9", "mxc": "mxc://x/y", "block": {
             "v": 1, "cipher": "none", "chunk_size": 65536, "size": 1, "name": "a" } });
         let cases = [
@@ -789,7 +803,7 @@ mod tests {
             ("room.refresh_devices", json!({ "room": "!r:localhost" })),
             (
                 "room.send_attachment",
-                json!({ "room": "!r:localhost", "mxc": "mxc://localhost/0000000000000007" }),
+                json!({ "room": "!r:localhost", "manifest": manifest.clone() }),
             ),
             (
                 "media.create",
@@ -863,7 +877,7 @@ mod tests {
             ("media.create", json!({ "size": 10 })),
             (
                 "room.send_attachment",
-                json!({ "room": "!r:localhost", "mxc": 7 }),
+                json!({ "room": "!r:localhost", "manifest": { "mxc": 7 } }),
             ),
             ("media.save_to", json!({ "manifest": {}, "out": "x" })),
             ("vault.unlock", json!({ "passphrase_base64": "!!" })),

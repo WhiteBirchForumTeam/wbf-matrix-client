@@ -5,7 +5,7 @@
 //! （/docs/design/rpc-specs/local-interface.md §8 記了這是初稿的錯）。
 //!
 //! 這一層現在只提供「**使用者明說要把明文放到自己選的位置**」那條路（[`Core::download_to`]）。
-//! 📎 daemon 落地時，播放與顯示會走資料平面的 capability URL（/docs/design/rpc-specs/local-interface.md §8），🚫 不是這裡。
+//! 📎 daemon 落地時，播放與顯示會走資料平面的 URL（/docs/design/rpc-specs/local-interface.md §8），🚫 不是這裡。
 
 use std::io::Write;
 use std::path::Path;
