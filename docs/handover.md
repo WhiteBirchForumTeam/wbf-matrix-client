@@ -4,7 +4,7 @@
 
 ## 1. 現況一句話
 
-📍 **最新（2026-09-30）**：PR #1–#61 全部合併（#43 擱置等 wbfuwunel #64）；**#62（E2EE 的 RPC 面，`design/e2ee-rpc.md`）審查中**——rumia、salvia 在最新 commit 批准，cirno 擋的文件 16 處已改、等他重審；2026-09-30 對本機真 server 跑過整條。下面依時間講每一段做了什麼；最新兩段在本節最後（「五條線」「E2EE 的 RPC 面」）。
+📍 **最新（2026-09-30）**：PR #1–#61 全部合併（#43 擱置等 wbfuwunel #64）；**#62（E2EE 的 RPC 面，`design/e2ee-rpc.md`）審查中**——rumia、salvia 在 `861f6e3` 批准，cirno 兩輪擋的文件殘句（16 處＋7 處）都改了、等他重審；2026-09-30 對本機真 server 跑過整條。下面依時間講每一段做了什麼；最新兩段在本節最後（「五條線」「E2EE 的 RPC 面」）。
 ⏳ 等維護者：RPC 錯誤碼 1401 或 1506、補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（e2ee-rpc.md §8）；`[profile.dev]` 降低除錯資訊的提案。
 
 第 1 步（`wbf-wire` codec）、第 2 步（`wbf-sdk` 密碼層／通道／上傳下載、`apps/wbf-cli`）做完；
@@ -261,9 +261,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
-| **一般 Matrix 帳號送檔案沒宣告附件**（約定 §5.2） | matrix-sdk 的 `Room::send` 不能加 header。✅ wbf 帳號 2026-09-22 起走 `Event/Send`、宣告成立（#56） | 一般 Matrix 帳號：server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號的加密房還送不了（等 E2EE 的 RPC 面） |
-| ~~`RoomCrypto` trait 還沒有~~ | ✅ 引擎是 `crypto_engine::OlmEngine`（#48／#49），沒抽 trait（只有一個實作，抽了是儀式） | CLI 送訊息還走 matrix-sdk；引擎還沒接進 daemon |
-| ~~推播被通道丟在地上~~ | ✅ 第 4 階段 SDK 那半做了（`ws-receive-dispatch.md`）：會話表依 id 交付、`device_subscription` 長活收、`Superseded` 進訂閱當終點、鉤子給 RPC 面 | daemon 那半（推播封裝、`desync`、推來就叫 refresh）還沒接（§7 第 2 項） |
+| **一般 Matrix 帳號送檔案沒宣告附件**（約定 §5.2） | matrix-sdk 的 `Room::send` 不能加 header。✅ wbf 帳號 2026-09-22 起走 `Event/Send`、宣告成立（#56） | 一般 Matrix 帳號：server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號的加密房送檔還拒（等加密附件，e2ee-rpc.md §8；文字 2026-09-29 起加密送） |
+| ~~`RoomCrypto` trait 還沒有~~ | ✅ 引擎是 `crypto_engine::OlmEngine`（#48／#49），沒抽 trait（只有一個實作，抽了是儀式） | 引擎 2026-09-29 起接進 daemon（`key_sync` 的 `crypto_engines` 表共用一個） |
+| ~~推播被通道丟在地上~~ | ✅ 第 4 階段 SDK 那半做了（`ws-receive-dispatch.md`）：會話表依 id 交付、`device_subscription` 長活收、`Superseded` 進訂閱當終點、鉤子給 RPC 面 | daemon 那半接上了：推播封裝在 `push.rs`（含 `devices.changed`）、漏掉的發 `desync`；「推來就叫 refresh」維護者 2026-09-29 拿掉，`DeviceChanged` 只轉給 UI（e2ee-rpc.md §4） |
 | ~~**E2EE 沒有產品路徑**~~ | ✅ #62（`design/e2ee-rpc.md`）：`Misc`／`Rooms` 宣告 `org.wbftw.device_versions`、`room.refresh_devices`、加密送出、收到即解 | — |
 | **E2EE 還缺的**（e2ee-rpc.md §8） | 維護者排 | 加密附件（加密房送檔仍拒）；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
 | 交叉簽章沒 bootstrap | §7 第 3 項 | 分享策略只能 `AllDevices`；server 建議的 `IdentityBased` 現在等於發給零台 |

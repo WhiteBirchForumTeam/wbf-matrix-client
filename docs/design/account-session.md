@@ -52,7 +52,7 @@
 - 順序：登入 → 目錄改成權威拼法 → **建 `m/`** → 封 session。🚨 **rollback 範圍＝拿到 token 之後到 session 封好**：這中間任一步失敗（正規目錄已存在、rename、建 `m/`、封檔）
   都把那個 token 撤掉（best effort 的 HTTP `/logout`）、清這次自己建的 `m/`，再回原錯（PR #56 審查 rumia 🔴）。🚫 不在 server 上留一台本地沒有 session 的裝置；
   一般 Matrix 那條路同一個 rollback（它以前也有這個窗）。
-- `m/` 由 `OlmEngine::open` 建（同一把 `matrix_store_key`）。裝置金鑰的上傳（`send_outgoing_requests`）跟 E2EE 那支一起接；在那之前這台裝置在 server 上沒有裝置金鑰，別人加密不到它——這是刻意的過渡，不是漏。
+- `m/` 由 `OlmEngine::open` 建（同一把 `matrix_store_key`）。登入這一步只建、不上傳；裝置金鑰的上傳（`send_outgoing_requests`）2026-09-29 起在開 `Keys` 線時做（e2ee-rpc.md §5，同 §6 那張表）。
 - 「每個連線打一次登入 token，確保連線真的登入」＝ 池開線的 `hello`：Bearer 升級過了不算，Hello 回來才算。
 
 ## 4. 登出（兩種 backend 同一套順序）
@@ -98,5 +98,5 @@ server #85 把上限放到 8 之後，2026-09-29 拆成兩條，而且由 daemon
   路由（session 指向沒人聽的位址）：`room.list`／`get`／`send_text` 到開線才失敗（`Network`，🚫 不是「log in again」），`backup.status`／`watch`／錨點不在本地的 `history` 是 `Usage`、登出閘門是 `HistoryWouldBeLost`；
   `room_state.rs`：Group／Direct（要 m.direct 且兩人）／Channel（門檻 100）、v12 建房者無限、字串型 power level、沒有 algorithm 的 encryption 不算加密、名字的後備順序；`file_message_content` 的形狀；
   登入的 rollback：迷你 HTTP 回的 `user_id` 跟打的不同、而那個正規目錄已經存在 → 登入回 `Usage`，迷你 HTTP 要收到第二個請求 `POST /logout`（token 撤了），打字算出來的目錄沒有 session 也沒有 `m/`；
-  真 server（daemon `real_server`）：`room.list sync=both` 走橋、`room.send_text` 走 `Event/Send`（前面的加密確認走 `GetStateEvent`）、加密房沒帶 `room_devices` 的 `send_text` 1100（選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁 1100。
+  真 server（daemon `real_server`）：`room.list sync=both` 走橋、`room.send_text` 走 `Event/Send`（前面的加密確認走 `GetStateEvent`）、加密房沒帶 `room_devices` 的 `send_text` 1100（選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁走 wbf（錨點由推播寫進本地；錨點不在本地的拒答改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
   ⚠️ 沒測的：`send_file` 走 `Event/Send`（沒有 daemon 的 e2e）、封 session 失敗那條 rollback（製造不出來：沒有可以讓 `seal_session` 失敗的接縫）、一般 Matrix 那條路的登入（沒有一台不講 wbf 的 server；它的程式沒動）。
