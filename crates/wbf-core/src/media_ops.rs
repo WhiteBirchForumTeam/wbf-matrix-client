@@ -39,6 +39,8 @@ pub struct MediaGcReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
     pub files_removed: u64,
+    /// 該刪但還有把手開著、這一輪跳過的檔數（/docs/design/media/media-pool.md §5）。
+    pub files_in_use: u64,
     /// ⚠️ `true` 表示**清完還是超過配額**：剩下的都在保護期內，沒有東西可以再刪。
     pub still_over_quota: bool,
     pub swept_missing_files: u64,
@@ -119,6 +121,7 @@ impl Core {
             bytes_before: report.bytes_before,
             bytes_after: report.bytes_after,
             files_removed: report.files_removed,
+            files_in_use: report.files_in_use,
             still_over_quota: report.still_over_quota,
             swept_missing_files: swept.reset_rows,
             swept_pending: swept.removed_pending,

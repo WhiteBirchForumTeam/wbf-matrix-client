@@ -209,6 +209,8 @@ pub struct GarbageReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
     pub files_removed: u64,
+    /// 該刪但還有把手開著、這一輪跳過的檔數（/docs/design/media/media-pool.md §5）。
+    pub files_in_use: u64,
     /// 保護期外的候選都刪了還是超過配額（/docs/design/media/media-pool.md §5：不擋、UI 提示手動清理）。
     pub still_over_quota: bool,
 }
@@ -248,6 +250,11 @@ pub fn collect_garbage(
         let Some(pool_file) = entry.pool_file.as_deref() else {
             continue;
         };
+        // 🚫 有把手開著的不刪，列也不動：正在看的東西不能從底下抽掉（Windows 上刪開著的檔還會失敗、整輪清理跟著中止）。
+        if pool.is_open(pool_file)? {
+            report.files_in_use += 1;
+            continue;
+        }
         // 這個池檔只有它一個 mxc 指著才能刪檔；否則只清這一列（空間沒省，但列要對）。
         if cache.media_references(pool_file)? <= 1 {
             pool.remove(pool_file)?;
@@ -315,7 +322,8 @@ pub fn sweep(
     }
     let mut removed_orphan_files = 0;
     for pool_file in pool.list_files()? {
-        if cache.media_references(&pool_file)? == 0 {
+        // 沒人指著但還有把手開著（列剛被 reset、讀的人還沒關）：這一輪先留著，下次再收。
+        if cache.media_references(&pool_file)? == 0 && !pool.is_open(&pool_file)? {
             pool.remove(&pool_file)?;
             removed_orphan_files += 1;
         }

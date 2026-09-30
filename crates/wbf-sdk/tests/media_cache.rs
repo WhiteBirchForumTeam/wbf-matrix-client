@@ -349,6 +349,43 @@ async fn garbage_collection_respects_quota_protection_and_shared_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 🚨 有把手開著的檔不刪、列也不動（/docs/design/media/media-pool.md §5）；把手關了，下一輪照常收。
+#[tokio::test]
+async fn garbage_collection_leaves_a_file_that_is_being_read() {
+    let dir = scratch("gc-open");
+    let (mut cache, pool) = open_cache_and_pool(&dir);
+    let mut server = FakeServer::new();
+    let plain = sample(CHUNK as usize + 3, 40);
+    let manifest = upload(&mut server, "open.bin", &plain).await;
+    let mut client = WbfClient::new(&mut server);
+    let fetched = media::fetch(&mut client, &manifest, &mut cache, &pool, &mut |_, _| {})
+        .await
+        .unwrap();
+    let pool_file = fetched.entry.pool_file.unwrap();
+    let now: i64 = 10_000_000_000_000;
+    set_last_used(&mut cache, &manifest.mxc, now - 30 * 24 * 3600 * 1000);
+
+    let reader = pool.open_read(&pool_file).unwrap();
+    assert!(pool.is_open(&pool_file).unwrap());
+    let report =
+        media::collect_garbage(&mut cache, &pool, 0, Duration::from_secs(7 * 24 * 3600), now)
+            .unwrap();
+    assert_eq!(report.files_removed, 0, "{report:?}");
+    assert_eq!(report.files_in_use, 1, "{report:?}");
+    assert!(cache.find_media(&manifest.mxc).unwrap().unwrap().complete, "列也不動");
+    let swept = media::sweep(&mut cache, &pool, Duration::from_secs(7 * 24 * 3600), now).unwrap();
+    assert_eq!(swept.removed_orphan_files, 0, "{swept:?}");
+
+    drop(reader);
+    assert!(!pool.is_open(&pool_file).unwrap());
+    let report =
+        media::collect_garbage(&mut cache, &pool, 0, Duration::from_secs(7 * 24 * 3600), now)
+            .unwrap();
+    assert_eq!(report.files_removed, 1, "把手關了就照常刪：{report:?}");
+    assert!(pool.open_read(&pool_file).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn set_last_used(cache: &mut Cache, mxc: &str, stamp: i64) {
     // 測試用後門：直接改 last_used_at（正式碼只會 touch 成現在）。
     cache

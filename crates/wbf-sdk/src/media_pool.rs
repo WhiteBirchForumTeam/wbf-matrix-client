@@ -17,6 +17,7 @@
 //!
 //! 🚫 金鑰不進錯誤訊息、不 log。這裡沒有 SQL、沒有網路。
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,19 @@ const TAG_LEN: u64 = 16;
 const AAD_PREFIX: &[u8] = b"wbf-media-pool v1";
 /// 明文段大小。64 KiB：跟最小的 chunk_size 一樣，每段 16 byte 標籤（0.02%），隨機讀一段只解 64 KiB。
 pub const SEGMENT_SIZE: u32 = 65536;
+
+/// 這個程序裡開著的讀把手：完成檔的路徑 → 幾個 `PoolReader` 開著它。
+/// 🚫 清理（`collect_garbage`、`sweep`）不刪還有把手開著的檔（/docs/design/media/media-pool.md §5）。
+/// 記在程序層級、不記在 `MediaPool` 上：池每次用都是新開一個值，把手卻活得比它久。
+/// 只看這個程序就夠：資料目錄綁定 daemon，別的程序不准碰（/docs/design/overview/architecture-v2.md §0.2）。
+static OPEN_READERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> = std::sync::OnceLock::new();
+
+fn open_readers() -> std::sync::MutexGuard<'static, HashMap<PathBuf, usize>> {
+    OPEN_READERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// 一個池：目錄加金鑰。
 pub struct MediaPool {
@@ -212,7 +226,9 @@ impl MediaPool {
         let header = read_header(&mut file)?;
         let cipher_len = file.metadata()?.len();
         let plain_len = plain_len_from_cipher_len(&header, cipher_len)?;
+        *open_readers().entry(path.clone()).or_insert(0) += 1;
         Ok(PoolReader {
+            path,
             cipher: XChaCha20Poly1305::new(self.key.as_bytes().into()),
             header,
             file,
@@ -220,6 +236,19 @@ impl MediaPool {
             position: 0,
             loaded_segment: None,
         })
+    }
+
+    /// 這個程序裡還有沒有 `PoolReader` 開著這個完成檔（清理要跳過它）。
+    ///
+    /// Args:
+    ///     pool_file: 完成檔的 hash, example: "9f86d081884c7d65…"
+    /// Return:
+    ///     Ok(true)    有把手開著
+    ///     Ok(false)   沒有
+    ///     Err(Usage)  名字不是合法的 hash
+    pub fn is_open(&self, pool_file: &str) -> Result<bool, SdkError> {
+        let path = self.path_of(pool_file)?;
+        Ok(open_readers().get(&path).is_some_and(|count| *count > 0))
     }
 
     /// 完成檔在磁碟上的大小（配額算 `bytes_on_disk` 用）。
@@ -395,6 +424,8 @@ impl Write for PoolWriter {
 
 /// 讀的把手：明文位置的 `Read + Seek`，一次解一段、快取那一段。
 pub struct PoolReader {
+    /// 登記在 `OPEN_READERS` 的鍵；drop 時扣回去。
+    path: PathBuf,
     cipher: XChaCha20Poly1305,
     header: Header,
     file: File,
@@ -417,6 +448,18 @@ impl PoolReader {
         match &self.loaded_segment {
             Some((_, plain)) => Ok(plain),
             None => Err(std::io::Error::other("media pool: segment was not loaded")),
+        }
+    }
+}
+
+impl Drop for PoolReader {
+    fn drop(&mut self) {
+        let mut readers = open_readers();
+        if let Some(count) = readers.get_mut(&self.path) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                readers.remove(&self.path);
+            }
         }
     }
 }
