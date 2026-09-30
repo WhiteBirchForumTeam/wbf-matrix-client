@@ -14,7 +14,7 @@ pub const CONVENTION_V: u32 = 1;
 /// `nonce_base` 的長度，byte。
 pub const NONCE_BASE_LEN: usize = 8;
 
-/// 事件區塊，也是描述（`key` 為 None 的那份）。欄位語意見wbf-client-convention-for-chunk.md §4 的表。
+/// 事件區塊，也是描述（`key` 為 None 的那份）。欄位語意見 /docs/design/media/wbf-client-convention-for-chunk.md §4 的表。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkedBlock {
     pub v: u32,

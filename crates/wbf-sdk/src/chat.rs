@@ -170,7 +170,7 @@ pub trait ChatBackend {
     ///     Ok(String)   event_id
     async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError>;
 
-    /// 送wbf-client-convention-for-chunk.md §5 的事件。⚠️ 附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）在這條路帶不出去：matrix-sdk 不能在送訊息的請求加 header；
+    /// 送 /docs/design/media/wbf-client-convention-for-chunk.md §5 的事件。⚠️ 附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）在這條路帶不出去：matrix-sdk 不能在送訊息的請求加 header；
     /// 實作要在回傳前把這件事講清楚（見 `backend/matrix_sdk.rs`）。wbf 帳號不走這個 trait，它走 `Event/Send`、有宣告。
     async fn send_file(
         &self,

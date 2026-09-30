@@ -131,7 +131,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | `abort <upload_id> [--file <path>]` | 送 `Abort`；給 `--file` 就順便刪它旁邊的狀態檔（狀態檔跟著檔案放，只有 id 找不到它） |
 
 - `--cipher` 預設：偵測到硬體 AES 用 `aes-256-gcm`，否則 `chacha20-poly1305`（/docs/design/media/wbf-client-convention-for-chunk.md §3）。`none` 是明文模式；`upload` 沒有房間，要不要警告是 `send` 的事（§3.4），這裡直接照做。
-- `--chunk-size` 沒給就照wbf-client-convention-for-chunk.md §2 的表選；給了就照給的（要在 server 允許的範圍，不然 Create 會被拒）。
+- `--chunk-size` 沒給就照 /docs/design/media/wbf-client-convention-for-chunk.md §2 的表選；給了就照給的（要在 server 允許的範圍，不然 Create 會被拒）。
 - `--sha256`：上傳時順便算整檔明文雜湊寫進描述與 manifest。串流模式一律算（反正要讀過一遍）。
 - **續傳**：`upload` 開始前在檔案旁寫狀態檔（§6）。同一個 `upload <file>` 再跑一次，看到狀態檔就先 `Status`，從 `received` 接著送，用**同一把** key 與 nonce_base（同一個上傳，不是重傳）。Seal 成功後刪狀態檔。
   狀態檔的 server 與 user 跟現在的不一樣 → 拒絕，不會拿 A server 的上傳去打 B server。
@@ -140,8 +140,8 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 | 命令 | 做什麼 |
 |---|---|
-| `info <mxc> [--manifest <m.json>]` | 印 `Info` 的 Ack（server 知道的欄位）。有 manifest 就順便解描述印出來，並做wbf-client-convention-for-chunk.md §3.1 第 2 條的核對 |
-| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照wbf-client-convention-for-chunk.md §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：池裡有完整檔（長度與校驗碼都對）就不連 server（stdout `source: cache`、`sha256_verified: false`、`hash` 是快取記的校驗碼）；沒有就邊下邊進池、可續傳，再從池複製到 `-o`。快取路徑上一塊驗不過仍 exit 3，但**池裡的半成品留著給下次續**（/docs/design/media/media-pool.md §3），`-o` 不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
+| `info <mxc> [--manifest <m.json>]` | 印 `Info` 的 Ack（server 知道的欄位）。有 manifest 就順便解描述印出來，並做 /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條的核對 |
+| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：池裡有完整檔（長度與校驗碼都對）就不連 server（stdout `source: cache`、`sha256_verified: false`、`hash` 是快取記的校驗碼）；沒有就邊下邊進池、可續傳，再從池複製到 `-o`。快取路徑上一塊驗不過仍 exit 3，但**池裡的半成品留著給下次續**（/docs/design/media/media-pool.md §3），`-o` 不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
 | `seek --manifest <m.json> --at <pos> [--len <n>]` | 只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。
@@ -161,7 +161,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | `seek --at 64K --len 64K` | 64K–128K | 第 1 塊 | 剛好一塊，不裁 |
 
 - **不帶 `--len`**：讀含 `pos` 的那一塊，印 `pos` 起到該塊結尾。所以長度**不是**固定一個 `chunk_size`，`pos` 在塊中間就比一塊短。要固定長度就給 `--len`。
-- **`--len` 跨幾塊就讀幾塊**，第一塊裁頭、最後一塊裁尾，中間的整塊照印。每塊都照wbf-client-convention-for-chunk.md §3.1 各自解密驗證，任一塊壞掉就 exit 3，stdout 已經印出去的不收回（呼叫者看 exit code 決定要不要丟掉）。
+- **`--len` 跨幾塊就讀幾塊**，第一塊裁頭、最後一塊裁尾，中間的整塊照印。每塊都照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1 各自解密驗證，任一塊壞掉就 exit 3，stdout 已經印出去的不收回（呼叫者看 exit code 決定要不要丟掉）。
 - **`--len` 超過檔尾**：印到檔尾為止，exit 0，摘要裡 `truncated: true`。這不是錯誤，`tail` 類的用法本來就會這樣要。
 - **`--at` 不小於明文總長**：exit 1（用法錯），什麼都不印。
 - 明文總長從 manifest 的描述來；`Info` 回的塊數與最後一塊長度要跟它對得上（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條），對不上 exit 3。
@@ -366,7 +366,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 ## 5. Manifest：`upload` 印的、`download` 吃的
 
-就是wbf-client-convention-for-chunk.md §5 事件區塊的 JSON，外加 `mxc` 與 `server`：
+就是 /docs/design/media/wbf-client-convention-for-chunk.md §5 事件區塊的 JSON，外加 `mxc` 與 `server`：
 
 ```json
 { "server": "http://localhost:6167", "mxc": "mxc://localhost/1122334455667788",

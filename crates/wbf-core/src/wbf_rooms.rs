@@ -123,7 +123,7 @@ impl Core {
                 CoreErrorKind::Usage,
                 format!(
                     "{room} is encrypted, and wbf accounts cannot send files there yet: this path sends a plaintext \
-                     attachment over Event/Send, and encrypted attachments are not wired (e2ee-rpc.md §8)"
+                     attachment over Event/Send, and encrypted attachments are not wired (/docs/design/keys/e2ee-rpc.md §8)"
                 ),
             ));
         }

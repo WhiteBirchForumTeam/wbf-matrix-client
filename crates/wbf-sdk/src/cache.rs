@@ -1512,7 +1512,7 @@ fn set_current_edit(
 
 /// 剛寫進來（或剛解開）的一則（/docs/design/messages/edits-and-redactions.md §4）。🚫 **不改任何一列的 `content_json`**。
 ///
-/// - msg／edit 的內容是wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
+/// - msg／edit 的內容是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
 /// - 等著這則的 redact、edit（先到的）→ 現在處理
 /// - 自己是 edit／redact → 目標在就處理，不在就等
 fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result<(), SdkError> {
@@ -1677,7 +1677,7 @@ fn apply_redaction(
     }
 }
 
-/// 內容是wbf-client-convention-for-chunk.md §5 的檔：建 `media`（已有就不動）與 `event_media`。
+/// 內容是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔：建 `media`（已有就不動）與 `event_media`。
 fn link_media_of(
     transaction: &Transaction<'_>,
     event: i64,

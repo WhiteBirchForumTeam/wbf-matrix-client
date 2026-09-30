@@ -144,7 +144,7 @@ fn main() -> ExitCode {
         Ok(keys) => Arc::new(keys),
         Err(actual) => {
             eprintln!(
-                "the daemon token at {} is {actual} bytes; it must be exactly {} (local-interface.md §3)",
+                "the daemon token at {} is {actual} bytes; it must be exactly {} (/docs/design/rpc-specs/local-interface.md §3)",
                 token_path.display(),
                 wbf_daemon::pack::TOKEN_LEN
             );

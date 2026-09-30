@@ -192,7 +192,7 @@ pub enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// 整檔下載，全部檢查照wbf-client-convention-for-chunk.md §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（media-pool）
+    /// 整檔下載，全部檢查照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（media-pool）
     Download {
         #[arg(long)]
         manifest: PathBuf,
@@ -224,7 +224,7 @@ pub enum Command {
     },
     /// 列出加入的房間（/docs/design/rpc-specs/wbf-cli-spec.md §3.4）
     Rooms,
-    /// 送文字或檔案進房間；檔案先上傳再送wbf-client-convention-for-chunk.md §5 的事件
+    /// 送文字或檔案進房間；檔案先上傳再送 /docs/design/media/wbf-client-convention-for-chunk.md §5 的事件
     Send(SendArgs),
     /// 等新事件，來一則立刻印一則，JSON Lines（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2）
     Watch(WatchArgs),
@@ -326,7 +326,7 @@ pub struct UploadArgs {
     /// chacha20-poly1305、aes-256-gcm、none；預設依硬體
     #[arg(long)]
     pub cipher: Option<String>,
-    /// 明文塊大小；沒給照wbf-client-convention-for-chunk.md §2 的表
+    /// 明文塊大小；沒給照 /docs/design/media/wbf-client-convention-for-chunk.md §2 的表
     #[arg(long)]
     pub chunk_size: Option<u32>,
     /// 串流的線路：mobile（預設）或 wifi
