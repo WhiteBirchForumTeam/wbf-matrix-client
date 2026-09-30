@@ -19,6 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 use wbf_daemon::connection::EncryptionPolicy;
+use wbf_daemon::data_plane::DataServer;
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
 use wbf_daemon::server::RpcServer;
@@ -33,18 +34,35 @@ const PASSPHRASE_BASE64: &str = "aHVudGVyMg==";
 /// （PR #31 審查 cirno🔴）。
 struct Daemon {
     port: u16,
+    /// 資料平面（/docs/design/rpc-specs/data-plane.md）的 port。
+    data_port: u16,
     task: tokio::task::JoinHandle<()>,
 }
 
 async fn start_daemon(data_dir: &std::path::Path) -> Daemon {
     let policy = EncryptionPolicy::enforced();
     let handle = Handle::new(data_dir, policy.clone(), Settings::default());
-    let rpc = RpcServer::bind(0, Arc::new(RpcKeys::from_token(&TOKEN)), policy, handle)
-        .await
-        .unwrap();
+    let rpc = RpcServer::bind(
+        0,
+        Arc::new(RpcKeys::from_token(&TOKEN)),
+        policy,
+        handle.clone(),
+    )
+    .await
+    .unwrap();
     let port = rpc.local_addr().unwrap().port();
-    let task = tokio::spawn(rpc.run());
-    Daemon { port, task }
+    let data = DataServer::bind(0, handle.clone()).await.unwrap();
+    let data_port = data.local_addr().unwrap().port();
+    handle.set_ports(port, data_port).await;
+    // 跟 `main.rs` 一樣兩個 listener 一起跑、一起停。
+    let task = tokio::spawn(async move {
+        tokio::join!(rpc.run(), data.run());
+    });
+    Daemon {
+        port,
+        data_port,
+        task,
+    }
 }
 
 /// 停掉一個 daemon：走**真的那條路**（`daemon.shutdown`），關掉連線，等 server 收攤，
@@ -460,4 +478,193 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         .await;
     assert_eq!(reply["code"], 0, "account.del: {reply}");
     stop_daemon(daemon, client).await;
+}
+
+/// 資料平面整條（/docs/design/rpc-specs/data-plane.md）：UI 先打 HTTP（`media.create` → `PUT`，拿回 manifest），再用 RPC 發訊息（`room.send_attachment` 帶 mxc）。
+/// 要 `WBF_E2E_ROOM`（明文房）與 `WBF_E2E_ENCRYPTED_ROOM`（加密房），`WBF_E2E_USER` 都在裡面。
+///
+/// | 步驟 | 驗什麼 |
+/// |---|---|
+/// | PUT 之前就送附件 | 1100：server 只認 `Seal` 過的媒體（宣告一個還在傳的 mxc 會被整則拒） |
+/// | 明文房：建檔 → PUT → 送附件 | 區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
+/// | 加密房：建檔 → PUT → 送附件（帶 `room_devices`） | 區塊有金鑰；送出去的是密文、附件在同一個請求宣告 |
+/// | 傳完再 PUT 一次 | 同一份 manifest（冪等），🚫 不重傳 |
+/// | `media.save_to` 那份 manifest | 從 server 拉回來、解開，跟 PUT 的 bytes 一樣 |
+/// | `room.files`（`both`） | 加密房那則解得開、認得出是檔案、mxc 對得上 |
+/// | 加密房串流（沒給大小） | 傳完拿到真的大小，送得出去 |
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_ROOM, WBF_E2E_ENCRYPTED_ROOM"]
+async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let user = std::env::var("WBF_E2E_USER").expect("WBF_E2E_USER");
+    let room = std::env::var("WBF_E2E_ROOM").expect("WBF_E2E_ROOM");
+    let encrypted_room = std::env::var("WBF_E2E_ENCRYPTED_ROOM").expect("WBF_E2E_ENCRYPTED_ROOM");
+    let password_file = std::env::var("WBF_E2E_PASSWORD_FILE").expect("WBF_E2E_PASSWORD_FILE");
+    let password = std::fs::read_to_string(password_file).unwrap();
+    let password = password.strip_suffix('\n').unwrap_or(&password).to_string();
+
+    let dir = tempfile::Builder::new()
+        .prefix("wd")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
+    let reply = client.call("vault.create", json!({})).await;
+    assert_eq!(reply["code"], 0, "vault.create: {reply}");
+    let reply = client
+        .call(
+            "account.add",
+            json!({ "server": server, "user": user, "password": password, "device_name": "wbf-daemon data plane e2e" }),
+        )
+        .await;
+    assert_eq!(reply["code"], 0, "account.add: {reply}");
+    wait_for_links(&mut client, 5).await;
+    let info = client.call("daemon.info", Value::Null).await;
+    assert_eq!(info["result"]["data_port"], daemon.data_port, "{info}");
+
+    // 幾塊大小的 bytes（不是塊大小的整數倍，最後一塊不滿）。
+    let body: Vec<u8> = (0..200_003u32)
+        .map(|position| (position % 251) as u8)
+        .collect();
+
+    // ── 明文房 ──
+    let created = client
+        .call(
+            "media.create",
+            json!({ "room": room, "name": "plain.bin", "size": body.len(), "mimetype": "application/octet-stream" }),
+        )
+        .await;
+    assert_eq!(created["code"], 0, "media.create: {created}");
+    let mxc = created["result"]["mxc"].clone();
+    let early = client
+        .call("room.send_attachment", json!({ "room": room, "mxc": mxc }))
+        .await;
+    assert_eq!(early["code"], 1100, "PUT 完成之前不能送：{early}");
+    let (status, manifest) = put(daemon.data_port, &created["result"]["url"], &body).await;
+    assert_eq!(status, 200, "{manifest}");
+    assert_eq!(manifest["mxc"], mxc);
+    assert_eq!(manifest["block"]["cipher"], "none", "明文房的附件是明文");
+    let sent = client
+        .call(
+            "room.send_attachment",
+            json!({ "room": room, "mxc": manifest["mxc"], "caption": "plain e2e" }),
+        )
+        .await;
+    assert_eq!(sent["code"], 0, "傳完就送得出去：{sent}");
+    assert_eq!(sent["result"]["attachment_declared"], true);
+    assert_eq!(sent["result"]["mxc"], mxc);
+
+    // ── 加密房：固定大小 ──
+    let refreshed = client
+        .call("room.refresh_devices", json!({ "room": encrypted_room }))
+        .await;
+    assert_eq!(refreshed["code"], 0, "room.refresh_devices: {refreshed}");
+    let created = client
+        .call(
+            "media.create",
+            json!({ "room": encrypted_room, "name": "secret.bin", "size": body.len() }),
+        )
+        .await;
+    assert_eq!(created["code"], 0, "media.create: {created}");
+    let url = created["result"]["url"].clone();
+    let (status, manifest) = put(daemon.data_port, &url, &body).await;
+    assert_eq!(status, 200, "{manifest}");
+    assert_ne!(manifest["block"]["cipher"], "none", "加密房的附件要加密");
+    assert!(manifest["block"]["key"].is_string());
+    let (status, again) = put(daemon.data_port, &url, &body).await;
+    assert_eq!((status, &again), (200, &manifest), "傳完的再 PUT 回同一份");
+    let sent = client
+        .call(
+            "room.send_attachment",
+            json!({ "room": encrypted_room, "mxc": manifest["mxc"], "room_devices": refreshed["result"] }),
+        )
+        .await;
+    assert_eq!(sent["code"], 0, "加密房的附件：{sent}");
+    let encrypted_event = sent["result"]["event_id"].as_str().unwrap().to_string();
+
+    // 拉回來解開，跟送出去的一樣。
+    let out = dir.path().join("secret.out");
+    let saved = client
+        .call(
+            "media.save_to",
+            json!({ "manifest": manifest, "out": out.display().to_string() }),
+        )
+        .await;
+    assert_eq!(saved["code"], 0, "media.save_to: {saved}");
+    assert_eq!(std::fs::read(&out).unwrap(), body, "解回來要一模一樣");
+
+    // 加密房那則：解得開、認得出是檔案、指著同一個 mxc。
+    let mut found = Value::Null;
+    for _ in 0..50 {
+        let files = client
+            .call(
+                "room.files",
+                json!({ "room": encrypted_room, "limit": 20, "sync": "both" }),
+            )
+            .await;
+        assert_eq!(files["code"], 0, "room.files: {files}");
+        if let Some(file) = files["result"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["event_id"] == encrypted_event.as_str())
+        {
+            found = file.clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(found["manifest"]["mxc"], manifest["mxc"], "{found}");
+
+    // ── 加密房：串流（沒給大小）──
+    let created = client
+        .call(
+            "media.create",
+            json!({ "room": encrypted_room, "name": "stream.bin" }),
+        )
+        .await;
+    assert_eq!(created["code"], 0, "media.create: {created}");
+    let (status, manifest) = put(daemon.data_port, &created["result"]["url"], &body).await;
+    assert_eq!(status, 200, "{manifest}");
+    assert_eq!(manifest["block"]["file_size"], body.len());
+    let sent = client
+        .call(
+            "room.send_attachment",
+            json!({ "room": encrypted_room, "mxc": manifest["mxc"], "room_devices": refreshed["result"] }),
+        )
+        .await;
+    assert_eq!(sent["code"], 0, "串流傳完就送得出去：{sent}");
+
+    stop_daemon(daemon, client).await;
+}
+
+/// 裸 TCP 送一個 PUT（`Connection: close`，讀到 EOF）。
+///
+/// Return:
+///     (u16, Value)   (狀態碼, JSON body)
+async fn put(port: u16, url: &Value, body: &[u8]) -> (u16, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = url.as_str().unwrap();
+    let path = url
+        .strip_prefix(&format!("http://127.0.0.1:{port}"))
+        .unwrap_or_else(|| panic!("{url} is not on the data port {port}"));
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let head = format!(
+        "PUT {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let head = String::from_utf8_lossy(&response[..split]).to_string();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    let json = serde_json::from_slice(&response[split + 4..]).unwrap_or(Value::Null);
+    (status, json)
 }

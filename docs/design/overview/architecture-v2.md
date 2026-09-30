@@ -288,7 +288,7 @@ crates/wbf-wire     pack 的 codec
 crates/wbf-sdk      協議、chunk 加解密、cache.db、媒體池、vault、matrix backend、crypto 引擎（OlmEngine）
 crates/wbf-core     常駐狀態（多帳號 session、解鎖一次）、連線池、事件分發、命令本體。**沒有 RPC**
 crates/wbf-daemon   core ＋ RPC 服務。library ＋ binary（wbf-matrix-client-daemon）。**自己的命令列**也在這裡（§0.2）
-                    還沒做：資料平面（data_port 現在是 0）、單發命令
+                    資料平面（`data_plane.rs`）：上傳做了，讀（`GET /media`）還沒。還沒做：單發命令
 apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）。
                     還沒做：改成 rpc-cli——只封裝 RPC 訊息、丟到本地 WS（§0.2），那時才改名
 ```
@@ -331,7 +331,7 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
   兩個 daemon 搶同一個資料目錄已經有答案：§0.2 的排他鎖，後來的起不來。
   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。要等 Desktop 的實際使用模式出來再定。
 - **第 5 點：資料平面 token 的 TTL 與撤銷**：TTL 多長（播一部長片要多久？）、`logout` 時要不要立刻讓所有 token 失效
-  （應該要）、同一個資源重複開要不要發新 token。暫定值在 /docs/design/rpc-specs/rpc-spec.md §6.2。
+  （應該要）、同一個資源重複開要不要發新 token。上傳那一半已定（TTL 1 小時、登出即撤，/docs/design/rpc-specs/data-plane.md §2）；讀那一半等 `media.open`。
 - **第 6 點：縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（/docs/design/rpc-specs/local-interface.md §8 的 1 MiB 規則），
   還是發一張涵蓋多個資源的 token？後者違反「一張 token 一個資源」，要想清楚再定。
 - **第 7 點：RPC 還是 uniffi**（這份文件假設 RPC）：

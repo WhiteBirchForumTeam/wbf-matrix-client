@@ -9,10 +9,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use wbf_core::{
-    cipher_for_plaintext_room, Core, HistoryQuery, RoomDevices, SendOptions, SyncMode,
-    UploadRequest,
+    cipher_for_plaintext_room, Core, CoreError, CoreErrorKind, HistoryQuery, RoomDevices,
+    SendOptions, SyncMode, UploadRequest,
 };
 use wbf_sdk::RecentPlan;
+
+use crate::data_plane::MissingUpload;
 
 use super::{
     parse_params, to_result, Handle, Outcome, TargetParams, TransportParam, DAEMON_NAME,
@@ -79,6 +81,70 @@ pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) 
         )
         .await?;
     Ok(json!({ "event_id": event_id }))
+}
+
+/// 資料平面版的送檔最後一步（/docs/design/rpc-specs/data-plane.md §5）：UI 打 HTTP 傳完、拿到 manifest 之後，帶那個 `mxc` 叫這支發訊息。
+/// daemon 照這個帳號找自己封存的那份上傳（區塊含金鑰，🚫 不從前端收回來）。加密房跟 `room.send_text` 一樣要 `room_devices`、被擋回 1401；
+/// 重送用同一個 `mxc` 與 `txn_id`，檔案🚫 不必重傳。
+pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        mxc: String,
+        #[serde(default)]
+        caption: Option<String>,
+        #[serde(default)]
+        room_devices: Option<RoomDevices>,
+        #[serde(default)]
+        txn_id: Option<String>,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let target = handle.target(&params.target);
+    let (server, user_id) = core.server_and_user_of(&target)?;
+    let (upload, manifest) =
+        match handle
+            .capabilities()
+            .find_finished_upload(&params.mxc, &server, &user_id)
+        {
+            Ok(found) => found,
+            Err(MissingUpload::NotFinished) => {
+                return Err(CoreError::new(
+                    CoreErrorKind::Usage,
+                    format!(
+                        "{} has not finished uploading: send the attachment after its PUT returns the manifest                          (the server only takes an attachment it already has)",
+                        params.mxc
+                    ),
+                )
+                .into())
+            }
+            Err(MissingUpload::Unknown) => {
+                return Err(CoreError::new(
+                    CoreErrorKind::Usage,
+                    format!(
+                        "{user_id} has no upload {} in this daemon: it expired, the daemon restarted, or it was never created here                          (call media.create and PUT it again)",
+                        params.mxc
+                    ),
+                )
+                .into())
+            }
+        };
+    let options = SendOptions {
+        room_devices: params.room_devices,
+        txn_id: params.txn_id,
+    };
+    let event_id = core
+        .send_attachment(
+            &params.room,
+            &upload,
+            &manifest,
+            params.caption.as_deref(),
+            &options,
+            &target,
+        )
+        .await?;
+    Ok(json!({ "event_id": event_id, "mxc": manifest.mxc, "attachment_declared": true }))
 }
 
 /// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。

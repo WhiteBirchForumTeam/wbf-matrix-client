@@ -11,7 +11,10 @@ wbf-sdk = { path = "../wbf-sdk", features = ["matrix", "cache"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = "1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "io-util"] }
+# 資料平面上傳邊收邊算整檔 SHA-256（attachment_ops.rs）；跟 wbf-sdk 同一份。
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt"] }

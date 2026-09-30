@@ -239,7 +239,7 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 
 ## 8 大資料走資料平面，不走 RPC
 
-還沒做：daemon 還沒開資料平面（`media.open`／`media.create` 與兩個 HTTP 路徑，/docs/design/rpc-specs/rpc-spec.md §6、§10）。
+怎麼用（路徑、token、狀態碼、上傳的兩步）的權威是 /docs/design/rpc-specs/data-plane.md；這一節只講**為什麼**。還沒做：`media.open` 與 `GET /media`。
 
 ⚠️ 下載一個 2 GB 的檔不可能塞進 JSON，改成 binary frame 串流也會逼**每個前端各自實作一次串流組裝**。
 
@@ -285,13 +285,8 @@ http://127.0.0.1:<data port>/media/<resource token>
 前端把 `url` 直接交給播放器／圖片元件，它自己發 Range。daemon 邊解密邊吐，
 🚫 **不把整個檔案讀進記憶體**。
 
-**上傳**：
-
-```jsonc
-{ "method": "media.create", "params": { "user": "…", "room": "…", "name": "video.mkv" }, "id": 12 }
-{ "code": 0, "msg": "ok", "result": { "upload_id": 77, "mxc": "…", "url": "http://127.0.0.1:51235/upload/7c1b…", "expires_in": 3600 }, "id": 12 }
-// 前端 PUT bytes 進去；daemon 邊收邊加密邊走 chunk 上傳。進度就是 PUT 送出去多少，🚫 不走 RPC（/docs/design/rpc-specs/rpc-spec.md §4）
-```
+**上傳**：UI `media.create` 拿一張 PUT 的 URL、把 bytes PUT 進去，傳完拿到 manifest，再用 RPC 叫 `room.send_attachment` 帶那個 `mxc` 發訊息
+（/docs/design/rpc-specs/data-plane.md §0）。進度就是 PUT 送出去多少，🚫 不走 RPC（/docs/design/rpc-specs/rpc-spec.md §4）。
 
 ⚠️ **Android 沒有別的選擇**：SAF 給的是 `content://` URI，**根本沒有檔案路徑可給**。
 所以 PUT 這條路在 Android 上不是「比較好」，是必要的。
@@ -328,20 +323,19 @@ homeserver  <=>  daemon 的 WS 協議層（wire、五條連線 /docs/design/over
 
 每一層只跟隔壁講話：前端不知道 wire，wire 不知道 RPC。
 
-**上傳一個大檔當附件**（走我們自己的分片協議）會拆成兩三個來回，這是複雜化的地方，寫清楚：
+**上傳一個大檔當附件**（走我們自己的分片協議）是 **UI 發動的兩步**（維護者 2026-09-30 定），細節在 /docs/design/rpc-specs/data-plane.md：
 
 | # | 誰 | 做什麼 |
 |---|---|---|
-| 1 | 前端 → daemon | RPC `media.create`（§8）：檔名、大小、目標房間 |
-| 2 | daemon → server | 去 server **建檔**（`Upload/Create`），拿回檔案的 URL／id |
-| 3 | daemon → 前端 | RPC 回 result：server 的 URL ＋ 資料平面的 PUT URL |
-| 4 | 前端 → daemon | 以那個 `upload_id` 為基礎**發一則附件訊息**（RPC `room.send_attachment`，內容是明文） |
-| 5 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）在這一步帶 |
-| 6 | 前端 → daemon | **同時**開始 PUT bytes 到資料平面的 URL（一個 HTTP 連線，不斷送） |
-| 7 | daemon → server | 邊收邊做 chunk 加密、邊走 `Upload/*` 上傳到 homeserver |
-| 8 | daemon → 前端 | `Seal` 完成之後 PUT 才回 `200`，body 是 manifest（/docs/design/rpc-specs/rpc-spec.md §6.2）。進度就是 PUT 送出去多少，🚫 不走 RPC |
+| 1 | 前端 → daemon | RPC `media.create`：檔名、大小、目標房間（房間決定加不加密） |
+| 2 | daemon → server | 去 server **建檔**（`Upload/Create`），拿回 mxc |
+| 3 | daemon → 前端 | RPC 回 result：資料平面的 PUT URL |
+| 4 | 前端 → daemon | PUT bytes 到那個 URL（一個 HTTP 連線，一直送） |
+| 5 | daemon → server | 邊收邊做 chunk 加密、邊走 `Upload/*` 上傳，最後 `Seal` |
+| 6 | daemon → 前端 | `Seal` 完成之後 PUT 才回 `200`，body 是 manifest（有 mxc）。進度就是 PUT 送出去多少，🚫 不走 RPC |
+| 7 | 前端 → daemon | RPC `room.send_attachment`，帶那個 `mxc`（內容是明文；daemon 用自己封存的區塊組事件） |
+| 8 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（/docs/design/rpc-specs/data-plane.md §6）在這一步帶 |
 
-⚠️ 第 4 與第 6 步**並行**：訊息不必等檔案傳完才發（訊息裡只有 URL 與描述），
-接收端拿到訊息時檔案可能還在傳——這正是分片協議與 `seek` 存在的原因（/docs/design/media/wbf-client-convention-for-chunk.md §7）。
-⚠️ 第 5 步失敗與第 7 步失敗是**兩件事**，各自回錯誤、各自可重試，🚫 不要綁成一個交易。
-
+⚠️ 第 7 步**一定在第 6 步之後**：server 只認 `Seal` 過的媒體，宣告一個還在傳的 mxc 會被整則拒送（2026-09-30 對真 server 驗到）。
+🚫 daemon 不替前端發訊息：傳完之後要不要發、發到哪，是前端的決定。
+⚠️ 上傳失敗與送訊息失敗是**兩件事**，各自回錯誤、各自可重試，🚫 不要綁成一個交易。

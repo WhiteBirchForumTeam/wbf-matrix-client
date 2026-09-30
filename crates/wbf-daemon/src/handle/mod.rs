@@ -9,10 +9,11 @@
 //! | `local` | `daemon.*`、`vault.*`、`account.list`／`switch`、`media.stats`／`gc`、`recovery.*` |
 //! | `accounts` | `account.add`／`whoami`／`del`／`destroy` |
 //! | `rooms` | `room.*`、`sync.recent` |
-//! | `media` | `upload.*`、`media.info`／`save_to`、`server.ping` |
+//! | `media` | `upload.*`、`media.create`／`info`／`save_to`、`server.ping` |
 //! | `backup` | `backup.*` |
 //!
-//! 推播與 `subscribe` 在 `push.rs`／`server.rs`。還沒有：`cancel`、`media.open`／`create`、`room.send_attachment`（/docs/design/rpc-specs/rpc-spec.md §10）。
+//! 推播與 `subscribe` 在 `push.rs`／`server.rs`；資料平面的 HTTP 在 `data_plane.rs`，這裡只替它鑄 token（`media.create`）、查上傳（`room.send_attachment`）。
+//! 還沒有：`cancel`、`media.open`（/docs/design/rpc-specs/rpc-spec.md §10）。
 
 mod accounts;
 mod backup;
@@ -34,6 +35,7 @@ use wbf_core::{Core, CoreError, CoreErrorKind, Target};
 use wbf_sdk::Transport;
 
 use crate::connection::{params_or_empty_object, EncryptionPolicy};
+use crate::data_plane::Capabilities;
 use crate::lock::WriteAccess;
 use crate::message::{code, Request, Response};
 use crate::settings::Settings;
@@ -131,6 +133,8 @@ pub struct Handle {
     connections: AtomicUsize,
     /// 「我有沒有寫這個資料目錄的能力」（維護者 2026-09-13）。🚨 預設**沒有**。
     write_access: WriteAccess,
+    /// 資料平面的 capability（/docs/design/rpc-specs/data-plane.md §2）：`media.create` 鑄、HTTP 那邊收、`room.send_attachment` 查。只在記憶體。
+    capabilities: Capabilities,
     /// 這個 daemon 實例的身分（維護者 2026-09-13）：起來時鑄一次，活著的期間**不變**。
     /// 生產環境一個程序就是一個 `Handle`（`main.rs` 只建一個），所以它也就是那個程序的身分。
     instance: String,
@@ -150,6 +154,7 @@ impl Handle {
             ports: RwLock::new(None),
             connections: AtomicUsize::new(0),
             write_access: WriteAccess::none(),
+            capabilities: Capabilities::default(),
             instance: new_instance_id(),
         })
     }
@@ -167,13 +172,28 @@ impl Handle {
     /// `daemon.shutdown` 的回應已經送出去了嗎？是就真的開始關。server 在送完每一則回應後問一次。
     pub fn begin_shutdown_if_requested(&self) {
         if self.shutdown_requested.load(Ordering::SeqCst) {
-            let _ = self.shutdown.send(true);
+            // `send_replace` 而不是 `send`：`send` 在當下沒有訂閱者時**不存值**，之後才訂閱的 listener
+            // （例如還沒被排程到的資料平面）就永遠看不到「要關了」。
+            self.shutdown.send_replace(true);
         }
     }
 
     /// server 起好 listener 之後回填，`daemon.info` 才報得出來。
     pub async fn set_ports(&self, rpc_port: u16, data_port: u16) {
         *self.ports.write().await = Some((rpc_port, data_port));
+    }
+
+    /// 資料平面的 port；還沒開（單發命令、或還沒回填）是 None。
+    pub async fn data_port(&self) -> Option<u16> {
+        self.ports
+            .read()
+            .await
+            .map(|(_, data)| data)
+            .filter(|port| *port != 0)
+    }
+
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
     }
 
     /// `daemon.shutdown` 之後變 `true`。server 用它停止 accept 並送 `SHUTTING_DOWN`。
@@ -330,12 +350,14 @@ impl Handle {
             "room.send_text" => Box::pin(rooms::room_send_text(self, core, params)),
             "room.refresh_devices" => Box::pin(rooms::room_refresh_devices(self, core, params)),
             "room.send_file" => Box::pin(rooms::room_send_file(self, core, params)),
+            "room.send_attachment" => Box::pin(rooms::room_send_attachment(self, core, params)),
             "room.history" => Box::pin(rooms::room_history(self, core, params)),
             "room.files" => Box::pin(rooms::room_files(self, core, params)),
             "sync.recent" => Box::pin(rooms::sync_recent(self, core, params)),
             "upload.file" => Box::pin(media::upload_file(self, core, params)),
             "upload.status" => Box::pin(media::upload_status(self, core, params)),
             "upload.abort" => Box::pin(media::upload_abort(self, core, params)),
+            "media.create" => Box::pin(media::media_create(self, core, params)),
             "media.info" => Box::pin(media::media_info(self, core, params)),
             "media.save_to" => Box::pin(media::media_save_to(self, core, params)),
             "server.ping" => Box::pin(media::server_ping(self, core, params)),
@@ -750,6 +772,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
         handle.core().await.create_vault(None).unwrap();
+        // `media.create` 要有資料平面才去 core（沒有的另一條測試驗）。
+        handle.set_ports(1, 2).await;
         let manifest = json!({ "server": "http://127.0.0.1:9", "mxc": "mxc://x/y", "block": {
             "v": 1, "cipher": "none", "chunk_size": 65536, "size": 1, "name": "a" } });
         let cases = [
@@ -763,6 +787,14 @@ mod tests {
                 json!({ "room": "!r:localhost", "body": "hi" }),
             ),
             ("room.refresh_devices", json!({ "room": "!r:localhost" })),
+            (
+                "room.send_attachment",
+                json!({ "room": "!r:localhost", "mxc": "mxc://localhost/0000000000000007" }),
+            ),
+            (
+                "media.create",
+                json!({ "room": "!r:localhost", "name": "v.mkv", "size": 10 }),
+            ),
             (
                 "room.send_file",
                 json!({ "room": "!r:localhost", "path": dir.path().join("nope").display().to_string() }),
@@ -828,6 +860,11 @@ mod tests {
             ),
             ("server.ping", json!({ "transport": "carrier-pigeon" })),
             ("upload.status", json!({ "upload_id": "one" })),
+            ("media.create", json!({ "size": 10 })),
+            (
+                "room.send_attachment",
+                json!({ "room": "!r:localhost", "mxc": 7 }),
+            ),
             ("media.save_to", json!({ "manifest": {}, "out": "x" })),
             ("vault.unlock", json!({ "passphrase_base64": "!!" })),
         ];
@@ -843,6 +880,22 @@ mod tests {
         let response = handle.call(request("daemon.nope", Value::Null)).await;
         assert_eq!(response.code, code::UNKNOWN_METHOD);
         assert_eq!(response.result, Value::Null);
+    }
+
+    /// 沒有資料平面（單發命令）就不去 server 建檔：建了也沒有地方收 bytes（/docs/design/rpc-specs/data-plane.md §4）。
+    #[tokio::test]
+    async fn media_create_without_a_data_plane_is_refused_before_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        handle.core().await.create_vault(None).unwrap();
+        let response = handle
+            .call(request(
+                "media.create",
+                json!({ "name": "v.mkv", "size": 10 }),
+            ))
+            .await;
+        assert_eq!(response.code, code::BAD_REQUEST, "{}", response.msg);
+        assert!(response.msg.contains("no data plane"), "{}", response.msg);
     }
 
     #[tokio::test]

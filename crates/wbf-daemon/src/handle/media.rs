@@ -1,18 +1,52 @@
 //! `upload.*`、`media.info`／`save_to`、`server.ping`（/docs/design/rpc-specs/rpc-spec.md §3.5、§3.6、§3.8）。都有 `transport`。
 //!
-//! 還沒有：`media.open`（要 `PoolReader` 接 HTTP Range）、`media.create`（要 core 把建檔與送事件拆開）。
+//! `media.create` 只建檔、鑄 token：bytes 走資料平面的 PUT（`data_plane.rs`，/docs/design/rpc-specs/data-plane.md）。
+//! 還沒有：`media.open`（要 `PoolReader` 接 HTTP Range）。
 
 use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use wbf_core::{Core, SyncMode, UploadRequest};
+use wbf_core::{Core, NewUpload, SyncMode, UploadRequest};
 use wbf_sdk::Manifest;
 
 use super::{
     invalid_params, parse_params, to_result, Fail, Handle, Outcome, TargetParams, TransportParam,
     DAEMON_NAME, DAEMON_VERSION,
 };
+use crate::data_plane::CAPABILITY_TTL;
+use crate::message::code;
+
+/// 資料平面的上傳第一步（/docs/design/rpc-specs/data-plane.md §4）：去 server 建檔、鑄一張 PUT 的 URL。
+/// 發訊息是 UI 在 PUT 回 manifest 之後另外叫的 `room.send_attachment`（帶 `mxc`），🚫 不是這裡的事。
+pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(flatten)]
+        upload: NewUpload,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    // 沒有資料平面（單發命令）就不去 server 建檔：建了也沒有地方收 bytes。
+    let Some(data_port) = handle.data_port().await else {
+        return Err(Fail::Rpc(
+            code::BAD_REQUEST,
+            "this daemon has no data plane (it was not started with -s), so nothing could receive the bytes".into(),
+        ));
+    };
+    let upload = core
+        .create_upload(&params.upload, &handle.target(&params.target))
+        .await?;
+    let (upload_id, mxc) = (upload.upload_id, upload.mxc.clone());
+    let token = handle.capabilities().issue_upload(upload)?;
+    Ok(json!({
+        "upload_id": upload_id,
+        "mxc": mxc,
+        "url": format!("http://127.0.0.1:{data_port}/upload/{token}"),
+        "expires_in": CAPABILITY_TTL.as_secs(),
+    }))
+}
 
 pub(super) async fn upload_file(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]

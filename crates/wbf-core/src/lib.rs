@@ -53,6 +53,7 @@
 mod account_lock;
 mod account_ops;
 mod accounts;
+mod attachment_ops;
 mod backend_choice;
 mod backup_ops;
 pub mod conf;
@@ -90,6 +91,7 @@ use wbf_sdk::Unlock;
 pub use account_ops::{AccountStatus, SwitchResult, WhoAmI};
 pub use accounts::AccountSummary;
 use accounts::{AccountDir, DataDirMap};
+pub use attachment_ops::NewUpload;
 pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};

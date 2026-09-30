@@ -97,7 +97,7 @@
 - 重拿也失敗：`data` 只有 `{ txn_id, current_room_version }`，`msg` 說明，UI 自己叫 `room.refresh_devices`。
 - 🚫 **daemon 不自動重送**：使用者可能已經撤回或改了，重送的政策在 UI。
 
-加密房的**檔案**還送不了（`room.send_file` 在加密房拒絕）：加密附件是另一件事（§8）。
+加密房的**檔案**走資料平面：UI 先 `media.create` ＋ `PUT` 傳完，再 `room.send_attachment` 帶 `mxc` 與同一份 `room_devices`，1506 的處理跟文字一樣（/docs/design/rpc-specs/data-plane.md §5）。路徑版的 `room.send_file` 在加密房仍拒（§8）。
 
 ## 4. `devices.changed` 推播
 
@@ -136,7 +136,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 
 ## 8. 不在這支（已知的缺口）
 
-- **加密附件**：`room.send_file` 在加密房拒絕。
+- **路徑版送檔進加密房**：`room.send_file` 在加密房拒絕（資料平面那條可以，/docs/design/rpc-specs/data-plane.md）。
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
 - **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，/docs/design/keys/e2ee-walkthrough.md §16）。

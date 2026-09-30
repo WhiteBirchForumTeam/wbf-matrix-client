@@ -28,6 +28,7 @@
 //! | `connection` | 一條連線的狀態機；**出去的包該不該加密只在這裡判斷** |
 //! | `handle` | method → core |
 //! | `server` | loopback 的 WS listener |
+//! | `data_plane` | 資料平面：capability 表與 loopback 的 HTTP listener（媒體的 bytes） |
 //! | `settings` | 從 `wbf.conf` 讀進來、要填進 `Target` 的那幾個值 |
 //! | `token` | `daemon.token` 的生命週期：權限、三遍覆蓋之後抹掉 |
 //! | `lock` | 資料目錄的獨佔：OS 層排他鎖，拿不到就不啟動 |
@@ -35,6 +36,7 @@
 //! 🚫 這個 crate 不印任何東西到 stdout／stderr（`main.rs` 例外）。
 
 pub mod connection;
+pub mod data_plane;
 pub mod handle;
 pub mod lock;
 pub mod message;

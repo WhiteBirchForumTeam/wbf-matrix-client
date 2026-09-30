@@ -55,26 +55,46 @@ struct RemoveParams {
 
 pub(super) async fn account_del(handle: &Handle, core: &Core, params: Value) -> Outcome {
     let params: RemoveParams = parse_params(params)?;
-    to_result(
-        core.log_out(
+    let owner = owner_of(handle, core, &params);
+    let removed = core
+        .log_out(
             &params.user,
             params.server.as_deref(),
             params.accept_history_loss,
             handle.settings().server_backup,
         )
-        .await?,
-    )
+        .await?;
+    revoke_data_plane(handle, owner);
+    to_result(removed)
 }
 
 pub(super) async fn account_destroy(handle: &Handle, core: &Core, params: Value) -> Outcome {
     let params: RemoveParams = parse_params(params)?;
-    to_result(
-        core.destroy_account(
+    let owner = owner_of(handle, core, &params);
+    let removed = core
+        .destroy_account(
             &params.user,
             params.server.as_deref(),
             params.accept_history_loss,
             handle.settings().server_backup,
         )
-        .await?,
-    )
+        .await?;
+    revoke_data_plane(handle, owner);
+    to_result(removed)
+}
+
+/// 要移除的帳號是誰（登出**之前**問：之後 session 就沒了）。問不到就是 None——那樣 core 那邊本來就會拒。
+fn owner_of(handle: &Handle, core: &Core, params: &RemoveParams) -> Option<(String, String)> {
+    let target = handle.target(&TargetParams {
+        user: Some(params.user.clone()),
+        server: params.server.clone(),
+    });
+    core.server_and_user_of(&target).ok()
+}
+
+/// 帳號移除了，它在資料平面上的 token 一起作廢（/docs/design/rpc-specs/data-plane.md §2）。
+fn revoke_data_plane(handle: &Handle, owner: Option<(String, String)>) {
+    if let Some((server, user_id)) = owner {
+        handle.capabilities().revoke_account(&server, &user_id);
+    }
 }

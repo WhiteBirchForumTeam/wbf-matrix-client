@@ -138,7 +138,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 ```
 
 - **控制平面** —— JSON 訊息走綁在 `127.0.0.1` 的 WebSocket，用 XChaCha20-Poly1305 加密，金鑰由每次啟動的 token 導出。
-- **資料平面**（*規劃中*）—— 本機 HTTP，支援 `Range`，播放器與檢視器可以直接串流媒體。⚠️ 還沒實作。
+- **資料平面** —— 本機 HTTP，媒體的 bytes 只走這裡：上傳是 `PUT`（邊收邊加密邊傳到 homeserver）；下載支援 `Range`、讓播放器直接串流（*還沒實作*）。規格在 [`docs/design/rpc-specs/data-plane.md`](docs/design/rpc-specs/data-plane.md)。
 - **backend 怎麼選** —— `transport: ws`（預設）＝ wbf 協議；`transport: http` ＝ 標準 Matrix。對一般 homeserver 指定 `ws` 是 no-op，🚫 不是錯誤。
 
 ## 專案結構
