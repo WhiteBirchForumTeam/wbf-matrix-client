@@ -1,4 +1,4 @@
-//! 媒體快取整條路（local-cache-db.md §8.3、§8.5、§8.7）對著記憶體版 server 跑：`media::fetch` 命中／下載／續傳、
+//! 媒體快取整條路（/docs/design/media/media-pool.md §3、§5、§7）對著記憶體版 server 跑：`media::fetch` 命中／下載／續傳、
 //! 配額清理、啟動掃孤兒。要 `--features cache`（SQLCipher）。
 #![cfg(feature = "cache")]
 

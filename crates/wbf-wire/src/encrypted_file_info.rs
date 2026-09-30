@@ -1,4 +1,4 @@
-//! `Create` 的 meta：固定 16 byte 二進位（規格 §3.1）。
+//! `Create` 的 meta：固定 16 byte 二進位（wbfuwunel 的 /docs/design/chunked-upload-spec.md §3.1）。
 
 /// `Create` 的 meta。三個欄位都是**明文**的事實；server 靠它們算塊的位置，不看密文。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +44,7 @@ impl EncryptedFileInfo {
         })
     }
 
-    /// 串流模式（規格 §3.1）：大小未知，最後一塊帶 `IS_LAST` 才結束。
+    /// 串流模式（wbfuwunel 的 /docs/design/chunked-upload-spec.md §3.1）：大小未知，最後一塊帶 `IS_LAST` 才結束。
     ///
     /// Return:
     ///     bool  1 = `file_size` 與 `chunk_count` 都是 0

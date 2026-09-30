@@ -1,27 +1,27 @@
-//! 每塊與描述的加解密、塊的長度規則、seek 的算法、`chunk_size` 的選法（約定 §2、§3、§4、§7）。
+//! 每塊與描述的加解密、塊的長度規則、seek 的算法、`chunk_size` 的選法（/docs/design/media/wbf-client-convention-for-chunk.md §2、§3、§4、§7）。
 //!
 //! 所有檢查 fail closed：長度不對、索引保留、標籤不對，一律 `Err`，不回部分內容。
 
 use crate::chunk_block::{BlockError, ChunkedBlock, NONCE_BASE_LEN};
 use crate::cipher::{Cipher, KEY_LEN, NONCE_LEN, TAG_LEN};
 
-/// 塊密文的 AAD（約定 §3）。
+/// 塊密文的 AAD（/docs/design/media/wbf-client-convention-for-chunk.md §3）。
 pub const CHUNK_AAD: &[u8] = b"wbf-chunk-v1";
-/// 描述密文的 AAD（約定 §4）。
+/// 描述密文的 AAD（/docs/design/media/wbf-client-convention-for-chunk.md §4）。
 pub const DESCRIPTION_AAD: &[u8] = b"wbf-desc-v1";
-/// 塊索引的上限；再上去是描述保留的兩個 nonce（約定 §3）。
+/// 塊索引的上限；再上去是描述保留的兩個 nonce（/docs/design/media/wbf-client-convention-for-chunk.md §3）。
 pub const MAX_CHUNK_INDEX: u32 = 0xFFFF_FFFD;
 /// `Create` 描述用的保留索引。
 pub const CREATE_DESCRIPTION_INDEX: u32 = 0xFFFF_FFFF;
 /// `Seal` 描述用的保留索引。
 pub const SEAL_DESCRIPTION_INDEX: u32 = 0xFFFF_FFFE;
 
-/// 約定 §2 的表：依明文大小選 `chunk_size` 的門檻。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §2 的表：依明文大小選 `chunk_size` 的門檻。
 pub const LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024;
 pub const SMALL_CHUNK_SIZE: u32 = 64 * 1024;
 pub const LARGE_CHUNK_SIZE: u32 = 1024 * 1024;
 
-/// 描述有兩份，各自一個 nonce（約定 §4）。
+/// 描述有兩份，各自一個 nonce（/docs/design/media/wbf-client-convention-for-chunk.md §4）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptionSlot {
     Create,
@@ -39,7 +39,7 @@ impl DescriptionSlot {
     }
 }
 
-/// 串流上傳看的是線路（約定 §2）。
+/// 串流上傳看的是線路（/docs/design/media/wbf-client-convention-for-chunk.md §2）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Link {
     /// 行動網路、或判斷不出來。
@@ -52,9 +52,9 @@ pub enum Link {
 pub enum CryptoError {
     /// 索引 > `MAX_CHUNK_INDEX`。
     IndexReserved(u32),
-    /// `Read` 回來的長度不是預期（約定 §3.1 第 3 條）。
+    /// `Read` 回來的長度不是預期（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 3 條）。
     LengthMismatch { expected: usize, actual: usize },
-    /// AEAD 標籤驗證失敗（約定 §3.1 第 4 條）。
+    /// AEAD 標籤驗證失敗（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 4 條）。
     TagInvalid,
     /// 明文長度超過 `chunk_size`（上傳端塞錯）。
     ChunkTooLong { chunk_size: u32, actual: usize },
@@ -138,7 +138,7 @@ impl FileCipher {
         })
     }
 
-    /// 上傳端：新的一檔，`key` 與 `nonce_base` 由 CSPRNG 產生。同一個檔重傳要再叫一次（約定 §2）。
+    /// 上傳端：新的一檔，`key` 與 `nonce_base` 由 CSPRNG 產生。同一個檔重傳要再叫一次（/docs/design/media/wbf-client-convention-for-chunk.md §2）。
     ///
     /// Args:
     ///     cipher: example: Cipher::default_for_this_machine()
@@ -188,7 +188,7 @@ impl FileCipher {
         FileCipher { chunk_size, mode }
     }
 
-    /// 上傳端：把參數寫成事件區塊（約定 §5），其餘欄位呼叫者填。
+    /// 上傳端：把參數寫成事件區塊（/docs/design/media/wbf-client-convention-for-chunk.md §5），其餘欄位呼叫者填。
     ///
     /// Args:
     ///     file_size: 明文總長（事件在 `Seal` 之後才送，一定知道）
@@ -234,7 +234,7 @@ impl FileCipher {
         }
     }
 
-    /// 約定 §3：`ct_i = AEAD(key, nonce_base ‖ u32_be(i), "wbf-chunk-v1", pt_i)`。明文模式回 `plain` 的複本。
+    /// /docs/design/media/wbf-client-convention-for-chunk.md §3：`ct_i = AEAD(key, nonce_base ‖ u32_be(i), "wbf-chunk-v1", pt_i)`。明文模式回 `plain` 的複本。
     ///
     /// Args:
     ///     index: 塊索引，0 起, example: 0
@@ -255,7 +255,7 @@ impl FileCipher {
         self.seal_with_index(index, CHUNK_AAD, plain)
     }
 
-    /// 約定 §3.1 第 3、4 條：先驗長度，再驗標籤。長度不對就不碰密碼。
+    /// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 3、4 條：先驗長度，再驗標籤。長度不對就不碰密碼。
     ///
     /// Args:
     ///     index: 塊索引, example: 0
@@ -293,7 +293,7 @@ impl FileCipher {
         Ok(plain)
     }
 
-    /// 約定 §4：描述用保留索引的 nonce 與 `"wbf-desc-v1"` 加密。明文模式直接回 JSON。
+    /// /docs/design/media/wbf-client-convention-for-chunk.md §4：描述用保留索引的 nonce 與 `"wbf-desc-v1"` 加密。明文模式直接回 JSON。
     ///
     /// Args:
     ///     slot: `Create` 或 `Seal`
@@ -363,7 +363,7 @@ impl FileCipher {
     }
 }
 
-/// 約定 §3：`nonce_i = nonce_base ‖ u32_be(i)`。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §3：`nonce_i = nonce_base ‖ u32_be(i)`。
 ///
 /// Args:
 ///     nonce_base: 8 byte, example: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -377,7 +377,7 @@ pub fn build_nonce(nonce_base: [u8; NONCE_BASE_LEN], index: u32) -> [u8; NONCE_L
     nonce
 }
 
-/// 約定 §3.1 第 2 條：`chunk_count == ceil(file_size / chunk_size)`。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條：`chunk_count == ceil(file_size / chunk_size)`。
 ///
 /// Args:
 ///     file_size: example: 132056
@@ -396,7 +396,7 @@ pub fn chunk_count(file_size: u64, chunk_size: u32) -> Option<u32> {
     Some(count as u32)
 }
 
-/// 約定 §3.1 第 3 條：非最後一塊 = `chunk_size`；最後一塊 = `file_size − i × chunk_size`。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 3 條：非最後一塊 = `chunk_size`；最後一塊 = `file_size − i × chunk_size`。
 ///
 /// Args:
 ///     file_size: example: 132056
@@ -415,15 +415,15 @@ pub fn expected_plain_len(file_size: u64, chunk_size: u32, index: u32) -> Option
     Some(remaining.min(u64::from(chunk_size)) as usize)
 }
 
-/// 約定 §7：seek 的結果，只要讀 `index` 那一塊，明文從 `offset` 起。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §7：seek 的結果，只要讀 `index` 那一塊，明文從 `offset` 起。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeekTarget {
     pub index: u32,
     pub offset: usize,
 }
 
-/// 約定 §7：`i = pos / chunk_size`，`off = pos − i × chunk_size`。不管 `pos` 有沒有超過檔尾，
-/// 那是呼叫者拿 `file_size` 先擋的事（CLI 規格 §3.3.1：`--at` 不小於總長是用法錯）。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §7：`i = pos / chunk_size`，`off = pos − i × chunk_size`。不管 `pos` 有沒有超過檔尾，
+/// 那是呼叫者拿 `file_size` 先擋的事（/docs/design/rpc-specs/wbf-cli-spec.md §3.3.1：`--at` 不小於總長是用法錯）。
 ///
 /// Args:
 ///     pos: 明文位置, example: 71680
@@ -445,7 +445,7 @@ pub fn locate(pos: u64, chunk_size: u32) -> Option<SeekTarget> {
     })
 }
 
-/// 約定 §2 的表：固定大小上傳依明文大小選。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §2 的表：固定大小上傳依明文大小選。
 ///
 /// Args:
 ///     file_size: example: 1024
@@ -459,7 +459,7 @@ pub fn choose_chunk_size(file_size: u64) -> u32 {
     }
 }
 
-/// 約定 §2 的表：串流上傳依線路選。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §2 的表：串流上傳依線路選。
 ///
 /// Args:
 ///     link: example: Link::MobileOrUnknown

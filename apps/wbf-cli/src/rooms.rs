@@ -1,7 +1,7 @@
-//! 房間命令（CLI 規格 §3.4）：`rooms`、`send`、`watch`、`read`、`files`。
+//! 房間命令（/docs/design/rpc-specs/wbf-cli-spec.md §3.4）：`rooms`、`send`、`watch`、`read`、`files`。
 //!
 //! ⚠️ 這一層**只做三件事**：把旗標翻成 core 的參數、問使用者（確認）、印出來。
-//! 做什麼在 `wbf-core`（architecture-v2 §7）——包括寫穿快取、過濾、翻頁那些。
+//! 做什麼在 `wbf-core`（/docs/design/overview/architecture-v2.md §6）——包括寫穿快取、過濾、翻頁那些。
 
 use std::io::Write;
 use std::path::Path;
@@ -45,8 +45,8 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
         ));
     };
 
-    // 約定 §5.1：沒 E2EE 的房間走明文模式，送之前**警告並要求確認**。
-    // 🚫 這個確認是前端的事，core 不問（architecture-v2 §3）。
+    // /docs/design/media/wbf-client-convention-for-chunk.md §5.1：沒 E2EE 的房間走明文模式，送之前**警告並要求確認**。
+    // 🚫 這個確認是前端的事，core 不問（/docs/design/overview/architecture-v2.md §3）。
     let conversation = core
         .conversation(&args.room, SyncMode::Both, &target)
         .await?;
@@ -82,7 +82,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
             &target,
         )
         .await?;
-    // ⚠️ manifest 含金鑰：給了路徑就用**私有權限**寫（CLI 規格 §5）。
+    // ⚠️ manifest 含金鑰：給了路徑就用**私有權限**寫（/docs/design/rpc-specs/wbf-cli-spec.md §5）。
     if let Some(path) = &args.manifest {
         write_private(path, &result.manifest.to_json()?)?;
     }
@@ -93,7 +93,7 @@ pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), Co
     context.warn_if_backups_are_off();
     let mode = watch_mode_from_name(&args.mode, args.seconds, args.timeout)?;
     let once = args.mode == "once";
-    // ⚠️ `watch` 是串流：訊息從事件來，一則印一行（CLI 規格 §3.4.2 的 JSON Lines）。
+    // ⚠️ `watch` 是串流：訊息從事件來，一則印一行（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2 的 JSON Lines）。
     // 所以要先訂閱再開始，🚫 不能等 `watch()` 回來才印。
     let mut events = context.core()?.subscribe();
     let printer = tokio::spawn(async move {
@@ -172,7 +172,7 @@ pub async fn files_command(
     print_value(&page)
 }
 
-/// CLI 的 `--from-cache` 對到新的三種 `sync`（daemon-runtime §3.1）。
+/// CLI 的 `--from-cache` 對到新的三種 `sync`（/docs/design/daemon/daemon-runtime.md §3.1）。
 ///
 /// Args:
 ///     from_cache: 有沒有帶 `--from-cache`, example: true
@@ -188,7 +188,7 @@ fn sync_of(from_cache: bool) -> SyncMode {
     }
 }
 
-/// manifest 含 key：給了路徑就用私有權限寫檔，否則印到 stdout（CLI 規格 §5）。
+/// manifest 含 key：給了路徑就用私有權限寫檔，否則印到 stdout（/docs/design/rpc-specs/wbf-cli-spec.md §5）。
 pub fn emit_manifest(manifest: &wbf_sdk::Manifest, path: Option<&Path>) -> Result<(), CoreError> {
     match path {
         Some(path) => {
@@ -212,7 +212,7 @@ pub fn confirm(question: &str) -> Result<bool, CoreError> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-/// watch 的 JSON Lines：一事件一行、即時 flush（CLI 規格 §3.4.2）。
+/// watch 的 JSON Lines：一事件一行、即時 flush（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2）。
 fn print_line(message: &Message) {
     let mut stdout = std::io::stdout().lock();
     let _ = serde_json::to_writer(&mut stdout, message);

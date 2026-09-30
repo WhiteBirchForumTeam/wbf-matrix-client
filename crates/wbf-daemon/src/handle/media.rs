@@ -1,4 +1,4 @@
-//! `upload.*`、`media.info`／`save_to`、`server.ping`（rpc-spec §3.5、§3.6、§3.8）。都有 `transport`。
+//! `upload.*`、`media.info`／`save_to`、`server.ping`（/docs/design/rpc-specs/rpc-spec.md §3.5、§3.6、§3.8）。都有 `transport`。
 //!
 //! 還沒有：`media.open`（要 `PoolReader` 接 HTTP Range）、`media.create`（要 core 把建檔與送事件拆開）。
 
@@ -108,7 +108,7 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
         mxc: String,
         #[serde(default)]
         manifest: Option<Value>,
-        /// 沒帶就是 `local`（rpc-spec §2）。⭐ 媒體不可變，本地那份就是同一份事實。
+        /// 沒帶就是 `local`（/docs/design/rpc-specs/rpc-spec.md §2）。⭐ 媒體不可變，本地那份就是同一份事實。
         #[serde(default)]
         sync: SyncMode,
         #[serde(flatten)]
@@ -134,7 +134,7 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
     )
 }
 
-/// 明文落地是**使用者要的**（architecture-v2 §4.8）。`no_cache` 不進池直接寫。
+/// 明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。`no_cache` 不進池直接寫。
 pub(super) async fn media_save_to(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {

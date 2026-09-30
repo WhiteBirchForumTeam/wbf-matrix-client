@@ -1,7 +1,7 @@
-//! 通道（線上規格 §1）：WebSocket 主要、HTTP 給測試與腳本。
+//! 通道（wbfuwunel 的 /docs/design/chunked-upload-spec.md §1）：WebSocket 主要、HTTP 給測試與腳本。
 //!
 //! `PackChannel` 的契約是「送一個、等一個」與「送一個、收到呼叫者說停」（`request_stream`：`Event/Recent` 的回應是一串 `Batch`）。
-//! WebSocket 底下是 `link::WsLink`（ws-receive-dispatch.md）：送與收是兩個 task，回覆依會話表交付，所以推播與回覆交錯、順序亂掉都不出事；
+//! WebSocket 底下是 `link::WsLink`（/docs/design/daemon/ws-receive-dispatch.md）：送與收是兩個 task，回覆依會話表交付，所以推播與回覆交錯、順序亂掉都不出事；
 //! 長活的訂閱走 `subscribe`。HTTP 一請求一回應，不能訂閱。
 
 use std::time::Duration;
@@ -39,7 +39,7 @@ pub trait PackChannel {
         on_pack: &mut (dyn FnMut(Pack) -> Result<bool, SdkError> + Send),
     ) -> Result<(), SdkError>;
 
-    /// 訂閱：長活的會話，之後抄這個 id 的每個 pack（`Ack`、`CryptoState`、`Push`、`Superseded`）都從 handle 來（ws-receive-dispatch.md §3）。
+    /// 訂閱：長活的會話，之後抄這個 id 的每個 pack（`Ack`、`CryptoState`、`Push`、`Superseded`）都從 handle 來（/docs/design/daemon/ws-receive-dispatch.md §3）。
     /// 預設回 `Usage`：只有 WebSocket 通道能收推播。
     ///
     /// Return:
@@ -124,7 +124,7 @@ impl Channel {
 
 impl Channel {
     /// Return:
-    ///     Some(n)   WebSocket：這條連線至今收到幾個沒人等的 pack（ws-receive-dispatch.md §2.1 第 4 條）
+    ///     Some(n)   WebSocket：這條連線至今收到幾個沒人等的 pack（/docs/design/daemon/ws-receive-dispatch.md §2.1 第 4 條）
     ///     None      HTTP：沒有這個數（一請求一回應）
     pub fn unmatched(&self) -> Option<u64> {
         match self {
@@ -186,7 +186,7 @@ impl PackChannel for Channel {
     }
 }
 
-/// `GET /_wbf/v1/ws`：一條 `WsLink`（讀取 task ＋ 送出 task ＋ 會話表，ws-receive-dispatch.md）。
+/// `GET /_wbf/v1/ws`：一條 `WsLink`（讀取 task ＋ 送出 task ＋ 會話表，/docs/design/daemon/ws-receive-dispatch.md）。
 /// `PackChannel` 的兩個方法在它上面是「登記 → 送 → 等」；推播與 `Superseded` 走 `subscribe`。
 pub struct WsChannel {
     link: WsLink,
@@ -197,7 +197,7 @@ impl WsChannel {
         WsChannel::connect_with_hook(server, access_token, crate::sessions::no_hook()).await
     }
 
-    /// 同上，每收一個 pack 叫一次 `hook`（ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。心跳是預設的（24 秒）。
+    /// 同上，每收一個 pack 叫一次 `hook`（/docs/design/daemon/ws-receive-dispatch.md §4：之後 daemon 的 RPC 面用它決定要不要送到 UI；這裡只呼叫）。心跳是預設的（24 秒）。
     pub async fn connect_with_hook(
         server: &str,
         access_token: &str,
@@ -206,7 +206,7 @@ impl WsChannel {
         WsChannel::connect_with_heartbeat(server, access_token, hook, Heartbeat::DEFAULT).await
     }
 
-    /// 同上，心跳的間隔自己給（ws-receive-dispatch.md §5.1；測試對真 server 用短的）。
+    /// 同上，心跳的間隔自己給（/docs/design/daemon/ws-receive-dispatch.md §5.1；測試對真 server 用短的）。
     pub async fn connect_with_heartbeat(
         server: &str,
         access_token: &str,
@@ -216,7 +216,7 @@ impl WsChannel {
         WsChannel::connect_inner(server, Some(access_token), hook, heartbeat).await
     }
 
-    /// **不帶 token** 的連線：只給探活（account-session.md §1）。server 允許未登入的升級，30 秒內只接受 `Hello`／`Ping`，
+    /// **不帶 token** 的連線：只給探活（/docs/design/daemon/account-session.md §1）。server 允許未登入的升級，30 秒內只接受 `Hello`／`Ping`，
     /// 之後自己關；所以拿到 `Hello` 的答案就把它丟掉。🚫 不要拿它做別的事。
     pub async fn connect_anonymous(server: &str) -> Result<WsChannel, SdkError> {
         WsChannel::connect_inner(server, None, crate::sessions::no_hook(), Heartbeat::OFF).await
@@ -366,7 +366,7 @@ impl PackChannel for HttpChannel {
             .bytes()
             .await
             .map_err(|error| SdkError::Network(format!("http pack body: {error}")))?;
-        // 線上規格 §1：HTTP 一律 200，沒 token 401 但 body 仍是 pack。其他狀態碼是 server 之外的東西（proxy）在講話。
+        // wbfuwunel 的 /docs/design/chunked-upload-spec.md §1：HTTP 一律 200，沒 token 401 但 body 仍是 pack。其他狀態碼是 server 之外的東西（proxy）在講話。
         match status.as_u16() {
             200 => Ok(Pack::decode(&body)?),
             // body 是 pack 就照 pack 的 Error 走；不是（proxy 的 401 頁）也要是 Unauthorized，跟 WebSocket 升級被拒同一個分類。

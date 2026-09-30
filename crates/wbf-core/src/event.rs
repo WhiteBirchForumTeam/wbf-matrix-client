@@ -1,11 +1,11 @@
-//! core 往外講話的唯一管道（architecture-v2 §7：**事件用 channel，不用回呼引用**）。
+//! core 往外講話的唯一管道（/docs/design/overview/architecture-v2.md §6：**事件用 channel，不用回呼引用**）。
 //!
 //! 為什麼不是回呼：回呼綁著呼叫端的生命週期，而 core 之後可能被 RPC 包住（呼叫端在
 //! 另一個程序）或被 uniffi 包住（呼叫端在 JVM 裡）。跨那兩條邊界都沒有「借一個 closure
 //! 給你」這種東西，channel 有。
 //!
 //! 🚫 core **不印任何東西**。`eprintln!` 對 rpc-cli 是對的，對 daemon 是把訊息丟進虛空
-//! （沒有人在看那個 stderr），對 Android 更是。誰要顯示、顯示成什麼樣，是前端的事（§3）。
+//! （沒有人在看那個 stderr），對 Android 更是。誰要顯示、顯示成什麼樣，是前端的事（/docs/design/overview/architecture-v2.md §3）。
 
 use tokio::sync::broadcast;
 
@@ -17,7 +17,7 @@ const EVENT_QUEUE: usize = 256;
 /// core 發生的事。
 ///
 /// ⚠️ 每個 variant 的欄位都要是**可序列化的簡單型別**：它們會變成 RPC 的推播訊息
-/// （§4.6 的「沒有 `id` 的請求」）。🚫 不要在這裡放 handle、路徑以外的 `PathBuf`、
+/// （/docs/design/rpc-specs/local-interface.md §6 的「沒有 `id` 的請求」）。🚫 不要在這裡放 handle、路徑以外的 `PathBuf`、
 /// 或任何帶秘密的東西。
 ///
 /// 📎 有 `Serialize`／`Deserialize`：daemon 那層要把它原樣送過 RPC，而**現在**補比
@@ -41,22 +41,22 @@ pub enum CoreEvent {
         /// 給人看的一句話，例如 "chunk 3/10"。
         text: String,
     },
-    /// 收到一則訊息（`watch`、或 daemon 的上游會話，architecture-v2 §6.1）。
+    /// 收到一則訊息（`watch`、或 daemon 的上游會話，/docs/design/overview/architecture-v2.md §5.1）。
     /// 串流的東西走事件，🚫 不等收齊再一次回 ——`watch tail` 永遠不會「收齊」。
     Message {
-        /// **哪個帳號的**。⚠️ 事件是每個帳號一組的（architecture-v2 §6.1），
+        /// **哪個帳號的**。⚠️ 事件是每個帳號一組的（/docs/design/overview/architecture-v2.md §5.1），
         /// 所以每個帳號相關的事件都要說得出是誰的，🚫 不能讓前端猜。
         user: String,
         message: Box<wbf_sdk::chat::Message>,
     },
-    /// 這個帳號跟它的 homeserver 之間的狀態變了（architecture-v2 §6.1）。
+    /// 這個帳號跟它的 homeserver 之間的狀態變了（/docs/design/overview/architecture-v2.md §5.1）。
     SyncState {
         user: String,
         state: SyncState,
         /// 房間事件的水位；不知道就 `None`。
         cg_seq: Option<i64>,
     },
-    /// 這個帳號的某一條線開了或關了（link-pool.md §4）。⚠️ 「關了」不是即時的：死了要到下一次有人用、或 daemon 的看線迴圈下一輪看到才知道（大約一分鐘內，link-pool.md §3.1）。
+    /// 這個帳號的某一條線開了或關了（/docs/design/daemon/link-pool.md §4）。⚠️ 「關了」不是即時的：死了要到下一次有人用、或 daemon 的看線迴圈下一輪看到才知道（大約一分鐘內，/docs/design/daemon/link-pool.md §3.1）。
     Link {
         user: String,
         role: crate::link_pool::LinkRole,
@@ -65,7 +65,7 @@ pub enum CoreEvent {
         reason: Option<String>,
     },
     /// 房間那條線上 server 推來「某個人的裝置變了」（`Event/DeviceChanged`）：原樣轉給 UI，要不要 `room.refresh_devices` 是 UI 的事
-    /// （維護者 2026-09-29：房間版本號存在 UI；e2ee-rpc.md §4）。daemon 自己🚫 不動作。
+    /// （維護者 2026-09-29：房間版本號存在 UI；/docs/design/keys/e2ee-rpc.md §4）。daemon 自己🚫 不動作。
     DeviceChanged {
         /// 收到這則的帳號
         user: String,
@@ -95,12 +95,12 @@ pub enum CoreEvent {
     Received {
         user: String,
         role: crate::link_pool::LinkRole,
-        /// pack 的 kind 號（wire-format §3.1）, example: 0x16
+        /// pack 的 kind 號（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.1）, example: 0x16
         kind: u8,
         subtype: u8,
         id: u64,
         seq: u32,
-        /// 會話表把它交給了誰（ws-receive-dispatch.md §2.1）。
+        /// 會話表把它交給了誰（/docs/design/daemon/ws-receive-dispatch.md §2.1）。
         route: wbf_sdk::Route,
     },
 }
@@ -113,17 +113,17 @@ pub enum LinkState {
     Closed,
 }
 
-/// 金鑰訂閱的狀態（`CoreEvent::Keys`，rpc-spec §4 的 `keys.state`）。
+/// 金鑰訂閱的狀態（`CoreEvent::Keys`，/docs/design/rpc-specs/rpc-spec.md §4 的 `keys.state`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeysState {
     /// 一批 to-device 匯完、銷毀完（上線追平、或推來一包處理完）：crypto store 現在有這些金鑰。
     CaughtUp,
-    /// 這台裝置不再收金鑰：被另一台裝置接手（1505）、或線死了。task 不原地重訂；金鑰那條線跟著關，daemon 的看線迴圈下一輪重開、重訂（to-device-client.md §5.1 的📌、link-pool.md §3.1）。
+    /// 這台裝置不再收金鑰：被另一台裝置接手（1505）、或線死了。task 不原地重訂；金鑰那條線跟著關，daemon 的看線迴圈下一輪重開、重訂（/docs/design/keys/to-device-client.md §5.1 的📌、/docs/design/daemon/link-pool.md §3.1）。
     Stopped,
 }
 
-/// 一個帳號跟它的 homeserver 之間現在是什麼狀態（rpc-spec §4 的 `sync.state`）。
+/// 一個帳號跟它的 homeserver 之間現在是什麼狀態（/docs/design/rpc-specs/rpc-spec.md §4 的 `sync.state`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncState {
@@ -137,11 +137,11 @@ pub enum SyncState {
 
 /// core 內部拿來發事件的那一端。
 ///
-/// 🚫 **crate 內部限定**：`progress` 收 `impl Into<String>`，而 §7 明文說公開介面上
+/// 🚫 **crate 內部限定**：`progress` 收 `impl Into<String>`，而 /docs/design/overview/architecture-v2.md §6 明文說公開介面上
 /// 不要有 `impl Trait`。前端要聽事件走 [`Core::subscribe`]，拿到的是 receiver
 /// ——那個形狀跨得過 RPC 與 uniffi（PR #24 審查 rumia🟡1／salvia🟡1）。
 ///
-/// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（§4.7「允許多條連線，每條都平等」），
+/// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（/docs/design/rpc-specs/local-interface.md §7「允許多條連線，每條都平等」），
 /// 而且**沒有訂閱者時發送是零成本的**——rpc-cli 在 `--quiet` 下就是這種情況。
 #[derive(Clone)]
 pub(crate) struct EventSink {

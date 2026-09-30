@@ -12,7 +12,7 @@
         clippy::string_slice
     )
 )]
-//! wbf-daemon：client 本體的 RPC 那一面（architecture-v2 §2、rpc-spec）。
+//! wbf-daemon：client 本體的 RPC 那一面（/docs/design/overview/architecture-v2.md §2、rpc-spec）。
 //!
 //! ```text
 //! 命令列 arg ──解析──> RPC 訊息 ──┐
@@ -40,7 +40,7 @@ pub mod lock;
 pub mod message;
 pub mod pack;
 pub mod protocol;
-/// 推播：core 的事件 → RPC 的推播，與每條連線的訂閱集合（rpc-spec §3.9、§4）。
+/// 推播：core 的事件 → RPC 的推播，與每條連線的訂閱集合（/docs/design/rpc-specs/rpc-spec.md §3.9、§4）。
 pub mod push;
 pub mod server;
 pub mod settings;

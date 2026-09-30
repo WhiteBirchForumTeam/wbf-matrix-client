@@ -1,11 +1,11 @@
-//! 媒體池：狀態、清理、下載到本機檔案。設計在 local-cache-db.md §8。
+//! 媒體池：狀態、清理、下載到本機檔案。設計在 /docs/design/media/media-pool.md。
 //!
-//! ⚠️ **池裡的東西是加密的**（§8）。所以「給前端一個路徑」是錯的：它讀到的是密文，
+//! ⚠️ **池裡的東西是加密的**（/docs/design/media/media-pool.md §1）。所以「給前端一個路徑」是錯的：它讀到的是密文，
 //! 而 core 先解密寫到某個路徑就是**明文落地**——整個加密池的意義就沒了
-//! （architecture-v2 §4.8 記了這是初稿的錯）。
+//! （/docs/design/rpc-specs/local-interface.md §8 記了這是初稿的錯）。
 //!
 //! 這一層現在只提供「**使用者明說要把明文放到自己選的位置**」那條路（[`Core::download_to`]）。
-//! 📎 daemon 落地時，播放與顯示會走資料平面的 capability URL（§4.8），🚫 不是這裡。
+//! 📎 daemon 落地時，播放與顯示會走資料平面的 capability URL（/docs/design/rpc-specs/local-interface.md §8），🚫 不是這裡。
 
 use std::io::Write;
 use std::path::Path;
@@ -90,7 +90,7 @@ impl Core {
         })
     }
 
-    /// 超過配額就從最久沒用的刪；保護期內的不刪。順便掃孤兒（local-cache-db §8.5）。
+    /// 超過配額就從最久沒用的刪；保護期內的不刪。順便掃孤兒（/docs/design/media/media-pool.md §5）。
     ///
     /// Args:
     ///     quota_mib: example: 2048
@@ -129,7 +129,7 @@ impl Core {
     /// 把一份 manifest 指的東西下載下來，**解密寫到 `out`**。
     ///
     /// ⚠️ 這裡明文落地是**使用者要的**（他指定了 `out`），不是我們偷偷做的——
-    /// 這條界線要守住（architecture-v2 §4.8）。
+    /// 這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
     ///
     /// 途中發 `Progress` 事件回報塊數。
     pub async fn download_to(
@@ -198,7 +198,7 @@ impl Core {
     /// 走快取那條（[`Core::download_to`]）會把東西留在池裡，這條不會。
     ///
     /// 🚫 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
-    /// （CLI 規格 §4 exit 3 的語意）。
+    /// （/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
     pub async fn download_direct(
         &self,
         manifest: &Manifest,

@@ -1,4 +1,4 @@
-//! 對真的 wbfuwunel 走一遍網路型 method（rpc-spec §10 判準：走我們自己的 WS 才算做完）。
+//! 對真的 wbfuwunel 走一遍網路型 method（/docs/design/rpc-specs/rpc-spec.md §10 判準：走我們自己的 WS 才算做完）。
 //!
 //! `--ignored`；環境變數：
 //!   WBF_E2E_SERVER        example: http://localhost:6167
@@ -11,7 +11,7 @@
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
 //! 對**真的 server** 也成立 —— 登入寫出來的 `session.sealed` 與 matrix store 都是用那把被 passphrase
-//! 包住的主金鑰派生的，所以 daemon 重開之後要能用同一句 passphrase 解回來（rpc-spec §3.1）。
+//! 包住的主金鑰派生的，所以 daemon 重開之後要能用同一句 passphrase 解回來（/docs/design/rpc-specs/rpc-spec.md §3.1）。
 
 use std::sync::Arc;
 
@@ -25,11 +25,11 @@ use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
 
 const TOKEN: [u8; 256] = [7u8; 256];
-/// base64("hunter2")。passphrase 是任意 bytes（local-cache-db §12），RPC 上一律 base64。
+/// base64("hunter2")。passphrase 是任意 bytes（/docs/design/storage/vault-and-keys.md §3），RPC 上一律 base64。
 const PASSPHRASE_BASE64: &str = "aHVudGVyMg==";
 
 /// 一個跑著的 daemon。⚠️ 拿著 `task` 才停得掉它 —— 「重開」必須是**真的停掉再起**，
-/// 🚫 不是「再起一個」：兩個 daemon 同時開同一個資料目錄正是 architecture-v2 §0.2 禁止的事
+/// 🚫 不是「再起一個」：兩個 daemon 同時開同一個資料目錄正是 /docs/design/overview/architecture-v2.md §0.2 禁止的事
 /// （PR #31 審查 cirno🔴）。
 struct Daemon {
     port: u16,
@@ -51,7 +51,7 @@ async fn start_daemon(data_dir: &std::path::Path) -> Daemon {
 /// 然後確認舊 port 真的不收連線了。
 ///
 /// ⭐ 這裡刻意不用「丟掉 task」那種便宜作法：那樣就算 shutdown 整條壞掉測試也會綠。
-/// 鉤子在背景開線（`vault.unlock`／`account.add` 之後，link-pool.md §3.1）：等 `daemon.info` 的線數到 `want`。
+/// 鉤子在背景開線（`vault.unlock`／`account.add` 之後，/docs/design/daemon/link-pool.md §3.1）：等 `daemon.info` 的線數到 `want`。
 async fn wait_for_links(client: &mut Client, want: u64) -> Value {
     for _ in 0..150 {
         let info = client.call("daemon.info", Value::Null).await;
@@ -148,7 +148,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let password = std::fs::read_to_string(password_file).unwrap();
     let password = password.strip_suffix('\n').unwrap_or(&password).to_string();
 
-    // data dir 用短路徑：加密過的目錄名很長（handover §4 9b）。
+    // data dir 用短路徑：加密過的目錄名很長（/docs/handover.md §4 9b）。
     let dir = tempfile::Builder::new()
         .prefix("wd")
         .tempdir_in(std::env::temp_dir())
@@ -156,7 +156,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let daemon = start_daemon(dir.path()).await;
     let mut client = Client::connect(daemon.port).await;
 
-    // fresh 資料目錄的起手式（rpc-spec §3.1）：🚫 account.add 不替前端建 vault，
+    // fresh 資料目錄的起手式（/docs/design/rpc-specs/rpc-spec.md §3.1）：🚫 account.add 不替前端建 vault，
     // 而「要不要 passphrase」就在**建的這一步**決定，🚫 不是登入之後再重包。
     let reply = client
         .call(
@@ -183,7 +183,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "whoami: {reply}");
     assert_eq!(reply["result"]["user_id"], user);
 
-    // 登入成功就觸發鉤子：五條線（misc、upload、download、rooms、keys）在背景開起來（link-pool.md §3.1）。
+    // 登入成功就觸發鉤子：五條線（misc、upload、download、rooms、keys）在背景開起來（/docs/design/daemon/link-pool.md §3.1）。
     wait_for_links(&mut client, 5).await;
 
     // WS：Hello／Ping。走已經開著的 misc，🚫 不再開一條。
@@ -196,7 +196,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let reply = client.call("room.list", json!({})).await;
     assert_eq!(reply["code"], 0, "room.list: {reply}");
     assert!(reply["result"].is_array());
-    // wbf 帳號沒有 matrix-sdk 的 Client（account-session.md §2）：`sync=both` 走橋（JoinedRooms ＋ 每房 GetState ＋ m.direct）。
+    // wbf 帳號沒有 matrix-sdk 的 Client（/docs/design/daemon/account-session.md §2）：`sync=both` 走橋（JoinedRooms ＋ 每房 GetState ＋ m.direct）。
     let reply = client.call("room.list", json!({ "sync": "both" })).await;
     assert_eq!(reply["code"], 0, "room.list sync=both: {reply}");
     assert!(reply["result"].is_array());
@@ -208,7 +208,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "recent: {reply}");
     assert!(reply["result"]["caught_up"].is_boolean(), "{reply}");
 
-    // 備份還掛在 Client 上（account-session.md §6）：wbf 帳號明講拒絕（1100），🚫 不靜默失效。
+    // 備份還掛在 Client 上（/docs/design/daemon/account-session.md §6）：wbf 帳號明講拒絕（1100），🚫 不靜默失效。
     let reply = client.call("backup.status", json!({})).await;
     assert_eq!(
         reply["code"], 1100,
@@ -219,9 +219,9 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         .expect("instance")
         .to_string();
 
-    // daemon 重開（真正的「鎖上」就是這條，rpc-spec §3.1）。
+    // daemon 重開（真正的「鎖上」就是這條，/docs/design/rpc-specs/rpc-spec.md §3.1）。
     // ⚠️ **先停掉第一個**：`daemon.shutdown` → 關連線 → 等它收攤 → 確認舊 port 不收連線了。
-    // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 §0.2 禁止的，而且那樣
+    // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 /docs/design/overview/architecture-v2.md §0.2 禁止的，而且那樣
     // 就算 shutdown 壞掉這條測試也會綠（PR #31 審查 cirno🔴）。
     stop_daemon(daemon, client).await;
     let daemon = start_daemon(dir.path()).await;
@@ -267,7 +267,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         )
         .await;
     assert_eq!(reply["code"], 0, "account.del: {reply}");
-    // 登出：token 撤了，這個帳號的線全關（link-pool.md §3）。
+    // 登出：token 撤了，這個帳號的線全關（/docs/design/daemon/link-pool.md §3）。
     let info = client.call("daemon.info", Value::Null).await;
     assert_eq!(info["result"]["links"], 0, "{info}");
 
@@ -324,10 +324,10 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         )
         .await;
     assert_eq!(reply["code"], 0, "account.add: {reply}");
-    // 訂閱線在背景開（link-pool.md §3.1）：等五條都開好再送，下面送的 7 則才一定會被推回來（訂閱不補訂閱之前的，那是 UI 叫 `sync.recent` 的事）。
+    // 訂閱線在背景開（/docs/design/daemon/link-pool.md §3.1）：等五條都開好再送，下面送的 7 則才一定會被推回來（訂閱不補訂閱之前的，那是 UI 叫 `sync.recent` 的事）。
     wait_for_links(&mut client, 5).await;
 
-    // wbf 帳號的送訊息走 `Event/Send` 明文：加密房要被拒（1100），而且是送之前問這一刻的 `m.room.encryption`（account-session.md §6）。
+    // wbf 帳號的送訊息走 `Event/Send` 明文：加密房要被拒（1100），而且是送之前問這一刻的 `m.room.encryption`（/docs/design/daemon/account-session.md §6）。
     // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
     if let Ok(encrypted_room) = std::env::var("WBF_E2E_ENCRYPTED_ROOM") {
         let reply = client
@@ -337,7 +337,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
             )
             .await;
         assert_eq!(reply["code"], 1100, "加密房的明文送出要被拒：{reply}");
-        // e2ee-rpc.md 的 RPC 形狀：`room.refresh_devices` 回的整份原樣當 `room_devices` 帶回來，送出去的是密文、帶那個號碼。
+        // /docs/design/keys/e2ee-rpc.md 的 RPC 形狀：`room.refresh_devices` 回的整份原樣當 `room_devices` 帶回來，送出去的是密文、帶那個號碼。
         let refreshed = client
             .call("room.refresh_devices", json!({ "room": encrypted_room }))
             .await;

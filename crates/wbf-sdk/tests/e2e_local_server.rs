@@ -1,4 +1,4 @@
-//! 對著真的 wbfuwunel 跑（plan-v1 §4 的驗收表，SDK 層那幾條）。平常 `#[ignore]`；要跑：
+//! 對著真的 wbfuwunel 跑（/docs/design/rpc-specs/wbf-cli-spec.md §8 的驗收項目，SDK 層那幾條）。平常 `#[ignore]`；要跑：
 //!
 //! ```text
 //! WBF_E2E_SERVER=http://127.0.0.1:6167 WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=<檔> \
@@ -255,7 +255,7 @@ async fn upload_download_seek_resume_stream_against_real_server() {
     );
 }
 
-/// 標準 `GET /_matrix/client/v1/media/download/{server}/{id}`：分塊媒體整份給（線上規格 §4.2）。
+/// 標準 `GET /_matrix/client/v1/media/download/{server}/{id}`：分塊媒體整份給（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.2）。
 async fn standard_media_download(server: &str, access_token: &str, mxc: &str) -> Vec<u8> {
     let path = mxc.strip_prefix("mxc://").expect("mxc");
     let url = format!(
@@ -400,7 +400,7 @@ async fn bridge_members_and_send_to_device_against_real_server() {
     logout(&session).await.expect("logout");
 }
 
-/// 心跳對真 server（ws-receive-dispatch.md §5.1）：安靜的線每秒跳一次，Pong 經會話表回來、也過鉤子；三秒內至少兩個 Pong、線還開著、沒有無主。
+/// 心跳對真 server（/docs/design/daemon/ws-receive-dispatch.md §5.1）：安靜的線每秒跳一次，Pong 經會話表回來、也過鉤子；三秒內至少兩個 Pong、線還開著、沒有無主。
 /// 📎 300 秒的 idle 不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
 #[tokio::test]
 #[ignore = "needs a running wbfuwunel; see file header"]

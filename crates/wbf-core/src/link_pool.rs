@@ -1,6 +1,6 @@
-//! 連線池（link-pool.md）：一個帳號五條線，各司其職；daemon 在解鎖、登入之後把五條都開起來（`link_keeper.rs`），平常要用時發現死了也重開。
+//! 連線池（/docs/design/daemon/link-pool.md）：一個帳號五條線，各司其職；daemon 在解鎖、登入之後把五條都開起來（`link_keeper.rs`），平常要用時發現死了也重開。
 //!
-//! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，§7 的接縫）——
+//! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，/docs/design/daemon/link-pool.md §7 的接縫）——
 //! 正式的在 `Core::open_link`（session → `Channel::connect` → `hello`），測試的用記憶體對接。
 //! 池自己🚫 不在背景做事：定時看線、重開是 `link_keeper.rs` 的鉤子（daemon 叫）；🚫 不知道訂閱的內容（那是用線的人的事）。
 
@@ -17,12 +17,12 @@ use wbf_sdk::sessions::Received;
 use crate::error::CoreError;
 use crate::event::{CoreEvent, EventSink, LinkState};
 
-/// 五條線的角色（link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
+/// 五條線的角色（/docs/design/daemon/link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
 /// 📌 房間與金鑰的訂閱 2026-09-29 起各自一條（維護者定；server #85 把每台裝置的 WS 上限放到 8）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkRole {
-    /// 一問一答：Hello／Ping、Info、橋、Event/Send、Recent（拉窗）、Device/Fetch／ItemsDestroy。
+    /// 一問一答：Hello／Ping、Info、橋、Event/Send、Recent（拉窗）。`Device/Fetch`／`ItemsDestroy` 在 `Keys`（見下）。
     Misc,
     /// Upload/*。
     Upload,
@@ -91,7 +91,7 @@ impl LinkPool {
             .clone()
     }
 
-    /// 拿那條線來用：沒開就開、發現死了就重開，然後把 guard 交出去（一條線一次一個命令，§5）。
+    /// 拿那條線來用：沒開就開、發現死了就重開，然後把 guard 交出去（一條線一次一個命令，/docs/design/daemon/link-pool.md §5）。
     ///
     /// Args:
     ///     role: example: LinkRole::Misc
@@ -100,7 +100,7 @@ impl LinkPool {
     ///     Ok(PooledClient)   開著的線；丟掉 guard 就是把線還回池裡（線本身還開著）
     ///     Err(...)           `open` 的錯原樣（沒 session 是 Usage、連不上是 Network）；池裡那格維持沒開，🚫 不發事件
     ///
-    /// 📌 登出跟這裡的競賽由 server 決定，不由池猜（link-pool.md §3）：登出先撤 token 再 `close_all`，之後才開的線在 hello 就被 server 拒；
+    /// 📌 登出跟這裡的競賽由 server 決定，不由池猜（/docs/design/daemon/link-pool.md §3）：登出先撤 token 再 `close_all`，之後才開的線在 hello 就被 server 拒；
     /// 正在開的那一條由 `close_all` 等它的鎖、開完、命令做完再收。
     pub async fn acquire<F, Fut>(&self, role: LinkRole, open: F) -> Result<PooledClient, CoreError>
     where
@@ -266,7 +266,7 @@ impl LinkPool {
     }
 }
 
-/// `ReceivedHook` 的那一頭（link-pool.md §4）：每個收到的 pack 變一則 `CoreEvent::Received`，**只有標頭**、🚫 不帶 meta／data。
+/// `ReceivedHook` 的那一頭（/docs/design/daemon/link-pool.md §4）：每個收到的 pack 變一則 `CoreEvent::Received`，**只有標頭**、🚫 不帶 meta／data。
 /// 讀取 task 上叫的，表鎖之外；`EventSink::emit` 是 broadcast 的 try_send，不擋。
 pub(crate) fn received_hook(
     events: EventSink,
@@ -286,7 +286,7 @@ pub(crate) fn received_hook(
     })
 }
 
-/// 「登出中」的範圍（account-session.md §4 第 1 與第 5 步）：活著就封池，丟掉就解封。
+/// 「登出中」的範圍（/docs/design/daemon/account-session.md §4 第 1 與第 5 步）：活著就封池，丟掉就解封。
 pub(crate) struct LoggingOutGuard<'a> {
     core: &'a crate::Core,
     account: &'a crate::accounts::AccountDir,
@@ -329,8 +329,8 @@ impl DerefMut for PooledClient {
 /// 池開線時 `Hello` 報的名字。
 pub const LINK_CLIENT_NAME: &str = "wbf-core/0.1";
 
-/// 開一條某個角色的線要向 server 宣告哪些 feature（link-pool.md §7）。
-/// `org.wbftw.device_versions`（e2ee-rpc.md §1）：
+/// 開一條某個角色的線要向 server 宣告哪些 feature（/docs/design/daemon/link-pool.md §7）。
+/// `org.wbftw.device_versions`（/docs/design/keys/e2ee-rpc.md §1）：
 /// - `Misc`：加密訊息從這條 `Event/Send`——宣告了，server 對**加密**事件一律要 `room_version`（漏帶是 `InvalidRequest`），明文不受影響。
 ///   我們的加密送出本來就一定帶（`encrypt_and_send`），宣告是把「漏帶」變成 server 擋得下的錯。
 /// - `Rooms`：宣告了 server 才推 `Event/DeviceChanged`。
@@ -354,7 +354,7 @@ impl crate::Core {
         &self,
         account: &crate::accounts::AccountDir,
     ) -> Result<Arc<LinkPool>, CoreError> {
-        // 登出中：封池（account-session.md §4 第 1 步）。正在跑的命令握著自己的 guard，不從這裡進來，不受影響。
+        // 登出中：封池（/docs/design/daemon/account-session.md §4 第 1 步）。正在跑的命令握著自己的 guard，不從這裡進來，不受影響。
         if self.is_logging_out(account) {
             return Err(CoreError::new(
                 crate::error::CoreErrorKind::AccountBusy,
@@ -374,7 +374,7 @@ impl crate::Core {
             .clone())
     }
 
-    /// 正式的「開一條線」（link-pool.md §3、§7）：session → `Channel::connect`（Bearer 升級，這就是登入）→ `hello`。
+    /// 正式的「開一條線」（/docs/design/daemon/link-pool.md §3、§7）：session → `Channel::connect`（Bearer 升級，這就是登入）→ `hello`。
     /// 每個收到的 pack 經鉤子變 `CoreEvent::Received`。
     ///
     /// Return:
@@ -396,12 +396,12 @@ impl crate::Core {
         .await?;
         let mut client = WbfClient::new(Channel::WebSocket(Box::new(channel)));
         client.hello(LINK_CLIENT_NAME, features_of(role)).await?;
-        // 通用的初始化（維護者 2026-09-22）：看角色決定開完線還要做什麼——訂閱線就是在這裡訂的（room-sync.md）。
+        // 通用的初始化（維護者 2026-09-22）：看角色決定開完線還要做什麼——訂閱線就是在這裡訂的（/docs/design/rooms/room-sync.md）。
         self.init_connection(account, role, &mut client).await?;
         Ok(client)
     }
 
-    /// 登出的封池（account-session.md §4）：guard 活著的期間 `pool_of_account` 一律 `AccountBusy`，guard 丟掉就解封——
+    /// 登出的封池（/docs/design/daemon/account-session.md §4）：guard 活著的期間 `pool_of_account` 一律 `AccountBusy`，guard 丟掉就解封——
     /// 成功、失敗、提前 return、future 被 drop 都走同一條（PR #54 審查 cirno／salvia／rumia 🔴：第一版只在失敗分支解封，成功登出後重登入會卡 AccountBusy 到 daemon 重開）。
     pub(crate) fn logging_out_guard<'a>(
         &'a self,
@@ -589,7 +589,7 @@ mod tests {
         );
     }
 
-    /// e2ee-rpc.md §2：送加密訊息的 `Misc` 與收 `DeviceChanged` 的 `Rooms` 宣告 `org.wbftw.device_versions`，其他三條不宣告。
+    /// /docs/design/keys/e2ee-rpc.md §2：送加密訊息的 `Misc` 與收 `DeviceChanged` 的 `Rooms` 宣告 `org.wbftw.device_versions`，其他三條不宣告。
     #[test]
     fn only_the_misc_and_rooms_lines_declare_device_versions() {
         let declared: Vec<LinkRole> = LinkRole::ALL

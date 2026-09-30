@@ -1,14 +1,14 @@
 //! core 的錯誤型別。
 //!
 //! **為什麼不直接用 `SdkError`**（PR #24 審查 salvia＋rumia）：`SdkError` 只 derive 了
-//! `Debug`，序列化不了。而 core 的公開面之後要被 RPC 包住，§4.6 定的回應形狀是
+//! `Debug`，序列化不了。而 core 的公開面之後要被 RPC 包住，/docs/design/rpc-specs/local-interface.md §6 定的回應形狀是
 //! `code` ＋ `msg`——所以錯誤必須是**結構化、可序列化**的東西，不能是一句人話。
 //!
 //! # 🚫 這裡刻意**沒有**號碼
 //!
-//! §4.6：「`code` 是穩定的整數，一個意思一個號碼、**定了就不改**」，而那張表的權威位置是
-//! `rpc-spec.md`（還沒寫）。在規格還沒寫的時候先配號碼，等於現在就兌現一個「不能改」的
-//! 承諾——所以這裡只定**種類**（[`CoreErrorKind`]），號碼等 `rpc-spec.md` 一起定
+//! /docs/design/rpc-specs/local-interface.md §6：「`code` 是穩定的整數，一個意思一個號碼、**定了就不改**」，而那張表的權威位置是
+//! `/docs/design/rpc-specs/rpc-spec.md`（還沒寫）。在規格還沒寫的時候先配號碼，等於現在就兌現一個「不能改」的
+//! 承諾——所以這裡只定**種類**（[`CoreErrorKind`]），號碼等 `/docs/design/rpc-specs/rpc-spec.md` 一起定
 //!（維護者 2026-09-11 定）。
 //!
 //! ⚠️ 加新 variant 時：種類是給**程式**判斷的，`message` 是給**人**看的。
@@ -23,7 +23,7 @@ use wbf_sdk::SdkError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoreErrorKind {
-    /// vault 還沒解鎖。RPC 那端對應 §4.5 的「只接受 `hello` 與 `vault.unlock`」。
+    /// vault 還沒解鎖。RPC 那端對應 /docs/design/rpc-specs/local-interface.md §5 的「只接受 `hello` 與 `vault.unlock`」。
     Locked,
     /// 這個資料目錄還沒有 `local.key`——沒登入過。
     NoKeyFile,
@@ -48,7 +48,7 @@ pub enum CoreErrorKind {
     ServerPendingRemoval,
     /// 這台機器沒保管這個帳號的 recovery key（`key-backup restore` 要它）。
     NoRecoveryKeyHere,
-    /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（local-cache-db.md §10.7）。
+    /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（/docs/design/keys/room-key-backup.md §7）。
     ///
     /// ⚠️ core 的訊息只說**條件**，🚫 不提命令名字——前端看到這個 kind 再補上自己那句
     /// （rpc-cli 說 `wbf-cli key-backup recovery`，Desktop 可能是一個按鈕）。
@@ -63,7 +63,7 @@ pub enum CoreErrorKind {
     /// server 拒絕或不講協議。
     Server,
     /// 加密訊息被 server 擋下：帶的房間版本號過期了（server 的 1506 `RoomDevicesChanged`）。訊息沒送。
-    /// daemon 已經自動重拿了房間狀態、補了金鑰，新的狀態在 [`CoreError::data`]（e2ee-rpc.md §3）；重不重送是 UI 的事。
+    /// daemon 已經自動重拿了房間狀態、補了金鑰，新的狀態在 [`CoreError::data`]（/docs/design/keys/e2ee-rpc.md §3）；重不重送是 UI 的事。
     RoomDevicesChanged,
     /// 完整性檢查不過（CRC、AEAD 標籤）。
     Integrity,
@@ -71,7 +71,7 @@ pub enum CoreErrorKind {
 }
 
 impl CoreErrorKind {
-    /// RPC 的 `code`（rpc-spec §5.2）。**號碼定了就不改**；同族留了縫給之後拆出來的 variant。
+    /// RPC 的 `code`（/docs/design/rpc-specs/rpc-spec.md §5.2）。**號碼定了就不改**；同族留了縫給之後拆出來的 variant。
     ///
     /// ⚠️ 這張表只能在這裡：daemon 那層🚫 不要另外維護一份對照——兩份就會漂。
     ///
@@ -107,7 +107,7 @@ impl CoreErrorKind {
 pub struct CoreError {
     pub kind: CoreErrorKind,
     pub message: String,
-    /// 這個錯誤順手帶回來的東西，例：`RoomDevicesChanged` 帶 daemon 自動重拿的房間狀態（e2ee-rpc.md §3）。大多數錯誤是 None。
+    /// 這個錯誤順手帶回來的東西，例：`RoomDevicesChanged` 帶 daemon 自動重拿的房間狀態（/docs/design/keys/e2ee-rpc.md §3）。大多數錯誤是 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn rpc_codes_are_the_ones_in_rpc_spec_section_5_2() {
-        // 逐字對 rpc-spec §5.2：這裡改了就是規格改了，反過來也一樣。
+        // 逐字對 /docs/design/rpc-specs/rpc-spec.md §5.2：這裡改了就是規格改了，反過來也一樣。
         let table = [
             (CoreErrorKind::Locked, 1001),
             (CoreErrorKind::NoKeyFile, 1002),

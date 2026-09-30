@@ -1,16 +1,16 @@
-//! 訂閱線的內容：房間事件的訂閱與推播寫進 `cache.db`（daemon-runtime 第 6／7 階段；server 的語意在 wbfuwunel `wbf-event-push.md`）。
+//! 訂閱線的內容：房間事件的訂閱與推播寫進 `cache.db`（daemon-runtime 第 6／7 階段；server 的語意在 wbfuwunel 的 `/docs/design/wbf-event-push.md`）。
 //!
-//! 維護者 2026-09-22／23 定的形狀（room-sync.md §0）：
+//! 維護者 2026-09-22／23 定的形狀（/docs/design/rooms/room-sync.md §0）：
 //!
 //! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Rooms` 就送 `Event/Subscribe`、起一個收推播的 task；`Keys` 是金鑰那半（`key_sync.rs`）。
-//!   線死了、重開時自然重訂（link-pool.md §3）。訂閱會話結束（server 送 `Error`）時 socket 可能還活著，池看不出來——
+//!   線死了、重開時自然重訂（/docs/design/daemon/link-pool.md §3）。訂閱會話結束（server 送 `Error`）時 socket 可能還活著，池看不出來——
 //!   task 收攤時自己把那格關掉，「重開就重訂」在這條路才成立；🚫 關線不是重訂，重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
 //! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`。**🚫 不碰水位、不記洞、不補窗**。
 //! - 水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動；推播漏掉的（server 的 `gap`、本地丟包、一包解不開、寫失敗）**都不管**：
 //!   UI 下次叫 `Recent` 會從它自己決定的起點重拉那一段（冪等），UI 不叫就不補，永遠拿不到也不管。誰記有沒有漏是 UI 層的事。
 //!
 //! 加密的事件收到時有金鑰就解（密文明文一起存），沒金鑰只存密文（維護者 2026-09-29，room_crypto.rs）；訂閱是純的，`seq` 跳號不管、`Subscribe` 不帶 `cg_seq`。
-//! `DeviceChanged` 原樣轉成 `CoreEvent::DeviceChanged` 給 UI，要不要 refresh 是 UI 的事（e2ee-rpc.md §4）。
+//! `DeviceChanged` 原樣轉成 `CoreEvent::DeviceChanged` 給 UI，要不要 refresh 是 UI 的事（/docs/design/keys/e2ee-rpc.md §4）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -192,7 +192,7 @@ impl RoomSyncTask {
                     self.on_push(meta, events).await;
                     continue;
                 }
-                // 原樣轉給 UI；要不要 refresh 是 UI 的事（e2ee-rpc.md §4）。
+                // 原樣轉給 UI；要不要 refresh 是 UI 的事（/docs/design/keys/e2ee-rpc.md §4）。
                 Ok(Some(EventSubscribeReply::DeviceChanged(changed))) => {
                     self.events.emit(CoreEvent::DeviceChanged {
                         user: self.me.clone(),
@@ -477,7 +477,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。task 自己🚫 不重連（重開是看線迴圈的事，link-pool.md §3.1）。
+    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。task 自己🚫 不重連（重開是看線迴圈的事，/docs/design/daemon/link-pool.md §3.1）。
     #[tokio::test]
     async fn a_dead_line_ends_the_task_and_says_so() {
         let dir = scratch("dead");

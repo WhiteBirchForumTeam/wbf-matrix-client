@@ -1,6 +1,6 @@
-//! 上傳：`Create` → 逐塊 → `Seal`（線上規格 §3、約定 §4、§6）。固定大小可續傳，串流不行。
+//! 上傳：`Create` → 逐塊 → `Seal`（wbfuwunel 的 /docs/design/chunked-upload-spec.md §3、/docs/design/media/wbf-client-convention-for-chunk.md §4、§6）。固定大小可續傳，串流不行。
 //!
-//! 三步分開，中間的 `UploadState` 由呼叫者落地（CLI 規格 §6）：SDK 不碰檔案系統，
+//! 三步分開，中間的 `UploadState` 由呼叫者落地（/docs/design/rpc-specs/wbf-cli-spec.md §6）：SDK 不碰檔案系統，
 //! 所以「殺掉再跑一次接著送」是 CLI 拿狀態檔呼叫 `send_chunks(from)` 的事，這裡只保證每一步各自正確。
 
 use std::io::{Read, Seek, SeekFrom};
@@ -31,8 +31,8 @@ pub struct SentSummary {
 }
 
 impl<C: PackChannel> WbfClient<C> {
-    /// 線上規格 §3.1。`block.file_size` 有 → 固定大小；None → 串流（`0/0` 哨兵）。
-    /// 描述用 `Create` 的 nonce 加密（約定 §4）。
+    /// wbfuwunel 的 /docs/design/chunked-upload-spec.md §3.1。`block.file_size` 有 → 固定大小；None → 串流（`0/0` 哨兵）。
+    /// 描述用 `Create` 的 nonce 加密（/docs/design/media/wbf-client-convention-for-chunk.md §4）。
     ///
     /// Args:
     ///     user_id: 寫進狀態檔，續傳時核對, example: "@alice:localhost"
@@ -82,7 +82,7 @@ impl<C: PackChannel> WbfClient<C> {
             .call(|seq| Ok(protocol::create(info, description, seq)))
             .await?;
         let created: CreateAck = protocol::parse_meta(&ack)?;
-        // 標頭 id 要嘛抄回 0（線上規格 §2），要嘛就是新發的上傳 id（wbfuwunel 的做法）；其他值是對方講錯話。
+        // 標頭 id 要嘛抄回 0（wbfuwunel 的 /docs/design/chunked-upload-spec.md §2），要嘛就是新發的上傳 id（wbfuwunel 的做法）；其他值是對方講錯話。
         if ack.id != 0 && ack.id != created.id {
             return Err(SdkError::Protocol(format!(
                 "Create ack header id {} is neither 0 nor the new upload id {}",
@@ -160,7 +160,7 @@ impl<C: PackChannel> WbfClient<C> {
                     truncated = ack.truncated;
                     index = ack.received;
                 }
-                // 線上規格 §3.2：server 說該送哪塊就跳去哪塊（漏了 Ack 的重送、或狀態檔比 server 舊）。
+                // wbfuwunel 的 /docs/design/chunked-upload-spec.md §3.2：server 說該送哪塊就跳去哪塊（漏了 Ack 的重送、或狀態檔比 server 舊）。
                 // 🚨 認碼只看 `code_id`（`wbf_code`），🚫 不比名字（issue #29 第 2 項）。
                 Err(error @ SdkError::Server { .. })
                     if error.wbf_code() == Some(WbfErrorCode::OutOfOrder) =>
@@ -201,7 +201,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// 串流：從 `reader` 讀到 EOF，每滿一塊送一塊，最後一塊帶 `IS_LAST`（線上規格 §3.2、約定 §6）。
+    /// 串流：從 `reader` 讀到 EOF，每滿一塊送一塊，最後一塊帶 `IS_LAST`（wbfuwunel 的 /docs/design/chunked-upload-spec.md §3.2、/docs/design/media/wbf-client-convention-for-chunk.md §6）。
     /// 一律算 SHA-256（反正要讀過一遍）。空輸入是 `Usage` 錯：協議沒有零塊的上傳。
     ///
     /// Return:
@@ -258,7 +258,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// `Seal` 帶最終描述（約定 §4：一律帶，整份覆蓋），回 manifest。
+    /// `Seal` 帶最終描述（/docs/design/media/wbf-client-convention-for-chunk.md §4：一律帶，整份覆蓋），回 manifest。
     ///
     /// Args:
     ///     final_block: `state.block` 填上 `file_size`／`sha256` 之後的
@@ -290,7 +290,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// 一塊的請求：seq 是塊索引，不走 `call` 的計數器。`Corrupt` 重送一次（線上規格 §5）。
+    /// 一塊的請求：seq 是塊索引，不走 `call` 的計數器。`Corrupt` 重送一次（wbfuwunel 的 /docs/design/chunked-upload-spec.md §5）。
     async fn send_one_chunk(
         &mut self,
         upload_id: u64,

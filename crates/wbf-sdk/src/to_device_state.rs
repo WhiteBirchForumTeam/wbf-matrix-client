@@ -1,4 +1,4 @@
-//! to-device 的兩份本地狀態（to-device-client.md §2、§4）：`cd_seq`（**已經處理完**到哪）與**待銷毀清單**（哪些可以叫 server 刪）。
+//! to-device 的兩份本地狀態（/docs/design/keys/to-device-client.md §2、§4）：`cd_seq`（**已經處理完**到哪）與**待銷毀清單**（哪些可以叫 server 刪）。
 //!
 //! 落在帳號目錄的 `m/` 裡面、跟 crypto store 同一個資料夾（維護者 2026-09-12：「你同步到哪，就應該寫到哪」）：
 //! `m/` 被刪（logout、壞掉重來、`key-backup import`）它就一起沒，下次從頭拉——🚫 不進 `cache.db`，否則 `m/` 沒了它還在，
@@ -80,7 +80,7 @@ impl ToDeviceState {
         }
     }
 
-    /// `ItemsDestroyed` 回來之後叫：只拿掉**真的回來的那些**（§4 第 1、3 條）。
+    /// `ItemsDestroyed` 回來之後叫：只拿掉**真的回來的那些**（/docs/design/keys/to-device-client.md §4 第 1、3 條）。
     ///
     /// Args:
     ///     destroyed: example: &[4712]

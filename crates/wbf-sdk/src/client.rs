@@ -28,16 +28,16 @@ pub struct WbfClient<C: PackChannel> {
 pub type OnBatch<'a> =
     &'a mut (dyn FnMut(&BatchMeta, Vec<serde_json::Value>) -> Result<(), SdkError> + Send);
 
-/// `Device/Fetch` 一窗的結果（to-device-client.md §7）：舊→新。
+/// `Device/Fetch` 一窗的結果（/docs/design/keys/to-device-client.md §7）：舊→新。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceWindow {
     /// `(count, 事件 JSON)`，舊→新。事件是 `{type, sender, content}`（server 對內容是瞎的）。
     pub items: Vec<(u64, serde_json::Value)>,
     /// 這一窗總共幾則。
     pub tc: u32,
-    /// 這一窗最新的 count：下一窗的 `cd_seq`。空窗是 None。
+    /// 這一窗最新的 count（落地紀錄用；`Fetch` 不帶游標，下一窗從佇列頭拉）。空窗是 None。
     pub nt: Option<u64>,
-    /// true ＝ 窗停在上限，後面可能還有（帶 `cd_seq = nt` 再拉）；false ＝ 佇列真的拉完了。
+    /// true ＝ 窗停在上限，後面可能還有（銷毀這一窗之後再 `Fetch`，從佇列頭接著拉）；false ＝ 佇列真的拉完了。
     pub more: bool,
 }
 
@@ -141,7 +141,7 @@ pub struct RecentSync {
     pub events: u64,
     pub last_ls: Option<i64>,
     /// true = 一窗回來說 `more: false`（回到了 `cg_seq`）；false = 被 `max_events` 停下，`last_ls` 以下到舊水位之間還沒拿
-    /// （那段之後靠逐房翻頁補，local-cache-db §6 的「洞」）。
+    /// （那段之後靠逐房翻頁補，/docs/design/storage/local-cache-db.md §5 的「洞」）。
     pub caught_up: bool,
 }
 
@@ -279,7 +279,7 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     /// 一個房間的房間版本號與每個已加入成員的裝置版本號（走橋的 `Members`，只要 `join` 的）。
-    /// 送加密訊息前、與收到 1506 之後都靠它（wbfuwunel `wbf-room-device-version.md` §5、§7.2）。
+    /// 送加密訊息前、與收到 1506 之後都靠它（wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §5、§7.2）。
     ///
     /// 🚨 fail closed：server 沒給號碼（舊 server、或不是成員清單）是 `Protocol`，🚫 不會回 0。
     ///
@@ -453,14 +453,14 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     /// 一串回應的請求（`Recent`、`Device/Fetch`、`ItemsDestroy`）用的會話號：client 自己選，從 1 起、永遠不是 0。
-    /// 型別 byte 是 SESSION（wire-format §2.2）：沒帶 server 回 InvalidRequest「carries none」（2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
+    /// 型別 byte 是 SESSION（wbfuwunel 的 /docs/design/wbf-wire-format.md §2.2）：沒帶 server 回 InvalidRequest「carries none」（2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
     fn next_session_id(&mut self) -> u64 {
         self.next_stream_id =
             self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
         wbf_wire::pack::id::compose_masked(wbf_wire::pack::id::SESSION, self.next_stream_id)
     }
 
-    /// `Device/Fetch` 一窗：從佇列最舊還沒銷毀的起拉 to-device，舊→新（to-device-client.md §7）。回應是一串 `Device/Batch`。
+    /// `Device/Fetch` 一窗：從佇列最舊還沒銷毀的起拉 to-device，舊→新（/docs/design/keys/to-device-client.md §7）。回應是一串 `Device/Batch`。
     /// 拉到的還沒匯進 crypto store，🚫 不推水位、🚫 不銷毀：那是呼叫者匯入成功之後的事。
     ///
     /// Args:
@@ -531,7 +531,7 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     /// `Device/Subscribe`（不帶 `cd_seq`）：把這條連線登記成這台裝置佇列的持有者——🚨 `ItemsDestroy` 只有持有者能做，
-    /// 而且後來的接手先來的（to-device-client.md §5）。回覆是 `Ack` 再 `CryptoState`（自己的 OTK 存量），這裡回後者。
+    /// 而且後來的接手先來的（/docs/design/keys/to-device-client.md §5）。回覆是 `Ack` 再 `CryptoState`（自己的 OTK 存量），這裡回後者。
     /// ⚠️ 這支只等到 `CryptoState` 就放手：之後 server 推到這條連線的 `Push`／`CryptoState` 沒人收（通道算成無主，佇列裡的下次 `Fetch` 還在）。
     /// 要一直收用 [`WbfClient::device_subscription`]。這支給「訂閱 → 拉 → 匯入 → 銷毀」這種一次走完的流程。
     ///
@@ -580,7 +580,7 @@ impl<C: PackChannel> WbfClient<C> {
         }
     }
 
-    /// `Device/Subscribe` 然後**一直收**（ws-receive-dispatch.md §3）：等到 `Ack` 與 `CryptoState` 才回，之後的 `Push`／`CryptoState`／`Superseded`
+    /// `Device/Subscribe` 然後**一直收**（/docs/design/daemon/ws-receive-dispatch.md §3）：等到 `Ack` 與 `CryptoState` 才回，之後的 `Push`／`CryptoState`／`Superseded`
     /// 都從 `subscription.next()` 來。只有 WebSocket 通道能長活收；HTTP 與假 server 回 `Usage`。
     /// 丟掉 handle 只是不再收，🚨 線上的退出仍要叫 [`WbfClient::device_unsubscribe`]。
     ///
@@ -637,7 +637,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// `Event/Subscribe` 然後**一直收**（wbfuwunel `wbf-event-push.md`）：等到 `Ack` 才回，之後的 `Push`／`DeviceChanged` 從 handle 來。
+    /// `Event/Subscribe` 然後**一直收**（wbfuwunel 的 `/docs/design/wbf-event-push.md`）：等到 `Ack` 才回，之後的 `Push`／`DeviceChanged` 從 handle 來。
     /// 🚫 這裡不帶 `cg_seq`（server 的補窗有上限、截斷只給一個 gap bit）：補窗由呼叫端自己用 `recent_sync` 做，在 Ack 之後、放手之前。
     ///
     /// Args:
@@ -726,7 +726,7 @@ impl<C: PackChannel> WbfClient<C> {
         }
     }
 
-    /// `Device/Unsubscribe`：下線前說出口的退出——解除這條連線對裝置佇列的持有（to-device-client.md §4）。沒訂也是 no-op。
+    /// `Device/Unsubscribe`：下線前說出口的退出——解除這條連線對裝置佇列的持有（/docs/design/keys/to-device-client.md §4）。沒訂也是 no-op。
     ///
     /// Return:
     ///     Ok(())         退了
@@ -741,7 +741,7 @@ impl<C: PackChannel> WbfClient<C> {
 
     /// `Device/ItemsDestroy`：叫 server 刪掉這些 count（已經匯進 crypto store 的）。回應是先 `Ack`（只是收到）再 `ItemsDestroyed`。
     /// 🚨 要先 `device_subscribe`：只有持有這台裝置佇列的連線能銷毀，否則 server 回 `Forbidden`。
-    /// 🚨 只有 `ItemsDestroyed` 裡回來的才算沒了；沒回來的留在待銷毀清單上下次再送（to-device-client.md §4）。
+    /// 🚨 只有 `ItemsDestroyed` 裡回來的才算沒了；沒回來的留在待銷毀清單上下次再送（/docs/design/keys/to-device-client.md §4）。
     ///
     /// Args:
     ///     counts: example: &[4712, 4713]；空的就不送、直接回 Ok(vec![])
@@ -796,7 +796,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(())
     }
 
-    /// 線上規格 §4.1。
+    /// wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.1。
     ///
     /// Return:
     ///     Ok((InfoAck, Vec<u8>))   meta 與 data（server 存的那份描述，原樣）
@@ -806,7 +806,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok((info, ack.data))
     }
 
-    /// 線上規格 §4.2：整整一塊，照上傳時的 bytes。這裡只驗 `len` 與 data 長度一致；解密與長度規則在下載端。
+    /// wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.2：整整一塊，照上傳時的 bytes。這裡只驗 `len` 與 data 長度一致；解密與長度規則在下載端。
     pub async fn read_chunk(
         &mut self,
         mxc: &str,
@@ -832,7 +832,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok((read, ack.data))
     }
 
-    /// `Event/Recent` 的**一窗**（pack-pipeline §6）：送請求、收一串 `Event/Batch` 直到 `r = 0`。
+    /// `Event/Recent` 的**一窗**（wbfuwunel 的 pack-pipeline.md §6）：送請求、收一串 `Event/Batch` 直到 `r = 0`。
     /// 每個 Batch 交給 `on_batch`（新到舊）；`Hello.features` 有 `recent` 才能用。
     ///
     /// Args:
@@ -900,7 +900,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(window)
     }
 
-    /// 整輪同步（pack-pipeline §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉，拉到追平或湊滿 `plan.max_events`。
+    /// 整輪同步（wbfuwunel 的 pack-pipeline.md §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉，拉到追平或湊滿 `plan.max_events`。
     /// 三層：上層要 `max_events` 則 → 底層每次 `Recent` 要一窗（`window`，≤ 500）→ server 每 `batch` 則回一個 `Batch`。
     /// 最後一窗會縮成剩下的數量，總量剛好不多拿。
     /// - 一窗收完且最後一個 Batch 說 `more: false`：追平（`caught_up`）。
@@ -988,8 +988,8 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(summary)
     }
 
-    /// `Event/Send`：送事件並宣告附件（media-attachments.md §3、spec §12）。
-    /// ⚠️ server 端還是提案（2026-09-06），`Hello.features` 有 `attachments` 才能用；沒有就走 HTTP 加 `X-Wbf-Attachments`。
+    /// `Event/Send`：送事件並宣告附件（wbfuwunel 的 /docs/design/media-attachments.md §3、wbfuwunel 的 /docs/design/chunked-upload-spec.md §12）。
+    /// ⚠️ `Hello.features` 有 `attachments` 才能用；沒有就走 HTTP 加 `X-Wbf-Attachments`。
     ///
     /// Args:
     ///     request: room、type、txn_id、這則用到的 mxc

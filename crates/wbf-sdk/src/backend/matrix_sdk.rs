@@ -1,4 +1,4 @@
-//! `ChatBackend` 的第一個實作：包上游 `matrix-sdk`。**這是整個 crate 唯一 `use matrix_sdk` 的檔**（plan-v1 §7.2）。
+//! `ChatBackend` 的第一個實作：包上游 `matrix-sdk`。**房間這一側唯一 `use matrix_sdk` 的檔**（另一個是 E2EE 引擎 `crypto_engine.rs`，/docs/design/overview/architecture-v2.md §8）。
 //!
 //! 對上游的依賴，逐條列（每個 PR 要寫的）：
 //! - `Client`（builder、sqlite store、`restore_session`、`sync_once`、`joined_rooms`）
@@ -8,7 +8,7 @@
 //! - ruma 的 `RoomMessageEventContent`／`MessageType::new`（組 `m.room.message`）
 //!
 //! 加密在這一版**完全在 matrix-sdk 裡**（`Room::send` 自己 Megolm、`TimelineEvent` 自己解）：我們沒有直接碰 `OlmMachine`，
-//! 所以 plan-v1 §7.2 的 `RoomCrypto` trait 這一版還沒有東西可包；接管送訊息（附件宣告需要，見 `send_file`）那一版才會出現。
+//! 這是一般 Matrix 帳號的路；wbf 帳號的 E2EE 引擎在 `crypto_engine.rs`（/docs/design/keys/e2ee-rpc.md）。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -46,8 +46,8 @@ pub struct MatrixBackend {
 }
 
 impl MatrixBackend {
-    /// 登入：拿到裝置與 token，store 落在 `store_dir`（crypto 與 state 兩個 sqlite，plan-v1 §7.1 說的「非存不可」）。
-    /// store 用 `store_key` 包住它自己的 `StoreCipher`（local-cache-db.md §5.3）：這把是 `Vault::matrix_store_key()`。
+    /// 登入：拿到裝置與 token，store 落在 `store_dir`（crypto 與 state 兩個 sqlite，是上游自己非存不可的；聊天內容的快取在 `cache.db`，/docs/design/storage/local-cache-db.md）。
+    /// store 用 `store_key` 包住它自己的 `StoreCipher`（/docs/design/storage/local-cache-db.md §4.3）：這把是 `Vault::matrix_store_key()`。
     ///
     /// Args:
     ///     server: example: "http://localhost:6167"
@@ -154,7 +154,7 @@ impl MatrixBackend {
         let member_count = room.joined_members_count();
         let is_direct = room.is_direct().await.unwrap_or(false);
 
-        // chat-model §3.1：m.direct 有它且成員剛好兩個才是 Direct；§3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
+        // /docs/design/rooms/chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；/docs/design/rooms/chat-model.md §3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
         let (kind, direct_peer) = if is_direct && member_count == 2 {
             let peer = room
                 .direct_targets()
@@ -200,7 +200,7 @@ impl ChatBackend for MatrixBackend {
         self.describe(&room).await
     }
 
-    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（chat-model §4.3：`event_id` 是可攜的權威）。
+    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（/docs/design/rooms/chat-model.md §4.3：`event_id` 是可攜的權威）。
     /// 標準 Matrix 沒有「從某則事件往前翻」的 API，所以分兩步：
     ///
     /// 1. `/context/{event_id}` 拿到**那一則之前**的 token（`prev_batch_token`）；
@@ -261,9 +261,9 @@ impl ChatBackend for MatrixBackend {
         Ok(response.response.event_id.to_string())
     }
 
-    /// ⚠️ 附件宣告（約定 §5.2）這一版帶不出去：`Room::send` 不能加 header，`Event/Send` 在 server 端還是提案。
-    /// 所以 server 的媒體計數不會 +1，這則的附件過保護期會被清（等 server 定案；到時這裡改走 `WbfClient::send_event`，
-    /// 那需要自己 Megolm 加密，也就是 `RoomCrypto` 出現的時候）。呼叫者要知道這件事，CLI 會印警告。
+    /// ⚠️ 附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）這條路帶不出去：`Room::send` 不能加 header。
+    /// 所以 server 的媒體計數不會 +1，這則的附件過保護期會被清。呼叫者要知道這件事，CLI 會印警告。
+    /// wbf 帳號不走這裡：它走 `Event/Send` 宣告附件（wbf-core 的 `upload_ops.rs`）。
     async fn send_file(
         &self,
         id: &str,
@@ -351,7 +351,7 @@ impl ChatBackend for MatrixBackend {
     }
 }
 
-/// server 端房間金鑰備份的設定（local-cache-db.md §10.3）。
+/// server 端房間金鑰備份的設定（/docs/design/keys/room-key-backup.md §3）。
 ///
 /// `auto_enable_backups`：`login` 之後 server 上沒有 backup version 就建一個，並開始上傳。
 /// ⚠️ 建 version 時 **backup 的私鑰只存在本機 crypto store**，沒進 SSSS —— 所以在使用者跑
@@ -361,7 +361,7 @@ impl ChatBackend for MatrixBackend {
 /// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，🚫 不一開機就全下載。
 ///
 /// Args:
-///     server_backup: conf 的 `SERVER_BACKUP`（CLI 規格 §10）, example: true
+///     server_backup: conf 的 `SERVER_BACKUP`（/docs/design/rpc-specs/wbf-cli-spec.md §10）, example: true
 /// Return:
 ///     EncryptionSettings   `server_backup` 是 false 時只有 `auto_enable_backups` 關掉
 fn backup_encryption_settings(server_backup: bool) -> EncryptionSettings {
@@ -376,7 +376,7 @@ fn backup_encryption_settings(server_backup: bool) -> EncryptionSettings {
     }
 }
 
-/// `key-backup status` 印的東西（CLI 規格 §3.6）。🚫 不含任何金鑰內容。
+/// `key-backup status` 印的東西（/docs/design/rpc-specs/wbf-cli-spec.md §3.6）。🚫 不含任何金鑰內容。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackupStatus {
     /// server 上有沒有 backup version。
@@ -392,7 +392,7 @@ pub struct BackupStatus {
     /// `has_recovery_key`——🚫 名字不要承諾我們驗不到的事。
     ///
     /// **只有 `Enabled` 算數**：`Unknown`、`Incomplete`、`Disabled` 一律當作沒有
-    /// （fail closed，§10.7 的閘門靠這個判斷）。
+    /// （fail closed，/docs/design/keys/room-key-backup.md §7 的閘門靠這個判斷）。
     pub recovery_enabled: bool,
     /// 上游 `RecoveryState` 的名字，給人看的。
     pub recovery_state: String,
@@ -414,7 +414,7 @@ impl MatrixBackend {
         Ok(BackupStatus {
             exists_on_server,
             enabled_locally: backups.are_enabled().await,
-            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（local-cache-db.md §10.7）。
+            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（/docs/design/keys/room-key-backup.md §7）。
             recovery_enabled: matches!(recovery_state, RecoveryState::Enabled),
             recovery_state: format!("{recovery_state:?}"),
         })
@@ -423,7 +423,7 @@ impl MatrixBackend {
     /// 把 crypto store 裡的房間金鑰推上 server，**傳完才回來**（`key-backup upload`）。
     ///
     /// 為什麼要有這個命令：上游的上傳是背景 task，而 `BackupUploadingTask` 的 `Drop` 直接
-    /// `abort()`——CLI 一個命令跑完就 exit，那個 task 可能一筆都還沒送出去（local-cache-db.md §10.6）。
+    /// `abort()`——CLI 一個命令跑完就 exit，那個 task 可能一筆都還沒送出去（/docs/design/keys/room-key-backup.md §6）。
     ///
     /// Return:
     ///     Ok(())        追平了
@@ -437,7 +437,7 @@ impl MatrixBackend {
             .map_err(|error| SdkError::Network(format!("key backup upload: {error}")))
     }
 
-    /// 把 crypto store 裡的**全部**房間金鑰倒進本地快照（`key-backup save`；local-cache-db.md §10.4）。
+    /// 把 crypto store 裡的**全部**房間金鑰倒進本地快照（`key-backup save`；/docs/design/keys/room-key-backup.md §4）。
     ///
     /// 上游直接寫檔，金鑰不經過我們的記憶體。先寫 `temp_path` 再 rename 到 `path`：
     /// 寫到一半斷電不會把上一份好的蓋成半個檔。
@@ -545,7 +545,7 @@ async fn build_client(
 ) -> Result<Client, SdkError> {
     std::fs::create_dir_all(store_dir)?;
     // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
-    // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（local-cache-db.md §5.3）。
+    // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（/docs/design/storage/local-cache-db.md §4.3）。
     let store_config = SqliteStoreConfig::new(store_dir).key(Some(store_key.as_bytes()));
     Client::builder()
         .homeserver_url(server)
@@ -568,7 +568,7 @@ async fn build_client(
                         path.chars().count()
                     ))
                 } else {
-                    // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
+                    // store 是上游自己的狀態（裝置、sync、它的快取），聊天紀錄的權威在 cache.db：刪掉重新 login 就好；不做遷移（/docs/design/storage/local-cache-db.md §1）。
                     SdkError::Usage(format!(
                         "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
                     ))
@@ -686,7 +686,7 @@ mod context_plan_tests {
     }
 
     /// 🚨 **`next` 從原始順序取**（PR #36 審查 rumia🔴）。這一頁新到舊是 `[$t, $r]`，最舊的 `$r` 是**對 `$t` 的 reaction**：
-    /// 顯示時會折進 `$t`，但下一頁要從 `$r` 之前問 —— 而且 `$r` 本身要原樣留著給快取存（local-cache-db.md §7）。
+    /// 顯示時會折進 `$t`，但下一頁要從 `$r` 之前問 —— 而且 `$r` 本身要原樣留著給快取存（/docs/design/messages/edits-and-redactions.md）。
     #[test]
     fn a_timeline_page_keeps_every_raw_event_and_its_next_is_the_oldest() {
         let target = plaintext(serde_json::json!({

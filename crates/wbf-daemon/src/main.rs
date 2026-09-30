@@ -12,10 +12,10 @@
         clippy::string_slice
     )
 )]
-//! `wbf-matrix-client-daemon`：這一版只有 `-s`（常駐）。單發命令（`daemon <命令>`，architecture-v2 §0.2）
-//! 與資料平面在下一支 PR。
+//! `wbf-matrix-client-daemon`：只有 `-s`（常駐）。還沒做：單發命令（`daemon <命令>`，/docs/design/overview/architecture-v2.md §0.2）、
+//! 資料平面（/docs/design/rpc-specs/local-interface.md §8）。
 //!
-//! 起動的順序照 architecture-v2 §4.3 的五步（前端寫 token → spawn → **daemon 宣告 ready** →
+//! 起動的順序照 /docs/design/rpc-specs/local-interface.md §3 的五步（前端寫 token → spawn → **daemon 宣告 ready** →
 //! 前端抹掉 token 檔 → 之後只在記憶體裡）。⭐ 這支負責的是第 3 步，而「宣告 ready」是**一個邊緣**，
 //! 不是一個狀態：所以 `daemon.json` 在綁定**之前**先刪掉，綁好之後才 temp＋rename 寫進去 ——
 //! 前端等的那個檔出現的瞬間，port 一定已經在聽了，而且它一定不是上一次留下來的。
@@ -45,7 +45,7 @@ struct Cli {
     /// 資料目錄
     #[arg(long, env = "WBF_DATA_DIR")]
     data_dir: PathBuf,
-    /// `daemon.token` 的路徑（前端產生的 256 byte 隨機檔，architecture-v2 §4.3）。預設 <data dir>/daemon.token
+    /// `daemon.token` 的路徑（前端產生的 256 byte 隨機檔，/docs/design/rpc-specs/local-interface.md §3）。預設 <data dir>/daemon.token
     ///
     /// ⚠️ daemon 讀完就不再回頭讀它：前端該在 ready 之後把它抹掉（`wbf_daemon::token::shred`）
     #[arg(long)]
@@ -53,10 +53,10 @@ struct Cli {
     /// RPC 的 port；0 就隨機，寫進 <data dir>/daemon.json
     #[arg(long, default_value_t = 0)]
     rpc_port: u16,
-    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（CLI 規格 §10.1）
+    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）
     #[arg(long, env = "WBF_CONFIG")]
     config: Option<PathBuf>,
-    /// 單發命令：`daemon <命令> [參數…]`（architecture-v2 §0.2）。⚠️ 還沒實作
+    /// 單發命令：`daemon <命令> [參數…]`（/docs/design/overview/architecture-v2.md §0.2）。⚠️ 還沒實作
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 }
@@ -144,7 +144,7 @@ fn main() -> ExitCode {
         Ok(keys) => Arc::new(keys),
         Err(actual) => {
             eprintln!(
-                "the daemon token at {} is {actual} bytes; it must be exactly {} (architecture-v2 §4.3)",
+                "the daemon token at {} is {actual} bytes; it must be exactly {} (/docs/design/rpc-specs/local-interface.md §3)",
                 token_path.display(),
                 wbf_daemon::pack::TOKEN_LEN
             );
@@ -176,7 +176,7 @@ fn main() -> ExitCode {
         let policy = EncryptionPolicy::enforced();
         let handle = Handle::new(&cli.data_dir, policy.clone(), settings);
 
-        // 🚨 **`-s` 的第一件事：拿寫權**（architecture-v2 §0.2）。`-s` 就是「我要寫」的意思，
+        // 🚨 **`-s` 的第一件事：拿寫權**（/docs/design/overview/architecture-v2.md §0.2）。`-s` 就是「我要寫」的意思，
         // 所以🚫 不等到第一個寫請求才拿 —— 拿不到就不該啟動（fail closed）。
         // ⚠️ 寫權活在 `handle` 裡，所以它要一路拿到程序結束。
         if let Err(error) = handle.grant_write_access() {
@@ -247,7 +247,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// 啟動路徑只有兩種，而且**互斥**（architecture-v2 §0.2）。
+    /// 啟動路徑只有兩種，而且**互斥**（/docs/design/overview/architecture-v2.md §0.2）。
     #[test]
     fn there_are_exactly_two_ways_to_start_and_they_are_mutually_exclusive() {
         assert!(matches!(start_mode(true, Vec::new()), Ok(StartMode::Serve)));

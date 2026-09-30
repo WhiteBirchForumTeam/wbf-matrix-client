@@ -1,4 +1,4 @@
-//! E2EE 引擎對著真的 wbfuwunel 跑（e2ee-walkthrough.md §16.3 第 3 支的「收」那半）。平常 `#[ignore]`；要跑：
+//! E2EE 引擎對著真的 wbfuwunel 跑（/docs/design/keys/e2ee-walkthrough.md §16.3 第 3 支的「收」那半）。平常 `#[ignore]`；要跑：
 //!
 //! ```text
 //! WBF_E2E_SERVER=http://127.0.0.1:6167 WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=<檔> \
@@ -7,7 +7,7 @@
 //!
 //! ⚠️ `--test-threads=1`：兩條測試都用同一個帳號（alice），並行跑會互相分到對方裝置的房間金鑰、互相推 CryptoState。
 //!
-//! 走的是 e2ee-walkthrough §6 那條最容易漏的路：同一個帳號的**兩台裝置** A、B，各自只靠 WS（橋 ＋ `Device/Fetch`）——
+//! 走的是 /docs/design/keys/e2ee-walkthrough.md §6 那條最容易漏的路：同一個帳號的**兩台裝置** A、B，各自只靠 WS（橋 ＋ `Device/Fetch`）——
 //! A 上傳金鑰、查到 B、跟 B claim OTK 建 Olm、把一個加密房的房間金鑰用 to-device 發給 B；B 用 `Device/Fetch` 拉、匯進自己的
 //! OlmMachine、拿到那把房間金鑰、叫 server 銷毀、再拉一次是空的。🚫 全程沒有 `/sync`、沒有 matrix-sdk 的 `Client`。
 #![cfg(feature = "matrix")]
@@ -261,7 +261,7 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     let _ = std::fs::remove_dir_all(&b.store_dir);
 }
 
-// ---- 第 4 階段：訂閱長活，A 分房間金鑰時 server 推的 `Device/Push` 要打進 B 的 handle（ws-receive-dispatch.md §3）----
+// ---- 第 4 階段：訂閱長活，A 分房間金鑰時 server 推的 `Device/Push` 要打進 B 的 handle（/docs/design/daemon/ws-receive-dispatch.md §3）----
 
 /// 跟上面同一條路，但 B 用 `device_subscription`（長活）：A 分房間金鑰 → server 推 `Push` 給 B 的訂閱 → handle 收到，
 /// 而且同一條連線上 B 之後跑 `Fetch`（串流會話）也不會把訂閱的 pack 吃掉、沒有任何 pack 無主。
@@ -434,7 +434,7 @@ async fn http_post(session: &Session, path: &str, body: serde_json::Value) -> se
 /// 用 `Recent` 把這個房的密文事件拉下來（新→舊）直到看到 `wanted_event_id`，交給引擎解。
 /// 實跑（2026-09-21）是 0 次輪詢就看到；留著輪詢只是防 server 端寫入與索引之間哪天出現一拍。
 /// 📎 曾經以為 Recent 看不到帶 room_version 的加密訊息，追下去是 txn_id 跨輪重用被 server 去重、拿到上一輪別的房的 event_id——
-/// 不是 Recent 的問題（見 e2ee-walkthrough §16.4）。
+/// 不是 Recent 的問題（見 /docs/design/keys/e2ee-walkthrough.md §16.4）。
 async fn read_room_events(
     device: &mut Device,
     room_id: &str,
@@ -654,7 +654,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         panic!("stale version must be refused: {stale:?}")
     };
     let current_room_version = current_room_version.expect("1506 carries the current room version");
-    // 🚫 不比大小：client 把房間版本號當不透明的值，只比相不相等（e2ee-rpc.md）。
+    // 🚫 不比大小：client 把房間版本號當不透明的值，只比相不相等（/docs/design/keys/e2ee-rpc.md）。
     // server 原本的定義是只增不減的位置，外部審查 #5 之後可能改成成員集合的雜湊（wbfuwunel `docs/room-version-prev` 分支）——兩種定義下「變了」都成立。
     assert_ne!(current_room_version, first.versions.room_version);
 

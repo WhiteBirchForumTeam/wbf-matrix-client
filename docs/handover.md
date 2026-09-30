@@ -1,93 +1,55 @@
 # 交接：現在在哪、怎麼跑、下一步
 
-> 給下一個接手的人（人或 agent）。2026-09-06 寫、2026-09-30 更新（上一版 2026-09-21），每次交接更新。設計理由不在這裡，在 `docs/design/`；這裡只講**現況、怎麼跑、坑、下一步**。
+> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-09-30）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
+> 這裡只講**現況、怎麼跑、坑、下一步**。每一支 PR 做了什麼看 git 歷史與 Forgejo 上的 PR，這裡不重述。
 
-## 1. 現況一句話
+## 1. 現況
 
-📍 **最新（2026-09-30）**：PR #1–#61 全部合併（#43 擱置等 wbfuwunel #64）；**#62（E2EE 的 RPC 面，`design/keys/e2ee-rpc.md`）審查中**——rumia、salvia 在 `861f6e3` 批准，cirno 兩輪擋的文件殘句（16 處＋7 處）都改了、等他重審；2026-09-30 對本機真 server 跑過整條。下面依時間講每一段做了什麼；最新兩段在本節最後（「五條線」「E2EE 的 RPC 面」）。
-⏳ 等維護者：RPC 錯誤碼 1401 或 1506、補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（e2ee-rpc.md §8）；`[profile.dev]` 降低除錯資訊的提案。
+PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照層次：
 
-第 1 步（`wbf-wire` codec）、第 2 步（`wbf-sdk` 密碼層／通道／上傳下載、`apps/wbf-cli`）做完；
-第 3 步（接 matrix-sdk 做房間）第一版做完：`rooms`、`send --text|--file`、`watch`、`read`、`files` 對本機 wbfuwunel 全走過。
-本地資料庫三步都合併了：vault 與金鑰（#11）、`cache.db` 多帳號混存（#13）、媒體儲存池（#14）。`Event/Recent` 跟上 server 的拉窗＋`Batch` 串流（#16）。
-PR #19 做完資料目錄的兩層路徑加密、`account` 一族與房間金鑰備份；PR #20 定了架構 v2 的形狀。
-**架構 v2 的第一塊落地了**：命令的「做什麼」全部搬進 `crates/wbf-core`（#24），
-`apps/wbf-cli` 只剩「解析參數 → 叫一個 core 方法 → 印 JSON」。
-**架構 v2 的 daemon 也落地了**：`crates/wbf-daemon` 有加密的 RPC、資料目錄獨佔、token 生命週期，
-全部有 core 對應的 method 都接上了（#30、#31）。daemon 執行期前三階段（#32：事件帶 `user`／`job`、
-`cache.db` 單一寫入者、`sync=local|server|both`）與 backend 接縫（#33：`transport` 就是選 backend、探測決定用哪一套）也合了。
-PR #1–#34 全部合併（到 2026-09-14 為止；最新的合併狀況見本節開頭）。
+- **線上協議與媒體**：`wbf-wire` 的 codec 對著 server 的黃金向量；`wbf-sdk` 的分塊上傳／下載／seek／續傳／串流、每塊 AEAD（`/docs/design/media/wbf-client-convention-for-chunk.md`）。
+- **本地資料**：vault 與子金鑰、資料目錄兩層路徑加密（`/docs/design/storage/vault-and-keys.md`）；`cache.db` 一個 server 一份、多帳號混存、單一寫入者（`/docs/design/storage/local-cache-db.md`、`/docs/design/daemon/daemon-runtime.md` §2）；
+  媒體池（`/docs/design/media/media-pool.md`）；房間金鑰的本地備份（`/docs/design/keys/room-key-backup.md`，只對一般 Matrix 帳號）。
+- **daemon**：加密的 RPC、資料目錄獨佔、token 生命週期（`/docs/design/rpc-specs/local-interface.md`）；方法與推播照 `/docs/design/rpc-specs/rpc-spec.md`；
+  `sync=local|server|both`、`transport` 選 backend（`/docs/design/daemon/daemon-runtime.md` §3）。
+- **帳號**：探活不帶 token；wbf 帳號不建 matrix-sdk 的 Client，登入登出走標準 HTTP、`m/` 只有 crypto store（`/docs/design/daemon/account-session.md`）。
+- **連線**：一個帳號五條線（Misc、Upload、Download、Rooms、Keys），解鎖／登入後 daemon 全開、每 15 秒看一次、死了重開、各自心跳（`/docs/design/daemon/link-pool.md`）；
+  收包依會話表交付、順序亂掉不出事（`/docs/design/daemon/ws-receive-dispatch.md`）。
+- **房間**：wbf 帳號的房間清單走橋、送訊息與送檔走 `Event/Send` 並宣告附件；訂閱線收推播寫快取、🚫 不碰水位，水位只由 UI 叫的 `sync.recent` 推（`/docs/design/rooms/room-sync.md`）。
+  訊息的 edit／redact 照 `/docs/design/messages/edits-and-redactions.md` 存。
+- **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
+  加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
 
-**2026-09-15 → 09-21 這一段：E2EE 全走 WS 做到「可以送、可以收、被擋了知道怎麼修」。** 房間歷史走 wbf（#35–#39）、account destroy 什麼都不留（#40）、
-跟上 server 的橋（#42）、E2EE 走讀文件（#44）；然後 issue #45（server 的房間版本號／F1–F4 做完後 client 要對齊的四件事）分四支全合：
-#46 協議層（向量、1506、`room_version`、裝置版本號雜湊）、#47 橋的通用入口（`call_bridge`、Members、發 to-device）、
-#48 `OlmMachine` 引擎與 to-device 的「拉」（Fetch／匯入／落地／銷毀鎖成一步、Subscribe／Unsubscribe）、#49 送（`refresh_room_devices`、
-`encrypt_and_send` 帶 `room_version`、1506 是結果不是錯、`decrypt_room_event`）。**#45 的驗收對真 server 走通**：Bob 登新裝置 → Alice 帶舊號碼送被 1506 擋 →
-refresh 只比出 Bob、金鑰補到新裝置 → 同 txn_id 重送接受 → 兩台都解得開。分工定案（e2ee-walkthrough §16.6）：**訊息是 UI 的，金鑰是 daemon 的**。
+**還沒有**：UI；加密附件（加密房送檔仍拒）；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
+已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面 HTTP；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
-**第 4 階段的 SDK 那半（2026-09-21）**：`WsChannel` 底下換成 `link::WsLink`——讀取 task ＋ 送出 task ＋ 會話表（`design/daemon/ws-receive-dispatch.md`）。每個收到的 pack 依 id 交給在等的會話，
-推播進訂閱的 handle（`WbfClient::device_subscription`），`Superseded` 進訂閱當終點，順序亂掉不出事；「丟推播」那段拿掉了。每個收到的 pack 都經過一個鉤子（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI。
-
-**連線生命週期（2026-09-21，`design/daemon/link-pool.md`）**：一個帳號的連線池在 core，要用才開、斷了下次要用再開、登出全關；
-每條線開關發 `link.state`、收到的每個 pack 發 `pack.received`（只有標頭）。daemon 接上了 `subscribe`／`unsubscribe`、每條 RPC 連線一個推播 task（訂了才推；`progress`／`note` 發那個請求的連線不用訂）、`desync`。
-每條線自己一個**心跳**（照 WireGuard：24 秒一次、最近 20 秒有通訊就跳過、沒 Pong 就當死），閘著的線不會被 server 的 300 秒 idle 收掉。
-
-**帳號的會話（2026-09-21，`design/daemon/account-session.md`，維護者定的規矩）**：探活不帶 token（未登入的 WS Hello）、以 server 為鍵；登入登出只走標準 HTTP，WS 只用 token；
-登出是「封池 → HTTP 登出（只有成與不成）→ 成了關池（等在跑的做完）→ 清本地 → 解封；不成就解封、no-op」（#54）。
-**B 也合了（#56，2026-09-22）：wbf 帳號不建 matrix-sdk 的 Client**——登入先探活，wbf 走自己包的 HTTP `/login`、`m/` 由 `OlmEngine` 開（只有 crypto store）、`Session::backend` 記住走哪邊；
-拿到 token 之後本地任一步失敗都撤 token（兩條路共用）。房間清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、送訊息與送檔走 `Event/Send`（附件宣告成立；加密與否問單項 `GetStateEvent`：加密房的文字 2026-09-29 起先分金鑰再加密送（e2ee-rpc.md），檔案仍拒）；
-備份／watch／`/context` 對 wbf 帳號回 1100、登出閘門只認本機 recovery key（account-session.md §6 有表）。裝置金鑰 2026-09-29 起開 `Keys` 線時上傳（e2ee-rpc.md §5）。
-
-**訂閱線的內容（2026-09-22，`design/rooms/room-sync.md`，維護者定：先明文房間、不接 RPC、補窗交給 UI）**：池開線走通用的 `init_connection(account, role, client)`，
-`Rooms` 角色（當時叫 `Subscriptions`）就送 `Event/Subscribe`（帳號層、不帶 cg_seq）、起收推播的 task：一包寫一包、commit 後發 `room.message`。
-**daemon 只管訂閱當下，不碰水位**：水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動（新參數 `since` 是 UI 自己記的起點）；推播漏掉的（gap／丟包／壞包／寫失敗）只講一聲，誰記有沒漏是 UI 的事（維護者 2026-09-23：永遠拿不到也不管）。
-訂閱會話結束（含 socket 還活著的 `Error`）task 把那格線關掉、池發 `link.state: closed`；task 🚫 不重訂，重開重訂是看線迴圈的事（見下面 2026-09-29 那段）。sdk codec 對著 server 向量；core 用記憶體對接的假 server 釘住「推播不碰水位、存不了的不通知、訂閱會話結束就關線、下次開才重訂」；真 server 兩帳號 e2e 過。
-
-**訂閱線的金鑰那半（2026-09-24，`design/keys/key-sync.md`，維護者定：推的與拉的走同一支）**：`init_connection` 裡多一個 `Device/Subscribe` 會話 → `pull_to_device` 追平 → 收金鑰的 task；
-推來一包與 `Fetch` 的一窗都走 `OlmEngine::import_items`（匯入 → 落地 → 銷毀那一包）；gap、匯失敗、壞包就從佇列頭再拉一次——`Fetch` 🚫 不帶 `cd_seq`，佇列頭就是水位（維護者 2026-09-26，wbfuwunel #87）；被接手（1505）就停、發 `keys.state: stopped`、關掉自己那條線、🚫 task 不重訂；
-`Device/Fetch`／`ItemsDestroy` 走金鑰那條線（池的 `reuse`）；登出前 `Device/Unsubscribe`；長活的 `OlmEngine` 在 `Core::crypto_engines`。新推播 `keys.state`（rpc-spec §4）。
-
-**五條線、daemon 自己開、背景看著（2026-09-29，`design/daemon/link-pool.md` §1、§3.1，維護者定：訂閱連線總是由 daemon 搞定）**：房間與金鑰的訂閱拆成兩條（`LinkRole::Rooms`／`Keys`；server #85 放到每台裝置 8 條）。
-鉤子 `Core::ensure_links`（`link_keeper.rs`）：解鎖了就一個一個 wbf 帳號看五條線，開著的不動、有命令在用的算開著、沒開或死了的開一條；有登入／登出／摧毀在跑（帳號生命週期鎖在別人手上）就整輪跳過。
-daemon 在 `vault.unlock`、`account.add` 成功後背景叫一次，常駐時 `Handle::keep_links_open` 每 15 秒一輪（開不起來就加倍、上限 5 分鐘；`daemon.shutdown` 就停；`TRANSPORT = http` 不跑）。
-🚫 沒有開／關訂閱線的 RPC：UI 要不要收推播就是 `subscribe`（維護者：「sync.open、sync.close 應該是指是否要推到 RPC UI 端的一個 flag」）。`Core::open_subscriptions`／`close_subscriptions` 拿掉了。
-
-**E2EE 的 RPC 面（2026-09-29，`design/keys/e2ee-rpc.md`，維護者定：狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再一起回）**：房間版本號與成員的裝置版本號（`RoomDevices`）存在 UI，`room.refresh_devices` 拿、`room.send_text` 的 `room_devices` 帶回來；送出前一律先分金鑰（第一次、該換、多了裝置）再加密帶號碼送；被 1506 擋 → daemon 自動 refresh，回 **1401** 帶 `data`（新狀態＋`txn_id`），🚫 不自動重送；`Misc`／`Rooms` 宣告 `org.wbftw.device_versions`（重 hello 的三處改成帶這份）；`DeviceChanged` 原樣轉 `devices.changed`；開 `Keys` 線上傳裝置金鑰、`CryptoState` 一到就補一次性金鑰；收到時有金鑰就解（密文明文一起存），金鑰晚到就補解、再發 `room.message`。2026-09-30 對本機真 server 跑過整條（alice 送、bob 解；bob 新裝置 → 1506 → daemon 回新狀態 → 重送、新舊裝置都解得開），e2ee-rpc.md §9。
-
-**還沒有：UI、加密附件、wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀舊訊息）、房間自設的換金鑰期限、監督者的其他部分（task panic 收攤、重連時重探 backend）、交叉簽章、cancel、資料平面 HTTP、單發命令列。**
+⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8）；
+matrix-sdk `Client` 那條要不要改回只開 crypto 與 state 兩個 store（`/docs/design/storage/local-cache-db.md` §4）。
 
 ## 2. 讀哪些文件、什麼順序
 
-| 順序 | 檔 | 講什麼 |
-|---|---|---|
-| 1 | [`README.md`](../README.md) | 佈局、狀態表、怎麼跑測試、貢獻規則 |
-| 1.5 | [`design/overview/architecture-v2.md`](design/overview/architecture-v2.md) | **daemon／RPC／四個前端的分層**（維護者 2026-09-09 定的方向）。要動介面之前先看這份 |
-| 1.55 | [`design/rpc-specs/rpc-spec.md`](design/rpc-specs/rpc-spec.md) | **草案**——前端 ↔ daemon 的逐條訊息：method 表、`params`／`result`、code 表（`CoreErrorKind` 的號碼在這）、推播、資料平面的 HTTP。2026-09-12 第一版；§10 每個 method 的現況（判準：走我們自己的 WS 才算做完） |
-| 1.57 | [`design/daemon/daemon-runtime.md`](design/daemon/daemon-runtime.md) | daemon 跑起來之後：多帳號怎麼落到 `cache.db`（§2 **一個 server 一個寫入者**，#32 做了）、UI 的每個動作走本地讀還是上游拉（§3 `sync` 參數；§3.5 **backend 與 transport**，#33）、事件扇出與 `user` 規則（§5）、通知為什麼不在 rpc-spec（§7）、`job` 與 `cancel`。**§11 九階段**：1–3 ✅，4–9 還沒 |
-| 1.58 | [`design/keys/e2ee-walkthrough.md`](design/keys/e2ee-walkthrough.md) | **E2EE 從建房到退出每一步發生什麼**（§1–§11）、只把 `OlmMachine` 當狀態機要自己寫哪十件（§13）、**#45 四支的落點與實跑踩到的事（§16.1–§16.4）、整套版本號驅動的分發邏輯對照 server 設計（§16.5）、UI 與 daemon 的分界（§16.6）**。要碰 `crypto_engine` 之前先看這份 |
-| 1.6 | [`design/keys/to-device-client.md`](design/keys/to-device-client.md) | **client 端怎麼接 `0x16 Device`**（to-device：金鑰、驗證、SSSS）。⚠️ 線上格式的權威在 wbfuwunel 的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`，這份只寫我們最容易寫錯的地方與待辦 |
-| 2 | [`design/overview/plan-v1.md`](design/overview/plan-v1.md) | 範圍、順序、進度；**§7.1**（本地不存）與 **§7.2**（耦合方向：上游 SDK 是可拆的零件）是所有程式的前提 |
-| 3 | [`design/media/wbf-client-convention-for-chunk.md`](design/media/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、seek；**§5.2 送事件要宣告附件**（等 server 定案） |
-| 4 | [`design/rooms/chat-model.md`](design/rooms/chat-model.md) | 聊天模型（Conversation／Message）、怎麼接 Matrix、Telegram 有 Matrix 沒有的逐列定案、`r_seq`／`g_seq`、§6 第 3 步範圍與差異 |
-| 5 | [`design/rpc-specs/wbf-cli-spec.md`](design/rpc-specs/wbf-cli-spec.md) | CLI 每個命令、exit code、manifest、狀態檔、session 檔、驗收腳本 |
-| 6 | [`design/storage/local-cache-db.md`](design/storage/local-cache-db.md) | 本地資料庫：主金鑰與五把子金鑰（§4）、房間金鑰備份（§10）、佈局（§5.6）、`cache.db` 的 schema 與多帳號混存規則（§6）、媒體儲存池與它的檔案格式（§8、§8.8）。檔頭的進度表三段都 ✅ |
+設計文件依類別分資料夾，全部列在 [`/docs/design/index.md`](design/index.md)。第一次接手照這個順序讀：
 
-server 端的權威在 wbfuwunel repo：`docs/design/chunked-upload-spec.md`（線上規格）、`room-seq-and-recent.md`、`media-attachments.md`（提案）、`wbf-vectors.json`（整份複製到本 repo，不手改）。
+1. [`/README.md`](../README.md)：佈局、狀態表、怎麼跑測試、貢獻規則。
+2. `/docs/design/overview/architecture-v2.md`：daemon／RPC／前端的分層，§8 耦合方向（上游 SDK 是可拆的零件）是所有程式的前提。
+3. `/docs/design/rpc-specs/rpc-spec.md`：前端 ↔ daemon 的每一條 method、錯誤碼、推播。
+4. `/docs/design/daemon/daemon-runtime.md` 與同資料夾的 `/docs/design/daemon/link-pool.md`、`/docs/design/daemon/account-session.md`：daemon 跑起來之後誰擁有什麼。
+5. 要碰哪一塊再讀那個資料夾：房間 `rooms/`、訊息 `messages/`、E2EE `keys/`（`/docs/design/keys/e2ee-rpc.md` 最權威）、本地資料 `storage/`、媒體 `media/`。
 
-📌 2026-09-22 多一份：`design/rooms/room-sync.md`（訂閱線的內容：`init_connection`、推播寫快取、不碰水位、補窗與漏包都是 UI 的事）。
+server 端的權威在 wbfuwunel repo：`/docs/design/chunked-upload-spec.md`（分塊上傳的線上格式）、`room-seq-and-recent.md`、`media-attachments.md`、`wbf-vectors.json`（整份複製到本 repo 的 `/docs/design/wire/`，不手改）。
 
 ## 3. 程式碼在哪
 
 ```
-crates/wbf-wire/         pack、EncryptedFileInfo、CRC-32C；純函數。tests/vectors.rs 對 docs/design/wire/wbf-vectors.json
+crates/wbf-wire/         pack、EncryptedFileInfo、CRC-32C；純函數。tests/vectors.rs 對 /docs/design/wire/wbf-vectors.json
 crates/wbf-sdk/src/
-  cipher.rs chunk_block.rs chunk_crypto.rs   密碼層（約定 §2–§4、§7）；tests/client_vectors.rs 產生並比對 wbf-client-vectors.json
+  cipher.rs chunk_block.rs chunk_crypto.rs   密碼層（/docs/design/media/wbf-client-convention-for-chunk.md §2–§4、§7）；tests/client_vectors.rs 產生並比對 wbf-client-vectors.json
   protocol.rs channel.rs client.rs upload.rs download.rs manifest.rs login.rs error.rs   通道與上傳／下載（線上規格）
   chat.rs                聊天模型與 ChatBackend trait，沒有 Matrix 型別
-  vault.rs               local.key、六把子金鑰、session.sealed、封 recovery key（local-cache-db §4）；沒有 SQLite、沒有 matrix-sdk
-  account_dir.rs         資料目錄名的確定性加密（`<b58 nonce>_<b58 密文>`，local-cache-db §11）；沒有 IO
-  room_keys.rs           本地金鑰快照放哪、用什麼 passphrase、權限（local-cache-db §10.4）；不碰 matrix-sdk
-  cache.rs               cache.db（feature `cache`，SQLCipher；local-cache-db §6）：users／rooms／events／events_synced_log／room_list／sync_state／read_positions／media／event_media
+  vault.rs               local.key、六把子金鑰、session.sealed、封 recovery key（/docs/design/storage/vault-and-keys.md §1）；沒有 SQLite、沒有 matrix-sdk
+  account_dir.rs         資料目錄名的確定性加密（`<b58 nonce>_<b58 密文>`，/docs/design/storage/vault-and-keys.md §2）；沒有 IO
+  room_keys.rs           本地金鑰快照放哪、用什麼 passphrase、權限（/docs/design/keys/room-key-backup.md §4）；不碰 matrix-sdk
+  cache.rs               cache.db（feature `cache`，SQLCipher；/docs/design/storage/local-cache-db.md §5）：users／rooms／events／events_synced_log／room_list／sync_state／read_positions／media／event_media
   media_pool.rs          媒體儲存池的落地格式（64 KiB 段各自 AEAD、暫定段、續傳、BLAKE3 檔名）；沒有 SQL、沒有網路
   media.rs               fetch／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
   event_json.rs          原始 Matrix 事件 JSON → Message；matrix backend 與 recent 共用，不掛 feature
@@ -104,7 +66,7 @@ crates/wbf-sdk/src/
                          ItemsDestroy／ItemsDestroyed／CryptoState）
   channel.rs             `PackChannel`（request／request_stream／`subscribe`，後者預設回 Usage）、`Channel` enum、`HttpChannel`；`WsChannel` 是 `WsLink` 的薄殼（`connect_with_hook` 帶鉤子）
   transport.rs           bytes 進出：`FrameSource`／`FrameSink`，tungstenite 一組、`memory_pair` 一組（測試餵亂序用）。不知道什麽是 pack
-  sessions.rs            **會話表**（ws-receive-dispatch.md §2–§4）：`SessionKey::{Session(id), Reply{id,seq}}` → `PackSink`；四條分派規則（活會話擁有它的 id → 精確 (id,seq) → Create 例外 → 無主計數）；
+  sessions.rs            **會話表**（/docs/design/daemon/ws-receive-dispatch.md §2–§4）：`SessionKey::{Session(id), Reply{id,seq}}` → `PackSink`；四條分派規則（活會話擁有它的 id → 精確 (id,seq) → Create 例外 → 無主計數）；
                          三種 sink（單發／串流 256 滿了失敗／訂閱 64 滿了丟標 gap）；`ReceivedHook` 每個 pack 都經過（含無主），這層只呼叫不判斷。純資料結構，單元測試在同檔
   link.rs                `WsLink`：讀取 task（收→decode→鎖內 classify→鎖外叫鉤子→鎖內 dispatch；連續 8 個壞 frame 就關）＋送出 task（有界佇列 16，單一 task 寫 sink 保序）＋表；
                          `request`／`request_with_policy(AckPolicy)`（預設不重送）／`open_stream`／`subscribe`；關線只有一條路 `shut_down`（讀取 task 結束、送出 task 寫失敗、`close()` 三個入口都走它：
@@ -113,20 +75,20 @@ crates/wbf-sdk/src/
                          請求號從 u32::MAX 往下；`Heartbeat::OFF`／`start_with_heartbeat` 給測試
 crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
   lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
-  error.rs               `CoreError { kind, message, data }`（`data` 選填：例 1401 帶 daemon 自動重拿的房間狀態，rpc-spec §5.3）、`CoreErrorKind`、`rpc_code()`（rpc-spec §5.2 的號碼）
-  conf.rs                wbf.conf 的解析與自動生成（CLI 規格 §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
+  error.rs               `CoreError { kind, message, data }`（`data` 選填：例 1401 帶 daemon 自動重拿的房間狀態，/docs/design/rpc-specs/rpc-spec.md §5.3）、`CoreErrorKind`、`rpc_code()`（/docs/design/rpc-specs/rpc-spec.md §5.2 的號碼）
+  conf.rs                wbf.conf 的解析與自動生成（/docs/design/rpc-specs/wbf-cli-spec.md §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。🚫 core 不印任何東西
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
-  room_sync.rs           **房間那條線的內容**（room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
-  room_crypto.rs         **房間的加解密**（e2ee-rpc.md）：`refresh_room_devices`、加密送出與 1506 之後自動重拿（`wbf_send_encrypted`）、收到時解（`to_incoming`）、補解（`decrypt_stored`）；`RoomDevices`／`SendOptions` 是 DTO
-  link_keeper.rs         **「該開的線都開著嗎」的鉤子**（link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
-  wbf_rooms.rs           **wbf 帳號的房間**（account-session.md §6）：清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、`Event/Send` 送文字（明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
-  link_pool.rs           **連線池**（link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
+  room_sync.rs           **房間那條線的內容**（/docs/design/rooms/room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
+  room_crypto.rs         **房間的加解密**（/docs/design/keys/e2ee-rpc.md）：`refresh_room_devices`、加密送出與 1506 之後自動重拿（`wbf_send_encrypted`）、收到時解（`to_incoming`）、補解（`decrypt_stored`）；`RoomDevices`／`SendOptions` 是 DTO
+  link_keeper.rs         **「該開的線都開著嗎」的鉤子**（/docs/design/daemon/link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
+  wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：清單走橋（`JoinedRooms`＋`GetState`＋`m.direct`）、`Event/Send` 送文字（明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
+  link_pool.rs           **連線池**（/docs/design/daemon/link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（一條線一次一個命令）、
                          `Core::client_of(…, role)` 是唯一閘門、`open_link`（session → Bearer 升級 → hello）、`close_links`（登出叫）、`received_hook`（pack → `CoreEvent::Received`）、
                          `open_link_count`（`daemon.info` 的 `links`）。單元測試用記憶體對接的假 opener
   job.rs                 「現在跑的是哪個請求」：tokio task-local，讓事件說得出屬於誰。⚠️ 不跟著 `tokio::spawn`（有測試釘住）
   server_cache.rs        `cache.db` 的**單一寫入者**：一個 server dir 一條 OS 執行緒＋無上限 queue；`post`（commit 之後才發事件）／
-                         `run`（等它落地）＋一條重用的讀連線。⚠️ 媒體那幾條是刻意的例外（daemon-runtime §2.3.1）。
+                         `run`（等它落地）＋一條重用的讀連線。⚠️ 媒體那幾條是刻意的例外（/docs/design/daemon/daemon-runtime.md §2.3.1）。
                          🚨 刪 cache.db 之前要 `Core::close_server_cache`（等 queue 寫完、執行緒結束），不然 Windows 刪不掉、Linux 寫進已刪的檔
   backend_choice.rs      `transport` → backend：`ws`＝wbf-sdk、`http`＝matrix-sdk。探測 `get_backend_kind`（key 是**帳號**、
                          只記 server 回答過的）、規則 `get_backend_for`、閘門 `client_of`、`MethodHome` 暫時清單
@@ -134,7 +96,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
                          `server_cache_of` 的註冊表鎖握滿「查、開、放」整段（#32：放掉會 `database is locked`）
   accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部
   *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
-                         ⚠️ 公開介面不能假設同程序（architecture-v2 §7）：`&self`、可序列化的型別、事件走 channel、
+                         ⚠️ 公開介面不能假設同程序（/docs/design/overview/architecture-v2.md §6）：`&self`、可序列化的型別、事件走 channel、
                          🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
 crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底與全部有 core 對應的 method：
   pack.rs                ver‖type‖data 的編解碼與 XChaCha20-Poly1305（token 導兩把鑰）；純函數
@@ -149,7 +111,7 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
   server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
                          2026-09-21 多：每連線一個推播 task（`forward_pushes`：core 的 broadcast → 訂閱過濾 → `seal_push`；`Lagged` → `desync`）、`subscribe`／`unsubscribe` 在這層回（不進 handle）、
                          請求包在 `job::run_as_job(id)` 裡（`progress`／`note` 對得回發它的連線）
-  push.rs                `Subscriptions`（每連線一份：名字集合＋選填 `user`）、`push_of`（`CoreEvent` → 推播名與 params，照 rpc-spec §4）、`desync`、`parse_subscription_params`
+  push.rs                `Subscriptions`（每連線一份：名字集合＋選填 `user`）、`push_of`（`CoreEvent` → 推播名與 params，照 /docs/design/rpc-specs/rpc-spec.md §4）、`desync`、`parse_subscription_params`
   token.rs               token 檔的三遍覆蓋抹除（隨機 → 0xFF → 0x00 → 刪）與權限檢查；⚠️ daemon 預設不動 token，誰起的誰動
   main.rs                `-s` 常駐（先拿寫權、讀 token 與 conf、寫 daemon.json）。沒有 `-s` ＝單發，⚠️ **還沒實作**（會報錯講清楚）；
                          兩個都帶也報錯。資料平面還沒有
@@ -161,14 +123,14 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
 apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源：檔案或終端，🚫 沒有 ticket 了）、
                          commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）；conf 的解析已搬到 wbf_core::conf
                          ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
-scripts/acceptance.sh    CLI 規格 §8 的驗收，對本機 wbfuwunel 跑
+scripts/acceptance.sh    /docs/design/rpc-specs/wbf-cli-spec.md §8 的驗收，對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
 ```
 
 ## 4. 怎麼跑
 
 ```bash
-# Windows：先 export PATH="/c/Strawberry/perl/bin:$PATH"，不然 openssl-sys（SQLCipher 用）編不起來（local-cache-db §3）
+# Windows：先 export PATH="/c/Strawberry/perl/bin:$PATH"，不然 openssl-sys（SQLCipher 用）編不起來（/docs/design/storage/local-cache-db.md §3）
 cargo test --workspace                       # 不含 matrix feature，快；含 cache feature 的測試要 --features cache
 cargo test -p wbf-sdk --features matrix      # 事件轉換、aggregate、錯密碼分類（起迷你 403 server）
 cargo clippy --workspace --all-targets --features wbf-sdk/matrix -- -D warnings   # 含 §8 那套「不准 panic」的 lint（crate 根的 deny）
@@ -186,7 +148,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
     第 4 階段的（B 長活訂閱 → A 分房間金鑰 → `CryptoState` 與 `Push` 都進 B 的 handle → 再 `Fetch` 一窗、沒有任何 pack 無主）。並行跑會互相分到對方的房間金鑰。
     不用 server 的那半在 `tests/dispatch.rs`（記憶體對接餵亂序）與 `sessions.rs` 的單元測試。
     橋的那條在 `e2e_local_server`（`bridge_members_and_send_to_device_against_real_server`）。
-4c. **E2EE 的 RPC 面整條**（#62，e2ee-rpc.md §9）：alice 建加密房、邀 bob、bob 加入，然後
+4c. **E2EE 的 RPC 面整條**（#62，/docs/design/keys/e2ee-rpc.md §9）：alice 建加密房、邀 bob、bob 加入，然後
     `WBF_E2E_SERVER=... WBF_E2E_USER=@alice:localhost WBF_E2E_PASSWORD_FILE=... WBF_E2E_USER_B=@bob:localhost WBF_E2E_PASSWORD_B_FILE=... WBF_E2E_ENCRYPTED_ROOM='!…' cargo test --workspace --lib -- --ignored --test-threads=1 an_encrypted_conversation`
     （alice 送、bob 解；bob 登第二台 → 1506 → daemon 回新狀態 → 重送、新舊兩台都解得開，約 3 秒）。daemon 的 `real_server` 帶 `WBF_E2E_ENCRYPTED_ROOM` 會多驗 `room.refresh_devices`＋帶 `room_devices` 送。
 4. `WBF_E2E_SERVER=... WBF_E2E_USER=... WBF_E2E_PASSWORD_FILE=... cargo test -p wbf-sdk --test e2e_local_server -- --ignored`（第 2 步的驗收）；`WBF_PASSWORD_FILE=... scripts/acceptance.sh`（CLI 的驗收，200 MiB 約 80 秒；`WBF_ACCEPT_SIZE_MIB=16` 快跑）。
@@ -195,14 +157,14 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 10. 媒體池：`upload --sha256 --manifest m.json` → `download --manifest m.json -o a`（`source: server`，池裡出現 `media/<hh>/<hash>`）→ 再 `download` 一次（`source: cache`）→ `media-stats` → 大檔用 `--transport http` 下到一半殺掉 → `media-stats` 看到 `incomplete_files: 1` → 再 `download` 的第一行進度從上次快照的塊數開始、sha 對 → `media-gc --quota-mib 1 --protect-days 0` 清光。2026-09-08 跑過一次全對。
 9b. 金鑰備份與閘門的手動流程（2026-09-09 跑過）：`login alice` → `key-backup status`（`server_backup_exists` 應為 true，證明 `auto_enable_backups` 生效）→ `logout`（**應該被閘門擋，exit 1**）→ `key-backup recovery`（產生並封進 `r/`）→ `recovery list` → `logout`（這次過）→ 確認 `r/` **還在** → 重 `login` → `key-backup restore` → `key-backup save`／`import` → `account destroy`（`recovery list` 應該空掉）。
    ⚠️ 閘門的 principal 迴歸：`account switch @alice`（有 recovery key）後 `account del @bob:localhost`（沒有）**必須被擋** —— 擋不住就是又用了 current 的狀態（PR #19 審查 rumia／salvia 🔴1）。
-   ⚠️ data dir 用短路徑（例如 `C:/Users/<you>/AppData/Local/Temp/wt`）：加密過的目錄名很長，scratchpad 那種深路徑在 Windows 會撞 MAX_PATH（餘裕算法見 local-cache-db §11.4.1）。
+   ⚠️ data dir 用短路徑（例如 `C:/Users/<you>/AppData/Local/Temp/wt`）：加密過的目錄名很長，scratchpad 那種深路徑在 Windows 會撞 MAX_PATH（餘裕算法見 /docs/design/storage/vault-and-keys.md §2.4.1）。
 9. 多帳號混存（兩個帳號 alice、bob，同一個 `--data-dir`）。（PR #19 起是 `account` 一族：`account status`／`switch`／`del`／`destroy`；下面的舊命令名要照著換）：alice `login` → 建只有 alice 的房 A 與邀 bob 的房 C，各送幾則 → `recent` → bob `login`（alice 不 logout）→ `accounts` 兩個、current 是 bob → `rooms` 只有 C → `read A --from-cache` 0 則、`read C --from-cache` 0 則（bob 還沒親自拿過）→ `recent` → `read C --from-cache` 有了，而且 alice 解過的那幾則是明文 → `--account alice read A --from-cache` 仍有 → alice `logout`（`cache.db` 還在）→ bob `logout`（`cache.db` 被刪）。`forget-account @alice:localhost --yes` 後 alice 的 `--from-cache` 全空、bob 的不受影響。2026-09-07 跑過一次全對。
-7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms --passphrase-file pw`（過）→ `rooms`（**問 passphrase**；非互動就 exit 1）→ `remove-passphrase --passphrase-file pw` → `rooms`（不問）。⚠️ 2026-09-13 起**每個命令都要 passphrase**：`unlock.ticket` 與 `lock` 都沒了（CLI 規格 §7.1）。
+7. vault 的手動流程：`login --passphrase-file pw`（建 `passphrase` 模式的 `local.key`）→ `rooms --passphrase-file pw`（過）→ `rooms`（**問 passphrase**；非互動就 exit 1）→ `remove-passphrase --passphrase-file pw` → `rooms`（不問）。⚠️ 2026-09-13 起**每個命令都要 passphrase**：`unlock.ticket` 與 `lock` 都沒了（/docs/design/rpc-specs/wbf-cli-spec.md §7.1）。
 6. 測完 `taskkill //F //IM <複本名>.exe`。
 
 ## 5. 坑（都踩過）
 
-- **wbfuwunel 的 `id` 第一個 byte 是型別**（wire-format §2.2，2026-09-12 BREAKING）：`Event/Recent`
+- **wbfuwunel 的 `id` 第一個 byte 是型別**（wbf-wire-format.md §2.2，2026-09-12 BREAKING）：`Event/Recent`
   這種 client 自己鑄會話號的包要用 `wbf_wire::pack::id::compose(id::SESSION, n)`，填裸的 `n` server 回
   `InvalidRequest: this kind takes a conversation the client named in its id, and this one carries none`。
   server 鑄的（上傳 id、`g_seq`）回來已經組好，原樣抄回去就對。
@@ -249,7 +211,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 - `watch` 對齊「現在」要一次 sync，debug build 啟動超過一秒；測時序要留餘裕。
 - **同一條線再 `hello` 會蓋掉 feature 宣告**（server 把宣告記在連線上、下一個 Hello 覆蓋，沒帶就收回）：在池裡的線上重 hello 一律帶 `link_pool::features_of(role)`（#62 修掉 `ping`／`room.history`／`sync.recent` 三處帶空的）。
 - **測試裡開訂閱線要照正式路徑的順序**：`init_connection` 放在 `pool.acquire` 的開線閉包裡跑（`test_support::subscribed_keys`）。先 init 再放進池的話，task 一起來就 `reuse` 會看到空格，第一個 `CryptoState` 的補上傳落空（#62 的測試抓到過）。
-- **daemon 的真 server 測試要等線開好**：`account.add`／`vault.unlock` 之後五條線在背景開（link-pool.md §3.1）；要驗推播，先 `wait_for_links(5)` 再送——訂閱不補訂閱之前的訊息。
+- **daemon 的真 server 測試要等線開好**：`account.add`／`vault.unlock` 之後五條線在背景開（/docs/design/daemon/link-pool.md §3.1）；要驗推播，先 `wait_for_links(5)` 再送——訂閱不補訂閱之前的訊息。
 - **`target/e2e/tuwunel.exe` 不一定是 server main 編的**：先在 wbfuwunel 看 `git branch --show-current`。2026-09-30 那顆是未合併的 `docs/room-version-prev`（房間版本號改成成員集合的雜湊、不遞增）——client 只比房間版本號相不相等，測試也只能這樣斷言。
 - **`cargo check` 會另外產一整套產物**（跟 test／clippy 不共用），D 槽緊的時候別用；型別檢查用 `cargo clippy --workspace --all-targets --features wbf-sdk/matrix`（反正要跑）。repo 的 `.cargo/config.toml` 已把 `build.jobs` 限 2。
 - Windows 主執行緒棧只有 1 MB，debug build 的 `send` 會爆棧；`main.rs` 把 runtime 跑在 64 MiB 棧的執行緒上。新增大的 async 路徑如果又爆，先懷疑這個。
@@ -261,110 +223,41 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
-| **一般 Matrix 帳號送檔案沒宣告附件**（約定 §5.2） | matrix-sdk 的 `Room::send` 不能加 header。✅ wbf 帳號 2026-09-22 起走 `Event/Send`、宣告成立（#56） | 一般 Matrix 帳號：server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號的加密房送檔還拒（等加密附件，e2ee-rpc.md §8；文字 2026-09-29 起加密送） |
-| ~~`RoomCrypto` trait 還沒有~~ | ✅ 引擎是 `crypto_engine::OlmEngine`（#48／#49），沒抽 trait（只有一個實作，抽了是儀式） | 引擎 2026-09-29 起接進 daemon（`key_sync` 的 `crypto_engines` 表共用一個） |
-| ~~推播被通道丟在地上~~ | ✅ 第 4 階段 SDK 那半做了（`ws-receive-dispatch.md`）：會話表依 id 交付、`device_subscription` 長活收、`Superseded` 進訂閱當終點、鉤子給 RPC 面 | daemon 那半接上了：推播封裝在 `push.rs`（含 `devices.changed`）、漏掉的發 `desync`；「推來就叫 refresh」維護者 2026-09-29 拿掉，`DeviceChanged` 只轉給 UI（e2ee-rpc.md §4） |
-| ~~**E2EE 沒有產品路徑**~~ | ✅ #62（`design/keys/e2ee-rpc.md`）：`Misc`／`Rooms` 宣告 `org.wbftw.device_versions`、`room.refresh_devices`、加密送出、收到即解 | — |
-| **E2EE 還缺的**（e2ee-rpc.md §8） | 維護者排 | 加密附件（加密房送檔仍拒）；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
-| 交叉簽章沒 bootstrap | §7 第 3 項 | 分享策略只能 `AllDevices`；server 建議的 `IdentityBased` 現在等於發給零台 |
-| PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（Recent 收 `before_event_id`）合併後重做 | 跳到訊息還是兩個來回 |
-| ~~房間金鑰沒有任何備份~~ | ✅ PR #19 做了：server 端標準 backup、本地全量快照、`logout` 的兩關閘門、`r/` 獨立保管 | — |
-| `Session/*`（WS 上的 Login／Refresh／Logout）只加了 wire 常數 | 維護者 2026-09-21 定：登入登出**維持標準 HTTP**，WS 只用 token（account-session.md §0） | 不是洞，是決定；那幾個常數留著認 server 的向量 |
-| **server 批 4 的四個新 kind 沒接**（0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加（批 3 的 0x12／0x15／0x1C／0x1D 也還沒加；#56 為 m.direct 才加 0x11）。沒有破壞性改動、向量檔沒變 | 推播規則／搜尋／目錄／TURN 都還沒有；做的時候先讀 #55 列的十個坑（搜尋在加密房搜不到、push 的 `kind` 不是 pack kind、規則種類打錯是 404、account data 不能刪） |
-| 斷線後 `recent` 不自動續 | 命令 exit、下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪；UI 那版做自動從最後的 `ls` 續 |
-| **沒有假的 wbf server 可以在 core 層測「成功」路徑**（部分解了：core 的 `test_support` 假 server 會答訂閱、Device、橋的 Members／GetStateEvent／Keys*／SendToDevice、`Event/Send`，#62） | 還沒做全 | 探測成功、`watch`、`log_in` 的探測接點都只有 `--ignored` 的真 server 測試走得到。#32／#33 的審查每一輪都碰到這個缺口 |
+| **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 排在 §7 第 1 項 | 加密房送檔仍拒；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
+| 交叉簽章沒 bootstrap | 要跟 server 一起設計 | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
+| 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
+| PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（`Recent` 收 `before_event_id`） | 跳到訊息還是兩個來回 |
+| server 批 3、批 4 的新 kind 沒接（0x12／0x15／0x1C／0x1D、0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加；沒有破壞性改動、向量檔沒變 | 推播規則、搜尋、目錄、TURN 都還沒有。做的時候先讀 #55 列的十個坑 |
+| 斷線後 `recent` 不自動續 | 命令 exit，下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪 |
+| core 層測「成功路徑」的假 wbf server 還不全 | core 的 `test_support` 會答訂閱、Device、橋的 Members／GetStateEvent／Keys*／SendToDevice、`Event/Send` | 探測成功、`watch`、`log_in` 的探測接點只有 `--ignored` 的真 server 測試走得到 |
 
-## 7. 下一步（維護者 2026-09-06 同意的順序，2026-09-10 更新）
+📎 `Session/*`（WS 上的 Login／Refresh／Logout）只有 wire 常數：不是洞，是決定——登入登出維持標準 HTTP（`/docs/design/daemon/account-session.md` §0）。
 
-做完的（都合併了）：資料目錄兩層路徑加密＋`account` 一族＋房間金鑰備份（#19，設計在 #18）、架構 v2 的形狀（#20）、vault 與金鑰（#11）、`cache.db` 多帳號混存（#13；rusqlite 0.40 與 matrix-sdk 合得來，代價是 Windows 要 Strawberry Perl，local-cache-db §3）、媒體儲存池（#14）、`recent` 改成拉窗＋`Event/Batch` 串流與三層分工 `RecentPlan { max_events, window, batch }`（#16，issue #15）。
+## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
-還沒做的：
+1. **E2EE 收尾**：加密附件（WBF 的檔案本來就用每檔金鑰分塊加密，區塊金鑰放在事件裡；加密房只要讓這則事件走 `encrypt_and_send`、帶附件宣告；被 1506 擋時錯誤的 `data` 帶回已上傳的附件，重送不用再傳一次）、
+   讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
+2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
+3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
+   `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡先讓它拿 `daemon.lock`，最終改走 RPC。
 
-📍 **2026-09-21 的順序**（維護者定；下面 09-14 與 0–6 是更早的清單，保留當歷史）：
-
-1. ✅ **第 4 階段：收包依種類分派**（維護者 2026-09-21 定的形狀；SDK 那半 2026-09-21 做完，設計在 `design/daemon/ws-receive-dispatch.md`；daemon 那半接在鉤子後面、歸第 2 項）。「送一個等一個」沒錯，錯的是「下一個收到的就是我的回覆」：
-   - `WsChannel` 多一個讀取 task：收、解碼、**依 kind／subtype 分派**。回覆類（Ack／Error／橋的回覆／Batch／ItemsDestroyed）依會話 id 表交給在等的請求；
-     推播類（Device／Push、CryptoState、Event／Push、DeviceChanged、Superseded）依訂閱 id 交給那個訂閱的處理器。順序亂掉不會出事。
-   - 會話 id 表：無序類（id 0）以 seq 對；有序或指定 id 的（Recent、Fetch、ItemsDestroy、Subscribe）以 id 登記一個會話項，seq 只在會話內驗遞增；
-     訂閱是長活的會話項，到 Unsubscribe 或 Superseded 才收。
-   - 現在 `receive_pack` 那段「推播型且 id 不符就丟」與 `dropped_pushes` **整段拿掉**；`PackChannel` 的 request／request_stream 介面可以不動，底下換成從會話表取。
-   - 測試要把「傳輸」跟「分派」拆開，用記憶體 duplex 餵亂序的 pack；現有的同步假 server 不夠用。
-   - 要小心：WS 關掉時所有在等的會話都要收到錯、每個會話自己的逾時、訂閱句柄的緩衝要有界（滿了當一次 gap）、Superseded 是 Control/Error 帶訂閱 id 要分到訂閱不是請求。
-   - 做完之後 e2ee-walkthrough §16.5 第 8、10 列、to-device-client §8 第 4、5 列才能勾。✅ 勾了（通道那半）。
-   - 維護者加的一條：**每個收到的 pack 都經過一個鉤子**（`ReceivedHook`），之後 daemon 的 RPC 面在鉤子裡決定要不要送 UI；link 只呼叫不判斷。
-     還有：送與收分開（兩個 task）；會話項是 trait（`PackSink`）好接特規 spec；重送靠 id 表（`AckPolicy`，預設關、冪等的呼叫點自己開）。
-     多條線（architecture-v2 §6.1.1；落地是一個帳號五條，link-pool.md §1）不進這層：一條 `WsLink` 一張表，開五條就是五個實例。
-1b. ✅ **連線生命週期**（維護者 2026-09-21 定：五條線各司其職，落地時房間與金鑰的訂閱暫時共用一條→四條、連線池按種類挑線、預設不起訂閱、斷了下次要用再開；`design/daemon/link-pool.md`）：
-   core 的 `link_pool.rs`（`LinkPool`／`LinkRole`／`client_of(…, role)`／`open_link`／`close_links`）、`CoreEvent::Link`／`Received`；daemon 的 `push.rs`（訂閱集合、事件→推播）與 `server.rs` 的推播 task。
-   訂閱線（`Subscriptions`，房間與金鑰暫共用）這支只保證開得起來、關得掉、有人收；內容在第 2、3 項。📌 2026-09-29 拆成 `Rooms`／`Keys`、由 daemon 自己開（link-pool.md §3.1）。
-1c. ✅ **帳號的會話 A**（`design/daemon/account-session.md`，PR #54）：探活不帶 token、以 server 為鍵；登出封池（guard）→ HTTP 登出→成了關池→清本地→解封；四條線。
-   ✅ **B**（2026-09-21）：wbf 帳號不建 matrix-sdk 的 Client——登入先探活，wbf 走自己包的 HTTP `/login`、`m/` 由 `OlmEngine` 開（只有 crypto store）、`Session::backend` 記住走哪邊；
-   `room.list`／`get` 走橋（`JoinedRooms`＋`GetState`＋`m.direct` → sdk `room_state.rs` 組 `Conversation`）、`send_text`／`send_file` 走 `Event/Send`（附件宣告成立；加密房：文字 2026-09-29 起加密送，檔案仍拒）；
-   備份／watch／`/context` 對 wbf 帳號回 1100（`handles::no_matrix_client_error`），登出閘門只認本機 recovery key；§6 有表。裝置金鑰的上傳 2026-09-29 做了（e2ee-rpc.md §5）。
-2. ✅ **E2EE 接進 daemon**（2026-09-29，權威改在 `design/keys/e2ee-rpc.md`；下面是 09-21 的原始說法，「daemon 存快照、發可以送了的狀態訊息」已被精確化掉）（e2ee-walkthrough §16.6 的 RPC 面；金鑰走 `LinkRole::Keys`，`Misc`（送 Event/Send）與 `Rooms`（收 DeviceChanged）宣告 `org.wbftw.device_versions`）：`refresh_room_devices` RPC（UI 點進房間叫）、send RPC 走 `encrypt_and_send`、
-   被 1506 擋時 daemon 自動 refresh 再把錯原樣回 UI 並發「這個房版本到 V、可以送了」的狀態訊息（daemon 🚫 不自動重送）、每房 `RoomRefresh` 的落地（記憶體還是 cache.db 待定）、
-   上線 `device_subscribe` → `pull_to_device`、下線 `device_unsubscribe`。這是第一條宣告 `org.wbftw.device_versions` 的產品路徑。
-3. 交叉簽章 bootstrap（`SigningKeysUpload` 已在橋上）→ 分享策略換 `IdentityBasedStrategy`（只改 `room_key_share_settings`）。
-4. 假的 wbf server 測試工具（老缺口；假 server 已經會橋、Device、Send，差的是在 core 層驅動）。
-5. PR #43 等 wbfuwunel #64 合併後重做；`Batch.more` 那項（server 未合分支）。
-6. server 批 4 的功能（推播規則、搜尋、公開房間目錄、TURN；本 repo issue #55）：都在橋上了，等 UI 需要才加 Kind 與包裝；坑見 §6。
-7. ✅ **訂閱線的內容（明文房間）**（2026-09-22，`design/rooms/room-sync.md`：`init_connection`、補窗與漏包交給 UI、daemon 不碰水位、`sync.recent` 多 `since`）。✅ **訂閱金鑰**（2026-09-24，`design/keys/key-sync.md`：`init_connection` 裡多一個 `Device/Subscribe` 會話、`pull_to_device` 追平、推的與拉的走同一支 `import_items`、`keys.state`）。
-   ✅ **訂閱線由 daemon 搞定**（2026-09-29，link-pool.md §1、§3.1）：房間與金鑰各一條、解鎖／登入後全開、常駐時背景看著重開；🚫 沒有開／關訂閱線的 RPC（UI 收不收是 `subscribe`）。
-   ✅ **E2EE 的 RPC 面**（2026-09-29，`design/keys/e2ee-rpc.md`）。下一步待維護者排：加密附件、wbf 帳號的金鑰備份、讀房間自設的換金鑰期限、交叉簽章。
-
-📍 **2026-09-14 的建議順序**：
-
-1. ✅ **房間歷史走 wbf**（2026-09-14）：`Event/Recent{rooms}`、翻頁一律 `event_id`、matrix 走 `/context`、
-   一般 Matrix 房本地不答。順帶修掉「最後一個帳號登出時 cache.db 還被註冊表握著」（真 server 測試抓到的）。
-2. **假的 wbf server 測試工具** —— 這支靠 `--ignored` 的真 server 測試才驗到兩條上游路線，缺口還在。
-3. **「沒洞就不問上游」**：記 server 保證過的範圍（按帳號、用 `g_seq`），🚫 不從本地 `r_seq` 連不連號推。等 server 推送再確認。
-4. **階段 4 訂閱／推播** —— 先跟維護者討論。
-
-0. ✅ **房間金鑰備份與周邊**（維護者 2026-09-09 提；2026-09-10 全部做完）：設計定案在 local-cache-db §10 與 CLI 規格 §3.1／§3.6／§10。
-   ✅ **PR #19 合併了大半**：兩層路徑加密、`account` 一族、CLI 輸出英文、金鑰備份（server 端 backup、本地全量快照、`key-backup` 六個子命令（status／upload／save／import／restore／recovery）、`logout` 的兩關閘門、`r/` 獨立保管與 `recovery list`／`show`）。
-   ✅ **2026-09-10 收掉了剩下兩塊**：`wbf.conf`（CLI 規格 §10：解析、旗標 > 環境 > conf > 預設、自動生成、`SERVER_BACKUP`／`LOCAL_ROOM_KEYS` 兩個開關）、passphrase 吃原始 bytes（local-cache-db §12）。**這一項到此關掉。**
-   ⚠️ PR #19 是 **breaking 的**：舊的 data dir（明文目錄名）一律**砍掉重來，🚫 不寫遷移**。本機測試環境要重新 `login`。
-   ✅ **2026-09-09 對真 server 跑過全流**（步驟見 §4 的 9b），含 principal 修正的迴歸（current=alice 刪 bob 時看的是 bob 的狀態）。
-   ✅ **Windows MAX_PATH 已解**：nonce 縮到 12 byte、目錄名縮成 `s`／`a`／`m`／`k`／`r`，最長路徑 230 → 184、餘裕 20 → 76；路徑太長時的錯誤訊息也不再誤導成「it was made with another key file」。前後對照與教訓在 local-cache-db §11.4.1。
-1. chat-model §6 剩的房間功能：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載。穿插。
-2. 附件宣告：等 server 定案（`media-attachments.md` 仍是提案）。期間寫設計：用 `matrix-sdk-crypto` 的 `OlmMachine` 自己 Megolm 加密、走 `Event/Send` pack（這也是 `RoomCrypto` trait 出現的地方）。✅ **2026-09-10 定了**：走 `OlmMachine::encrypt_room_event_raw`。⚠️ `Room` 上沒有 `encrypt`，所以那從來不是二選一；fork 已建、`base_client()` 改 `pub` 那一行也推上去了（architecture-v2 §8.3，#23）。
-3. ⚠️ **架構 v2 的落地**（`design/overview/architecture-v2.md`，2026-09-09 定形狀、2026-09-10 定名字）。
-   ✅ **`wbf-core` 做完了**（#24）：命令本體全搬進去，公開面只剩可序列化的 DTO 與 `CoreError`。
-   ✅ **兩個「未定的決策」也不擋了**：fork 已建並成為 submodule（#23）；server 的 to-device
-   已由 wbfuwunel PR #43 實作（`0x16 Device`，權威在那邊的 `wbf-to-device.md`）。
-   還沒做的三塊，**建議順序**：
-   1. ✅ **`rpc-spec.md`**（2026-09-12 第一版）：method 表、code 表（`CoreErrorKind` 配號在 §5.2）、推播、資料平面。
-      §8 列了 daemon PR 要順手補進 core 的四樣（建檔與送事件拆開、`PoolReader` 接 Range、
-      結構化事件、配號）。📎 本來還有第五樣 `Core::lock()`，2026-09-13 連 `vault.lock` 一起取消了
-      （rpc-spec §3.1：daemon 沒有「鎖上」這個 feature，真正的 lock 是 `daemon.shutdown`）。
-   2. 🔁 **`crates/wbf-daemon`**：第一塊（#30）pack、訊息、hello、連線狀態機、WS listener、`-s`；
-      第二塊（#31）全部有 core 對應的 method 與 conf 搬進 daemon，外加寫權能力、token 五步、`vault.create`。
-      **執行期（daemon-runtime §11）**：階段 1–3 ✅（#32）、backend 接縫 ✅（#33）。
-      還沒：**階段 4 訂閱／推播**（⚠️ 維護者要先討論；wbfuwunel #51 也改了 `Subscribe` 補窗的語意）、
-      5 `cancel`、6 sdk 的 `0x04/05/06` codec、7 上游會話、8 監督者、9 已讀三層；
-      資料平面 HTTP（media.open／create、send_attachment）、單發命令列。
-      ⏳ 懸著等維護者：`media.db` 拆檔（維護者說「等要做的時候再討論，這點我有一些想說清楚」）。
-      📎 起手式是 `vault.create`（fresh 資料目錄）：🚫 `account.add` 不替前端建 vault（rpc-spec §3.1）。
-      原定義：core ＋ RPC 服務 ＋ 資料平面 ＋ **自己的命令列**（`daemon <命令>` 單發＝測試性質、常駐中再叫獨佔命令跳錯、
-      `daemon -s` 常駐；arg 先轉成 RPC 訊息再進 handle，architecture-v2 §0.2）。
-   3. **`apps/wbf-cli` → rpc-cli**：參數解析搬進 daemon，殼縮成「封裝 RPC 訊息丟本地 WS」的測試工具。
-      改名跟著「真的走 RPC」那支走，🚫 不單獨開一支改名 PR。
-   📎 附件訊息的完整流程（建檔拿 URL → 發訊息 ＆ PUT bytes 並行 → 進度）與閘門鏈在 architecture-v2 §4.9。
-   ⚠️ 還有一個 client 端的欠債：**接 `0x16 Device`**（server 那邊 2026-09-12 全做完了，
-   我們一個字都沒寫）。五件事、為什麼要排在 daemon 之後，在 `design/keys/to-device-client.md`。
-4. UI 框架比較文件。UI 的同步流程已經有 SDK 介面可接：開一個 task 跑 `recent_sync`，callback 把每個 Batch 丟 channel 給寫 DB 的 task（chat-model §4.3）；媒體用 `media::fetch` 加 `PoolReader`。
-5. 串流／seek 對著媒體池讀（local-cache-db §8.6）：`seek` 命令現在仍直接打 server。
-6. ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補（PR #16 審查記錄）。
+之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章（要跟 server 一起設計）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
+資料平面 HTTP 與附件訊息的完整流程（`/docs/design/rpc-specs/local-interface.md` §9）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC；
+UI 框架比較；串流／seek 對著媒體池讀（`/docs/design/media/media-pool.md` §6）。
+⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
+⏳ 懸著等維護者：`media.db` 拆檔（維護者：「等要做的時候再討論」）。
 
 ## 8. 規矩（維護者定，全域 CLAUDE.md 也有）
 
 - 一律開分支送 PR，merge commit，不 rebase、不 squash、不 amend、不 force push。
-- 每個 PR 描述要列「新增了對上游的哪些依賴」（plan-v1 §7.2）。
+- 每個 PR 描述要列「新增了對上游的哪些依賴」（/docs/design/overview/architecture-v2.md §8）。
 - 會 breaking Matrix 兼容的設計先寫給維護者，不自己選。
-- 本地不落地任何聊天內容（plan-v1 §7.1），直到 local-cache-db 那一版。
+- 🔒 **資料目錄綁定 daemon**（維護者 2026-09-30）：前端（UI、rpc-cli）只能發 RPC 請 daemon 改，🚫 不越過 daemon 直接寫；不拿 `daemon.lock` 就寫是非法侵占。
+- 📑 **引用文件寫從 repo 根目錄算的完整路徑加章節**（維護者 2026-09-30）：`/docs/design/keys/e2ee-rpc.md §3`；只有指同一份文件自己的章節才只寫 `§3`。搬家或改名時 grep 完整路徑就找得到每一處。
+- 📜 **設計文件只講現在的約定與理由**（維護者 2026-09-30）：被推翻的版本、進度、「第 N 步」「PR #x 合併了」不寫進文件，歷史在 git；改規則的那支 PR 同時掃掉舊說法。
 - 審查者 cirno／rumia／salvia 每個 PR 都會來；逐條回應，能改就改，不改講理由。
-- 🧭 **狀態放 UI、動作能自動就自動**（維護者 2026-09-29，e2ee-rpc.md §0）：「誰記住什麼」預設是 UI（房間版本號、同步起點、`txn_id`），daemon 不存快照；「被擋之後該補的」daemon 順手做完再一起回（1506 → 自動 refresh、新狀態放錯誤的 `data`），但🚫 不替 UI 做決定（不自動重送、`DeviceChanged` 只轉不叫 refresh）。兩題分開答：狀態放哪、動作能不能順手做完。
-- 🔌 **訂閱與連線總是由 daemon 搞定**（維護者 2026-09-29，link-pool.md §3.1）：解鎖／登入後五條線全開、背景每 15 秒看一次；UI 收不收推播用 `subscribe`，🚫 沒有開關上游訂閱的 RPC。
+- 🧭 **狀態放 UI、動作能自動就自動**（維護者 2026-09-29，/docs/design/keys/e2ee-rpc.md §0）：「誰記住什麼」預設是 UI（房間版本號、同步起點、`txn_id`），daemon 不存快照；「被擋之後該補的」daemon 順手做完再一起回（1506 → 自動 refresh、新狀態放錯誤的 `data`），但🚫 不替 UI 做決定（不自動重送、`DeviceChanged` 只轉不叫 refresh）。兩題分開答：狀態放哪、動作能不能順手做完。
+- 🔌 **訂閱與連線總是由 daemon 搞定**（維護者 2026-09-29，/docs/design/daemon/link-pool.md §3.1）：解鎖／登入後五條線全開、背景每 15 秒看一次；UI 收不收推播用 `subscribe`，🚫 沒有開關上游訂閱的 RPC。
 - 🧯 **正式碼不用會讓整支程式收掉的方法**（維護者 2026-09-23）：`unwrap()`、`expect()`、`panic!`、`unreachable!`、`todo!`、`[i]` 直接索引／切片。
   每個失敗要有去處（`?` 往上丟、給安全值、`get`／`split_at_checked`、mutex 用 `unwrap_or_else(|p| p.into_inner())`）；「這裡不可能失敗」不是理由，「CLI 炸了就炸了」也不是。
   唯一的例外是「沒有它就沒有這支程式」的層級（runtime、主執行緒起不來），那也是講清楚、給 exit code，🚫 不 panic。

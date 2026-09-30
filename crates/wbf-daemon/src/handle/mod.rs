@@ -1,8 +1,8 @@
-//! RPC 的 handle：一個 `Request` 進、一個 `Response` 出（rpc-spec §3）。
+//! RPC 的 handle：一個 `Request` 進、一個 `Response` 出（/docs/design/rpc-specs/rpc-spec.md §3）。
 //!
-//! 它是 architecture-v2 §4.9 閘門鏈裡「RPC 轉換 ⇔ daemon handle」那一格：把 JSON 的 `params`
+//! 它是 /docs/design/rpc-specs/local-interface.md §9 閘門鏈裡「RPC 轉換 ⇔ daemon handle」那一格：把 JSON 的 `params`
 //! 反序列化成 core 的型別、叫一個 core 方法、把回傳序列化回去。**命令列的 arg 之後也走這裡**
-//! （§0.2：arg → RPC 訊息 → 同一個 `call`），🚫 不留第二套分派。
+//! （/docs/design/overview/architecture-v2.md §0.2：arg → RPC 訊息 → 同一個 `call`），🚫 不留第二套分派。
 //!
 //! | 子模組 | method |
 //! |---|---|
@@ -12,7 +12,7 @@
 //! | `media` | `upload.*`、`media.info`／`save_to`、`server.ping` |
 //! | `backup` | `backup.*` |
 //!
-//! 還沒有：推播、`subscribe`／`cancel`、`media.open`／`create`、`room.send_attachment`（rpc-spec §10）。
+//! 推播與 `subscribe` 在 `push.rs`／`server.rs`。還沒有：`cancel`、`media.open`／`create`、`room.send_attachment`（/docs/design/rpc-specs/rpc-spec.md §10）。
 
 mod accounts;
 mod backup;
@@ -47,7 +47,7 @@ pub const KEEP_LINKS_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// 一直開不起來時，間隔最長拉到多久。
 pub const KEEP_LINKS_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// 未解鎖時也接受的 method（architecture-v2 §4.5）。其他一律 `1001`。
+/// 未解鎖時也接受的 method（/docs/design/rpc-specs/local-interface.md §5）。其他一律 `1001`。
 /// 這個 method **保證不碰資料目錄**嗎？
 ///
 /// Args:
@@ -116,7 +116,7 @@ fn new_instance_id() -> String {
 
 pub struct Handle {
     data_dir: PathBuf,
-    /// 解鎖一次就活著（`Core` 沒有 lock，daemon 也沒有 `vault.lock`——rpc-spec §3.1）。
+    /// 解鎖一次就活著（`Core` 沒有 lock，daemon 也沒有 `vault.lock`——/docs/design/rpc-specs/rpc-spec.md §3.1）。
     /// 還是 `RwLock`：`vault.create`／`unlock` 會換掉裡面的狀態，而讀的人是每一個請求。
     core: RwLock<Arc<Core>>,
     policy: EncryptionPolicy,
@@ -186,7 +186,7 @@ impl Handle {
         self.shutdown_requested.load(Ordering::SeqCst) || *self.shutdown.borrow()
     }
 
-    /// 拿下這個資料目錄的寫權。**`-s` 起來的第一件事**（architecture-v2 §0.2）：拿不到就不要啟動。
+    /// 拿下這個資料目錄的寫權。**`-s` 起來的第一件事**（/docs/design/overview/architecture-v2.md §0.2）：拿不到就不要啟動。
     ///
     /// Return:
     ///     Ok(())      有寫的能力了
@@ -221,7 +221,7 @@ impl Handle {
         &self.settings
     }
 
-    /// `hello` 的 result（rpc-spec §1.3）。connection 談完版本後由這裡填 daemon 的狀態。
+    /// `hello` 的 result（/docs/design/rpc-specs/rpc-spec.md §1.3）。connection 談完版本後由這裡填 daemon 的狀態。
     pub async fn hello_result(&self, protocol: u32) -> Value {
         let core = self.core().await;
         json!({
@@ -247,7 +247,7 @@ impl Handle {
                 "the daemon is shutting down",
             );
         }
-        // 🚨 **要寫就要先有寫的能力**（architecture-v2 §0.2）。這是全 daemon 唯一檢查它的地方。
+        // 🚨 **要寫就要先有寫的能力**（/docs/design/overview/architecture-v2.md §0.2）。這是全 daemon 唯一檢查它的地方。
         // `-s` 在啟動時就拿到了，所以這裡是一個 atomic 讀；單發命令則是**第一個要寫的命令**
         // 觸發去拿鎖。拿不到就回「我沒有寫的權限」，🚫 不重試、🚫 不降級成唯讀跑一半。
         if !is_read_only(&request.method) {
@@ -260,7 +260,7 @@ impl Handle {
             return Response::from_core_error(id, &self.why_it_is_shut(&core));
         }
         let params = params_or_empty_object(&request.params);
-        // 這個 method 認得 `sync` 的話，回應要說出**這次實際用的是哪一種**（rpc-spec §2）——
+        // 這個 method 認得 `sync` 的話，回應要說出**這次實際用的是哪一種**（/docs/design/rpc-specs/rpc-spec.md §2）——
         // ⭐ 包括「沒帶所以是預設」那種情況，這樣前端🚫 不必去記規格。
         let sync = sync_of_request(&request.method, &params);
         let outcome = self.dispatch(&core, &request.method, params).await;
@@ -277,7 +277,7 @@ impl Handle {
 
     /// 擋下來的時候是「還沒有 vault」還是「有但鎖著」？兩者的下一步完全不同，所以🚫 不共用一個
     /// `1001`：沒有 `local.key` 回 `1002` 並指向 `vault.create`（fresh 資料目錄的起手式，
-    /// rpc-spec §3.1），有但鎖著才是 `1001`（去 `vault.unlock`）。
+    /// /docs/design/rpc-specs/rpc-spec.md §3.1），有但鎖著才是 `1001`（去 `vault.unlock`）。
     /// 📎 讀不到 `local.key` 的狀態（IO 壞了）也當成鎖著：不確定就拒絕。
     fn why_it_is_shut(&self, core: &Core) -> CoreError {
         match core.key_mode() {
@@ -361,7 +361,7 @@ impl Handle {
         let ports = *self.ports.read().await;
         Ok(json!({
             "version": format!("{DAEMON_NAME} {DAEMON_VERSION}"),
-            // 所有帳號加起來現在開著幾條上游的線（link-pool.md）。
+            // 所有帳號加起來現在開著幾條上游的線（/docs/design/daemon/link-pool.md）。
             "links": core.open_link_count(),
             "instance": self.instance,
             "pid": std::process::id(),
@@ -374,7 +374,7 @@ impl Handle {
             "data_port": ports.map(|(_, data)| data),
             "uptime_seconds": self.uptime_seconds(),
             "connections": self.connection_count(),
-            // 寫入者還有幾件在排隊（daemon-runtime §2.2）。⚠️ 一直漲＝寫得比收得慢。
+            // 寫入者還有幾件在排隊（/docs/design/daemon/daemon-runtime.md §2.2）。⚠️ 一直漲＝寫得比收得慢。
             "cache_queue": core.cache_queue_len(),
             "server_backup_setting": on_off(self.settings.server_backup),
             "local_room_keys_setting": on_off(self.settings.local_room_keys),
@@ -391,9 +391,9 @@ impl Handle {
         Ok(json!({ "encryption_enforced": self.policy.is_enforced() }))
     }
 
-    /// 「該開的線都開著嗎」的鉤子（`Core::ensure_links`，link-pool.md §3.1，維護者 2026-09-29）：`vault.unlock`、`account.add` 成功之後叫。
+    /// 「該開的線都開著嗎」的鉤子（`Core::ensure_links`，/docs/design/daemon/link-pool.md §3.1，維護者 2026-09-29）：`vault.unlock`、`account.add` 成功之後叫。
     /// 背景跑，🚫 不擋那個 RPC 的回應（五條線×每個帳號、金鑰還要追平）；開關各自發 `link.state`，開不起來的發 `Note`。
-    /// conf 的 `TRANSPORT = http` 是上限（architecture-v2 §6.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
+    /// conf 的 `TRANSPORT = http` 是上限（/docs/design/overview/architecture-v2.md §5.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
     /// 已經有一輪在跑時，core 那邊自己跳過（`ensuring_links` 旗），這裡不必再擋。
     async fn start_ensuring_links(&self) {
         if self.settings.transport == Transport::Http || self.is_shutting_down() {
@@ -405,7 +405,7 @@ impl Handle {
         });
     }
 
-    /// 常駐時的背景迴圈（維護者 2026-09-29，link-pool.md §3.1）：每隔一段時間叫一次同一支鉤子，被關掉、死掉的線就在這裡重開。
+    /// 常駐時的背景迴圈（維護者 2026-09-29，/docs/design/daemon/link-pool.md §3.1）：每隔一段時間叫一次同一支鉤子，被關掉、死掉的線就在這裡重開。
     /// 很輕：鎖著、或正在登入／登出／摧毀，那一輪什麼都不做；開著的線只是看一眼。
     /// 開不起來（server 不在）就拉長間隔（每次加倍，上限 [`KEEP_LINKS_MAX_INTERVAL`]），一輪全順就回到 [`KEEP_LINKS_INTERVAL`]：🚫 不對一台不在的 server 每 15 秒敲五次門。
     /// `daemon.shutdown` 一廣播就停。`TRANSPORT = http` 不開 WS 線，所以整個不跑。
@@ -443,7 +443,7 @@ impl Handle {
         Ok(json!({ "ok": true }))
     }
 
-    /// `user`／`server` 兩個共同欄位（rpc-spec §2）→ core 的 `Target`，`server_backup` 從 conf 來。
+    /// `user`／`server` 兩個共同欄位（/docs/design/rpc-specs/rpc-spec.md §2）→ core 的 `Target`，`server_backup` 從 conf 來。
     fn target(&self, params: &TargetParams) -> Target {
         Target {
             user: params.user.clone(),
@@ -452,7 +452,7 @@ impl Handle {
         }
     }
 
-    /// `transport` 欄位（rpc-spec §2）：沒帶用 conf 的；帶了認不得 → `102`。
+    /// `transport` 欄位（/docs/design/rpc-specs/rpc-spec.md §2）：沒帶用 conf 的；帶了認不得 → `102`。
     fn transport(&self, params: &TransportParam) -> Result<Transport, Fail> {
         match &params.transport {
             None => Ok(self.settings.transport),
@@ -522,7 +522,7 @@ fn on_off(flag: bool) -> &'static str {
     }
 }
 
-/// conf 的開關關著、而這個命令**只做**那件事：拒絕，並說是哪個鍵（CLI 規格 §3.6 同一條）。
+/// conf 的開關關著、而這個命令**只做**那件事：拒絕，並說是哪個鍵（/docs/design/rpc-specs/wbf-cli-spec.md §3.6 同一條）。
 fn refuse_switched_off(key: &str, what: &str) -> Fail {
     Fail::Core(CoreError::new(
         CoreErrorKind::Usage,
@@ -530,7 +530,7 @@ fn refuse_switched_off(key: &str, what: &str) -> Fail {
     ))
 }
 
-/// `user`／`server`（rpc-spec §2）。用 `#[serde(flatten)]` 嵌進各 method 的 params。
+/// `user`／`server`（/docs/design/rpc-specs/rpc-spec.md §2）。用 `#[serde(flatten)]` 嵌進各 method 的 params。
 #[derive(Deserialize, Default)]
 struct TargetParams {
     #[serde(default)]
@@ -539,7 +539,7 @@ struct TargetParams {
     server: Option<String>,
 }
 
-/// `transport`（rpc-spec §2）。同上，只有標了「有 transport」的 method 嵌它。
+/// `transport`（/docs/design/rpc-specs/rpc-spec.md §2）。同上，只有標了「有 transport」的 method 嵌它。
 #[derive(Deserialize, Default)]
 struct TransportParam {
     #[serde(default)]
@@ -646,7 +646,7 @@ mod tests {
         let response = handle.call(request("account.list", json!({}))).await;
         assert_eq!(response.code, 0, "{}", response.msg);
         assert_eq!(response.result["accounts"], json!([]));
-        // 🚫 沒有 vault.lock（維護者 2026-09-13：daemon 不需要這個 feature，rpc-spec §3.1）。
+        // 🚫 沒有 vault.lock（維護者 2026-09-13：daemon 不需要這個 feature，/docs/design/rpc-specs/rpc-spec.md §3.1）。
         // 真正的「鎖上」是 daemon.shutdown 再重開 —— 換一個 Handle 就是那條路。
         let response = handle.call(request("vault.lock", Value::Null)).await;
         assert_eq!(response.code, code::UNKNOWN_METHOD, "{}", response.msg);
@@ -691,7 +691,7 @@ mod tests {
         assert!(handle.can_write());
     }
 
-    /// `sync` 沒帶就是 `local`，而 `local` **不連網**（rpc-spec §2、daemon-runtime §3.1）。
+    /// `sync` 沒帶就是 `local`，而 `local` **不連網**（/docs/design/rpc-specs/rpc-spec.md §2、/docs/design/daemon/daemon-runtime.md §3.1）。
     ///
     /// ⭐ 這條測得出「預設值對不對」：`local` 讀空的快取會**成功回一個空列表**，
     /// 而打上游會失敗（測試裡沒有帳號、也沒有 server）。🚫 不必真的架一台 server 來分辨。
@@ -746,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn every_network_method_parses_its_params_and_reaches_core() {
         // 解鎖了但沒有帳號：每個 method 都該走到 core 然後被 core 拒絕（1000+），
-        // 🚫 不是 101 unknown、🚫 不是 102 params。這張表是 rpc-spec §3 有 core 對應的全部。
+        // 🚫 不是 101 unknown、🚫 不是 102 params。這張表是 /docs/design/rpc-specs/rpc-spec.md §3 有 core 對應的全部。
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
         handle.core().await.create_vault(None).unwrap();

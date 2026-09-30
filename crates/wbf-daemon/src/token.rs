@@ -1,6 +1,6 @@
-//! `daemon.token` 的生命週期（architecture-v2 §4.3，維護者 2026-09-13 定）。
+//! `daemon.token` 的生命週期（/docs/design/rpc-specs/local-interface.md §3，維護者 2026-09-13 定）。
 //!
-//! token 是**前端**產生的、前端與 daemon 之間唯一的憑證（§4.4 從它導兩把金鑰）。它落在磁碟上
+//! token 是**前端**產生的、前端與 daemon 之間唯一的憑證（/docs/design/rpc-specs/local-interface.md §4 從它導兩把金鑰）。它落在磁碟上
 //! 只是為了「把它交給一個還沒啟動的程序」，所以那段落地時間要**盡量短**：
 //!
 //! ```text

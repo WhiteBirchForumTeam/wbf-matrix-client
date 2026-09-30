@@ -1,4 +1,4 @@
-//! 一條連線：一個讀取 task ＋ 一個送出 task ＋ 一張會話表（ws-receive-dispatch.md §0、§5–§7）。
+//! 一條連線：一個讀取 task ＋ 一個送出 task ＋ 一張會話表（/docs/design/daemon/ws-receive-dispatch.md §0、§5–§7）。
 //!
 //! 送與收是兩件事：`send` 只等佇列有位子，永遠不等回覆；回覆由讀取 task 查表交付。
 //! 兩個 task 哪一個死了、或呼叫端 `close()`，都走同一條路 `shut_down`：`closed` → `fail_all` → 兩個 task 都 abort。
@@ -26,7 +26,7 @@ pub const CORRUPT_FRAME_BUDGET: u32 = 8;
 /// 送出（進佇列）最多等多久：送出 task 卡在死掉的 socket 上時，呼叫端不該永遠掛著。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 心跳（ws-receive-dispatch.md §5.1，維護者 2026-09-21：照 WireGuard 的 persistent keepalive 那個概念）：每條線自己一個，
+/// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1，維護者 2026-09-21：照 WireGuard 的 persistent keepalive 那個概念）：每條線自己一個，
 /// 每 `interval` 醒一次；最近 `quiet` 之內這條線有任何送或收就跳過這次，否則送一個 `Ping` 等 `Pong`；
 /// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +58,7 @@ const HEARTBEAT_FIRST_SEQ: u32 = u32::MAX;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
-/// 一個要 Ack 的請求怎麼等（§6）。🚨 預設 `attempts = 1`：重送是冪等的呼叫點自己開的。
+/// 一個要 Ack 的請求怎麼等（/docs/design/daemon/ws-receive-dispatch.md §6）。🚨 預設 `attempts = 1`：重送是冪等的呼叫點自己開的。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AckPolicy {
     /// 總共送幾次（含第一次）。0 當 1。
@@ -114,7 +114,7 @@ impl Shared {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// 唯一的關線路徑（§7）：第一個叫到的人做事，之後的都是 no-op。
+    /// 唯一的關線路徑（/docs/design/daemon/ws-receive-dispatch.md §7）：第一個叫到的人做事，之後的都是 no-op。
     /// 順序是先 `fail_all` 再 abort：在等的人先拿到錯，task 才停（abort 自己那個 task 也可以：它在下一個 await 點才停）。
     fn shut_down(&self, reason: &str) {
         if self.closed.swap(true, Ordering::SeqCst) {
@@ -141,7 +141,7 @@ pub struct WsLink {
 }
 
 impl WsLink {
-    /// 起兩個 task 加預設的心跳（`Heartbeat::DEFAULT`）。`hook` 每收一個 pack 叫一次（§4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
+    /// 起兩個 task 加預設的心跳（`Heartbeat::DEFAULT`）。`hook` 每收一個 pack 叫一次（/docs/design/daemon/ws-receive-dispatch.md §4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
     pub fn start<S: FrameSource, K: FrameSink>(source: S, sink: K, hook: ReceivedHook) -> WsLink {
         WsLink::start_with_heartbeat(source, sink, hook, Heartbeat::DEFAULT)
     }

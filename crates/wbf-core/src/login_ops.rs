@@ -1,5 +1,5 @@
 //! 登入：建 `local.key`（如果還沒有）、探活、登入（一般 Matrix 走 matrix-sdk 的 Client；wbf 走自己包的 HTTP `/login`，
-//! `m/` 只建 crypto store）、封 session、切成 current（account-session.md §3）。
+//! `m/` 只建 crypto store）、封 session、切成 current（/docs/design/daemon/account-session.md §3）。
 
 use serde::Serialize;
 
@@ -22,7 +22,7 @@ pub struct LoginResult {
     pub user_id: String,
     pub device_id: String,
     pub server: String,
-    /// 登入成功自動切成 current（CLI 規格 §3.1.1）；換掉的是誰。
+    /// 登入成功自動切成 current（/docs/design/rpc-specs/wbf-cli-spec.md §3.1.1）；換掉的是誰。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub switched_from: Option<String>,
 }
@@ -30,7 +30,7 @@ pub struct LoginResult {
 impl Core {
     /// 建這個資料目錄的 `local.key`。
     ///
-    /// ⚠️ 「要不要設 passphrase」是**前端的決定**（§3），所以它在這裡就是一個參數：
+    /// ⚠️ 「要不要設 passphrase」是**前端的決定**（/docs/design/overview/architecture-v2.md §3），所以它在這裡就是一個參數：
     /// 給 `Some(bytes)` 就是 passphrase 模式，`None` 就是 plain。🚫 core 不問、不猜。
     ///
     /// Return:
@@ -62,7 +62,7 @@ impl Core {
     /// Args:
     ///     user: mxid 或 localpart, example: "@alice:localhost"
     ///     password: 🚫 不印、不 log；⚠️ 它要送給 homeserver，所以是**字串**不是任意
-    ///         bytes（local-cache-db §12.4：跟 passphrase 分家的理由）
+    ///         bytes（/docs/design/storage/vault-and-keys.md §3.4：跟 passphrase 分家的理由）
     ///     device_name: example: "wbf-cli"
     pub async fn log_in(
         &self,
@@ -101,10 +101,10 @@ impl Core {
                 .progress("removing a matrix store left over from a previous device");
             account.delete_matrix_store()?;
         }
-        // account-session.md §3：先探活（不帶 token），再決定走哪一邊。探不到當一般 Matrix（探活自己的規矩：只算這一次）。
+        // /docs/design/daemon/account-session.md §3：先探活（不帶 token），再決定走哪一邊。探不到當一般 Matrix（探活自己的規矩：只算這一次）。
         let speaks_wbf = self.get_backend_kind_of_server(server).await == BackendKind::WbfSdk;
         let session = if speaks_wbf {
-            // wbf：標準 HTTP `/login`（自己包的那支），🚫 不建 Client。之後房間、訊息、媒體、金鑰全走 WS（§2）。
+            // wbf：標準 HTTP `/login`（自己包的那支），🚫 不建 Client。之後房間、訊息、媒體、金鑰全走 WS（/docs/design/daemon/account-session.md §2）。
             let mut session =
                 wbf_sdk::login::login_with_password(server, user, password, device_name).await?;
             session.backend = Some(SessionBackend::WbfSdk);
@@ -178,15 +178,15 @@ impl Core {
             }
             return Err(error.into());
         }
-        // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：換 session 不影響它，這裡不再忘掉探測結果。
-        // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（link-pool.md §3；PR #53 審查 cirno 🟡1）。
+        // 📎 探活以 server 為鍵、不帶 token（/docs/design/daemon/account-session.md §1）：換 session 不影響它，這裡不再忘掉探測結果。
+        // 🚨 舊 session 開著的線也不算數（它們拿的是舊 token）：整個池關掉，下一個命令用新 session 重開（/docs/design/daemon/link-pool.md §3；PR #53 審查 cirno 🟡1）。
         self.close_links(&account, "session replaced by a new login")
             .await;
         Ok(account)
     }
 
-    /// wbf 帳號的 `m/`：**只有 crypto store**，由 `OlmEngine` 開（account-session.md §2；裝置身分金鑰在這一步生出來，
-    /// 開 `Keys` 線時才上傳，e2ee-rpc.md §5）。這裡只要它建好，引擎本身丟掉；長活的引擎在 `key_sync` 的 `crypto_engines` 表裡共用。
+    /// wbf 帳號的 `m/`：**只有 crypto store**，由 `OlmEngine` 開（/docs/design/daemon/account-session.md §2；裝置身分金鑰在這一步生出來，
+    /// 開 `Keys` 線時才上傳，/docs/design/keys/e2ee-rpc.md §5）。這裡只要它建好，引擎本身丟掉；長活的引擎在 `key_sync` 的 `crypto_engines` 表裡共用。
     ///
     /// 🚨 建不起來就把半套的 `m/` 刪掉再回錯（token 由 `log_in` 的 rollback 撤）：🚫 不留一個「登入了、但沒有金鑰庫」的帳號——
     /// 那種帳號下一次碰到 E2EE 才發現，而那時已經有人把房間金鑰發給一台不存在的裝置。
@@ -267,7 +267,7 @@ mod tests {
         dir
     }
 
-    /// account-session.md §3：探到 wbf → 標準 HTTP `/login`、🚫 不建 Client、`m/` 只有 crypto store、session 記著 `WbfSdk`。
+    /// /docs/design/daemon/account-session.md §3：探到 wbf → 標準 HTTP `/login`、🚫 不建 Client、`m/` 只有 crypto store、session 記著 `WbfSdk`。
     /// 探活對真 server 要 WS，這裡直接把探測結果記進註冊表；`/login` 由本機一個回 200 的迷你 HTTP 扮。
     #[tokio::test]
     async fn logging_in_to_a_wbf_server_builds_no_matrix_client() {

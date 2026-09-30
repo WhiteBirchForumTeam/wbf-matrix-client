@@ -1,4 +1,4 @@
-//! wbf 協議的錯誤碼：server 那張表（wbfuwunel `wbf-wire-format.md` §3.4）在 client 這邊的投影。
+//! wbf 協議的錯誤碼：server 那張表（wbfuwunel 的 `/docs/design/wbf-wire-format.md` §3.4）在 client 這邊的投影。
 //!
 //! 🚨 **程式只比對 `code_id`（整數），🚫 不比對 `code`（名字）**。名字是給人看 log 用的。
 //! 📎 在這之前 client 比的是名字（`code == "Corrupt"`），而 `SdkError::Server` 同時裝著 Matrix 的
@@ -50,7 +50,7 @@ pub enum WbfErrorCode {
     Superseded = 1505,
     /// 這則加密訊息帶的 `room_version` 已經過期：房間的成員或成員的裝置變了，**訊息沒有送出**。
     /// meta 帶目前的號碼（[`SdkError::current_room_version`]）；重拿成員清單、補發房間金鑰、帶新號碼重送
-    /// （wbfuwunel `wbf-room-device-version.md` §7）。重試幾次是 client 的政策。
+    /// （wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §7）。重試幾次是 client 的政策。
     RoomDevicesChanged = 1506,
     /// server 自己的錯。可以退避重試。
     Internal = 1901,

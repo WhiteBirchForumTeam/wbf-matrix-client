@@ -14,7 +14,7 @@
 //! 同一個程序裡兩個請求各開各的 handle，一樣互斥（Windows `LockFileEx`、Unix `flock` 都是以 handle 為單位）。
 //!
 //! 📎 範圍是**整個資料目錄**一把，不是一個帳號一把：鎖檔名如果帶 server 或帳號，就等於在目錄外面留下
-//! 「這裡有過哪個 server」的痕跡（local-cache-db.md §11）；而這三個操作很少發生，一起排隊的代價很小。
+//! 「這裡有過哪個 server」的痕跡（/docs/design/storage/vault-and-keys.md §2）；而這三個操作很少發生，一起排隊的代價很小。
 //! 📎 🚫 不併進 `daemon.lock`：那把是「這個目錄現在誰有權寫」，daemon 活著就一直握著；這把只在一次操作的期間握著。
 
 use std::fs::{File, TryLockError};

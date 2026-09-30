@@ -3,7 +3,7 @@
 //! ⚠️ 這整個模組是 **`pub(crate)`**，而且要一直是。`Session`（裡面有 `access_token`）、
 //! `MatrixBackend`、`Cache`、`MediaPool` 全是程序內的 handle：序列化不了、跨不了 FFI，
 //! 而 `Session` 還帶著秘密——**它一個欄位都不該離開這個 crate**
-//!（architecture-v2 §7；PR #24 審查 cirno🔴）。
+//!（/docs/design/overview/architecture-v2.md §6；PR #24 審查 cirno🔴）。
 //!
 //! 外面看得到的是 `Core` 上那些回**可序列化 DTO** 的方法；handle 活在這裡，被它們用。
 
@@ -44,16 +44,16 @@ impl Core {
     /// 這個帳號的 matrix-sdk backend（store 在帳號目錄的 `m/`，金鑰是第二把子金鑰）。
     ///
     /// Args:
-    ///     server_backup: conf 的 `SERVER_BACKUP`（CLI 規格 §10）, example: true
+    ///     server_backup: conf 的 `SERVER_BACKUP`（/docs/design/rpc-specs/wbf-cli-spec.md §10）, example: true
     ///
-    /// ⚠️ 這個旗標由**呼叫端**帶進來，🚫 core 自己不讀 conf——那是「代前端做決定」（§3）。
+    /// ⚠️ 這個旗標由**呼叫端**帶進來，🚫 core 自己不讀 conf——那是「代前端做決定」（/docs/design/overview/architecture-v2.md §3）。
     pub(crate) async fn backend_of(
         &self,
         account: &AccountDir,
         server_backup: bool,
     ) -> Result<MatrixBackend, CoreError> {
         let session = self.session_of(account)?;
-        // wbf 帳號沒有 Client（account-session.md §2）：要用它的呼叫點就是還沒搬到 WS 上的那幾支，明講、🚫 不靜默失效。
+        // wbf 帳號沒有 Client（/docs/design/daemon/account-session.md §2）：要用它的呼叫點就是還沒搬到 WS 上的那幾支，明講、🚫 不靜默失效。
         if session.backend == Some(SessionBackend::WbfSdk) {
             return Err(no_matrix_client_error(account, "this call"));
         }
@@ -72,7 +72,7 @@ impl Core {
         .await?)
     }
 
-    /// 這個帳號是不是登入時就走了 wbf 那條（沒有 matrix-sdk 的 Client；account-session.md §2）。
+    /// 這個帳號是不是登入時就走了 wbf 那條（沒有 matrix-sdk 的 Client；/docs/design/daemon/account-session.md §2）。
     ///
     /// Return:
     ///     Ok(true)      `Session::backend == WbfSdk`
@@ -82,9 +82,9 @@ impl Core {
         Ok(self.session_of(account)?.backend == Some(SessionBackend::WbfSdk))
     }
 
-    /// 這個帳號所屬 server 的 `cache.db`（local-cache-db.md §6，同 server 的帳號共用）。
+    /// 這個帳號所屬 server 的 `cache.db`（/docs/design/storage/local-cache-db.md §5，同 server 的帳號共用）。
     ///
-    /// server 不符、解不開就重建（§1），重建時發一個 `Progress` 事件說一聲——
+    /// server 不符、解不開就重建（/docs/design/storage/local-cache-db.md §1），重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
         #[cfg(test)]
@@ -113,7 +113,7 @@ impl Core {
         Ok(cache)
     }
 
-    /// 這個帳號所屬 server 的 `cache.db` 的**寫入者＋讀連線**（daemon-runtime §2）。
+    /// 這個帳號所屬 server 的 `cache.db` 的**寫入者＋讀連線**（/docs/design/daemon/daemon-runtime.md §2）。
     ///
     /// ⭐ **一個 server dir 一份，開了就留著**：多個寫入者就沒有順序可言（水位會倒退），
     /// 而且每次重開都要付一次 SQLCipher 導金鑰。
@@ -250,7 +250,7 @@ impl Core {
         }
     }
 
-    /// 這個帳號所屬 server 的媒體儲存池（local-cache-db.md §8），跟 `cache.db` 同層。
+    /// 這個帳號所屬 server 的媒體儲存池（/docs/design/media/media-pool.md），跟 `cache.db` 同層。
     pub(crate) fn pool_of(&self, account: &AccountDir) -> Result<MediaPool, CoreError> {
         Ok(MediaPool::open(
             &account.server_dir(),
@@ -290,8 +290,8 @@ pub(crate) fn get_raw_cache_opens_for(server_dir: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-/// wbf 帳號不建 matrix-sdk 的 Client（account-session.md §2），所以還掛在 Client 上的那幾支對它是**關的**——
-/// 講清楚是哪一支、為什麼、去哪看清單（§6），🚫 不靜默失效、不裝成「連不上」。
+/// wbf 帳號不建 matrix-sdk 的 Client（/docs/design/daemon/account-session.md §2），所以還掛在 Client 上的那幾支對它是**關的**——
+/// 講清楚是哪一支、為什麼、去哪看清單（/docs/design/daemon/account-session.md §6），🚫 不靜默失效、不裝成「連不上」。
 ///
 /// Args:
 ///     account: 哪個帳號
@@ -303,7 +303,7 @@ pub(crate) fn no_matrix_client_error(account: &AccountDir, what: &str) -> CoreEr
         CoreErrorKind::Usage,
         format!(
             "{what} is not available for {}: it is on a wbf server, and wbf accounts do not build the \
-             matrix-sdk client (backup, recovery, watch and /context still need it; account-session.md §6 lists \
+             matrix-sdk client (backup, recovery, watch and /context still need it; /docs/design/daemon/account-session.md §6 lists \
              what runs over the wbf protocol)",
             account.label()
         ),

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# 驗收腳本（CLI 規格 §8、plan-v1 §4），對著本機 wbfuwunel 跑。Windows 用 Git Bash。
+# 驗收腳本（/docs/design/rpc-specs/wbf-cli-spec.md §8），對著本機 wbfuwunel 跑。Windows 用 Git Bash。
 #
 #   WBF_PASSWORD_FILE=<檔> scripts/acceptance.sh
 #
 # 環境變數：WBF_SERVER（預設 http://127.0.0.1:6167）、WBF_USER（預設 alice）、WBF_PASSWORD_FILE（必要）、
 # WBF_ACCEPT_SIZE_MIB（預設 200；想快一點就給小的）。
 # 任一步失敗就 exit 非 0 並印出是哪一步。
-# 執行順序與規格 §8 的編號不同（三種 cipher 先跑，因為 seek／續傳／串流都要它的 manifest）；
+# 執行順序與 /docs/design/rpc-specs/wbf-cli-spec.md §8 的編號不同（三種 cipher 先跑，因為 seek／續傳／串流都要它的 manifest）；
 # 每一步的標題括號裡是規格的步驟號。
 set -euo pipefail
 
@@ -68,7 +68,7 @@ upload_download_roundtrip() {
     chunks=$(( (file_size + chunk_size - 1) / chunk_size ))
     overhead=16; [ "$cipher" = none ] && overhead=0
     expected_len=$(( file_size + chunks * overhead ))
-    # 標準下載：分塊媒體整份給（線上規格 §4.2）。逐 byte 的密文比對在 wbf-sdk 的 e2e 測試；這裡驗長度。
+    # 標準下載：分塊媒體整份給（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.2）。逐 byte 的密文比對在 wbf-sdk 的 e2e 測試；這裡驗長度。
     actual_len=$(curl -sS -H "Authorization: Bearer $token" -o "$work/standard-$cipher.bin" -w '%{size_download}' \
         "$SERVER/_matrix/client/v1/media/download/${mxc#mxc://}")
     [ "$actual_len" = "$expected_len" ] || fail "standard download is $actual_len bytes, expected $expected_len"

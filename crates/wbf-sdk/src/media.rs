@@ -1,8 +1,8 @@
-//! 媒體快取的接法（local-cache-db.md §8.3、§8.5、§8.7）：下載管線、儲存池（`media_pool`）與 `cache.db`（`cache`）三者怎麼一起動。
+//! 媒體快取的接法（/docs/design/media/media-pool.md §3、§5、§7）：下載管線、儲存池（`media_pool`）與 `cache.db`（`cache`）三者怎麼一起動。
 //!
 //! - `fetch`：快取有完整檔就從池開；沒有就邊下邊 append 進池，進度在記憶體、每 `PROGRESS_FLUSH` 快照一次到 DB，
 //!   中斷從上次快照的塊數續（檔截到那裡，之後的不信）。完成算 hash → adopt 進池（同 hash 去重）→ DB 寫齊。
-//! - `collect_garbage`：配額 best effort、保護期內不刪、先刪檔再刪列、有人指著的池檔不刪（§8.5）。
+//! - `collect_garbage`：配額 best effort、保護期內不刪、先刪檔再刪列、有人指著的池檔不刪（/docs/design/media/media-pool.md §5）。
 //! - `sweep`：啟動掃孤兒（DB 說有檔不在 → reset；pending 沒對應列 → 刪）。
 //!
 //! 這裡是三個模組唯一的交會點：`cache` 不知道池，`media_pool` 不知道 DB，下載管線不知道兩者。
@@ -17,9 +17,9 @@ use crate::error::SdkError;
 use crate::manifest::Manifest;
 use crate::media_pool::{MediaPool, PoolReader};
 
-/// 進度快照的間隔（§8.3：每 1–2 秒）。
+/// 進度快照的間隔（/docs/design/media/media-pool.md §3：每 1–2 秒）。
 pub const PROGRESS_FLUSH: Duration = Duration::from_millis(1500);
-/// §8.5 的預設。
+/// /docs/design/media/media-pool.md §5 的預設。
 pub const DEFAULT_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PROTECT: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -64,7 +64,7 @@ pub async fn fetch<C: PackChannel>(
         block.chunk_size,
     )?;
     if entry.complete {
-        // DB 說有：檔也要真的在、長度要對、校驗碼要跟這份 manifest 的區塊一致（§8.3「兩邊都問」；PR #14 審查 rumia 🟡1）。
+        // DB 說有：檔也要真的在、長度要對、校驗碼要跟這份 manifest 的區塊一致（/docs/design/media/media-pool.md §3「兩邊都問」；PR #14 審查 rumia 🟡1）。
         // 任一不符就當沒快取，reset 後重下。
         if cached_copy_matches(pool, &entry, manifest) {
             cache.touch_media(&manifest.mxc)?;
@@ -133,7 +133,7 @@ pub async fn fetch<C: PackChannel>(
         )));
     }
     let finished = writer.finish()?;
-    // 明文 sha256（約定 §3.1 第 5 條）由 verify 過的塊逐塊保證；這裡另有 BLAKE3 當檔名。
+    // 明文 sha256（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 5 條）由 verify 過的塊逐塊保證；這裡另有 BLAKE3 當檔名。
     pool.adopt(&pending_name, &finished.hash_hex)?;
     let bytes_on_disk = pool.bytes_on_disk(&finished.hash_hex)?;
     cache.media_finish(
@@ -209,11 +209,11 @@ pub struct GarbageReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
     pub files_removed: u64,
-    /// 保護期外的候選都刪了還是超過配額（§8.5：不擋、UI 提示手動清理）。
+    /// 保護期外的候選都刪了還是超過配額（/docs/design/media/media-pool.md §5：不擋、UI 提示手動清理）。
     pub still_over_quota: bool,
 }
 
-/// §8.5：超過 `quota_bytes` 就從最舊的 `last_used_at` 開始刪，只刪保護期外的；有別的 mxc 指著的池檔不刪檔只清列。
+/// /docs/design/media/media-pool.md §5：超過 `quota_bytes` 就從最舊的 `last_used_at` 開始刪，只刪保護期外的；有別的 mxc 指著的池檔不刪檔只清列。
 /// 先刪檔再改 DB。
 ///
 /// Args:
@@ -273,7 +273,7 @@ pub struct SweepReport {
     pub removed_orphan_files: u64,
 }
 
-/// 啟動時掃一次（§8.5 最後一條），三個方向：DB → 檔（說完整但檔不在 → reset）、`pending/` → DB（沒列認領或過保護期 → 刪）、
+/// 啟動時掃一次（/docs/design/media/media-pool.md §5 最後一條），三個方向：DB → 檔（說完整但檔不在 → reset）、`pending/` → DB（沒列認領或過保護期 → 刪）、
 /// `media/<hh>/` → DB（沒列指著的完成檔 → 刪；`forget_account` 刪掉孤兒列之後就是這裡收檔，PR #14 審查 rumia／salvia 🟡）。
 pub fn sweep(
     cache: &mut Cache,

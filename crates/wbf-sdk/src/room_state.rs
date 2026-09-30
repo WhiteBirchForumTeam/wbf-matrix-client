@@ -1,4 +1,4 @@
-//! wbf 帳號的房間描述：從橋拿到的狀態事件（`GetState`）與 `m.direct` 組出 `Conversation`（chat-model §2、§3）。
+//! wbf 帳號的房間描述：從橋拿到的狀態事件（`GetState`）與 `m.direct` 組出 `Conversation`（/docs/design/rooms/chat-model.md §2、§3）。
 //!
 //! 純函數、沒有 matrix-sdk。規則跟 `backend/matrix_sdk.rs` 的 `describe` 是同一套（那邊讀的是 Client 的 `Room`），
 //! 兩邊算出來的 `kind`／`can_send_message` 要一樣——這裡的測試就是在釘那件事。
@@ -71,7 +71,7 @@ pub fn conversation_from_state(
         .collect();
     let member_count = joined.len() as u64;
 
-    // chat-model §3.1：m.direct 有它且成員剛好兩個才是 Direct；§3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
+    // /docs/design/rooms/chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；/docs/design/rooms/chat-model.md §3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
     let (kind, direct_peer) = if !direct_peers.is_empty() && member_count == 2 {
         (ConversationKind::Direct, direct_peers.first().cloned())
     } else if needed_to_send >= 100 {

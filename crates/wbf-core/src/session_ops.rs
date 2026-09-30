@@ -1,10 +1,10 @@
 //! 登出與摧毀：裝置層（`session.sealed`、`m/`、`k/`）與資料層（`cache.db` 的忘掉鏈）。
 //!
 //! ⚠️ 這一家是**會刪檔**的，所以 fail closed 的規矩最多；每一條的理由都在
-//! local-cache-db.md §10.7 與 §6。
+//! /docs/design/keys/room-key-backup.md §7 與 /docs/design/storage/local-cache-db.md §5。
 //!
 //! 🚫 這裡的訊息**不提任何命令名字**（`wbf-cli key-backup recovery` 那種）：core 不知道
-//! 呼叫它的是 rpc-cli、Desktop 還是 Android（§3）。它只說**條件**，前端照
+//! 呼叫它的是 rpc-cli、Desktop 還是 Android（/docs/design/overview/architecture-v2.md §3）。它只說**條件**，前端照
 //! [`CoreErrorKind::HistoryWouldBeLost`] 補上自己的那句話。
 
 use serde::Serialize;
@@ -48,7 +48,7 @@ impl Core {
     /// ⚠️ `m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊的 crypto
     /// store 會擋登入（"account in the store doesn't match"，2026-09-07 實跑踩到）。
     ///
-    /// 🚫 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（§10.8）。
+    /// 🚫 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（/docs/design/keys/room-key-backup.md §8）。
     ///
     /// Args:
     ///     user: 完整 mxid, example: "@bob:matrix.org"
@@ -84,7 +84,7 @@ impl Core {
     ///    ⭐ 放最後是 fail closed：前面任何一步失敗，目錄還在，`account status` 看得到殘留、重跑 destroy 能接著清。
     ///
     /// ⚠️ 這個命令**連 recovery key 一起摧毀**，所以之後 server 上那份備份永遠解不開。
-    /// 🚫 呼叫端要先問過使用者：core 不做「你確定嗎」，那是前端的事（§3）。
+    /// 🚫 呼叫端要先問過使用者：core 不做「你確定嗎」，那是前端的事（/docs/design/overview/architecture-v2.md §3）。
     pub async fn destroy_account(
         &self,
         user: &str,
@@ -109,7 +109,7 @@ impl Core {
 
         let report = self.forget_cached_account(&account, &server, user).await?;
 
-        // DB 先、檔案後（§6 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。
+        // DB 先、檔案後（/docs/design/storage/local-cache-db.md §5 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。
         // 刪不掉只說一聲，下次 media-gc 的 sweep 會再收（整個 server 目錄被刪時也一起走）。
         let pool = self.pool_of(&account)?;
         let mut pool_files_removed = 0u64;
@@ -151,7 +151,7 @@ impl Core {
         })
     }
 
-    /// 忘掉鏈（local-cache-db.md §6），走這台 server 的**唯一寫入者**。
+    /// 忘掉鏈（/docs/design/storage/local-cache-db.md §5），走這台 server 的**唯一寫入者**。
     ///
     /// 🚫 `cache.db` 不在就不開：開了等於為了「忘掉」建一個空的出來（#25 同一支的 bug）。
     /// 🚫 不拿使用者打的字串去查 `users` 列：那裡存的是權威 mxid，精確比對差一個大小寫
@@ -277,7 +277,7 @@ impl Core {
         let vault = self.vault()?;
         match vault.unseal_session(&account.session_path())? {
             Some(session) => {
-                // account-session.md §4：1 封池 → 2 HTTP 登出（只有成與不成）→ 3 關池 → 4 清本地 → 5 解封。
+                // /docs/design/daemon/account-session.md §4：1 封池 → 2 HTTP 登出（只有成與不成）→ 3 關池 → 4 清本地 → 5 解封。
                 // 封池是一個 guard：這個函數怎麼離開（不成、`?`、成功走到底）都會解封（PR #54 審查 🔴：第一版只在失敗分支解封）。
                 let _logging_out = self.logging_out_guard(account);
                 // 不成：`?` 原樣回錯、guard 解封，連線照常收新封包（維護者 2026-09-21：no-op）。
@@ -285,9 +285,9 @@ impl Core {
                 // 成了：先收掉跟上游的 task（它握著訂閱線的 handle），再關線——順序反了 task 會看到 Network 才結束，一樣收得掉，但這樣乾淨。
                 self.stop_room_sync_of(account).await;
                 self.stop_key_sync_of(account).await;
-                // 說出口的退出（wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
+                // 說出口的退出（wbfuwunel 的 /docs/design/wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
                 self.unsubscribe_keys_of(account).await;
-                // token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（link-pool.md §3）。
+                // token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（/docs/design/daemon/link-pool.md §3）。
                 // `close_all` 等正在用線的命令做完才收那條；遠端先關了的只是丟掉，不二次跳錯。
                 // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed；「登出中」是帳號的狀態。
                 self.close_links(account, "logged out").await;
@@ -299,13 +299,13 @@ impl Core {
                 account.label()
             )),
         }
-        // 📎 探活以 server 為鍵、不帶 token（account-session.md §1）：session 沒了不影響它，這裡不再忘掉探測結果。
+        // 📎 探活以 server 為鍵、不帶 token（/docs/design/daemon/account-session.md §1）：session 沒了不影響它，這裡不再忘掉探測結果。
         // 已經登出但目錄還在那條分支：池照理說是空的（沒 session 開不了線），還是掃一次——消費端自己再問一次。
         self.close_links(account, "logged out").await;
         // 長活的引擎握著 `m/` 的 sqlite：先丟掉才刪得掉（Windows）。
         self.forget_crypto_engine(account).await;
         account.delete_matrix_store()?;
-        // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（§10.7）。
+        // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（/docs/design/keys/room-key-backup.md §7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。
         room_keys::del_snapshot(&account.dir)?;
         accounts::clear_current_if(&self.data_dir, account)?;
@@ -324,7 +324,7 @@ impl Core {
         Ok(described)
     }
 
-    /// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
+    /// `logout`／`account del`／`account destroy` 的閘門（/docs/design/keys/room-key-backup.md §7）。
     ///
     /// 這些命令會連 `m/`（crypto store）與 `k/`（本地快照）一起刪。在還沒有 recovery key 的
     /// 預設狀態下，**server 端備份的私鑰就在那個 store 裡**——照樣登出的話歷史就回不來了。
@@ -348,7 +348,7 @@ impl Core {
             return Ok(());
         }
         if self.is_wbf_account(account)? {
-            // wbf 帳號沒有 Client，問不到「server 那份救得回來嗎」（備份還沒搬到橋上；account-session.md §6）：
+            // wbf 帳號沒有 Client，問不到「server 那份救得回來嗎」（備份還沒搬到橋上；/docs/design/daemon/account-session.md §6）：
             // 第 1 關問不出來就當沒過（fail closed），只剩第 2 關——這台機器保管著 recovery key 才放行。
             let Some(session) = self.vault()?.unseal_session(&account.session_path())? else {
                 return Err(refusal(
@@ -362,7 +362,7 @@ impl Core {
             return Err(refusal(
                 account,
                 "it is on a wbf server, where the server-side backup cannot be checked yet (wbf accounts have no\n       \
-                 matrix-sdk client; account-session.md §6), and this machine is not keeping its recovery key.\n       \
+                 matrix-sdk client; /docs/design/daemon/account-session.md §6), and this machine is not keeping its recovery key.\n       \
                  Pass accept_history_loss to log out anyway",
             ));
         }
@@ -423,7 +423,7 @@ impl Core {
     }
 }
 
-/// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（local-cache-db.md §10.7）。
+/// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（/docs/design/keys/room-key-backup.md §7）。
 ///
 /// 🚫 不寫成「沒有 recovery key 才擋」：上游哪天多一種 `RecoveryState`，那種寫法會默默放行。
 fn is_history_recoverable(status: Option<&BackupStatus>) -> bool {
@@ -640,7 +640,7 @@ fn remove_error(path: &std::path::Path, error: std::io::Error) -> CoreError {
 
 /// 閘門擋下來時的訊息：`why` 是這一次為什麼擋，後面接一律相同的出路。
 ///
-/// 🚫 **不提命令名字**：core 不知道呼叫它的是誰（§3）。前端看到
+/// 🚫 **不提命令名字**：core 不知道呼叫它的是誰（/docs/design/overview/architecture-v2.md §3）。前端看到
 /// [`CoreErrorKind::HistoryWouldBeLost`] 再補上自己那句 `wbf-cli …`。
 fn refusal(account: &AccountDir, why: &str) -> CoreError {
     CoreError::new(
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn the_refusal_says_the_condition_but_never_names_a_command() {
-        // 🚫 core 不知道呼叫它的是 rpc-cli、Desktop 還是 Android（§3）。
+        // 🚫 core 不知道呼叫它的是 rpc-cli、Desktop 還是 Android（/docs/design/overview/architecture-v2.md §3）。
         let dir = std::env::temp_dir().join(format!("wbf-core-refusal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

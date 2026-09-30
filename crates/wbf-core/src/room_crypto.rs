@@ -1,4 +1,4 @@
-//! 房間的加解密（e2ee-rpc.md，維護者 2026-09-29 定的形狀）：refresh、加密送出、被 1506 擋之後自動重拿房間狀態、
+//! 房間的加解密（/docs/design/keys/e2ee-rpc.md，維護者 2026-09-29 定的形狀）：refresh、加密送出、被 1506 擋之後自動重拿房間狀態、
 //! 收到時解密、金鑰到了補解。
 //!
 //! - **狀態放 UI**：房間版本號與每個成員的裝置版本號（[`RoomDevices`]）由 UI 存，送出時帶回來；daemon 🚫 不存每房的快照。
@@ -358,7 +358,7 @@ mod tests {
         }
     }
 
-    /// e2ee-rpc.md 的整條送出：加密房沒帶 `room_devices` 就拒（🚫 不送明文）；refresh 回 UI 要存的那份；帶著它送出去的是密文、帶那個號碼；
+    /// /docs/design/keys/e2ee-rpc.md 的整條送出：加密房沒帶 `room_devices` 就拒（🚫 不送明文）；refresh 回 UI 要存的那份；帶著它送出去的是密文、帶那個號碼；
     /// 號碼過期被 1506 擋 → **daemon 自動重拿房間狀態**，錯誤是 `RoomDevicesChanged`、`data` 帶新狀態與同一個 `txn_id`，訊息沒送（🚫 不自動重送）；
     /// UI 帶新狀態、同一個 `txn_id` 重送就過。
     #[tokio::test]
@@ -734,7 +734,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("{event_id} arrives decrypted within 30 s"))
     }
 
-    /// e2ee-rpc.md 整條對真的 wbfuwunel（#45 的驗收，這次走 daemon 的形狀）：
+    /// /docs/design/keys/e2ee-rpc.md 整條對真的 wbfuwunel（#45 的驗收，這次走 daemon 的形狀）：
     /// alice、bob 各一個 `Core`（各自的資料目錄）登入、鉤子開五條線（`Keys` 線上傳裝置金鑰）→ alice `refresh` 拿到 UI 要存的 `RoomDevices`
     /// → 帶著它送加密訊息 → bob 收到的 `room.message` 是解開的；
     /// bob 再登一台新裝置（第三個 `Core`）→ alice 帶**舊的** `RoomDevices` 送 → 被 server 擋（1506），`RoomDevicesChanged` 的 `data` 是 daemon 自動重拿的新狀態、訊息沒送

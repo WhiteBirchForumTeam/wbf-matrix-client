@@ -1,4 +1,4 @@
-//! 真的把 daemon 這個**程序**跑起來（architecture-v2 §4.3 的第 2–5 步）。
+//! 真的把 daemon 這個**程序**跑起來（/docs/design/rpc-specs/local-interface.md §3 的第 2–5 步）。
 //!
 //! 上面兩個測試檔都是在同一個程序裡叫 `RpcServer::bind`，所以 `main.rs` 那一段
 //! ——讀 token 檔、清掉舊的 `daemon.json`、綁好之後才寫、stdout 宣告 ready、結束時收拾——
@@ -24,7 +24,7 @@ struct Ready {
     pid: u32,
 }
 
-/// 像前端那樣放一個 token 檔：**Unix 0600**（architecture-v2 §4.3 的第 1 步）。
+/// 像前端那樣放一個 token 檔：**Unix 0600**（/docs/design/rpc-specs/local-interface.md §3 的第 1 步）。
 ///
 /// 🚨 🚫 不要用 `std::fs::write`：那會套 umask（常見 0644），而 daemon 對別人讀得到的 token 檔是
 /// **fail closed** 的 —— 於是 Unix 上每個 process 測試都會在 `spawn_daemon` 就死掉，
@@ -123,7 +123,7 @@ async fn call(port: u16, keys: &RpcKeys, requests: &[Value]) -> Vec<Value> {
 /// 第 2–5 步走一遍真的程序：ready 的兩個管道、token 檔誰動、`daemon.json` 的進與出。
 #[tokio::test]
 async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up_on_shutdown() {
-    // 短路徑：加密過的目錄名很長（handover §4 9b）。
+    // 短路徑：加密過的目錄名很長（/docs/handover.md §4 9b）。
     let dir = tempfile::Builder::new()
         .prefix("wp")
         .tempdir_in(std::env::temp_dir())
@@ -220,7 +220,7 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-/// token 檔別人讀得到就**拒絕啟動**（fail closed，architecture-v2 §4.3）。
+/// token 檔別人讀得到就**拒絕啟動**（fail closed，/docs/design/rpc-specs/local-interface.md §3）。
 /// Windows 靠目錄 ACL，那裡這條檢查一律過，所以只在 Unix 跑。
 #[cfg(unix)]
 #[test]
@@ -245,7 +245,7 @@ fn a_world_readable_token_file_stops_the_daemon_from_starting() {
     assert!(!dir.path().join("daemon.json").exists(), "也不該寫 ready");
 }
 
-/// 資料目錄的獨佔（architecture-v2 §0.2）：第二個 daemon **起不來**，而且不會動到第一個的東西。
+/// 資料目錄的獨佔（/docs/design/overview/architecture-v2.md §0.2）：第二個 daemon **起不來**，而且不會動到第一個的東西。
 ///
 /// 🚨 這條在 2026-09-13 之前是不成立的：`cache.db` 開在 WAL（SQLite 本來就支援多程序），
 /// 而 port 預設是隨機的，所以兩個 daemon 可以同時開著同一個資料目錄互相踩。
@@ -312,7 +312,7 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
     let _ = third.wait();
 }
 
-/// `-s` 與單發是**兩種起法**，兩個都帶就報錯（architecture-v2 §0.2，維護者 2026-09-13）。
+/// `-s` 與單發是**兩種起法**，兩個都帶就報錯（/docs/design/overview/architecture-v2.md §0.2，維護者 2026-09-13）。
 #[test]
 fn serving_and_a_one_shot_command_at_the_same_time_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -338,7 +338,7 @@ fn serving_and_a_one_shot_command_at_the_same_time_is_refused() {
     assert!(!dir.path().join(wbf_daemon::lock::LOCK_FILE_NAME).exists());
 }
 
-/// token 檔長度不對就不啟動，而且**講得出原因**（`TOKEN_LEN`，architecture-v2 §4.3）。
+/// token 檔長度不對就不啟動，而且**講得出原因**（`TOKEN_LEN`，/docs/design/rpc-specs/local-interface.md §3）。
 ///
 /// 📎 這條同時是 `spawn_daemon` 那個診斷路徑的實跑：daemon 起不來的時候，
 /// 測試要看得到它的抱怨，🚫 不是對著一行空的 stdout 猜。
