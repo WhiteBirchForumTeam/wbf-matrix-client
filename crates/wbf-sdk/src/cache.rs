@@ -2,7 +2,9 @@
 //!
 //! **一個 server 一個檔、多帳號混存**（維護者 2026-09-07 定）：事件只存一份；誰看得到哪一則由 `events_synced_log` 逐則記
 //! （server 經任一條路給過這個 user 的才算），沒有列就看不到——fail closed，不用 r_seq 下界去猜可見性。
-//! **快取不是權威**（/docs/design/storage/local-cache-db.md §1）：server 不符、schema 版本不對、解不開，一律刪檔重建，不寫遷移；讀到壞資料當成沒有快取。
+//! **快取不是權威**（/docs/design/storage/local-cache-db.md §1）：schema 版本不對、解不開，一律刪檔重建，不寫遷移；讀到壞資料當成沒有快取。
+//! [`Cache::open`] 本身逐字比對 `CacheIdentity`、不符就重建；產品層在呼叫它之前先用 [`Cache::read_identity`] 照庫記的身分開，
+//! host 不同就拒絕（wbf-core 的 `find_recorded_cache_identity`），所以「server 不符」在產品裡不會變成重建。
 //!
 //! schema 風格：實體表 `INTEGER PRIMARY KEY` 加識別碼的 UNIQUE 索引；關聯表整數複合主鍵 `WITHOUT ROWID`；
 //! 字串識別碼（mxid、room_id、event_id）各只存一次，其餘全走整數外鍵。整數 id 不出這個檔。
@@ -60,7 +62,7 @@ pub enum OpenOutcome {
     Reused,
     /// 沒有檔，新建。
     Created,
-    /// 有檔但解不開／server 不符／版本不對，刪掉重建。
+    /// 有檔但解不開／版本不對（或 `identity` 跟檔裡記的不符——產品層不會這樣呼叫，見模組註解），刪掉重建。
     Rebuilt,
 }
 

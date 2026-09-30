@@ -109,7 +109,7 @@ impl Core {
                 .events
                 .progress(format!("created {}", cache.path().display())),
             OpenOutcome::Rebuilt => self.events.progress(format!(
-                "rebuilt {} (it was for another server, or could not be opened)",
+                "rebuilt {} (it could not be opened, or its schema was out of date)",
                 cache.path().display()
             )),
         }
@@ -243,7 +243,7 @@ impl Core {
                 .events
                 .progress(format!("created {}", dir.join("cache.db").display())),
             OpenOutcome::Rebuilt => self.events.progress(format!(
-                "rebuilt {} (it was for another server, or could not be opened)",
+                "rebuilt {} (it could not be opened, or its schema was out of date)",
                 dir.join("cache.db").display()
             )),
         }

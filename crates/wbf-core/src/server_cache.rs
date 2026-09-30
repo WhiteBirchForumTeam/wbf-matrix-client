@@ -103,7 +103,7 @@ impl ServerCache {
     /// Args:
     ///     server_dir: `<data dir>/s/<加密的 server 名>`
     ///     key: vault 的第三把子金鑰
-    ///     identity: 這個庫是哪個 server 的（對不上就重建）
+    ///     identity: 這個庫是哪個 server 的；呼叫端（`Core::open_server_cache`）已經照庫自己記的身分決定好，🚫 不傳使用者打的字串
     ///     events: commit 之後發事件用
     /// Return:
     ///     Ok(ServerCache)

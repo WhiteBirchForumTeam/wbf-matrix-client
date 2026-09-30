@@ -238,7 +238,8 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 ### 3.5 本地快取（/docs/design/storage/local-cache-db.md §5）
 
-`cache.db` 在 `s/<b58>_<b58>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：server 不符、schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
+`cache.db` 在 `s/<b58>_<b58>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
+既有的庫照它自己記的 server 開（`--server` 拼法不同也沿用）；記的 host 跟這次的不是同一台就拒絕、庫不動：`the cache in … belongs to …, not …; it was left untouched`（exit 1，/docs/design/storage/local-cache-db.md §1）。
 
 多帳號混存怎麼不漏（維護者 2026-09-07 定，細節在 /docs/design/storage/local-cache-db.md §5）：
 

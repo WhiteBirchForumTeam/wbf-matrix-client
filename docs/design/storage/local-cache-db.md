@@ -12,7 +12,7 @@
 
 | 因為它是快取，所以 | 具體做法 |
 |---|---|
-| 可以整個丟掉 | schema 版本不對、server 換了、解不開：刪檔重建，不寫遷移。一個 server 一份、多帳號混存（§5），user 換了不丟 |
+| 可以整個丟掉 | 沒有可用的庫（沒檔、解不開、schema 版本不對）：建或刪檔重建，不寫遷移。一個 server 一份、多帳號混存（§5），user 換了不丟。<br>既有而且解得開的庫**照它 `meta` 記的 server 開**，🚫 不拿呼叫端的字串逐字比對（同一台 server 的拼法會不同：`http://localhost:6167`、`localhost:6167`）；記的 host 跟要開的不是同一台就**拒絕（`Usage`：`the cache in … belongs to …, not …; it was left untouched`）、庫不動**（`Core::find_recorded_cache_identity`） |
 | 不需要衝突解決 | 同一個 event_id 再寫一次就覆蓋；server 說的算 |
 | 事件快取只長不刪 | **500 是同步視窗，不是上限**（維護者 2026-09-05 訂正）：進房時把最新 500 則同步進快取；往舊滑超過就再 load 更舊的存進去；下次重讀那一段從快取拿，不重拉。事件小，不設上限。500 則／房與初開全域 10000 則是預設值，可調 |
 | 媒體快取有配額，但是 best effort | **2 GiB**（維護者 2026-09-05 定），不是 hard limit；另有 **7 天保護期**，期內用過的檔不自動刪（/docs/design/media/media-pool.md §5） |
@@ -147,7 +147,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
--- schema_version、server（URL）、created_at。身份只有 server：不符就重建（§1）。
+-- schema_version、server（URL，第一個開這份庫的帳號寫下的拼法）、created_at。之後照它開、host 不同就拒絕（§1）。
 
 -- 看過的任何 mxid（本機帳號、事件的 sender 都在這）。哪些是本機帳號由資料目錄的 a/ 決定，不在表裡標。
 CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);
