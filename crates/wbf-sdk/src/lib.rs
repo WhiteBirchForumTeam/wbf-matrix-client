@@ -12,9 +12,9 @@
         clippy::string_slice
     )
 )]
-//! wbfuwunel 的 client SDK。權威是 `docs/design/wbf-client-convention-for-chunk.md`（約定規格書）
+//! wbfuwunel 的 client SDK。權威是 `docs/design/media/wbf-client-convention-for-chunk.md`（約定規格書）
 //! 與 server repo 的 `chunked-upload-spec.md`（線上規格）；`tests/client_vectors.rs` 對著
-//! `docs/design/wbf-client-vectors.json` 跑。
+//! `docs/design/media/wbf-client-vectors.json` 跑。
 //!
 //! 分層：
 //! - `cipher`／`chunk_block`／`chunk_crypto`：不需要網路的部分，每塊怎麼加密、事件區塊長什麼樣、seek 怎麼算。

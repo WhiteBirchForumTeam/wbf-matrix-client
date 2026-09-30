@@ -47,7 +47,7 @@ homeserver ──wbf protocol (WS) / Matrix HTTP──> daemon ──encrypted J
 
 - **Rust 1.95.0** — pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it up automatically.
 - **Git with submodules** — `vendor/matrix-rust-sdk` is a submodule.
-- **Windows only:** [Strawberry Perl](https://strawberryperl.com/) on `PATH` *before* running `cargo` — it is needed to build OpenSSL for SQLCipher ([details](docs/design/local-cache-db.md)).
+- **Windows only:** [Strawberry Perl](https://strawberryperl.com/) on `PATH` *before* running `cargo` — it is needed to build OpenSSL for SQLCipher ([details](docs/design/storage/local-cache-db.md)).
 
 ### Build and test
 
@@ -76,15 +76,15 @@ Design documents live in [`docs/design`](docs/design). They are written in Tradi
 
 | Document | Covers |
 |---|---|
-| [`architecture-v2.md`](docs/design/architecture-v2.md) | Layers: daemon, RPC, frontends; the two planes; tokens and encryption |
-| [`rpc-spec.md`](docs/design/rpc-spec.md) | Every RPC method, error code, push message, and the media HTTP API |
-| [`daemon-runtime.md`](docs/design/daemon-runtime.md) | How the running daemon handles many accounts, the single `cache.db` writer, local vs. upstream reads |
-| [`local-cache-db.md`](docs/design/local-cache-db.md) | The encrypted vault, `cache.db` schema, and media pool |
-| [`chat-model.md`](docs/design/chat-model.md) | Conversations, peers, messages, roles — and how they map onto Matrix |
-| [`wbf-cli-spec.md`](docs/design/wbf-cli-spec.md) | CLI commands, flags, output, exit codes |
-| [`wbf-client-convention-for-chunk.md`](docs/design/wbf-client-convention-for-chunk.md) | Client-to-client conventions for chunk encryption, streaming, and seeking |
-| [`to-device-client.md`](docs/design/to-device-client.md) | Wiring up to-device messages (`0x16 Device`) |
-| [`plan-v1.md`](docs/design/plan-v1.md) | v1 scope, layout, dependencies, milestones |
+| [`architecture-v2.md`](docs/design/overview/architecture-v2.md) | Layers: daemon, RPC, frontends; the two planes; tokens and encryption |
+| [`rpc-spec.md`](docs/design/rpc-specs/rpc-spec.md) | Every RPC method, error code, push message, and the media HTTP API |
+| [`daemon-runtime.md`](docs/design/daemon/daemon-runtime.md) | How the running daemon handles many accounts, the single `cache.db` writer, local vs. upstream reads |
+| [`local-cache-db.md`](docs/design/storage/local-cache-db.md) | The encrypted vault, `cache.db` schema, and media pool |
+| [`chat-model.md`](docs/design/rooms/chat-model.md) | Conversations, peers, messages, roles — and how they map onto Matrix |
+| [`wbf-cli-spec.md`](docs/design/rpc-specs/wbf-cli-spec.md) | CLI commands, flags, output, exit codes |
+| [`wbf-client-convention-for-chunk.md`](docs/design/media/wbf-client-convention-for-chunk.md) | Client-to-client conventions for chunk encryption, streaming, and seeking |
+| [`to-device-client.md`](docs/design/keys/to-device-client.md) | Wiring up to-device messages (`0x16 Device`) |
+| [`plan-v1.md`](docs/design/overview/plan-v1.md) | v1 scope, layout, dependencies, milestones |
 | [`handover.md`](docs/handover.md) | Where things stand right now, known gaps, next steps |
 
 ## Related projects
@@ -157,7 +157,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 
 - **Rust 1.95.0** —— 釘在 [`rust-toolchain.toml`](rust-toolchain.toml)，`rustup` 會自動用它。
 - **帶 submodule 的 Git** —— `vendor/matrix-rust-sdk` 是 submodule。
-- **只有 Windows：** 跑 `cargo` 之前，[Strawberry Perl](https://strawberryperl.com/) 要排在 `PATH` 前面 —— SQLCipher 要靠它編 OpenSSL（[細節](docs/design/local-cache-db.md)）。
+- **只有 Windows：** 跑 `cargo` 之前，[Strawberry Perl](https://strawberryperl.com/) 要排在 `PATH` 前面 —— SQLCipher 要靠它編 OpenSSL（[細節](docs/design/storage/local-cache-db.md)）。
 
 ### 建置與測試
 
@@ -186,15 +186,15 @@ git submodule update --init
 
 | 文件 | 內容 |
 |---|---|
-| [`architecture-v2.md`](docs/design/architecture-v2.md) | 分層：daemon、RPC、前端；兩個平面；token 與加密 |
-| [`rpc-spec.md`](docs/design/rpc-spec.md) | 每一條 RPC method、錯誤碼、推播訊息，以及媒體的 HTTP API |
-| [`daemon-runtime.md`](docs/design/daemon-runtime.md) | daemon 跑起來之後：多帳號、`cache.db` 的單一寫入者、本地讀與上游拉 |
-| [`local-cache-db.md`](docs/design/local-cache-db.md) | 加密的 vault、`cache.db` 的 schema、媒體池 |
-| [`chat-model.md`](docs/design/chat-model.md) | 對話、對象、訊息、角色 —— 以及它們怎麼對到 Matrix |
-| [`wbf-cli-spec.md`](docs/design/wbf-cli-spec.md) | 命令列的命令、參數、輸出、exit code |
-| [`wbf-client-convention-for-chunk.md`](docs/design/wbf-client-convention-for-chunk.md) | client 之間的約定：區塊加密、串流、seek |
-| [`to-device-client.md`](docs/design/to-device-client.md) | to-device 訊息（`0x16 Device`）怎麼接 |
-| [`plan-v1.md`](docs/design/plan-v1.md) | v1 範圍、佈局、依賴、里程碑 |
+| [`architecture-v2.md`](docs/design/overview/architecture-v2.md) | 分層：daemon、RPC、前端；兩個平面；token 與加密 |
+| [`rpc-spec.md`](docs/design/rpc-specs/rpc-spec.md) | 每一條 RPC method、錯誤碼、推播訊息，以及媒體的 HTTP API |
+| [`daemon-runtime.md`](docs/design/daemon/daemon-runtime.md) | daemon 跑起來之後：多帳號、`cache.db` 的單一寫入者、本地讀與上游拉 |
+| [`local-cache-db.md`](docs/design/storage/local-cache-db.md) | 加密的 vault、`cache.db` 的 schema、媒體池 |
+| [`chat-model.md`](docs/design/rooms/chat-model.md) | 對話、對象、訊息、角色 —— 以及它們怎麼對到 Matrix |
+| [`wbf-cli-spec.md`](docs/design/rpc-specs/wbf-cli-spec.md) | 命令列的命令、參數、輸出、exit code |
+| [`wbf-client-convention-for-chunk.md`](docs/design/media/wbf-client-convention-for-chunk.md) | client 之間的約定：區塊加密、串流、seek |
+| [`to-device-client.md`](docs/design/keys/to-device-client.md) | to-device 訊息（`0x16 Device`）怎麼接 |
+| [`plan-v1.md`](docs/design/overview/plan-v1.md) | v1 範圍、佈局、依賴、里程碑 |
 | [`handover.md`](docs/handover.md) | 現在在哪、已知的洞、下一步 |
 
 ## 關聯專案

@@ -1,7 +1,7 @@
 # 聊天模型與房間設計：站在 Matrix 的高度，用 Telegram 的形狀
 
 > 狀態：2026-09-05 維護者訂正過一輪（標「維護者定」的是定案，標「再議」的還開著）。
-> 前提：[plan-v1.md](plan-v1.md) §7.2 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
+> 前提：[plan-v1.md](../overview/plan-v1.md) §7.2 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
 > 「現在怎麼接到 Matrix」只是第一個 backend 的接法，之後換成自己的協定時，模型不動、只換接法。
 > Telegram 的部分是憑印象寫的（維護者明說接受）；Matrix 的部分照規格與 `vendor/matrix-rust-sdk` 的實作。
 > 🚨 標 **[審]** 的地方會 breaking Matrix 兼容或 Matrix 做不到，要維護者定案（plan-v1 §7.2）。
@@ -139,7 +139,7 @@ pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: 
 pub struct Unread { pub count: u32, pub mentions: u32, pub local_offset: Option<MessageId> }
 ```
 
-`local_offset` 是自己看到哪，只在本地（之後進 [local-cache-db.md](local-cache-db.md) 的 `read_positions`；現在沒有本地庫，只活在記憶體）。
+`local_offset` 是自己看到哪，只在本地（之後進 [local-cache-db.md](../storage/local-cache-db.md) 的 `read_positions`；現在沒有本地庫，只活在記憶體）。
 `count` 是 `local_offset` 之後、不是自己發的、非 System 的訊息數；我們自己算，不信 server 的通知計數（各 server 算法不一）。
 
 ### 2.6 動作（`Backend` trait 的一半）

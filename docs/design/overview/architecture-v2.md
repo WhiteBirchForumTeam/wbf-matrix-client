@@ -1,8 +1,8 @@
 # 架構 v2：daemon、RPC、與四個前端
 
 > 維護者 2026-09-09 定的方向。這份文件講**分層與介面**，不講功能——功能在
-> [`plan-v1.md`](plan-v1.md)、[`chat-model.md`](chat-model.md)、[`local-cache-db.md`](local-cache-db.md)、
-> [`wbf-cli-spec.md`](wbf-cli-spec.md)。RPC 的逐條訊息在 [`rpc-spec.md`](rpc-spec.md)（2026-09-12 第一版）。
+> [`plan-v1.md`](plan-v1.md)、[`chat-model.md`](../rooms/chat-model.md)、[`local-cache-db.md`](../storage/local-cache-db.md)、
+> [`wbf-cli-spec.md`](../rpc-specs/wbf-cli-spec.md)。RPC 的逐條訊息在 [`rpc-spec.md`](../rpc-specs/rpc-spec.md)（2026-09-12 第一版）。
 
 ## 0. 一句話
 
@@ -580,7 +580,7 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 | 流 | 現況 |
 |---|---|
 | 房間事件 | ✅ `Event/Recent` 已經是拉窗＋水位（`cg_seq`） |
-| **to-device（金鑰）** | 🔁 **server 端 2026-09-12 實作完了**（wbfuwunel #41 提案 → #42 共用核心 → #43 實作 → #44 文件）：`0x16 Device` 七個 subtype，推送為主、`Fetch` 補洞、**`ItemsDestroy` 才刪**。線上格式的權威在那邊的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`。⚠️ **client 端還一個字都沒寫**——要做什麼、哪三處跟 `Event` 相反、為什麼要等 daemon，在 [`to-device-client.md`](to-device-client.md) |
+| **to-device（金鑰）** | 🔁 **server 端 2026-09-12 實作完了**（wbfuwunel #41 提案 → #42 共用核心 → #43 實作 → #44 文件）：`0x16 Device` 七個 subtype，推送為主、`Fetch` 補洞、**`ItemsDestroy` 才刪**。線上格式的權威在那邊的 `wbf-wire-format.md` §3.2 與 `wbf-to-device.md`。⚠️ **client 端還一個字都沒寫**——要做什麼、哪三處跟 `Event` 相反、為什麼要等 daemon，在 [`to-device-client.md`](../keys/to-device-client.md) |
 
 📎 當初判斷「server 端要加的是**一個新的 opcode**，不是一套新機制」——那個判斷成立了：
 `get_to_device_events` 本來就吃游標、`remove_to_device_events` 就是刪除，wbfuwunel 這三支

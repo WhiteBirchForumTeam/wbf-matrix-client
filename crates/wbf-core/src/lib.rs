@@ -14,7 +14,7 @@
 )]
 //! `wbf-core`：常駐狀態。解鎖一次的 vault、資料目錄的佈局、多帳號。
 //!
-//! 這一層在 [`architecture-v2.md`](../../../docs/design/architecture-v2.md) §7 的位置：
+//! 這一層在 [`architecture-v2.md`](../../../docs/design/overview/architecture-v2.md) §7 的位置：
 //!
 //! ```text
 //! 前端（rpc-cli / Desktop / Android / Python）

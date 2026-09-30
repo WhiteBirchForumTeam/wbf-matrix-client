@@ -1,7 +1,7 @@
 # RPC 規格：前端 ↔ daemon 的每一則訊息
 
 > 2026-09-12 第一版。形狀（加密、framing、`code`／`msg`、有 `id` 要回）在
-> [`architecture-v2.md`](architecture-v2.md) §4，**這裡不重複**；這份只定**逐條**：
+> [`architecture-v2.md`](../overview/architecture-v2.md) §4，**這裡不重複**；這份只定**逐條**：
 > method 清單、每個的 `params`／`result`、code 表、推播清單、資料平面的 HTTP 介面。
 > 它是 `crates/wbf-daemon` 與 rpc-cli 的前提（handover §7 第 3 項），也是
 > `wbf-core::CoreErrorKind` 配號的權威（PR #24 刻意留空等這份）。
@@ -169,7 +169,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | `sync` | `"local"` \| `"server"` \| `"both"` | **要本地的還是上游的**。**預設 `local`**。只有標了「有 `sync`」的 method 認得它 |
 
 🚨 **`sync`：RPC 大部分是對本地資料庫的呼叫**（維護者 2026-09-13 定；執行期細節在
-[`daemon-runtime.md`](daemon-runtime.md) §3）。UI 顯示東西走本地，要打上游得**明講**：
+[`daemon-runtime.md`](../daemon/daemon-runtime.md) §3）。UI 顯示東西走本地，要打上游得**明講**：
 
 | 值 | daemon 做什麼 | 寫 `cache.db` |
 |---|---|---|
@@ -603,7 +603,7 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（等 wbfuwunel #64） | ✅ wbf／🔁 一般 server |
 | `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
-| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22；訂閱線 2026-09-29 起由 daemon 自己開、看著、重開（link-pool.md §3.1），🚫 沒有開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
+| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（`design/rooms/room-sync.md`）；一般 Matrix matrix-sdk `/sync` | ✅ wbf 2026-09-22；訂閱線 2026-09-29 起由 daemon 自己開、看著、重開（link-pool.md §3.1），🚫 沒有開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`--transport http` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
 | `media.save_to` | ✅ | **WS** `Read`＋媒體池 | ✅ |

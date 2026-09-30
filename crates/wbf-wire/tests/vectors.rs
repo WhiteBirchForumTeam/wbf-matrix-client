@@ -1,11 +1,11 @@
-//! 對著 `docs/design/wbf-vectors.json`（從 server repo 複製）跑。
+//! 對著 `docs/design/wire/wbf-vectors.json`（從 server repo 複製）跑。
 //! 這裡紅 = 這個 crate 與 server 的線上格式漂移了，或複製的向量檔過期了。
 //! 規格書 §11 寫了 client 該驗什麼；每個段落一個測試。
 
 use serde::Deserialize;
 use wbf_wire::{crc32c, DecodeError, EncodeError, EncryptedFileInfo, Kind, Pack};
 
-const VECTORS_JSON: &str = include_str!("../../../docs/design/wbf-vectors.json");
+const VECTORS_JSON: &str = include_str!("../../../docs/design/wire/wbf-vectors.json");
 
 #[derive(Deserialize)]
 struct Vectors {

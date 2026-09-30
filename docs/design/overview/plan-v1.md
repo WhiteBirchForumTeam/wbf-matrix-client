@@ -24,7 +24,7 @@ wbf-matrix-client/
   vendor/matrix-rust-sdk/    上游 submodule（維護者選 submodule：要改就在這裡改、這裡 fork）
   crates/
     wbf-wire/                協議 codec：pack、EncryptedFileInfo、CRC-32C；純函數、無 tokio、無 matrix
-                             tests/vectors.rs 對著 docs/design/wbf-vectors.json（從 server 複製）跑
+                             tests/vectors.rs 對著 docs/design/wire/wbf-vectors.json（從 server 複製）跑
     wbf-sdk/                 用得上的東西：WebSocket 通道、pack 收發管線、分塊上傳／下載、每塊 AEAD、續傳、
                              與 matrix-sdk 的接縫（登入、房間、事件、金鑰）
   apps/
@@ -62,23 +62,23 @@ wbf-matrix-client/
 
 ## 5. 事件格式與 client 之間的約定
 
-由 [wbf-client-convention-for-chunk.md](wbf-client-convention-for-chunk.md) 定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。
+由 [wbf-client-convention-for-chunk.md](../media/wbf-client-convention-for-chunk.md) 定：每塊怎麼加密、描述長什麼樣、串流怎麼收尾、房間事件怎麼放、seek 怎麼算。
 server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢：`wbf.` 違反 Matrix 的反向網域命名慣例，
 而規格的 `file` 欄位語意是 AES-CTR，放 ChaCha20 的參數進去是說謊。
 
 ## 6. 順序
 
 0. repo 只有設計文件與 `vendor/matrix-rust-sdk` submodule，等維護者同意規劃。（2026-09-04 同意）
-1. `wbf-wire` 加向量測試。（2026-09-04 做完）向量檔是 `docs/design/wbf-vectors.json`，從 server repo 的同名檔**整份複製**，不手改；
+1. `wbf-wire` 加向量測試。（2026-09-04 做完）向量檔是 `docs/design/wire/wbf-vectors.json`，從 server repo 的同名檔**整份複製**，不手改；
    server 規格改了就重新複製一次，`cargo test -p wbf-wire` 紅了就是漂移。工具鏈釘在 `rust-toolchain.toml`（1.95.0，與 submodule 的 `rust-version` 一致）。
-2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`seek`／續傳。CLI 介面見 [wbf-cli-spec.md](wbf-cli-spec.md)。拆三個 PR：
-   1. 密碼層與 client 向量：`cipher`、每塊與描述的 AEAD、事件區塊、seek 算法、`chunk_size` 選法；`docs/design/wbf-client-vectors.json`（約定 §9）。無 async、無網路。（PR #4，2026-09-05 合併）
+2. `wbf-sdk` 的通道與上傳／下載（不接 matrix-sdk；`login` 用純 HTTP 打 `/_matrix/client/v3/login` 拿 token），CLI 的 `login`／`upload`／`download`／`seek`／續傳。CLI 介面見 [wbf-cli-spec.md](../rpc-specs/wbf-cli-spec.md)。拆三個 PR：
+   1. 密碼層與 client 向量：`cipher`、每塊與描述的 AEAD、事件區塊、seek 算法、`chunk_size` 選法；`docs/design/media/wbf-client-vectors.json`（約定 §9）。無 async、無網路。（PR #4，2026-09-05 合併）
    2. WebSocket／HTTP 通道、`login`、上傳（固定大小與串流）、下載、seek、續傳；`tests/pipeline.rs` 對著記憶體版 server，
       `tests/e2e_local_server.rs`（`#[ignore]`，環境變數指定 server）對著真的 wbfuwunel 跑 §4 的驗收表。（PR #5，2026-09-05 合併）
       順帶發現：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭 `id`，不是線上規格 §2 說的「抄請求的」0；
       SDK 兩種都收，但標頭 id 非 0 時必須等於 Ack meta 的 `id`。要不要對 server 開 issue、還是改規格，等維護者定。
    3. `apps/wbf-cli` 與 `scripts/acceptance.sh`（CLI 規格 §8）；對本機 wbfuwunel 跑 200 MiB 全過。（2026-09-05 送審）
-3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`watch`。範圍在 [chat-model.md](chat-model.md) §6。
+3. 接 matrix-sdk：登入、房間、事件、金鑰分發；CLI 的 `login`／`rooms`／`send`／`watch`。範圍在 [chat-model.md](../rooms/chat-model.md) §6。
    第一版 2026-09-06 送審：`wbf-sdk` 的 `chat`（模型與 `ChatBackend`）與 `backend/matrix_sdk`（feature `matrix`，唯一 `use matrix_sdk` 的檔）；
    CLI `login` 改走 matrix-sdk，加 `rooms`／`send --text|--file`／`watch tail|wait|once`／`read`／`files`。對本機 wbfuwunel 跑過：加密房間送文字與分塊檔、讀回來解得開、
    `files --save` 的 manifest 能 `download` 逐 byte 相同、watch 三模式。附件宣告還帶不出去（約定 §5.2，等 server）。
@@ -99,7 +99,7 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 會持久的只有 session 與 token（CLI 規格 §7）；第 3 步接 matrix-sdk 後，它的 store 也只放它自己非存不可的（裝置金鑰、sync 位置），不當成快取用。
 **現在先把 function code 接通、讓 API 能正常互動；同步本地的事之後才開始。**
 
-之後的版本再規劃本地資料庫，定位是**暫存快取**：刷新聊天室時更新，不是權威。設計在 [local-cache-db.md](local-cache-db.md)。要求：
+之後的版本再規劃本地資料庫，定位是**暫存快取**：刷新聊天室時更新，不是權威。設計在 [local-cache-db.md](../storage/local-cache-db.md)。要求：
 
 - 資料庫本身要加密。解密金鑰先留在本地，相當於自解密的資料庫（防的是把檔案拷走的人，不防能登入這台機器的人）。
 - 未來加上 passphrase 時，啟動要輸入 passphrase 才解得開，**UI 與 CLI 一致**，沒有哪一邊繞過。
@@ -119,7 +119,7 @@ server 不讀那些內容。原本這裡寫的 `m.file` 加 `wbf.chunked` 作廢
 - **與聯邦對接能兼容就盡量兼容**；我們自幹的 feature 是 extension，可以不兼容。
 - 🚨 **任何會 breaking Matrix 兼容的地方，都要提出來審查**，由維護者定案要不要兼容。這條沒有例外。
 
-聊天模型（Conversation／Peer／Message／Role、怎麼接 Matrix、哪裡要審）在 [chat-model.md](chat-model.md)。
+聊天模型（Conversation／Peer／Message／Role、怎麼接 Matrix、哪裡要審）在 [chat-model.md](../rooms/chat-model.md)。
 
 落到程式上的規則（第 3 步起適用）：
 
