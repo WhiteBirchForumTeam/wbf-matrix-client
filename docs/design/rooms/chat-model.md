@@ -216,7 +216,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | | 放哪 | 誰看得到 | 怎麼送 |
 |---|---|---|---|
 | **本地 offset** | 本地（`cache.db` 的 `read_positions`） | 只有自己這台裝置 | 不送。UI 捲到哪就寫哪 |
-| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `send_read_receipt(visible_to_others)`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策：設定放 `wbf.conf`、預設 private，RPC 不逐次帶（/docs/design/messages/read-receipts.md §3） |
+| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `send_read_receipt(visible_to_others)`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）；RPC 那層 `visible_to_others` 是選填，沒帶就照 `wbf.conf` 的預設（/docs/design/messages/read-receipts.md §3）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策 |
 
 `m.fully_read`：不用，本地 offset 取代它（它本來就只是「自己讀到哪」的 server 端副本）。`Unread` 從本地 offset 算。
 已讀的三層（快取水位／本地已讀／遠端已讀）與 `room.read` 的形狀在 /docs/design/messages/read-receipts.md。還沒做：寫本地已讀的 RPC、送 receipt。

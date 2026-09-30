@@ -483,6 +483,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）
 
 架構在 /docs/design/rpc-specs/local-interface.md §8；這裡只定路徑與狀態碼。**沒有全域 token**，每個 URL 自己就是 capability。
+🚨 **媒體本身的 bytes 只走這裡**（維護者 2026-09-30 再確認）：上傳是前端 HTTP `PUT` 給 daemon、下載是 `GET`；
+RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachment` 送事件、回來的 manifest），🚫 不傳 bytes，進度也不走 RPC（§4）。
 還沒做：daemon 還沒開資料平面（`daemon.info` 的 `data_port` 是 `0`）。
 
 ### 6.1 讀：`GET /media/<token>`
@@ -578,8 +580,8 @@ homeserver 給不出下一塊，daemon 就**卡在那裡**，等拿到了再繼�
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | 探活（WS Hello）→ wbf：標準 HTTP `/login`、不建 Client；一般 Matrix：matrix-sdk | ✅（維護者 2026-09-21 定：登入登出維持 HTTP 慣例，/docs/design/daemon/account-session.md §0） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |
-| `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |
-| `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | 🔁 |
+| `account.whoami` | ✅ | HTTP `/whoami`（維護者 2026-09-30：RPC 或 HTTP 都可以） | ✅ |
+| `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | ✅（維護者 2026-09-30 定：登出跟登入一樣走 HTTP） |
 | `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋 `JoinedRooms`＋`GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（/docs/design/daemon/account-session.md §6） |
 | `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房先分金鑰、加密、帶 `room_version`，/docs/design/keys/e2ee-rpc.md §3）；一般 Matrix：`Room::send` | ✅ wbf（含加密，真 server 驗過）／🔁 一般 server |
 | `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** 橋 `Members`＋`/keys/query`＋`/keys/claim`＋`sendToDevice` | ✅（真 server 驗過） |

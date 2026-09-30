@@ -24,7 +24,7 @@ PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照�
 已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面 HTTP；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 ⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8）；
-SDK 的 `send_read_receipt` 要不要改成跟 read-receipts 草案一樣由 conf 決定公開與否；matrix-sdk `Client` 那條要不要改回只開 crypto 與 state 兩個 store（`/docs/design/storage/local-cache-db.md` §4）。
+matrix-sdk `Client` 那條要不要改回只開 crypto 與 state 兩個 store（`/docs/design/storage/local-cache-db.md` §4）。
 
 ## 2. 讀哪些文件、什麼順序
 
@@ -238,7 +238,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 1. **E2EE 收尾**：加密附件（WBF 的檔案本來就用每檔金鑰分塊加密，區塊金鑰放在事件裡；加密房只要讓這則事件走 `encrypt_and_send`、帶附件宣告；被 1506 擋時錯誤的 `data` 帶回已上傳的附件，重送不用再傳一次）、
    讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
 2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
-3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）。
+3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
+   `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡先讓它拿 `daemon.lock`，最終改走 RPC。
 
 之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章（要跟 server 一起設計）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
 資料平面 HTTP 與附件訊息的完整流程（`/docs/design/rpc-specs/local-interface.md` §9）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC；
@@ -251,6 +252,7 @@ UI 框架比較；串流／seek 對著媒體池讀（`/docs/design/media/media-p
 - 一律開分支送 PR，merge commit，不 rebase、不 squash、不 amend、不 force push。
 - 每個 PR 描述要列「新增了對上游的哪些依賴」（/docs/design/overview/architecture-v2.md §8）。
 - 會 breaking Matrix 兼容的設計先寫給維護者，不自己選。
+- 🔒 **資料目錄綁定 daemon**（維護者 2026-09-30）：前端（UI、rpc-cli）只能發 RPC 請 daemon 改，🚫 不越過 daemon 直接寫；不拿 `daemon.lock` 就寫是非法侵占。
 - 📑 **引用文件寫從 repo 根目錄算的完整路徑加章節**（維護者 2026-09-30）：`/docs/design/keys/e2ee-rpc.md §3`；只有指同一份文件自己的章節才只寫 `§3`。搬家或改名時 grep 完整路徑就找得到每一處。
 - 📜 **設計文件只講現在的約定與理由**（維護者 2026-09-30）：被推翻的版本、進度、「第 N 步」「PR #x 合併了」不寫進文件，歷史在 git；改規則的那支 PR 同時掃掉舊說法。
 - 審查者 cirno／rumia／salvia 每個 PR 都會來；逐條回應，能改就改，不改講理由。

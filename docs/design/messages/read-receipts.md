@@ -24,7 +24,7 @@ UI 分離之後那個等式不成立了 —— **只有 UI 說看過了才算看
 ```jsonc
 { "method": "room.read",
   "params": { "room": "!r:localhost", "user": "@a:localhost",
-              "g_seq": 123, "sync": "local" }, "id": 7 }
+              "g_seq": 123, "sync": "both", "visible_to_others": false }, "id": 7 }   // visible_to_others 選填，§3
 ```
 
 | `sync` | 效果 |
@@ -40,18 +40,16 @@ UI 分離之後那個等式不成立了 —— **只有 UI 說看過了才算看
   UI 收到 `room.message` 之後**重新讀一次未讀**（本地讀，毫秒），🚫 不要自己 +1
   —— 自己加會在多裝置、多前端的情況下漂掉。
 
-## 3 private 還是 public：conf 決定，🚫 不是每次呼叫決定
+## 3 private 還是 public：呼叫可以指定，沒指定就照 conf 的預設（維護者 2026-09-30 定）
 
 Matrix 有兩種 receipt：`m.read`（**public**，同房間的人看得到）與 `m.read.private`（只有自己的其他裝置看得到）。
 
-- **預設 private。** 送 `sync: "server"`／`"both"` 的已讀，daemon 一律送 private。
-- 要公開：**UI 把設定寫進 `wbf.conf`**（例如 `READ_RECEIPTS=public`），然後叫一個
-  **`daemon.reload_conf`** 讓 daemon graceful reload；之後的已讀才會是 public。
-- ⭐ 為什麼是 conf 而不是每次呼叫帶一個 `public: true`：**這是使用者對「我要不要被看見」的長期偏好**，
-  🚫 不是某一次操作的選項。放在呼叫上，第一個忘了帶的地方就會把使用者曝光出去
-  —— 而那種錯誤是**不可回收的**（別人已經看到了）。
-- ⚠️ 因此 `daemon.reload_conf` 這個 method 是這條的一部分，🚫 不是附帶：
-  沒有它，改設定就要重開 daemon（斷掉所有上游會話）。
+- `room.read` 多一個**選填**的 `visible_to_others: bool`：有帶就照參數送；沒帶就照 `wbf.conf` 的 `READ_RECEIPTS`（`private`／`public`）；
+  conf 也沒寫、或寫了認不得的值，一律 **private**（fail closed）。只影響 `sync: "server"`／`"both"`（`local` 不送上游）。
+- 改預設：**UI 把設定寫進 `wbf.conf`**，然後叫 **`daemon.reload_conf`** 讓 daemon graceful reload，之後沒帶參數的已讀照新預設。
+- ⭐ 為什麼沒帶參數時落到 conf、最後落到 private：**「要不要被看見」是使用者的長期偏好**。第一個忘了帶參數的地方
+  🚫 不該把使用者曝光出去——那種錯誤是**不可回收的**（別人已經看到了）。參數是給 UI 做「這一則例外」用的。
+- ⚠️ 因此 `daemon.reload_conf` 這個 method 是這條的一部分，🚫 不是附帶：沒有它，改預設就要重開 daemon（斷掉所有上游會話）。
 
 ⚠️ 這一節是**方向草案**（維護者原話：「執行上有沒有問題我不確定」）。實作時要回頭確認兩件事：
 matrix-sdk 送 private receipt 的介面長什麼樣、以及 wbfuwunel 那邊對兩種 receipt 的支援。
