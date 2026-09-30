@@ -47,6 +47,10 @@ use wbf_sdk::{Key32, SdkError};
 use crate::event::EventSink;
 use crate::{CoreError, CoreEvent};
 
+/// 排隊超過這麼多件就發一則 `Note` 講出來（/docs/design/daemon/daemon-runtime.md §2.2）。🚫 不是上限：一件都不丟，只是要看得見。
+/// 只在「剛好漲到這個數」的那一次發（邊緣觸發）：退回去再漲上來會再發一次，🚫 不會每寫一件就吵一次。
+pub(crate) const QUEUE_WARN_AT: usize = 10_000;
+
 /// 寫入 task 收到的一件事。事件與回執都包在閉包裡，所以這個型別不必有泛型。
 type Job = Box<dyn FnOnce(&mut Cache, &EventSink) + Send>;
 
@@ -55,6 +59,8 @@ pub(crate) struct ServerCache {
     to_writer: mpsc::UnboundedSender<Job>,
     /// 排隊中（還沒被寫入 task 拿走）的件數。
     queued: Arc<AtomicUsize>,
+    /// 排隊太長時發 `Note` 用（寫入 task 那一份在它自己的執行緒上）。
+    events: EventSink,
     /// 讀用的第二條連線。⚠️ WAL 允許一寫多讀，但**開一條連線要付 SQLCipher 導金鑰的成本**，
     /// 所以留著重用；🚫 不要每個請求開一次。
     /// 📎 用 `Mutex` 是因為 `Connection` 不是 `Sync`：讀因此是排隊的，
@@ -117,6 +123,7 @@ impl ServerCache {
 
         let (to_writer, mut inbox) = mpsc::unbounded_channel::<Job>();
         let queued = Arc::new(AtomicUsize::new(0));
+        let warn_events = events.clone();
         let counter = queued.clone();
         // 🚨 自己的 OS 執行緒，🚫 不是 `tokio::spawn`：SQLite 的寫是**同步阻塞**的
         // （拿不到鎖會等，最壞 5 秒），擺在 runtime 的工作執行緒上就是卡住別人的 future。
@@ -145,6 +152,7 @@ impl ServerCache {
             ServerCache {
                 to_writer,
                 queued,
+                events: warn_events,
                 reader: Mutex::new(reading),
                 writer,
             },
@@ -252,7 +260,13 @@ impl ServerCache {
     }
 
     fn send(&self, job: Job) {
-        self.queued.fetch_add(1, Ordering::SeqCst);
+        let depth = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
+        if depth == QUEUE_WARN_AT {
+            self.events.progress(format!(
+                "the cache writer is {depth} writes behind; they are kept in memory and nothing is dropped, \
+                 but the disk is not keeping up"
+            ));
+        }
         if self.to_writer.send(job).is_err() {
             // 寫入 task 沒了（收攤中）。計數要退回去，🚫 不然 `queued` 會永遠掛在那個數字。
             self.queued.fetch_sub(1, Ordering::SeqCst);
@@ -466,6 +480,43 @@ mod tests {
             0,
             "rusqlite 的 busy_timeout 應該讓它們排隊；這裡不是 0 代表那個預設變了"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 排隊漲到門檻時講一聲（/docs/design/daemon/daemon-runtime.md §2.2），而且只講一次、一件都不丟。
+    #[tokio::test]
+    async fn a_long_queue_is_said_out_loud_once() {
+        let dir = scratch("long-queue");
+        let events = EventSink::new();
+        let mut received = events.subscribe();
+        let cache = open(&dir, &events);
+        // 先把寫入者卡住，排隊的件數就只會往上長。
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        cache.post(
+            move |_cache| {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            },
+            Vec::new(),
+        );
+        started_rx.recv().unwrap();
+        for _ in 0..QUEUE_WARN_AT + 5 {
+            cache.post(|_cache| Ok(()), Vec::new());
+        }
+        let mut warnings = 0;
+        while let Ok(event) = received.try_recv() {
+            if let CoreEvent::Note { text, .. } = event {
+                if text.contains("writes behind") {
+                    warnings += 1;
+                }
+            }
+        }
+        assert_eq!(warnings, 1, "漲到門檻那一次講一聲，🚫 不是每一件都講");
+        release_tx.send(()).unwrap();
+        cache.run(|_cache| Ok(())).await.unwrap();
+        assert_eq!(cache.queued(), 0, "一件都沒丟：全部寫完才歸零");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
