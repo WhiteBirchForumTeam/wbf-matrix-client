@@ -4,8 +4,8 @@
 > 命令如何被解讀成上游同步」都沒講清楚）。
 >
 > **這份講執行期**：資料在哪、誰寫、寫的時候會不會撞、UI 的每一個動作實際走哪條路。
-> 🚫 不重複分層（[`architecture-v2.md`](architecture-v2.md)）、逐條訊息（[`rpc-spec.md`](rpc-spec.md)）、
-> 資料庫 schema（[`local-cache-db.md`](local-cache-db.md) §6）。
+> 🚫 不重複分層（[`architecture-v2.md`](../overview/architecture-v2.md)）、逐條訊息（[`rpc-spec.md`](../rpc-specs/rpc-spec.md)）、
+> 資料庫 schema（[`local-cache-db.md`](../storage/local-cache-db.md) §6）。
 >
 > 🚨 **狀態：草案**。⚠️ §3 的 `sync` 參數、§6 的已讀三層是維護者 2026-09-13 當場定的方向，
 > **本分支預設同意、照著做**；跟現況的落差在 §3.5 列著。
@@ -661,7 +661,7 @@ let response = tokio::select! {
 | 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` → `sync`、預設 `local`，**回應回報這次用了哪一種** | ✅ 這支分支做了 |
 | 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ✅ 2026-09-21：SDK 那半（`ws-receive-dispatch.md`）與 daemon 這半（`link-pool.md` §6：`subscribe`／`unsubscribe`、每條 RPC 連線一個推播 task、`progress`／`note` 自動路由到發那個請求的連線、`Lagged` → `desync`）。❌ 還沒：進度節流（§5.4） |
 | 5 | `cancel`（§9） | ❌ |
-| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ✅ 2026-09-22：codec 對著 server 向量、`WbfClient::room_subscription`／core `room_sync.rs`（`design/room-sync.md`：池開線的 `init_connection` 訂、背景收推播寫快取、不碰水位；補窗與漏包都是 UI 叫 `sync.recent`（多 `since`）的事；🚫 還沒接 RPC） |
+| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ✅ 2026-09-22：codec 對著 server 向量、`WbfClient::room_subscription`／core `room_sync.rs`（`design/rooms/room-sync.md`：池開線的 `init_connection` 訂、背景收推播寫快取、不碰水位；補窗與漏包都是 UI 叫 `sync.recent`（多 `since`）的事；🚫 還沒接 RPC） |
 | 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | 🔧 連線的部分 2026-09-21 做了（`link-pool.md`：一個帳號五條線的池、要用才開、斷了下次再開、登出全關、每個收到的 pack 變 `CoreEvent::Received`）；收事件迴圈→寫庫→發 `room.message` 還沒（要第 6 階段的 codec） |
 | 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 🔁 線的那半做了（2026-09-29，link-pool.md §3.1：解鎖／登入後開、背景每 15 秒看、失敗加倍）；task panic 收攤、重探 backend 還沒 |
 | 9 | **已讀三層**（§6）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | ❌ |

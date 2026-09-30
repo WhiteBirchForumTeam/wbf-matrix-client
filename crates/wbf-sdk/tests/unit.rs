@@ -244,7 +244,7 @@ fn event_recent_and_batch_match_server_vectors() {
     use wbf_sdk::SdkError;
     use wbf_wire::Pack;
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+        serde_json::from_str(include_str!("../../../docs/design/wire/wbf-vectors.json")).unwrap();
     let pack_named = |name: &str| -> Pack {
         let entry = vectors["packs"]
             .as_array()
@@ -526,7 +526,7 @@ fn room_device_version_packs_match_server_vectors() {
     use wbf_wire::pack::{device, event};
     use wbf_wire::{Kind, Pack};
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+        serde_json::from_str(include_str!("../../../docs/design/wire/wbf-vectors.json")).unwrap();
     let entry_named = |name: &str| -> &serde_json::Value {
         vectors["packs"]
             .as_array()
@@ -608,7 +608,7 @@ fn error_meta_matrix_fields_match_server_vectors() {
     use wbf_wire::pack::flags;
     use wbf_wire::Pack;
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+        serde_json::from_str(include_str!("../../../docs/design/wire/wbf-vectors.json")).unwrap();
     let pack_named = |name: &str| -> Pack {
         let entry = vectors["packs"]
             .as_array()
@@ -666,7 +666,7 @@ fn bridge_request_and_replies_match_server_vectors() {
     use wbf_sdk::SdkError;
     use wbf_wire::{Kind, Pack};
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+        serde_json::from_str(include_str!("../../../docs/design/wire/wbf-vectors.json")).unwrap();
     let bytes_named = |name: &str| -> Vec<u8> {
         let entry = vectors["packs"]
             .as_array()
@@ -885,7 +885,7 @@ fn device_packs_match_server_vectors() {
     use wbf_sdk::protocol::{self, DeviceFetchRequest, DeviceSubscribeRequest};
     use wbf_wire::Pack;
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+        serde_json::from_str(include_str!("../../../docs/design/wire/wbf-vectors.json")).unwrap();
     let pack_named = |name: &str| -> Pack {
         let entry = vectors["packs"]
             .as_array()
@@ -1141,7 +1141,7 @@ fn event_subscribe_and_push_match_the_server_vectors() {
     use wbf_sdk::protocol::{self, EventSubscribeReply, EventSubscribeRequest};
     use wbf_wire::Pack;
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../../docs/design/wbf-vectors.json")).unwrap();
+        serde_json::from_str(include_str!("../../../docs/design/wire/wbf-vectors.json")).unwrap();
     let pack_named = |name: &str| -> Pack {
         let entry = vectors["packs"]
             .as_array()

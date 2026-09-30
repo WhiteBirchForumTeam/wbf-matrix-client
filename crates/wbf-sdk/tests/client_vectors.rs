@@ -1,4 +1,4 @@
-//! 對著 `docs/design/wbf-client-vectors.json`（約定規格書 §9）跑。
+//! 對著 `docs/design/media/wbf-client-vectors.json`（約定規格書 §9）跑。
 //! 這裡紅 = 這個 crate 與約定漂移了，或向量檔過期了。
 //!
 //! 向量檔由這個測試本身產生：`WBF_WRITE_CLIENT_VECTORS=1 cargo test -p wbf-sdk --test client_vectors`
@@ -13,7 +13,7 @@ use wbf_sdk::{ChunkedBlock, Cipher, DescriptionSlot, FileCipher};
 
 const VECTORS_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/design/wbf-client-vectors.json"
+    "/../../docs/design/media/wbf-client-vectors.json"
 );
 
 #[derive(Serialize, Deserialize)]

@@ -345,7 +345,7 @@ impl Pack {
     /// 先驗標頭欄位再驗 CRC，所以 version／kind／flags 錯的 pack 回的是那個錯，不是 `MetaCrc`。
     ///
     /// Args:
-    ///     bytes: 一整個 pack（WebSocket 一個 binary message）, example: 見 `docs/design/wbf-vectors.json`
+    ///     bytes: 一整個 pack（WebSocket 一個 binary message）, example: 見 `docs/design/wire/wbf-vectors.json`
     /// Return:
     ///     Ok(Pack)
     ///     Err(DecodeError)  類別見 `DecodeError`；任何一項不過就拒絕，不會回半個 pack

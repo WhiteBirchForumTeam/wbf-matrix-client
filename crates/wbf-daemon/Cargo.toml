@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "client 本體：core ＋ RPC 服務（加密的 JSON over loopback WS）。介面見 docs/design/rpc-spec.md、分層見 architecture-v2.md。"
+description = "client 本體：core ＋ RPC 服務（加密的 JSON over loopback WS）。介面見 docs/design/rpc-specs/rpc-spec.md、分層見 architecture-v2.md。"
 
 [[bin]]
 name = "wbf-matrix-client-daemon"

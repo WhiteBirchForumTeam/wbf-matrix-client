@@ -1,4 +1,4 @@
-//! 聊天模型（`docs/design/chat-model.md` §2）與 `ChatBackend` trait。
+//! 聊天模型（`docs/design/rooms/chat-model.md` §2）與 `ChatBackend` trait。
 //!
 //! 這裡只有資料與契約，沒有 Matrix：`matrix_sdk::Room`、ruma 的型別不出現在這個檔（plan-v1 §7.2）。
 //! 第一個實作在 `backend/matrix_sdk.rs`；之後自己的 WS 協定是同一個 trait 的另一個實作。

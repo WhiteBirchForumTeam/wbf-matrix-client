@@ -799,7 +799,7 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 
 📎 **to-device 的水位（`cd_seq`）住在 `m/` 裡面，所以這張表的每一列它都自動跟著對**
 （維護者 2026-09-12）：`m/` 被刪 → 水位一起沒 → 下次從頭拉。🚫 不需要有人記得另外去清它，
-理由在 [to-device-client.md](to-device-client.md) §2.1。
+理由在 [to-device-client.md](../keys/to-device-client.md) §2.1。
 
 為什麼 `logout`（即 `account del`）連著刪（維護者 2026-09-09）：它在心智上是「我離開這台機器」，
 留一個能解開全部歷史的檔案在磁碟上是驚嚇，而且跟「crypto store 一定會被刪」不一致。

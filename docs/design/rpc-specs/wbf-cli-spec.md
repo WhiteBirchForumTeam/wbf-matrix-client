@@ -2,7 +2,7 @@
 
 > 狀態：草案，2026-09-04，等維護者同意。對應 plan-v1 §6 第 2 步（不接 matrix-sdk）與第 3 步（接）。
 > 本文定的是**介面**；線上行為照 wbfuwunel 的線上規格，加解密照
-> [wbf-client-convention-for-chunk.md](wbf-client-convention-for-chunk.md)（以下稱「約定」）。
+> [wbf-client-convention-for-chunk.md](../media/wbf-client-convention-for-chunk.md)（以下稱「約定」）。
 
 ## 0. 一句話
 
