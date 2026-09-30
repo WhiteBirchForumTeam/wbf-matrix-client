@@ -23,7 +23,7 @@ pub enum WatchMode {
     Tail,
     /// 等這麼多秒就回來。
     Wait { seconds: u64 },
-    /// 等到**別人**送的第一則就回來（自己送的不算，wbf-cli-spec.md §3.4.2）。
+    /// 等到**別人**送的第一則就回來（自己送的不算，/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2）。
     Once { timeout_seconds: Option<u64> },
 }
 
@@ -109,7 +109,7 @@ impl Core {
             if conversation != room {
                 return WatchControl::Continue;
             }
-            // 通知給折好的訊息；庫裡存原樣（關係事件也存，edits-and-redactions.md）。
+            // 通知給折好的訊息；庫裡存原樣（關係事件也存，/docs/design/messages/edits-and-redactions.md）。
             let messages = messages_from_incoming(&conversation, &events);
             // 自己送的也發出去（呼叫端自己濾），但 `once` 不把自己的算「第一則」。
             let any_from_others = messages.iter().any(|message| message.sender != me);
@@ -122,7 +122,7 @@ impl Core {
                 })
                 .collect();
             // 🚨 寫跟事件**一起**進 queue：事件由寫入者在 commit 之後發，
-            // 所以收到通知的人去讀本地一定讀得到（daemon-runtime.md §2.3）。
+            // 所以收到通知的人去讀本地一定讀得到（/docs/design/daemon/daemon-runtime.md §2.3）。
             let writer_me = me.clone();
             cache.post(
                 move |cache| {
@@ -154,7 +154,7 @@ impl Core {
     /// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（server 的
     /// wbfuwunel 的 pack-pipeline.md §6.4）；下次再跑會從水位重來。
     ///
-    /// 水位（`cg_seq`）**只由這支動**（room-sync.md）：推播不碰它。起點由 UI 定：帶 `since` 就從那裡起（UI 手上有每則 `room.message`
+    /// 水位（`cg_seq`）**只由這支動**（/docs/design/rooms/room-sync.md）：推播不碰它。起點由 UI 定：帶 `since` 就從那裡起（UI 手上有每則 `room.message`
     /// 的 `g_seq` 與上次回的 `cg_seq_after`），沒帶就用存的上一次 Recent 的水位；拉完把水位推到這次最新的 `fs`。
     ///
     /// Args:
@@ -208,7 +208,7 @@ impl Core {
     }
 }
 
-/// 補窗 job（`sync.recent` 用；訂閱線不補窗、不碰水位，room-sync.md）：從 `cg_seq` 起一窗一窗拉、每批寫一次 DB、最後才推水位。
+/// 補窗 job（`sync.recent` 用；訂閱線不補窗、不碰水位，/docs/design/rooms/room-sync.md）：從 `cg_seq` 起一窗一窗拉、每批寫一次 DB、最後才推水位。
 ///
 /// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（wbfuwunel 的 pack-pipeline.md §6.4）；下次再跑會從水位重來。
 ///
@@ -251,7 +251,7 @@ pub(crate) async fn pull_recent(
         });
         skipped_without_room += without_room.len();
         // `upsert_events` 一次一個房間：照 room_id 分組。這個回呼是同步的、不能等解密，所以先原樣寫；
-        // 整輪 `recent_sync` 回來之後，下面用 `decrypt_stored(… EventIds …)` 把這輪的密文補解（e2ee-rpc.md §6）。
+        // 整輪 `recent_sync` 回來之後，下面用 `decrypt_stored(… EventIds …)` 把這輪的密文補解（/docs/design/keys/e2ee-rpc.md §6）。
         let mut by_room: std::collections::BTreeMap<String, Vec<IncomingEvent>> =
             std::collections::BTreeMap::new();
         for raw in with_room {
@@ -312,14 +312,14 @@ pub(crate) async fn pull_recent(
         }
     }
     if skipped_without_room > 0 {
-        // 存不了的（缺 room_id／event_id／sender）講出來；水位照推——它不是洞，再拿一次還是同一則（room-sync.md §2）。
+        // 存不了的（缺 room_id／event_id／sender）講出來；水位照推——它不是洞，再拿一次還是同一則（/docs/design/rooms/room-sync.md §2）。
         events.progress(format!(
             "recent: {skipped_without_room} event(s) could not be stored (no room_id, event_id or sender) and are dropped on purpose"
         ));
     }
     if let Some(new_cg_seq) = summary.new_cg_seq {
         // 🚨 水位最後才推進，而且**跟事件走同一條 queue** —— 這樣「事件還沒寫進去、
-        // 水位卻前進了」不可能發生（daemon-runtime.md §2.3）。
+        // 水位卻前進了」不可能發生（/docs/design/daemon/daemon-runtime.md §2.3）。
         let me_here = me.to_string();
         cache
             .run(move |cache| cache.set_cg_seq(&me_here, new_cg_seq))

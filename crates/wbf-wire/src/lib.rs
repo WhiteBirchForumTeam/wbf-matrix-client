@@ -13,7 +13,7 @@
     )
 )]
 //! wbfuwunel 線上協議的 codec。權威是 server repo 的 `docs/design/chunked-upload-spec.md`；
-//! `tests/vectors.rs` 對著複製來的 `docs/design/wire/wbf-vectors.json` 跑，向量沒跟上就紅。
+//! `tests/vectors.rs` 對著複製來的 `/docs/design/wire/wbf-vectors.json` 跑，向量沒跟上就紅。
 //!
 //! 這個 crate 只回答「byte 怎麼排」：沒有 tokio、沒有 matrix、沒有 IO。
 

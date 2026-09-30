@@ -1,8 +1,8 @@
 # 架構 v2：daemon、RPC、與四個前端
 
 > 維護者 2026-09-09 定的方向。這份文件講**分層與介面**，不講功能——功能在
-> [`chat-model.md`](../rooms/chat-model.md)、[`local-cache-db.md`](../storage/local-cache-db.md)、
-> [`wbf-cli-spec.md`](../rpc-specs/wbf-cli-spec.md)。本地介面的形狀在 [`local-interface.md`](../rpc-specs/local-interface.md)，RPC 的逐條訊息在 [`rpc-spec.md`](../rpc-specs/rpc-spec.md)。
+> [`/docs/design/rooms/chat-model.md`](../rooms/chat-model.md)、[`/docs/design/storage/local-cache-db.md`](../storage/local-cache-db.md)、
+> [`/docs/design/rpc-specs/wbf-cli-spec.md`](../rpc-specs/wbf-cli-spec.md)。本地介面的形狀在 [`/docs/design/rpc-specs/local-interface.md`](../rpc-specs/local-interface.md)，RPC 的逐條訊息在 [`/docs/design/rpc-specs/rpc-spec.md`](../rpc-specs/rpc-spec.md)。
 
 ## 0. 一句話
 
@@ -24,7 +24,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 | 下指令的前端，走 RPC | `wbf-matrix-rpc-cli` | **rpc-cli** |
 
 📎 為什麼不叫 kernel（初稿的名字）：跟 Linux kernel 打架。
-📎 為什麼簡稱不縮成 `rpc`：RPC 是**協議**的名字（這一章、`rpc-spec.md`、「走 RPC 還是 uniffi」），
+📎 為什麼簡稱不縮成 `rpc`：RPC 是**協議**的名字（這一章、`/docs/design/rpc-specs/rpc-spec.md`、「走 RPC 還是 uniffi」），
 拿去當 binary 的名字之後，「RPC 掛了」就分不出是協議還是那支程式——正是這一節要根除的那種語病。
 📎 `server` 這個字在這個 repo 已經指過 homeserver 與 wbfuwunel，🚫 不要再拿它指這裡的任何東西。
 
@@ -37,7 +37,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 
 | 帶了什麼 | 是什麼 |
 |---|---|
-| `-s`（`--server`） | **常駐**：開本地 RPC 的 WS（local-interface.md）與資料平面，等前端來連。**大多數時候是這個** |
+| `-s`（`--server`） | **常駐**：開本地 RPC 的 WS（/docs/design/rpc-specs/local-interface.md）與資料平面，等前端來連。**大多數時候是這個** |
 | 沒有 `-s`、帶了一個命令（`daemon <命令> <參數>`） | **單發**：起一次、執行那一個命令、就死。**測試性質**（除錯、腳本、驗收），不是日常操作。還沒做：現在帶命令會印 not implemented、exit 1 |
 | **兩個都帶** | 🚫 **報錯** —— 它們是兩種不同的起法，不是「以某一邊為準」。使用者搞錯了，我們🚫 不替他猜 |
 | 兩個都沒帶 | 🚫 報錯（沒事可做） |
@@ -65,7 +65,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 | 起法 | 什麼時候拿 |
 |---|---|
 | `-s` | **啟動的第一件事**（`-s` 就是「我要寫」的意思）。拿不到就不啟動 —— 🚫 不要起來之後才發現寫不了 |
-| 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（rpc-spec.md §5.1），🚫 不重試、🚫 不降級成唯讀跑一半 |
+| 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（/docs/design/rpc-specs/rpc-spec.md §5.1），🚫 不重試、🚫 不降級成唯讀跑一半 |
 | `--version` 這類 | 🚫 **不拿**：它連讀都不用（clap 印完就結束，根本走不到資料目錄） |
 
 **檢查點只有一個**：`Handle::call()` 進 dispatch 之前。判準是**反過來寫**的 ——
@@ -115,7 +115,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 
 | 痛 | 一命令一程序 | daemon |
 |---|---|---|
-| **每個命令都要解鎖** | 每次都要 passphrase；想省打字只能讓明文主金鑰落地（舊的 `unlock.ticket`，已拿掉，vault-and-keys.md §1） | 解鎖一次，主金鑰只在 daemon 的記憶體裡 |
+| **每個命令都要解鎖** | 每次都要 passphrase；想省打字只能讓明文主金鑰落地（舊的 `unlock.ticket`，已拿掉，/docs/design/storage/vault-and-keys.md §1） | 解鎖一次，主金鑰只在 daemon 的記憶體裡 |
 | **matrix-sdk 的 store 是獨佔的** | Desktop 開著就不能同時用命令列（`crypto.db` 被鎖）。上游為此有 `enable_cross_process_store_lock`，但那是 iOS notification extension 的權宜之計，代價是每次操作搶鎖 | 一個程序持有 store，問題不存在 |
 | **收不了推送** | event（含金鑰的 to-device）走 WS 推送，而一命令一程序的東西**沒有人在線上收**，斷開的期間就是漏 | daemon 常駐，連線與游標由它維護 |
 
@@ -129,7 +129,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 │             Rust         Rust 原生      Kotlin       任意   │
 └───────┬─────────┬────────────┬─────────────┬────────────────┘
         └─────────┴────────────┴─────────────┘
-  控制 ws://127.0.0.1（加密的 JSON）  ＋  資料 http://127.0.0.1（bytes，Range）  local-interface.md
+  控制 ws://127.0.0.1（加密的 JSON）  ＋  資料 http://127.0.0.1（bytes，Range）  /docs/design/rpc-specs/local-interface.md
                               │
 ┌─────────────────────────────┴───────────────────────────┐
 │ daemon（crates/wbf-core ＋ crates/wbf-daemon）           │
@@ -157,8 +157,8 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 | 前端 ↔ daemon（控制） | **加密的 JSON over WS** | 是（XChaCha20-Poly1305，token 導出的金鑰） | **否**：同一台機器、同一個使用者 |
 | 前端 ↔ daemon（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上；靠 capability URL 擋） | 否 |
 
-⚠️ 控制平面**加密的收穫主要是完整性**（local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與 token 檔。
-資料平面則刻意**不加密**：它要餵給播放器與圖片元件，那些只吃普通的 HTTP；防護靠 capability URL（local-interface.md §8）。
+⚠️ 控制平面**加密的收穫主要是完整性**（/docs/design/rpc-specs/local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與 token 檔。
+資料平面則刻意**不加密**：它要餵給播放器與圖片元件，那些只吃普通的 HTTP；防護靠 capability URL（/docs/design/rpc-specs/local-interface.md §8）。
 
 ## 3. daemon 的職責邊界
 
@@ -205,8 +205,8 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 
 | 流 | 怎麼補齊 |
 |---|---|
-| 房間事件 | `Event/Recent` 拉窗＋水位（`cg_seq`）；什麼時候補是 UI 的事（room-sync.md） |
-| **to-device（金鑰）** | `0x16 Device`：推送為主、`Fetch` 補洞、**`ItemsDestroy` 才刪**。線上格式在 wbfuwunel 的 wbf-wire-format.md §3.2 與 wbf-to-device.md；client 端在 to-device-client.md、key-sync.md |
+| 房間事件 | `Event/Recent` 拉窗＋水位（`cg_seq`）；什麼時候補是 UI 的事（/docs/design/rooms/room-sync.md） |
+| **to-device（金鑰）** | `0x16 Device`：推送為主、`Fetch` 補洞、**`ItemsDestroy` 才刪**。線上格式在 wbfuwunel 的 /docs/design/wbf-wire-format.md §3.2 與 wbf-to-device.md；client 端在 /docs/design/keys/to-device-client.md、/docs/design/keys/key-sync.md |
 
 📎 server 端沒有為此發明新機制：`get_to_device_events` 本來就吃游標、`remove_to_device_events` 就是刪除，
 wbfuwunel 只是把它們接到通道上，外加「銷毀是帶結果的命令」的閉環。server 對 to-device 的內容仍然是瞎的
@@ -214,7 +214,7 @@ wbfuwunel 只是把它們接到通道上，外加「銷毀是帶結果的命令�
 
 ### 5.1 事件流是**每個帳號一組**（維護者 2026-09-13 定）
 
-daemon 的推播（rpc-spec.md §4）不是憑空來的：**每個已經登入的帳號，daemon 都對它的 homeserver
+daemon 的推播（/docs/design/rpc-specs/rpc-spec.md §4）不是憑空來的：**每個已經登入的帳號，daemon 都對它的 homeserver
 維持一組連線**，事件從那裡進來、解密、寫進資料庫，然後才變成 RPC 的推播。
 
 ```
@@ -226,8 +226,8 @@ daemon 的推播（rpc-spec.md §4）不是憑空來的：**每個已經登入�
 - ⚠️ **「一組」不是「一條」**：對 wbfuwunel 是五條 WS（§5.1.1），對一般 homeserver 是一條
   HTTP 的 sync。所以三個帳號同時登入、都在 wbf server 上，就是 **15 條 WS**。
 - 帳號各自獨立：一個帳號的連線斷了、落後了、被登出了，🚫 不影響別的帳號。
-  推播因此**一定帶 `user`**（rpc-spec.md §4）——前端要分得出這是誰的事件。
-- 📎 連線狀態的推播（`link.state`，rpc-spec.md §4）講的是**那一個帳號**的某一條線，
+  推播因此**一定帶 `user`**（/docs/design/rpc-specs/rpc-spec.md §4）——前端要分得出這是誰的事件。
+- 📎 連線狀態的推播（`link.state`，/docs/design/rpc-specs/rpc-spec.md §4）講的是**那一個帳號**的某一條線，
   🚫 不是「daemon 連上網了沒」。
 
 **用哪一種連線：預設 HTTP，wbf 專用的 homeserver 才走 WS**（維護者 2026-09-13 定）。
@@ -238,10 +238,10 @@ daemon 的推播（rpc-spec.md §4）不是憑空來的：**每個已經登入�
 | **wbfuwunel**（我們自己那套） | **五條 WS**（§5.1.1） | `Event/Push` 推送＋`Recent` 補洞 |
 
 - ⭐ 判準是**「這台 server 講不講 wbf-pack」**，🚫 不是網域名、🚫 不是使用者設定裡的一個勾。
-  問法：不帶 token 的 WS `Hello`，看回來的 `protocol` 認不認得（account-session.md §1）。
+  問法：不帶 token 的 WS `Hello`，看回來的 `protocol` 認不認得（/docs/design/daemon/account-session.md §1）。
 - **不確定就落到 HTTP**：連不上 WS、`Hello` 不回、協議認不得 —— 一律當成一般 homeserver。
   ⭐ 壞在「用了比較慢但一定能動的那條」，🚫 不壞在「以為對方懂我們的協議」。
-- conf 的 `TRANSPORT`（wbf-cli-spec.md §10）是**上限不是下限**：設成 `http` 就一律 HTTP、daemon 不開 WS 線（除錯用）；
+- conf 的 `TRANSPORT`（/docs/design/rpc-specs/wbf-cli-spec.md §10）是**上限不是下限**：設成 `http` 就一律 HTTP、daemon 不開 WS 線（除錯用）；
   設成 `ws`（預設）仍然要探測，探不到照樣 HTTP。
 
 ### 5.1.1 對 wbfuwunel：一個帳號開**五條** WS，一條一個用途（維護者 2026-09-12 定、09-21 與 09-29 拆細）
@@ -251,14 +251,14 @@ daemon 的推播（rpc-spec.md §4）不是憑空來的：**每個已經登入�
 跟金鑰推送擺在同一條線上，那條佇列被媒體佔滿的時候，掉的是**金鑰**。
 
 五條是 `Misc`（一問一答）、`Upload`、`Download`、`Rooms`（房間事件的訂閱）、`Keys`（金鑰的訂閱與 `Fetch`／銷毀）；
-各自只做什麼、為什麼單獨一條、命令怎麼挑線，在 link-pool.md §1、§2。
+各自只做什麼、為什麼單獨一條、命令怎麼挑線，在 /docs/design/daemon/link-pool.md §1、§2。
 
 - ⭐ 分界線是**「誰會塞爆佇列」與「掉了救不救得回來」的交叉**，🚫 不是「照 kind 分類」——`Misc` 收的就是各種不同 kind。
   媒體最會塞爆佇列，所以它**只能塞爆自己**（上傳與下載再各一條，一邊塞爆不拖另一邊）；金鑰🚨 **掉了就沒了**，所以要一條安靜的線。
 - ⚠️ 這五條是**那一個帳號的**（§5.1）：兩個帳號登在同一台 wbf server 上也是各開各的，
   🚫 不共用 —— 它們的 `access_token` 不同，連線本來就分得開，而共用會讓一個帳號的流量塞爆另一個的。
 - ⚠️ **`gap` 的意義因此是局部的**：房間那條標 `gap`，只表示房間事件漏了，🚫 不要當成整個 daemon 落後。
-  各補各的：房間由 UI 叫 `sync.recent` 補（room-sync.md），金鑰由 daemon 從佇列頭 `Fetch`（key-sync.md）。
+  各補各的：房間由 UI 叫 `sync.recent` 補（/docs/design/rooms/room-sync.md），金鑰由 daemon 從佇列頭 `Fetch`（/docs/design/keys/key-sync.md）。
 
 ### 5.2 一條連線上仍然會有好幾段會話——`seq` 屬於會話（wbfuwunel #42／#44 定）
 
@@ -273,7 +273,7 @@ daemon 的推播（rpc-spec.md §4）不是憑空來的：**每個已經登入�
 | 連線層一個 `next_seq` | 同一條線上兩段會話互相看起來像對方漏號，`gap` 的判斷全毀 |
 | 每個 kind 一個 `next_seq` | 同 kind 兩段會話交錯（兩個上傳）就分不出哪包是誰的 |
 
-所以連線那一層收到的包先照 `id` 分派到會話，才輪到 `seq`（ws-receive-dispatch.md）。📎 `seq` 🚫 不是重送機制——
+所以連線那一層收到的包先照 `id` 分派到會話，才輪到 `seq`（/docs/design/daemon/ws-receive-dispatch.md）。📎 `seq` 🚫 不是重送機制——
 WS 不會掉單一 frame，跳號只代表 server 故意丟了一包（佇列滿），補救是帶游標重新要。
 
 ## 6. 現有 crate 怎麼重組
@@ -306,7 +306,7 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
 
 ### 6.1 現在那支 CLI 的假設要重新檢視
 
-wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout 只印一個 JSON 物件）都建立在
+/docs/design/rpc-specs/wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout 只印一個 JSON 物件）都建立在
 「它是開發與除錯工具，不是產品面」上。變成 rpc-cli 之後要重想的：
 
 - `--token` 模式：那是「不碰 vault、不碰帳號目錄」的路徑，在 daemon 模型下是什麼意思？
@@ -326,8 +326,8 @@ wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout �
   兩個 daemon 搶同一個資料目錄已經有答案：§0.2 的排他鎖，後來的起不來。
   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。要等 Desktop 的實際使用模式出來再定。
 - **第 5 點：資料平面 token 的 TTL 與撤銷**：TTL 多長（播一部長片要多久？）、`logout` 時要不要立刻讓所有 token 失效
-  （應該要）、同一個資源重複開要不要發新 token。暫定值在 rpc-spec.md §6.2。
-- **第 6 點：縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（local-interface.md §8 的 1 MiB 規則），
+  （應該要）、同一個資源重複開要不要發新 token。暫定值在 /docs/design/rpc-specs/rpc-spec.md §6.2。
+- **第 6 點：縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（/docs/design/rpc-specs/local-interface.md §8 的 1 MiB 規則），
   還是發一張涵蓋多個資源的 token？後者違反「一張 token 一個資源」，要想清楚再定。
 - **第 7 點：RPC 還是 uniffi**（這份文件假設 RPC）：
   📎 **Desktop 一旦走 web，這題實質上倒向 RPC**——web 前端沒有別的路。uniffi 只剩 Android 用得上。
@@ -336,13 +336,13 @@ wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout �
   維護者 2026-09-09 也提到同一件事：不想 Python 直接包 Rust，怕「Rust 掛了全部一起死」。
   反過來，uniffi（matrix-rust-sdk 自己就用它給 Element X）可以零序列化直接綁，Desktop 與 Android 都省事。
   **建議等 Desktop 有原型、摸到實際使用模式再定**；在那之前 `wbf-core` 的介面兩條路都能接（§6）。
-  📎 如果選 uniffi，local-interface.md 整份不需要——但 `wbf-core` 不會白做。
+  📎 如果選 uniffi，/docs/design/rpc-specs/local-interface.md 整份不需要——但 `wbf-core` 不會白做。
 - **第 8 點：Desktop 的 UI 框架**：維護者 2026-09-09 定 **Desktop 可以先用 web** 當速成框架驗證 RPC，
   Android 不走 web。候選分兩批：短期的 web（Tauri／Electron／純瀏覽器頁面），
   長期若要原生則是 egui／iced／slint／gtk-rs 這一類。
   ⚠️ 原生 Rust GUI 的傳統弱項（長列表虛擬化、IME 中文輸入）要單獨驗；web 那批沒有這個問題，
-  但多一層 runtime。評估維度見 handover.md §7。
-- **第 9 點：續傳狀態檔放哪**：現在寫在被上傳的檔旁邊（`<file>.wbf-upload.json`，wbf-cli-spec.md §6），那是一命令一程序時定的。
+  但多一層 runtime。評估維度見 /docs/handover.md §7。
+- **第 9 點：續傳狀態檔放哪**：現在寫在被上傳的檔旁邊（`<file>.wbf-upload.json`，/docs/design/rpc-specs/wbf-cli-spec.md §6），那是一命令一程序時定的。
   daemon 不一定有那個目錄的寫入權，Android 的 SAF 連路徑都沒有（`crates/wbf-core/src/upload_ops.rs` 檔頭）。
 
 ## 8. 耦合方向：上游 SDK 是可以拆掉的零件，不是地基（維護者 2026-09-05 定）
@@ -350,11 +350,11 @@ wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout �
 維護者的原話，照錄：「不要依賴太重，能切乾淨就切乾淨，蓋下去之後，要拆開來就難了。現在剛起步，這是重點的重點。」
 
 - **我們自己的東西越多，對上游的依賴越低。** 上游 `matrix-sdk` 不是要一次淘汰，是隨著我們的 work 長大自然變薄，最後變成 fallback。
-- **WS 層是我們自己的協定**（pack）。wbf 帳號已經不建 matrix-sdk 的 Client（account-session.md）；上游那套只剩一般 Matrix 帳號在用。
+- **WS 層是我們自己的協定**（pack）。wbf 帳號已經不建 matrix-sdk 的 Client（/docs/design/daemon/account-session.md）；上游那套只剩一般 Matrix 帳號在用。
 - **crypto 只當「加密解密的引用」，引擎是我們的**：`matrix-sdk-crypto` 的 `OlmMachine` 包在 `crypto_engine::OlmEngine` 裡，呼叫者只看得到它。
   沒抽 trait：只有一個實作，抽了是儀式；真的要換引擎時再抽。
 - **`matrix-sdk-base` 的型別不滲進我們的介面。**
-- **整體架構往 Telegram 對齊**（房間、對話、媒體的使用方式），但**不丟掉 E2EE 的本質**。聊天模型在 chat-model.md。
+- **整體架構往 Telegram 對齊**（房間、對話、媒體的使用方式），但**不丟掉 E2EE 的本質**。聊天模型在 /docs/design/rooms/chat-model.md。
 - **與聯邦對接能兼容就盡量兼容**；我們自幹的 feature 是 extension，可以不兼容。
 - 🚨 **任何會 breaking Matrix 兼容的地方，都要提出來審查**，由維護者定案要不要兼容。這條沒有例外。
 

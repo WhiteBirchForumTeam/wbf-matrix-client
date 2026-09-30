@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 驗收腳本（wbf-cli-spec.md §8），對著本機 wbfuwunel 跑。Windows 用 Git Bash。
+# 驗收腳本（/docs/design/rpc-specs/wbf-cli-spec.md §8），對著本機 wbfuwunel 跑。Windows 用 Git Bash。
 #
 #   WBF_PASSWORD_FILE=<檔> scripts/acceptance.sh
 #
@@ -68,7 +68,7 @@ upload_download_roundtrip() {
     chunks=$(( (file_size + chunk_size - 1) / chunk_size ))
     overhead=16; [ "$cipher" = none ] && overhead=0
     expected_len=$(( file_size + chunks * overhead ))
-    # 標準下載：分塊媒體整份給（wbfuwunel 的 chunked-upload-spec.md §4.2）。逐 byte 的密文比對在 wbf-sdk 的 e2e 測試；這裡驗長度。
+    # 標準下載：分塊媒體整份給（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.2）。逐 byte 的密文比對在 wbf-sdk 的 e2e 測試；這裡驗長度。
     actual_len=$(curl -sS -H "Authorization: Bearer $token" -o "$work/standard-$cipher.bin" -w '%{size_download}' \
         "$SERVER/_matrix/client/v1/media/download/${mxc#mxc://}")
     [ "$actual_len" = "$expected_len" ] || fail "standard download is $actual_len bytes, expected $expected_len"

@@ -1,4 +1,4 @@
-//! recovery key 的本機保管（room-key-backup.md §8；維護者 2026-09-09 定）：
+//! recovery key 的本機保管（/docs/design/keys/room-key-backup.md §8；維護者 2026-09-09 定）：
 //!
 //! ```text
 //! <data dir>/r/<b58>_<b58>             檔名是 `recovery-key@bob:matrix.org` 加密後的樣子
@@ -45,7 +45,7 @@ pub fn dir(data_dir: &Path) -> PathBuf {
 ///     user_id: 完整 mxid, example: "@alice:localhost"
 /// Return:
 ///     Ok(PathBuf)   `<data dir>/r/<b58>_<b58>`
-///     Err(Usage)    加密後的名字太長（vault-and-keys.md §2.4）
+///     Err(Usage)    加密後的名字太長（/docs/design/storage/vault-and-keys.md §2.4）
 pub fn path_of(data_dir: &Path, vault: &Vault, user_id: &str) -> Result<PathBuf, SdkError> {
     let name = to_dir_name(
         &vault.account_dir_key(),

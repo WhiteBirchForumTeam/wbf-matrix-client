@@ -1,8 +1,8 @@
 //! 房間金鑰備份：server 端的標準 Matrix key backup、本地的全量快照、recovery key。
-//! 設計在 room-key-backup.md。
+//! 設計在 /docs/design/keys/room-key-backup.md。
 //!
 //! 🚫 這裡**不判斷 conf 的兩個開關**（`SERVER_BACKUP`／`LOCAL_ROOM_KEYS`）：那是「要不要
-//! 叫我」的決定，屬於前端（architecture-v2.md §3「🚫 不代前端做決定」）。core 被叫到就做，🚫 不會回一句
+//! 叫我」的決定，屬於前端（/docs/design/overview/architecture-v2.md §3「🚫 不代前端做決定」）。core 被叫到就做，🚫 不會回一句
 //! 「好了」卻什麼都沒做。
 
 use serde::Serialize;
@@ -78,7 +78,7 @@ impl Core {
     /// 把 crypto store 裡的金鑰推上 server 的備份，**傳完才回來**。
     ///
     /// Args:
-    ///     also_save_snapshot: 順手也更新本地快照（room-key-backup.md §5：兩份備份的用途
+    ///     also_save_snapshot: 順手也更新本地快照（/docs/design/keys/room-key-backup.md §5：兩份備份的用途
     ///         不同，但沒有理由讓使用者記得跑兩個命令）。呼叫端把本地那份關掉時傳 `false`
     pub async fn upload_room_keys(
         &self,
@@ -160,7 +160,7 @@ impl Core {
     }
 
     /// 產生 recovery key，並**封進 `r/`**（🚫 不是帳號目錄——`logout` 會把那裡清光，
-    /// 而 recovery key 正是清完之後唯一回得去的路；room-key-backup.md §8）。
+    /// 而 recovery key 正是清完之後唯一回得去的路；/docs/design/keys/room-key-backup.md §8）。
     ///
     /// ⚠️ **回傳值是秘密**。呼叫端要負責讓使用者看到並抄下來：這台機器保管著它，但
     /// 機器沒了就兩份都沒了。

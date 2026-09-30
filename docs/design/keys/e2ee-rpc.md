@@ -7,8 +7,8 @@
 >   `room_sync.rs`（推來的有金鑰就解、`DeviceChanged` 轉給 UI）、`sync_ops.rs`（`Recent` 拉完補解）、`link_pool.rs`（宣告 feature）。
 > - daemon：`room.refresh_devices`、`room.send_text` 多兩個參數、錯誤回應的 `data`、`devices.changed` 推播。
 >
-> server 的語意在 wbfuwunel `wbf-room-device-version.md`（房間版本號、1506、`DeviceChanged`）與 `wbf-e2ee.md`（`CryptoState`）。
-> UI 與 daemon 誰呼叫什麼，以這份為準（e2ee-walkthrough.md §16.6 只留原則）。
+> server 的語意在 wbfuwunel 的 `/docs/design/wbf-room-device-version.md`（房間版本號、1506、`DeviceChanged`）與 `wbf-e2ee.md`（`CryptoState`）。
+> UI 與 daemon 誰呼叫什麼，以這份為準（/docs/design/keys/e2ee-walkthrough.md §16.6 只留原則）。
 
 ## 0. 規矩（維護者原話，2026-09-29）
 
@@ -47,7 +47,7 @@
 | 別人的裝置公鑰清單、追蹤中的人 | daemon，crypto store | 分金鑰時送給誰、用哪把公鑰 |
 | 訊息（密文，解得開的連明文） | daemon，`cache.db` | UI 讀歷史；補解時找還沒解的 |
 | **房間版本號、每個成員的裝置版本號**（`RoomDevices`） | **UI** | 送出時帶回來：號碼給 server 擋、成員給 daemon 分金鑰、也當「上一份」讓 1506 之後只重查變了的人 |
-| 全局同步的起點（`g_seq`） | UI | 下次 `sync.recent` 從哪接（room-sync.md） |
+| 全局同步的起點（`g_seq`） | UI | 下次 `sync.recent` 從哪接（/docs/design/rooms/room-sync.md） |
 | 還沒送成功的訊息與它的 `txn_id` | UI | 重送用同一個 `txn_id`，server 冪等 |
 
 - **金鑰一律不離開 daemon**；分金鑰、換金鑰、補一次性金鑰全由 daemon 自動做。
@@ -92,7 +92,7 @@
   "data": { "room_version": 9, "members": { "@bob:localhost": "4-0a1b2c3d4e", … }, "shared": 1, "txn_id": "wbf-…" } }
 ```
 
-- `1401 room_devices_changed` 是 RPC 的號碼（rpc-spec.md §5.2，server 家族 1400 裡拆出來的；server 那邊叫 1506，訊息裡照帶）。
+- `1401 room_devices_changed` 是 RPC 的號碼（/docs/design/rpc-specs/rpc-spec.md §5.2，server 家族 1400 裡拆出來的；server 那邊叫 1506，訊息裡照帶）。
 - `data` 就是新的 `RoomDevices` ＋ `shared` ＋ 這則的 `txn_id`（UI 沒給的話是 daemon 產的）：UI 存下它、用同一個 `txn_id` 重送就過。
 - 重拿也失敗：`data` 只有 `{ txn_id, current_room_version }`，`msg` 說明，UI 自己叫 `room.refresh_devices`。
 - 🚫 **daemon 不自動重送**：使用者可能已經撤回或改了，重送的政策在 UI。
@@ -139,7 +139,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 - **加密附件**：`room.send_file` 在加密房拒絕。
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
-- **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，e2ee-walkthrough.md §16）。
+- **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，/docs/design/keys/e2ee-walkthrough.md §16）。
 - **補解寫失敗的那批不會自動重試**：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
   那把金鑰已經匯入，之後不會再觸發補解（只有同一把金鑰再來才會）。要不要加一個觸發點（例如 `room.history` 讀到未解的就試一次）待維護者決定。
 

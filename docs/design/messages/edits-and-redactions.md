@@ -1,7 +1,7 @@
 # 事件的處理：原始事件永遠不動，最終內容另存（維護者 2026-09-14 定）
 
 > 這份講 `cache.db` 的 `events` 表怎麼存一則事件，以及 edit、redact、reaction 這些關係事件怎麼折回目標（schema v5）。
-> 從 local-cache-db.md 拆出來；整份 schema 在 local-cache-db.md §5。
+> 從 /docs/design/storage/local-cache-db.md 拆出來；整份 schema 在 /docs/design/storage/local-cache-db.md §5。
 
 ## 1 為什麼原始事件與顯示內容分開存
 
@@ -17,7 +17,7 @@
   目標那一列只記「目前要顯示哪個 edit」（`ref_event_id`）與「最後一次變動的 server 時間」（`modified_timestamp`），顯示時引用（§5）；
   redact 只在目標打勾 `is_redacted`。
 - ⭐ **先解密再寫入**：寫進去的時候就已經處理過，只有解不開的才停在「未處理」。
-  wbf 帳號照這條做：收到時有金鑰就解；解不開的，金鑰晚到時由金鑰那半找出來補解、補寫 `content_json`（`raw_event` 的密文不動，e2ee-rpc.md §6）。
+  wbf 帳號照這條做：收到時有金鑰就解；解不開的，金鑰晚到時由金鑰那半找出來補解、補寫 `content_json`（`raw_event` 的密文不動，/docs/design/keys/e2ee-rpc.md §6）。
 - 📎 **redact 要不要真的清掉本地的唯一快取，是裝置端的選擇，🚫 不是協議保證**（維護者 2026-09-14）。
   client 選擇不清，redact 對它就是「標記」而不是「抹除」—— 在這個 client 上不算 bug。
 
@@ -33,7 +33,7 @@
 | **`ref_event_id`** | TEXT | NULL | **兩種意思，看 `class`**（維護者 2026-09-14）：edit／redact／reaction → 指向的**目標的 `event_id`**；msg → **目前要顯示的那個 edit 的 `event_id`**（沒被 edit 過是 NULL）。**加索引** `(room, ref_event_id)`（反查「誰參照這則」）。⚠️ 所以每一條用它的查詢都要帶 `class` 條件 |
 | **`modified_timestamp`** | INTEGER | **0** | 這一列最後一次變動的 server 時間：寫入時＝**0**（所以第一個 edit 一定贏，發送端時鐘偏了也一樣）；換成新的 edit 時＝那個 edit 的 `origin_server_ts`；被 redact 時＝那個 redact 的。edit 寫入時拿它**直接比大小**，讀取不必再查參照（§5） |
 
-⚠️ **`ref_event_id` 是 local-cache-db.md §5 第 2 條原則的刻意例外**（「字串識別碼在整個 DB 裡各只出現一次，其餘全走整數外鍵」）：
+⚠️ **`ref_event_id` 是 /docs/design/storage/local-cache-db.md §5 第 2 條原則的刻意例外**（「字串識別碼在整個 DB 裡各只出現一次，其餘全走整數外鍵」）：
 這裡**沒辦法用外鍵**，因為目標那一列**可能還不存在**（只先讀到 edit／redact）。
 📎 只有關係事件才填，數量遠少於訊息。
 ⭐ 用 `event_id` 而不是 `g_seq` 參照（維護者 2026-09-14）：關係事件本身就帶著目標的 `event_id`（`m.relates_to.event_id`、`redacts`），
@@ -147,7 +147,7 @@
 1. **一般 Matrix server 沒有 `g_seq`**：edit 的新舊一律比 `origin_server_ts`，平手比 `event_id`（維護者 2026-09-14），見 §5。
 2. **`content_json` 存解密後的整份 `content` JSON**（維護者 2026-09-14），讀取時從它組出 `Message`。
    edit 的 `content_json` 是它的 `m.new_content`。
-3. **解密**：wbf 帳號由 `OlmEngine` 自己解（e2ee-rpc.md §6）——WS 收到的密文有金鑰就解、密文明文一起存；沒金鑰的金鑰晚到時補解。
+3. **解密**：wbf 帳號由 `OlmEngine` 自己解（/docs/design/keys/e2ee-rpc.md §6）——WS 收到的密文有金鑰就解、密文明文一起存；沒金鑰的金鑰晚到時補解。
    **matrix-sdk 解開的事件拿不到密文**（`DecryptedRoomEvent` 只有明文）：`raw_event` 放 NULL（維護者 2026-09-14）。
 4. **沒有「套了」與「跳過」要分**：目標那列的 `ref_event_id` 就是目前生效的那個，跳過的就是比較舊的（維護者 2026-09-14），見 §5。
 
@@ -163,7 +163,7 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 | 項目 | 做法 | 為什麼 |
 |---|---|---|
 | 多一欄 `event_type` | 明文的 `type` | `content_json` 只有 `content`（§7 第 2 點），而加密事件的 `raw_event` 是 `m.room.encrypted`、matrix-sdk 解開的甚至是 NULL —— 沒有這欄就不知道要怎麼顯示，也驗不了「edit 不能改 type」 |
-| 沒有 `kind` 欄 | 讀取時從 `content_json` 算 | 同一個事實的第二份（local-cache-db.md §5 原則）；`files` 用 `json_extract(content_json, '$.msgtype')` |
+| 沒有 `kind` 欄 | 讀取時從 `content_json` 算 | 同一個事實的第二份（/docs/design/storage/local-cache-db.md §5 原則）；`files` 用 `json_extract(content_json, '$.msgtype')` |
 | 有 `decrypted` 欄 | NULL／0／1 | 「原本是不是加密事件」要明說 —— edit 的資安規則（加密的目標配明文 edit）靠它，🚫 不靠「`raw_event` 是 NULL 所以大概是加密的」這種巧合 |
 | 不存解不開的原因 | 讀出來一律 `NotDecryptedHere` | matrix-sdk 給的 UTD 原因只在那一次請求有意義 |
 | 解不開、過時有專用的 `kind` | `MessageKind::Undecryptable`／`Outdated`（JSON `"undecryptable"`／`"outdated"`） | 維護者 2026-09-14：跟 `deleted` 一樣是 UI 直接渲染的記號，🚫 不再混在 `unsupported` 裡 |
@@ -173,7 +173,7 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 - 🚫 **不寫**：沒有 `event_id` 或 `sender` 的（佔位值相等會讓 edit 的 sender 比對放行）；事件自帶的 `room_id` 跟參數不一樣的。
 - 同一則再來：`raw_event`／`r_seq`／`g_seq` 只從 NULL 補；server 蓋了 `redacted_because` 就 `is_redacted = 1`（只升不降）；
   原本是 `general`、這次帶明文 → 照明文分類，當作第一次處理。其他一律不動（`content_json` 不被覆蓋）。
-- msg／edit 的內容是 wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）。
+- msg／edit 的內容是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）。
 - 每一則寫入時都查「有沒有 redact、edit 在等這則」，redact 先處理；自己是 edit／redact 時，目標在就處理，不在就等。
 
 **讀取**：`find_current_edit` 照 §5；reaction 🚨 只算讀者自己同步過、沒 hide、沒被 redact 的（跟事件本身同一條可見性規則）。

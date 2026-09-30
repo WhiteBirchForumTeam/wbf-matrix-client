@@ -1,4 +1,4 @@
-//! wbf-cli-spec.md §5 的 manifest 與 wbf-cli-spec.md §6 的上傳狀態檔。兩者都含 `key`，寫檔時是機密。
+//! /docs/design/rpc-specs/wbf-cli-spec.md §5 的 manifest 與 /docs/design/rpc-specs/wbf-cli-spec.md §6 的上傳狀態檔。兩者都含 `key`，寫檔時是機密。
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,7 @@ impl Manifest {
     }
 }
 
-/// 上傳中的一切，`Create` 之後就該落地（wbf-cli-spec.md §6），續傳時讀回來。
+/// 上傳中的一切，`Create` 之後就該落地（/docs/design/rpc-specs/wbf-cli-spec.md §6），續傳時讀回來。
 /// `block.file_size` 在串流模式是 None；串流沒有續傳，狀態只活在記憶體。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadState {
@@ -79,7 +79,7 @@ impl UploadState {
             .map_err(|error| crate::error::cannot_serialize("UploadState", error))
     }
 
-    /// wbf-cli-spec.md §3.2：狀態檔的 server 與 user 跟現在的不一樣就拒絕，不拿 A server 的上傳去打 B server。
+    /// /docs/design/rpc-specs/wbf-cli-spec.md §3.2：狀態檔的 server 與 user 跟現在的不一樣就拒絕，不拿 A server 的上傳去打 B server。
     ///
     /// Return:
     ///     bool  1 = 同一個 server、同一個 user

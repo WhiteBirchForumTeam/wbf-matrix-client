@@ -1,4 +1,4 @@
-//! 對真的 loopback WS 走一遍（rpc-spec.md §1）：hello、請求、token 錯、text frame、shutdown。
+//! 對真的 loopback WS 走一遍（/docs/design/rpc-specs/rpc-spec.md §1）：hello、請求、token 錯、text frame、shutdown。
 //! 這裡的 client 只用 `wbf_daemon::pack` 封包，其餘是 tokio-tungstenite 的原生 client——
 //! 證明的是「另一個程序照規格寫就接得上」，不是「daemon 自己跟自己講話」。
 
@@ -233,7 +233,7 @@ async fn shutdown_notifies_open_connections_and_stops_accepting() {
     );
 }
 
-/// local-interface.md §3 的第 4、5 步：前端在 ready 之後**抹掉** token 檔，而 daemon 照樣服務。
+/// /docs/design/rpc-specs/local-interface.md §3 的第 4、5 步：前端在 ready 之後**抹掉** token 檔，而 daemon 照樣服務。
 ///
 /// ⭐ 這條釘住的是「daemon 讀完就不再回頭讀那個路徑」—— 哪天有人加了一段「重讀 token」
 /// （例如想支援換 token），這裡會紅，而那正是要停下來想的時候。
@@ -278,7 +278,7 @@ async fn the_daemon_keeps_serving_after_the_frontend_shreds_the_token_file() {
     assert_eq!(reply["result"]["unlocked"], false);
 }
 
-// ---- 訂閱與推播（rpc-spec.md §3.9、§4；link-pool.md §6）----
+// ---- 訂閱與推播（/docs/design/rpc-specs/rpc-spec.md §3.9、§4；/docs/design/daemon/link-pool.md §6）----
 
 fn link_event(user: &str) -> wbf_core::CoreEvent {
     wbf_core::CoreEvent::Link {

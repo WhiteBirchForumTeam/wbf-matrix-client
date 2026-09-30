@@ -1,10 +1,10 @@
 # daemon 的執行期：多帳號怎麼落到資料庫、UI 怎麼拿、命令怎麼往上游走
 
 > **這份講執行期**：多帳號如何落地到 db、db 如何與 UI 互動、命令如何被解讀成上游同步——資料在哪、誰寫、寫的時候會不會撞、UI 的每一個動作實際走哪條路。
-> 🚫 不重複分層（[`architecture-v2.md`](../overview/architecture-v2.md)）、逐條訊息（[`rpc-spec.md`](../rpc-specs/rpc-spec.md)）、
-> 資料庫 schema（[`local-cache-db.md`](../storage/local-cache-db.md)、read-receipts.md）。
+> 🚫 不重複分層（[`/docs/design/overview/architecture-v2.md`](../overview/architecture-v2.md)）、逐條訊息（[`/docs/design/rpc-specs/rpc-spec.md`](../rpc-specs/rpc-spec.md)）、
+> 資料庫 schema（[`/docs/design/storage/local-cache-db.md`](../storage/local-cache-db.md)、/docs/design/messages/read-receipts.md）。
 >
-> §3 的 `sync` 參數、read-receipts.md 的已讀三層是維護者 2026-09-13 定的方向。
+> §3 的 `sync` 參數、/docs/design/messages/read-receipts.md 的已讀三層是維護者 2026-09-13 定的方向。
 
 ## 0. 先把三個字分開
 
@@ -30,7 +30,7 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 ```
 <data dir>/
   local.key                    一台機器一把主金鑰
-  daemon.lock  daemon.json     獨佔與 ready（architecture-v2.md §0.2、local-interface.md §3）
+  daemon.lock  daemon.json     獨佔與 ready（/docs/design/overview/architecture-v2.md §0.2、/docs/design/rpc-specs/local-interface.md §3）
   s/<加密的 server 名>/
     cache.db                   🚨 **一個 server 一份，這台機器上所有這個 server 的帳號共用**
     media/                     媒體池：一個加密池、一把鑰，不分帳號
@@ -67,7 +67,7 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 | 3 | **成本**。每個操作都 `Cache::open` 要付一次 SQLCipher 導金鑰。連線留著重用 |
 | 4 | 那 5 秒真的用完時**仍然會失敗** —— 單一寫入者連這個尾巴也消掉 |
 
-📎 為什麼 daemon 的排他鎖（architecture-v2.md §0.2）不管這件事：那把鎖擋的是**別的程序**。
+📎 為什麼 daemon 的排他鎖（/docs/design/overview/architecture-v2.md §0.2）不管這件事：那把鎖擋的是**別的程序**。
 同一個 daemon 裡面的兩個 task 都在鎖的**裡面**，它一個字都沒說。
 
 ### 2.2 定案：一個 server 一個寫入者
@@ -278,11 +278,11 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 - **點開房間 = 先 `sync: "local"`**（立刻有東西看），**之後**才視情況補洞。
   🚫 不要「先去 server 拉完再顯示」——那是把毫秒變成秒。
 - 有沒有洞是**看得出來的**：`cache.db` 的 `events` 有 `r_seq`（房內序號），
-  一段連續的 `r_seq` 中間缺號就是洞（local-cache-db.md §5）。有洞才發第二個 `sync: "both"`。
+  一段連續的 `r_seq` 中間缺號就是洞（/docs/design/storage/local-cache-db.md §5）。有洞才發第二個 `sync: "both"`。
 - 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 UI 起來時另外叫的 `sync.recent`（§4.3），🚫 不是 daemon 自己的事。
 - 🚨 **往回翻一律拿 `event_id`**（維護者 2026-09-14）：UI 拿手上最舊那則當 `before`，`both` **永遠問上游**、
   寫進去、照上游順序從本地讀回。daemon 換算：wbf 查本地 `g_seq` → `Recent{rooms, before}`；matrix `/context` → `/messages`。
-  🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 rpc-spec.md §3.3「往回翻」。
+  🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 /docs/design/rpc-specs/rpc-spec.md §3.3「往回翻」。
 
 ### 3.5 ⚠️ 跟這個模型不同的地方：CLI，與 backend 怎麼選
 
@@ -312,18 +312,18 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 **`wbf_core::backend_choice` 的三塊**：
 
-1. **探測** `Core::get_backend_kind` —— 規矩在 account-session.md §1–§2：不帶 token 的 WS `Hello`、以 server URL 為鍵、探不到不記；
+1. **探測** `Core::get_backend_kind` —— 規矩在 /docs/design/daemon/account-session.md §1–§2：不帶 token 的 WS `Hello`、以 server URL 為鍵、探不到不記；
    wbf 帳號登入時就把 backend 記進 session，之後不再探。
    ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
 2. **規則** `get_backend_for(transport, server_speaks_wbf, home)` —— 純函數，所以上面那張表
    逐格測得到。⚠️ 只有一種情況報錯：那個 feature 只有 wbf 有，而這條路到不了它 ——
    它就是**關的**，而「因為你選了 http」跟「因為對方不是 wbf」訊息分開講。
-3. **唯一的閘門** `Core::client_of(account, transport, home, role)` —— 探測＋規則＋從連線池拿線（link-pool.md §2）都在這裡。
+3. **唯一的閘門** `Core::client_of(account, transport, home, role)` —— 探測＋規則＋從連線池拿線（/docs/design/daemon/link-pool.md §2）都在這裡。
    （探測不能走閘門，不然它會叫到自己。）
 
 **`MethodHome`**：每個呼叫點自己說出它住在哪一邊 —— 🚫 不是一串字串比對（名字跟實際走哪條會漂移）。
 `room.history`／`files` 是 `BothSides`；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfSdkOnly`；
-`room.list`／`get`／`send_text` 先看 `session.backend`（`is_wbf_account`）分流：wbf 帳號那半（`wbf_rooms.rs`，走橋，account-session.md §6）是 `WbfSdkOnly`，一般 Matrix 帳號走 Client（`synced_backend_of`）。
+`room.list`／`get`／`send_text` 先看 `session.backend`（`is_wbf_account`）分流：wbf 帳號那半（`wbf_rooms.rs`，走橋，/docs/design/daemon/account-session.md §6）是 `WbfSdkOnly`，一般 Matrix 帳號走 Client（`synced_backend_of`）。
 🚧 暫時清單（`StillOnMatrixSdk`）現在沒有正式呼叫點。
 
 ⭐ rpc-spec 看不到 backend 怎麼選 —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
@@ -338,7 +338,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 ### 4.1 一個帳號一組會話
 
-誰開、什麼時候開關：wbf 帳號是連線池的五條線，解鎖／登入後 daemon 全開、背景看著（link-pool.md §1、§3.1）；
+誰開、什麼時候開關：wbf 帳號是連線池的五條線，解鎖／登入後 daemon 全開、背景看著（/docs/design/daemon/link-pool.md §1、§3.1）；
 一般 Matrix 帳號沒有常駐的上游會話（§5.5）。執行期要補的是**事件進來之後的順序**：
 
 ```
@@ -363,12 +363,12 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 - **事件各自進來、各自解密**（金鑰是每帳號的），但**寫進同一個 `cache.db`**。
 - 事件本體（`events` 表）是**共用的**：同一則訊息 A 與 B 都收到，庫裡只有一列。
-- **「誰看得到」是另一張表**（`events_synced_log`，local-cache-db.md §5）：
+- **「誰看得到」是另一張表**（`events_synced_log`，/docs/design/storage/local-cache-db.md §5）：
   一則事件對每個看得到它的帳號各有一列。⭐ 這就是「混存但不混視野」的機制。
 - 所以 §2.2 那個「一個 server 一個寫入者」不只是為了避免撞鎖，
   也是因為**兩個帳號寫的是同一批列**（`rooms`、`users`、`events` 都要 upsert）。
 
-### 4.3 補洞是 UI 的事（維護者 2026-09-23；room-sync.md §0 原話）
+### 4.3 補洞是 UI 的事（維護者 2026-09-23；/docs/design/rooms/room-sync.md §0 原話）
 
 **daemon 不自己叫 `Recent`**（「daemon 只有訂閱新事件，不主動叫 Recent。誰負責記有沒漏，是 UI 層的事」）：
 
@@ -387,7 +387,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 |---|---|
 | `room.message` | ✅ |
 | `sync.state` | ✅ |
-| `link.state`、`keys.state`、`pack.received`（link-pool.md §6） | ✅ |
+| `link.state`、`keys.state`、`pack.received`（/docs/design/daemon/link-pool.md §6） | ✅ |
 | 之後所有從 homeserver 來的（已讀回條、輸入中、房間狀態變更、裝置驗證…） | ✅ **一律** |
 | `progress`、`note` | ❌ 它們是**請求**的進度與說明，用 `id` 對得起來 |
 | `vault.state` | ❌ 它是 daemon 這台機器的狀態，跟帳號無關 |
@@ -399,7 +399,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 **要，而且預設全收。** 使用者正在看帳號 A，帳號 B 來了訊息 —— UI 要能在側邊欄顯示未讀。
 所以：
 
-- `subscribe` 不帶 `user` ＝ **全部帳號**（rpc-spec.md §3.9）。帶了才是只收那一個。
+- `subscribe` 不帶 `user` ＝ **全部帳號**（/docs/design/rpc-specs/rpc-spec.md §3.9）。帶了才是只收那一個。
 - 🚫 **daemon 不替 UI 決定「哪些值得看」**：它只送「發生了什麼」，
   要不要響、要不要跳紅點、要不要靜音某個帳號 —— 那是 UI 的事（§6）。
 
@@ -414,7 +414,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
   ⭐ 全部都是本地讀，很便宜，所以這個補救是廉價的。
 - 🚫 **不重播**（我們沒有留著那些事件），🚫 **也不假裝沒事**。
 
-📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（architecture-v2.md §5.1.1）。
+📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（/docs/design/overview/architecture-v2.md §5.1.1）。
 ⭐ 我們自己的推播是同一個問題，🚫 沒有理由用不同的答案。
 
 ### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13）
@@ -475,7 +475,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 ## 7. 進度歸誰：`job`
 
-長工作的進度必須說得出是哪一個請求的（rpc-spec.md §4 的 `progress.id`），可是 core 不知道
+長工作的進度必須說得出是哪一個請求的（/docs/design/rpc-specs/rpc-spec.md §4 的 `progress.id`），可是 core 不知道
 「請求」這種東西，而三個長工作的事件在同一條廣播上是交錯的。
 
 做法是 `crates/wbf-core/src/job.rs`：daemon 把整個工作包在 `run_as_job(請求的 id, …)` 裡，
@@ -485,7 +485,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
   🚫 不走「每個長工作多收一個 `job` 參數」：那要改十幾個公開簽名，而中間任何一層忘了往下傳，
   事件就默默變成無主的 —— 那種漏法不會有人發現。
 - ⚠️ 限制：task-local 不跟著 `tokio::spawn` 走（模組註解裡有，**有測試釘住**）。
-- **`job: None` 的事件🚫 不自動推給哪條連線**：背景工作（收推播、看線的迴圈）講的話不屬於任何請求，只有訂了 `progress`／`note`（或 `"*"`）的連線收得到（link-pool.md §6）。
+- **`job: None` 的事件🚫 不自動推給哪條連線**：背景工作（收推播、看線的迴圈）講的話不屬於任何請求，只有訂了 `progress`／`note`（或 `"*"`）的連線收得到（/docs/design/daemon/link-pool.md §6）。
 
 ## 8. 取消
 
@@ -507,7 +507,7 @@ let response = tokio::select! {
 
   | 工作 | 取消之後 |
   |---|---|
-  | 上傳 | 狀態檔還在（wbf-cli-spec.md §6），可續傳；🚫 不自動去 `abort` server 那邊 |
+  | 上傳 | 狀態檔還在（/docs/design/rpc-specs/wbf-cli-spec.md §6），可續傳；🚫 不自動去 `abort` server 那邊 |
   | 下載 | 媒體池的段是可續的；`no_cache` 的直接下載刪掉半個檔 |
   | `sync.recent` | 水位只在整批寫完之後前進，所以🚫 不會留下「假裝拉過」的洞 |
 
@@ -518,7 +518,7 @@ let response = tokio::select! {
 | vault 鎖著 | 🚫 不起上游會話（token 在 `session.sealed` 裡，讀不到） |
 | 沒有寫權（別的 daemon 佔著） | 🚫 不起上游會話；會寫的 method 回 `109` |
 | 上游斷線，但有請求正在跑 | 那個請求照它自己的錯誤路徑失敗（`1300`），🚫 不掛在那裡等重連 |
-| 前端關掉連線 | 訂閱沒了；**它發起的長工作繼續跑**（rpc-spec.md §1.2），進度沒人收就沒人收 |
+| 前端關掉連線 | 訂閱沒了；**它發起的長工作繼續跑**（/docs/design/rpc-specs/rpc-spec.md §1.2），進度沒人收就沒人收 |
 | `cache.db` 寫失敗 | 推播那包：講一聲、🚫 不發 `room.message`、不重試（水位不歸推播管，UI 下次 `sync.recent` 重拉，§4.3）。`sync.recent` 的一批：整次回錯、水位不推進，下次從舊水位重拉 |
 | daemon 關閉 | 先停上游會話 → 等在跑的請求收攤 → 關 listener |
 
@@ -529,17 +529,17 @@ let response = tokio::select! {
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ |
 | 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 媒體那幾條是刻意的例外（§2.3.1） |
 | 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info`，預設 `local`，**回應回報這次用了哪一種** | ✅ |
-| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）；SDK 的收包分派（ws-receive-dispatch.md）；daemon 那半在 link-pool.md §6 | ✅ 還沒做：兩條佇列分開＋進度節流（§5.4 定了先不做） |
+| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）；SDK 的收包分派（/docs/design/daemon/ws-receive-dispatch.md）；daemon 那半在 /docs/design/daemon/link-pool.md §6 | ✅ 還沒做：兩條佇列分開＋進度節流（§5.4 定了先不做） |
 | 5 | `cancel`（§8） | 還沒做 |
-| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`）與 core 的 `room_sync.rs`（room-sync.md） | ✅ |
-| 7 | 上游會話：探測、收事件迴圈、寫庫、發事件 | ✅ wbf 帳號（連線池 link-pool.md、收推播寫快取再發 `room.message`）。還沒做：一般 Matrix 帳號的收事件迴圈（§5.5） |
-| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 線的那半有了（link-pool.md §3.1）。還沒做：task panic 收攤、重連時重探 backend |
-| 9 | **已讀三層**（read-receipts.md）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | 還沒做 |
+| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`）與 core 的 `room_sync.rs`（/docs/design/rooms/room-sync.md） | ✅ |
+| 7 | 上游會話：探測、收事件迴圈、寫庫、發事件 | ✅ wbf 帳號（連線池 /docs/design/daemon/link-pool.md、收推播寫快取再發 `room.message`）。還沒做：一般 Matrix 帳號的收事件迴圈（§5.5） |
+| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 線的那半有了（/docs/design/daemon/link-pool.md §3.1）。還沒做：task panic 收攤、重連時重探 backend |
+| 9 | **已讀三層**（/docs/design/messages/read-receipts.md）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | 還沒做 |
 
 ## 11. 明確不做的
 
 - 🚫 **不重播掉掉的事件**：推播是「不用輪詢」，不是「保證看得到全部」。掉了就重查（本地讀很便宜）。
-- 🚫 **不把「這台 server 是 wbf」寫進設定檔**：探測結果只在記憶體、daemon 重開就重探（account-session.md §1）。wbf 帳號登入時記進 session 的 `backend` 是那個 session 的屬性，不是 server 的設定（account-session.md §2）。
+- 🚫 **不把「這台 server 是 wbf」寫進設定檔**：探測結果只在記憶體、daemon 重開就重探（/docs/design/daemon/account-session.md §1）。wbf 帳號登入時記進 session 的 `backend` 是那個 session 的屬性，不是 server 的設定（/docs/design/daemon/account-session.md §2）。
 - 🚫 **不做跨帳號的合併事件流**：每個帳號各自一組，要合併是 UI 的事。
 - 🚫 **不在 daemon 裡做通知政策**（§6）。
 - 🚫 **不做「UI 現在在看哪個帳號」的伺服器端狀態**（§3.3）。
@@ -570,7 +570,7 @@ let response = tokio::select! {
 **為什麼誘人**：§2 那一整章（單一寫入者、queue、回執）**會直接消失** ——
 一個帳號一個庫、一個寫入者，天生沒有競爭。刪帳號也變成 `rm` 一個檔。
 
-🚫 **不走**（而且這是 2026-08 就定案的，local-cache-db.md §5）：
+🚫 **不走**（而且這是 2026-08 就定案的，/docs/design/storage/local-cache-db.md §5）：
 
 - 同一個房間裡的兩個帳號會**各存一份**全部事件與媒體指針，而群組房間裡這是常態。
 - 跨帳號的東西（搜尋、媒體去重）會從「一句 SQL」變成「N 個庫合併」。
@@ -590,7 +590,7 @@ let response = tokio::select! {
 **為什麼誘人**：少一層翻譯。
 
 🚫 **不走**：`user` 是 core 知道的，但 `id`（哪個請求）、訂閱、加密、每條連線的過濾都是 daemon 的。
-core 一旦認識「連線」與「請求 id」，architecture-v2.md §6 那條「公開面只有可序列化 DTO」就破了 ——
+core 一旦認識「連線」與「請求 id」，/docs/design/overview/architecture-v2.md §6 那條「公開面只有可序列化 DTO」就破了 ——
 ⭐ 而那條是 uniffi／FFI 那條路的前提。
 
 ### 12.5 這次檢視改掉的四件事

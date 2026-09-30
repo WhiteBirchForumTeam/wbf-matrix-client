@@ -1,7 +1,7 @@
 # 本地的金鑰：主金鑰與子金鑰、路徑加密、passphrase
 
 > 這份講本機所有加密的根：`local.key` 裡的主金鑰與它導出的子金鑰（§1）、資料目錄裡 server 與帳號名字的加密（§2）、passphrase 怎麼讀（§3）。
-> 各檔放在哪見 local-cache-db.md §4.6；`wbf-sdk::vault` 與 `wbf-sdk::account_dir` 就是照這裡寫的。
+> 各檔放在哪見 /docs/design/storage/local-cache-db.md §4.6；`wbf-sdk::vault` 與 `wbf-sdk::account_dir` 就是照這裡寫的。
 
 ## 1. 金鑰：一把主金鑰，兩種鎖法，型別化
 
@@ -22,11 +22,11 @@ local.key（0600）
 
   | # | context | 用途 |
   |---|---|---|
-  | 1 | `wbf-matrix-client cache sqlcipher v1` | `cache.db` 的 SQLCipher raw key（local-cache-db.md §3） |
-  | 2 | `wbf-matrix-client matrix-sdk store v1` | matrix-sdk store 的 `open_with_key`（local-cache-db.md §4.3） |
+  | 1 | `wbf-matrix-client cache sqlcipher v1` | `cache.db` 的 SQLCipher raw key（/docs/design/storage/local-cache-db.md §3） |
+  | 2 | `wbf-matrix-client matrix-sdk store v1` | matrix-sdk store 的 `open_with_key`（/docs/design/storage/local-cache-db.md §4.3） |
   | 3 | `wbf-matrix-client session v1` | XChaCha20-Poly1305 封 `session.sealed`（server、user_id、device_id、access_token）與 `r/` 裡的 recovery key，兩者靠 aad 分 |
-  | 4 | `wbf-matrix-client media store v1` | 媒體池（media-pool.md §8） |
-  | 5 | `wbf-matrix-client room key backup v1` | 本地房間金鑰快照 `k/snapshot` 的 passphrase（base64 後餵給上游的匯出，room-key-backup.md §4） |
+  | 4 | `wbf-matrix-client media store v1` | 媒體池（/docs/design/media/media-pool.md §8） |
+  | 5 | `wbf-matrix-client room key backup v1` | 本地房間金鑰快照 `k/snapshot` 的 passphrase（base64 後餵給上游的匯出，/docs/design/keys/room-key-backup.md §4） |
   | 6 | `wbf-matrix-client account directory v1` | 目錄名加密（§2），`s/`、`a/`、`r/` 共用這一把，靠 aad 分 |
 
   session 與 token **不進 DB**，但跟 DB 同一把鎖（維護者 2026-09-05 定）。
@@ -46,8 +46,8 @@ local.key（0600）
   CLI passphrase 的來源與 `login` 的 password 同一套：`--passphrase-file <檔>` 或終端不回顯；不接受命令列明文與環境變數。優先順序：檔案參數 → 問終端。
 
   🚫 **不把解鎖狀態寫到磁碟**（維護者 2026-09-13）：不做仿 `sudo` 的 ticket（明文主金鑰落地一段時間，省掉每個命令再問 passphrase）。
-  ⭐ 理由是那個痛點沒有了：daemon 常駐、解鎖一次（architecture-v2.md §1），而單發命令在 daemon
-  起著的時候本來就不准碰資料庫（architecture-v2.md §0.2），所以 CLI 只剩 debug／test 用、一次一個 ——
+  ⭐ 理由是那個痛點沒有了：daemon 常駐、解鎖一次（/docs/design/overview/architecture-v2.md §1），而單發命令在 daemon
+  起著的時候本來就不准碰資料庫（/docs/design/overview/architecture-v2.md §0.2），所以 CLI 只剩 debug／test 用、一次一個 ——
   省那幾次打字換不到「明文主金鑰落地」。
 
 ### 1.1 實作細節
@@ -57,8 +57,8 @@ local.key（0600）
 - `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空的 passphrase 在這裡被拒。
 - `Vault::from_master(dir, master, mode)` 只給 `set_passphrase` 重包 `local.key` 用（同一個目錄、同一把主金鑰）；⚠️ 它不驗證那把金鑰是不是這個目錄的，所以🚫 除此之外不要拿它做別的事。
 - 寫 `local.key`／`session.sealed` 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
-- 既有的 matrix-sdk store 用別把金鑰開會失敗：訊息叫人刪那個 store 目錄（`m/`）重新 `login`，不遷移（local-cache-db.md §1 的政策，維護者 2026-09-09 決定不改）。
-  ⚠️ 這條站得住的前提是 room-key-backup.md 的本地快照：`m/` 裡的 crypto store 裝著解開全部歷史的房間金鑰，手動刪 `m/` 時 `k/snapshot` 留著、`key-backup import` 讀得回來。
+- 既有的 matrix-sdk store 用別把金鑰開會失敗：訊息叫人刪那個 store 目錄（`m/`）重新 `login`，不遷移（/docs/design/storage/local-cache-db.md §1 的政策，維護者 2026-09-09 決定不改）。
+  ⚠️ 這條站得住的前提是 /docs/design/keys/room-key-backup.md 的本地快照：`m/` 裡的 crypto store 裝著解開全部歷史的房間金鑰，手動刪 `m/` 時 `k/snapshot` 留著、`key-backup import` 讀得回來。
 
 - **威脅模型**（老實寫）：
 
@@ -99,7 +99,7 @@ Base58 的字母表**沒有底線**，所以 `_` 可以當分隔符，兩段各�
   nonce_a = BLAKE3 keyed_hash(key, "wbf account-dir-nonce v1" ‖ 0x00 ‖ host ‖ 0x00 ‖ localpart) 前 12 byte
   ct_a    = ChaCha20-Poly1305(key, nonce_a, localpart, aad = "wbf-matrix-client account dir v1" ‖ host)
 
-recovery key  r/<B58(nonce_r)>_<B58(ct_r)>          明文是 `recovery-key@mxid`（room-key-backup.md §8）
+recovery key  r/<B58(nonce_r)>_<B58(ct_r)>          明文是 `recovery-key@mxid`（/docs/design/keys/room-key-backup.md §8）
   nonce_r = BLAKE3 keyed_hash(key, "wbf recovery-name-nonce v1" ‖ 0x00 ‖ 明文) 前 12 byte
   ct_r    = ChaCha20-Poly1305(key, nonce_r, 明文,      aad = "wbf-matrix-client recovery name v1")
 ```
@@ -178,7 +178,7 @@ s/ 底下每個目錄名
          → 解得開                                  → localpart，組回 @localpart:<server_name>
 ```
 
-`r/`（recovery key，room-key-backup.md §8）跟著一起掃：檔名的明文是 `recovery-key@mxid`，同一套規則。
+`r/`（recovery key，/docs/design/keys/room-key-backup.md §8）跟著一起掃：檔名的明文是 `recovery-key@mxid`，同一套規則。
 
 - 對照表**只在記憶體裡**，一個命令的生命週期。🚫 不落地成明文索引檔 —— 那等於把剛加密的東西再寫一次明文。
 - **解不開的不猜、不刪、不報錯**：可能是另一把 `local.key` 建的（換過 data dir），也可能是舊版留下的。
@@ -209,7 +209,7 @@ account destroy @BOB:matrix.org
 ⚠️ map 是**快照，不是快取**：🚫 不存成長命的全域狀態 —— 存起來的那一份不會知道
 中間有東西被刪掉。會刪檔的命令一律當場刷新。
 
-📎 例：recovery key 的檔名是用 server 的權威 mxid 封的（room-key-backup.md §8）。拿使用者打的那串去算，
+📎 例：recovery key 的檔名是用 server 的權威 mxid 封的（/docs/design/keys/room-key-backup.md §8）。拿使用者打的那串去算，
 大小寫差一個字就刪不到 —— 而 `destroy` 的語意是「什麼都不留」。
 
 ### 2.6 代價：`account status` 要解鎖
@@ -226,7 +226,7 @@ account destroy @BOB:matrix.org
 所以這裡 🚫 不寫遷移、🚫 不留 `layout` 之類的版本標記檔 —— 少一個檔、少一段只跑一次的程式。
 
 - 明文佈局的舊目錄在 §2.5 的掃描裡本來就解不開，會被跳過（fail closed），不會被誤認成別人的帳號。
-- `s/` 底下有東西但**一個都解不開**時（等著被刪的 `🗑️…` 不算，local-cache-db.md §5），印一行提示就好：
+- `s/` 底下有東西但**一個都解不開**時（等著被刪的 `🗑️…` 不算，/docs/design/storage/local-cache-db.md §5），印一行提示就好：
 
   ```
   warning: no directory in <data dir>/s could be decrypted with this local.key; if this data dir was made
@@ -255,7 +255,7 @@ CLI 的 `--passphrase-file` 與 `--password-file` 各有一支：`read_passphras
   ⚠️ 這代表 `echo hunter2 > pw` 產生的檔（結尾有 `\n`）跟 `printf hunter2 > pw` 是**兩個不同的 passphrase**。
   這是刻意的：檔案就是檔案，我們不替使用者猜哪個 byte 不算數。
 - 終端輸入：讀到的那一行的 UTF-8 bytes（不含結尾換行）。終端只打得出字，這是它的天然子集。
-- RPC：`passphrase_base64`，解開的 bytes 原樣用（rpc-spec.md §3.1）。
+- RPC：`passphrase_base64`，解開的 bytes 原樣用（/docs/design/rpc-specs/rpc-spec.md §3.1）。
 - 空的判斷是 **`bytes.is_empty()`**（「沒設 passphrase」是 `Plain` 模式，不是空 passphrase，§1）。
 
 ### 3.3 沒有相容包袱：`v: 1` 就是這個定義

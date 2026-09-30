@@ -1,12 +1,12 @@
-//! E2EE 引擎：把 `matrix-sdk-crypto` 的 `OlmMachine` **只當狀態機用**（e2ee-walkthrough.md §13）——
+//! E2EE 引擎：把 `matrix-sdk-crypto` 的 `OlmMachine` **只當狀態機用**（/docs/design/keys/e2ee-walkthrough.md §13）——
 //! server 給的推進去（to-device、自己的 OTK 存量），它要送的拉出來（`outgoing_requests`）走我們的橋送，回應再交回去。
 //! 網路、水位、銷毀都在這個 crate 自己手上；🚫 沒有 `/sync`、🚫 沒有 matrix-sdk 的 `Client`。
 //!
 //! 這是 wbf-sdk 裡**第二個**碰上游的地方（第一個是 `backend/matrix_sdk`）；兩者共用同一個 sqlite crypto store（`m/`），
-//! ⚠️ 同一時間只能有一個持有者（e2ee-walkthrough.md §13 第 9 條）——過渡期由呼叫端保證不同時開。
+//! ⚠️ 同一時間只能有一個持有者（/docs/design/keys/e2ee-walkthrough.md §13 第 9 條）——過渡期由呼叫端保證不同時開。
 //!
 //! 涵蓋到哪：金鑰上傳／查詢／claim、收 to-device、把房間金鑰分給一群人、先分金鑰再加密帶房間版本號送出（`Event/Send`）、
-//! 解密（WS 收到的密文 → 要寫進 cache 的樣子）。1506 之後重拿房間狀態是呼叫端的事（daemon 自動做，e2ee-rpc.md）。
+//! 解密（WS 收到的密文 → 要寫進 cache 的樣子）。1506 之後重拿房間狀態是呼叫端的事（daemon 自動做，/docs/design/keys/e2ee-rpc.md）。
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -99,7 +99,7 @@ pub struct OutgoingRoomEvent {
 }
 
 /// `encrypt_and_send` 的結果：送進去了，或被 1506 擋下來。
-/// 被擋不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 補金鑰、UI 決定重送，e2ee-walkthrough.md §16.6）。
+/// 被擋不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 補金鑰、UI 決定重送，/docs/design/keys/e2ee-walkthrough.md §16.6）。
 #[derive(Debug)]
 pub enum SendOutcome {
     Sent {
@@ -117,7 +117,7 @@ pub struct OlmEngine {
     machine: OlmMachine,
     /// crypto store 與 `td.json` 所在的 `m/`。
     store_dir: PathBuf,
-    /// 最近一次 `/keys/query` 回答這個人的 body（整份）：拿來重算裝置雜湊跟成員清單上的比（wbfuwunel 的 wbf-room-device-version.md §3.4）。
+    /// 最近一次 `/keys/query` 回答這個人的 body（整份）：拿來重算裝置雜湊跟成員清單上的比（wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4）。
     /// 只在記憶體：重開就重查。
     last_keys_query: Mutex<BTreeMap<String, serde_json::Value>>,
 }
@@ -166,7 +166,7 @@ impl OlmEngine {
         })
     }
 
-    /// UI 叫 `room.refresh_devices`（點進房間、收到 `devices.changed` 之後由 UI 決定）與被 1506 擋之後都叫這一支（e2ee-rpc.md §2、§3）：
+    /// UI 叫 `room.refresh_devices`（點進房間、收到 `devices.changed` 之後由 UI 決定）與被 1506 擋之後都叫這一支（/docs/design/keys/e2ee-rpc.md §2、§3）：
     /// 拿這一刻的成員清單與版本號 → 跟上一份比出誰變了 → 只重查那些人 → 雜湊對一次（不對再查一次，還不對就拒絕）→
     /// 把房間金鑰補給每台還沒有的裝置（有人離開由上游決定輪換）。
     ///
@@ -228,7 +228,7 @@ impl OlmEngine {
     /// 該換了（到期、有人離開或有裝置被移除）、多了還沒拿到的裝置——三種都在 `share_room_key` 裡由上游判斷；都齊了它什麼都不送。
     /// 上游的加密在「沒有 outbound session」與「session 過期」時是 **panic** 不是回錯，先分就是把那兩條排除掉；
     /// 分完到加密之間剛好跨過期限的那一瞬間，用 `catch_unwind` 接住轉成錯（全域 P 條：失敗要有去處）。
-    /// 號碼與成員由呼叫端帶（UI 存著，e2ee-rpc.md）：成員拿來決定分給誰；號碼是 server 用來擋「送出方不知道最新裝置組合」的。
+    /// 號碼與成員由呼叫端帶（UI 存著，/docs/design/keys/e2ee-rpc.md）：成員拿來決定分給誰；號碼是 server 用來擋「送出方不知道最新裝置組合」的。
     /// 被 1506 擋是 `Ok(RoomDevicesChanged)` 不是 `Err`：這條路預期內的結果，訊息沒送。
     ///
     /// Args:
@@ -347,7 +347,7 @@ impl OlmEngine {
             .map_err(|error| SdkError::Protocol(format!("decrypted event is not JSON: {error}")))
     }
 
-    /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 wbfuwunel 的 wbf-room-device-version.md §3.4 重算的比。
+    /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 重算的比。
     ///
     /// Return:
     ///     Vec<String>  對不上的人（排序）。沒查過的人、server 說 `unhashable` 的人不算；我們自己算不出來的（到不了）**算對不上**——寬可多查一次，不拿舊金鑰送
@@ -380,7 +380,7 @@ impl OlmEngine {
         ToDeviceState::load(&self.store_dir)
     }
 
-    /// 一批 to-device 的完整處理（`Fetch` 的一窗、或推來的一包 `Push`：同一支，維護者 2026-09-24），**順序鎖死**（to-device-client.md §4、§7）：
+    /// 一批 to-device 的完整處理（`Fetch` 的一窗、或推來的一包 `Push`：同一支，維護者 2026-09-24），**順序鎖死**（/docs/design/keys/to-device-client.md §4、§7）：
     /// 匯進 crypto store（sqlite commit 了才回）→ 水位與待銷毀清單落地（`m/td.json`，原子寫）→ 才叫 server 銷毀
     /// （連上次沒銷成的一起）→ 只清 `ItemsDestroyed` 回來的。
     /// 🚨 呼叫者拿不到「先銷毀再匯入」的路，這就是這個函式存在的理由。中途任何一步失敗，已落地的照樣有效：
@@ -425,7 +425,7 @@ impl OlmEngine {
         })
     }
 
-    /// 從佇列最舊還沒銷毀的起一窗一窗拉到追平（to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap`、匯失敗也是它。
+    /// 從佇列最舊還沒銷毀的起一窗一窗拉到追平（/docs/design/keys/to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap`、匯失敗也是它。
     /// 每一窗都走 `import_items`。🚫 不帶 `cd_seq`：佇列頭就是水位，`ItemsDestroy` 是唯一的「處理完了」（wbfuwunel #87）。
     /// 空窗也走一次（把上次沒銷成的補送）。
     ///
@@ -767,9 +767,9 @@ impl OlmEngine {
     }
 }
 
-/// 房間金鑰發給誰（e2ee-walkthrough.md §13 第 8 條：要明確選，🚫 不默默用預設）。
+/// 房間金鑰發給誰（/docs/design/keys/e2ee-walkthrough.md §13 第 8 條：要明確選，🚫 不默默用預設）。
 ///
-/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。wbfuwunel 的 wbf-room-device-version.md §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
+/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。wbfuwunel 的 /docs/design/wbf-room-device-version.md §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
 /// 要每個帳號都 bootstrap 過交叉簽章才有意義——client 這邊還沒做（`SigningKeysUpload` 只有號碼），現在選它等於發給零台裝置。
 /// ✅ 交叉簽章做好之後要換成 `IdentityBasedStrategy`，這裡是唯一要改的地方。
 pub fn room_key_share_settings() -> EncryptionSettings {
@@ -784,7 +784,7 @@ fn more_is_only_meaningful_with_items(window: &DeviceWindow) -> bool {
     !window.items.is_empty() && window.more
 }
 
-/// 只把 Olm session 的密文交給狀態機解，信任要求先照上游的預設（🚨 送出那一半決定「誰收得到金鑰」時要明確選，e2ee-walkthrough.md §13 第 8 條）。
+/// 只把 Olm session 的密文交給狀態機解，信任要求先照上游的預設（🚨 送出那一半決定「誰收得到金鑰」時要明確選，/docs/design/keys/e2ee-walkthrough.md §13 第 8 條）。
 fn decryption_settings() -> DecryptionSettings {
     DecryptionSettings {
         sender_device_trust_requirement: TrustRequirement::Untrusted,
@@ -802,7 +802,7 @@ fn parse_user_ids(users: &[String]) -> Result<Vec<OwnedUserId>, SdkError> {
 }
 
 /// ruma 組請求時，要 token 的端點沒給 token 會直接拒絕；這裡給一個占位字串——只取 body，header 整個丟掉，
-/// 真正的 `Authorization` 由橋在 server 那端用這條連線的 session 填（wbfuwunel 的 wbf-api-bridge.md §2.2 規則 1，client 蓋不掉）。
+/// 真正的 `Authorization` 由橋在 server 那端用這條連線的 session 填（wbfuwunel 的 /docs/design/wbf-api-bridge.md §2.2 規則 1，client 蓋不掉）。
 const PLACEHOLDER_ACCESS_TOKEN: &str = "not-sent-over-the-bridge";
 
 /// ruma 請求組成 HTTP 請求（用一個假的 base URL）只為了拿它的 body bytes。

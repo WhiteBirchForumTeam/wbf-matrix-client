@@ -1,27 +1,27 @@
-//! 純 HTTP 的 Matrix 登入（wbf-cli-spec.md §1）：`POST /_matrix/client/v3/login`、`logout`、`whoami`。
+//! 純 HTTP 的 Matrix 登入（/docs/design/rpc-specs/wbf-cli-spec.md §1）：`POST /_matrix/client/v3/login`、`logout`、`whoami`。
 //! 不拖 matrix-sdk；第 3 步接 matrix-sdk 後這裡仍是「拿 token」的最短路。
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::SdkError;
 
-/// wbf-cli-spec.md §7 的 session 檔內容。🚫 `access_token` 不印、不 log、不進錯誤訊息。
+/// /docs/design/rpc-specs/wbf-cli-spec.md §7 的 session 檔內容。🚫 `access_token` 不印、不 log、不進錯誤訊息。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub server: String,
     pub user_id: String,
     pub device_id: String,
     pub access_token: String,
-    /// matrix-sdk 的 store 目錄（crypto 與 state 兩個 sqlite）；純 HTTP 登入的 session 沒有（wbf-cli-spec.md §7）。
+    /// matrix-sdk 的 store 目錄（crypto 與 state 兩個 sqlite）；純 HTTP 登入的 session 沒有（/docs/design/rpc-specs/wbf-cli-spec.md §7）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_dir: Option<String>,
-    /// 登入時探到的那一邊（account-session.md §2）：這個帳號之後的命令走哪一套。
+    /// 登入時探到的那一邊（/docs/design/daemon/account-session.md §2）：這個帳號之後的命令走哪一套。
     /// None ＝ 舊版封的、或用 token 接的：消費端用 `store_dir` 與探活自己判（不改舊行為）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<SessionBackend>,
 }
 
-/// 登入時定下的那一邊（account-session.md §2）。
+/// 登入時定下的那一邊（/docs/design/daemon/account-session.md §2）。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionBackend {

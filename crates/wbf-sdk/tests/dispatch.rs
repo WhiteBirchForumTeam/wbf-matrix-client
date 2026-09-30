@@ -1,4 +1,4 @@
-//! 收包分派（ws-receive-dispatch.md §8）：傳輸用記憶體對接，測試扮 server 從另一頭送 bytes，順序故意亂。
+//! 收包分派（/docs/design/daemon/ws-receive-dispatch.md §8）：傳輸用記憶體對接，測試扮 server 從另一頭送 bytes，順序故意亂。
 //! 表本身的規則在 `sessions.rs` 的單元測試；這裡驗的是 link 把 task、表、handle 接起來之後的行為。
 
 use std::sync::{Arc, Mutex};
@@ -498,7 +498,7 @@ async fn a_quiet_server_is_a_timeout_but_a_dead_connection_is_a_network_error() 
     ));
 }
 
-// ---- 心跳（ws-receive-dispatch.md §5.1；維護者 2026-09-21：照 WireGuard，安靜才跳、每條線自己一個）----
+// ---- 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1；維護者 2026-09-21：照 WireGuard，安靜才跳、每條線自己一個）----
 
 use wbf_sdk::link::Heartbeat;
 

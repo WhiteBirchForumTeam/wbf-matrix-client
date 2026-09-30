@@ -1,4 +1,4 @@
-//! 裝置版本號與房間版本號（wbfuwunel `wbf-room-device-version.md`）：client 這邊怎麼讀、怎麼比、怎麼自己重算。
+//! 裝置版本號與房間版本號（wbfuwunel 的 `/docs/design/wbf-room-device-version.md`）：client 這邊怎麼讀、怎麼比、怎麼自己重算。
 //!
 //! server 給的兩個號碼：
 //! - **裝置版本號** `序號-雜湊`（每個帳號一個）：序號是他的裝置集合變動了幾次，雜湊是「任何人查得到的金鑰」的指紋。
@@ -22,9 +22,9 @@ use crate::SdkError;
 pub const ROOM_VERSION_KEY: &str = "org.wbftw.room_version";
 /// 每個已加入成員 `unsigned` 裡的裝置版本號。
 pub const DEVICE_VERSION_KEY: &str = "org.wbftw.device_version";
-/// server 算不出雜湊時寫的佔位字（wbfuwunel 的 wbf-room-device-version.md §3.2）：序號照樣前進，雜湊永遠對不上任何重算結果。
+/// server 算不出雜湊時寫的佔位字（wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.2）：序號照樣前進，雜湊永遠對不上任何重算結果。
 pub const UNHASHABLE: &str = "unhashable";
-/// 雜湊是 SHA-256 十六進位小寫的前幾個字元（wbfuwunel 的 wbf-room-device-version.md §3.4）。
+/// 雜湊是 SHA-256 十六進位小寫的前幾個字元（wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4）。
 pub const HASH_HEX_LEN: usize = 10;
 
 /// 一個帳號的裝置版本號 `序號-雜湊`。
@@ -74,7 +74,7 @@ impl DeviceVersion {
     }
 }
 
-/// 一次成員清單讀到的房間版本號與每個已加入成員的裝置版本號——兩者是同一次讀到的房間狀態算的（wbfuwunel 的 wbf-room-device-version.md §5.1）。
+/// 一次成員清單讀到的房間版本號與每個已加入成員的裝置版本號——兩者是同一次讀到的房間狀態算的（wbfuwunel 的 /docs/design/wbf-room-device-version.md §5.1）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomDeviceVersions {
     pub room_version: u64,
@@ -82,7 +82,7 @@ pub struct RoomDeviceVersions {
     pub members: BTreeMap<String, DeviceVersion>,
 }
 
-/// 兩份 [`RoomDeviceVersions`] 的差：收到 1506 之後只對這些人動作（wbfuwunel 的 wbf-room-device-version.md §7.2）。
+/// 兩份 [`RoomDeviceVersions`] 的差：收到 1506 之後只對這些人動作（wbfuwunel 的 /docs/design/wbf-room-device-version.md §7.2）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MembersDiff {
     /// 要重新 `/keys/query` 的人：新加入的、或裝置版本號跟上次不同的。
@@ -169,7 +169,7 @@ impl RoomDeviceVersions {
     }
 }
 
-/// 照 wbfuwunel 的 wbf-room-device-version.md §3.4 從 `/keys/query` 的回應重算某人的裝置雜湊，跟 server 給的比：對得上表示看到的是同一組金鑰。
+/// 照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 從 `/keys/query` 的回應重算某人的裝置雜湊，跟 server 給的比：對得上表示看到的是同一組金鑰。
 ///
 /// 放進去的：主金鑰、自簽金鑰、每台上傳過金鑰的裝置（依裝置 ID 排序）；每一項去掉 `unsigned`、只留擁有者自己的簽章
 /// （過濾完空了就整個 `signatures` 拿掉）；沒有主金鑰或自簽金鑰時那一項是空的（長度 0），不是跳過。
@@ -311,7 +311,7 @@ mod tests {
         )
     }
 
-    /// wbfuwunel 的 wbf-room-device-version.md §3.4 的黃金向量（server 端 `keys_hash.rs::the_documented_vector` 釘住同一個值）。
+    /// wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 的黃金向量（server 端 `keys_hash.rs::the_documented_vector` 釘住同一個值）。
     #[test]
     fn the_documented_vector() {
         assert_eq!(

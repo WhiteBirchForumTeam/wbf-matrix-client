@@ -1,4 +1,4 @@
-//! `wbf.conf`：不用每次指定環境變數（wbf-cli-spec.md §10）。
+//! `wbf.conf`：不用每次指定環境變數（/docs/design/rpc-specs/wbf-cli-spec.md §10）。
 //!
 //! ```ini
 //! ; 分號或井號開頭是註解
@@ -13,10 +13,10 @@
 //! 也不必另外背一套名字。區段只是給人看的分組，🚫 **不參與查找** —— 同一個鍵放在哪一段
 //! 都讀得到。這是刻意的：讓區段參與查找等於同一個鍵有兩個身分，而使用者搬一行就會壞。
 //!
-//! 優先序（wbf-cli-spec.md §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次，
+//! 優先序（/docs/design/rpc-specs/wbf-cli-spec.md §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次，
 //! 🚫 不是整份取代。環境變數優先於 conf 是維護者 2026-09-09 定的。
 //!
-//! 🚫 這裡不放秘密（wbf-cli-spec.md §10.5）：`ACCESS_TOKEN`、passphrase、password 一律不從 conf 來。
+//! 🚫 這裡不放秘密（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：`ACCESS_TOKEN`、passphrase、password 一律不從 conf 來。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,16 +34,16 @@ pub struct Conf {
     warnings: Vec<String>,
 }
 
-/// 🚫 conf 不支援的鍵（wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
+/// 🚫 conf 不支援的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
 /// ⚠️ 寫成「正面列出不准的」而不是「正面列出准的」——新鍵加進 CLI 時不必記得回來改這裡，
-/// 而漏掉的那個會被**允許**，所以這張表只放秘密，其餘認不得的鍵本來就只是警告加忽略（wbf-cli-spec.md §10.4）。
+/// 而漏掉的那個會被**允許**，所以這張表只放秘密，其餘認不得的鍵本來就只是警告加忽略（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
 const REFUSED_KEYS: &[&str] = &["ACCESS_TOKEN", "TOKEN", "PASSWORD", "PASSPHRASE"];
 
 /// 區段只是給人看的分組（🚫 不參與查找），但認不得的還是要說一聲——多半是打錯字，
-/// 而那一段底下的鍵會安靜地不生效（wbf-cli-spec.md §10.4）。
+/// 而那一段底下的鍵會安靜地不生效（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
 const KNOWN_SECTIONS: &[&str] = &["GENERAL", "BACKUP", "MEDIA", "RECENT"];
 
-/// 找 conf 檔並讀進來（wbf-cli-spec.md §10.1）。
+/// 找 conf 檔並讀進來（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
 ///
 /// Args:
 ///     explicit: `--config <path>`, example: Some(Path::new("/tmp/wbf.conf"))
@@ -53,7 +53,7 @@ const KNOWN_SECTIONS: &[&str] = &["GENERAL", "BACKUP", "MEDIA", "RECENT"];
 ///     Err(Usage)   `--config` 明指的檔不在、或檔案語法壞了
 pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, CoreError> {
     if let Some(path) = explicit {
-        // 🚫 明指了就不 fallback：讀到別的檔比讀不到更糟（wbf-cli-spec.md §10.1）。
+        // 🚫 明指了就不 fallback：讀到別的檔比讀不到更糟（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
         if !path.exists() {
             return Err(CoreError::new(
                 CoreErrorKind::Usage,
@@ -69,7 +69,7 @@ pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, CoreError>
     Ok(Conf::default())
 }
 
-/// ⚠️ 讀壞掉的設定檔一律**報錯 exit**，🚫 不當作沒有這個檔：讀一半比讀不到危險（wbf-cli-spec.md §10.4）。
+/// ⚠️ 讀壞掉的設定檔一律**報錯 exit**，🚫 不當作沒有這個檔：讀一半比讀不到危險（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
 fn parse_file(path: &Path) -> Result<Conf, CoreError> {
     let text = std::fs::read_to_string(path).map_err(|error| {
         CoreError::new(
@@ -145,7 +145,7 @@ pub fn parse(text: &str, source: &str) -> Result<Conf, CoreError> {
 }
 
 /// `;` 或 `#` 起註解，⚠️ 只有**行首**或**前面是空白**時才算 —— `PASSWORD_FILE=/tmp/a#b`
-/// 裡的 `#` 是值的一部分（wbf-cli-spec.md §10.1）。
+/// 裡的 `#` 是值的一部分（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
 ///
 /// ⚠️ 雙引號裡面的一律不算註解：`KEY="  # 這是值  "` 的引號就是為了保住它。
 /// 🚫 所以不能先剪註解再拆引號 —— 那樣剪到的是值本身（2026-09-10 寫測試時踩到）。
@@ -190,7 +190,7 @@ impl Conf {
         self.values.get(key).map(String::as_str)
     }
 
-    /// 開關型的鍵（wbf-cli-spec.md §10.4）：**只正面認得 `on` 與 `off`**（不分大小寫）。
+    /// 開關型的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）：**只正面認得 `on` 與 `off`**（不分大小寫）。
     ///
     /// ⚠️ 判斷寫成「**正面認得 `off` 才關**」，🚫 不寫成「不等於 `on` 就關」——
     /// 壞掉的時候要壞在「備份還開著」那一邊，不是「以為開著、其實沒開」。
@@ -218,7 +218,7 @@ impl Conf {
         safe
     }
 
-    /// 數值型的鍵（wbf-cli-spec.md §10.4）：parse 不出來就警告並用內建預設，🚫 不用半套的值。
+    /// 數值型的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）：parse 不出來就警告並用內建預設，🚫 不用半套的值。
     pub fn get_number<T: std::str::FromStr>(
         &self,
         key: &str,
@@ -244,7 +244,7 @@ impl Conf {
         &self.warnings
     }
 
-    /// 認不得的鍵：CLI 知道自己吃哪些，所以這一步要它把清單傳進來（wbf-cli-spec.md §10.4）。
+    /// 認不得的鍵：CLI 知道自己吃哪些，所以這一步要它把清單傳進來（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
     /// 印警告、忽略、命令照跑 —— conf 要往前相容，舊版 CLI 讀到新版寫的鍵不該整個掛掉。
     pub fn warn_about_unknown_keys(&self, known: &[&str]) -> Vec<String> {
         self.values
@@ -284,7 +284,7 @@ pub fn origin_of(from_flag_or_env: bool, from_conf: bool) -> &'static str {
     }
 }
 
-/// 自動生成（wbf-cli-spec.md §10.3）：把**這次實際生效的值**寫進 `<data dir>/wbf.conf`。
+/// 自動生成（/docs/design/rpc-specs/wbf-cli-spec.md §10.3）：把**這次實際生效的值**寫進 `<data dir>/wbf.conf`。
 ///
 /// 三個條件都成立才寫：`--data-dir`／`WBF_DATA_DIR` 有給、那個目錄下還沒有 `wbf.conf`、
 /// 這次命令成功結束（呼叫點在成功之後）。
@@ -308,7 +308,7 @@ pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, CoreE
     // 只吃掉換行**不吃**後面的空白——結果是我們自己寫給人看的檔長出一排怪縮排
     // （2026-09-12 真 server 驗證時看到的）。
     let mut text = String::from(concat!(
-        "; wbf.conf —— wbf-cli 自動生成的一份起手式（wbf-cli-spec.md §10.3）
+        "; wbf.conf —— wbf-cli 自動生成的一份起手式（/docs/design/rpc-specs/wbf-cli-spec.md §10.3）
 ",
         "; 每個值後面註明它這次是哪來的。改這個檔不影響已經登入的帳號。
 ",
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_broken_line_is_an_error_not_a_shrug() {
-        // 設定檔讀一半比讀不到危險（wbf-cli-spec.md §10.4）。
+        // 設定檔讀一半比讀不到危險（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
         assert!(parse("[general\nSERVER=x\n", "t").is_err());
         assert!(parse("this is not a pair\n", "t").is_err());
         assert!(parse("=novalue\n", "t").is_err());

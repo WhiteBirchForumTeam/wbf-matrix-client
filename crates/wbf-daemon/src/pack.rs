@@ -1,10 +1,10 @@
-//! RPC 自己的極簡 pack（rpc-spec.md §1）：`ver(1) ‖ type(1) ‖ data`。
+//! RPC 自己的極簡 pack（/docs/design/rpc-specs/rpc-spec.md §1）：`ver(1) ‖ type(1) ‖ data`。
 //!
 //! 📎 跟 homeserver 那套 `wbf-pack`（`wbf-wire`）**無關**，只借「極簡二進位前綴」的做法，
 //! 🚫 不共用 codec。
 //!
 //! 這個檔只做 bytes ↔ (type, JSON bytes)：明文直接放、密文用 token 導出的兩把金鑰
-//! （local-interface.md §4）。**哪些該加密**不在這裡判斷——那是 `connection.rs` 的事，
+//! （/docs/design/rpc-specs/local-interface.md §4）。**哪些該加密**不在這裡判斷——那是 `connection.rs` 的事，
 //! 而且只能在那一個地方判斷。
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -15,7 +15,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const PACK_VERSION: u8 = 0x01;
 /// 一個 frame 的上限（含前綴）。跟「超過就走資料平面」是同一個數。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
-/// `daemon.token` 的長度（local-interface.md §3）。不是恰好這麼長就拒，不接受「夠長就好」。
+/// `daemon.token` 的長度（/docs/design/rpc-specs/local-interface.md §3）。不是恰好這麼長就拒，不接受「夠長就好」。
 pub const TOKEN_LEN: usize = 256;
 
 const NONCE_LEN: usize = 24;
@@ -48,7 +48,7 @@ impl PackType {
     }
 }
 
-/// 解包失敗的種類。對到 rpc-spec.md §1.4 的 close：前三種是 `BAD_FRAME`，最後一種是 `BAD_TOKEN`。
+/// 解包失敗的種類。對到 /docs/design/rpc-specs/rpc-spec.md §1.4 的 close：前三種是 `BAD_FRAME`，最後一種是 `BAD_TOKEN`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackError {
     TooShort,

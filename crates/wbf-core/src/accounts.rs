@@ -1,11 +1,11 @@
-//! 每個帳號的資料放哪（wbf-cli-spec.md §7；local-cache-db.md §4.6、vault-and-keys.md §2）：
+//! 每個帳號的資料放哪（/docs/design/rpc-specs/wbf-cli-spec.md §7；/docs/design/storage/local-cache-db.md §4.6、/docs/design/storage/vault-and-keys.md §2）：
 //!
 //! ```text
 //! <data dir>/
 //!   local.key                          一台機器一把主金鑰（vault）
 //!   current                             目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"
 //!   r/<b58>_<b58>                       recovery key（recovery.rs）；🚫 logout 不碰
-//!   s/<b58>_<b58>/                      正規化過的 server host，加密（vault-and-keys.md §2.2）
+//!   s/<b58>_<b58>/                      正規化過的 server host，加密（/docs/design/storage/vault-and-keys.md §2.2）
 //!     cache.db                          這個 server 上所有帳號共用的快取
 //!     a/<b58>_<b58>/                    localpart，加密
 //!       session.sealed                  這個帳號的 session（第三把子金鑰封住）
@@ -66,7 +66,7 @@ impl AccountDir {
     ///     user: mxid 或 localpart, example: "@alice:localhost"
     /// Return:
     ///     Ok(AccountDir)
-    ///     Err(Usage)   localpart 是空的、或加密後的名字太長（vault-and-keys.md §2.4）
+    ///     Err(Usage)   localpart 是空的、或加密後的名字太長（/docs/design/storage/vault-and-keys.md §2.4）
     pub fn locate(
         data_dir: &Path,
         key: &Key32,
@@ -133,7 +133,7 @@ impl AccountDir {
     /// 登出的閘門才剛開過一次 backend 去問 recovery 狀態，那個 handle 關掉與 OS 真的放手之間有延遲。
     /// 所以這裡**重試幾次**（2026-09-13 對真 server 跑 daemon e2e 時遇到，第二次跑就過了 —— 典型的 race）。
     /// 🚫 重試完還是不行就回錯，不吞掉：那時多半是**別的程序**開著同一個 store（例如一個常駐的
-    /// daemon 加一個單發命令，architecture-v2.md §0.2），而那件事必須讓呼叫端知道。
+    /// daemon 加一個單發命令，/docs/design/overview/architecture-v2.md §0.2），而那件事必須讓呼叫端知道。
     pub fn delete_matrix_store(&self) -> Result<(), SdkError> {
         const TRIES: u32 = 10;
         const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -185,7 +185,7 @@ struct ServerEntry {
     accounts: Vec<Mapping>,
 }
 
-/// 掃 `s/*/a/*` 兩層與 `r/`，解密每一段名字，做成 map（vault-and-keys.md §2.5）。
+/// 掃 `s/*/a/*` 兩層與 `r/`，解密每一段名字，做成 map（/docs/design/storage/vault-and-keys.md §2.5）。
 ///
 /// 解不開的一律跳過（fail closed）：可能是別把 `local.key` 建的，也可能是舊版留下的明文佈局。
 /// 🚫 不猜、🚫 不刪、🚫 不報錯——當它不存在。
@@ -209,7 +209,7 @@ pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap
                 continue;
             }
             let server_dir_name = server_entry.file_name().to_string_lossy().into_owned();
-            // destroy 改名後還沒刪完的舊目錄：垃圾，🚫 不當成 server（local-cache-db.md §5）。
+            // destroy 改名後還沒刪完的舊目錄：垃圾，🚫 不當成 server（/docs/design/storage/local-cache-db.md §5）。
             if crate::account_lock::is_to_be_deleted_dir_name(&server_dir_name) {
                 continue;
             }
@@ -219,7 +219,7 @@ pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap
                 continue;
             };
             map.add_server(server_host.clone(), server_dir_name);
-            // localpart 的密文綁著它上面那層的 host 明文（vault-and-keys.md §2.2），所以 scope 要帶進去。
+            // localpart 的密文綁著它上面那層的 host 明文（/docs/design/storage/vault-and-keys.md §2.2），所以 scope 要帶進去。
             let scope = DirScope::Account {
                 server_host: &server_host,
             };
@@ -408,7 +408,7 @@ impl DataDirMap {
     }
 
     /// `s/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
-    /// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（vault-and-keys.md §2.7）。
+    /// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（/docs/design/storage/vault-and-keys.md §2.7）。
     ///
     /// Return:
     ///     Some(String)   該印的那一行
@@ -580,12 +580,12 @@ pub fn find_account_of_current(data_dir: &Path, key: &Key32, current: &str) -> O
 
 /// `http://localhost:6167` → `localhost:6167`；`https://matrix.example.org` → `matrix.example.org`（預設 port 不帶）。
 ///
-/// ⚠️ 這是**加密的輸入**（vault-and-keys.md §2.3），不是檔名了：所以要正規化到底（小寫），
+/// ⚠️ 這是**加密的輸入**（/docs/design/storage/vault-and-keys.md §2.3），不是檔名了：所以要正規化到底（小寫），
 /// 🚫 不再過濾 `[A-Za-z0-9._-]` —— 那是為了當檔名才做的，留著只會讓不同的 host 撞成同一個目錄。
 pub fn server_host_of(server: &str) -> String {
     // scheme 先小寫再比：`HTTPS://x:443` 與 `https://x:443` 必須算同一台，
     // 不然 443 只在其中一邊被當成預設 port 拿掉，同一個 server 長出兩個目錄
-    // （PR #19 審查 rumia🟢／salvia🟡4；正是 vault-and-keys.md §2.3 要根除的形狀）。
+    // （PR #19 審查 rumia🟢／salvia🟡4；正是 /docs/design/storage/vault-and-keys.md §2.3 要根除的形狀）。
     let lowered = server.to_lowercase();
     let without_scheme = lowered
         .trim_end_matches('/')
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn server_host_is_lowercased_so_one_server_gets_one_directory() {
-        // 加密是逐 byte 的：漏了這一步，同一台 server 打成大寫就會長出第二個目錄（vault-and-keys.md §2.3）。
+        // 加密是逐 byte 的：漏了這一步，同一台 server 打成大寫就會長出第二個目錄（/docs/design/storage/vault-and-keys.md §2.3）。
         assert_eq!(
             server_host_of("https://MATRIX.example.ORG"),
             server_host_of("https://matrix.example.org")

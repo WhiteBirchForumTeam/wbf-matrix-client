@@ -1,4 +1,4 @@
-//! 下載與 seek（wbfuwunel 的 chunked-upload-spec.md §4、wbf-client-convention-for-chunk.md §3.1、§7、wbf-cli-spec.md §3.3.1）。wbf-client-convention-for-chunk.md §3.1 的五條全在這裡，任一不過就 `Integrity`。
+//! 下載與 seek（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4、/docs/design/media/wbf-client-convention-for-chunk.md §3.1、§7、/docs/design/rpc-specs/wbf-cli-spec.md §3.3.1）。/docs/design/media/wbf-client-convention-for-chunk.md §3.1 的五條全在這裡，任一不過就 `Integrity`。
 
 use std::io::Write;
 
@@ -17,11 +17,11 @@ use crate::protocol::InfoAck;
 pub struct DownloadReport {
     pub chunks: u32,
     pub bytes: u64,
-    /// 區塊有 `sha256` 才會是 true；沒有就沒驗（wbf-client-convention-for-chunk.md §3.1 第 5 條「有就要驗」）。
+    /// 區塊有 `sha256` 才會是 true；沒有就沒驗（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 5 條「有就要驗」）。
     pub sha256_verified: bool,
 }
 
-/// `seek` 的結果（wbf-cli-spec.md §3.3.1 的 stderr 摘要）。
+/// `seek` 的結果（/docs/design/rpc-specs/wbf-cli-spec.md §3.3.1 的 stderr 摘要）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeekResult {
     pub bytes: Vec<u8>,
@@ -38,7 +38,7 @@ pub struct VerifiedTarget {
 }
 
 impl<C: PackChannel> WbfClient<C> {
-    /// wbf-client-convention-for-chunk.md §3.1 第 1、2 條，加描述交叉核對（wbf-client-convention-for-chunk.md §4）。
+    /// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 1、2 條，加描述交叉核對（/docs/design/media/wbf-client-convention-for-chunk.md §4）。
     ///
     /// Return:
     ///     Ok(VerifiedTarget)
@@ -62,7 +62,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// 整檔：逐塊 `Read` → 驗長度 → 解密 → 寫出；有 `sha256` 就整檔核對（wbf-client-convention-for-chunk.md §3.1 第 3、4、5 條）。
+    /// 整檔：逐塊 `Read` → 驗長度 → 解密 → 寫出；有 `sha256` 就整檔核對（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 3、4、5 條）。
     /// 任一塊不過就回 `Integrity`，`out` 已寫的是半成品，呼叫者刪（CLI exit 3 的語意）。
     pub async fn download<W: Write>(
         &mut self,
@@ -106,7 +106,7 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// wbf-cli-spec.md §3.3.1：`at` 是明文位置；不帶 `len` 印到含 `at` 那塊的塊尾；跨塊裁頭裁尾；超過檔尾 `truncated`。
+    /// /docs/design/rpc-specs/wbf-cli-spec.md §3.3.1：`at` 是明文位置；不帶 `len` 印到含 `at` 那塊的塊尾；跨塊裁頭裁尾；超過檔尾 `truncated`。
     ///
     /// Args:
     ///     at: example: 71680
@@ -181,7 +181,7 @@ impl<C: PackChannel> WbfClient<C> {
     }
 }
 
-/// wbf-client-convention-for-chunk.md §3.1 第 2 條：`chunk_size`、`chunk_count` 要與 `Info` 一致；`Info` 有 `file_size` 也要一致。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條：`chunk_size`、`chunk_count` 要與 `Info` 一致；`Info` 有 `file_size` 也要一致。
 fn check_info_against_block(
     info: &InfoAck,
     block: &ChunkedBlock,
@@ -219,7 +219,7 @@ fn check_info_against_block(
     Ok(())
 }
 
-/// wbf-client-convention-for-chunk.md §4：描述解開後要與區塊一致。我們自己的上傳一定 `Seal` 過，所以先試 `Seal` 的 nonce，
+/// /docs/design/media/wbf-client-convention-for-chunk.md §4：描述解開後要與區塊一致。我們自己的上傳一定 `Seal` 過，所以先試 `Seal` 的 nonce，
 /// 再試 `Create`（別的 client 可能沒 `Seal` 帶描述）。兩個都解不開 → 拒絕：描述必帶不空，解不開就是對不上。
 fn check_description(
     file_cipher: &FileCipher,
@@ -245,7 +245,7 @@ fn check_description(
     Ok(())
 }
 
-/// wbf-client-convention-for-chunk.md §4：`sha256` 是十六進位小寫 64 字；不是就拒絕，不猜。
+/// /docs/design/media/wbf-client-convention-for-chunk.md §4：`sha256` 是十六進位小寫 64 字；不是就拒絕，不猜。
 fn parse_sha256_field(block: &ChunkedBlock) -> Result<Option<String>, SdkError> {
     let Some(text) = &block.sha256 else {
         return Ok(None);

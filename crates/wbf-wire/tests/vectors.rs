@@ -1,6 +1,6 @@
-//! 對著 `docs/design/wire/wbf-vectors.json`（從 server repo 複製）跑。
+//! 對著 `/docs/design/wire/wbf-vectors.json`（從 server repo 複製）跑。
 //! 這裡紅 = 這個 crate 與 server 的線上格式漂移了，或複製的向量檔過期了。
-//! wbfuwunel 的 chunked-upload-spec.md §11 寫了 client 該驗什麼；每個段落一個測試。
+//! wbfuwunel 的 /docs/design/chunked-upload-spec.md §11 寫了 client 該驗什麼；每個段落一個測試。
 
 use serde::Deserialize;
 use wbf_wire::{crc32c, DecodeError, EncodeError, EncryptedFileInfo, Kind, Pack};
@@ -75,7 +75,7 @@ fn crc32c_vectors() {
             vector.input_hex
         );
     }
-    // wbfuwunel 的 chunked-upload-spec.md §9 的自檢向量，寫死一份以免向量檔本身被改壞。
+    // wbfuwunel 的 /docs/design/chunked-upload-spec.md §9 的自檢向量，寫死一份以免向量檔本身被改壞。
     assert_eq!(crc32c(b"123456789"), 0xE306_9283);
 }
 
@@ -182,11 +182,11 @@ fn encode_rejects_reserved_flags() {
     assert_eq!(bit5.encode(), Err(EncodeError::ReservedFlags(0x20)));
 }
 
-/// 向量檔的每個 id 都要說得出自己是什麼型別（wbfuwunel 的 wbf-wire-format.md §2.2）。
+/// 向量檔的每個 id 都要說得出自己是什麼型別（wbfuwunel 的 /docs/design/wbf-wire-format.md §2.2）。
 ///
 /// ⚠️ 這條補的是 `packs_decode_and_re_encode_identically` 看不見的洞：codec 只搬 8 個 byte，
 /// 裸的 `10`（型別 0x00、值 10）跟組好的 `0x01…0a` 對它一樣好，所以 server 那邊漏組型別時
-/// 這裡整片綠，只有對真 server 跑才會收到 `InvalidRequest`（handover.md §5）。
+/// 這裡整片綠，只有對真 server 跑才會收到 `InvalidRequest`（/docs/handover.md §5）。
 #[test]
 fn every_vector_id_carries_a_type_byte_we_know() {
     use wbf_wire::pack::id;

@@ -1,4 +1,4 @@
-//! bytes 怎麼進出：一個 binary frame 一個 pack 的 bytes（ws-receive-dispatch.md §1）。
+//! bytes 怎麼進出：一個 binary frame 一個 pack 的 bytes（/docs/design/daemon/ws-receive-dispatch.md §1）。
 //!
 //! 這層🚫 不知道什麼是 pack：收到的是 `Vec<u8>`，送出的也是。兩組實作：tungstenite 的 WebSocket（正式），
 //! 與記憶體對接（`memory_pair`，給測試餵亂序的 pack）。讀與寫是兩個 trait，因為它們住在兩個 task 裡（`link.rs`）。

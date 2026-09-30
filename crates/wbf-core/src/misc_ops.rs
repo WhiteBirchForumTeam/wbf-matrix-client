@@ -15,7 +15,7 @@ use crate::link_pool::LinkRole;
 use crate::upload_ops::UploadRequest;
 use crate::{Core, Target};
 
-/// `info`：這份媒體長什麼樣。**本地與上游都答得出大部分**（daemon-runtime.md §3.1 的 `sync`）。
+/// `info`：這份媒體長什麼樣。**本地與上游都答得出大部分**（/docs/design/daemon/daemon-runtime.md §3.1 的 `sync`）。
 ///
 /// ⭐ 媒體是**不可變**的：`file_size`／`chunk_size`／`mimetype` 上傳完就不會變，所以本地那張
 /// `media` 表存的就是同一份事實 —— 🚫 沒有理由為了這些欄位跑一趟 server（維護者 2026-09-13）。
@@ -30,7 +30,7 @@ pub struct MediaInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_size: Option<u64>,
     /// ⚠️ 這三個是 `Option` **有語意**，不是圖方便：整檔媒體（舊上傳）沒有分塊，
-    /// wbfuwunel 的 chunked-upload-spec.md §4.1 定它們是 `null`。🚫 不要填 0 或 `false` 頂替——
+    /// wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.1 定它們是 `null`。🚫 不要填 0 或 `false` 頂替——
     /// 「沒有分塊」跟「切成 0 塊」是兩件事。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<u32>,
@@ -98,7 +98,7 @@ impl SeekResult {
 impl Core {
     /// 這個 mxc 的媒體有多大、切成幾塊、本地下載到哪了。
     ///
-    /// `sync` 決定去哪問（daemon-runtime.md §3.1）：
+    /// `sync` 決定去哪問（/docs/design/daemon/daemon-runtime.md §3.1）：
     ///
     /// | `sync` | 回什麼 |
     /// |---|---|
@@ -106,7 +106,7 @@ impl Core {
     /// | `Server` | 問 server，🚫 不寫庫、🚫 不附 `cached` |
     /// | `Both` | 問 server ＋ 把它寫進 `media` 表 ＋ 附上 `cached` |
     ///
-    /// 給了 `manifest` 就多做一次**交叉核對**（wbf-client-convention-for-chunk.md §3.1 第 2 條）並把描述解出來 ——
+    /// 給了 `manifest` 就多做一次**交叉核對**（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條）並把描述解出來 ——
     /// ⚠️ 那需要 server 的描述，所以 `Local` 時🚫 不做（給了 manifest 也一樣）。
     pub async fn media_info(
         &self,
@@ -244,7 +244,7 @@ impl Core {
         }))
     }
 
-    /// 只讀含 `at` 的那一段（wbf-client-convention-for-chunk.md §7）。⚠️ 回的是**明文 bytes**。
+    /// 只讀含 `at` 的那一段（/docs/design/media/wbf-client-convention-for-chunk.md §7）。⚠️ 回的是**明文 bytes**。
     pub async fn seek_read(
         &self,
         manifest: &Manifest,
@@ -273,10 +273,10 @@ impl Core {
     /// 串流上傳：邊讀邊傳，**事先不知道總長**。
     ///
     /// ⚠️ **這個方法是過渡的**。它收一個
-    /// `&mut dyn Read`，而那是 trait object——architecture-v2.md §6 明文說公開介面上
+    /// `&mut dyn Read`，而那是 trait object——/docs/design/overview/architecture-v2.md §6 明文說公開介面上
     /// 🚫 不要有 trait object（過不了 FFI、序列化不了）。
     ///
-    /// 為什麼還是放這裡：local-interface.md §8 定了 daemon 模型下**上傳走資料平面的 HTTP PUT**
+    /// 為什麼還是放這裡：/docs/design/rpc-specs/local-interface.md §8 定了 daemon 模型下**上傳走資料平面的 HTTP PUT**
     /// （Android 的 SAF 只給 `content://`，根本沒有路徑可傳）。所以這條路徑在 daemon
     /// 落地時會**整個被 PUT 取代**，不是要長期維護的介面。
     /// 🚫 daemon 不要把它開成 RPC method；rpc-cli 用它讀 stdin，到此為止。
@@ -360,7 +360,7 @@ mod tests {
     }
 
     /// `sync=local` 回的那份：**只有 server 知道的欄位不在**，🚫 不填假的
-    /// （daemon-runtime.md §3.2）。
+    /// （/docs/design/daemon/daemon-runtime.md §3.2）。
     #[test]
     fn a_local_answer_leaves_out_what_only_the_server_knows() {
         let local = MediaInfo {

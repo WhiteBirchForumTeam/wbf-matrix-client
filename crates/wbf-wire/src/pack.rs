@@ -1,4 +1,4 @@
-//! pack：固定 32 byte 外框 + meta + data，兩段各一個 CRC-32C（wbfuwunel 的 chunked-upload-spec.md §2）。
+//! pack：固定 32 byte 外框 + meta + data，兩段各一個 CRC-32C（wbfuwunel 的 /docs/design/chunked-upload-spec.md §2）。
 //!
 //! 版面（所有整數 big-endian）：
 //! ```text
@@ -26,21 +26,21 @@ pub const MIN_PACK_LEN: usize = 32;
 #[repr(u8)]
 pub enum Kind {
     Control = 0x01,
-    /// 串流訊息的草稿（wbfuwunel 的 wbf-wire-format.md §3）：`Draft`、`Keypoint`、`Append`……client 這邊還沒用，先認得它才能解 server 的向量。
+    /// 串流訊息的草稿（wbfuwunel 的 /docs/design/wbf-wire-format.md §3）：`Draft`、`Keypoint`、`Append`……client 這邊還沒用，先認得它才能解 server 的向量。
     Stream = 0x02,
     Upload = 0x03,
     Download = 0x04,
-    /// 連線背後的 session（wbfuwunel 的 wbf-wire-format.md §6.3）：`Login`、`Refresh`、`Logout`。client 這邊還沒用，先認得它才能解 server 的向量。
+    /// 連線背後的 session（wbfuwunel 的 /docs/design/wbf-wire-format.md §6.3）：`Login`、`Refresh`、`Logout`。client 這邊還沒用，先認得它才能解 server 的向量。
     Session = 0x10,
     /// 帳號（bridge-specs `0x11-account.md`）：沒有原生的 pack，全是走橋的 Matrix 端點（profile、account data）。
     Account = 0x11,
-    /// 房間（wbfuwunel 的 wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 Matrix 端點（`Members` 等，bridge-specs `0x13-room.md`）。
+    /// 房間（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 Matrix 端點（`Members` 等，bridge-specs `0x13-room.md`）。
     Room = 0x13,
-    /// 房間事件的領域（wbfuwunel 的 wbf-wire-format.md §3.3）：`Recent`、`Send`、`Batch`。
+    /// 房間事件的領域（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：`Recent`、`Send`、`Batch`。
     Event = 0x14,
-    /// to-device（wbfuwunel 的 wbf-wire-format.md §3.2；to-device-client.md）：`Fetch`、`Batch`、`ItemsDestroy`、`Subscribe`……client 這邊還沒接。
+    /// to-device（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.2；/docs/design/keys/to-device-client.md）：`Fetch`、`Batch`、`ItemsDestroy`、`Subscribe`……client 這邊還沒接。
     Device = 0x16,
-    /// E2EE 的金鑰（wbfuwunel 的 wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 `/keys/*` 與 `/room_keys/*`（bridge-specs `0x17-keys.md`）。
+    /// E2EE 的金鑰（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 `/keys/*` 與 `/room_keys/*`（bridge-specs `0x17-keys.md`）。
     Keys = 0x17,
 }
 
@@ -67,7 +67,7 @@ impl Kind {
     }
 }
 
-/// `id` 欄位（wbfuwunel 的 wbf-wire-format.md §2.2，wbfuwunel PR #46）：`[id_type 1 byte] ‖ [值 7 byte 大端]`。
+/// `id` 欄位（wbfuwunel 的 /docs/design/wbf-wire-format.md §2.2，wbfuwunel PR #46）：`[id_type 1 byte] ‖ [值 7 byte 大端]`。
 ///
 /// 一個 id 自己就說得出它是什麼。server 驗型別跟 `(kind, subtype)` 對不對得上，不符 → `InvalidRequest`；
 /// 需要會話的包（`Event/Recent`、`Subscribe`、`Device/*`）填 0 也是 `InvalidRequest`。
@@ -152,7 +152,7 @@ pub mod download {
     pub const READ: u8 = 0x02;
 }
 
-/// `Kind::Event` 的 subtype（wbfuwunel 的 room-seq-and-recent.md §2、wbfuwunel 的 media-attachments.md §3）。
+/// `Kind::Event` 的 subtype（wbfuwunel 的 /docs/design/room-seq-and-recent.md §2、wbfuwunel 的 /docs/design/media-attachments.md §3）。
 pub mod event {
     /// 跨房間「在 `cg_seq` 之後的事件」：請求一窗，回應是一串 `Batch`（不是 `Ack`）。
     pub const RECENT: u8 = 0x01;
@@ -166,12 +166,12 @@ pub mod event {
     /// 只有 server → client：訂閱中的房間有新事件，meta `{ bc, fs, ls, gap }`。
     pub const PUSH: u8 = 0x06;
     /// 只有 server → client：某人的裝置版本號變了，meta `{ user_id, device_version, rooms, gap }`
-    /// （wbfuwunel `wbf-room-device-version.md` §6）。**只推給 `Hello.features` 宣告過
+    /// （wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §6）。**只推給 `Hello.features` 宣告過
     /// `org.wbftw.device_versions` 的連線**；`id`、`seq`、`gap` 跟這條連線的 `Push` 共用。
     pub const DEVICE_CHANGED: u8 = 0x07;
 }
 
-/// `Kind::Device` 的 subtype（wbfuwunel `wbf-to-device.md`、`wbf-e2ee.md` §3；client 這邊的解讀在 `to-device-client.md`）。
+/// `Kind::Device` 的 subtype（wbfuwunel 的 `/docs/design/wbf-to-device.md`、`wbf-e2ee.md` §3；client 這邊的解讀在 `/docs/design/keys/to-device-client.md`）。
 /// 這些是**原生**的 pack（不帶 `IS_BRIDGED`）；同一個 kind 從 `0x20` 起是走橋的 Matrix 端點。
 pub mod device {
     /// 從 `cd_seq` 起拉 to-device 佇列；回應是一串 `Batch`。
@@ -192,7 +192,7 @@ pub mod device {
     pub const CRYPTO_STATE: u8 = 0x08;
 }
 
-/// kind `0x10 Session`（wbfuwunel 的 wbf-wire-format.md §6.3）。
+/// kind `0x10 Session`（wbfuwunel 的 /docs/design/wbf-wire-format.md §6.3）。
 pub mod session {
     pub const LOGIN: u8 = 0x01;
     pub const REFRESH: u8 = 0x02;
@@ -345,7 +345,7 @@ impl Pack {
     /// 先驗標頭欄位再驗 CRC，所以 version／kind／flags 錯的 pack 回的是那個錯，不是 `MetaCrc`。
     ///
     /// Args:
-    ///     bytes: 一整個 pack（WebSocket 一個 binary message）, example: 見 `docs/design/wire/wbf-vectors.json`
+    ///     bytes: 一整個 pack（WebSocket 一個 binary message）, example: 見 `/docs/design/wire/wbf-vectors.json`
     /// Return:
     ///     Ok(Pack)
     ///     Err(DecodeError)  類別見 `DecodeError`；任何一項不過就拒絕，不會回半個 pack

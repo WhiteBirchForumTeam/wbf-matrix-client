@@ -1,4 +1,4 @@
-//! wbfuwunel 的 chunked-upload-spec.md §3、§4 的記憶體版 server，實作 `PackChannel`，讓上傳／下載管線不用真 server 就能測。
+//! wbfuwunel 的 /docs/design/chunked-upload-spec.md §3、§4 的記憶體版 server，實作 `PackChannel`，讓上傳／下載管線不用真 server 就能測。
 //! 它照規格拒絕（`OutOfOrder`、`Conflict`、`NotFound`…），並提供故障旋鈕（掉 Ack、竄改一塊）。
 //! 它不是權威：與真 server 的差異由 `e2e_local_server.rs` 抓。
 
@@ -79,7 +79,7 @@ pub struct FakeServer {
     pub sent_contents: Vec<Vec<u8>>,
 }
 
-/// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
+/// 名字 → 序號（wbfuwunel 的 `/docs/design/wbf-wire-format.md` §3.4）。只給這個假 server 用：
 /// 真 server 兩個都送，這裡照表補上，client 那邊才會像對真 server 一樣只看序號。
 ///
 /// ⭐ **從 `WbfErrorCode` 反查，🚫 不再手寫第二張表**（PR #37 審查 cirno💡）：變體名就是 server 的 `code` 名字，
@@ -286,7 +286,7 @@ impl FakeServer {
         }
     }
 
-    /// `Event/Send`（wbfuwunel 的 media-attachments.md §3 ＋ wbfuwunel 的 wbf-room-device-version.md §7）：收下並發一個假的 event_id；
+    /// `Event/Send`（wbfuwunel 的 /docs/design/media-attachments.md §3 ＋ wbfuwunel 的 /docs/design/wbf-room-device-version.md §7）：收下並發一個假的 event_id；
     /// `current_room_version` 有設時，`m.room.encrypted` 帶的 `room_version` 對不上就回 1506（meta 帶目前的號碼）。
     fn send(
         &mut self,
@@ -640,7 +640,7 @@ impl FakeServer {
         packs
     }
 
-    /// `Device/Fetch` 一窗 → 一串 `Device/Batch`（wbfuwunel 的 wbf-to-device.md §3）：只要 count > cd_seq 的，舊→新，最多 `limit` 則，
+    /// `Device/Fetch` 一窗 → 一串 `Device/Batch`（wbfuwunel 的 /docs/design/wbf-to-device.md §3）：只要 count > cd_seq 的，舊→新，最多 `limit` 則，
     /// 每 `device_batch_size` 則一個 Batch；meta 帶 `counts`（跟 data 一一對應）、`ot`／`nt`。
     fn device_batches(&self, request: &Pack) -> Vec<Pack> {
         let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
@@ -694,7 +694,7 @@ impl FakeServer {
     }
 
     /// `Device/ItemsDestroy` → 先 `Control/Ack`（只是收到）再 `Device/ItemsDestroyed`（真的沒了的：佇列裡有的刪掉、本來就不在的也算沒了）。
-    /// `tc` 跟 data 長度對不上 → `InvalidRequest`，一則都不刪（to-device-client.md §4 第 4 條）。
+    /// `tc` 跟 data 長度對不上 → `InvalidRequest`，一則都不刪（/docs/design/keys/to-device-client.md §4 第 4 條）。
     fn items_destroy_replies(&mut self, request: &Pack) -> Vec<Pack> {
         let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
         let tc = meta["tc"].as_u64().unwrap_or(u64::MAX) as usize;
@@ -758,7 +758,7 @@ impl FakeServer {
         replies
     }
 
-    /// `Device/Subscribe`（不帶 `cd_seq`）→ `Ack` 再 `CryptoState`（wbfuwunel 的 wbf-e2ee.md §3.3）；`device_id` 缺了 → `InvalidRequest`。
+    /// `Device/Subscribe`（不帶 `cd_seq`）→ `Ack` 再 `CryptoState`（wbfuwunel 的 /docs/design/wbf-e2ee.md §3.3）；`device_id` 缺了 → `InvalidRequest`。
     fn subscribe_replies(&mut self, request: &Pack) -> Vec<Pack> {
         let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
         let reply = |kind: Kind, subtype: u8, seq: u32, meta: serde_json::Value| Pack {

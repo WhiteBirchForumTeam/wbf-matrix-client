@@ -14,7 +14,7 @@
 )]
 //! `wbf-core`：常駐狀態。解鎖一次的 vault、資料目錄的佈局、多帳號。
 //!
-//! 這一層在 [`architecture-v2.md`](../../../docs/design/overview/architecture-v2.md) §6 的位置：
+//! 這一層在 [`/docs/design/overview/architecture-v2.md`](../../../docs/design/overview/architecture-v2.md) §6 的位置：
 //!
 //! ```text
 //! 前端（rpc-cli / Desktop / Android / Python）
@@ -24,10 +24,10 @@
 //! wbf-sdk      ← 純 library：協議、chunk 加解密、cache.db、媒體池、vault、matrix backend
 //! ```
 //!
-//! **為什麼跟 `wbf-daemon` 分開**：RPC 還是 uniffi 那個決策（architecture-v2.md §7 第 7 點）還沒定，
+//! **為什麼跟 `wbf-daemon` 分開**：RPC 還是 uniffi 那個決策（/docs/design/overview/architecture-v2.md §7 第 7 點）還沒定，
 //! 而這一層**兩條路都要**。所以它先做，🚫 它不能知道自己被誰包起來。
 //!
-//! # 公開介面的紀律（architecture-v2.md §6，這是現在唯一要守的）
+//! # 公開介面的紀律（/docs/design/overview/architecture-v2.md §6，這是現在唯一要守的）
 //!
 //! 🚫 **不能假設「同程序」**——之後包 RPC 或包 uniffi 都不該回來改這裡：
 //!
@@ -41,11 +41,11 @@
 //!
 //! # 這一層**不**做的
 //!
-//! - 🚫 **不問終端**：passphrase 一律由呼叫端餵進來（local-interface.md §5——那樣 Desktop 與 Android
+//! - 🚫 **不問終端**：passphrase 一律由呼叫端餵進來（/docs/design/rpc-specs/local-interface.md §5——那樣 Desktop 與 Android
 //!   才解得開）。⚠️ 所以 `unlock` 吃的是 bytes，不是「檔案路徑」也不是「去問使用者」。
 //! - 🚫 **不寫任何「解鎖狀態」到磁碟**：以前 CLI 有一張 `unlock.ticket`（明文主金鑰落地 15 分鐘），
-//!   2026-09-13 整條拿掉了（vault-and-keys.md §1）。解鎖狀態只活在這個物件裡。
-//! - 🚫 **不管 UI 狀態、不管顯示格式、不代前端做決定**（architecture-v2.md §3）。
+//!   2026-09-13 整條拿掉了（/docs/design/storage/vault-and-keys.md §1）。解鎖狀態只活在這個物件裡。
+//! - 🚫 **不管 UI 狀態、不管顯示格式、不代前端做決定**（/docs/design/overview/architecture-v2.md §3）。
 
 // ⚠️ 這兩個是**內部**：它們的型別（`DataDirMap`、`AccountDir`）帶著路徑與 `Vault`，
 // 跨不了 RPC 也綁不了 uniffi。公開面只走 `Core` 的方法與可序列化的 DTO
@@ -59,11 +59,11 @@ pub mod conf;
 mod error;
 pub mod event;
 mod handles;
-/// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec.md §4）。
+/// 「現在跑的是哪一個工作」——事件的歸屬（/docs/design/rpc-specs/rpc-spec.md §4）。
 pub mod job;
 mod key_sync;
 mod link_keeper;
-/// 連線池（link-pool.md）：一個帳號五條線。
+/// 連線池（/docs/design/daemon/link-pool.md）：一個帳號五條線。
 pub mod link_pool;
 mod login_ops;
 mod media_ops;
@@ -110,7 +110,7 @@ pub use upload_ops::{SendFileResult, UploadRequest};
 /// 幾乎每個操作都要回答的三件事。
 ///
 /// 📎 把它們綁成一個型別不只是為了少打字：**RPC 的 `params` 就是這個形狀**
-/// （local-interface.md §6），所以 daemon 那邊直接反序列化成它，🚫 不必再拆成一串位置參數。
+/// （/docs/design/rpc-specs/local-interface.md §6），所以 daemon 那邊直接反序列化成它，🚫 不必再拆成一串位置參數。
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     /// 對哪個帳號動作。**`None` = 用 `current`**。
@@ -119,11 +119,11 @@ pub struct Target {
     /// 哪台 server：同名 localpart 在多個 server 時消歧，或覆蓋 session 裡那個。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
-    /// conf 的 `SERVER_BACKUP`（wbf-cli-spec.md §10）。
+    /// conf 的 `SERVER_BACKUP`（/docs/design/rpc-specs/wbf-cli-spec.md §10）。
     ///
-    /// ⚠️ 由**呼叫端**帶進來：core 不讀 conf，那是「代前端做決定」（architecture-v2.md §3）。
+    /// ⚠️ 由**呼叫端**帶進來：core 不讀 conf，那是「代前端做決定」（/docs/design/overview/architecture-v2.md §3）。
     /// 🚫 預設是 `false`，但那只是 `Default` 的值——真正的預設（開著）在前端那邊，
-    /// 因為「認不得的值落到安全值」是 wbf-cli-spec.md §10.4 的規矩，不是這一層的。
+    /// 因為「認不得的值落到安全值」是 /docs/design/rpc-specs/wbf-cli-spec.md §10.4 的規矩，不是這一層的。
     #[serde(default)]
     pub server_backup: bool,
 }
@@ -151,22 +151,22 @@ impl Target {
 ///
 /// **解鎖一次**：`unlock` 成功之後主金鑰活在這個物件裡，直到它被丟掉。
 /// ⚠️ 這正是 `unlock.ticket`（明文主金鑰落地 15 分鐘）不再存在的原因——
-/// 常駐之後沒有人需要把它寫到磁碟上（vault-and-keys.md §1，2026-09-13 拿掉）。
+/// 常駐之後沒有人需要把它寫到磁碟上（/docs/design/storage/vault-and-keys.md §1，2026-09-13 拿掉）。
 ///
 /// 🚫 `Core` 自己**不會**去問終端、不讀 passphrase 檔。那些是前端的事。
 pub struct Core {
     data_dir: PathBuf,
-    /// 解一次就留著。`OnceLock` 讓 `unlock` 收 `&self`（architecture-v2.md §6 的紀律）。
+    /// 解一次就留著。`OnceLock` 讓 `unlock` 收 `&self`（/docs/design/overview/architecture-v2.md §6 的紀律）。
     vault: OnceLock<Vault>,
-    /// core 往外講話的唯一管道（architecture-v2.md §6：事件用 channel）。🚫 core 不印東西。
+    /// core 往外講話的唯一管道（/docs/design/overview/architecture-v2.md §6：事件用 channel）。🚫 core 不印東西。
     pub(crate) events: EventSink,
     /// 一個 server dir 一份：那個 `cache.db` 的**唯一寫入者**與讀連線
-    /// （`server_cache`、daemon-runtime.md §2）。⚠️ 開一次就留著 ——
+    /// （`server_cache`、/docs/design/daemon/daemon-runtime.md §2）。⚠️ 開一次就留著 ——
     /// 每次重開要付 SQLCipher 導金鑰的成本，而且**多個寫入者就沒有順序可言**。
     pub(crate) server_caches: std::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<crate::server_cache::ServerCache>>,
     >,
-    /// **一個帳號一格**：那個帳號探到的 backend（architecture-v2.md §5.1）。
+    /// **一個帳號一格**：那個帳號探到的 backend（/docs/design/overview/architecture-v2.md §5.1）。
     ///
     /// ⚠️ 只在記憶體裡，🚫 **不寫進設定檔** —— 「這台是不是 wbf」是 server 那邊的事實，
     /// 它會變（升級、降級），而寫進檔案的那份不會有人通知你它過期了。
@@ -181,7 +181,7 @@ pub struct Core {
     /// 🚨 值是 `OnceCell` 而不是 `BackendKind`：**探測失敗不會留下結論**
     /// （`get_or_try_init` 出錯時不寫進去，下次重探），而**同一個帳號**同時進來的呼叫
     /// 共用同一次探測（🚫 不是各開一條 WS）。
-    /// 📌 2026-09-21 起 **key 是 server URL**（account-session.md §1）：探活不帶 token（未登入的 WS Hello），
+    /// 📌 2026-09-21 起 **key 是 server URL**（/docs/design/daemon/account-session.md §1）：探活不帶 token（未登入的 WS Hello），
     /// 所以「A 的 token 壞了拖累 B」那個理由沒了，而「講不講 wbf」本來就是 server 的事實。
     pub(crate) backends: std::sync::Mutex<
         std::collections::HashMap<
@@ -189,11 +189,11 @@ pub struct Core {
             std::sync::Arc<tokio::sync::OnceCell<crate::BackendKind>>,
         >,
     >,
-    /// **一個帳號一個連線池**（link-pool.md）：五條線、要用才開、斷了下次要用再開。key 跟 `backends` 一樣是帳號目錄。
+    /// **一個帳號一個連線池**（/docs/design/daemon/link-pool.md）：五條線、要用才開、斷了下次要用再開。key 跟 `backends` 一樣是帳號目錄。
     /// 登出就整個拿掉（token 撤了）；`Core` 丟掉就全關。
     pub(crate) link_pools:
         std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<LinkPool>>>,
-    /// 正在登出的帳號（account-session.md §4 的「封池」）：在這裡的帳號 `pool_of_account` 一律拒，正在跑的命令不受影響。
+    /// 正在登出的帳號（/docs/design/daemon/account-session.md §4 的「封池」）：在這裡的帳號 `pool_of_account` 一律拒，正在跑的命令不受影響。
     /// 登出開始就放進去，HTTP 登出失敗或本地清完就拿掉。這是**帳號**的狀態，🚫 不是池的。
     pub(crate) logging_out: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// 正在跟上游的帳號（`room_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Event/Push` 寫進 cache。
@@ -243,7 +243,7 @@ impl Core {
     /// 所有 `cache.db` 寫入者加起來還有幾件在排隊。
     ///
     /// Return:
-    ///     usize  0 = 都寫完了；⚠️ 一直漲就是**寫得比收得慢**（daemon-runtime.md §2.2）
+    ///     usize  0 = 都寫完了；⚠️ 一直漲就是**寫得比收得慢**（/docs/design/daemon/daemon-runtime.md §2.2）
     ///
     /// ⭐ queue 沒有上限是刻意的（丟掉已經收到的事件比慢更糟），所以它**必須看得見** ——
     /// daemon 把這個數字放進 `daemon.info`。
@@ -283,7 +283,7 @@ impl Core {
 
     /// 解鎖。**冪等**：已經解開就直接回 `Ok`，🚫 不重跑 Argon2。
     ///
-    /// ⚠️ `passphrase` 是**原始 bytes**（vault-and-keys.md §3）：它可以是中文、可以是一個
+    /// ⚠️ `passphrase` 是**原始 bytes**（/docs/design/storage/vault-and-keys.md §3）：它可以是中文、可以是一個
     /// mp3。🚫 這一層不驗 UTF-8、不去尾換行——那些是「怎麼拿到 passphrase」的問題，
     /// 屬於前端（`rpc-cli` 讀檔或問終端，Desktop 從輸入框，Android 從對話框）。
     ///
@@ -297,7 +297,7 @@ impl Core {
     ///     Err(WrongPassphrase)       打錯了
     ///
     /// ⚠️ 這四種**分得出來**是刻意的（PR #24 審查 rumia🟡）：前端要據此決定「跳輸入框」
-    /// 還是「說打錯了」，而 daemon 的 `vault.unlock`（local-interface.md §5）要回結構化的錯誤。
+    /// 還是「說打錯了」，而 daemon 的 `vault.unlock`（/docs/design/rpc-specs/local-interface.md §5）要回結構化的錯誤。
     /// 🚫 不要讓呼叫端去 parse 人話。
     pub fn unlock(&self, passphrase: Option<&[u8]>) -> Result<(), CoreError> {
         if self.is_unlocked() {
@@ -344,7 +344,7 @@ impl Core {
     ///
     /// Return:
     ///     Ok(&Vault)
-    ///     Err(Locked)   還沒解鎖——呼叫端要先叫 `unlock`（RPC 那邊回 `locked`，local-interface.md §5）
+    ///     Err(Locked)   還沒解鎖——呼叫端要先叫 `unlock`（RPC 那邊回 `locked`，/docs/design/rpc-specs/local-interface.md §5）
     pub(crate) fn vault(&self) -> Result<&Vault, CoreError> {
         self.vault
             .get()
@@ -356,8 +356,8 @@ impl Core {
     /// 兩個呼叫端，都是 `unlock` 涵蓋不了的：
     ///
     /// - **`login`**：`local.key` 還不存在，vault 是**建**出來的。🚫 `Core` 不長出「建」
-    ///   的那半——那需要「要不要設 passphrase」的政策，是前端的決定（architecture-v2.md §3）。
-    /// - **daemon 的 `vault.create`**（rpc-spec.md §3.1）：同一件事走 RPC 進來，「要不要 passphrase」
+    ///   的那半——那需要「要不要設 passphrase」的政策，是前端的決定（/docs/design/overview/architecture-v2.md §3）。
+    /// - **daemon 的 `vault.create`**（/docs/design/rpc-specs/rpc-spec.md §3.1）：同一件事走 RPC 進來，「要不要 passphrase」
     ///   由前端在那一步決定。
     ///
     /// **冪等**，跟 [`Core::unlock`] 一樣：已經有一把就把傳進來的丟掉、回原本那把。
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_binary_passphrase_goes_in_as_raw_bytes() {
-        // vault-and-keys.md §3：passphrase 是任意 bytes，這一層一個都不動。
+        // /docs/design/storage/vault-and-keys.md §3：passphrase 是任意 bytes，這一層一個都不動。
         let dir = scratch("bytes");
         let passphrase = "早安\u{0}世界".as_bytes();
         Vault::create(
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn the_three_ways_unlocking_can_fail_are_told_apart() {
-        // ⚠️ 這是 daemon 的 `vault.unlock`（local-interface.md §5）要回結構化錯誤的前提：前端得知道
+        // ⚠️ 這是 daemon 的 `vault.unlock`（/docs/design/rpc-specs/local-interface.md §5）要回結構化錯誤的前提：前端得知道
         // 該「跳輸入框」還是該說「打錯了」，🚫 不能靠 parse 人話（PR #24 審查 rumia🟡）。
         let dir = scratch("unlock-kinds");
         assert_eq!(

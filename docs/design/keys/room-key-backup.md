@@ -2,19 +2,19 @@
 
 > 這份講 **matrix-sdk 帳號**的房間金鑰備份：server 端的標準 Matrix key backup（§3、§6）、本地的 `k/` 快照（§4、§5）、
 > 誰刪什麼與 `logout` 的閘門（§7）、recovery key 的保管（§8）。實作：sdk `room_keys.rs`、`backend/matrix_sdk.rs`；core `backup_ops.rs`、`recovery.rs`、`session_ops.rs`（閘門）。
-> ⚠️ wbf 帳號沒有 matrix-sdk 的 `Client`，這一套都還沒接（`key-backup` 對它回錯；e2ee-rpc.md §8），`logout` 閘門對它只看第二關（§7）。
+> ⚠️ wbf 帳號沒有 matrix-sdk 的 `Client`，這一套都還沒接（`key-backup` 對它回錯；/docs/design/keys/e2ee-rpc.md §8），`logout` 閘門對它只看第二關（§7）。
 
 ## 1 為什麼要有這一章
 
 房間金鑰（Megolm inbound session）平常**只活在一個地方**：帳號目錄底下的 crypto store（`m/`）。沒有備份的話：
 
 - 換一台機器、重灌、`logout`，**歷史訊息永久解不開**。事件本身還在 server 上，但沒有鑰匙。
-- vault-and-keys.md §1.1 那條「store 開不了就刪掉 `m/` 重新 `login`」**把這件事寫成了正常操作**。
+- /docs/design/storage/vault-and-keys.md §1.1 那條「store 開不了就刪掉 `m/` 重新 `login`」**把這件事寫成了正常操作**。
   「只是裝置狀態」對 state store 成立，對 crypto store 不成立 —— 它裡面是解開全部歷史的唯一鑰匙。這條政策站得住，靠的是這一章。
 - 光有 recovery key 沒有用。recovery key 只是解開 SSSS 拿到 backup 的解密金鑰；**如果沒有人把房間金鑰上傳上去，備份是空的**。
   有意義的是房間金鑰本身（維護者 2026-09-09 在別的專案踩過同一個坑）。
 
-唯一的緩衝是 `cache.db` 存的是**解密後的明文**（local-cache-db.md §2），所以本機歷史不會馬上消失。但它是快取（local-cache-db.md §1：可以整個丟掉），而且新裝置拿不到。
+唯一的緩衝是 `cache.db` 存的是**解密後的明文**（/docs/design/storage/local-cache-db.md §2），所以本機歷史不會馬上消失。但它是快取（/docs/design/storage/local-cache-db.md §1：可以整個丟掉），而且新裝置拿不到。
 **快取不是備份。** 這一章講的是備份。
 
 ## 2 兩份備份，分工不同
@@ -23,9 +23,9 @@
 |---|---|---|
 | 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | 帳號目錄的 `k/`（§4） |
 | 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §3） | 意外：crypto store 壞掉、`m/` 被刪掉重 `login`、server 端資料沒了 |
-| 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，vault-and-keys.md §1） |
+| 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，/docs/design/storage/vault-and-keys.md §1） |
 | 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§6） | **命令觸發**：`key-backup save`，`upload` 時順手一起（§5） |
-| 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，wbf-cli-spec.md §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
+| 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，/docs/design/rpc-specs/wbf-cli-spec.md §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
 | 生命週期 | 跟帳號走，`logout` 不動它 | **跟這台機器上的這個帳號走：`logout` 連它一起刪**（維護者 2026-09-09，§7） |
 | 互通性 | 有：Element 之類的 client 用同一份 | 格式是 Element 的金鑰匯出，但 passphrase 由 vault 導出：實際上只有這個 client 打得開 |
 
@@ -43,8 +43,8 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
   > 所以在使用者顯式產生 recovery key 之前，server 上那份備份**換一台機器也解不開** ——
   > 它防的是「本機 crypto.db 壞掉」，不是「換裝置」。
 
-  這句話要出現在警告裡（警告的原文在 wbf-cli-spec.md §3.6），不能只說「你還沒設 recovery key」。
-- **recovery key 不自動印**（維護者定）。顯式入口是 `key-backup recovery`（wbf-cli-spec.md §3.6）：走上游的 `recovery().enable()`，
+  這句話要出現在警告裡（警告的原文在 /docs/design/rpc-specs/wbf-cli-spec.md §3.6），不能只說「你還沒設 recovery key」。
+- **recovery key 不自動印**（維護者定）。顯式入口是 `key-backup recovery`（/docs/design/rpc-specs/wbf-cli-spec.md §3.6）：走上游的 `recovery().enable()`，
   把 recovery key 印**一次**並說明拿不回來（只能 reset）。同一個命令會把它封進 `<data dir>/r/`（§8）——
   🚫 但仍然不進 conf、不進 log，而且那份保管**不算「使用者擁有」**（同一台機器，一起被拿走就一起沒了）。
 - 關掉（`SERVER_BACKUP=off`）就是 `auto_enable_backups: false` 且不跑上傳；**已經在 server 上的 version 不動、不刪**
@@ -107,13 +107,13 @@ server 那份裡。
 
 | 情形 | `m/` | `k/` | 怎麼把歷史找回來 |
 |---|---|---|---|
-| **意外**：store 壞掉、金鑰對不上，照 vault-and-keys.md §1.1 的指示手動刪 `m/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
-| **有意**：`logout`／`account del <user>`（同一件事，wbf-cli-spec.md §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
+| **意外**：store 壞掉、金鑰對不上，照 /docs/design/storage/vault-and-keys.md §1.1 的指示手動刪 `m/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
+| **有意**：`logout`／`account del <user>`（同一件事，/docs/design/rpc-specs/wbf-cli-spec.md §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
 | **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
 
 📎 **to-device 的本地狀態（`m/td.json`：`cd_seq` 與待銷毀清單）住在 `m/` 裡面，所以這張表的每一列它都自動跟著對**
 （維護者 2026-09-12）：`m/` 被刪 → 它一起沒 → 下次從頭拉。🚫 不需要有人記得另外去清它，
-理由在 to-device-client.md §2.1。
+理由在 /docs/design/keys/to-device-client.md §2.1。
 
 為什麼 `logout`（即 `account del`）連著刪（維護者 2026-09-09）：它在心智上是「我離開這台機器」，
 留一個能解開全部歷史的檔案在磁碟上是驚嚇，而且跟「crypto store 一定會被刪」不一致。
@@ -145,7 +145,7 @@ server 那份裡。
 `RecoveryState` 是 `Unknown`／`Incomplete`、問不到 server。🚫 不寫成「沒有 recovery key 才擋」——
 那樣新增一種狀態就默默放行；要壞就壞在「多擋一次」那一邊。
 
-擋下來的時候印的訊息要直接給下一步（原文在 wbf-cli-spec.md §3.6）：先跑 `key-backup recovery` 產生 recovery key，
+擋下來的時候印的訊息要直接給下一步（原文在 /docs/design/rpc-specs/wbf-cli-spec.md §3.6）：先跑 `key-backup recovery` 產生 recovery key，
 server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損失。
 
 📎 副作用（好的）：這讓「recovery key 延後」不會被無限期延後 —— **延到第一次 `logout` 為止**。

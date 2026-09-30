@@ -33,7 +33,7 @@
 //!
 //! 🚫 清單**不是一串字串**：每個呼叫點自己用 [`MethodHome`] 說出它住在哪一邊 ——
 //! ⭐ 那樣「名字」跟「實際走哪條」不可能漂移（原則 A4），而 `MethodHome::StillOnMatrixSdk`
-//! 的呼叫點就是那份清單。📎 給人看的版本是 rpc-spec.md §10「底層」那一欄。
+//! 的呼叫點就是那份清單。📎 給人看的版本是 /docs/design/rpc-specs/rpc-spec.md §10「底層」那一欄。
 //! 現在清單是空的：wbf 帳號的房間命令都走 ws（`wbf_rooms.rs`），`StillOnMatrixSdk` 只剩測試在用。
 
 use wbf_sdk::Transport;
@@ -124,7 +124,7 @@ pub fn get_backend_for(
 const PROBE_CLIENT_NAME: &str = "wbf-client probe";
 
 impl crate::Core {
-    /// 這台 homeserver 講不講 wbf 協議。**探測，🚫 不是設定**（architecture-v2.md §5.1；account-session.md §1）。
+    /// 這台 homeserver 講不講 wbf 協議。**探測，🚫 不是設定**（/docs/design/overview/architecture-v2.md §5.1；/docs/design/daemon/account-session.md §1）。
     ///
     /// ⭐ **不確定一律回 [`BackendKind::MatrixSdk`]**：連不上、`Hello` 不回、回來的東西看不懂——
     /// 全部當成一般 homeserver。壞在「用了比較慢但一定能動的那條」，🚫 不壞在「以為對方懂我們的協議」。
@@ -183,7 +183,7 @@ impl crate::Core {
 
     /// 同上，server 從帳號的 session 拿。沒登入的帳號沒有 server 可問 → `MatrixSdk`（fail safe，🚫 不探、不記）。
     ///
-    /// 📌 登入時就走了 wbf 那條的帳號（`Session::backend == WbfSdk`，account-session.md §2）**不再探**：答案登入時就定了，
+    /// 📌 登入時就走了 wbf 那條的帳號（`Session::backend == WbfSdk`，/docs/design/daemon/account-session.md §2）**不再探**：答案登入時就定了，
     /// 而 server 暫時不通時把它探成「一般 Matrix」，會讓池那條路回「你接錯線了」而不是 `Network`——錯的那個訊息。
     ///
     /// Args:
@@ -276,7 +276,7 @@ impl crate::Core {
     ///     account: 哪個帳號
     ///     transport: 呼叫端要的那條, example: Transport::WebSocket
     ///     home: 這個方法住在哪一邊, example: MethodHome::WbfSdkOnly
-    ///     role: 走池裡哪一條線（link-pool.md §2：角色是呼叫點的屬性）, example: LinkRole::Misc
+    ///     role: 走池裡哪一條線（/docs/design/daemon/link-pool.md §2：角色是呼叫點的屬性）, example: LinkRole::Misc
     /// Return:
     ///     Ok(PooledClient)  池裡那條線（沒開就開、死了重開）；丟掉就還回去
     ///     Err(Usage)        這條路到不了 wbf，而這個功能只有它有 —— 它是關的；或帳號沒登入
@@ -410,7 +410,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚨 **一台 server 一格**：同一台 server 的兩個帳號共用一次探測（account-session.md §1）。
+    /// 🚨 **一台 server 一格**：同一台 server 的兩個帳號共用一次探測（/docs/design/daemon/account-session.md §1）。
     /// 探活不帶 token，所以沒有「A 的 token 壞了拖累 B」（PR #33 那條反過來的理由）；「講不講 wbf」是 server 的事實。
     /// ⚠️ 這條在「key 是帳號目錄」的舊寫法上會紅（那時是兩格）。
     #[tokio::test]
@@ -479,7 +479,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 登出的封池（account-session.md §4）：封了 `pool_of_account` 就拒（`AccountBusy`），解封就過。
+    /// 登出的封池（/docs/design/daemon/account-session.md §4）：封了 `pool_of_account` 就拒（`AccountBusy`），解封就過。
     #[tokio::test]
     async fn logging_out_blocks_the_pool_until_unblocked() {
         let dir = scratch("logout-blocks");

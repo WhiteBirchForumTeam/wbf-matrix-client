@@ -1,8 +1,8 @@
-//! 本地金鑰庫（vault-and-keys.md §1、local-cache-db.md §4.3、§4.6）：一把 32 byte 主金鑰放 `local.key`，
+//! 本地金鑰庫（/docs/design/storage/vault-and-keys.md §1、/docs/design/storage/local-cache-db.md §4.3、§4.6）：一把 32 byte 主金鑰放 `local.key`，
 //! 明文（`KeyFile::Plain`）或被 passphrase 包住（`KeyFile::Passphrase`）；子金鑰用 BLAKE3 從主金鑰導出，不落地。
 //! `session.sealed` 用第三把子金鑰封住 session 與 token。
 //!
-//! 這裡沒有 SQLite、沒有 matrix-sdk：兩個世界只從 `Vault` 拿各自的子金鑰（local-cache-db.md §4.3 的那一條線）。
+//! 這裡沒有 SQLite、沒有 matrix-sdk：兩個世界只從 `Vault` 拿各自的子金鑰（/docs/design/storage/local-cache-db.md §4.3 的那一條線）。
 //! 🚫 主金鑰、子金鑰、passphrase 都不印、不進錯誤訊息。
 //! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼，這個檔裡沒有它。
 
@@ -21,7 +21,7 @@ use crate::login::Session;
 pub const KEY_FILE_NAME: &str = "local.key";
 pub const SEALED_SESSION_FILE_NAME: &str = "session.sealed";
 
-/// 子金鑰的 BLAKE3 context（vault-and-keys.md §1）。字串帶版本：換字串就是換金鑰。
+/// 子金鑰的 BLAKE3 context（/docs/design/storage/vault-and-keys.md §1）。字串帶版本：換字串就是換金鑰。
 const CACHE_KEY_CONTEXT: &str = "wbf-matrix-client cache sqlcipher v1";
 const MATRIX_STORE_KEY_CONTEXT: &str = "wbf-matrix-client matrix-sdk store v1";
 const SESSION_KEY_CONTEXT: &str = "wbf-matrix-client session v1";
@@ -40,7 +40,7 @@ const WRAP_AAD: &[u8] = b"wbf-matrix-client local.key v1";
 const KEY_FILE_VERSION: u32 = 1;
 const SEALED_VERSION: u32 = 1;
 
-/// Argon2id 預設參數（vault-and-keys.md §1）：64 MiB、3 輪、1 lane。寫進檔裡，之後調高不用遷移。
+/// Argon2id 預設參數（/docs/design/storage/vault-and-keys.md §1）：64 MiB、3 輪、1 lane。寫進檔裡，之後調高不用遷移。
 const ARGON2_M_KIB: u32 = 65536;
 const ARGON2_T: u32 = 3;
 const ARGON2_P: u32 = 1;
@@ -73,11 +73,11 @@ impl std::fmt::Debug for Key32 {
     }
 }
 
-/// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassphrase`，`KeyFile::Passphrase` 的配 `Passphrase`，配錯就 `Err`（vault-and-keys.md §1）。
+/// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassphrase`，`KeyFile::Passphrase` 的配 `Passphrase`，配錯就 `Err`（/docs/design/storage/vault-and-keys.md §1）。
 pub enum Unlock {
     NoPassphrase,
     /// 🚫 不接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
-    /// ⚠️ **原始 bytes，不是字串**（vault-and-keys.md §3）：passphrase 只餵給本機的
+    /// ⚠️ **原始 bytes，不是字串**（/docs/design/storage/vault-and-keys.md §3）：passphrase 只餵給本機的
     /// Argon2id，永遠不出這台機器，所以它可以是 UTF-8 的中文、可以是一個 mp3。
     /// 🚫 不驗 UTF-8、🚫 不去尾換行——那是 `--password-file`（要送給 homeserver）的規則。
     Passphrase(Zeroizing<Vec<u8>>),
@@ -299,17 +299,17 @@ impl Vault {
         self.derive(MATRIX_STORE_KEY_CONTEXT)
     }
 
-    /// 媒體池（media-pool.md）的金鑰。
+    /// 媒體池（/docs/design/media/media-pool.md）的金鑰。
     pub fn media_store_key(&self) -> Key32 {
         self.derive(MEDIA_STORE_KEY_CONTEXT)
     }
 
-    /// 本地的房間金鑰備份（`room_keys`；room-key-backup.md §4）：base64 之後當作 `k/snapshot` 的 passphrase 餵給上游的匯出（`room_keys::snapshot_passphrase`）。
+    /// 本地的房間金鑰備份（`room_keys`；/docs/design/keys/room-key-backup.md §4）：base64 之後當作 `k/snapshot` 的 passphrase 餵給上游的匯出（`room_keys::snapshot_passphrase`）。
     pub fn room_key_backup_key(&self) -> Key32 {
         self.derive(ROOM_KEY_BACKUP_KEY_CONTEXT)
     }
 
-    /// 資料目錄裡兩層目錄名的加密（`account_dir`；vault-and-keys.md §2.2）。
+    /// 資料目錄裡兩層目錄名的加密（`account_dir`；/docs/design/storage/vault-and-keys.md §2.2）。
     /// `s/` 與 `a/` 共用這一把，靠 aad 分。
     pub fn account_dir_key(&self) -> Key32 {
         self.derive(ACCOUNT_DIR_KEY_CONTEXT)
@@ -360,7 +360,7 @@ impl Vault {
     ///
     /// ⚠️ 這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台機器上，
     /// 一起被拿走就一起沒了。閘門（CLI 的 `refuse_if_history_would_be_lost`）拿它當第 2 關，
-    /// 🚫 不問使用者（room-key-backup.md §8）。
+    /// 🚫 不問使用者（/docs/design/keys/room-key-backup.md §8）。
     ///
     /// Args:
     ///     path: example: "<data dir>/r/<b58 nonce>_<b58 密文>"
@@ -587,7 +587,7 @@ fn decode_key32(text: &str, field: &str) -> Result<Key32, SdkError> {
     Ok(Key32(array))
 }
 
-/// 含金鑰或 token 的檔：Unix 0600 建立；Windows 靠使用者目錄的 ACL（wbf-cli-spec.md §5）。
+/// 含金鑰或 token 的檔：Unix 0600 建立；Windows 靠使用者目錄的 ACL（/docs/design/rpc-specs/wbf-cli-spec.md §5）。
 /// 先寫到同目錄的暫存檔再 rename：寫到一半斷電不會留下半個 `local.key`。
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
     use std::io::Write;

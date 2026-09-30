@@ -1,6 +1,6 @@
 # WS 收包分派：一條連線、任何順序、依會話表交付
 
-> 維護者 2026-09-21 定的形狀（daemon-runtime.md §10 的第 4 階段，SDK 這一半）：
+> 維護者 2026-09-21 定的形狀（/docs/design/daemon/daemon-runtime.md §10 的第 4 階段，SDK 這一半）：
 > **送一個等一個沒錯，錯的是「下一個收到的就是我的回覆」**。
 > 收到什麼就依它的種類處理，順序完全亂掉也不該出事；會話狀態另外維護一張 id 表。
 > 這份文件是那張表的形狀，實作在 `crates/wbf-sdk/src/{transport,sessions,link}.rs`。
@@ -20,19 +20,19 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
 |---|---|---|---|
 | **傳輸** | `transport.rs` | bytes 怎麼進出：`FrameSource`（收一個 binary frame）、`FrameSink`（送一個）。tungstenite 一組實作、記憶體對接一組實作（測試用） | 任何協議邏輯。它不知道什麼是 pack |
 | **會話表** | `sessions.rs` | 這個 pack 是誰的：`SessionKey` → `PackSink`；分派規則；無主計數；鉤子 | 網路。它是純資料結構，同步、可單元測試 |
-| **連線** | `link.rs` | 把上面兩個接起來：`WsLink` 起兩個 task、給呼叫端「登記 → 送 → 等」的 API；關線時把表清掉 | 重連。死了的線由連線池重開（link-pool.md §3、§3.1） |
+| **連線** | `link.rs` | 把上面兩個接起來：`WsLink` 起兩個 task、給呼叫端「登記 → 送 → 等」的 API；關線時把表清掉 | 重連。死了的線由連線池重開（/docs/design/daemon/link-pool.md §3、§3.1） |
 | 通道 | `channel.rs` | `WsChannel` 是 `WsLink` 的薄殼，對外還是 `PackChannel` 介面：`HttpChannel`、假 server、`WbfClient` 不用知道底下是什麼 | |
 
-⭐ 分線的設計（link-pool.md §1 的五條）**不進這一層**。一條 `WsLink` 一張表；daemon 開五條就是五個實例，
+⭐ 分線的設計（/docs/design/daemon/link-pool.md §1 的五條）**不進這一層**。一條 `WsLink` 一張表；daemon 開五條就是五個實例，
 哪個命令走哪條線由 daemon 決定，link 自己不知道它是做什麼的。這就是「通用」：只用一條線也行，只是擠。
 
 ## 2. 會話表的鍵：`id` 是會話的名字，`seq` 是會話內的計數
 
-照 wbfuwunel 的 wbf-wire-format.md §4.1。兩種鍵：
+照 wbfuwunel 的 /docs/design/wbf-wire-format.md §4.1。兩種鍵：
 
 | 鍵 | 誰 | 一個項目收幾個 pack |
 |---|---|---|
-| `Session(id)` | 具名會話：`Recent`、`Device/Fetch`、`ItemsDestroy`、`Subscribe`（`id` 由 client 選，`id::SESSION` 型別） | 多個：所有抄這個 `id` 的 pack，包含推播（`Push`、`CryptoState`、`DeviceChanged`）與 **`Superseded`**（它的 `id` 就是訂閱的 id，wbfuwunel 的 wbf-wire-format.md §3.4） |
+| `Session(id)` | 具名會話：`Recent`、`Device/Fetch`、`ItemsDestroy`、`Subscribe`（`id` 由 client 選，`id::SESSION` 型別） | 多個：所有抄這個 `id` 的 pack，包含推播（`Push`、`CryptoState`、`DeviceChanged`）與 **`Superseded`**（它的 `id` 就是訂閱的 id，wbfuwunel 的 /docs/design/wbf-wire-format.md §3.4） |
 | `Reply { id, seq }` | 一問一答：`Hello`、`Ping`、`Info`、`Read`、`Send`、橋、`Upload/Chunk`／`Status`／`Seal`／`Abort`、`Device/Unsubscribe` | 一個：`id` 與 `seq` 都抄回的那個 Control 回應 |
 
 ### 2.1 分派規則（讀取 task 每收一個 pack 走一次）
@@ -53,7 +53,7 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
   ——那個回覆會進會話的收件匣，`Reply` 那格永遠等不到。
   `Event/Unsubscribe` 就是刻意用訂閱的 id 送：`send_only`、不登記，Ack 從訂閱的 handle 收（`WbfClient::room_unsubscribe`）。其他命令都發新的會話 id。
 - 🚨 **fail closed**：無主的 pack 🚫 永遠不交給「剛好在等」的人。第 4 條之前沒有任何「猜」。
-- 🚨 **登記一定在送出之前**。回覆比登記早到就變無主——server 那邊補窗曾因「先收窗再註冊」漏事件（wbfuwunel 的 wbf-event-push.md §7），同型的錯。
+- 🚨 **登記一定在送出之前**。回覆比登記早到就變無主——server 那邊補窗曾因「先收窗再註冊」漏事件（wbfuwunel 的 /docs/design/wbf-event-push.md §7），同型的錯。
 
 ### 2.2 為什麼是 `Reply { id, seq }` 而不是 `Unordered(seq)`
 
@@ -102,9 +102,9 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 - 鉤子在表鎖**之外**（`std::sync::Mutex` 不可重入，鎖內叫鉤子的話鉤子裡摸回同一條 link 就自死鎖）：
   鉤子裡可以讀同一條 link 的同步狀態（`unmatched()`、`is_closed()`）；🚫 不能在裡面 block 等這條 link 的回覆，那是等自己。
   `Received.session`／`route` 是查表那一刻的答案；交付在放鎖之後，中間項目被拿掉的話交付會算成無主（差一個 pack、只影響計數）。
-- **要不要送到 UI 是鉤子那頭決定的**（daemon 的推播函數，link-pool.md §6）。link 只有呼叫，沒有過濾。
+- **要不要送到 UI 是鉤子那頭決定的**（daemon 的推播函數，/docs/design/daemon/link-pool.md §6）。link 只有呼叫，沒有過濾。
 - 鉤子是同步、不可等待的：要做慢事（寫庫、推 RPC）就自己丟進自己的佇列，讀取 task 不被它拖住。
-  daemon-runtime.md §4.1 的「先寫庫、後發事件」由那頭守。
+  /docs/design/daemon/daemon-runtime.md §4.1 的「先寫庫、後發事件」由那頭守。
 - 鉤子與會話表是兩條路：會話項交付給在等的呼叫者，鉤子交付給 UI 那條線。同一個 pack 兩邊都拿得到。
 
 ## 5. 送出：一條佇列、一個 task、天然保序
@@ -124,7 +124,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
   對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒遠小於 300 秒，也讓「線死了」在半分鐘內可見。
 - 心跳的請求號從 `u32::MAX` 往下數（`WbfClient` 的從 1 往上），兩邊要碰到得幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。
 - `Heartbeat::OFF` 不跳（測試別的事情時用）；`start_with_heartbeat` 可以給短的間隔（測試用）。
-- 📎 這不是監督者：它只**發現**線死了，不重連（重開見 link-pool.md §3、§3.1）。
+- 📎 這不是監督者：它只**發現**線死了，不重連（重開見 /docs/design/daemon/link-pool.md §3、§3.1）。
 
 ## 6. ACK 與重送：規則在表之上，不在表裡
 
@@ -134,7 +134,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 - `WsLink::request_with_policy(pack, AckPolicy { attempts, timeout })`：登記一次，逾時而且還有次數就**原樣**重送（同 id、同 seq、同 bytes）。
   第一次的回覆晚到與第二次的回覆同鍵：先到的交付，後到的無主，計數。
 - 🚨 **預設 `attempts = 1`，不重送**。fail closed：`Upload/Create` 重送會開出兩個上傳。冪等的呼叫點自己開：
-  `Chunk`（`Corrupt` 重送一次）、`Event/Send`（server 以 `txn_id` 去重）、`Session/Login`（wbfuwunel 的 wbf-wire-format.md §6.3.2 維護者建議 3 秒沒回重送、連三次算無回應）。
+  `Chunk`（`Corrupt` 重送一次）、`Event/Send`（server 以 `txn_id` 去重）、`Session/Login`（wbfuwunel 的 /docs/design/wbf-wire-format.md §6.3.2 維護者建議 3 秒沒回重送、連三次算無回應）。
 - 哪些要 Ack 看 `WANT_ACK`。
 
 ## 7. 關線：表整張清空，每一項收到錯
@@ -170,4 +170,4 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 
 ## 10. 之後
 
-這一層沒有待辦。推播封裝、`desync` 在 link-pool.md §6；`Event/Subscribe` 的訂閱在 room-sync.md。
+這一層沒有待辦。推播封裝、`desync` 在 /docs/design/daemon/link-pool.md §6；`Event/Subscribe` 的訂閱在 /docs/design/rooms/room-sync.md。

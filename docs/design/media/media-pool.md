@@ -8,7 +8,7 @@
 
 - 對上層（下載管線、UI）看起來像掛載了一塊區域：開檔、順序寫、讀、刪，檔就是完整明文，**檔內不分片**。
 - 落地時整個池是加密的。池是 `wbf-sdk` 裡的一層虛擬層，不用 FUSE／WinFsp（Windows 要裝東西、Android 沒有）。
-- 池只用**一把金鑰**：第四把子金鑰 `"wbf-matrix-client media store v1"`（vault-and-keys.md §1）。沒有每檔金鑰。
+- 池只用**一把金鑰**：第四把子金鑰 `"wbf-matrix-client media store v1"`（/docs/design/storage/vault-and-keys.md §1）。沒有每檔金鑰。
 - 為了「順序 append」與「從中間讀」，池內部落地會分段加密（gocryptfs、Cryptomator、age 都是這樣）。**那是池的實作細節，對上層完全隱藏**；對上層只有 `PoolWriter`（`Write`，順序 append）與 `PoolReader`（`Read + Seek`，明文位置）。落地格式與段大小在 §8。
 
 存的是**解密後的明文**（維護者：「每塊解密後就放這裡」），不存 server 密文：server 密文的金鑰是每則訊息各自的（事件區塊裡的 `key`），本地要留一堆房間金鑰才讀得回來；明文進池，本地只有一套金鑰制度。
@@ -46,8 +46,8 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 
 ## 4 DB 的指針
 
-表在 local-cache-db.md §5（`media` 與 `event_media`）。沒有 bitmap：檔要嘛完整、要嘛是一個「寫到第 N 塊」的半成品，沒有中間有洞的狀態。
-摧毀帳號的鏈（local-cache-db.md §5 `forget_account`）走到 `media` 這一層時回傳沒人指的 `pool_file`，池刪檔。
+表在 /docs/design/storage/local-cache-db.md §5（`media` 與 `event_media`）。沒有 bitmap：檔要嘛完整、要嘛是一個「寫到第 N 塊」的半成品，沒有中間有洞的狀態。
+摧毀帳號的鏈（/docs/design/storage/local-cache-db.md §5 `forget_account`）走到 `media` 這一層時回傳沒人指的 `pool_file`，池刪檔。
 
 ## 5 配額與清理（維護者 2026-09-05 定）
 
@@ -66,9 +66,9 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 - 整檔進整檔出。先刪檔再把列 reset 成「還沒下載」（列本身留著：事件還指著它），中途死掉留下的「說完整但檔不在」的列在下次啟動掃一次 reset；`complete = 0` 且沒有下載在跑的半成品也在啟動時掃，超過保護期就清。
 - 有把手打開的檔不刪；讀一次就更新 `last_used_at`，所以正在看的東西自然在保護期內。
   還沒做：`collect_garbage` 不查有沒有把手開著，現在只靠 `last_used_at` 與保護期擋。
-- 事件快取不受這個配額（local-cache-db.md §1）。
+- 事件快取不受這個配額（/docs/design/storage/local-cache-db.md §1）。
 
-**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now)` 啟動掃：DB 說完整但檔不在 → reset；半成品超過保護期 → 刪暫存檔加 reset；`pending/` 裡沒有列認領的 → 刪；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後留下的）→ 刪。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
+**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now)` 啟動掃：DB 說完整但檔不在 → reset；半成品超過保護期 → 刪暫存檔加 reset；`pending/` 裡沒有列認領的 → 刪；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後留下的）→ 刪。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
 
 ## 6 先不做的
 
@@ -103,7 +103,7 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 第 i 段（i 從 0 起，u64）：
   位置   = 32 + i × (segment_size + 16)
   內容   = XChaCha20-Poly1305(
-             key   = 第四把子金鑰 "wbf-matrix-client media store v1"（32 byte，全池共用，vault-and-keys.md §1）
+             key   = 第四把子金鑰 "wbf-matrix-client media store v1"（32 byte，全池共用，/docs/design/storage/vault-and-keys.md §1）
              nonce = nonce_base(16) ‖ u64_le(i)                     → 24 byte
              aad   = "wbf-media-pool v1" ‖ nonce_base(16) ‖ u64_le(i)
              明文  = 第 i 段明文 )
@@ -123,13 +123,13 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 **寫入（`PoolWriter`）**：收明文進 segment_size 的緩衝，湊滿封一段 append；同時餵 BLAKE3。`finish()` 封最後的短段、fsync、回明文 BLAKE3 hex（就是檔名）。
 **暫定段**：進度快照前 `sync()` 把緩衝裡湊不滿的那段先封成短段寫在檔尾並 fsync，讓快照指到的每個 byte 都在磁碟上；下次要封正式的第 i 段時先把檔截回第 i 段的起點再寫。所以**檔中間永遠不會有短段**，短段只可能在檔尾。
 **續傳（`resume_pending(trusted_len)`）**：完整段數 = trusted_len / segment_size 逐段解開餵 BLAKE3；尾巴 = trusted_len % segment_size 從下一段解出來放回緩衝；檔截到完整段之後；接著寫。trusted_len 來自 DB 的 `chunks_written × chunk_size`，之後的資料一律不信。
-**讀取（`PoolReader`）**：`seek` 只改明文位置；`read` 算出段號、讀那一段解開、快取在記憶體，同段連續讀不重解。任何一段標籤不對回 `Io` 錯，上層當「檔壞了、重拉」（local-cache-db.md §1）。
+**讀取（`PoolReader`）**：`seek` 只改明文位置；`read` 算出段號、讀那一段解開、快取在記憶體，同段連續讀不重解。任何一段標籤不對回 `Io` 錯，上層當「檔壞了、重拉」（/docs/design/storage/local-cache-db.md §1）。
 
 **跟 server 的 chunk 無關**：server 的 `chunk_size` 是傳輸單位、每檔可不同（事件區塊裡）；池的 `segment_size` 是儲存單位、寫在每個檔頭。下載時一個 chunk 的明文丟進 `PoolWriter`，它照自己的 64 KiB 切，兩邊不必對齊；續傳點落在段中間也照上面的尾巴規則處理。
 
 **檔名與目錄**：完成檔是 `media/<hash 前 2 hex>/<hash>`（hash = 明文 BLAKE3（32 byte），64 個小寫 hex 字元），下載中是 `media/pending/m<media.id>`。**檔案本身不帶任何 metadata**：原檔名、mimetype、校驗碼、mxc、大小都只在 `cache.db` 的 `media` 列（`name`／`mimetype`／`hash` 來自事件區塊，上傳者填的；`hash` 的形式是 `<algo>:<hex>`，區塊沒帶 sha256 時下載完用我們算的 BLAKE3 補成 `blake3:…`；同內容去重成一個池檔時，每個 mxc 各自保留自己的 name／mimetype／hash）。磁碟上能看到的只有幾個檔、各多大。
 
-**安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；金鑰不進錯誤訊息。**暫定段用自己的 nonce**（段號最高位設 1）：同段號的暫定段與之後的正式段是兩個 nonce，每個 nonce 只封一次——AEAD 同 (key, nonce) 封兩份不同明文會漏 Poly1305 金鑰，這條路被堵死；段號因此只用 63 位。`resume_pending` 讀暫存檔尾巴時先用暫定 nonce、解不開再用正式的（尾巴可能是暫定段，也可能是快照點落在中間的正式整段）；完成檔裡永遠沒有暫定段。**不防**：能讀 `local.key` 的人（同 vault-and-keys.md §1 的威脅模型）、檔案大小與數量。
+**安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；金鑰不進錯誤訊息。**暫定段用自己的 nonce**（段號最高位設 1）：同段號的暫定段與之後的正式段是兩個 nonce，每個 nonce 只封一次——AEAD 同 (key, nonce) 封兩份不同明文會漏 Poly1305 金鑰，這條路被堵死；段號因此只用 63 位。`resume_pending` 讀暫存檔尾巴時先用暫定 nonce、解不開再用正式的（尾巴可能是暫定段，也可能是快照點落在中間的正式整段）；完成檔裡永遠沒有暫定段。**不防**：能讀 `local.key` 的人（同 /docs/design/storage/vault-and-keys.md §1 的威脅模型）、檔案大小與數量。
 
 **快取命中的核對**：`fetch` 命中前比對池檔開得起來、明文長度等於區塊 `file_size`、區塊帶 sha256 時要等於 `media.hash`；任一不符 `media_reset` 重下。CLI 的 `sha256_verified` 只在這次真的下載才 true，命中報 false 並附 `hash`。
 

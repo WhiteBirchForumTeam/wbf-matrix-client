@@ -1,9 +1,9 @@
 //! 上傳：分塊、續傳、封存成 manifest，以及「上傳完當成附件送進房間」。
 //!
 //! ⚠️ **續傳狀態檔寫在使用者那個檔案旁邊**（`<file>.wbf-upload.json`）。那個位置是
-//! 命令列定的（wbf-cli-spec.md §3.2、§6），在 daemon 模型下**不一定對**——daemon 可能根本
+//! 命令列定的（/docs/design/rpc-specs/wbf-cli-spec.md §3.2、§6），在 daemon 模型下**不一定對**——daemon 可能根本
 //! 沒有那個目錄的寫入權（Android 的 SAF 給的是 `content://`，連路徑都沒有）。
-//! 🚫 **不在這裡發明新答案**：開著的項目是 architecture-v2.md §7 第 9 點。
+//! 🚫 **不在這裡發明新答案**：開著的項目是 /docs/design/overview/architecture-v2.md §7 第 9 點。
 
 use std::path::{Path, PathBuf};
 
@@ -51,7 +51,7 @@ pub struct SendFileResult {
     /// （2026-09-12 真 server 驗證抓到：重構時這一步掉了，而且是靜默的）。
     #[serde(skip)]
     pub manifest: Manifest,
-    /// ⚠️ 附件**有沒有向 server 宣告**（wbf-client-convention-for-chunk.md §5.2）。wbf 帳號走 `Event/Send`，一律是 `true`；
+    /// ⚠️ 附件**有沒有向 server 宣告**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。wbf 帳號走 `Event/Send`，一律是 `true`；
     /// 一般 Matrix 帳號走 matrix-sdk 的 `Room::send`，不能加 header，一律是 `false`。
     /// 🚫 沒宣告的上傳過了保護期會被掃掉——這個欄位就是讓前端講得出這件事。
     pub attachment_declared: bool,
@@ -71,7 +71,7 @@ impl Core {
 
     /// 上傳一個檔案，然後把它當附件送進房間。
     ///
-    /// 🚫 **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（architecture-v2.md §3）。前端要先問
+    /// 🚫 **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（/docs/design/overview/architecture-v2.md §3）。前端要先問
     /// [`Core::conversation`]，再用 [`crate::cipher_for_plaintext_room`] 決定 `cipher`。
     pub async fn send_file(
         &self,
@@ -83,7 +83,7 @@ impl Core {
     ) -> Result<SendFileResult, CoreError> {
         let account = self.account_or_current(target)?;
         if self.is_wbf_account(&account)? {
-            // wbf 帳號：事件走 `Event/Send`，附件在 meta 裡宣告（wbf-client-convention-for-chunk.md §5.2 終於成立）。加密房在**上傳之前**就拒，不白傳。
+            // wbf 帳號：事件走 `Event/Send`，附件在 meta 裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2 終於成立）。加密房在**上傳之前**就拒，不白傳。
             self.wbf_refuse_if_encrypted(&account, room).await?;
             let manifest = self
                 .upload_with_account(&account, request, transport)
@@ -120,7 +120,7 @@ impl Core {
             mxc: manifest.mxc.clone(),
             block: manifest.block.clone(),
         };
-        // wbf-client-convention-for-chunk.md §5.2：附件宣告這一版帶不出去。⚠️ 講清楚，🚫 不裝作沒事——
+        // /docs/design/media/wbf-client-convention-for-chunk.md §5.2：附件宣告這一版帶不出去。⚠️ 講清楚，🚫 不裝作沒事——
         // 沒被引用的上傳過了 server 的保護期就會被掃掉。
         self.events.progress(format!(
             "attachment {} is NOT declared to the server (no Event/Send yet); an unreferenced upload is swept after the server's grace period",
@@ -238,7 +238,7 @@ impl Core {
     }
 }
 
-/// 續傳狀態檔就放在那個檔案旁邊（wbf-cli-spec.md §3.3）。
+/// 續傳狀態檔就放在那個檔案旁邊（/docs/design/rpc-specs/wbf-cli-spec.md §3.3）。
 pub(crate) fn remove_resume_state(file: &Path) -> Result<(), CoreError> {
     remove_if_exists(&state_path_for(file))
 }

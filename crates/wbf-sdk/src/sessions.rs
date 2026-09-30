@@ -1,8 +1,8 @@
-//! 會話表：這個 pack 是誰的（ws-receive-dispatch.md §2–§4）。
+//! 會話表：這個 pack 是誰的（/docs/design/daemon/ws-receive-dispatch.md §2–§4）。
 //!
 //! 純資料結構、同步、沒有網路：`SessionKey` → `PackSink`。讀取 task 每收一個 pack 先 `classify`（查表、不動表）、
 //! 放鎖之後叫鉤子、再 `dispatch`（交付）；沒人等就是「無主」，計數、🚫 不交給剛好在等的人。
-//! 鉤子（`ReceivedHook`，ws-receive-dispatch.md §4）的型別定義在這裡，但表**不持有、不呼叫**它：它在表鎖之外由 `link.rs` 叫，才不會重入死鎖。
+//! 鉤子（`ReceivedHook`，/docs/design/daemon/ws-receive-dispatch.md §4）的型別定義在這裡，但表**不持有、不呼叫**它：它在表鎖之外由 `link.rs` 叫，才不會重入死鎖。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +14,7 @@ use wbf_wire::{Kind, Pack};
 
 use crate::error::SdkError;
 
-/// `id` 是會話的名字，`seq` 是會話內的計數（wbfuwunel 的 wbf-wire-format.md §4.1）。
+/// `id` 是會話的名字，`seq` 是會話內的計數（wbfuwunel 的 /docs/design/wbf-wire-format.md §4.1）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionKey {
     /// 具名會話：所有抄這個 `id` 的 pack 都是它的（含推播與 `Superseded`）。`id` 不是 0。
@@ -24,7 +24,7 @@ pub enum SessionKey {
 }
 
 /// 這個 pack 走了哪條路。只給鉤子與 log 看，表自己不用它做決定。
-/// 有 serde：它會跟著 `CoreEvent::Received` 變成 RPC 的推播（link-pool.md §4）。
+/// 有 serde：它會跟著 `CoreEvent::Received` 變成 RPC 的推播（/docs/design/daemon/link-pool.md §4）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Route {
@@ -45,7 +45,7 @@ pub struct Received<'a> {
 }
 
 /// 同步、不可等待：要做慢事就自己丟進自己的佇列，讀取 task 不被它拖住。
-/// 在表鎖**之外**叫（ws-receive-dispatch.md §4），所以裡面可以讀同一條 link 的同步狀態（`unmatched()` 之類）；🚫 不能在裡面 block 等這條 link 的回覆——那是等自己。
+/// 在表鎖**之外**叫（/docs/design/daemon/ws-receive-dispatch.md §4），所以裡面可以讀同一條 link 的同步狀態（`unmatched()` 之類）；🚫 不能在裡面 block 等這條 link 的回覆——那是等自己。
 pub type ReceivedHook = Arc<dyn Fn(&Received<'_>) + Send + Sync>;
 
 /// 什麼都不做的鉤子（沒接 UI 的時候）。
@@ -125,7 +125,7 @@ impl PackSink for OneshotSink {
 }
 
 /// 串流的收件匣一次最多積幾個 pack。串流的窗有 server 的則數與位元組上限（`Recent` 一窗 ≤ 500 則、每 Batch 10 則），
-/// 一個正常的消費者不會塞滿它；塞滿是消費端的 bug，這段會話**失敗**（🚫 不丟、🚫 不擋讀取 task，ws-receive-dispatch.md §3）。
+/// 一個正常的消費者不會塞滿它；塞滿是消費端的 bug，這段會話**失敗**（🚫 不丟、🚫 不擋讀取 task，/docs/design/daemon/ws-receive-dispatch.md §3）。
 pub const STREAM_QUEUE_PACKS: usize = 256;
 
 /// 一問多答：`Recent`、`Fetch`、`ItemsDestroy`、`Subscribe` 的 Ack＋`CryptoState`。`IS_LAST` 或 `Control/Error` 之後結束。
@@ -293,7 +293,7 @@ impl SessionTable {
         self.connection_id
     }
 
-    /// 🚨 登記一定在送出之前（ws-receive-dispatch.md §2.1）。同一個鍵已經有人在等就是呼叫端的 bug：拒絕，🚫 不蓋掉。
+    /// 🚨 登記一定在送出之前（/docs/design/daemon/ws-receive-dispatch.md §2.1）。同一個鍵已經有人在等就是呼叫端的 bug：拒絕，🚫 不蓋掉。
     ///
     /// Return:
     ///     Ok(generation)  登記了；拿掉自己時用 `remove_if(key, generation)`
@@ -353,7 +353,7 @@ impl SessionTable {
         self.entries.is_empty()
     }
 
-    /// ws-receive-dispatch.md §2.1 的四條規則，依序。
+    /// /docs/design/daemon/ws-receive-dispatch.md §2.1 的四條規則，依序。
     fn find_key(&self, pack: &Pack) -> Option<SessionKey> {
         if pack.id != 0 && self.entries.contains_key(&SessionKey::Session(pack.id)) {
             return Some(SessionKey::Session(pack.id));

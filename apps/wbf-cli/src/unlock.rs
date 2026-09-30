@@ -1,15 +1,15 @@
-//! CLI 怎麼打開 vault（vault-and-keys.md §1 的 CLI 那一列）：資料目錄在哪、passphrase 從哪來。
+//! CLI 怎麼打開 vault（/docs/design/storage/vault-and-keys.md §1 的 CLI 那一列）：資料目錄在哪、passphrase 從哪來。
 //!
 //! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼（只有 `login` 用）。
 //! passphrase 來源的優先順序：`--passphrase-file` → `local.key` 是 `Plain` 就不用 passphrase → 問終端。
 //! ⚠️ 這整個模組是「**一個命令一個程序**」的產物：問終端、讀 passphrase 檔，都是為了
-//! 「每次執行都要重新解鎖」而存在。daemon 常駐之後（architecture-v2.md §1、local-interface.md §5）passphrase
+//! 「每次執行都要重新解鎖」而存在。daemon 常駐之後（/docs/design/overview/architecture-v2.md §1、/docs/design/rpc-specs/local-interface.md §5）passphrase
 //! 改從 RPC 的 `vault.unlock` 進來——所以 🚫 這些都沒有搬進 `wbf-core`。
 //! 這裡的責任是「把 passphrase 生出來」，解鎖本身交給 `Core`。
 //!
 //! 🚫 **沒有 `unlock.ticket`**（維護者 2026-09-13 拿掉）：那張票是仿 `sudo`、為了「每個命令都要
 //! 重新解鎖」而把**明文主金鑰落地** 15 分鐘的妥協。daemon 之後單發命令只剩 debug／test 的用途
-//! （常駐時碰資料庫的命令一律跳錯，architecture-v2.md §0.2），省那幾次打字換不到落地一份主金鑰。
+//! （常駐時碰資料庫的命令一律跳錯，/docs/design/overview/architecture-v2.md §0.2），省那幾次打字換不到落地一份主金鑰。
 
 use std::path::{Path, PathBuf};
 use wbf_core::{Core, CoreError, CoreErrorKind};
@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 /// 舊版（PR #9 之前）的明文 session 檔；看到它只提示，不讀。
 const LEGACY_SESSION_FILE_NAME: &str = "session.json";
 
-/// wbf-cli-spec.md §7 的預設資料目錄。
+/// /docs/design/rpc-specs/wbf-cli-spec.md §7 的預設資料目錄。
 ///
 /// Return:
 ///     Ok(PathBuf)      Windows `%APPDATA%\wbf-cli`；macOS `~/Library/Application Support/wbf-cli`；
@@ -57,7 +57,7 @@ impl UnlockOptions {
     /// 讓 `core` 解鎖。**rpc-cli 這一側的責任就是「把 passphrase 生出來」**：
     /// `--passphrase-file` → 問終端。解鎖本身在 `Core`。
     ///
-    /// 📎 daemon 沒有這整條：passphrase 從 RPC 的 `vault.unlock` 進來（local-interface.md §5）。
+    /// 📎 daemon 沒有這整條：passphrase 從 RPC 的 `vault.unlock` 進來（/docs/design/rpc-specs/local-interface.md §5）。
     ///
     /// Return:
     ///     Ok(())       解開了，或本來就開著
@@ -98,14 +98,14 @@ impl UnlockOptions {
     }
 }
 
-/// `--passphrase-file` 的規則（vault-and-keys.md §3）：**整檔原始 bytes**。
+/// `--passphrase-file` 的規則（/docs/design/storage/vault-and-keys.md §3）：**整檔原始 bytes**。
 ///
 /// 🚫 不去尾換行、🚫 不驗 UTF-8、🚫 不 trim：passphrase 只餵給本機的 Argon2id，永遠不出這台
 /// 機器，所以它可以是中文、可以是一個 mp3。⚠️ 這代表 `echo hunter2 > pw`（結尾有 `\n`）跟
 /// `printf hunter2 > pw` 是**兩個不同的 passphrase**——檔案就是檔案，🚫 我們不替使用者猜
 /// 哪個 byte 不算數。
 ///
-/// 🚫 `--password-file` 不走這個（vault-and-keys.md §3.4）：那句話要送給 homeserver，Matrix 規定它是 JSON
+/// 🚫 `--password-file` 不走這個（/docs/design/storage/vault-and-keys.md §3.4）：那句話要送給 homeserver，Matrix 規定它是 JSON
 /// 字串，塞不進任意 bytes。兩者長得像，但一個是本機的鑰匙、一個是要上線的憑證。
 ///
 /// Args:
@@ -117,7 +117,7 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CoreError
     Ok(Zeroizing::new(std::fs::read(path)?))
 }
 
-/// `--password-file` 的規則（wbf-cli-spec.md §3.1）：整檔就是那句話，去掉結尾一個換行。
+/// `--password-file` 的規則（/docs/design/rpc-specs/wbf-cli-spec.md §3.1）：整檔就是那句話，去掉結尾一個換行。
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>, CoreError> {
     let text = Zeroizing::new(std::fs::read_to_string(path)?);
     let trimmed = text
@@ -148,7 +148,7 @@ pub fn prompt_password_on_terminal(label: &str) -> Result<Zeroizing<String>, Cor
 
 /// 從終端讀 passphrase：那一行的 UTF-8 bytes，不含結尾換行。
 ///
-/// ⚠️ 終端只打得出字，所以這是 vault-and-keys.md §3 那個「任意 bytes」的天然子集——同一句話從終端打
+/// ⚠️ 終端只打得出字，所以這是 /docs/design/storage/vault-and-keys.md §3 那個「任意 bytes」的天然子集——同一句話從終端打
 /// 與用 `printf` 寫進檔案是**同一個** passphrase，用 `echo` 寫的（多一個 `\n`）不是。
 pub fn prompt_passphrase_on_terminal(label: &str) -> Result<Zeroizing<Vec<u8>>, CoreError> {
     Ok(Zeroizing::new(
@@ -191,7 +191,7 @@ mod tests {
 
     /// 這一側的責任是「把 passphrase 生出來」，所以測的是**來源的優先序**，
     /// 🚫 不是解鎖本身（那在 `wbf-core` 的測試裡）。
-    /// 中文加一個 0x00：兩者以前都過不了 `read_to_string`（vault-and-keys.md §3）。
+    /// 中文加一個 0x00：兩者以前都過不了 `read_to_string`（/docs/design/storage/vault-and-keys.md §3）。
     const BINARY_PASSPHRASE: &[u8] = "早安\u{0}世界".as_bytes();
 
     fn new_core(options: &UnlockOptions) -> Core {
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn a_passphrase_file_is_taken_byte_for_byte() {
-        // vault-and-keys.md §3：檔案就是檔案。`echo` 寫的（結尾 \n）與 `printf` 寫的是兩個不同的 passphrase，
+        // /docs/design/storage/vault-and-keys.md §3：檔案就是檔案。`echo` 寫的（結尾 \n）與 `printf` 寫的是兩個不同的 passphrase，
         // 🚫 不替使用者猜哪個 byte 不算數——猜錯的那天是 local.key 打不開。
         let dir = std::env::temp_dir().join(format!("wbf-pp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

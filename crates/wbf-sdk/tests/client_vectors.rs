@@ -1,4 +1,4 @@
-//! 對著 `docs/design/media/wbf-client-vectors.json`（wbf-client-convention-for-chunk.md §9）跑。
+//! 對著 `/docs/design/media/wbf-client-vectors.json`（/docs/design/media/wbf-client-convention-for-chunk.md §9）跑。
 //! 這裡紅 = 這個 crate 與約定漂移了，或向量檔過期了。
 //!
 //! 向量檔由這個測試本身產生：`WBF_WRITE_CLIENT_VECTORS=1 cargo test -p wbf-sdk --test client_vectors`
@@ -22,7 +22,7 @@ struct Vectors {
     convention_v: u32,
     /// 每個 cipher 一個檔：固定 key／nonce_base，一個小檔切幾塊。
     files: Vec<FileVector>,
-    /// wbf-client-convention-for-chunk.md §7。
+    /// /docs/design/media/wbf-client-convention-for-chunk.md §7。
     seek: Vec<SeekVector>,
     /// 事件區塊或描述，必須被拒絕的樣本；`error` 是 `BlockError` 的變體名。
     rejected_blocks: Vec<RejectedBlockVector>,

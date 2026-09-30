@@ -1,8 +1,8 @@
-//! `room.*` 與 `sync.recent`（rpc-spec.md §3.3、§3.4）。
+//! `room.*` 與 `sync.recent`（/docs/design/rpc-specs/rpc-spec.md §3.3、§3.4）。
 //!
 //! 🚫 沒有 `room.watch`：常駐之後新訊息走訂閱＋推播（下一支）。
 //! 🚫 沒有確認：沒 E2EE 的房間送檔案，CLI 會問「送明文嗎」；daemon 不問，
-//! 只守住那條不能破的規矩——**沒 E2EE 的房間永遠不送加密的區塊**（wbf-client-convention-for-chunk.md §5.1）。
+//! 只守住那條不能破的規矩——**沒 E2EE 的房間永遠不送加密的區塊**（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 
 use std::path::PathBuf;
 
@@ -22,7 +22,7 @@ use super::{
 #[derive(Deserialize)]
 struct RoomParams {
     room: String,
-    /// 沒帶就是 `local`（rpc-spec.md §2）。
+    /// 沒帶就是 `local`（/docs/design/rpc-specs/rpc-spec.md §2）。
     #[serde(default)]
     sync: SyncMode,
     #[serde(flatten)]
@@ -52,7 +52,7 @@ pub(super) async fn room_get(handle: &Handle, core: &Core, params: Value) -> Out
     )
 }
 
-/// 加密房要帶 `room_devices`（UI 存的那份，`room.refresh_devices` 回的）；被擋回 1401，`data` 是 daemon 自動重拿的房間狀態（e2ee-rpc.md §3）。
+/// 加密房要帶 `room_devices`（UI 存的那份，`room.refresh_devices` 回的）；被擋回 1401，`data` 是 daemon 自動重拿的房間狀態（/docs/design/keys/e2ee-rpc.md §3）。
 pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
@@ -82,7 +82,7 @@ pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) 
 }
 
 /// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。
-/// 回的 `{room_version, members, shared}` UI 存下來，送出時整份當 `room_devices` 帶回來（e2ee-rpc.md §2）。
+/// 回的 `{room_version, members, shared}` UI 存下來，送出時整份當 `room_devices` 帶回來（/docs/design/keys/e2ee-rpc.md §2）。
 pub(super) async fn room_refresh_devices(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
@@ -103,7 +103,7 @@ pub(super) async fn room_refresh_devices(handle: &Handle, core: &Core, params: V
     Ok(json!(refreshed))
 }
 
-/// 路徑版（rpc-spec.md §3.3）：daemon 自己讀檔、上傳、送事件，一則回應。
+/// 路徑版（/docs/design/rpc-specs/rpc-spec.md §3.3）：daemon 自己讀檔、上傳、送事件，一則回應。
 /// result 多帶 `manifest`（含金鑰）：前端要存就自己存，🚫 daemon 不落地。
 pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
@@ -177,7 +177,7 @@ struct PageParams {
     limit: u32,
     #[serde(default)]
     before: Option<String>,
-    /// 沒帶就是 `local`（rpc-spec.md §2）。📎 `before` 三種 `sync` 都是 `event_id`（上一頁的 `next`）。
+    /// 沒帶就是 `local`（/docs/design/rpc-specs/rpc-spec.md §2）。📎 `before` 三種 `sync` 都是 `event_id`（上一頁的 `next`）。
     #[serde(default)]
     sync: SyncMode,
     #[serde(flatten)]
@@ -232,14 +232,14 @@ pub(super) async fn room_files(handle: &Handle, core: &Core, params: Value) -> O
 pub(super) async fn sync_recent(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
-        /// 這一輪總共要幾則；0 = 拉到追平（wbf-cli-spec.md §3.5）。
+        /// 這一輪總共要幾則；0 = 拉到追平（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。
         #[serde(default = "default_max_events")]
         max_events: u64,
         #[serde(default = "default_window")]
         window: u32,
         #[serde(default)]
         batch: Option<u32>,
-        /// 從這個 `g_seq` 之後拿（UI 自己記的起點）；沒帶用 daemon 存的上一次水位（rpc-spec.md §3.5）。
+        /// 從這個 `g_seq` 之後拿（UI 自己記的起點）；沒帶用 daemon 存的上一次水位（/docs/design/rpc-specs/rpc-spec.md §3.5）。
         #[serde(default)]
         since: Option<i64>,
         #[serde(default)]

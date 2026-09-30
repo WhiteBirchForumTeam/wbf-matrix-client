@@ -1,4 +1,4 @@
-//! 訂閱線的金鑰那半：`Device/Subscribe`、上線追平、推來的匯進 store、任何異常就從佇列頭拉一次（key-sync.md）。
+//! 訂閱線的金鑰那半：`Device/Subscribe`、上線追平、推來的匯進 store、任何異常就從佇列頭拉一次（/docs/design/keys/key-sync.md）。
 //!
 //! 維護者 2026-09-24 定的形狀：
 //!
@@ -6,9 +6,9 @@
 //!   ——匯進 crypto store、水位與待銷毀清單落地、對 server 銷毀那一包。這裡不解封包、不碰 store，只把 items 交給它。
 //! - 金鑰自己一條線（`LinkRole::Keys`，維護者 2026-09-29）。`Device/Fetch`／`ItemsDestroy` 也走它（server：只有持有這台裝置佇列的連線能銷毀），所以 task 要用線時跟池拿同一格。
 //! - 訂閱結束（被另一台裝置接手的 1505、線死了）就停、發 `keys.state: stopped`、關掉這格線（跟房間那半同一個做法）；
-//!   🚫 不在這裡重訂（to-device-client.md §5.1：兩台會互踢）。重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
+//!   🚫 不在這裡重訂（/docs/design/keys/to-device-client.md §5.1：兩台會互踢）。重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
 //! - `keys.state` 留著（「有點多餘，但傾向保留——不然 RPC 無從知道」）。
-//! - 維護者 2026-09-29（e2ee-rpc.md §2、§5）：開線時上傳自己的裝置金鑰與一次性金鑰；`CryptoState` 一到就把存量交給狀態機、它要補就補
+//! - 維護者 2026-09-29（/docs/design/keys/e2ee-rpc.md §2、§5）：開線時上傳自己的裝置金鑰與一次性金鑰；`CryptoState` 一到就把存量交給狀態機、它要補就補
 //!   （上游一律補到 50 把＋一把 fallback key，vodozemac 的上限）；每匯進一批帶新房間金鑰，就去 cache 找那把 session 還沒解的訊息立刻解、發 `room.message`。
 //!
 //! 🚨 **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）：server 的佇列沒有洞（每一則存到我們 `ItemsDestroy` 才刪），
@@ -110,7 +110,7 @@ impl Core {
 
     /// 金鑰那條線開好之後（`room_sync::init_connection` 叫）：`Device/Subscribe` → 上線追平（先訂再拉，中間到的沒人漏）→ 起收金鑰的 task。
     ///
-    /// ⚠️ 這裡回錯就是這條線沒開成：fail loud，因為「金鑰沒在收」靠 UI 看不出來，而線開不起來看得出來（key-sync.md §1）。
+    /// ⚠️ 這裡回錯就是這條線沒開成：fail loud，因為「金鑰沒在收」靠 UI 看不出來，而線開不起來看得出來（/docs/design/keys/key-sync.md §1）。
     /// 唯一的例外是「這不是 wbf 帳號」：金鑰不在這裡，講一聲、跳過（鉤子本來就只替 wbf 帳號開線，這條是多一道防線）。
     ///
     /// Args:
@@ -144,13 +144,13 @@ impl Core {
             .await?;
         // Ack 之前推來的（early pushes）不用單獨匯：它們還沒銷，還在佇列裡，下面的追平會連同更舊的一起拉回來。
         subscription.early_pushes.clear();
-        // 上線追平（to-device-client.md §7）：從佇列最舊還沒銷毀的起一窗一窗拉到 more=false；空窗也走一次（補送上次沒銷成的）。
-        // 這裡失敗＝整條訂閱線沒開成；沒進 store 的還在佇列裡，下次開線的追平會拉回（key-sync.md §1、PR #60 審查 rumia 🟡）。
+        // 上線追平（/docs/design/keys/to-device-client.md §7）：從佇列最舊還沒銷毀的起一窗一窗拉到 more=false；空窗也走一次（補送上次沒銷成的）。
+        // 這裡失敗＝整條訂閱線沒開成；沒進 store 的還在佇列裡，下次開線的追平會拉回（/docs/design/keys/key-sync.md §1、PR #60 審查 rumia 🟡）。
         let reports = engine.pull_to_device(client, REPLY_TIMEOUT).await?;
         emit_caught_up(&self.events, &me, &reports);
         decrypt_what_the_keys_open(&engine, &cache, &self.events, &me, &reports).await;
         // 訂閱時 server 跟著推的那個 `CryptoState`（sdk 收在 `subscription.crypto_state`）：先把存量交給狀態機，
-        // 下面那一次上傳才知道要補幾把一次性金鑰、要不要補 fallback key（e2ee-rpc.md 那支的測試抓到：沒交的話要等到下一個 `CryptoState` 才補）。
+        // 下面那一次上傳才知道要補幾把一次性金鑰、要不要補 fallback key（/docs/design/keys/e2ee-rpc.md 那支的測試抓到：沒交的話要等到下一個 `CryptoState` 才補）。
         let initial = &subscription.crypto_state;
         if let Err(error) = engine
             .receive_to_device(
@@ -215,7 +215,7 @@ impl Core {
         true
     }
 
-    /// 說出口的退出（wbfuwunel 的 wbf-to-device.md §4）：下線前對訂閱線送 `Device/Unsubscribe`。線沒開就沒事；失敗只講一聲（token 之後也撤了）。
+    /// 說出口的退出（wbfuwunel 的 /docs/design/wbf-to-device.md §4）：下線前對訂閱線送 `Device/Unsubscribe`。線沒開就沒事；失敗只講一聲（token 之後也撤了）。
     pub(crate) async fn unsubscribe_keys_of(&self, account: &AccountDir) {
         let pool = self
             .link_pools
@@ -306,7 +306,7 @@ impl KeySyncTask {
                 }
                 continue;
             };
-            // 🚫 不重訂（to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）。
+            // 🚫 不重訂（/docs/design/keys/to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）。
             // 關掉這格（跟房間那半一樣）：socket 可能還活著，不關的話鉤子看它活著就不會重開，金鑰就永遠沒人收。
             self.events.emit(CoreEvent::Keys {
                 user: self.me.clone(),
@@ -706,7 +706,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 維護者 2026-09-29（e2ee-rpc.md §5）：開金鑰那條線時上傳這台裝置的金鑰（別人才查得到它）；`CryptoState` 說一次性金鑰剩不多 → 補上傳。
+    /// 維護者 2026-09-29（/docs/design/keys/e2ee-rpc.md §5）：開金鑰那條線時上傳這台裝置的金鑰（別人才查得到它）；`CryptoState` 說一次性金鑰剩不多 → 補上傳。
     /// 存量是滿的（50 把）就不上傳。
     #[tokio::test]
     async fn the_keys_line_uploads_this_devices_keys_and_tops_up_one_time_keys() {

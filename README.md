@@ -72,7 +72,7 @@ A few notes:
 
 ## Documentation
 
-Design documents live in [`docs/design`](docs/design), one folder per topic; start from the index, [`docs/design/index.md`](docs/design/index.md). They are written in Traditional Chinese.
+Design documents live in [`docs/design`](docs/design), one folder per topic; start from the index, [`/docs/design/index.md`](docs/design/index.md). They are written in Traditional Chinese.
 
 | Folder | Covers |
 |---|---|
@@ -183,7 +183,7 @@ git submodule update --init
 
 ## 文件
 
-設計文件在 [`docs/design`](docs/design)，一個資料夾一個題目；從索引 [`docs/design/index.md`](docs/design/index.md) 開始看。以繁體中文撰寫。
+設計文件在 [`docs/design`](docs/design)，一個資料夾一個題目；從索引 [`/docs/design/index.md`](docs/design/index.md) 開始看。以繁體中文撰寫。
 
 | 資料夾 | 內容 |
 |---|---|

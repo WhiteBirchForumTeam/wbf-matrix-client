@@ -1,4 +1,4 @@
-//! wbfuwunel 的 chunked-upload-spec.md §1、§3、§4 的訊息：怎麼組請求 pack、怎麼讀回應。
+//! wbfuwunel 的 /docs/design/chunked-upload-spec.md §1、§3、§4 的訊息：怎麼組請求 pack、怎麼讀回應。
 //!
 //! 這裡不碰網路、不碰加密：輸入輸出都是 `Pack` 與 JSON。通道在 `channel`，加密在 `chunk_crypto`。
 
@@ -9,10 +9,10 @@ use wbf_wire::{EncryptedFileInfo, Kind, Pack};
 
 use crate::error::SdkError;
 
-/// `Hello` 的 meta（wbfuwunel 的 chunked-upload-spec.md §1）。
+/// `Hello` 的 meta（wbfuwunel 的 /docs/design/chunked-upload-spec.md §1）。
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// `Hello.features` 裡唯一 server 會讀的字串（wbfuwunel `wbf-room-device-version.md` §6.2）。
+/// `Hello.features` 裡唯一 server 會讀的字串（wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §6.2）。
 /// 宣告了，server 才推 `Event/DeviceChanged`；**宣告了之後，加密訊息漏帶 `room_version` 會被 `InvalidRequest` 拒**——
 /// 所以只有「送出前會比對房間版本號」的那條路才能宣告它。server 的 `Hello` 回應 `features` 也列這一項，
 /// 拿來判斷對面支不支援。
@@ -69,7 +69,7 @@ pub fn status(upload_id: u64, seq: u32) -> Pack {
 }
 
 /// Args:
-///     description_data: 最終描述，取代 `Create` 那份（wbf-client-convention-for-chunk.md §4：一律帶）
+///     description_data: 最終描述，取代 `Create` 那份（/docs/design/media/wbf-client-convention-for-chunk.md §4：一律帶）
 pub fn seal(upload_id: u64, description_data: Vec<u8>, seq: u32) -> Pack {
     upload_request(upload::SEAL, upload_id, seq, description_data)
 }
@@ -128,7 +128,7 @@ fn download_request(subtype: u8, seq: u32, meta: serde_json::Value) -> Pack {
 
 // ---- 回應 ----
 
-/// wbfuwunel 的 chunked-upload-spec.md §2 的回應規則：Control、`IS_RESPONSE`、id 與 seq 抄請求的；`Ack` 過、`Error` 變 `SdkError::Server`。
+/// wbfuwunel 的 /docs/design/chunked-upload-spec.md §2 的回應規則：Control、`IS_RESPONSE`、id 與 seq 抄請求的；`Ack` 過、`Error` 變 `SdkError::Server`。
 ///
 /// Args:
 ///     request: 送出去的那個
@@ -143,7 +143,7 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
             response.kind, response.flags
         )));
     }
-    // id 與 seq 都要抄回（wbfuwunel 的 chunked-upload-spec.md §2）。唯一的放寬：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭，
+    // id 與 seq 都要抄回（wbfuwunel 的 /docs/design/chunked-upload-spec.md §2）。唯一的放寬：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭，
     // 所以只有 `Create` 允許標頭 id 不是 0，而 `create_upload` 會再拿它對 Ack meta 的 `id`。其他 id 0 的請求
     // （Hello、Ping、Info、Read）回應 id 必須是 0。
     let is_create = request.kind == Kind::Upload && request.subtype == upload::CREATE;
@@ -163,12 +163,12 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
     }
 }
 
-// ---- 橋：pack 帶 flags bit4，server 轉成內部 HTTP 請求交給 Matrix 端點（wbfuwunel `wbf-api-bridge.md`）----
+// ---- 橋：pack 帶 flags bit4，server 轉成內部 HTTP 請求交給 Matrix 端點（wbfuwunel 的 `/docs/design/wbf-api-bridge.md`）----
 //
-// 🚨 **號碼的權威在 server 的 `docs/bridge-specs/index.md`**（wbfuwunel 的 wbf-wire-format.md §3.2 只列原生的）。這裡只抄**用得到的**那幾個，
+// 🚨 **號碼的權威在 server 的 `docs/bridge-specs/index.md`**（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.2 只列原生的）。這裡只抄**用得到的**那幾個，
 // 用到一個抄一個，🚫 不整張表搬過來 —— 搬過來的那份不會知道 server 改了。
 
-/// server 在 `Hello.features` 宣告「橋在」的字串（wbfuwunel 的 wbf-api-bridge.md §3 批 3-C）。沒宣告的 server 不送橋的 pack。
+/// server 在 `Hello.features` 宣告「橋在」的字串（wbfuwunel 的 /docs/design/wbf-api-bridge.md §3 批 3-C）。沒宣告的 server 不送橋的 pack。
 pub const BRIDGE_FEATURE: &str = "bridge";
 /// server 宣告「`0x16 Device` 的原生 pack（to-device 佇列）在」的字串（同上）。
 pub const DEVICE_FEATURE: &str = "device";
@@ -476,7 +476,7 @@ pub struct SealAck {
     pub mxc: String,
 }
 
-/// wbfuwunel 的 chunked-upload-spec.md §4.1：整檔媒體（舊上傳）的分塊欄位是 null。
+/// wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.1：整檔媒體（舊上傳）的分塊欄位是 null。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct InfoAck {
     pub total_len: u64,
@@ -499,7 +499,7 @@ pub struct ReadAck {
     pub total_len: u64,
 }
 
-// ---- Event（kind 0x14）：wbfuwunel 的 room-seq-and-recent.md §2、wbfuwunel 的 media-attachments.md §3 ----
+// ---- Event（kind 0x14）：wbfuwunel 的 /docs/design/room-seq-and-recent.md §2、wbfuwunel 的 /docs/design/media-attachments.md §3 ----
 
 /// `unsigned` 裡 server 加的每房連續序號（第一個事件是 1；聯邦補回的歷史 0、−1、…）。
 pub const R_SEQ_KEY: &str = "org.wbftw.wbfuwunel.r_seq";
@@ -710,8 +710,8 @@ pub fn event_seqs(event: &serde_json::Value) -> (Option<i64>, Option<i64>) {
     (read(R_SEQ_KEY), read(G_SEQ_KEY))
 }
 
-/// `Event/Send` 的請求 meta（wbfuwunel 的 media-attachments.md §3、wbfuwunel `wbf-room-device-version.md` §7）。
-/// `attachments` 是這則訊息用到的 mxc，server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（wbfuwunel 的 chunked-upload-spec.md §12）。
+/// `Event/Send` 的請求 meta（wbfuwunel 的 /docs/design/media-attachments.md §3、wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §7）。
+/// `attachments` 是這則訊息用到的 mxc，server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（wbfuwunel 的 /docs/design/chunked-upload-spec.md §12）。
 /// 鍵序就是線上的 JSON 序（向量逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SendRequest {
@@ -765,7 +765,7 @@ pub struct SendAck {
     pub event_id: String,
 }
 
-// ---- 房間事件的訂閱（wbfuwunel `wbf-event-push.md` §2）：`Subscribe`／`Unsubscribe`／`Push` ----
+// ---- 房間事件的訂閱（wbfuwunel 的 `/docs/design/wbf-event-push.md` §2）：`Subscribe`／`Unsubscribe`／`Push` ----
 
 /// `Event/Subscribe` 的 meta。鍵序照向量（`cg_seq`、`rooms`），兩個都可省。
 /// - `rooms` 沒帶 ＝ 帳號層：現在加入的每個房，**之後新加入的也自動跟**；點名 ＝ 只那幾房（不是成員的列進 Ack 的 `skipped`）。
@@ -934,7 +934,7 @@ pub fn parse_push(pack: &Pack) -> Result<(PushMeta, Vec<serde_json::Value>), Sdk
     Ok((meta, events))
 }
 
-/// `Event/DeviceChanged`（`0x14 0x07`，只有 server → client）的 meta（wbfuwunel `wbf-room-device-version.md` §6）。
+/// `Event/DeviceChanged`（`0x14 0x07`，只有 server → client）的 meta（wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §6）。
 /// 某人的裝置版本號變了；`rooms` 是這條連線訂閱中、而且他在裡面的房間 → 各自新的房間版本號。
 /// 一條連線一次變動只收一個，不管共同幾個房。丟了由 `gap` 提醒，最後由送出時的 1506 擋。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -949,7 +949,7 @@ pub struct DeviceChangedMeta {
     pub gap: bool,
 }
 
-/// `Device/CryptoState`（`0x16 0x08`，只有 server → client）的 meta（wbfuwunel `wbf-e2ee.md` §3）：
+/// `Device/CryptoState`（`0x16 0x08`，只有 server → client）的 meta（wbfuwunel 的 `/docs/design/wbf-e2ee.md` §3）：
 /// **自己這台裝置**的金鑰存量，跟 `/sync` 的 `device_one_time_keys_count`、`device_unused_fallback_key_types` 同義。
 /// 每個 `Device/Subscribe` 之後一定跟一個；OTK 被 claim、上傳、fallback 被用掉時再推。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -968,9 +968,9 @@ fn gap_when_missing() -> bool {
     true
 }
 
-// ---- Device（kind 0x16）：to-device 佇列的原生 pack（wbfuwunel `wbf-to-device.md` §3；client 端的解讀在 to-device-client.md）----
+// ---- Device（kind 0x16）：to-device 佇列的原生 pack（wbfuwunel 的 `/docs/design/wbf-to-device.md` §3；client 端的解讀在 /docs/design/keys/to-device-client.md）----
 //
-// 跟 `Event` 那組刻意不同的三處（wbfuwunel 的 wbf-to-device.md §3.1）：**順序舊→新**；`ot`／`nt` 不是 `fs`／`ls`（兩邊方向相反，🚫 不混用）；
+// 跟 `Event` 那組刻意不同的三處（wbfuwunel 的 /docs/design/wbf-to-device.md §3.1）：**順序舊→新**；`ot`／`nt` 不是 `fs`／`ls`（兩邊方向相反，🚫 不混用）；
 // 每則的 count 不在事件裡，在 meta 的 `counts`（跟 data 一一對應）。
 // 📎 訂閱（`Subscribe`／`Push`／`CryptoState`）要能收非回應的 pack，通道還沒有那個能力（daemon-runtime 第 4 階段）；
 // 這裡先只有 `Fetch`／`Batch`／`ItemsDestroy`／`ItemsDestroyed` 這條「拉」的路，`Subscribe` 只有編碼。
@@ -1004,7 +1004,7 @@ pub fn device_fetch(request: &DeviceFetchRequest, id: u64, seq: u32) -> Result<P
 }
 
 /// `Device/Subscribe` 的 meta。
-/// ⚠️ `device_id` 是明示意圖，server 會跟 session 的比對，不合回 `Forbidden`（to-device-client.md §5）。
+/// ⚠️ `device_id` 是明示意圖，server 會跟 session 的比對，不合回 `Forbidden`（/docs/design/keys/to-device-client.md §5）。
 /// 🚫 **沒有 `cd_seq`**（同 `DeviceFetchRequest`）：訂閱完自己 `Fetch{}` 一次就好，不要 server 的補窗。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DeviceSubscribeRequest {
@@ -1028,7 +1028,7 @@ pub fn device_subscribe(
     })
 }
 
-/// `Device/Subscribe` 之後這條會話上會來的每一種（wbfuwunel 的 wbf-to-device.md §3）：先 `Ack`（登記好了）、再 `CryptoState`（自己的金鑰存量），
+/// `Device/Subscribe` 之後這條會話上會來的每一種（wbfuwunel 的 /docs/design/wbf-to-device.md §3）：先 `Ack`（登記好了）、再 `CryptoState`（自己的金鑰存量），
 /// 之後佇列有新東西就 `Push`（跟 `Batch` 同一種切法，這裡解好：吹推來的與主動拉的走同一支匯入，維護者 2026-09-24）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscribeReply {
@@ -1043,7 +1043,7 @@ pub enum SubscribeReply {
     },
 }
 
-/// `Device/Push` 的 meta（wbfuwunel 的 wbf-to-device.md §3）：跟 `Batch` 少了 `tc`／`r`／`more`，多了 `gap`。
+/// `Device/Push` 的 meta（wbfuwunel 的 /docs/design/wbf-to-device.md §3）：跟 `Batch` 少了 `tc`／`r`／`more`，多了 `gap`。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct DevicePushMeta {
     /// 這一包幾則。
@@ -1106,7 +1106,7 @@ pub fn parse_subscribe_reply(request: &Pack, response: &Pack) -> Result<Subscrib
     }
 }
 
-/// `Device/Unsubscribe`：說出口的退出（wbfuwunel 的 wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
+/// `Device/Unsubscribe`：說出口的退出（wbfuwunel 的 /docs/design/wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
 /// 🚨 下線前要叫：不叫的話這條連線退了卻還佔著裝置，別的連線得靠搶佔才進得來。斷線 server 會自動退，但那是「沒說出口的退出」，兩條路都要有。
 ///
 /// Args:
@@ -1124,7 +1124,7 @@ pub fn device_unsubscribe(id: u64, seq: u32) -> Pack {
 }
 
 /// `Device/ItemsDestroy`：meta `{"tc"}`，data 是 `tc` 個 u64 大端的 count（不是 JSON、沒有分隔符）。
-/// 送的是**清單**不是水位（to-device-client.md §4）：只列匯進 crypto store 成功的那些。
+/// 送的是**清單**不是水位（/docs/design/keys/to-device-client.md §4）：只列匯進 crypto store 成功的那些。
 ///
 /// Args:
 ///     counts: example: &[4712, 4713]
@@ -1146,7 +1146,7 @@ pub fn device_items_destroy(counts: &[u64], id: u64, seq: u32) -> Pack {
     }
 }
 
-/// `Device/Batch` 的 meta（wbfuwunel 的 wbf-to-device.md §3）。
+/// `Device/Batch` 的 meta（wbfuwunel 的 /docs/design/wbf-to-device.md §3）。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct DeviceBatchMeta {
     /// 這一窗總共幾則（≤ limit）。
@@ -1296,7 +1296,7 @@ fn parse_device_items(
     Ok(events)
 }
 
-/// `ItemsDestroy` 的兩個回應（to-device-client.md §4）：先 `Control/Ack`（只是命令收到），再 `Device/ItemsDestroyed`（真的沒了的那些）。
+/// `ItemsDestroy` 的兩個回應（/docs/design/keys/to-device-client.md §4）：先 `Control/Ack`（只是命令收到），再 `Device/ItemsDestroyed`（真的沒了的那些）。
 ///
 /// Args:
 ///     request: 送出的 `ItemsDestroy` pack

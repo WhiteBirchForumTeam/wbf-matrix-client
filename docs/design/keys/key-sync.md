@@ -3,7 +3,7 @@
 > 維護者 2026-09-24 定，原話在 §0。實作：sdk `protocol.rs` 的 `DevicePushMeta`／`SubscribeReply::Push`（`Push` 跟 `Batch` 共用 `parse_device_items`）、
 > `client.rs` 的 `DeviceSubscription::next`、`crypto_engine.rs` 的 `OlmEngine::import_items`（吃「一批 items」）；
 > core `key_sync.rs`（`olm_engine_of`、`init_keys`、收金鑰的 task）、`link_pool.rs` 的 `reuse`；事件 `CoreEvent::Keys` → RPC `keys.state`。
-> server 的語意在 wbfuwunel `wbf-to-device.md`；client 端要守的線上規則（順序、銷毀、會話、被接手）與理由在 to-device-client.md。這份講 core 怎麼把它們接起來。
+> server 的語意在 wbfuwunel 的 `/docs/design/wbf-to-device.md`；client 端要守的線上規則（順序、銷毀、會話、被接手）與理由在 /docs/design/keys/to-device-client.md。這份講 core 怎麼把它們接起來。
 
 ## 0. 規矩（維護者原話，2026-09-24）
 
@@ -16,7 +16,7 @@
 
 > `Device/Fetch`／`ItemsDestroy` 走訂閱線而不是 Misc：同意。
 
-2026-09-29（server #85 把每台裝置的 WS 上限放到 8，link-pool.md §3.1）：金鑰**自己一條線**（`LinkRole::Keys`），
+2026-09-29（server #85 把每台裝置的 WS 上限放到 8，/docs/design/daemon/link-pool.md §3.1）：金鑰**自己一條線**（`LinkRole::Keys`），
 訂閱線總是由 daemon 搞定——解鎖／登入之後開、常駐時背景迴圈看著、被關掉的重開。上面「訂閱線被關應該主動再開」就是這一條。
 
 2026-09-26（來由在 §1「佇列頭就是水位」）：
@@ -28,13 +28,13 @@
 ## 1. 形狀
 
 ```
-鉤子（Core::ensure_links，link-pool.md §3.1）→ 池開金鑰那條線（link_pool::open_link）→ init_connection(account, Keys, client) → init_keys
+鉤子（Core::ensure_links，/docs/design/daemon/link-pool.md §3.1）→ 池開金鑰那條線（link_pool::open_link）→ init_connection(account, Keys, client) → init_keys
        不是 wbf 帳號（金鑰在 matrix-sdk 的 Client 裡）→ 講一聲、跳過（鉤子本來就只替 wbf 帳號開線，這是多一道防線）
        Device/Subscribe{device_id}（不帶 cd_seq）→ Ack ＋ CryptoState
        Ack 之前推來的（early pushes）→ 不單獨匯：還沒銷、還在佇列裡，下面的追平會一起拉回
        pull_to_device：Fetch（🚫 不帶 cd_seq：server 從佇列最舊還沒銷毀的給）一窗一窗到 more=false，每窗 import_items   ← 同一支
-       發 keys.state: caught_up（匯了幾則、幾把新房間金鑰）；這幾窗帶來的新房間金鑰 → 去 cache 補解（e2ee-rpc.md §6）
-       訂閱時跟著來的 CryptoState 交給狀態機 → send_outgoing_requests：上傳裝置金鑰、一次性金鑰、fallback key（e2ee-rpc.md §5；失敗只講一聲）
+       發 keys.state: caught_up（匯了幾則、幾把新房間金鑰）；這幾窗帶來的新房間金鑰 → 去 cache 補解（/docs/design/keys/e2ee-rpc.md §6）
+       訂閱時跟著來的 CryptoState 交給狀態機 → send_outgoing_requests：上傳裝置金鑰、一次性金鑰、fallback key（/docs/design/keys/e2ee-rpc.md §5；失敗只講一聲）
        起收金鑰的 task（握 Arc<OlmEngine>、Arc<LinkPool>、Arc<ServerCache>、EventSink、訂閱會話）
        ⚠️ 這一段回錯（m/ 開不起來、Subscribe 被拒、追平壞包）＝這條線沒開成：fail loud，
           因為「金鑰沒在收」靠 UI 看不出來，線開不起來看得出來（接受的取捨）。
@@ -43,18 +43,18 @@
   Push{gap:false, items} → pool.reuse(Keys) 拿線 → import_items → keys.state: caught_up → 帶來的新房間金鑰去 cache 補解、發 room.message
   Push{gap:true} / import_items 回錯 / 一包解不開 / 本地收件匣滿過 / CryptoState{gap:true} → 記「要拉」
   每處理完一個事件（含 60 秒閒置逾時）：有「要拉」就 pull_to_device 一次；失敗就留著，下一個事件或下一分鐘再拉（🚫 不原地狂試）
-  CryptoState            → 存量交給狀態機，它要補（不到 50 把、fallback key 到期）就走 Keys 線上傳（e2ee-rpc.md §5）
+  CryptoState            → 存量交給狀態機，它要補（不到 50 把、fallback key 到期）就走 Keys 線上傳（/docs/design/keys/e2ee-rpc.md §5）
   訂閱結束（server 送 Error：被同一裝置後來的連線接手的 1505；或線死了）→ keys.state: stopped 帶原因、關掉這格線（link.state: closed）、task 結束
-                           🚫 task 不重訂（to-device-client.md §5.1）；關線是為了讓看線迴圈下一輪看到它不在、重開重訂
+                           🚫 task 不重訂（/docs/design/keys/to-device-client.md §5.1）；關線是為了讓看線迴圈下一輪看到它不在、重開重訂
 登出：停兩個 task → Device/Unsubscribe（說出口的退出）→ close_links → 丟掉長活引擎 → 刪 m/
 ```
 
 - **同一支**：`OlmEngine::import_items(client, items)`＝匯進 crypto store（commit 了才回）→ `cd_seq` 與待銷毀清單落地（`m/td.json`）→
   對 server `ItemsDestroy` 那一批 → 只清回來的。`Fetch` 的一窗與推來的一包都是 `(count, 事件)` 舊→新，差別只在 meta（`Batch` 多 `tc`／`r`／`more`，`Push` 多 `gap`），
   解的那半也共用（`parse_device_items`）。core 不解封包、不碰 store。
-- **`Fetch`／`ItemsDestroy` 走金鑰那條線**：server 只讓持有這台裝置佇列的連線銷毀（to-device-client.md §8），所以 task 用線時跟池 `reuse` `Keys` 那一格
+- **`Fetch`／`ItemsDestroy` 走金鑰那條線**：server 只讓持有這台裝置佇列的連線銷毀（/docs/design/keys/to-device-client.md §8），所以 task 用線時跟池 `reuse` `Keys` 那一格
   ——`reuse` 只拿開著的線，🚫 不開（開線是 `open_link` 的事，會再跑一次 `init_connection`、換掉 task 自己）。線不在就講一聲：東西還在 server 佇列裡，下次開線的追平會拉回。
-- **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87；規則與「帶游標會漏的三條路」在 to-device-client.md §7）：`Fetch` 🚫 不帶 `cd_seq`，
+- **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87；規則與「帶游標會漏的三條路」在 /docs/design/keys/to-device-client.md §7）：`Fetch` 🚫 不帶 `cd_seq`，
   `ItemsDestroy` 是唯一的「處理完了」，`m/td.json` 的 `cd_seq` 只是紀錄。所以 core 這邊「要拉」一律從頭拉，不必記任何位置；
   🚫 不要用「不先匯、標落後」之類的狀態去補游標，那是在補自己挖的坑。代價是「匯了但還沒銷成」的那幾則下次會再回來、重複匯入一次（冪等）。
   server 把這條寫成承諾（wbfuwunel #88）：`Fetch{}` 是正確叫法、翻頁靠銷毀；`cd_seq` 欄位 server 還收（不做 breaking），但 client 不送。client 的**型別直接沒有** `DeviceFetchRequest.cd_seq`／`DeviceSubscribeRequest.cd_seq`，🚫 不靠「記得填 None」。server 的黃金向量 `device_fetch`／`device_subscribe` 還帶 `cd_seq`，client 的向量測試先拿掉它再比（`tests/unit.rs`）；還沒做：不帶游標的向量（wbfuwunel #91）。
@@ -69,12 +69,12 @@
 | 上線追平完、或推來一包匯完 | `keys.state { user, state: "caught_up", imported, room_keys }`——`room_keys` 是這一輪帶進來的新房間金鑰數，UI 拿它決定要不要重解密文 |
 | 訂閱結束（被接手、線死） | `keys.state { user, state: "stopped", reason }`：這台裝置不再收金鑰 |
 | 線不在、匯入失敗、拉失敗、上傳金鑰失敗、補解失敗 | `Note`，只是講一聲 |
-| 新房間金鑰讓 cache 裡的舊密文解開了 | 每一則一個 `room.message`（同 `event_id`，UI 當更新；e2ee-rpc.md §6） |
+| 新房間金鑰讓 cache 裡的舊密文解開了 | 每一則一個 `room.message`（同 `event_id`，UI 當更新；/docs/design/keys/e2ee-rpc.md §6） |
 
 ## 3. 不在這支
 
-- `DeviceChanged` 與 refresh：不在金鑰這條線上。房間那條線原樣轉給 UI，refresh 是 UI 叫的（e2ee-rpc.md §2、§4）。
-- 線怎麼開、怎麼重開：link-pool.md §1、§3.1。
+- `DeviceChanged` 與 refresh：不在金鑰這條線上。房間那條線原樣轉給 UI，refresh 是 UI 叫的（/docs/design/keys/e2ee-rpc.md §2、§4）。
+- 線怎麼開、怎麼重開：/docs/design/daemon/link-pool.md §1、§3.1。
 
 ## 4. 測試
 

@@ -1,14 +1,14 @@
-//! `cache.db`：本地快取（local-cache-db.md §1、§3、§5）。SQLCipher 整檔加密，raw key 是 `Vault::cache_key()`。
+//! `cache.db`：本地快取（/docs/design/storage/local-cache-db.md §1、§3、§5）。SQLCipher 整檔加密，raw key 是 `Vault::cache_key()`。
 //!
 //! **一個 server 一個檔、多帳號混存**（維護者 2026-09-07 定）：事件只存一份；誰看得到哪一則由 `events_synced_log` 逐則記
 //! （server 經任一條路給過這個 user 的才算），沒有列就看不到——fail closed，不用 r_seq 下界去猜可見性。
-//! **快取不是權威**（local-cache-db.md §1）：server 不符、schema 版本不對、解不開，一律刪檔重建，不寫遷移；讀到壞資料當成沒有快取。
+//! **快取不是權威**（/docs/design/storage/local-cache-db.md §1）：server 不符、schema 版本不對、解不開，一律刪檔重建，不寫遷移；讀到壞資料當成沒有快取。
 //!
 //! schema 風格：實體表 `INTEGER PRIMARY KEY` 加識別碼的 UNIQUE 索引；關聯表整數複合主鍵 `WITHOUT ROWID`；
 //! 字串識別碼（mxid、room_id、event_id）各只存一次，其餘全走整數外鍵。整數 id 不出這個檔。
-//! **事件存原樣、顯示另存**（edits-and-redactions.md，維護者 2026-09-14）：`raw_event` 第一次寫入之後永遠不動；解密結果與套過 edit 的內容在
+//! **事件存原樣、顯示另存**（/docs/design/messages/edits-and-redactions.md，維護者 2026-09-14）：`raw_event` 第一次寫入之後永遠不動；解密結果與套過 edit 的內容在
 //! `content_json`，**兩者寫進去就不改**。edit／redact／reaction 的 `ref_event_id` 指目標；訊息自己的 `ref_event_id` 指
-//! **目前要顯示的 edit**，寫入時比 `modified_timestamp` 決定換不換（edits-and-redactions.md §5）。redact 在目標那列打勾 `is_redacted`。
+//! **目前要顯示的 edit**，寫入時比 `modified_timestamp` 決定換不換（/docs/design/messages/edits-and-redactions.md §5）。redact 在目標那列打勾 `is_redacted`。
 //! 這裡只有 SQL 與我們的聊天模型（`Message`、`Conversation`），沒有 matrix-sdk、沒有網路。
 //! 🚫 金鑰不進錯誤訊息、不 log。
 
@@ -26,10 +26,10 @@ use crate::incoming::{
 use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
-/// 換 schema 就加一，舊檔整個重建（local-cache-db.md §1）。v5：`events` 照 edits-and-redactions.md 改。
+/// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改。
 const SCHEMA_VERSION: i64 = 5;
 
-/// 快取屬於哪個 server；不符就不是這份快取（local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
+/// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheIdentity {
     pub server: String,
@@ -71,7 +71,7 @@ pub struct Cache {
 
 /// 一則事件在房間裡的位置（[`Cache::find_event_position`]）。
 ///
-/// ⚠️ 兩個號各司其職（wbfuwunel room-seq-and-recent.md §2）：**`g_seq` 翻頁**（server 的游標），
+/// ⚠️ 兩個號各司其職（wbfuwunel 的 /docs/design/room-seq-and-recent.md §2）：**`g_seq` 翻頁**（server 的游標），
 /// **`r_seq` 判洞**（房內連續）。非 fork server 的事件兩個都是 `None`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventPosition {
@@ -79,7 +79,7 @@ pub struct EventPosition {
     pub g_seq: Option<i64>,
 }
 
-/// 本地閱讀位置（local-cache-db.md §5 `read_positions`）：`event_id` 是權威，`r_seq` 給算術用。
+/// 本地閱讀位置（/docs/design/storage/local-cache-db.md §5 `read_positions`）：`event_id` 是權威，`r_seq` 給算術用。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPosition {
     pub event_id: String,
@@ -87,7 +87,7 @@ pub struct ReadPosition {
     pub ts: i64,
 }
 
-/// `media` 的一列（local-cache-db.md §5）：指向媒體池裡的檔（media-pool.md §4）與使用時間。
+/// `media` 的一列（/docs/design/storage/local-cache-db.md §5）：指向媒體池裡的檔（/docs/design/media/media-pool.md §4）與使用時間。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaEntry {
     pub mxc: String,
@@ -207,7 +207,7 @@ impl Cache {
                 .map_err(db_error)?;
             // 🚨 **只准 0 → 1，🚫 不准 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
             // 「沒加密」—— 過期的、別的帳號舊的、有 bug 的 —— 都🚫 不准把已知加密的房間蓋回明文。
-            // ⭐ 蓋回去的下一步就是送檔時用 `cipher: none` 把區塊金鑰公開出去（wbf-client-convention-for-chunk.md §5.1）。
+            // ⭐ 蓋回去的下一步就是送檔時用 `cipher: none` 把區塊金鑰公開出去（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
             let mut mark_encryption = transaction
                 .prepare_cached(
                     "UPDATE rooms SET encrypted = CASE WHEN encrypted = 1 THEN 1 ELSE ?2 END WHERE id = ?1",
@@ -234,7 +234,7 @@ impl Cache {
     }
 
     /// Return:
-    ///     Ok(Vec<Conversation>)   這個帳號的，照名稱排；解不開的列跳過（local-cache-db.md §1：壞資料當沒有）
+    ///     Ok(Vec<Conversation>)   這個帳號的，照名稱排；解不開的列跳過（/docs/design/storage/local-cache-db.md §1：壞資料當沒有）
     pub fn list_conversations(&self, user_id: &str) -> Result<Vec<Conversation>, SdkError> {
         let mut statement = self
             .connection
@@ -268,7 +268,7 @@ impl Cache {
 
     // ---- events ----
 
-    /// 這個帳號從 server 拿到的一批事件（同一個房間），照 edits-and-redactions.md 存與處理，一個 transaction。
+    /// 這個帳號從 server 拿到的一批事件（同一個房間），照 /docs/design/messages/edits-and-redactions.md 存與處理，一個 transaction。
     ///
     /// - 事件一份：**`raw_event` 第一次寫入之後永遠不動**（只從 NULL 補上）；同一則再來只補缺的序號、
     ///   server 已經 redact 過就把 `is_redacted` 打勾（只升不降）。
@@ -422,8 +422,8 @@ impl Cache {
         })
     }
 
-    /// 歷史，從最新往回（wbf-cli-spec.md §3.4.1 的 `read`，只是來源是快取）。只回這個帳號同步過、而且沒藏的。
-    /// 有 `r_seq` 的房間照 `r_seq` 排；沒有的退到 `origin_server_ts`（chat-model.md §4.3 的退化表）。
+    /// 歷史，從最新往回（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1 的 `read`，只是來源是快取）。只回這個帳號同步過、而且沒藏的。
+    /// 有 `r_seq` 的房間照 `r_seq` 排；沒有的退到 `origin_server_ts`（/docs/design/rooms/chat-model.md §4.3 的退化表）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -550,7 +550,7 @@ impl Cache {
     /// ⭐ 用在「問完上游、寫進去、再從本地讀回這一頁」：上游決定**哪幾則、什麼順序**
     /// （`Recent` 照 `g_seq`、`/messages` 照拓樸序），本地決定**每一則長什麼樣**
     /// （已解密的明文不會被密文蓋掉、`hidden` 的不出來、別的帳號的看不到）。
-    /// 🚫 **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（chat-model.md §4.3）。
+    /// 🚫 **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（/docs/design/rooms/chat-model.md §4.3）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -658,7 +658,7 @@ impl Cache {
             .collect()
     }
 
-    /// 一列 → 顯示用的 `Message`（edits-and-redactions.md §5 的讀取順序）：
+    /// 一列 → 顯示用的 `Message`（/docs/design/messages/edits-and-redactions.md §5 的讀取順序）：
     ///
     /// 1. `is_redacted` → 已刪除
     /// 2. 還沒解開（general）→ 解不開的記號
@@ -667,7 +667,7 @@ impl Cache {
     ///
     /// Return:
     ///     Ok(Some(Message))
-    ///     Ok(None)            不出現：目前的 edit 被這個讀者 hide 了；或壞列（class 認不得、msg 沒有 content_json 或解不開 JSON，local-cache-db.md §1）
+    ///     Ok(None)            不出現：目前的 edit 被這個讀者 hide 了；或壞列（class 認不得、msg 沒有 content_json 或解不開 JSON，/docs/design/storage/local-cache-db.md §1）
     fn to_message(&self, user_id: &str, row: &EventRow) -> Result<Option<Message>, SdkError> {
         let Some(class) = EventClass::from_column(&row.class) else {
             return Ok(None);
@@ -710,7 +710,7 @@ impl Cache {
         ) else {
             return Ok(None);
         };
-        // ⭐ 這則自己的 content_json 永遠不改；被 edit 過就在這裡換成目前那個 edit 的（edits-and-redactions.md §5）。
+        // ⭐ 這則自己的 content_json 永遠不改；被 edit 過就在這裡換成目前那個 edit 的（/docs/design/messages/edits-and-redactions.md §5）。
         let content = match self.find_current_edit(user_id, row)? {
             CurrentEdit::NotEdited => own_content,
             CurrentEdit::Visible {
@@ -978,7 +978,7 @@ impl Cache {
             .map_err(db_error)
     }
 
-    /// Delete for me（chat-model.md §5）：只對這個帳號藏；再同步同一則也不會跑回來（`hidden` 不被 sync 動）。
+    /// Delete for me（/docs/design/rooms/chat-model.md §5）：只對這個帳號藏；再同步同一則也不會跑回來（`hidden` 不被 sync 動）。
     /// 那則不在這個帳號的同步紀錄裡就什麼都不做（沒看過的東西沒有可藏的）。
     ///
     /// Return:
@@ -1043,7 +1043,7 @@ impl Cache {
             .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished after insert")))
     }
 
-    /// `media.id`：池裡暫存檔的名字（media-pool.md §2）。
+    /// `media.id`：池裡暫存檔的名字（/docs/design/media/media-pool.md §2）。
     pub fn media_pending_name(&self, mxc: &str) -> Result<Option<String>, SdkError> {
         self.connection
             .query_row("SELECT id FROM media WHERE mxc = ?1", params![mxc], |row| {
@@ -1054,7 +1054,7 @@ impl Cache {
             .map(|id| id.map(|id| format!("m{id}")))
     }
 
-    /// 進度快照（media-pool.md §3：記憶體每 1–2 秒 flush 一次）。`chunk_size` 也一起寫：續傳截檔用的是下載時的塊大小。
+    /// 進度快照（/docs/design/media/media-pool.md §3：記憶體每 1–2 秒 flush 一次）。`chunk_size` 也一起寫：續傳截檔用的是下載時的塊大小。
     pub fn media_progress(
         &mut self,
         mxc: &str,
@@ -1125,7 +1125,7 @@ impl Cache {
             .map_err(db_error)
     }
 
-    /// 完成檔，照 `last_used_at` 由舊到新（LRU 清理用，media-pool.md §5）。
+    /// 完成檔，照 `last_used_at` 由舊到新（LRU 清理用，/docs/design/media/media-pool.md §5）。
     pub fn list_media_by_last_used(&self) -> Result<Vec<MediaEntry>, SdkError> {
         let mut statement = self
             .connection
@@ -1155,7 +1155,7 @@ impl Cache {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
-    /// 看過一次：更新 `last_used_at`（配額的保護期靠它，media-pool.md §5）。
+    /// 看過一次：更新 `last_used_at`（配額的保護期靠它，/docs/design/media/media-pool.md §5）。
     pub fn touch_media(&mut self, mxc: &str) -> Result<bool, SdkError> {
         let changed = self
             .connection
@@ -1383,7 +1383,7 @@ fn event_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
-// ---- edits-and-redactions.md 的處理（都在寫入的 transaction 裡） ----
+// ---- /docs/design/messages/edits-and-redactions.md 的處理（都在寫入的 transaction 裡） ----
 
 /// 狀態事件（有 `state_key`）。狀態事件從不加密，所以看原樣就夠；原樣是 NULL（matrix-sdk 解開的）就一定不是。
 fn is_state_event(raw_event: Option<&serde_json::Value>) -> bool {
@@ -1510,7 +1510,7 @@ fn set_current_edit(
     Ok(())
 }
 
-/// 剛寫進來（或剛解開）的一則（edits-and-redactions.md §4）。🚫 **不改任何一列的 `content_json`**。
+/// 剛寫進來（或剛解開）的一則（/docs/design/messages/edits-and-redactions.md §4）。🚫 **不改任何一列的 `content_json`**。
 ///
 /// - msg／edit 的內容是wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
 /// - 等著這則的 redact、edit（先到的）→ 現在處理
@@ -1543,7 +1543,7 @@ fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result
             content_json.as_deref(),
         )?;
     }
-    // redact 先（edits-and-redactions.md §6）：打勾之後，等著的 edit 都會跳過。
+    // redact 先（/docs/design/messages/edits-and-redactions.md §6）：打勾之後，等著的 edit 都會跳過。
     for redaction in list_waiting_relations(transaction, room, &event_id, EventClass::Redact)? {
         apply_redaction(transaction, room, redaction)?;
     }
@@ -1558,7 +1558,7 @@ fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result
     Ok(())
 }
 
-/// edit（edits-and-redactions.md §5）：目標在本地、沒被 redact、這個 edit 有效、**比目前的新** → 目標的 `ref_event_id` 換成它、
+/// edit（/docs/design/messages/edits-and-redactions.md §5）：目標在本地、沒被 redact、這個 edit 有效、**比目前的新** → 目標的 `ref_event_id` 換成它、
 /// `modified_timestamp` 換成它的 server 時間；否則跳過。不管換不換，這個 edit 都標處理過（目標不在或還沒解開除外）。
 ///
 /// 「比目前的新」一律看 `modified_timestamp`：`(edit 的 origin_server_ts, event_id) > (modified_timestamp, ref_event_id)`。
@@ -1607,9 +1607,9 @@ fn apply_edit(transaction: &Transaction<'_>, room: i64, edit: i64) -> Result<(),
     set_processed(transaction, edit.id)
 }
 
-/// redact（edits-and-redactions.md §6）：目標在本地就打勾 `is_redacted`、`modified_timestamp` 換成 redact 的 server 時間，這個 redact 標處理過；
+/// redact（/docs/design/messages/edits-and-redactions.md §6）：目標在本地就打勾 `is_redacted`、`modified_timestamp` 換成 redact 的 server 時間，這個 redact 標處理過；
 /// 目標還不在就留著 `is_processed = 0` 等它到。
-/// 🚫 不動目標的 `raw_event`、`content_json`：密文與明文都還在，可以復原（edits-and-redactions.md §2）。
+/// 🚫 不動目標的 `raw_event`、`content_json`：密文與明文都還在，可以復原（/docs/design/messages/edits-and-redactions.md §2）。
 /// ⭐ 目標還沒解開（general）也照打勾：刪不刪跟看不看得懂無關。
 /// ⭐ 被 redact 的是**某則訊息目前顯示的 edit** → 那則訊息退回剩下的有效 edit 裡最新的（沒有就顯示原文）。
 fn apply_redaction(
@@ -1854,7 +1854,7 @@ fn try_open_existing(
 
 fn open_with_key(path: &Path, key: &Key32) -> Result<Connection, SdkError> {
     let connection = Connection::open(path).map_err(db_error)?;
-    // raw key：跳過 SQLCipher 自己的 KDF，導出在 Vault 做過了（local-cache-db.md §3）。
+    // raw key：跳過 SQLCipher 自己的 KDF，導出在 Vault 做過了（/docs/design/storage/local-cache-db.md §3）。
     let key_pragma = format!("\"x'{}'\"", hex::encode(key.as_bytes()));
     connection
         .pragma_update(None, "key", &key_pragma)
@@ -1962,7 +1962,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
     Ok(())
 }
 
-/// 這個 server 的快取整個丟掉（所有帳號都登出時；local-cache-db.md §1 說快取可以整個刪）。沒有檔也算成功。
+/// 這個 server 的快取整個丟掉（所有帳號都登出時；/docs/design/storage/local-cache-db.md §1 說快取可以整個刪）。沒有檔也算成功。
 pub fn remove_cache(dir: &Path) -> Result<bool, SdkError> {
     let path = dir.join(CACHE_FILE_NAME);
     if !path.exists() {
@@ -2587,7 +2587,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- edits-and-redactions.md：原始事件不動、最終內容另存、ref_event_id 參照 ----
+    // ---- /docs/design/messages/edits-and-redactions.md：原始事件不動、最終內容另存、ref_event_id 參照 ----
 
     fn plain(room: &str, event: serde_json::Value) -> Fixture {
         Fixture {
@@ -2908,7 +2908,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ⭐ edit 先到、目標後到：什麼都不用補 —— 讀取時一查就有（edits-and-redactions.md §5）。
+    /// ⭐ edit 先到、目標後到：什麼都不用補 —— 讀取時一查就有（/docs/design/messages/edits-and-redactions.md §5）。
     #[test]
     fn an_edit_that_arrives_before_its_target_shows_once_the_target_lands() {
         let (mut cache, dir) = open("edit-before");
@@ -3096,7 +3096,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ⭐ 目標那一列記著「目前顯示哪個 edit」與它的時間（edits-and-redactions.md §5）；讀取只照那一列走。
+    /// ⭐ 目標那一列記著「目前顯示哪個 edit」與它的時間（/docs/design/messages/edits-and-redactions.md §5）；讀取只照那一列走。
     #[test]
     fn the_target_row_points_at_the_current_edit_with_its_server_time() {
         let (mut cache, dir) = open("edit-pointer");

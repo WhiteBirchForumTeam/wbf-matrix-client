@@ -1,10 +1,10 @@
 # 聊天模型與房間設計：站在 Matrix 的高度，用 Telegram 的形狀
 
 > 標「維護者定」的是定案，標「再議」的還開著。§2 是模型；現在的實作（`wbf-sdk/src/chat.rs`）是它的子集，差異在 §6。
-> 前提：architecture-v2.md §8 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
+> 前提：/docs/design/overview/architecture-v2.md §8 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
 > 「現在怎麼接到 Matrix」只是第一個 backend 的接法，之後換成自己的協定時，模型不動、只換接法。
 > Telegram 的部分是憑印象寫的（維護者明說接受）；Matrix 的部分照規格與 `vendor/matrix-rust-sdk` 的實作。
-> 🚨 標 **[審]** 的地方會 breaking Matrix 兼容或 Matrix 做不到，要維護者定案（architecture-v2.md §8）。
+> 🚨 標 **[審]** 的地方會 breaking Matrix 兼容或 Matrix 做不到，要維護者定案（/docs/design/overview/architecture-v2.md §8）。
 
 ## 0. 一句話
 
@@ -31,11 +31,11 @@
 | 頻道 | 沒有原生概念；用 power levels 讓只有管理員能發 | channel：單向廣播 | 底層 **do nothing**：UI 建「channel」時把 room 包裝成大家都沒權限發言、只有 owner 能發（§3.2，維護者定） |
 | 置頂 | `m.room.pinned_events` state | pinned messages | `pinned: Vec<MessageId>` |
 | 資料夾／封存 | `m.tag`（`m.favourite`、`m.lowpriority`）加 client 自己的 | folders、archive | **Tag**，第一版只做 favourite／archived |
-| 歷史 | `/messages` 分頁，token 往回翻 | 一路往上捲 | `history(before)`（wbf-cli-spec.md §3.4.1 的 `read`） |
+| 歷史 | `/messages` 分頁，token 往回翻 | 一路往上捲 | `history(before)`（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1 的 `read`） |
 | 即時 | `/sync` 長輪詢，回全部房間的增量 | 推送 | **watch 流**（§4.2） |
-| 加密 | Olm（裝置對裝置）＋ Megolm（房間金鑰），跨裝置簽章驗證 | 一般聊天 server 端可讀；secret chat 端到端、綁單一裝置 | **一律 E2EE 是預設**，非 E2EE 是例外要警告（wbf-client-convention-for-chunk.md §5.1） |
+| 加密 | Olm（裝置對裝置）＋ Megolm（房間金鑰），跨裝置簽章驗證 | 一般聊天 server 端可讀；secret chat 端到端、綁單一裝置 | **一律 E2EE 是預設**，非 E2EE 是例外要警告（/docs/design/media/wbf-client-convention-for-chunk.md §5.1） |
 | 檔案 | `m.file` 加 `file` 欄（AES-CTR）；整檔上傳 | 檔案 2 GB，串流播放 | 我們的分塊檔（約定規格書），`msgtype = org.wbftw.wbfuwunel.file` |
-| 聯邦 | 有：room 可以跨 server | 沒有：單一平台 | 保留，能兼容盡量兼容（architecture-v2.md §8） |
+| 聯邦 | 有：room 可以跨 server | 沒有：單一平台 | 保留，能兼容盡量兼容（/docs/design/overview/architecture-v2.md §8） |
 
 Telegram 沒有而 Matrix 有、我們**要留**的：多裝置各自金鑰、裝置驗證、聯邦、房間 state（可查歷史誰改了名字）。
 Matrix 沒有而 Telegram 有的，全部在 §5，維護者逐列定過。
@@ -118,7 +118,7 @@ pub enum MessageKind {
 pub struct Attachment {
     pub mxc: String,
     pub name: Option<String>, pub mimetype: Option<String>, pub size: Option<u64>,
-    pub block: ChunkedBlock,              // wbf-client-convention-for-chunk.md §5 的區塊，含 key；就是 manifest 的 block
+    pub block: ChunkedBlock,              // /docs/design/media/wbf-client-convention-for-chunk.md §5 的區塊，含 key；就是 manifest 的 block
 }
 
 pub struct Edit { pub at: Timestamp, pub by: PeerId }
@@ -139,7 +139,7 @@ pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: 
 pub struct Unread { pub count: u32, pub mentions: u32, pub local_offset: Option<MessageId> }
 ```
 
-`local_offset` 是自己看到哪，只在本地：`cache.db` 的 `read_positions`（local-cache-db.md §5、read-receipts.md）。
+`local_offset` 是自己看到哪，只在本地：`cache.db` 的 `read_positions`（/docs/design/storage/local-cache-db.md §5、/docs/design/messages/read-receipts.md）。
 `count` 是 `local_offset` 之後、不是自己發的、非 System 的訊息數；我們自己算，不信 server 的通知計數（各 server 算法不一）。
 
 ### 2.6 動作（`Backend` trait 的一半）
@@ -168,7 +168,7 @@ pub trait Backend {
 
 ## 3. 現在怎麼接到 Matrix
 
-兩條接法，判定規則同一套：Matrix 帳號走 `backend/matrix_sdk.rs`（matrix-sdk 的 `Client`）；wbf 帳號走橋，`room_state.rs` 從 `GetState` 與 `m.direct` 組出 `Conversation`、送事件走 `Event/Send`（account-session.md §6）。
+兩條接法，判定規則同一套：Matrix 帳號走 `backend/matrix_sdk.rs`（matrix-sdk 的 `Client`）；wbf 帳號走橋，`room_state.rs` 從 `GetState` 與 `m.direct` 組出 `Conversation`、送事件走 `Event/Send`（/docs/design/daemon/account-session.md §6）。
 
 ### 3.1 Direct 的判定與唯一性
 
@@ -199,12 +199,12 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | 我們 | Matrix 事件 |
 |---|---|
 | `Text` | `m.room.message`，`msgtype: m.text`，`body`；有 `formatted_body` 就進 `Formatted` |
-| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房送檔還沒接（e2ee-rpc.md §6）。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
+| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房送檔還沒接（/docs/design/keys/e2ee-rpc.md §6）。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
 | `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
-| `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（edits-and-redactions.md §2、§6，維護者 2026-09-14） |
+| `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（/docs/design/messages/edits-and-redactions.md §2、§6，維護者 2026-09-14） |
 | `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
-| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（edits-and-redactions.md §5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
+| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（/docs/design/messages/edits-and-redactions.md §5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
 | `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>` |
 | `System` | `m.room.member`、`m.room.name`、`m.room.topic`、`m.room.power_levels`、`m.room.encryption`、`m.room.pinned_events`… |
 | `Unsupported` | 其他所有 type。**不丟**，這是 fail-safe：至少讓人看到「這裡有東西」 |
@@ -216,30 +216,30 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | | 放哪 | 誰看得到 | 怎麼送 |
 |---|---|---|---|
 | **本地 offset** | 本地（`cache.db` 的 `read_positions`） | 只有自己這台裝置 | 不送。UI 捲到哪就寫哪 |
-| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `send_read_receipt(visible_to_others)`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策：設定放 `wbf.conf`、預設 private，RPC 不逐次帶（read-receipts.md §3） |
+| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `send_read_receipt(visible_to_others)`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策：設定放 `wbf.conf`、預設 private，RPC 不逐次帶（/docs/design/messages/read-receipts.md §3） |
 
 `m.fully_read`：不用，本地 offset 取代它（它本來就只是「自己讀到哪」的 server 端副本）。`Unread` 從本地 offset 算。
-已讀的三層（快取水位／本地已讀／遠端已讀）與 `room.read` 的形狀在 read-receipts.md。還沒做：寫本地已讀的 RPC、送 receipt。
+已讀的三層（快取水位／本地已讀／遠端已讀）與 `room.read` 的形狀在 /docs/design/messages/read-receipts.md。還沒做：寫本地已讀的 RPC、送 receipt。
 
 ### 3.6 加密
 
 - **開 room 時自由選擇要不要加密**，由 UI（也就是 owner）決定；底層不帶立場（`CreateOptions.encrypted`）（維護者定）。
   不論是不是 E2EE，都照 Matrix 實作：加密就 `m.room.encryption`（Megolm）；公開可搜就 `history_visibility: world_readable` 加 `join_rule: public`，這兩件事互不影響。
-  UI 的預設值（例如 Direct／Group 預設加密）是 UI 的事；非加密 room 送檔案前的警告照 wbf-client-convention-for-chunk.md §5.1。
-- 解得開就解、解不開是 `Undecryptable`（`decrypted: false`）。房間金鑰備份在 room-key-backup.md。還沒做：裝置驗證。
-- 沒有 `RoomCrypto` trait（空的 trait 是儀式，不先立）。wbf 帳號的加解密在 `crypto_engine.rs` 的 `OlmEngine`：把 `OlmMachine` 只當狀態機用，網路自己走 WS（e2ee-walkthrough.md §13）；Matrix 帳號的在 matrix-sdk 裡面。
+  UI 的預設值（例如 Direct／Group 預設加密）是 UI 的事；非加密 room 送檔案前的警告照 /docs/design/media/wbf-client-convention-for-chunk.md §5.1。
+- 解得開就解、解不開是 `Undecryptable`（`decrypted: false`）。房間金鑰備份在 /docs/design/keys/room-key-backup.md。還沒做：裝置驗證。
+- 沒有 `RoomCrypto` trait（空的 trait 是儀式，不先立）。wbf 帳號的加解密在 `crypto_engine.rs` 的 `OlmEngine`：把 `OlmMachine` 只當狀態機用，網路自己走 WS（/docs/design/keys/e2ee-walkthrough.md §13）；Matrix 帳號的在 matrix-sdk 裡面。
 
 ### 3.7 上游依賴清單
 
 `matrix-sdk`（`Client`、`Room`、sync 迴圈、send queue、`m.direct` 處理）、`matrix-sdk-crypto`（`OlmMachine`，只在 `crypto_engine.rs`）、`ruma`（事件型別）。上游只出現在 `backend/matrix_sdk.rs` 與 `crypto_engine.rs` 兩個模組。
-**不用** `matrix-sdk-ui`（它的 `Timeline` 是給 UI 綁定用的，聚合邏輯我們自己做，理由 architecture-v2.md §8）。
+**不用** `matrix-sdk-ui`（它的 `Timeline` 是給 UI 綁定用的，聚合邏輯我們自己做，理由 /docs/design/overview/architecture-v2.md §8）。
 
 ## 4. 流：歷史與即時
 
 ### 4.1 歷史
 
-`history(before, limit)` 回一頁加 `next: Option<Cursor>`，`None` 是到頭。🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token：UI 不分 server 是誰，一律拿手上最舊那則往回問（rpc-spec.md §3.3）。
-過濾（type、sender）在 client 端做（wbf-cli-spec.md §3.4.1 的理由）。
+`history(before, limit)` 回一頁加 `next: Option<Cursor>`，`None` 是到頭。🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token：UI 不分 server 是誰，一律拿手上最舊那則往回問（/docs/design/rpc-specs/rpc-spec.md §3.3）。
+過濾（type、sender）在 client 端做（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1 的理由）。
 
 ### 4.2 watch 流
 
@@ -260,16 +260,16 @@ pub enum Update {
 
 現在的 `Update` 只有兩個變體，其他還沒做：
 
-- `NewEvents { conversation, events: Vec<IncomingEvent> }`：上游給的**原樣**（關係事件也在），🚫 不是折好的 `NewMessage`。快取要存原樣（edits-and-redactions.md），通知由 core 用 `event_json::messages_from_incoming` 折好再發。
+- `NewEvents { conversation, events: Vec<IncomingEvent> }`：上游給的**原樣**（關係事件也在），🚫 不是折好的 `NewMessage`。快取要存原樣（/docs/design/messages/edits-and-redactions.md），通知由 core 用 `event_json::messages_from_incoming` 折好再發。
 - `ConversationLeft { id }`。新加入的房間用 `conversations()` 看，watch 不推。
 
-Matrix 帳號：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（wbf-cli-spec.md §3.4.2）。
-wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（room-sync.md）。
+Matrix 帳號：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2）。
+wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/docs/design/rooms/room-sync.md）。
 
 ### 4.3 順序：為什麼不能用時間戳排序
 
 `sent_at` 是**發送者的 server**蓋的時間，聯邦下兩台 server 時鐘不同，排序會亂。Matrix 的真順序是 DAG 的拓樸序，`/sync` 與 `/messages` 回來的順序就是它。
-維護者 2026-09-05 定（規格在 wbfuwunel 的 room-seq-and-recent.md）：**每個 room 一個連續序號**，第一個事件是 1。
+維護者 2026-09-05 定（規格在 wbfuwunel 的 /docs/design/room-seq-and-recent.md）：**每個 room 一個連續序號**，第一個事件是 1。
 這是 Telegram 的做法：順序由 server 說了算，所以我們的使用者之間一致。兩個數，都在事件的 `unsigned`：
 
 | key | 意思 | client 拿來做什麼 |
@@ -282,7 +282,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（r
 | client 端 | `Message.r_seq: Option<i64>`、`Message.g_seq: Option<i64>`（`protocol::event_seqs`）。`unsigned` 是 server 加的、不進雜湊、送聯邦時被剥掉，其他 client 無感 |
 | offset | 一對 `(event_id, r_seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`r_seq` 是本地算術用；比較用 `r_seq` |
 | `sent_at` | 只當顯示用的時間 |
-| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r, more }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（wbfuwunel 的 pack-pipeline.md §6.4）：一窗收完且 **`more: false`** 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`more: true`（窗停在則數或**位元組**上限）帶 `before = 最後的 ls` 再一窗、水位不動。🚨 🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14）；缺 `more` 當 `true`；空窗就是追平；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。水位只由 UI 叫的 `sync.recent` 動（room-sync.md §1） |
+| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r, more }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（wbfuwunel 的 pack-pipeline.md §6.4）：一窗收完且 **`more: false`** 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`more: true`（窗停在則數或**位元組**上限）帶 `before = 最後的 ls` 再一窗、水位不動。🚨 🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14）；缺 `more` 當 `true`；空窗就是追平；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。水位只由 UI 叫的 `sync.recent` 動（/docs/design/rooms/room-sync.md §1） |
 | 還沒有的 | server 端「`r_seq` → 事件」的反查（跳到第 N 則直接問）：server 列為候選。在那之前用 `/messages` 二分逼近，或只提供「跳到快取裡有的第 N 則」 |
 
 **退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `r_seq`。client 必須顯式判斷它在不在，不靠巧合：
@@ -328,15 +328,15 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（r
 - `MessageKind`：`Text` 的 HTML 是 `formatted_html`；`Deleted` 只有 `reason`；`System` 是 `event_type` 加一行 `line`，不逐種列 enum；`Unsupported` 多帶 `body`。
 - `Attachment` 只有 `mxc` 與 `block`。
 - trait 叫 `ChatBackend`，只有 `conversations`、`conversation`、`history`、`send_text`（不帶 `reply_to`）、`send_file`、`watch`。
-  `history` 回原樣的 `EventPage`，不是 `Page<Message>`（edits-and-redactions.md §8）。
+  `history` 回原樣的 `EventPage`，不是 `Page<Message>`（/docs/design/messages/edits-and-redactions.md §8）。
 - `watch` 是 callback（`FnMut(Update) -> WatchControl` 加 deadline），不是 `Stream`：sync 迴圈在 backend 手上。
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
-- 聚合：寫庫的路照 edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
+- 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
 
 還沒做：送 edit／delete／reaction／reply、建房、邀請、角色、置頂、已讀送出、裝置驗證、標準附件下載、`Unread`、`Tag`、`DeviceTrust`。
 
 ## 7. 還開著的（再議）
 
-- **送事件要宣告附件**（wbf-client-convention-for-chunk.md §5.2，wbfuwunel 的 media-attachments.md）：wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號（matrix-sdk 的 `Room::send` 不能加 header）還帶不出去，送檔時講一聲。
+- **送事件要宣告附件**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2，wbfuwunel 的 /docs/design/media-attachments.md）：wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號（matrix-sdk 的 `Room::send` 不能加 header）還帶不出去，送檔時講一聲。
 
 已定案的都寫在各節，標「維護者定」。

@@ -1,10 +1,10 @@
-//! 本地的房間金鑰備份（room-key-backup.md §4）：`k/snapshot` 一個檔（`k` 是 room-keys，
+//! 本地的房間金鑰備份（/docs/design/keys/room-key-backup.md §4）：`k/snapshot` 一個檔（`k` 是 room-keys，
 //! 名字短是為了 MAX_PATH），內容就是上游 `export_room_keys` 倒出來的**全量加密快照**。
 //!
 //! 為什麼要有它：房間金鑰（Megolm inbound session）平常只活在 matrix-sdk 的 `crypto.db` 裡，
 //! 那個目錄 `logout` 會刪、壞掉也叫人刪。server 端的標準 backup 是主力，但在使用者產生
 //! recovery key 之前，**解開它的私鑰也只在本機的 crypto store 裡**——所以本地這一份是那段期間
-//! 唯一救得回歷史的東西（room-key-backup.md §2）。
+//! 唯一救得回歷史的東西（/docs/design/keys/room-key-backup.md §2）。
 //!
 //! 這個模組只回答兩件事：**檔案放哪**、**用什麼 passphrase**。真正的匯出與匯入是上游做的
 //! （`MatrixBackend::save_room_key_snapshot` / `import_room_key_snapshot`），所以這裡不吃
@@ -131,7 +131,7 @@ pub fn set_snapshot_permissions(path: &Path) -> Result<(), SdkError> {
     Ok(())
 }
 
-/// 刪掉這個帳號的本地快照（`logout` 與 `account destroy` 用；room-key-backup.md §7）。
+/// 刪掉這個帳號的本地快照（`logout` 與 `account destroy` 用；/docs/design/keys/room-key-backup.md §7）。
 ///
 /// Return:
 ///     Ok(true)    刪掉了

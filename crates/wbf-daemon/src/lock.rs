@@ -1,4 +1,4 @@
-//! 資料目錄的獨佔（architecture-v2.md §0.2，維護者 2026-09-13 要求實作）。
+//! 資料目錄的獨佔（/docs/design/overview/architecture-v2.md §0.2，維護者 2026-09-13 要求實作）。
 //!
 //! 🚨 **在這之前這條規則只寫在文件裡，一行實作都沒有** —— 而且兩層「以為會擋」的東西都不擋：
 //!
@@ -35,7 +35,7 @@
 //!
 //! 📎 鎖檔**不刪、也不寫東西進去**：刪掉會跟「另一個程序正要開它」對撞；而「誰握著」不放這裡 ——
 //! Windows 的排他鎖連讀都擋，所以寫進去的字沒人讀得到。⭐ 那個問題已經有答案了：
-//! `<data dir>/daemon.json` 裡有現在這個 daemon 的 `pid` 與 `instance`（local-interface.md §3）。
+//! `<data dir>/daemon.json` 裡有現在這個 daemon 的 `pid` 與 `instance`（/docs/design/rpc-specs/local-interface.md §3）。
 //!
 //! 📎 用的是 `std::fs::File::try_lock`（Rust 1.89 起在標準庫裡，本專案 MSRV 1.95）——
 //! 🚫 不引 `fs2`／`fs4`：標準庫已經有同一個東西了。
@@ -166,7 +166,7 @@ fn acquire(data_dir: &Path, intent: Intent) -> Result<DataDirLock, LockError> {
 ///
 /// | 誰 | 什麼時候 grant |
 /// |---|---|
-/// | `-s` 常駐 | **啟動的第一件事**；拿不到就不啟動（architecture-v2.md §0.2） |
+/// | `-s` 常駐 | **啟動的第一件事**；拿不到就不啟動（/docs/design/overview/architecture-v2.md §0.2） |
 /// | 單發命令 | 那個命令**真的要寫**的時候才拿；`--version` 這種連讀都不用的🚫 不拿 |
 ///
 /// ⚠️ 能力一旦拿到就**持有到程序結束**（`DataDirLock` 活在這裡）：🚫 不做「寫完就放、下次再拿」——

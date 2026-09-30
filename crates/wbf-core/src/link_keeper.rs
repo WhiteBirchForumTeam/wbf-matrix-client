@@ -1,4 +1,4 @@
-//! 「該開的線都開著嗎」的鉤子（維護者 2026-09-29，link-pool.md §3.1）：vault 解鎖了，就一個一個帳號看它的五條線，
+//! 「該開的線都開著嗎」的鉤子（維護者 2026-09-29，/docs/design/daemon/link-pool.md §3.1）：vault 解鎖了，就一個一個帳號看它的五條線，
 //! 沒開的、死了的，對那一類重開一條。訂閱線（`Rooms`／`Keys`）開的時候 `init_connection` 就訂了，所以「開著」＝「在收」。
 //!
 //! 誰叫它（daemon）：`vault.unlock` 與 `account.add` 成功之後馬上叫一次（背景跑，🚫 不擋那個 RPC 的回應）；

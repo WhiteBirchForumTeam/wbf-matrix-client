@@ -1,4 +1,4 @@
-//! SDK 對外的錯誤。分類對齊 wbf-cli-spec.md §4 的 exit code：用法錯、server 拒絕、完整性失敗、網路。
+//! SDK 對外的錯誤。分類對齊 /docs/design/rpc-specs/wbf-cli-spec.md §4 的 exit code：用法錯、server 拒絕、完整性失敗、網路。
 
 use crate::chunk_block::BlockError;
 use crate::chunk_crypto::CryptoError;
@@ -18,11 +18,11 @@ pub enum SdkError {
         code: String,
         message: String,
         meta: serde_json::Value,
-        /// wbf `Error` pack 帶的序號（wbfuwunel `wbf-wire-format.md` §3.4）。
+        /// wbf `Error` pack 帶的序號（wbfuwunel 的 `/docs/design/wbf-wire-format.md` §3.4）。
         /// `None` ＝ 不是 wbf pack 來的（Matrix、合成的），或 pack 裡沒有合法的非 0 整數。
         code_id: Option<u64>,
     },
-    /// wbf-client-convention-for-chunk.md §3.1 任一條不過、CRC 不對、事件與 `Info` 對不上（CLI exit 3）。
+    /// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 任一條不過、CRC 不對、事件與 `Info` 對不上（CLI exit 3）。
     Integrity(String),
     /// 連不上、斷線、HTTP 層失敗（CLI exit 4）。
     Network(String),
@@ -69,7 +69,7 @@ impl From<CryptoError> for SdkError {
 }
 
 impl From<DecodeError> for SdkError {
-    /// CRC 不對是完整性問題（wbfuwunel 的 chunked-upload-spec.md §5 說重送，那是通道層的事；到這裡就是壞的），其他是對方不講協議。
+    /// CRC 不對是完整性問題（wbfuwunel 的 /docs/design/chunked-upload-spec.md §5 說重送，那是通道層的事；到這裡就是壞的），其他是對方不講協議。
     fn from(error: DecodeError) -> Self {
         match error {
             DecodeError::MetaCrc { .. } | DecodeError::DataCrc { .. } => {
@@ -164,7 +164,7 @@ impl SdkError {
         self.server_meta_field("retry_after_ms")?.as_u64()
     }
 
-    /// `RoomDevicesChanged`（1506）帶的**目前**房間版本號（wbfuwunel `wbf-room-device-version.md` §7.1）。
+    /// `RoomDevicesChanged`（1506）帶的**目前**房間版本號（wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §7.1）。
     ///
     /// 📎 這個號碼只能拿來「知道自己過期了」，🚫 不能直接拿它重送：金鑰還沒補發給變了的裝置。
     /// 重送前要重拿成員清單（那份帶的號碼才跟名單同一刻）。

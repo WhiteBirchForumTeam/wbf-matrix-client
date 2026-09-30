@@ -1,10 +1,10 @@
 //! 房間的讀與寫：清單、歷史、附件、送訊息。
 //!
-//! ⚠️ **快取是寫穿的，而且寫穿失敗只報不擋**（local-cache-db.md §1：快取壞了的代價是
+//! ⚠️ **快取是寫穿的，而且寫穿失敗只報不擋**（/docs/design/storage/local-cache-db.md §1：快取壞了的代價是
 //! 重拉，不是命令失敗）。所以這裡每個從 server 拿資料的路徑都是「拿到 → 試著寫快取 →
 //! 不管成不成功都回傳」。
 //!
-//! 🚫 這裡**不做任何互動**：「這個房間沒加密，你確定要送嗎」那種確認是前端的事（architecture-v2.md §3）。
+//! 🚫 這裡**不做任何互動**：「這個房間沒加密，你確定要送嗎」那種確認是前端的事（/docs/design/overview/architecture-v2.md §3）。
 //! core 提供的是[`Core::conversation`]（讓前端問得到「加密了沒」）與一個**照做**的
 //! [`Core::send_file`]。
 
@@ -61,14 +61,14 @@ pub struct HistoryQuery {
     pub before: Option<String>,
     #[serde(default)]
     pub sync: SyncMode,
-    /// 空的就不濾。⚠️ 過濾在**這一層**做（wbf-cli-spec.md §3.4.1）：server 不知道我們的 kind 名字。
+    /// 空的就不濾。⚠️ 過濾在**這一層**做（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1）：server 不知道我們的 kind 名字。
     #[serde(default)]
     pub types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
 }
 
-/// 這次查詢要本地的、上游的、還是兩者（rpc-spec.md §2 的 `sync`；daemon-runtime.md §3.1）。
+/// 這次查詢要本地的、上游的、還是兩者（/docs/design/rpc-specs/rpc-spec.md §2 的 `sync`；/docs/design/daemon/daemon-runtime.md §3.1）。
 ///
 /// ⭐ **預設是 `Local`**：RPC 大部分是對本地資料庫的呼叫，要打上游得**明講**。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ pub enum SyncMode {
 }
 
 impl Core {
-    /// 加入的房間。`sync` 決定要本地的還是上游的（daemon-runtime.md §3.1）。
+    /// 加入的房間。`sync` 決定要本地的還是上游的（/docs/design/daemon/daemon-runtime.md §3.1）。
     pub async fn list_conversations(
         &self,
         sync: SyncMode,
@@ -213,7 +213,7 @@ impl Core {
                 target.server_backup,
             )
             .await?;
-        // 過濾在這一層（wbf-cli-spec.md §3.4.1）：server 不知道我們的 kind 名字。
+        // 過濾在這一層（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1）：server 不知道我們的 kind 名字。
         let events = events
             .into_iter()
             .filter(|message| sender.is_none_or(|sender| message.sender == sender))
@@ -279,10 +279,10 @@ impl Core {
         Ok(FilePage { files, next })
     }
 
-    /// `history` 與 `files` 共用的取頁（daemon-runtime.md §3.1 的三種 `sync`）。
+    /// `history` 與 `files` 共用的取頁（/docs/design/daemon/daemon-runtime.md §3.1 的三種 `sync`）。
     ///
     /// 🚨 **`before` 與回傳的 `next` 都是 `event_id`**（這一頁最舊那則）—— UI 不分 server 是誰，
-    /// 一律拿手上最舊那則往回問（chat-model.md §4.3；維護者 2026-09-14）。
+    /// 一律拿手上最舊那則往回問（/docs/design/rooms/chat-model.md §4.3；維護者 2026-09-14）。
     ///
     /// | `sync` | 做什麼 |
     /// |---|---|
@@ -321,7 +321,7 @@ impl Core {
             let messages = wbf_sdk::event_json::messages_from_incoming(room, &page.events);
             return Ok((messages, page.next));
         }
-        // `Both`：**原樣**寫進去等它落地（edits-and-redactions.md），再用這一頁的 event_id 讀回。
+        // `Both`：**原樣**寫進去等它落地（/docs/design/messages/edits-and-redactions.md），再用這一頁的 event_id 讀回。
         // ⭐ 上游決定**哪幾則、什麼順序**，本地決定**每一則長什麼樣**（已解密的明文不會被密文蓋掉、
         // 別頁的 edit／redact／reaction 已經套上、`hidden` 的不出來）。
         // 🚫 不從本地「照 r_seq 重讀一頁」：非 fork server 的事件沒有 r_seq。
@@ -373,7 +373,7 @@ impl Core {
                 }
                 // ⚠️ wbf 要的是 `g_seq`，而它只在本地有。那則不在本地（`sync=server` 不寫庫，
                 // 所以它給的 `next` 本地查不到）→ 改走 `/context`：它只要 `event_id`。
-                // wbf 帳號沒有 Client 可以走 `/context`：明講拒絕，等 wbfuwunel #64 的 `before_event_id`（account-session.md §6）。
+                // wbf 帳號沒有 Client 可以走 `/context`：明講拒絕，等 wbfuwunel #64 的 `before_event_id`（/docs/design/daemon/account-session.md §6）。
                 Anchor::NotInLocalCache => {
                     if self.is_wbf_account(account)? {
                         return Err(crate::handles::no_matrix_client_error(
@@ -480,7 +480,7 @@ impl Core {
     /// 純本地的一頁。
     ///
     /// 🚫 **非 fork server 的房間不答**（維護者 2026-09-14：那種房「不快取、總是詢問」）——
-    /// 沒有 `r_seq` 就排不出順序，而拿時間戳排是錯的（chat-model.md §4.3）。
+    /// 沒有 `r_seq` 就排不出順序，而拿時間戳排是錯的（/docs/design/rooms/chat-model.md §4.3）。
     async fn cached_page_of(
         &self,
         account: &AccountDir,
@@ -534,7 +534,7 @@ impl Core {
     /// 那個 server 的快取（寫入者＋讀連線）與「我是誰」。**新的路徑都走這個**。
     ///
     /// 📎 舊的 [`Core::cache_and_me`] 還在：媒體那幾條會抓著 `&mut Cache` 跨越網路 I/O
-    /// （邊下載邊寫），塞不進「一個工作 = 一個交易」，所以它們維持自己的連線（daemon-runtime.md §2.3.1）。
+    /// （邊下載邊寫），塞不進「一個工作 = 一個交易」，所以它們維持自己的連線（/docs/design/daemon/daemon-runtime.md §2.3.1）。
     pub(crate) fn server_cache_and_me(
         &self,
         account: &AccountDir,
@@ -591,7 +591,7 @@ fn kind_matches(message: &Message, wanted: &str) -> bool {
     }
 }
 
-/// 在沒有 E2EE 的房間送檔案時，唯一准的密碼學選擇（wbf-client-convention-for-chunk.md §5.1）。
+/// 在沒有 E2EE 的房間送檔案時，唯一准的密碼學選擇（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 ///
 /// 🚫 **永遠不在沒 E2EE 的房間送加密的區塊**：那個區塊的金鑰會公開，等於用一個假的
 /// 保護感騙人。呼叫端要嘛用 `Cipher::None`，要嘛別送。
@@ -718,7 +718,7 @@ mod tests {
     }
 
     /// 🚫 **一般 Matrix 房（沒有 `r_seq`）本地不答**（維護者 2026-09-14：「不快取，總是詢問」）——
-    /// 沒有 `r_seq` 就只剩時間戳可排，而那是錯的（chat-model.md §4.3）。第一頁、翻頁都一樣。
+    /// 沒有 `r_seq` 就只剩時間戳可排，而那是錯的（/docs/design/rooms/chat-model.md §4.3）。第一頁、翻頁都一樣。
     #[tokio::test]
     async fn a_room_without_r_seq_is_never_answered_from_the_local_cache() {
         let dir = scratch("plain-room");
