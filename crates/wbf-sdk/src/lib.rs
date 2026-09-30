@@ -31,7 +31,7 @@
 //!
 //! - `incoming`：上游給的事件原樣（`IncomingEvent`）、一頁的游標、事件分類與 edit 的有效性規則（edits-and-redactions.md）。
 //! - `event_json`：原始 Matrix 事件 JSON → `Message`，matrix backend 與 `recent` 共用。
-//! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
+//! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，房間這一側唯一 `use matrix_sdk` 的地方（E2EE 引擎在 `crypto_engine`）。
 //! - `device_version`：裝置版本號與房間版本號（server 的 `wbf-room-device-version.md`）：成員清單怎麼讀、1506 之後跟誰重查、雜湊怎麼自己重算。
 //! - `to_device_state`：to-device 的 `cd_seq` 與待銷毀清單，落在 `m/`（to-device-client.md §2、§4）。
 //! - `crypto_engine`（feature `matrix`）：`OlmMachine` 只當狀態機用——to-device 推進去、`outgoing_requests` 走橋送出去、房間金鑰分給一群人（e2ee-walkthrough.md §13）。

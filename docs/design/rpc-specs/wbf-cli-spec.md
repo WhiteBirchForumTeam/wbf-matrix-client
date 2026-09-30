@@ -1,6 +1,5 @@
 # wbf-cli 規格：命令、參數、輸出、狀態檔
 
-> 狀態：草案，2026-09-04，等維護者同意。對應 plan-v1 §6 第 2 步（不接 matrix-sdk）與第 3 步（接）。
 > 本文定的是**介面**；線上行為照 wbfuwunel 的線上規格，加解密照
 > [wbf-client-convention-for-chunk.md](../media/wbf-client-convention-for-chunk.md)（以下稱「約定」）。
 
@@ -447,7 +446,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 ## 8. 驗收腳本（第 2 步交付的一部分）
 
-`scripts/acceptance.sh`（Windows 跑 Git Bash），對著本機 wbfuwunel，照 plan-v1 §4 的表：
+`scripts/acceptance.sh`（Windows 跑 Git Bash），對著本機 wbfuwunel 驗上傳、下載、seek、續傳、串流：
 
 1. `login`，`ping` 看 features 有 `upload`、`download`。
 2. 產生 200 MiB 隨機檔 → `upload` → 標準 `GET /_matrix/client/v1/media/download/…` 拿整份 → 長度必須是 `file_size + 塊數 × 16`（明文模式不加）。

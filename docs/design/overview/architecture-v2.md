@@ -1,7 +1,7 @@
 # 架構 v2：daemon、RPC、與四個前端
 
 > 維護者 2026-09-09 定的方向。這份文件講**分層與介面**，不講功能——功能在
-> [`plan-v1.md`](plan-v1.md)、[`chat-model.md`](../rooms/chat-model.md)、[`local-cache-db.md`](../storage/local-cache-db.md)、
+> [`chat-model.md`](../rooms/chat-model.md)、[`local-cache-db.md`](../storage/local-cache-db.md)、
 > [`wbf-cli-spec.md`](../rpc-specs/wbf-cli-spec.md)。RPC 的逐條訊息在 [`rpc-spec.md`](../rpc-specs/rpc-spec.md)（2026-09-12 第一版）。
 
 ## 0. 一句話
@@ -331,7 +331,7 @@ apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出�
 所以那個還沒定的決策**不會擋住開工**：先做 `wbf-core`，它兩條路都要。
 ✅ **2026-09-12 做完了**（#24），而 RPC vs uniffi 仍然沒定——這正是「先做 core」想買到的東西。
 
-- **`wbf-sdk` 保持是純 library**（plan-v1 §7.2 的方向不變）：core 是它的使用者，不是它的一部分。
+- **`wbf-sdk` 保持是純 library**（architecture-v2 §8 的方向不變）：core 是它的使用者，不是它的一部分。
 - **`wbf-daemon` 同時是 library 與 binary**：Desktop 內嵌用 library，其他人 spawn binary。
 - ⚠️ **`wbf-core` 的公開介面不能假設「同程序」**：方法收 `&self`、參數與回傳用簡單型別、
   事件用 channel 而不是回呼引用、自己持有 tokio runtime 不要求宿主提供。
@@ -391,3 +391,25 @@ CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印�
    長期若要原生則是 egui／iced／slint／gtk-rs 這一類。
    ⚠️ 原生 Rust GUI 的傳統弱項（長列表虛擬化、IME 中文輸入）要單獨驗；web 那批沒有這個問題，
    但多一層 runtime。評估維度見 handover §7。
+
+## 8. 耦合方向：上游 SDK 是可以拆掉的零件，不是地基（維護者 2026-09-05 定）
+
+維護者的原話，照錄：「不要依賴太重，能切乾淨就切乾淨，蓋下去之後，要拆開來就難了。現在剛起步，這是重點的重點。」
+
+- **我們自己的東西越多，對上游的依賴越低。** 上游 `matrix-sdk` 不是要一次淘汰，是隨著我們的 work 長大自然變薄，最後變成 fallback。
+- **WS 層是我們自己的協定**（pack）。wbf 帳號已經不建 matrix-sdk 的 Client（account-session.md）；上游那套只剩一般 Matrix 帳號在用。
+- **crypto 只當「加密解密的引用」，引擎是我們的**：`matrix-sdk-crypto` 的 `OlmMachine` 包在 `crypto_engine::OlmEngine` 裡，呼叫者只看得到它。
+  沒抽 trait：只有一個實作，抽了是儀式；真的要換引擎時再抽。
+- **`matrix-sdk-base` 的型別不滲進我們的介面。**
+- **整體架構往 Telegram 對齊**（房間、對話、媒體的使用方式），但**不丟掉 E2EE 的本質**。聊天模型在 chat-model.md。
+- **與聯邦對接能兼容就盡量兼容**；我們自幹的 feature 是 extension，可以不兼容。
+- 🚨 **任何會 breaking Matrix 兼容的地方，都要提出來審查**，由維護者定案要不要兼容。這條沒有例外。
+
+落到程式上的規則：
+
+| 規則 | 意思 |
+|---|---|
+| CLI 與 UI 只看我們的型別 | `matrix_sdk::Room`、`ruma::events::…` 不出現在 `wbf-sdk`／`wbf-core` 的 pub 介面 |
+| 上游只出現在兩個模組 | `wbf-sdk/src/backend/matrix_sdk.rs`（一般 Matrix 帳號的房間）與 `wbf-sdk/src/crypto_engine.rs`（E2EE 引擎）；其他檔不 `use matrix_sdk` |
+| 跨邊界只傳資料，不傳規則 | adapter 不知道 CLI 的政策（要不要警告、要不要落地）；CLI 不知道 adapter 底下是 HTTP 還是 pack |
+| 每個 PR 要寫「這次新增了對上游的哪些依賴」 | 讓依賴的增長是看得見的，不是蓋下去才發現 |

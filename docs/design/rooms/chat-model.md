@@ -1,10 +1,10 @@
 # 聊天模型與房間設計：站在 Matrix 的高度，用 Telegram 的形狀
 
 > 狀態：2026-09-05 維護者訂正過一輪（標「維護者定」的是定案，標「再議」的還開著）。
-> 前提：[plan-v1.md](../overview/plan-v1.md) §7.2 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
+> 前提：architecture-v2 §8 —— 上游 `matrix-sdk` 是可拆的零件。這份文件定的是**我們的模型**；
 > 「現在怎麼接到 Matrix」只是第一個 backend 的接法，之後換成自己的協定時，模型不動、只換接法。
 > Telegram 的部分是憑印象寫的（維護者明說接受）；Matrix 的部分照規格與 `vendor/matrix-rust-sdk` 的實作。
-> 🚨 標 **[審]** 的地方會 breaking Matrix 兼容或 Matrix 做不到，要維護者定案（plan-v1 §7.2）。
+> 🚨 標 **[審]** 的地方會 breaking Matrix 兼容或 Matrix 做不到，要維護者定案（architecture-v2 §8）。
 
 ## 0. 一句話
 
@@ -35,7 +35,7 @@
 | 即時 | `/sync` 長輪詢，回全部房間的增量 | 推送 | **watch 流**（§4.2） |
 | 加密 | Olm（裝置對裝置）＋ Megolm（房間金鑰），跨裝置簽章驗證 | 一般聊天 server 端可讀；secret chat 端到端、綁單一裝置 | **一律 E2EE 是預設**，非 E2EE 是例外要警告（約定 §5.1） |
 | 檔案 | `m.file` 加 `file` 欄（AES-CTR）；整檔上傳 | 檔案 2 GB，串流播放 | 我們的分塊檔（約定規格書），`msgtype = org.wbftw.wbfuwunel.file` |
-| 聯邦 | 有：room 可以跨 server | 沒有：單一平台 | 保留，能兼容盡量兼容（plan-v1 §7.2） |
+| 聯邦 | 有：room 可以跨 server | 沒有：單一平台 | 保留，能兼容盡量兼容（architecture-v2 §8） |
 
 Telegram 沒有而 Matrix 有、我們**要留**的：多裝置各自金鑰、裝置驗證、聯邦、房間 state（可查歷史誰改了名字）。
 Matrix 沒有而 Telegram 有的，全部在 §5，維護者逐列定過。
@@ -223,12 +223,12 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
   不論是不是 E2EE，都照 Matrix 實作：加密就 `m.room.encryption`（Megolm）；公開可搜就 `history_visibility: world_readable` 加 `join_rule: public`，這兩件事互不影響。
   UI 的預設值（例如 Direct／Group 預設加密）是 UI 的事；非加密 room 送檔案前的警告照約定 §5.1。
 - 裝置驗證、cross-signing、金鑰備份：第一版只做「解得開就解、解不開標 `decrypted: false`」，驗證流程是第 4 步以後的事。
-- 這一層是 `RoomCrypto` trait 的實作包 `OlmMachine`（plan-v1 §7.2）；adapter 呼叫的是 trait。
+- 這一層是 `RoomCrypto` trait 的實作包 `OlmMachine`（architecture-v2 §8）；adapter 呼叫的是 trait。
 
 ### 3.7 上游依賴清單（第 3 步 PR 要列的）
 
 `matrix-sdk`（`Client`、`Room`、sync 迴圈、send queue、`m.direct` 處理）、`matrix-sdk-crypto`（透過 `RoomCrypto`）、`ruma`（事件型別，只在 adapter 內）。
-**不用** `matrix-sdk-ui`（它的 `Timeline` 是給 UI 綁定用的，聚合邏輯我們自己做，理由 plan-v1 §7.2）。
+**不用** `matrix-sdk-ui`（它的 `Timeline` 是給 UI 綁定用的，聚合邏輯我們自己做，理由 architecture-v2 §8）。
 
 ## 4. 流：歷史與即時
 

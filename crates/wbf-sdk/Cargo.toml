@@ -36,7 +36,7 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled-sq
 
 [features]
 default = []
-# 第 3 步的房間 backend：唯一 use matrix_sdk 的地方是 src/backend/matrix_sdk.rs（plan-v1 §7.2）。
+# 上游只出現在兩個模組：房間 backend src/backend/matrix_sdk.rs 與 E2EE 引擎 src/crypto_engine.rs（architecture-v2.md §8）。
 # 預設關：wbf-sdk 本體不拖 matrix-sdk，apps/wbf-cli 才開。
 matrix = ["dep:matrix-sdk", "dep:matrix-sdk-crypto", "dep:futures-core"]
 # 本地快取 cache.db（local-cache-db.md §5）。與 matrix feature 的 store 共用同一份 libsqlite3-sys（feature 統一後是 SQLCipher 版）。

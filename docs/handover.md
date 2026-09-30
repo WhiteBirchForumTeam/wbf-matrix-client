@@ -359,9 +359,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 ## 8. 規矩（維護者定，全域 CLAUDE.md 也有）
 
 - 一律開分支送 PR，merge commit，不 rebase、不 squash、不 amend、不 force push。
-- 每個 PR 描述要列「新增了對上游的哪些依賴」（plan-v1 §7.2）。
+- 每個 PR 描述要列「新增了對上游的哪些依賴」（architecture-v2 §8）。
 - 會 breaking Matrix 兼容的設計先寫給維護者，不自己選。
-- 本地不落地任何聊天內容（plan-v1 §7.1），直到 local-cache-db 那一版。
 - 審查者 cirno／rumia／salvia 每個 PR 都會來；逐條回應，能改就改，不改講理由。
 - 🧭 **狀態放 UI、動作能自動就自動**（維護者 2026-09-29，e2ee-rpc.md §0）：「誰記住什麼」預設是 UI（房間版本號、同步起點、`txn_id`），daemon 不存快照；「被擋之後該補的」daemon 順手做完再一起回（1506 → 自動 refresh、新狀態放錯誤的 `data`），但🚫 不替 UI 做決定（不自動重送、`DeviceChanged` 只轉不叫 refresh）。兩題分開答：狀態放哪、動作能不能順手做完。
 - 🔌 **訂閱與連線總是由 daemon 搞定**（維護者 2026-09-29，link-pool.md §3.1）：解鎖／登入後五條線全開、背景每 15 秒看一次；UI 收不收推播用 `subscribe`，🚫 沒有開關上游訂閱的 RPC。

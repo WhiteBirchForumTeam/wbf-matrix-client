@@ -1,4 +1,4 @@
-//! `ChatBackend` 的第一個實作：包上游 `matrix-sdk`。**這是整個 crate 唯一 `use matrix_sdk` 的檔**（plan-v1 §7.2）。
+//! `ChatBackend` 的第一個實作：包上游 `matrix-sdk`。**房間這一側唯一 `use matrix_sdk` 的檔**（另一個是 E2EE 引擎 `crypto_engine.rs`，architecture-v2.md §8）。
 //!
 //! 對上游的依賴，逐條列（每個 PR 要寫的）：
 //! - `Client`（builder、sqlite store、`restore_session`、`sync_once`、`joined_rooms`）
@@ -8,7 +8,7 @@
 //! - ruma 的 `RoomMessageEventContent`／`MessageType::new`（組 `m.room.message`）
 //!
 //! 加密在這一版**完全在 matrix-sdk 裡**（`Room::send` 自己 Megolm、`TimelineEvent` 自己解）：我們沒有直接碰 `OlmMachine`，
-//! 所以 plan-v1 §7.2 的 `RoomCrypto` trait 這一版還沒有東西可包；接管送訊息（附件宣告需要，見 `send_file`）那一版才會出現。
+//! 這是一般 Matrix 帳號的路；wbf 帳號的 E2EE 引擎在 `crypto_engine.rs`（e2ee-rpc.md）。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ pub struct MatrixBackend {
 }
 
 impl MatrixBackend {
-    /// 登入：拿到裝置與 token，store 落在 `store_dir`（crypto 與 state 兩個 sqlite，plan-v1 §7.1 說的「非存不可」）。
+    /// 登入：拿到裝置與 token，store 落在 `store_dir`（crypto 與 state 兩個 sqlite，是上游自己非存不可的；聊天內容的快取在 `cache.db`，local-cache-db.md）。
     /// store 用 `store_key` 包住它自己的 `StoreCipher`（local-cache-db.md §4.3）：這把是 `Vault::matrix_store_key()`。
     ///
     /// Args:

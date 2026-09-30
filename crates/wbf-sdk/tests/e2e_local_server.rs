@@ -1,4 +1,4 @@
-//! 對著真的 wbfuwunel 跑（plan-v1 §4 的驗收表，SDK 層那幾條）。平常 `#[ignore]`；要跑：
+//! 對著真的 wbfuwunel 跑（wbf-cli-spec §8 的驗收項目，SDK 層那幾條）。平常 `#[ignore]`；要跑：
 //!
 //! ```text
 //! WBF_E2E_SERVER=http://127.0.0.1:6167 WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=<檔> \

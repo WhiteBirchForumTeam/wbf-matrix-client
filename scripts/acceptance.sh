@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 驗收腳本（CLI 規格 §8、plan-v1 §4），對著本機 wbfuwunel 跑。Windows 用 Git Bash。
+# 驗收腳本（CLI 規格 §8），對著本機 wbfuwunel 跑。Windows 用 Git Bash。
 #
 #   WBF_PASSWORD_FILE=<檔> scripts/acceptance.sh
 #
