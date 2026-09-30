@@ -7,3 +7,12 @@ exclude = ["vendor/matrix-rust-sdk"]
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.95"
+
+# 除錯資訊（維護者 2026-09-30）：完整除錯資訊讓 target/ 長到 22 GB，其中 15 GB 是 .pdb，而每個 tests/*.rs 各自連一份 matrix-sdk。
+# 自家 crate 只留行號：panic／backtrace 仍然指得到檔案與行數，只是除錯器看不到區域變數。依賴不帶：它們的行號我們用不到。
+# 要在除錯器裡看變數，臨時帶 CARGO_PROFILE_DEV_DEBUG=true（環境變數蓋過這裡）。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
