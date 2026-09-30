@@ -35,9 +35,9 @@ pub struct DeviceWindow {
     pub items: Vec<(u64, serde_json::Value)>,
     /// 這一窗總共幾則。
     pub tc: u32,
-    /// 這一窗最新的 count：下一窗的 `cd_seq`。空窗是 None。
+    /// 這一窗最新的 count（落地紀錄用；`Fetch` 不帶游標，下一窗從佇列頭拉）。空窗是 None。
     pub nt: Option<u64>,
-    /// true ＝ 窗停在上限，後面可能還有（帶 `cd_seq = nt` 再拉）；false ＝ 佇列真的拉完了。
+    /// true ＝ 窗停在上限，後面可能還有（銷毀這一窗之後再 `Fetch`，從佇列頭接著拉）；false ＝ 佇列真的拉完了。
     pub more: bool,
 }
 

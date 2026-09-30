@@ -1,9 +1,7 @@
 # 連線池：一個帳號五條線，各司其職；daemon 解鎖／登入後全開，背景看著、死了重開
 
-> 維護者 2026-09-21 定的形狀（architecture-v2.md §5.1.1 四條線的落地版；daemon-runtime.md §10 第 4 階段 daemon 那半、第 7 階段的連線部分）。
-> 📌 2026-09-29 維護者改了兩件事（§1、§3.1）：房間與金鑰的訂閱**各自一條**（server #85 把每台裝置的 WS 上限放到 8）；
-> 訂閱**總是由 daemon 搞定**——解鎖、登入之後五條全開，常駐時有個背景迴圈看著，被關掉的重開。
-> 前提是 PR #52：`WsLink` 能收任何 pack、每個收到的 pack 過 `ReceivedHook`（`ws-receive-dispatch.md`）。這份文件講的是**誰擁有那些 link、什麼時候開關、命令怎麼挑線**。
+> 維護者 2026-09-21 定的形狀（architecture-v2.md §5.1.1 的落地版）；2026-09-29 定：房間與金鑰的訂閱**各自一條**（§1）、訂閱**總是由 daemon 搞定**（§3.1）。
+> 收包這層（`WsLink` 能收任何 pack、每個收到的 pack 過 `ReceivedHook`）在 `ws-receive-dispatch.md`。這份文件講的是**誰擁有那些 link、什麼時候開關、命令怎麼挑線**。
 > 實作在 `crates/wbf-core/src/link_pool.rs`（池）、`link_keeper.rs`（「該開的都開著嗎」的鉤子）與 `crates/wbf-daemon`（觸發、背景迴圈、推播、desync）。
 
 ## 0. 一句話
@@ -20,14 +18,14 @@
 | `Upload` | `Upload/*` | 資料平面，長時間高頻寫，最會塞爆佇列——只能塞爆自己 |
 | `Download` | `Download/*`（`Read`、串流） | 同上；跟上傳分開，一邊塞爆不拖另一邊（維護者 2026-09-21：媒體開兩條） |
 | `Rooms` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件） | 推播線，不跟資料平面共享佇列；量大但可重拉 |
-| `Keys` | `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件），以及 `Device/Fetch`／`ItemsDestroy`（拉、銷毀：server 只讓持有裝置佇列的那條連線銷毀，維護者 2026-09-24 同意） | 🚨 **掉了就沒了**：它必須有一條安靜的線，不跟任何大流量共享佇列（architecture-v2.md §5.1.1 原本的設計；2026-09-21 到 09-29 跟 `Rooms` 共用過一條，因為 server 那時每台裝置只給 4 條 WS） |
+| `Keys` | `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件），以及 `Device/Fetch`／`ItemsDestroy`（拉、銷毀：server 只讓持有裝置佇列的那條連線銷毀，維護者 2026-09-24 同意） | 🚨 **掉了就沒了**：它必須有一條安靜的線，不跟任何大流量共享佇列（architecture-v2.md §5.1.1）；跟 `Rooms` 分開靠的是 server 每台裝置給 8 條 WS（server #85） |
 
 - ⭐ 分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind：`Misc` 收各種 kind。例外是 `Device/Fetch`／`ItemsDestroy`：它們是拉窗、不是訂閱，
   但 server 只讓**持有這台裝置佇列的那條連線**銷毀（to-device-client.md §8 實跑補的），所以跟著金鑰的訂閱走：收金鑰的 task 用線時跟池 `reuse` 那一格（key-sync.md §1）。
 - `Keys` **綁裝置**（server 的 `Device/Subscribe` 一台裝置一條連線在收、後來的接手），所以它就是那個帳號**唯一**在收金鑰的連線；🚫 不要在別條線上訂。
   `Rooms` 沒有這個限制（server 的房間 topic 是 `Occupancy::Many`），但一個帳號也只訂一次。
 - 一個帳號一個池；兩個帳號登在同一台 server 也各自五條（token 不同，共用會讓一個帳號塞爆另一個）。server 的上限是每台裝置 8 條、每個來源位址預設 40 條（超過回 1403）。
-  常駐五條之後的容量：**同一台機器（同一個位址）最多 8 個常駐的 wbf 帳號**，第 9 個開始會有線開不起來（PR #61 審查 cirno 🟢3）。
+  常駐五條之後的容量：**同一台機器（同一個位址）最多 8 個常駐的 wbf 帳號**，第 9 個開始會有線開不起來。
 
 ## 2. 命令怎麼挑線：角色是**呼叫點**的屬性
 
@@ -68,20 +66,16 @@
   `Keys` 就 `Device/Subscribe` → 追平 → 起收金鑰的 task（`key-sync.md`）；所以「開這條線」＝「訂了」，重開就重訂。
   訂閱會話結束而 socket 還活著（server 送 `Error`，例如金鑰被同一裝置後來的連線接手的 1505）時池的殞死偵測看不出來，
   所以兩個 task 收攤時都自己 `close` 那格（room-sync.md §4、key-sync.md §1）——鉤子下一輪看到它不在，才會重開、重訂。
-- **登出**（維護者 2026-09-21 定）：登出的 RPC 就是一次 HTTP `/logout`（或 fallback 到 matrix-sdk），**只有成與不成**。不成就到此為止，什麼都不動；
-  成了就把這個帳號的池**直接關掉、釋放資源**（`close_all`），然後才刪本地的 `session.sealed`、`m/`…。順序：
-
-  | 步 | 做什麼 | 之後的世界 |
-  |---|---|---|
-  | 1 | HTTP `/logout`（撤 token、刪裝置） | server 不再認這個 token：既有的線在下一個 message 被踢（server 每個 message 重驗），之後才開的線 hello 就被拒 |
-  | 2 | `close_all`：等每一格的鎖、取出、關掉，池從註冊表拿掉 | **還在處理的命令做完才被收**（它握著鎖）；正在開的那條也是。該落地的由 cache 寫入者照常落地 |
-  | 3 | 刪 `session.sealed`、`m/`、快照、current | 本地跟 server 一致；`session_of` 回 NotLoggedIn，連試都不試 |
+- **登出**（維護者 2026-09-21 定；完整順序在 account-session.md §4）：登出的 RPC 就是一次 HTTP `/logout`（一般 Matrix 帳號走 Client 的），**只有成與不成**。不成就到此為止，什麼都不動；
+  成了就把這個帳號的池**直接關掉、釋放資源**（`close_all`），然後才刪本地的 `session.sealed`、`m/`…。池這邊看到的是：
+  - `/logout` 成了：server 不再認這個 token。既有的線在下一個 message 被踢（server 每個 message 重驗），之後才開的線 hello 就被拒。
+  - `close_all`：等每一格的鎖、取出、關掉，池從註冊表拿掉。**還在處理的命令做完才被收**（它握著鎖）；正在開的那條也是。該落地的由 cache 寫入者照常落地。
 
   🚫 **池裡不存「登出了沒」**：那件事的真相只有兩份——server 的 token 表與本地的 `session.sealed`——池再存一份就是第三份（維護者 2026-09-21：「這個改法有點髯」）。
-  登出與一般命令的競賽因此由 server 裁決：第 1 步之後任何新開的線都拿不到授權（hello 就是第一個 message），第 1 步之前開的由第 2 步收。
+  登出與一般命令的競賽因此由 server 裁決：`/logout` 之後任何新開的線都拿不到授權（hello 就是第一個 message），之前開的由 `close_all` 收。
 - **destroy**：同上（共用同一段）。**重登入**（session 換了）：封好新 session 之後 `close_all` 舊池（舊 token 沒撤、但那些線不該再用）。**daemon 關**：`Core` 丟掉就全關（`Drop`）。
 - 背景重開見 §3.1：它用的就是這裡的 `acquire`（經 `ensure_open`），🚫 不另開一套。
-- 📎 重開時**不重探** backend（`backends` 那格照舊）：探測的是「這台講不講 wbf」，跟這條線死沒死無關。登出才 `forget_backend_probe`（既有）。
+- 📎 重開時**不重探** backend：wbf 帳號的 backend 登入時就記在 session（`session.backend`，account-session.md §2），跟這條線死沒死無關。登出也不忘掉探測結果（探測以 server 為鍵、不帶 token）；`forget_backend_probe` 沒有正式呼叫點，留給監督者重連。
 
 ### 3.1 「該開的線都開著嗎」：鉤子與背景迴圈（維護者 2026-09-29）
 
@@ -96,8 +90,8 @@
    拿到就馬上放：🚫 不握著它開線（開線要幾秒，server 不在時更久；握著會把使用者的登入／登出擋成 `AccountBusy`）。
    之後才開始的登出由封池擋（`pool_of_account` 回 `AccountBusy`）；之後才開始的登入會自己 `close_links` 舊 session 的線，下一輪用新 session 重開。
 3. 一個一個帳號：沒登入的跳過；登出中的跳過（封池）；不是 wbf 的跳過——判準只看登入時記下的 `session.backend == Some(WbfSdk)`（跟 `init_keys`／`olm_engine_of` 同一條），
-   🚫 不探 server（維護者 2026-09-29 選的，PR #61 審查 cirno 🟡1：探測沒有逾時、失敗不記，每 15 秒一輪會對一般 Matrix 帳號一直敲門、server 黑洞時卡住整輪）。
-   代價：沒記 backend 的舊 session（PR #56 之前登入的）不會自動開線，重新登入一次就有。
+   🚫 不探 server（維護者 2026-09-29 選的：探測沒有逾時、失敗不記，每 15 秒一輪會對一般 Matrix 帳號一直敲門、server 黑洞時卡住整輪）。
+   代價：沒記 backend 的 session（舊版封的、`--token` 接的，account-session.md §2）不會自動開線，重新登入一次就有。
 4. 五個角色照 `LinkRole::ALL` 的順序 `LinkPool::ensure_open`：開著的不動、**有命令正在用的算開著**（🚫 不排在一個長下載後面等）、沒開或死了的開一條（死的先發 `closed`）。
    開不起來：發 `Note`、記進 `failed`、繼續下一條（一條不擋其他條、其他帳號）。
 
@@ -126,10 +120,10 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 - `Link`：開成功發 `Opened`；發現死了（下一次取用、或背景迴圈下一輪看到時）、`close`／`close_all` 發 `Closed` 帶理由。⚠️ 不是即時的——死了大約一分鐘內才被看到（心跳＋迴圈間隔，§3.1）。
   `sync.state` 那個帳號層的事件維持不變（它講的是「追平了沒」，不是哪條線）。
 - `Received`：`ReceivedHook` 的那一頭。**只有標頭**（kind／subtype／id／seq／路徑），🚫 不帶 meta、🚫 不帶 data——data 可能是幾 MiB 的媒體塊或密文，
-  而事件是 broadcast、每條 RPC 連線都會拿到一份。要內容的（訊息、金鑰）由 PR 2／第 6 階段發**型別化**的事件（`room.message` 那種）。
+  而事件是 broadcast、每條 RPC 連線都會拿到一份。要內容的（訊息、金鑰）走**型別化**的事件（`room.message`、`keys.state` 那種）。
   這則的用途是**讓 UI 看得到線上發生了什麼**（除錯、狀態列），維護者：「rpc 發送到 UI 的 function 裡面判斷這個包要不要過去」——
   判斷在 daemon 的推播函數（§6），池只發。
-- 鉤子在讀取 task 上、表鎖之外（`ws-receive-dispatch.md` §4）；`EventSink` 是 broadcast 的 `try_send`，不會擋讀取 task。
+- 鉤子在讀取 task 上、表鎖之外（ws-receive-dispatch.md §4）；`EventSink` 是 broadcast 的 `try_send`，不會擋讀取 task。
 
 ## 5. 一條線一次一個命令
 
@@ -176,7 +170,7 @@ pub trait LinkOpener: Send + Sync {
 - daemon：`subscribe`／`unsubscribe` 回剩下的集合；沒訂就收不到；訂了 `"*"` 全收；`user` 過濾；Lagged → `desync`；`progress` 不訂也收得到自己的；
   看線的迴圈 `daemon.shutdown` 一廣播就停、`TRANSPORT = http` 根本不跑。
 - 真 server（`--ignored`）：`account.add` 之後五條在背景開起來（`daemon.info` 的線數到 5）、`server.ping` 走開著的 `Misc`（還是 5）；daemon 重開、`vault.unlock` 之後又是 5；
-  `account.del` 之後五條關。core 的兩條（房間、金鑰）改用 `ensure_links` 開線。
+  `account.del` 之後五條關。core 的兩條（房間、金鑰）用 `ensure_links` 開線。
 
 ## 9. 明確不做的
 

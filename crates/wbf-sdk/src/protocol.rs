@@ -1155,7 +1155,7 @@ pub struct DeviceBatchMeta {
     pub bc: u32,
     /// oldest：這批最舊的 count（舊→新，所以是第一則）。
     pub ot: u64,
-    /// newest：這批最新的 count（最後一則）——下一窗的 `cd_seq`。
+    /// newest：這批最新的 count（最後一則），落地紀錄用；`Fetch` 不帶游標，下一窗從佇列頭拉。
     pub nt: u64,
     /// 每則的 count，跟 data 一一對應（`bc` 個）。
     pub counts: Vec<u64>,

@@ -1,22 +1,12 @@
 # 本地資料庫設計：加密的暫存快取
 
-> 狀態：2026-09-05 草案，維護者同意 §1–vault-and-keys.md §1、§5 的提案；§4（與 matrix-sdk store 的關係）維護者要求寫細再議。
-> **2026-09-06 起動手**（維護者定：第 3 步第一版之後下一隻專注這裡）。做到哪：
->
-> | 段 | 狀態 |
-> |---|---|
-> | vault-and-keys.md §1 主金鑰、兩種鎖法、三把子金鑰、`session.sealed` | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 vault-and-keys.md §1.1 |
-> | §4.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
-> | §3、§5 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，wbf-cli-spec.md §3.1，實作還沒跟上）。§5 的 schema 就是實作的（v2）；建置需求見 §3 |
-> | room-key-backup.md 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。room-key-backup.md §4 的本地格式實作時改成全量快照（原因寫在那一節）。✅ 2026-09-10 補上 conf 的兩個開關（`SERVER_BACKUP`／`LOCAL_ROOM_KEYS`）與關掉時的警告 |
-> | vault-and-keys.md §2 路徑兩層都加密、vault-and-keys.md §3 passphrase 是任意 bytes | ✅ vault-and-keys.md §2 2026-09-09 做了（`account_dir`）、vault-and-keys.md §3 2026-09-10 做了（`read_passphrase_file`）。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪，舊 `local.key` 解不開也直接刪 |
-> | media-pool.md 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 media-pool.md §1、§3 的「實作」段 |
+> 這份講 `cache.db`（與 matrix-sdk 的 store 怎麼分工）。主金鑰、子金鑰、路徑加密、passphrase 在 vault-and-keys.md；媒體內容在 media-pool.md。
 
 ## 0. 一句話
 
-本地有兩個 SQLite 檔：matrix-sdk 自己的 store（它非存不可的東西）與我們的快取（聊天紀錄、房間、事件區塊）。
-兩個都加密，金鑰都從同一把 32 byte 主金鑰導出；主金鑰第一版明文放本地（自解密），加 passphrase 後被密碼包住，
-啟動時要解開，UI 與 CLI 走同一個函數。**快取不是權威**：可以整個刪掉重建，衝突以 server 為準。
+本地有兩種 SQLite：matrix-sdk 的 store（帳號目錄的 `m/`，它非存不可的東西）與我們的快取 `cache.db`（聊天紀錄、房間、事件區塊）。
+兩種都加密，金鑰都從同一把 32 byte 主金鑰導出；主金鑰預設明文放本地（`Plain`），設了 passphrase 就被它包住，
+啟動時要解開，UI 與 CLI 走同一個函數（vault-and-keys.md §1）。**快取不是權威**：可以整個刪掉重建，衝突以 server 為準。
 
 ## 1. 定位：快取，不是權威
 
@@ -24,7 +14,7 @@
 |---|---|
 | 可以整個丟掉 | schema 版本不對、server 換了、解不開：刪檔重建，不寫遷移。一個 server 一份、多帳號混存（§5），user 換了不丟 |
 | 不需要衝突解決 | 同一個 event_id 再寫一次就覆蓋；server 說的算 |
-| 事件快取只長不刪 | **500 是同步視窗，不是上限**（維護者 2026-09-05 訂正）：進房時把最新 500 則同步進快取；往舊滑超過就再 load 更舊的存進去；下次重讀那一段從快取拿，不重拉。事件小，不設上限 |
+| 事件快取只長不刪 | **500 是同步視窗，不是上限**（維護者 2026-09-05 訂正）：進房時把最新 500 則同步進快取；往舊滑超過就再 load 更舊的存進去；下次重讀那一段從快取拿，不重拉。事件小，不設上限。500 則／房與初開全域 10000 則是預設值，可調 |
 | 媒體快取有配額，但是 best effort | **2 GiB**（維護者 2026-09-05 定），不是 hard limit；另有 **7 天保護期**，期內用過的檔不自動刪（media-pool.md §5） |
 | 壞掉的代價只是重拉 | 任何讀到壞資料的地方都 fail closed：當成沒有快取，回 server 拿 |
 
@@ -45,20 +35,19 @@
 
 ## 3. 加密：SQLCipher，整檔頁級
 
-`rusqlite` 的 `bundled-sqlcipher` feature（實作時確認 feature 名與 matrix-sdk 釘的 rusqlite 0.40 相容；
-兩邊 feature 會統一，SDK 的 store 也會連到 SQLCipher 版的 sqlite，但它不下 `PRAGMA key`，行為就是普通 SQLite）。
+`rusqlite` 0.40 開 `bundled-sqlcipher-vendored-openssl`。feature 統一後整個 workspace 的 `libsqlite3-sys` 都是 SQLCipher 版：
+matrix-sdk 的 store 也連到它，但不下 `PRAGMA key`，行為就是普通 SQLite。
 
 - 用 **raw key** 開：`PRAGMA key = "x'<64 hex>'"`，跳過 SQLCipher 自己的 PBKDF2，金鑰導出由我們統一做（vault-and-keys.md §1）。
 - 不選「自己在 SQLite 上做每列 AEAD」：查詢變難、索引做不了、表名與列數等 metadata 漏在外面。
-- Android：`bundled-sqlcipher` 是原始碼編譯，NDK 能編（實作時驗）。
-- **建置需求（2026-09-07 實測）**：`rusqlite` 開 `bundled-sqlcipher-vendored-openssl`，feature 統一後整個 workspace 的 `libsqlite3-sys` 都是 SQLCipher 版（matrix-sdk 的 store 也連到它，但不下 `PRAGMA key`，行為是普通 SQLite）。SQLCipher 的 AES 走 OpenSSL：
+- **建置需求（2026-09-07 實測）**：SQLCipher 的 AES 走 OpenSSL：
 
   | 平台 | 需要什麼 |
   |---|---|
   | Windows MSVC | 編 vendored OpenSSL 要 **Strawberry Perl**（git-bash 的 msys perl 跑 `Configure` 會失敗）。cargo 前把 `C:\Strawberry\perl\bin` 排到 PATH 前面。第一次編要好幾分鐘 |
   | Linux | 系統 perl 就夠 |
   | macOS | SQLCipher 走 CommonCrypto，不編 OpenSSL |
-  | Android | 還沒驗 |
+  | Android | 還沒驗：`bundled-sqlcipher` 是原始碼編譯，NDK 應該編得動 |
 
 - **fail closed**：`Cache::open` 下完 `PRAGMA key` 會問 `PRAGMA cipher_version`，空的（這個 build 沒有 SQLCipher，`PRAGMA key` 是 no-op）就拒絕開，不會靜默寫出明文快取。
 
@@ -66,17 +55,20 @@
 
 ### 4.1 它有什麼
 
-`vendor/matrix-rust-sdk` 的 `matrix-sdk-sqlite`（2026-09-03 的上游）有**四個** store，各自一個 SQLite 檔，由 feature 開關：
+`vendor/matrix-rust-sdk` 的 `matrix-sdk-sqlite` 有**四個** store，各自一個 SQLite 檔（`matrix-sdk-<名字>.sqlite3`）：
 
 | store | 表（migrations 裡的） | 裝什麼 | 我們要不要 |
 |---|---|---|---|
 | crypto | `device identity session inbound_group_session outbound_group_session secrets key_requests olm_hash tracked_user room_settings …` | 裝置金鑰、Olm／Megolm session、房間金鑰、金鑰備份狀態 | **必要**。沒有它每次啟動是新裝置，E2EE 訊息解不開、要重新驗證 |
-| state | `room_info member profile state_event receipt global_account_data room_account_data send_queue_events kv …` | sync 狀態：房間列表、成員、房間 state、收據、送出佇列 | **必要**。沒有它每個命令都 initial sync，慢而且 sync token 沒地方放 |
-| event_cache | `linked_chunks event_chunks gap_chunks events threads media …` | SDK 自己的時間線快取（linked chunk 結構），給它的 `Timeline` 用 | **不開**：這正是「聊天紀錄」，edits-and-redactions.md §1 說不存。不給它 sqlite 版就落在記憶體版，程序結束就沒了 |
-| media | `media kv lease_locks` | 媒體內容快取 | **不開**：§2 說第一版不快取媒體 |
+| state | `room_info member profile state_event receipt global_account_data room_account_data send_queue_events kv …` | sync 狀態：房間列表、成員、房間 state、收據、送出佇列 | 只有 matrix-sdk `Client` 那條要：沒有它每個命令都 initial sync |
+| event_cache | `linked_chunks event_chunks gap_chunks events threads media …` | SDK 自己的時間線快取（linked chunk 結構），給它的 `Timeline` 用 | **不用**：聊天紀錄的權威是 `cache.db`（§1） |
+| media | `media kv lease_locks` | 媒體內容快取 | **不用**：媒體在 media-pool.md 的池 |
 
-所以「SDK 的 store 只放它非存不可的」在程式上就是：只建 crypto 與 state 兩個 sqlite store 交給 `Client` builder，
-event cache 與 media 用 SDK 的記憶體實作。**這是 edits-and-redactions.md §1 的「非存不可」的精確定義。**
+`m/` 裡有什麼看帳號走哪條路（account-session.md §2）：
+
+- **wbf 帳號**：只有 crypto store，由 `OlmEngine::open` 建（`crypto_engine.rs`），加上 `td.json`（to-device-client.md §2）。不建 `Client`。
+- **matrix-sdk `Client` 那條**（一般 Matrix、舊 session）：`build_client` 用 `sqlite_store_with_config_and_cache_path(config, None)`，
+  上游 builder 把四個 store 都開成 sqlite 檔、放在 `m/`、用同一把子金鑰。event_cache 與 media 那兩個檔在，但我們不讀。
 
 ### 4.2 它怎麼加密
 
@@ -91,13 +83,13 @@ event cache 與 media 用 SDK 的記憶體實作。**這是 edits-and-redactions
 
 ```
 local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   ──► SQLCipher raw key ──► cache.db（整檔加密）
-                    └─ BLAKE3 derive_key("…matrix-sdk store v1") ──► open_with_key(...) ──► crypto.db、state.db（每值加密）
+                    └─ BLAKE3 derive_key("…matrix-sdk store v1") ──► open_with_key(...) ──► m/ 裡的 store（每值加密）
 ```
 
 - SDK 那邊用 `open_with_key`，**不用 passphrase**：PBKDF2 20 萬輪每次啟動要花時間，而且我們的密碼 KDF 已經在 vault-and-keys.md §1 做過一次；
-  兩個 store 傳同一把子金鑰即可（各自的 `StoreCipher` 仍是隨機的，子金鑰只是包住它們）。
+  每個 store 傳同一把子金鑰即可（各自的 `StoreCipher` 仍是隨機的，子金鑰只是包住它們）。
 - 加 passphrase 後，SDK 的 store 也一起被鎖住：主金鑰解不開就導不出子金鑰，`open_with_key` 就失敗。**不需要動 SDK。**
-- 兩個世界的邊界只有一條線：`Vault::open` 回兩把子金鑰。SDK 不知道 SQLCipher，快取不知道 `StoreCipher`。
+- 兩個世界的邊界只有一條線：`Vault` 導出的兩把子金鑰（`cache_key()`、`matrix_store_key()`）。SDK 不知道 SQLCipher，快取不知道 `StoreCipher`。
 
 ### 4.4 為什麼不把快取塞進 SDK 的 event_cache（方案 B）
 
@@ -105,18 +97,20 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
   對著它做要嘛繞它的 API、要嘛直接讀它的表（等於綁死上游內部結構，上游改 migration 我們就壞）。
 - 它的加密是每值加密、檔案結構外露；我們的快取要整檔加密（§3）。
 - 它存不存、存多少由 SDK 決定；§1 的配額與「整個丟掉」政策要自己掌控。
-- 代價：多一個檔、多一份「事件」的複本（SDK 記憶體裡一份、我們 DB 一份）。可接受：記憶體那份程序結束就沒了。
+- 代價：matrix-sdk `Client` 那條多一份「事件」的複本（它的 event_cache，§4.1）。可接受：我們不讀它，權威是 `cache.db`。wbf 帳號沒有這份。
 
 ### 4.5 為什麼不讓 SDK 也用 SQLCipher（方案 C）
 
-要改 `matrix-sdk-sqlite` 的開檔路徑下 `PRAGMA key`，等於 fork submodule；而 5.3 已經讓密碼一把鎖住兩邊，收益只剩「SDK 的檔案結構也藏起來」。不值得。
+要改 `matrix-sdk-sqlite` 的開檔路徑下 `PRAGMA key`，等於 fork submodule；而 §4.3 已經讓密碼一把鎖住兩邊，收益只剩「SDK 的檔案結構也藏起來」。不值得。
 
-### 4.6 各檔在磁碟上（2026-09-07 修訂：一台機器一把鑰、一個 server 一份快取、一個帳號一套 session）
+### 4.6 各檔在磁碟上：一台機器一把鑰、一個 server 一份快取、一個帳號一套 session（維護者 2026-09-07 定）
 
 ```
 <data dir>/
   local.key                      主金鑰（vault-and-keys.md §1），一台機器一把，所有帳號共用
   current                        CLI 的目前帳號
+  account.lock                   登入、登出、destroy 全程握著的 OS 鎖（§5 的 destroy）
+  daemon.lock                    daemon 獨佔（architecture-v2.md §0.2）
   r/<b58>_<b58>                  recovery key（room-key-backup.md §8）：檔名是 `recovery-key@mxid` 加密後的樣子。
                                  🚫 logout 不碰它——那是它不放在帳號目錄底下的全部理由
   s/<b58>_<b58>/                 **server host 加密後的名字**（vault-and-keys.md §2.2）：外面看不出這台機器連過哪家
@@ -125,7 +119,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
     a/
       <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 vault-and-keys.md §2.2）
         session.sealed           第三把子金鑰封住的 session
-        m/                       SDK 的 store（crypto.db、state.db），綁 device；logout 刪
+        m/                       matrix-sdk 的 store（§4.1）與 `td.json`，綁 device；logout 刪
         k/snapshot               本地房間金鑰備份（room-key-backup.md §4）；`account del`／`destroy` 連它一起刪
 
 ⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母，理由是 Windows 的 MAX_PATH（vault-and-keys.md §2.4.1）——
@@ -134,12 +128,14 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 
 `<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
 
-與 2026-09-05 草稿的差異（維護者 2026-09-07 定）：
-- 草稿寫 `<data dir>/wbf/<server host>/<user localpart>/` 一帳號一套、`local.key` 在帳號底下。改成 **`local.key` 在頂層**：主金鑰的定位是「這台機器」（vault-and-keys.md §1 第一條），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase。
+為什麼這樣分層（維護者 2026-09-07 定）：
+- **`local.key` 在頂層**：主金鑰的定位是「這台機器」（vault-and-keys.md §1 第一條），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase。
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
-- **兩層目錄名 2026-09-09 起都是加密的**（vault-and-keys.md §2）：`servers/` 與 `accounts/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
+- **兩層目錄名都是加密的**（vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v2 2026-09-07 維護者定、v5 2026-09-14 照 edits-and-redactions.md 改 `events`；就是 `wbf-sdk::cache` 建的）
+## 5. 快取的 schema（v5，就是 `wbf-sdk::cache` 建的）
+
+混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
 
 三條原則：
 
@@ -151,9 +147,9 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- schema_version、server（URL）、created_at。身份只有 server：不符就重建（§1）。
 
--- 看過的任何 mxid（本機帳號、事件的 sender 都在這）。哪些是本機帳號由 CLI 的 accounts/ 目錄決定，不在表裡標。
+-- 看過的任何 mxid（本機帳號、事件的 sender 都在這）。哪些是本機帳號由資料目錄的 a/ 決定，不在表裡標。
 CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL);
--- encrypted：這個房間開了 E2EE 沒有（schema v4，2026-09-14 維護者提）。
+-- encrypted：這個房間開了 E2EE 沒有（維護者 2026-09-14 提）。
 --   NULL ＝ 不知道（只因為收到事件才建出來的列）、0 ＝ 明文、1 ＝ 加密。
 --   🚫 不是 NOT NULL DEFAULT 0：預設成 0 等於預設「明文」，那是最危險的預設。
 --   🚨 只准 0 → 1，不准 1 → 0：Matrix 房間一開加密就關不掉，所以一份過期的「沒加密」（別的帳號舊的、有 bug 的）
@@ -163,7 +159,7 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
   encrypted INTEGER CHECK (encrypted IN (0, 1)));
 
--- 事件一份，不記誰的。收到的原樣存 raw_event、要顯示的存 content_json（edits-and-redactions.md，schema v5）。
+-- 事件一份，不記誰的。收到的原樣存 raw_event、要顯示的存 content_json（edits-and-redactions.md）。
 CREATE TABLE events (
   id INTEGER PRIMARY KEY,
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -247,12 +243,19 @@ CREATE INDEX event_media_by_media ON event_media (media);
 規則：
 
 - **寫入**（`upsert_events(user_id, room_id, &[IncomingEvent])`，一個房間、一個 transaction）：mxid／room_id 換成整數 id（`INSERT OR IGNORE` 再 `SELECT id`）→ 事件照 edits-and-redactions.md 寫入與處理（`raw_event` 只寫一次、`content_json` 不被密文蓋掉、file 內容建 `media`（已有就不動）與 `event_media`）→ `events_synced_log(event, user)` upsert（新列 `hidden = 0`，已有只更新 `last_synced_at`）。
-- **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0 AND class IN ('msg', 'general')`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model.md §4.3 的退化表）。每列從 `content_json` 組回 `Message`（edits-and-redactions.md §8）；`files` 另加 `json_extract(content_json, '$.msgtype')` 是wbf-client-convention-for-chunk.md §5 的檔、而且沒被 redact。
-- **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。**預設不叫它；`account del`（即 `logout`）不叫它，只有 `account destroy` 叫**；這個 server 最後一個帳號登出時 CLI 直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
-  ⚠️ **`destroy` 的順序**（#25，維護者 2026-09-15）：閘門 → 忘掉鏈（**趁 `cache.db` 還在**，走這台 server 的唯一寫入者 `ServerCache`，🚫 不另開 `cache_of` 連線；`cache.db` 不在就不開，🚫 不為了忘掉而建一個空的）→ 池檔 → 裝置層（登出）→ recovery key → 刪目錄。🚨 **登入、登出、destroy 全程握著 `<data dir>/account.lock`**（PR #40 審查 rumia🔴 第三輪，維護者 2026-09-15：仿 `daemon.lock`）：OS 層的排他鎖、拿不到就回 `account_busy`（1013）、🚫 不排隊；檔案不刪、不寫內容；整個資料目錄一把（鎖檔名🚫 不帶 server 或帳號，否則在外面留痕跡）。所以 destroy 期間不會有登入冒出新目錄，反之亦然 —— 下面的「再看一次 `a/`」降為防線，🚫 不是同步。🚨 **最後一個帳號時另外放 `s/<b58>/to_be_deleted.lock`**（維護者 2026-09-15）：磁碟上的標記、🚫 不是 OS 鎖，程序當掉也還在；清理的第一步放下；收尾時 `a/` 收掉之後先把 server 目錄**改名、名字最前面加 🗑️**（`s/🗑️<b58>_<b58>`），再收 `to_be_deleted.lock`、刪那個目錄（維護者 2026-09-15）。改名之後原本的路徑就不在了，之後登入這台 server 建的是新目錄；沒刪完的 `🗑️…` 掃描時一律跳過、也不觸發「local.key 換過了」的提示；改名目標已經存在就停下不覆蓋。它在的時候登入這台 server 一律回 `server_pending_removal`（1014），🚫 core 不自己收拾，訊息說出要手動刪的目錄。🚨 **回 Err ⇒ 帳號目錄還在**（PR #40 審查 rumia🔴×2）：它一不在，重跑 destroy 就找不到這個帳號。同 server 還有別的帳號就只刪它；它是最後一個時：先 `close_server_cache`（關不掉就停，什麼都沒刪）→ 刪 `s/<b58>/` 裡 `a/` 以外的東西（`cache.db`、媒體池）→ **再看一次** `a/` 是不是只剩它（中途有人建了新帳號就只刪它、不收 server 目錄）→ 刪帳號目錄 → 收掉已經空了的 `a/` 與 `s/<b58>/`。最後這一步 🚫 **不回 Err**：帳號已經不在，回 Err 等於叫人重跑卻找不到它；留下的只可能是空目錄（或剛冒出來的新帳號，`remove_dir` 不會碰），只發一則 progress 說明。
+- **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0 AND class IN ('msg', 'general')`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model.md §4.3 的退化表）。每列從 `content_json` 組回 `Message`（edits-and-redactions.md §8）；`files` 另加 `json_extract(content_json, '$.msgtype')` 是 wbf-client-convention-for-chunk.md §5 的檔、而且沒被 redact。
+- **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。
+  **預設不叫它；`account del`（即 `logout`）不叫它，只有 `account destroy` 叫。** 這個 server 已經沒有登入中的帳號時，登出直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
+- **`destroy` 的順序**（維護者 2026-09-15）：閘門 → 忘掉鏈 → 池檔 → 裝置層（登出）→ recovery key → 刪目錄。
+  - 忘掉鏈**趁 `cache.db` 還在**時跑，走這台 server 的唯一寫入者 `ServerCache`，🚫 不另開 `cache_of` 連線；`cache.db` 不在就不開，🚫 不為了忘掉而建一個空的。
+  - 🚨 **登入、登出、destroy 全程握著 `<data dir>/account.lock`**（仿 `daemon.lock`）：OS 層的排他鎖，拿不到就回 `account_busy`（1013），🚫 不排隊。檔案不刪、不寫內容；整個資料目錄一把，鎖檔名🚫 不帶 server 或帳號（否則在外面留痕跡）。所以 destroy 期間不會有登入冒出新目錄，反之亦然。
+  - 🚨 **回 Err ⇒ 帳號目錄還在**：它一不在，重跑 destroy 就找不到這個帳號。所以同 server 還有別的帳號就只刪它；它是最後一個時：
+    先 `close_server_cache`（關不掉就停，什麼都沒刪）→ 放下 `s/<b58>/to_be_deleted.lock` → 刪 `s/<b58>/` 裡 `a/` 以外的東西（`cache.db`、媒體池）→ **再看一次** `a/` 是不是只剩它（有別的就只刪它、不收 server 目錄；有 `account.lock` 在，這一步是防線，🚫 不是同步）→ 刪帳號目錄 → 收尾。
+  - **收尾**：server 目錄先**改名、名字最前面加 🗑️**（`s/🗑️<b58>_<b58>`），再收 `to_be_deleted.lock`、刪那個目錄。改名之後原本的路徑就不在了，之後登入這台 server 建的是新目錄；沒刪完的 `🗑️…` 掃描時一律跳過、也不觸發「local.key 換過了」的提示；改名目標已經存在就停下不覆蓋。這一步 🚫 **不回 Err**：帳號已經不在，回 Err 等於叫人重跑卻找不到它；只發一則 progress 說明。
+  - `to_be_deleted.lock` 是**磁碟上的標記**、🚫 不是 OS 鎖：程序當掉也還在。它在的時候登入這台 server 一律回 `server_pending_removal`（1014），🚫 core 不自己收拾，訊息說出要手動刪的目錄。
 - 解不開的加密事件也存（`decrypted = 0`、`class = general`、密文在 `raw_event`），之後明文到了才處理（edits-and-redactions.md §4）；不存等於每次都要重拉。`recent` 拿到的原始 `m.room.encrypted` 就是這樣存的。
-- **威脅模型的邊界（PR #13 審查 rumia 🟡1，維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
-- **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`（PR #13 審查 salvia 🟢3、cirno）。
+- **威脅模型的邊界（維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
+- **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`。
 - **洞**：有 `r_seq` 的 room，「快取裡有哪些」就是 `r_seq` 的集合，缺的就是洞，不存 token。沒有 `r_seq` 的 room 只快取最新一段連續視窗。
 - **開 app 的同步**（UI 的順序，維護者定）：先刷房間清單（`room_list`）→ `Event/Recent` 帶這個帳號的 `cg_seq` 一窗一窗拉（每個 `Batch` 寫一次 DB：事件進 `events` 加 `events_synced_log`），Batch 說 `more: true` 就帶 `before = 最後的 ls` 再一窗；追平（`more: false`，或空窗）才把**第一窗第一個 Batch 的 `fs`** 寫回 `sync_state`。🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`，中途斷線不推水位（wbfuwunel 的 pack-pipeline.md §6.4）→ 點進房間才刷該房歷史（`/messages`）。
 
@@ -261,12 +264,9 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - `Cache::open(dir, key, identity)` 回 `OpenOutcome`（Reused／Created／Rebuilt），呼叫者印出來，重建不是靜默的。錯金鑰在第一次讀頁就是「file is not a database」，走重建；「這個 build 沒有 SQLCipher」是另一種錯，往上丟（§3 的 fail closed）。
 - `read_positions.event` 指事件列：那則還沒進快取就拒絕標已讀（先同步再標）。
 - `hide_message` 只對這個帳號的 synced_log 列動手，沒同步過的東西沒有可藏的（回 false）。
-- `media` 這一版只建與寫指針（`find_media`／`touch_media`、file 事件進來時的 `INSERT OR IGNORE`）；池與下載管線是 media-pool.md 的 PR。
+- `media` 列在 file 事件進來時 `INSERT OR IGNORE` 建（已有就不動）；下載進度與完成由 `media_begin`／`media_progress`／`media_finish` 寫（media-pool.md §3）。
 
 ## 6. 還開著的
 
-1. ~~session 與 token 要不要搬進 DB~~ 定了：不進 DB，`session.sealed`（vault-and-keys.md §1）。~~CLI 每個命令輸密碼的體感~~ 定了：每次重新解鎖（2026-09-13 把 unlock ticket 拿掉，vault-and-keys.md §1）。
-2. ~~媒體內容快取另議~~ 定了：media-pool.md（2026-09-07 重寫成儲存池）。
-3. ~~媒體配額的數字~~ 定了：2 GiB best effort、保護期 7 天（media-pool.md §5）。事件快取不設上限；同步視窗 500 則／房、初開全域 10000 則是預設值，可調。
-4. ~~房間金鑰只在 `crypto.db`，刪了就沒~~ 定了：room-key-backup.md（維護者 2026-09-09），server 一份標準 backup、本地一份加密金鑰池。
+目前沒有。
 

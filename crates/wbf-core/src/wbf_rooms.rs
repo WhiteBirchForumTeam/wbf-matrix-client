@@ -1,7 +1,7 @@
 //! wbf 帳號的房間（account-session.md §6）：沒有 matrix-sdk 的 Client，房間清單走橋（`JoinedRooms` ＋ 每房 `GetState` ＋ `m.direct`），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，wbf-client-convention-for-chunk.md §5.2）。
 //!
-//! 加密房的文字走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）；加密房的**檔案**還送不了（加密附件沒接，e2ee-rpc.md §6）。
+//! 加密房的文字走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）；加密房的**檔案**還送不了（加密附件沒接，e2ee-rpc.md §8）。
 //! ⚠️ 「加不加密」問的是**這一刻的狀態**（`GetState`），🚫 不用快取：過期的「沒加密」會把明文送進已經加密的房。
 
 use serde_json::Value;
@@ -123,7 +123,7 @@ impl Core {
                 CoreErrorKind::Usage,
                 format!(
                     "{room} is encrypted, and wbf accounts cannot send files there yet: this path sends a plaintext \
-                     attachment over Event/Send, and encrypted attachments are not wired (e2ee-rpc.md §6)"
+                     attachment over Event/Send, and encrypted attachments are not wired (e2ee-rpc.md §8)"
                 ),
             ));
         }

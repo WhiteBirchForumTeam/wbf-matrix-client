@@ -87,7 +87,7 @@ pub struct ReadPosition {
     pub ts: i64,
 }
 
-/// `media` 的一列（local-cache-db.md §5）。池與下載管線還沒有，這一版只有指針與時間。
+/// `media` 的一列（local-cache-db.md §5）：指向媒體池裡的檔（media-pool.md §4）與使用時間。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaEntry {
     pub mxc: String,

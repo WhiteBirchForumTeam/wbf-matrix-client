@@ -208,7 +208,7 @@ impl Core {
     }
 }
 
-/// 補窗 job（`sync.recent` 與 `room_sync` 共用）：從 `cg_seq` 起一窗一窗拉、每批寫一次 DB、最後才推水位。
+/// 補窗 job（`sync.recent` 用；訂閱線不補窗、不碰水位，room-sync.md）：從 `cg_seq` 起一窗一窗拉、每批寫一次 DB、最後才推水位。
 ///
 /// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（wbfuwunel 的 pack-pipeline.md §6.4）；下次再跑會從水位重來。
 ///

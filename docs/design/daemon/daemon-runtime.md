@@ -1,14 +1,10 @@
 # daemon 的執行期：多帳號怎麼落到資料庫、UI 怎麼拿、命令怎麼往上游走
 
-> 2026-09-13 第二版（第一版太粗，維護者指出「多帳號如何落地到 db、db 如何與 UI 互動、
-> 命令如何被解讀成上游同步」都沒講清楚）。
->
-> **這份講執行期**：資料在哪、誰寫、寫的時候會不會撞、UI 的每一個動作實際走哪條路。
+> **這份講執行期**：多帳號如何落地到 db、db 如何與 UI 互動、命令如何被解讀成上游同步——資料在哪、誰寫、寫的時候會不會撞、UI 的每一個動作實際走哪條路。
 > 🚫 不重複分層（[`architecture-v2.md`](../overview/architecture-v2.md)）、逐條訊息（[`rpc-spec.md`](../rpc-specs/rpc-spec.md)）、
-> 資料庫 schema（[`local-cache-db.md`](../storage/local-cache-db.md) read-receipts.md）。
+> 資料庫 schema（[`local-cache-db.md`](../storage/local-cache-db.md)、read-receipts.md）。
 >
-> 🚨 **狀態：草案**。⚠️ §3 的 `sync` 參數、read-receipts.md 的已讀三層是維護者 2026-09-13 當場定的方向，
-> **本分支預設同意、照著做**；跟現況的落差在 §3.5 列著。
+> §3 的 `sync` 參數、read-receipts.md 的已讀三層是維護者 2026-09-13 定的方向。
 
 ## 0. 先把三個字分開
 
@@ -18,7 +14,7 @@
 |---|---|---|---|
 | **上游同步** | homeserver → `cache.db` | daemon（上游會話收推播；`Recent` 與進房 backfill 由 UI 叫，§4.3） | 推播一直在收；`Recent` 只在 UI 叫的時候 |
 | **本地讀** | `cache.db` → UI | daemon 回答 RPC 的讀命令 | UI 每次要顯示東西 |
-| **matrix-sdk 的 `/sync`** | matrix-sdk 自己的長輪詢，寫它自己的 store（`m/`） | matrix-sdk | HTTP 那條路上一直在跑 |
+| **matrix-sdk 的 `/sync`** | matrix-sdk 自己的同步，寫它自己的 store（`m/`） | matrix-sdk | 一般 Matrix 帳號的房間命令前各跑一次（`synced_backend_of`）；wbf 帳號沒有 |
 
 🚨 **UI 拿聊天紀錄是「本地讀」**，🚫 不是上游同步。UI 每捲一頁就打一次 homeserver 是錯的設計：
 資料早就在 `cache.db` 裡了（daemon 收到事件時就寫進去了），UI 要的只是「把它讀出來」。
@@ -40,7 +36,7 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
     media/                     媒體池：一個加密池、一把鑰，不分帳號
     a/<加密的帳號名>/
       session.sealed           access_token（每帳號）
-      m/                       matrix-sdk 的 store（每帳號，裡面有裝置金鑰與 crypto.db）
+      m/                       matrix-sdk 的 crypto store（每帳號；wbf 帳號由 OlmEngine 開、只有 crypto store，一般 Matrix 帳號還有 Client 的 state store）
       k/  r/                   本地房間金鑰快照、recovery key（每帳號）
 ```
 
@@ -55,21 +51,16 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 
 ## 2. 誰寫 `cache.db`
 
-### 2.1 現況（查證於 2026-09-13；⚠️ 這一節第一版寫錯過，見下）
+### 2.1 為什麼要單一寫入者
 
-- `Cache::open` **每次呼叫都開一條新的 SQLite 連線**，而 SQLCipher 每次開都要重導金鑰
-  （PBKDF2，不是免費的）。`Core::cache_of` 是每個操作叫一次。
+- `Cache::open` 每次呼叫都開一條新的 SQLite 連線，而 SQLCipher 每次開都要重導金鑰（PBKDF2，不是免費的）。
 - `PRAGMA journal_mode = WAL`（多讀一寫），`foreign_keys = ON`。
+- ⚠️ 兩條各自的連線同時寫**不會**立刻 `SQLITE_BUSY`：`rusqlite` 開連線時自己就設了 `busy_timeout = 5000`（`inner_connection.rs`），它們是**排隊**。
+  釘住這個假設的測試是 `two_raw_connections_serialise_instead_of_failing`（兩條連線、兩條執行緒、各 200 次寫，`database is locked` 0 次）；哪天 rusqlite 改掉那個預設，它會紅。
 
-🚨 **我第一版在這裡寫「沒有設 `busy_timeout`，所以同時寫會立刻 `SQLITE_BUSY`」——那是錯的。**
-`rusqlite` 開連線時自己就設了 `busy_timeout = 5000`（`inner_connection.rs`）。
-⭐ 寫了一條實驗去量（兩條各自的連線、兩條執行緒、各 200 次寫）：**`database is locked` 出現 0 次**
-—— 它們是**排隊**，不是失敗。那條實驗留下來了（`two_raw_connections_serialise_instead_of_failing`），
-哪天 rusqlite 改掉那個預設，它會紅。
+所以單一寫入者防的不是「撞鎖就失敗」，而是：
 
-**所以「單一寫入者」的理由要重寫，而它仍然成立 —— 只是理由不同**：
-
-| # | 真正的理由 |
+| # | 理由 |
 |---|---|
 | 1 | 🚨 **等的時候是同步阻塞**。`upsert_*` 是 blocking 呼叫，卡在 async task 裡就是**卡住一條 tokio 工作執行緒**，最壞 5 秒。⭐ 所以寫入者要跑在**自己的 OS 執行緒**上，🚫 不在 runtime 的工作執行緒上 |
 | 2 | 🚨 **順序**。兩批事件誰先 commit 決定水位（`cg_seq`）落在哪，而搶鎖的順序 ≠ 收到的順序 → 水位可能**倒退**。一條 queue 從根本解決，🚫 不必在每個寫入點做 `max()` 防禦 |
@@ -78,9 +69,6 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 
 📎 為什麼 daemon 的排他鎖（architecture-v2.md §0.2）不管這件事：那把鎖擋的是**別的程序**。
 同一個 daemon 裡面的兩個 task 都在鎖的**裡面**，它一個字都沒說。
-
-⭐ 值得記住：**「我以為的 bug」查下去不存在，但那個結構仍然該做** —— 差別在於現在寫得出
-它真正防的是什麼，🚫 而不是防一個不存在的東西。
 
 ### 2.2 定案：一個 server 一個寫入者
 
@@ -97,24 +85,16 @@ UI 觸發的寫（已讀…）─┘
   📎 順帶的好處：`ServerCache::open` 因此🚫 **不需要** tokio runtime，CLI 那種一次性的用法也能開。
   ⭐ 重點是**寫入者只有一個**，🚫 不是「大家各開一條連線然後靠 SQLite 去擋」。
 - ⚠️ **無上限的 queue 要有代價的自覺**：寫得比收得慢的時候，那些工作會累積在記憶體裡。
-  🚫 不加上限是刻意的（丟掉一則已經收到的事件比慢更糟），但**要看得見** ——
-  queue 長度應該進 `daemon.info`，長到不像話時發一則 `Note` 說出來。
+  🚫 不加上限是刻意的（丟掉一則已經收到的事件比慢更糟），但**要看得見**：queue 長度在 `daemon.info` 的 `cache_queue`。
+  還沒做：長到不像話時發一則 `Note` 說出來。
 - **讀不走那個寫入者**：讀各自開唯讀連線，WAL 本來就允許「一個寫、多個讀」。
   ⚠️ 讀連線也要付 SQLCipher 的開檔成本，所以要**留著重用**，🚫 不要每個請求開一次。
 - **`busy_timeout` 已經有了**：`rusqlite` 開連線就設 5 秒（§2.1），所以跨程序的情況
-  （單發命令、未來的唯讀工具）本來就是等而不是失敗。🚫 **不用自己再設一次** ——
-  ⭐ 我本來要寫一行 `PRAGMA busy_timeout`，查了才知道那是多餘的。
-- 🚨 **「只有一個」是靠註冊表的鎖成立的，🚫 不是靠時序**（PR #32 審查 cirno🔴）：
+  （單發命令、未來的唯讀工具）本來就是等而不是失敗。🚫 **不用自己再設一次**。
+- 🚨 **「只有一個」是靠註冊表的鎖成立的，🚫 不是靠時序**：
   `Core::server_cache_of` 把註冊表的鎖**握滿「查、開、放進去」整段**。
-  ⚠️ 查完就放掉鎖、開完再 `or_insert` 是**錯的** —— 實測（2026-09-13，八條執行緒同時要
-  同一個 server）：
-
-  | 以為會怎樣 | 實際上 |
-  |---|---|
-  | 後到的那個把自己那份丟掉，沒事 | 它**已經開過庫、已經起過寫入者**了 |
-  | 頂多多一條孤兒執行緒 | 🚨 **大部分呼叫端直接失敗**：`io: cache.db: database is locked` |
-
-  ⭐ 第一次開同一個檔的那段（建表）是排他的，`busy_timeout` 救不了。
+  ⚠️ 查完就放掉鎖、開完再 `or_insert` 是**錯的**：後到的那個**已經開過庫、已經起過寫入者**了，
+  而第一次開同一個檔的那段（建表）是排他的、`busy_timeout` 救不了——八條執行緒同時要同一個 server 時，大部分呼叫端直接 `database is locked`。
   📎 代價是開庫期間別的呼叫端會等 —— 它們等的本來就是同一份東西。
   🚫 **`Arc::ptr_eq` 驗不出這件事**（輸家拿到的就是贏家那份，位址相等），所以
   `ServerCache` 另外按目錄記「起過幾條寫入者」，測試斷言的是那個數字。
@@ -144,17 +124,16 @@ struct Work {
 
 | 入口 | 語意 | 誰用 |
 |---|---|---|
-| `writer.post(work)` | **丟進去就走**。仍然照順序執行，只是沒人等 | 上游會話收事件（§4.1） |
-| `writer.run(work).await` | 丟進去**並等它 commit**，拿回結果或錯誤 | 任何要回應 RPC 的寫入 |
+| `writer.post(work, emit_after_commit)` | **丟進去就走**。仍然照順序執行，只是沒人等；commit 成功之後由寫入者發 `emit_after_commit` | 沒人等結果的背景寫（CLI 的 `watch`） |
+| `writer.run(work).await` | 丟進去**並等它 commit**，拿回結果或錯誤（同步版 `run_blocking`：`Recent` 的收批回呼是同步的） | 任何要回應 RPC 的寫入；訂閱線收推播（`room_sync.rs`：等 commit 再發 `room.message`，§4.1）；`sync.recent` 的每一批 |
 
 - ⭐ **回執是 `oneshot`，🚫 不是一個 `job.complete` 事件。** 差別是決定性的：
   事件要對號（誰的完成？）、可能因為慢而被丟掉（廣播會 lagged）、而且錯誤沒地方放。
   `oneshot` 三件事都不會 —— **收得到、對得上、錯誤原樣回來**，而且型別逼你處理。
 - ⭐ **一條規則就講完該用哪個**：**回應的內容取決於這次寫入的，就 `run().await`**；
   其餘 `post`。🚫 不要靠「這個 method 感覺比較重要」去猜。
-- ⚠️ **`post` 的正確性靠「一個工作 = 一個交易」**：上游會話寫一批事件**連同水位**（`cg_seq`）
-  在同一個交易裡。所以沒人等它也安全 —— 要嘛整批加水位都進去了，要嘛都沒有，
-  🚫 不會出現「事件沒寫進去但水位前進了」那種洞。
+- ⚠️ **水位的正確性靠順序**：`sync.recent` 每批事件各一個工作，全部 commit 之後才推水位（`cg_seq`，`sync_ops.rs` 的 `pull_recent`）；
+  中途失敗水位不動，下次從舊水位重拉（冪等）。所以🚫 不會出現「事件沒寫進去但水位前進了」那種洞。推播那條路🚫 不碰水位（§4.3）。
 - 📎 呼叫者被取消（§8）不會取消已經排進去的寫入：它照樣落地。⭐ 這是對的 ——
   資料庫🚫 不該因為「發問的人走了」就留下半套。
 
@@ -201,37 +180,35 @@ for index in resumed_from..chunk_count {
 ⚠️ 代價要說實話，三條：
 
 1. 那些 DB 寫仍然是**在 async task 裡同步阻塞**（最壞等 5 秒鎖）→ 會卡住一條 tokio 工作執行緒。
-   📎 這是**既有行為**，🚫 不是這次引入的。
 2. `daemon.info` 的 `cache_queue` **看不到**媒體那條路的寫（它們不排在 queue 上）。
 3. 兩個寫入者都在等同一把 SQLite 寫鎖 —— 正確，但會互相拖慢。
 
-👉 **什麼時候會消失**：資料平面那支（§10 階段 5／7）本來就要重寫下載路徑（`PoolReader`、
-邊拉邊吐給 HTTP）。⭐ 到那時候把 DB 觸點改成 `post`／`run` 是順路的，
-🚫 現在為了對稱去改 `media::fetch` 的簽名只是製造一次沒有內容的大 diff。
+👉 **什麼時候會消失**：還沒做：重寫下載路徑（`PoolReader`、邊拉邊吐給 HTTP）。⭐ 到那時候把 DB 觸點改成 `post`／`run` 是順路的，
+🚫 為了對稱先去改 `media::fetch` 的簽名只是製造一次沒有內容的大 diff。
 
 ### 2.4 為什麼 `m/` 不需要這一套
 
-matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一個上游會話在寫它。
+matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一台 OlmMachine 在寫它（wbf 帳號是那個帳號長活的 `OlmEngine`）。
 🚫 所以不要為了「對稱」也給它包一層 —— 沒有第二個寫入者的東西不需要序列化。
 
-⚠️ 但有一個例外要記著：**同一個帳號的兩件事同時跑**（例如上游會話在 `/sync`，同時使用者送一則訊息）
+⚠️ 但有一個例外要記著：**同一個帳號的兩件事同時跑**（例如收金鑰的 task 在匯入，同時使用者送一則加密訊息）
 仍然共用那個 store。matrix-sdk 自己處理這件事（它內部有鎖），我們🚫 不要在外面再包一層去猜它的鎖。
 
 ### 2.5 要驗的（🚫 不靠推測）
 
-- 兩個帳號登在同一台 server，同時灌事件，跑 N 分鐘：**不能出現 `database is locked`**。
+`server_cache.rs` 的單元測試守著：
+- **回執真的等到了**：`run()` 回來之後，**另一條連線**立刻讀得到那筆（🚫 不是「大概好了」）。
+- **`post` 的順序**：連續丟 N 件，寫進去的順序與發出的事件順序都跟丟的一樣。
+- **兩個帳號、同一個房間、同一批事件同時灌**：🚫 不出現 `database is locked`，
+  而且兩個帳號各自都讀得到全部（混存但不混視野）。
+- **queue 長度看得見**、跑完歸零。
+- ⭐ **釘住那個假設**：兩條各自的連線同時寫會**排隊**（`rusqlite` 的 5 秒 `busy_timeout`）——
+  哪天那個預設變了，這條會紅（§2.1）。
+
+還沒驗：
+- 兩個帳號登在同一台 server，同時灌事件，**跑很久**（幾分鐘）：不能出現 `database is locked`。
 - 一邊寫一邊讀（UI 在捲歷史、上游在寫新事件）：讀不能被餓死，也不能讀到半個交易。
 - 殺掉 daemon（`kill -9`）之後重開：WAL 要能自己回復，🚫 不能留下壞掉的 `cache.db`。
-- **回執真的等到了**：`run()` 回來之後，**另一條連線**立刻讀得到那筆（🚫 不是「大概好了」）。✅
-- **`post` 的順序**：連續丟 N 件，寫進去的順序與發出的事件順序都跟丟的一樣。✅
-- **兩個帳號、同一個房間、同一批事件同時灌**：🚫 不出現 `database is locked`，
-  而且兩個帳號各自都讀得到全部（混存但不混視野）。✅
-- **queue 長度看得見**、跑完歸零。✅
-- ⭐ **釘住那個假設**：兩條各自的連線同時寫會**排隊**（`rusqlite` 的 5 秒 `busy_timeout`）——
-  哪天那個預設變了，這條會紅（§2.1）。✅
-
-📎 上面五條 2026-09-13 寫成 `server_cache.rs` 的單元測試了；還沒驗的是**跑很久**
-（幾分鐘的持續灌）與 `kill -9` 之後的 WAL 回復。
 
 ## 3. UI 拿東西走哪條路：`sync` 這個參數
 
@@ -267,8 +244,8 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一個上游�
 | method | 補嗎 | 為什麼 |
 |---|---|---|
 | `room.list`、`room.get` | ✅ | `room_list` 表就是它的本地版 |
-| `room.history`、`room.files` | ✅ | ⚠️ 它們現在的參數叫 `source: server\|cache` —— **改名成 `sync`、值改成三種**，🚫 不要兩個名字講同一件事 |
-| `media.info` | ✅ | ⭐ **媒體不可變**：`file_size`／`chunk_size`／`mimetype` 上傳完就不會變，本地 `media` 表存的就是同一份事實 —— 🚫 沒理由為這些跑一趟 server（維護者 2026-09-13；我本來判錯了）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**讓它們不在**，🚫 不編造；反過來 `cached`（下載到哪了）是**上游答不出來**的 |
+| `room.history`、`room.files` | ✅ | 跟其他讀命令同一個 `sync`，🚫 不另外有 `source` 這種第二個名字講同一件事 |
+| `media.info` | ✅ | ⭐ **媒體不可變**：`file_size`／`chunk_size`／`mimetype` 上傳完就不會變，本地 `media` 表存的就是同一份事實 —— 🚫 沒理由為這些跑一趟 server（維護者 2026-09-13）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**讓它們不在**，🚫 不編造；反過來 `cached`（下載到哪了）是**上游答不出來**的 |
 | 讀已讀位置（§6） | ✅ | `read_positions` 有 |
 | `account.list`、`recovery.list`／`show` | ❌ | **已登入的帳號 always local**：那是這台機器的檔案，不是快取，🚫 沒有「上游版本」可言 |
 | `sync.recent` | ❌ | 它**本身就是**上游拉。加 `sync=local` 沒有意義 |
@@ -306,28 +283,20 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 - 🚨 **往回翻一律拿 `event_id`**（維護者 2026-09-14）：UI 拿手上最舊那則當 `before`，`both` **永遠問上游**、
   寫進去、照上游順序從本地讀回。daemon 換算：wbf 查本地 `g_seq` → `Recent{rooms, before}`；matrix `/context` → `/messages`。
   🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 rpc-spec.md §3.3「往回翻」。
-  📎 #32 的權宜守門 `before_for_upstream_page` 拿掉了：三種 `sync` 同一種座標，它沒有存在的理由。
 
-### 3.5 ⚠️ 現況與這個模型的落差
+### 3.5 ⚠️ 跟這個模型不同的地方：CLI，與 backend 怎麼選
 
-| 這份說 | 現在的程式 |
-|---|---|
-| `room.list`／`room.get` 預設 `local` | ✅ 改好了。⚠️ **CLI 那一側刻意維持舊行為**：`--from-cache` → `Local`，沒帶 → **`Both`**（它本來就是「打上游＋寫穿快取」），🚫 不偷偷改掉它 |
-| 參數叫 `sync`，三個值 | ✅ 改好了（`HistorySource` → `SyncMode`，預設 `Local`） |
-| 帳號列表永遠本地 | ✅ 已經是了 |
-| `sync=server`／`both` 該按「這台是不是 wbf」挑 backend | 🟡 **歷史做了**：`room.history`／`files` 照探測走 wbf `Recent{rooms}` 或 matrix（`BothSides`）；`room.list`／`get`／`send_text` 還在暫時清單上。見下 |
+- ⚠️ **CLI 刻意不走 `local` 預設**：`rooms` 一律 `Both`；`read`／`files` 的 `--from-cache` → `Local`，沒帶 → **`Both`**（打上游＋寫穿快取）。
+  CLI 沒有常駐的東西可以依賴，每個命令自己去 sync 是唯一選擇。
 
-🟡 **backend 這條線挖到一半**（維護者 2026-09-13 定案）。
-
-🚨 **`transport` 就是選 backend，🚫 不是「wbf 底下再挑一條管子」**：
+**backend 怎麼選**（維護者 2026-09-13 定）。🚨 **`transport` 就是選 backend，🚫 不是「wbf 底下再挑一條管子」**：
 
 | `transport` | 協議 | 誰實作 |
 |---|---|---|
 | **`ws`**（**沒帶就是它**） | wbf 客製協議 | `wbf-sdk`（`BackendKind::WbfSdk`） |
 | **`http`** | 原生 Matrix HTTP | `matrix-sdk`（`BackendKind::MatrixSdk`） |
 
-🚫 **wbf 協議一律 WS**，底下不再分。pack-over-HTTP 只剩 debug 用途 ——
-⚠️ 這份文件之前把它當成「wbf 的 HTTP 模式」，那是多的一層，拿掉了。
+🚫 **wbf 協議一律 WS**，底下不再分。pack-over-HTTP 只剩 debug 用途，🚫 不是「wbf 的 HTTP 模式」。
 
 ```text
 http ─────────────────────────> matrix-sdk（永遠）
@@ -339,77 +308,43 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 🚨 **沒帶 `transport` 就是 `ws`**，所以**預設走的就是那條分岔**：對方講 wbf 就用 wbf，
 不講就 **fallback 到 matrix-sdk** —— ⚠️ 兩種都🚫 不報錯。
 📎 那份預設只有一個地方寫著：`Transport::default()`（`wbf-sdk` 的 `channel.rs`）。
-🚫 daemon 的 `Settings` 不再自己寫死一份 —— ⭐ 同一個預設有兩個地方決定，遲早只有一邊被改到。
+🚫 daemon 的 `Settings` 不自己寫死一份 —— ⭐ 同一個預設有兩個地方決定，遲早只有一邊被改到。
 
-**已經做好的（`wbf_core::backend_choice`）**：
+**`wbf_core::backend_choice` 的三塊**：
 
-1. **探測** `Core::get_backend_kind` —— 一個 WS `Hello`，講得出協議版本就是 wbf。
-   ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。
-   一個 server dir 記一格，🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
-   🚨 **session 一換，舊結論就不算數**（PR #33 審查 rumia 第三輪🟡）：探測是拿 session 裡的 token 問的，
-   所以 `Core::forget_backend_probe` 接在**所有動 session 的地方** —— `log_in` 封新 session 之後、
-   `log_out_account`（logout 與 destroy 共用）刪掉之後。🚧 階段 8 的會話監督者重連時也要叫它。
-   ⚠️ 新增任何封／刪／換 session 的路徑都要接上，🚫 不然下一次拿到的是舊 token 探到的答案。
-
-   ⚠️ **2026-09-21 起下面這一段被 `account-session.md` §1 取代**（保留當歷史）：探活改成**不帶 token**的 WS Hello（`WsChannel::connect_anonymous`）、
-   **key 是 server URL**（`Core::get_backend_kind_of_server`）、登入登出不再 `forget_backend_probe`（探活跟 token 無關，session 換了或沒了都不影響「這台講不講 wbf」）。
-   「A 的 token 壞了拖累 B」那個理由因此消失，一台 server 一格。失敗不記、同時進來共用一次探測這兩點不變。
-
-   🚨 **（舊）一個帳號一格，而且只有「server 自己回答過的」才記住**（PR #33 審查 rumia🔴×2）：
-
-   | 探測結果 | 這次回 | 記住嗎 |
-   |---|---|---|
-   | `Hello` 回了（不管版本認不認得） | 照答案 | ✅ |
-   | 連不上／token 被拒／逾時 | `MatrixSdk` | 🚫 **不記**（下次重探） |
-
-   ⚠️ **key 是帳號目錄，🚫 不是 server 目錄**。雖然「講不講 wbf」是 server 的性質，
-   但**探測是拿某一個帳號的 token 去問的**。一台 server 共用一格的話，有兩種方式出事：
-
-   - 記下失敗 → A 的 token 過期，同 server 上 token 好的 B **永久**被降級；
-   - 就算不記失敗 → **同時**第一次呼叫時 B 會去等 A 那一次 single-flight，
-     A 失敗 B 也跟著拿到 `MatrixSdk`，🚫 B 從來沒用自己的 token 問過。
-
-   ⭐ 兩個是同一個病：**用 A 的身分回答 B 的問題**。修法🚫 不是在 key 上補 identity，
-   而是讓 key **就是** identity —— 「A 影響 B」在結構上就不可能發生。
-   📎 代價：同 server 的 N 個帳號各探一次。一個帳號一次 WS handshake，而它們本來就各自要開連線。
-
-   作法：註冊表存 `Arc<OnceCell<BackendKind>>`，key 是帳號目錄。`get_or_try_init`
-   **出錯不寫進去**，順便讓**同一個帳號**同時進來的呼叫共用一次探測（🚫 不是各開一條 WS）。
+1. **探測** `Core::get_backend_kind` —— 規矩在 account-session.md §1–§2：不帶 token 的 WS `Hello`、以 server URL 為鍵、探不到不記；
+   wbf 帳號登入時就把 backend 記進 session，之後不再探。
+   ⭐ 連不上／不回／看不懂一律 `MatrixSdk`，所以它**不回 `Err`**：探測失敗不是錯誤，是一個答案。🚫 不寫進磁碟（那是 server 那邊的事實，它會變）。
 2. **規則** `get_backend_for(transport, server_speaks_wbf, home)` —— 純函數，所以上面那張表
    逐格測得到。⚠️ 只有一種情況報錯：那個 feature 只有 wbf 有，而這條路到不了它 ——
    它就是**關的**，而「因為你選了 http」跟「因為對方不是 wbf」訊息分開講。
-3. **唯一的閘門** `Core::client_of(account, transport, home)` —— 探測＋規則＋開通道都在這裡。
-   （2026-09-21 起底下那半是連線池 `link-pool.md`：`client_of(…, role)` 從池裡拿線；舊的 `connect_wbf_client` 已刪）
-   （探測不能走閘門，不然它會叫到自己）。
+3. **唯一的閘門** `Core::client_of(account, transport, home, role)` —— 探測＋規則＋從連線池拿線（link-pool.md §2）都在這裡。
+   （探測不能走閘門，不然它會叫到自己。）
 
-**🚧 那份會縮短的清單**：每個呼叫點自己用 `MethodHome` 說出它住在哪一邊 ——
-🚫 不是一串字串比對（名字跟實際走哪條會漂移）。現在在清單上的是 `room.list`／`get`／`send_text`、`account.*`、
-`backup.*`、`recovery.*`（`room.history`／`files` 已經是 `BothSides`）；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfOnly`。
+**`MethodHome`**：每個呼叫點自己說出它住在哪一邊 —— 🚫 不是一串字串比對（名字跟實際走哪條會漂移）。
+`room.history`／`files` 是 `BothSides`；`sync.recent`／`upload.*`／`media.*`／`server.ping` 是 `WbfSdkOnly`；
+`room.list`／`get`／`send_text` 先看 `session.backend`（`is_wbf_account`）分流：wbf 帳號那半（`wbf_rooms.rs`，走橋，account-session.md §6）是 `WbfSdkOnly`，一般 Matrix 帳號走 Client（`synced_backend_of`）。
+🚧 暫時清單（`StillOnMatrixSdk`）現在沒有正式呼叫點。
 
-**還沒做的**：`room.list`／`room.get`／`room.send_text` 還是只有 matrix-sdk（`StillOnMatrixSdk`）。
-房間歷史已經搬過去了（wbfuwunel #51，`Recent` 點名房間；`MethodHome::BothSides`）。
-**rpc-spec 那一層一個字都沒改** —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
+⭐ rpc-spec 看不到 backend 怎麼選 —— 那正是 `sync` 這個參數的價值：它講的是「要不要去問上游」，🚫 不是「用哪個協議去問」。
+上游那條路一行都不少，只是從「唯一的路」變成「說出來才走的那條」。
 
-📎 **代價講在前面**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）。
-**探到答案就是每個帳號在一個 daemon 生命週期裡一次**，🚫 不是每個請求一次。
+📎 **代價**：每個 server 第一次用到 wbf 那條路時會多一次 `Hello`（探測自己開一條 WS）；探到答案之後每個 server 在一個 daemon 生命週期裡只探一次。
 ⚠️ 但**探不到**（一般 homeserver 沒有 WS 端點）那次不會被記住，所以之後每個用到 wbf-only 功能的
 呼叫都會再試一次 handshake。⭐ 可以接受 —— 那些呼叫本來就會失敗（那個功能在那台 server 上是關的），
 而記一個錯的結論會讓**能動的**帳號也不能動。
-
-⭐ **這是補參數、不是改方向**：上游那條路一行都不會少，只是從「唯一的路」變成「說出來才走的那條」。
-📎 CLI 現在那樣寫沒有錯 —— 它沒有常駐的東西可以依賴，每個命令自己去 sync 是唯一選擇。
 
 ## 4. 上游會話：多帳號怎麼落到資料庫
 
 ### 4.1 一個帳號一組會話
 
-誰開、什麼時候開關、傳輸怎麼選（探到 wbf 走 WS——2026-09-29 起一個帳號五條，link-pool.md §1——否則落 HTTP）、斷線退避與 `sync.state`
-三個狀態 —— 這些在 architecture-v2.md §5.1／§5.1.1 定了。執行期要補的是**事件進來之後的順序**：
+誰開、什麼時候開關：wbf 帳號是連線池的五條線，解鎖／登入後 daemon 全開、背景看著（link-pool.md §1、§3.1）；
+一般 Matrix 帳號沒有常駐的上游會話（§5.5）。執行期要補的是**事件進來之後的順序**：
 
 ```
-事件進來 ──> 解密 ──> post 給那個 server 的寫入者（§2.3），⚠️ **事件跟著工作一起交出去**
+事件進來 ──> 解密 ──> 交給那個 server 的寫入者（§2.3）
                                     │
-                        寫入者 commit 成功之後，**由它**發 CoreEvent::Message
+                        commit 成功之後才發 CoreEvent::Message
                                                         ↓
                                             各連線的訂閱過濾 ──> room.message
 ```
@@ -417,20 +352,12 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 🚨 **先寫庫、後發事件**：前端收到推播八成馬上去查（捲到那一則、更新未讀數），
 反過來的話它查到的是還沒有那則訊息的資料庫。
 
-⚠️ **所以「發事件」這件事是寫入者做的，🚫 不是上游會話做的**（2026-09-13 自我審查抓到的：
-第一版寫成「會話 post 完就發事件」——那是錯的，`post` 是丟進去就走，事件會**跑在 commit 前面**，
-剛好違反上面那條）。工作本身帶著「commit 成功之後要發什麼」：
+兩種寫法都守這條：
+- `post(work, emit_after_commit)`：事件跟著工作一起交出去，**由寫入者**在 commit 成功之後發；失敗就一則都不發（CLI 的 `watch`）。
+- `run(work).await`：等到回執、成功了呼叫端才發（訂閱線 `room_sync.rs`）；寫失敗只講一聲、不發。
 
-```rust
-struct Work {
-    apply: Box<dyn FnOnce(&mut Cache) -> Result<Done, CoreError> + Send>,
-    /// commit 成功**之後**才發。失敗就一則都不發 —— 🚫 沒寫進去的事不該有人聽說。
-    emit_after_commit: Vec<CoreEvent>,
-    receipt: Option<oneshot::Sender<Result<Done, CoreError>>>,
-}
-```
-
-⭐ 這樣「順序對不對」就不是每個呼叫點的紀律，而是**型別逼出來的**：想發事件就得把它交給寫入者。
+🚫 不要 `post` 完就自己發：`post` 是丟進去就走，事件會**跑在 commit 前面**。
+⭐ 所以「順序對不對」不是每個呼叫點的紀律：想在不等的情況下發事件，就得把它交給寫入者。
 
 ### 4.2 兩個帳號在同一台 server 上
 
@@ -441,9 +368,8 @@ struct Work {
 - 所以 §2.2 那個「一個 server 一個寫入者」不只是為了避免撞鎖，
   也是因為**兩個帳號寫的是同一批列**（`rooms`、`users`、`events` 都要 upsert）。
 
-### 4.3 補洞是 UI 的事（維護者 2026-09-23 改；room-sync.md §0 原話）
+### 4.3 補洞是 UI 的事（維護者 2026-09-23；room-sync.md §0 原話）
 
-~~連上（或重連）之後：先 `Recent` 從 `cg_seq` 補到追平，才發 `caught_up`；`sync.recent` 跟 daemon 自己的排程是同一段程式，UI 幾乎不需要叫它~~
 **daemon 不自己叫 `Recent`**（「daemon 只有訂閱新事件，不主動叫 Recent。誰負責記有沒漏，是 UI 層的事」）：
 
 - daemon 開訂閱線就只訂（`init_connection`），推播一包寫一包、🚫 不碰水位。
@@ -461,8 +387,9 @@ struct Work {
 |---|---|
 | `room.message` | ✅ |
 | `sync.state` | ✅ |
+| `link.state`、`keys.state`、`pack.received`（link-pool.md §6） | ✅ |
 | 之後所有從 homeserver 來的（已讀回條、輸入中、房間狀態變更、裝置驗證…） | ✅ **一律** |
-| `progress` | ❌ 它是**請求**的進度，用 `id` 對得起來 |
+| `progress`、`note` | ❌ 它們是**請求**的進度與說明，用 `id` 對得起來 |
 | `vault.state` | ❌ 它是 daemon 這台機器的狀態，跟帳號無關 |
 
 ⭐ 判準一句話：**這件事是「某個帳號在它的 homeserver 上發生的」嗎？是就帶 `user`。**
@@ -476,13 +403,13 @@ struct Work {
 - 🚫 **daemon 不替 UI 決定「哪些值得看」**：它只送「發生了什麼」，
   要不要響、要不要跳紅點、要不要靜音某個帳號 —— 那是 UI 的事（§6）。
 
-### 5.3 🚨 掉了事件要**講出來**（2026-09-13 自我審查補的）
+### 5.3 🚨 掉了事件要**講出來**
 
-政策一直是「推播不保證看得到全部，掉了就重查」。但那句話有個前提我漏了：
+政策是「推播不保證看得到全部，掉了就重查」。那句話的前提是：
 **UI 得知道自己掉了東西**，否則它永遠不會去重查 —— 它以為自己什麼都收到了。
 
 - daemon 的每條連線各自從 core 的廣播收事件。收到 `RecvError::Lagged(n)` 的時候
-  （這條連線讀太慢、被覆蓋掉 n 則），**必須送一則 `desync { user?, missed: n }` 給 UI**。
+  （這條連線讀太慢、被覆蓋掉 n 則），**必須送一則 `desync { missed: n }` 給 UI**（不帶 `user`：掉的是這條 RPC 連線上的推播，不分帳號）。
 - UI 收到之後的動作是**重讀**（房間列表、開著的那個房間的最新一頁、未讀數）——
   ⭐ 全部都是本地讀，很便宜，所以這個補救是廉價的。
 - 🚫 **不重播**（我們沒有留著那些事件），🚫 **也不假裝沒事**。
@@ -490,10 +417,10 @@ struct Work {
 📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（architecture-v2.md §5.1.1）。
 ⭐ 我們自己的推播是同一個問題，🚫 沒有理由用不同的答案。
 
-### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13 更正）
+### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13）
 
-> 我原本在這裡寫「一個 2 GB 上傳會發上萬則 `Progress`，把 `room.message` 擠掉」。
-> **那是錯的**，而且錯在最根本的地方：**媒體的 bytes 從來不經過 RPC 通道**。
+**媒體的 bytes 從來不經過 RPC 通道**，所以「一個 2 GB 上傳發上萬則 `progress`、把 `room.message` 擠掉」這個情境不存在。
+還沒做：daemon 的資料平面 HTTP（下面的 PUT／GET）；現在只有路徑版的 method。
 
 ```
 上傳：UI ──HTTP PUT chunk──> daemon ──組裝、加密──> homeserver
@@ -517,9 +444,11 @@ struct Work {
 👉 哪天 RPC 上真的出現高頻進度（例如有人把資料平面接回 RPC），再回來看這一節。
 
 
-### 5.5 HTTP 那條路也要寫進 `cache.db`（缺口，**http fallback 要實作的內容**）
+### 5.5 HTTP 那條路也要寫進 `cache.db`
 
-⚠️ `sync: "local"` 讀的是 `cache.db`。走 **HTTP** 的帳號（一般 homeserver，§1.2）事件是進
+還沒做：一般 Matrix 帳號沒有常駐的收事件迴圈；它們的快取只在 `sync=both`（與 CLI 的 `watch`）時寫。
+
+⚠️ `sync: "local"` 讀的是 `cache.db`。走 **HTTP** 的帳號（一般 homeserver）事件是進
 **matrix-sdk 自己的 store**（`m/`）—— 如果上游會話不把它們**鏡射**進 `cache.db`，
 那些帳號的 `room.list`／`room.history` 用 `sync: "local"` 會是**空的**。
 
@@ -556,9 +485,11 @@ struct Work {
   🚫 不走「每個長工作多收一個 `job` 參數」：那要改十幾個公開簽名，而中間任何一層忘了往下傳，
   事件就默默變成無主的 —— 那種漏法不會有人發現。
 - ⚠️ 限制：task-local 不跟著 `tokio::spawn` 走（模組註解裡有，**有測試釘住**）。
-- **`job: None` 的事件不推給任何人**：上游會話發的進度是背景工作，🚫 不硬塞給某條連線。
+- **`job: None` 的事件🚫 不自動推給哪條連線**：背景工作（收推播、看線的迴圈）講的話不屬於任何請求，只有訂了 `progress`／`note`（或 `"*"`）的連線收得到（link-pool.md §6）。
 
 ## 8. 取消
+
+還沒做（§10 第 5 階段）；下面是定下的形狀。
 
 `cancel { id }` 停掉的是**這條連線上**那個還在跑的請求。
 
@@ -588,33 +519,30 @@ let response = tokio::select! {
 | 沒有寫權（別的 daemon 佔著） | 🚫 不起上游會話；會寫的 method 回 `109` |
 | 上游斷線，但有請求正在跑 | 那個請求照它自己的錯誤路徑失敗（`1300`），🚫 不掛在那裡等重連 |
 | 前端關掉連線 | 訂閱沒了；**它發起的長工作繼續跑**（rpc-spec.md §1.2），進度沒人收就沒人收 |
-| `cache.db` 寫失敗 | ⚠️ 上游會話**不能就這樣往前走**：水位（`cg_seq`）沒推進才是對的，下次重連會重拉那一段 |
+| `cache.db` 寫失敗 | 推播那包：講一聲、🚫 不發 `room.message`、不重試（水位不歸推播管，UI 下次 `sync.recent` 重拉，§4.3）。`sync.recent` 的一批：整次回錯、水位不推進，下次從舊水位重拉 |
 | daemon 關閉 | 先停上游會話 → 等在跑的請求收攤 → 關 listener |
 
 ## 10. 分階段
 
 | 階段 | 內容 | 狀態 |
 |---|---|---|
-| 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ 這支分支做了 |
-| 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 這支分支做了（媒體那幾條是刻意的例外，§2.3.1） |
-| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info` 補上，`source` → `sync`、預設 `local`，**回應回報這次用了哪一種** | ✅ 這支分支做了 |
-| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）、**兩條佇列分開＋進度節流**（§5.4） | ✅ 2026-09-21：SDK 那半（`ws-receive-dispatch.md`）與 daemon 這半（`link-pool.md` §6：`subscribe`／`unsubscribe`、每條 RPC 連線一個推播 task、`progress`／`note` 自動路由到發那個請求的連線、`Lagged` → `desync`）。❌ 還沒：進度節流（§5.4） |
-| 5 | `cancel`（§8） | ❌ |
-| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`） | ✅ 2026-09-22：codec 對著 server 向量、`WbfClient::room_subscription`／core `room_sync.rs`（`design/rooms/room-sync.md`：池開線的 `init_connection` 訂、背景收推播寫快取、不碰水位；補窗與漏包都是 UI 叫 `sync.recent`（多 `since`）的事；🚫 還沒接 RPC） |
-| 7 | 上游會話：探測、兩種傳輸的收事件迴圈、寫庫、發事件 | 🔧 連線的部分 2026-09-21 做了（`link-pool.md`：一個帳號五條線的池、要用才開、斷了下次再開、登出全關、每個收到的 pack 變 `CoreEvent::Received`）；收事件迴圈→寫庫→發 `room.message` 還沒（要第 6 階段的 codec） |
-| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 🔁 線的那半做了（2026-09-29，link-pool.md §3.1：解鎖／登入後開、背景每 15 秒看、失敗加倍）；task panic 收攤、重探 backend 還沒 |
-| 9 | **已讀三層**（read-receipts.md）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | ❌ |
-
-⚠️ 順序有兩條刻意的：**階段 2 排在推播前面**（先確定兩個帳號一起寫不會炸，再談把事件送出去）；
-**階段 3 排在上游會話前面**（`sync` 參數定了「誰負責去打上游」，會話那層才知道自己要不要主動拉）。
+| 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ |
+| 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 媒體那幾條是刻意的例外（§2.3.1） |
+| 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info`，預設 `local`，**回應回報這次用了哪一種** | ✅ |
+| 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）；SDK 的收包分派（ws-receive-dispatch.md）；daemon 那半在 link-pool.md §6 | ✅ 還沒做：兩條佇列分開＋進度節流（§5.4 定了先不做） |
+| 5 | `cancel`（§8） | 還沒做 |
+| 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`）與 core 的 `room_sync.rs`（room-sync.md） | ✅ |
+| 7 | 上游會話：探測、收事件迴圈、寫庫、發事件 | ✅ wbf 帳號（連線池 link-pool.md、收推播寫快取再發 `room.message`）。還沒做：一般 Matrix 帳號的收事件迴圈（§5.5） |
+| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 線的那半有了（link-pool.md §3.1）。還沒做：task panic 收攤、重連時重探 backend |
+| 9 | **已讀三層**（read-receipts.md）：`room.read`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | 還沒做 |
 
 ## 11. 明確不做的
 
 - 🚫 **不重播掉掉的事件**：推播是「不用輪詢」，不是「保證看得到全部」。掉了就重查（本地讀很便宜）。
-- 🚫 **不把「這台 server 是 wbf」寫進設定檔**：每次起會話重探（architecture-v2.md §5.1）。
+- 🚫 **不把「這台 server 是 wbf」寫進設定檔**：探測結果只在記憶體、daemon 重開就重探（account-session.md §1）。wbf 帳號登入時記進 session 的 `backend` 是那個 session 的屬性，不是 server 的設定（account-session.md §2）。
 - 🚫 **不做跨帳號的合併事件流**：每個帳號各自一組，要合併是 UI 的事。
 - 🚫 **不在 daemon 裡做通知政策**（§6）。
-- 🚫 **不做「UI 現在在看哪個帳號」的伺服器端狀態**（§3.2）。
+- 🚫 **不做「UI 現在在看哪個帳號」的伺服器端狀態**（§3.3）。
 
 ## 12. 考慮過、沒走的路（2026-09-13 動手前的重新檢視）
 
@@ -667,13 +595,5 @@ core 一旦認識「連線」與「請求 id」，architecture-v2.md §6 那條�
 
 ### 12.5 這次檢視改掉的四件事
 
-| # | 原本 | 問題 | 改成 |
-|---|---|---|---|
-| 1 | 上游會話 `post` 完就發事件 | 🚨 **`post` 是丟進去就走** —— 事件會跑在 commit 前面，剛好違反「先寫庫後發事件」 | 事件跟著工作交給寫入者，**commit 成功之後由它發**（§4.1） |
-| 2 | 「掉了就重查」 | 🚨 UI **不知道自己掉了** —— 那句話它執行不了 | `Lagged` 要送 `desync { missed }`（§5.3） |
-| 3 | ~~所有事件一條廣播，進度會把訊息擠掉~~ | ❌ **這條我搞錯了**（維護者 2026-09-13 更正）：媒體的 bytes 與進度**從來不經過 RPC**，那是資料平面的 HTTP | §5.4 改寫。節流與分佇列**先不做** |
-| 4 | HTTP 帳號的事件在 matrix-sdk store | 🚨 那 `sync: "local"` 對它們是**空的**（維護者確認是缺口） | HTTP 那條也鏡射進 `cache.db`（§5.5） |
-
-⭐ 四條裡**三條成立、一條是我自己想錯**，而成立的三條全部是「文件自己前後矛盾」，
-不是「想得不夠遠」。📎 兩個教訓：**把兩條規則寫在同一份文件的不同章節，不代表它們相容**；
-以及**推論前先確認那些 bytes 到底走哪條管** —— 第 3 條我是把兩個平面混在一起想才錯的。
+結論已寫進各節：先寫庫、後發事件（§4.1）；`Lagged` 要送 `desync`（§5.3）；媒體的 bytes 與進度不走 RPC（§5.4）；HTTP 帳號也鏡射進 `cache.db`（§5.5）。
+📎 教訓：**把兩條規則寫在同一份文件的不同章節，不代表它們相容**。

@@ -1,5 +1,5 @@
 //! 本地金鑰庫（vault-and-keys.md §1、local-cache-db.md §4.3、§4.6）：一把 32 byte 主金鑰放 `local.key`，
-//! 明文（`Plain`）或被 passphrase 包住（`PassphraseWrapped`）；子金鑰用 BLAKE3 從主金鑰導出，不落地。
+//! 明文（`KeyFile::Plain`）或被 passphrase 包住（`KeyFile::Passphrase`）；子金鑰用 BLAKE3 從主金鑰導出，不落地。
 //! `session.sealed` 用第三把子金鑰封住 session 與 token。
 //!
 //! 這裡沒有 SQLite、沒有 matrix-sdk：兩個世界只從 `Vault` 拿各自的子金鑰（local-cache-db.md §4.3 的那一條線）。
@@ -73,7 +73,7 @@ impl std::fmt::Debug for Key32 {
     }
 }
 
-/// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassphrase`，`PassphraseWrapped` 配 `Passphrase`，配錯就 `Err`（vault-and-keys.md §1）。
+/// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassphrase`，`KeyFile::Passphrase` 的配 `Passphrase`，配錯就 `Err`（vault-and-keys.md §1）。
 pub enum Unlock {
     NoPassphrase,
     /// 🚫 不接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
@@ -299,12 +299,12 @@ impl Vault {
         self.derive(MATRIX_STORE_KEY_CONTEXT)
     }
 
-    /// 媒體檔案空間（media-pool.md）。這一版還沒有人用，先導出來讓 context 字串一次定完。
+    /// 媒體池（media-pool.md）的金鑰。
     pub fn media_store_key(&self) -> Key32 {
         self.derive(MEDIA_STORE_KEY_CONTEXT)
     }
 
-    /// 本地的房間金鑰備份（`room_keys`；room-key-backup.md §4）：檔案內容的加密與檔名的 keyed hash 都用它。
+    /// 本地的房間金鑰備份（`room_keys`；room-key-backup.md §4）：base64 之後當作 `k/snapshot` 的 passphrase 餵給上游的匯出（`room_keys::snapshot_passphrase`）。
     pub fn room_key_backup_key(&self) -> Key32 {
         self.derive(ROOM_KEY_BACKUP_KEY_CONTEXT)
     }

@@ -568,7 +568,7 @@ async fn build_client(
                         path.chars().count()
                     ))
                 } else {
-                    // store 只是「非存不可」的裝置狀態，刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
+                    // store 是上游自己的狀態（裝置、sync、它的快取），聊天紀錄的權威在 cache.db：刪掉重新 login 就好；不做遷移（local-cache-db.md §1）。
                     SdkError::Usage(format!(
                         "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
                     ))

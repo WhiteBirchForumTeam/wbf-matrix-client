@@ -518,10 +518,8 @@ impl Core {
 
     /// 開 backend 並做一次增量 sync（timeout 0）：房間列表與新事件到 store，之後才看得到現況。
     ///
-    /// 🚧 **這是 matrix-sdk 那一套**。房間歷史（`history`／`files`）已經照探測分派了
-    /// （`upstream_page_of`，`MethodHome::BothSides`）；其餘房間命令（`list`／`get`／`send_text`）
-    /// 還在「還沒有 ws」的清單上（`MethodHome::StillOnMatrixSdk`），所以不管 `transport`、
-    /// 不管對方是不是 wbf 都走這裡。⭐ 清單上的東西**沒有選擇**，所以這裡刻意不看 `transport`。
+    /// 🚧 **這是一般 Matrix 帳號（matrix-sdk）那一套**。wbf 帳號的房間命令在叫到這裡之前就分流到 `wbf_rooms.rs`
+    /// （`is_wbf_account`）；房間歷史（`history`／`files`）照探測分派（`upstream_page_of`）。這裡刻意不看 `transport`。
     pub(crate) async fn synced_backend_of(
         &self,
         account: &AccountDir,
@@ -536,7 +534,7 @@ impl Core {
     /// 那個 server 的快取（寫入者＋讀連線）與「我是誰」。**新的路徑都走這個**。
     ///
     /// 📎 舊的 [`Core::cache_and_me`] 還在：媒體那幾條會抓著 `&mut Cache` 跨越網路 I/O
-    /// （邊下載邊寫），塞不進「一個工作 = 一個交易」，所以它們維持自己的連線（daemon-runtime.md §2.2）。
+    /// （邊下載邊寫），塞不進「一個工作 = 一個交易」，所以它們維持自己的連線（daemon-runtime.md §2.3.1）。
     pub(crate) fn server_cache_and_me(
         &self,
         account: &AccountDir,

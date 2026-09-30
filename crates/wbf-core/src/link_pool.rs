@@ -22,7 +22,7 @@ use crate::event::{CoreEvent, EventSink, LinkState};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkRole {
-    /// 一問一答：Hello／Ping、Info、橋、Event/Send、Recent（拉窗）、Device/Fetch／ItemsDestroy。
+    /// 一問一答：Hello／Ping、Info、橋、Event/Send、Recent（拉窗）。`Device/Fetch`／`ItemsDestroy` 在 `Keys`（見下）。
     Misc,
     /// Upload/*。
     Upload,

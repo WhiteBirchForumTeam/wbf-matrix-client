@@ -8,7 +8,7 @@
 > - daemon：`room.refresh_devices`、`room.send_text` 多兩個參數、錯誤回應的 `data`、`devices.changed` 推播。
 >
 > server 的語意在 wbfuwunel `wbf-room-device-version.md`（房間版本號、1506、`DeviceChanged`）與 `wbf-e2ee.md`（`CryptoState`）。
-> 這份取代 e2ee-walkthrough.md §16.6 那張「誰呼叫」的表（09-21 版的「daemon 存快照、補完發狀態訊息」被這版精確化）。
+> UI 與 daemon 誰呼叫什麼，以這份為準（e2ee-walkthrough.md §16.6 只留原則）。
 
 ## 0. 規矩（維護者原話，2026-09-29）
 
@@ -59,8 +59,8 @@
 - `Misc` 與 `Rooms` 兩條線的 `Hello.features` 宣告 `org.wbftw.device_versions`（`link_pool::features_of`）：
   - `Misc`：加密訊息從這條 `Event/Send`。宣告了，server 對**加密**事件一律要 `room_version`（漏帶是 `InvalidRequest`），明文不受影響。
   - `Rooms`：宣告了 server 才推 `Event/DeviceChanged`。
-  - ⚠️ server 把宣告記在**連線**上、下一個 `Hello` 覆蓋（沒帶就收回）。在共用 `Misc` 上重 `hello` 的三處（`server.ping`、`room.history`、`sync.recent`）
-    原本帶空的 features，會把宣告收掉——這支一起改成帶 `features_of(Misc)`。
+  - ⚠️ server 把宣告記在**連線**上、下一個 `Hello` 覆蓋（沒帶就收回）。所以在共用 `Misc` 上重 `hello` 的三處（`server.ping`、`room.history`、`sync.recent`）
+    也帶 `features_of(Misc)`；帶空的會把宣告收掉。
 - `room.refresh_devices { room, previous?, user?, server? }` → `{ room_version, members, shared }`：
   daemon 拿這一刻的成員清單與版本號（橋 `Members`）→ 跟 `previous` 比出誰的裝置版本號變了 → 只重查那些人（`/keys/query`）→ 雜湊對一次（不對再查一次，還不對就拒絕，fail closed）
   → 把房間金鑰補給還沒有的裝置。`previous` 不帶就每個人都查（只是查得多，送金鑰照樣只送缺的）。
@@ -95,7 +95,7 @@
 - `1401 room_devices_changed` 是 RPC 的號碼（rpc-spec.md §5.2，server 家族 1400 裡拆出來的；server 那邊叫 1506，訊息裡照帶）。
 - `data` 就是新的 `RoomDevices` ＋ `shared` ＋ 這則的 `txn_id`（UI 沒給的話是 daemon 產的）：UI 存下它、用同一個 `txn_id` 重送就過。
 - 重拿也失敗：`data` 只有 `{ txn_id, current_room_version }`，`msg` 說明，UI 自己叫 `room.refresh_devices`。
-- 🚫 **daemon 不自動重送**（09-21 那條仍成立：使用者可能已經撤回或改了，重送的政策在 UI）。
+- 🚫 **daemon 不自動重送**：使用者可能已經撤回或改了，重送的政策在 UI。
 
 加密房的**檔案**還送不了（`room.send_file` 在加密房拒絕）：加密附件是另一件事（§8）。
 
@@ -108,7 +108,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 
 - 開 `Keys` 線時（`init_keys`）：先把訂閱時 server 跟著推的那個 `CryptoState`（sdk 收在 `DeviceSubscription::crypto_state`）交給狀態機，
   再 `send_outgoing_requests` 一次——裝置金鑰、一次性金鑰、fallback key 一起上傳。別人查得到這台，就是從這一步開始。
-  ⚠️ 這支的測試抓到：原本沒交初始那份，fallback key 要等到下一個 `CryptoState` 才會補。
+  ⚠️ 初始那份一定要先交：沒交的話 fallback key 要等到下一個 `CryptoState` 才會補（測試釘住，§9）。
 - 之後每個 `CryptoState`：存量交給狀態機，它要補就補（上游一律補到 50 把；fallback key 到期才換），走 `Keys` 那條線上傳。
 - 上傳失敗只講一聲（`Note`）：收金鑰照常，下一個 `CryptoState` 再試；一次性金鑰領光了還有 fallback key 撐著。
 
@@ -132,7 +132,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 | cache 裡還沒解的要怎麼補解、要不要通知 | `room_crypto::decrypt_stored` | 金鑰到了（`announce: true`）與 `Recent` 拉完（`false`）共用 |
 | 被 1506 擋之後做什麼 | `Core::wbf_send_encrypted` | 自動 refresh、組 `data` |
 | 這個房加密了沒 | `Core::wbf_is_room_encrypted`（問 `m.room.encryption` 這一項，🚫 不用快取） | 問不到就是錯，🚫 不當成沒加密 |
-| 走橋的每支端點是哪個 kind／subtype | sdk `protocol.rs` 的 `BRIDGE_*` 常數（對 wbfuwunel `docs/design/bridge-specs/`） | core 的假 server（`test_support::bridged_reply`）也吃這些常數，🚫 不手寫 hex |
+| 走橋的每支端點是哪個 kind／subtype | sdk `protocol.rs` 的 `BRIDGE_*` 常數（對 wbfuwunel 的 `/docs/bridge-specs/`） | core 的假 server（`test_support::bridged_reply`）也吃這些常數，🚫 不手寫 hex |
 
 ## 8. 不在這支（已知的缺口）
 
@@ -140,14 +140,13 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
 - **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，e2ee-walkthrough.md §16）。
-- **補解寫失敗的那批不會自動重試**（PR #62 審查 rumia 🟡1）：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
+- **補解寫失敗的那批不會自動重試**：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
   那把金鑰已經匯入，之後不會再觸發補解（只有同一把金鑰再來才會）。要不要加一個觸發點（例如 `room.history` 讀到未解的就試一次）待維護者決定。
-- ~~沒對真 server 跑過~~：2026-09-30 server 重編後跑過了，見 §9 最後一項。
 
 ## 9. 測試
 
 - sdk `tests/pipeline.rs`（會答橋的假 server）：沒 refresh 過就直接送——先分金鑰、不 panic、送的是密文帶 UI 的號碼、自己解得開（`to_incoming` 走 Decrypted、密文照帶）；
-  `to_incoming` 明文原樣、解不開的照存帶原因；原本的 refresh／1506 兩條改用新簽名。
+  `to_incoming` 明文原樣、解不開的照存帶原因；refresh 與 1506 各一條。
 - sdk `cache.rs`：`list_undecrypted_ciphertexts` 只回這個讀者同步過、還沒解、那把 session（或那幾則）的，舊→新；解開之後就不再出現。
 - core `room_crypto.rs`（core 的假 server 多答橋的 `Members`／`GetStateEvent`／`KeysUpload`／`KeysQuery`／`KeysClaim`／`SendToDevice` 與 `Event/Send`，並學 server 的 1506）：
   - 加密房沒帶 `room_devices` 拒、🚫 不送明文；refresh 回 UI 要存的；送出去是密文、帶那個號碼；號碼過期 → `RoomDevicesChanged`、`data` 帶新狀態與同一個 `txn_id`、訊息沒送；帶新狀態重送就過；
@@ -158,8 +157,8 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
   - `to_incoming` 有引擎就解、沒引擎原樣。
 - core `key_sync.rs`：開線上傳一次（裝置金鑰＋一次性金鑰＋fallback key）；存量滿的 `CryptoState` 不上傳、剩 10 把的上傳一次。
 - daemon：錯誤的 `data` 原樣進回應、沒有就不在；`devices.changed` 推播的形狀；`room.refresh_devices` 在方法表上、參數錯是 102。
-- 真 server（`--ignored`，2026-09-30 對本機 wbfuwunel 跑過）：
+- 真 server（`--ignored`，對本機 wbfuwunel 跑）：
   - core `an_encrypted_conversation_survives_a_new_device_over_the_real_server`：alice、bob 各一個 `Core` 登入、鉤子開五條線 → alice refresh、帶 `RoomDevices` 送 → bob 的 `room.message` 是解開的；bob 登第二台裝置 → alice 帶舊的送 → `RoomDevicesChanged`、`data` 是新狀態、訊息沒送 → 帶新狀態同一個 `txn_id` 重送 → bob 的新舊兩台都解得開。
   - daemon `real_server`：加密房沒帶 `room_devices` 是 1100；`room.refresh_devices` 回的整份當 `room_devices` 帶回去送，成功。
-  - 原有的 sdk `e2e_crypto_engine`（#45 驗收）、`e2e_local_server`、core 房間／金鑰兩條、daemon 兩條都照跑、都過。
-  - ⚠️ 當時那顆 server 是從 wbfuwunel 還沒合併的 `docs/room-version-prev` 分支編的：房間版本號從「只增不減的位置」改成「成員集合的雜湊」（外部審查 #5）。client 本來就把號碼當不透明的值、只比相不相等，所以照常運作；sdk 的 #45 驗收原本寫死「新號碼比舊的大」，改成「不相等」，兩種定義下都成立。
+  - 另外還有 sdk `e2e_crypto_engine`（issue #45 的驗收）、`e2e_local_server`、core 房間／金鑰兩條、daemon 兩條。
+  - ⚠️ client 把房間版本號當**不透明的值**、只比相不相等：wbfuwunel 的 `docs/room-version-prev` 把它從「只增不減的位置」改成「成員集合的雜湊」，兩種定義 client 都照常運作。sdk 的驗收因此斷言「不相等」，🚫 不斷言「變大」。

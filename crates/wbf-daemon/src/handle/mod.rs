@@ -12,7 +12,7 @@
 //! | `media` | `upload.*`、`media.info`／`save_to`、`server.ping` |
 //! | `backup` | `backup.*` |
 //!
-//! 還沒有：推播、`subscribe`／`cancel`、`media.open`／`create`、`room.send_attachment`（rpc-spec.md §10）。
+//! 推播與 `subscribe` 在 `push.rs`／`server.rs`。還沒有：`cancel`、`media.open`／`create`、`room.send_attachment`（rpc-spec.md §10）。
 
 mod accounts;
 mod backup;

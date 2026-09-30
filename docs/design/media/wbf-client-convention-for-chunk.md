@@ -1,8 +1,6 @@
 # WBF client 約定規格書：分塊／串流媒體，client 之間怎麼讀
 
-> 狀態：草案，2026-09-04，等維護者同意。
->
-> server 端的規格書（wbfuwunel `docs/design/chunked-upload-spec.md`，以下稱「線上規格」）只講 byte 怎麼排、
+> server 端的規格書（wbfuwunel 的 chunked-upload-spec.md，以下稱「線上規格」）只講 byte 怎麼排、
 > 打哪個端點、server 怎麼回。它刻意不講的東西 —— 每塊怎麼加密、`Create` 的 data 裝什麼、串流怎麼收尾、
 > 房間事件怎麼放、seek 怎麼算 —— 由本文定。**server 不讀本文定義的任何內容**；兩個 client 只要都照本文，
 > 就能互相解開。
@@ -186,10 +184,10 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 - 縮圖：沒有（密文做不出來），事件不帶 `info.thumbnail_*`。
 - `m.video`／`m.audio` 的 `info.duration` 這類明文元資料，v1 不放；要放就放進區塊，之後升 `v`。
 
-### 5.2 ⚠️ 送事件時要宣告附件，否則媒體會被 server 清掉（第一版，等 server 的 feat 定案後再核對）
+### 5.2 ⚠️ 送事件時要宣告附件，否則媒體會被 server 清掉
 
-> 依據：wbfuwunel `docs/design/media-attachments.md`（提案，維護者 2026-09-06 定方向）與 `chunked-upload-spec.md` §12。
-> server 端還沒實作；這一節先寫下 client 該留的位置，server 定案後逐條核對，有出入以 server 的規格為準並回來改這裡。
+> 依據：wbfuwunel 的 media-attachments.md（維護者 2026-09-06 定方向）與 wbfuwunel 的 chunked-upload-spec.md §12。
+> 跟 server 的規格有出入時以 server 為準，回來改這裡。
 
 server 在 E2EE 房間讀不到 `content`，不知道哪則訊息用了哪個 mxc。**沒被任何訊息指到的新媒體計數是 0，
 過保護期（`media_unreferenced_grace_seconds`，至少 7 天）後台掃描會清掉。** 所以 §5 的事件送出時**必須在同一個請求裡宣告附件**：
@@ -209,8 +207,8 @@ client 的規則：
 - `Hello.features` 沒有 `attachments` = 舊 server：照 Matrix 原樣送，什麼都不帶。這是顯式判斷，不是「帶了沒人理」。
 - 上傳完到送出前的空窗：媒體計數是 0，靠保護期撐著；保護期是 server 的設定，client 不假設它多長，**上傳完就盡快送**，不要先上傳一堆再慢慢寫訊息。
 
-`wbf-sdk` 的落點：`protocol::send_event`／`SendRequest`（已有，等 server）；matrix-sdk 那條路的 header 在第 3 步的 adapter 裡加。
-**CLI 的 `send --file` 從第一版就要走這條**，不然開發期間上傳的媒體 7 天後全部消失。
+`wbf-sdk` 的落點：`protocol::send_event`／`SendRequest`、`WbfClient::send_event`。
+還沒做：matrix-sdk 那條（HTTP）還不帶 `X-Wbf-Attachments`；加密房的附件還沒接（e2ee-rpc.md §8）。
 
 ## 6. 串流上傳（大小未知）
 
@@ -240,7 +238,7 @@ Read(mxc, chunk=i) → ct_i → 解密 → pt_i[off..]
 - 不認得的 `v` 一律拒絕（顯示 `body`），不要猜。
 - 本文任何會讓舊 client 解錯的改動（演算法、nonce 構造、AAD、欄位語意）都要升 `v`；只加選用欄位不用。
 
-## 9. 測試向量（第 2 步產生）
+## 9. 測試向量
 
 本文的可執行版本：[`wbf-client-vectors.json`](wbf-client-vectors.json)，由 `crates/wbf-sdk/tests/client_vectors.rs` 產生
 （`WBF_WRITE_CLIENT_VECTORS=1 cargo test -p wbf-sdk --test client_vectors`）。內容：三個 `cipher` 各一個檔，固定 `key`、
@@ -259,7 +257,4 @@ JSON 與密文、對應的事件區塊；§7 的 seek 算例（含 wbf-cli-spec.
 
 ## 11. 要維護者決定的
 
-1. ~~命名空間~~ 定了：`org.wbftw.wbfuwunel.<名字>`（維護者 2026-09-04）。
-2. ~~E2EE 硬擋~~ 定了：不擋，沒 E2EE 的房間用明文模式，發送前警告並確認（§5.1，維護者 2026-09-04）。
-3. ~~`chunk_size`~~ 定了：依大小，50 MiB 以下 64 KiB、以上 1 MiB；串流依線路，行動網路 64 KiB、Wi-Fi 1 MiB（§2，維護者 2026-09-04）。
-4. ~~`cipher`~~ 定了：`chacha20-poly1305` 與 `aes-256-gcm` 二選一，SDK 依硬體預設、UI 可覆蓋（§3，維護者 2026-09-04）。
+目前沒有。

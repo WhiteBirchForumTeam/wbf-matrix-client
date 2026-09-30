@@ -1,13 +1,16 @@
 # 房間金鑰的備份：server 一份、本地一份（維護者 2026-09-09 定）
 
+> 這份講 **matrix-sdk 帳號**的房間金鑰備份：server 端的標準 Matrix key backup（§3、§6）、本地的 `k/` 快照（§4、§5）、
+> 誰刪什麼與 `logout` 的閘門（§7）、recovery key 的保管（§8）。實作：sdk `room_keys.rs`、`backend/matrix_sdk.rs`；core `backup_ops.rs`、`recovery.rs`、`session_ops.rs`（閘門）。
+> ⚠️ wbf 帳號沒有 matrix-sdk 的 `Client`，這一套都還沒接（`key-backup` 對它回錯；e2ee-rpc.md §8），`logout` 閘門對它只看第二關（§7）。
+
 ## 1 為什麼要有這一章
 
-在這一章之前，房間金鑰（Megolm inbound session）**只活在一個地方**：帳號目錄底下的 `m/crypto.db`（那時還叫 `matrix/`）。
-整個 repo 沒有任何一行碰 `/room_keys`、backup、recovery。這代表：
+房間金鑰（Megolm inbound session）平常**只活在一個地方**：帳號目錄底下的 crypto store（`m/`）。沒有備份的話：
 
 - 換一台機器、重灌、`logout`，**歷史訊息永久解不開**。事件本身還在 server 上，但沒有鑰匙。
-- vault-and-keys.md §1.1 與 local-cache-db.md §1 那條「store 開不了就刪掉 `matrix/` 重新 `login`，store 只是裝置狀態」**把這件事寫成了正常操作**。
-  「只是裝置狀態」對 `state.db` 成立，對 `crypto.db` 不成立 —— 它裡面是解開全部歷史的唯一鑰匙。
+- vault-and-keys.md §1.1 那條「store 開不了就刪掉 `m/` 重新 `login`」**把這件事寫成了正常操作**。
+  「只是裝置狀態」對 state store 成立，對 crypto store 不成立 —— 它裡面是解開全部歷史的唯一鑰匙。這條政策站得住，靠的是這一章。
 - 光有 recovery key 沒有用。recovery key 只是解開 SSSS 拿到 backup 的解密金鑰；**如果沒有人把房間金鑰上傳上去，備份是空的**。
   有意義的是房間金鑰本身（維護者 2026-09-09 在別的專案踩過同一個坑）。
 
@@ -16,15 +19,15 @@
 
 ## 2 兩份備份，分工不同
 
-| | server 端（標準 Matrix key backup） | 本地端（我們自己的加密金鑰池） |
+| | server 端（標準 Matrix key backup） | 本地端（`k/` 快照） |
 |---|---|---|
 | 存哪 | homeserver 的 `/room_keys`（`m.megolm_backup.v1.curve25519-aes-sha2`） | 帳號目錄的 `k/`（§4） |
-| 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §3） | 意外：`crypto.db` 壞掉、`matrix/` 被刪掉重 `login`、server 端資料沒了 |
+| 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §3） | 意外：crypto store 壞掉、`m/` 被刪掉重 `login`、server 端資料沒了 |
 | 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，vault-and-keys.md §1） |
 | 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§6） | **命令觸發**：`key-backup save`，`upload` 時順手一起（§5） |
 | 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，wbf-cli-spec.md §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
 | 生命週期 | 跟帳號走，`logout` 不動它 | **跟這台機器上的這個帳號走：`logout` 連它一起刪**（維護者 2026-09-09，§7） |
-| 互通性 | 有：Element 之類的 client 用同一份 | 沒有：只有這個 client 讀得懂 |
+| 互通性 | 有：Element 之類的 client 用同一份 | 格式是 Element 的金鑰匯出，但 passphrase 由 vault 導出：實際上只有這個 client 打得開 |
 
 兩份都是 best effort 的**副本**，權威永遠是 crypto store。任何一份讀壞就當作沒有（fail closed），不要拿壞掉的金鑰去覆蓋 store。
 
@@ -47,7 +50,7 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
 - 關掉（`SERVER_BACKUP=off`）就是 `auto_enable_backups: false` 且不跑上傳；**已經在 server 上的 version 不動、不刪**
   （刪 server 端備份是不可逆的，要顯式命令，見 §9）。
 
-## 4 本地端：一個全量快照檔（2026-09-09 實作時改的）
+## 4 本地端：一個全量快照檔
 
 放在**帳號層**（維護者 2026-09-09 定）：
 
@@ -57,22 +60,10 @@ a/<b58>_<b58>/k/
   snapshot.tmp    寫入時的暫存檔，寫完 rename 成 snapshot
 ```
 
-> ⚠️ **這一節 2026-09-09 實作時改過**。原本定的是「一房一檔、逐把 append 的 `WBFRK1` 格式，
-> 每個命令結束前比對後只寫新的那幾筆」。做不到，因為**上游只給全量匯出**：
-> `Encryption::export_room_keys(path, passphrase, predicate)` 直接把金鑰寫成一個加密檔，
-> 而拿逐把金鑰要 `Client::olm_machine()`，那是 `pub(crate)`（只有 `olm_machine_for_testing()` 露出來，
-> 名字就是契約，🚫 不碰）。
->
-> 改成全量快照之後**反而簡單得多**，而且原本那套 append 格式的理由都消失了：
->
-> | 原本要解決的 | 全量快照為什麼不需要 |
-> |---|---|
-> | 去重（同一把 session 存很多次） | 每次覆蓋整份，本來就沒有重複 |
-> | 檔案愈積愈長 | 快照大小 ＝ 金鑰總量，不隨備份次數長 |
-> | 自訂的 `WBFRK1` 格式與它的 nonce／序號 | 不用了，格式是上游的 |
-> | 尾巴壞掉要截斷 | 先寫 `.tmp` 再 rename，要嘛舊的完整、要嘛新的完整 |
->
-> 代價只有一個：拿不到「只寫增量」，每次要跑一輪 PBKDF2 500,000（約半秒）。所以它是**命令觸發**的（§5）。
+**為什麼是全量快照**：上游只給全量匯出——`Encryption::export_room_keys(path, passphrase, predicate)` 直接把金鑰寫成一個加密檔；
+拿逐把金鑰要 `Client::olm_machine()`，那是 `pub(crate)`（只有 `olm_machine_for_testing()` 露出來，名字就是契約，🚫 不碰）。
+全量快照每次覆蓋整份，所以沒有重複、不隨備份次數長、格式是上游的；先寫 `.tmp` 再 rename，要嘛舊的完整、要嘛新的完整。
+代價只有一個：拿不到「只寫增量」，每次要跑一輪 PBKDF2 500,000（約半秒）。所以它是**命令觸發**的（§5）。
 
 - **passphrase 是 vault 第五把子金鑰的 base64**（`BLAKE3 derive_key("wbf-matrix-client room key backup v1", master)`），
   不是使用者打的字——所以「passphrase 太弱被暴力破」在這裡不存在。
@@ -94,7 +85,7 @@ a/<b58>_<b58>/k/
 | `logout` 的閘門擋下來時 | 訊息告訴他有 `key-backup save` 這條路（也老實說 logout 會連它一起刪） |
 
 ⚠️ 所以本地這份**不是「一定不會漏」**：兩次 `save` 之間拿到的金鑰，只在 crypto store 與（有跑 upload 的話）
-server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那是建立在「拿得到逐把金鑰」的假設上，而那個假設是錯的。
+server 那份裡。
 真正的保險仍然是 §3 的 server 端 backup 加 recovery key。
 
 ## 6 server 那份怎麼追平：`key-backup upload`
@@ -116,13 +107,13 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 
 | 情形 | `m/` | `k/` | 怎麼把歷史找回來 |
 |---|---|---|---|
-| **意外**：store 壞掉、金鑰對不上，照 vault-and-keys.md §1.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
+| **意外**：store 壞掉、金鑰對不上，照 vault-and-keys.md §1.1 的指示手動刪 `m/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
 | **有意**：`logout`／`account del <user>`（同一件事，wbf-cli-spec.md §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
 | **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
 
-📎 **to-device 的水位（`cd_seq`）住在 `m/` 裡面，所以這張表的每一列它都自動跟著對**
-（維護者 2026-09-12）：`m/` 被刪 → 水位一起沒 → 下次從頭拉。🚫 不需要有人記得另外去清它，
-理由在 [to-device-client.md](../keys/to-device-client.md) local-cache-db.md §2.1。
+📎 **to-device 的本地狀態（`m/td.json`：`cd_seq` 與待銷毀清單）住在 `m/` 裡面，所以這張表的每一列它都自動跟著對**
+（維護者 2026-09-12）：`m/` 被刪 → 它一起沒 → 下次從頭拉。🚫 不需要有人記得另外去清它，
+理由在 to-device-client.md §2.1。
 
 為什麼 `logout`（即 `account del`）連著刪（維護者 2026-09-09）：它在心智上是「我離開這台機器」，
 留一個能解開全部歷史的檔案在磁碟上是驚嚇，而且跟「crypto store 一定會被刪」不一致。
@@ -147,6 +138,8 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 而那個目錄 `logout` 不碰——所以刪完 `m/` 與 `k/` 之後它還在，歷史真的救得回來。
 
 🚫 **不問使用者手打 recovery key**（維護者 2026-09-09 定）：既然我們自己就保管著，問他等於刁難。
+
+⚠️ **wbf 帳號例外**：它沒有 `Client`，問不到 server 那份備份，第一關問不出來；所以只看第二關——這台機器保管著它的 recovery key 才放行，否則擋（`session_ops.rs` 的 `refuse_if_history_would_be_lost`）。
 
 「其他任何狀態」包含：沒有 recovery key、`SERVER_BACKUP=off`（使用者自己關掉的，那本地這份就是唯一一份）、
 `RecoveryState` 是 `Unknown`／`Incomplete`、問不到 server。🚫 不寫成「沒有 recovery key 才擋」——
@@ -192,6 +185,6 @@ server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損
 
 - 🚫 不自己發明備份格式上傳到 fork server（走 pack 通道）：標準路徑已經可用，自訂等於放棄互通又要 server 改。
 - 🚫 `key-backup` 不做「刪掉 server 上的 backup version」：不可逆，而且會讓其他裝置的備份一起失效。要刪去別的 client 刪。
-- 還開著：本地金鑰池要不要配額或壓縮（append-only 會一直長）。一筆約 200 byte，一萬把也才 2 MB，第一版不管。
+- 還開著：本地快照要不要配額或壓縮。快照大小 ＝ 金鑰總量（一把約 200 byte，一萬把也才 2 MB），第一版不管。
 - 還開著：UI 那版怎麼呈現 recovery key（CLI 只印一次就算了，UI 要有「我存好了」的確認流程）。
 

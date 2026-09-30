@@ -34,6 +34,7 @@
 //! 🚫 清單**不是一串字串**：每個呼叫點自己用 [`MethodHome`] 說出它住在哪一邊 ——
 //! ⭐ 那樣「名字」跟「實際走哪條」不可能漂移（原則 A4），而 `MethodHome::StillOnMatrixSdk`
 //! 的呼叫點就是那份清單。📎 給人看的版本是 rpc-spec.md §10「底層」那一欄。
+//! 現在清單是空的：wbf 帳號的房間命令都走 ws（`wbf_rooms.rs`），`StillOnMatrixSdk` 只剩測試在用。
 
 use wbf_sdk::Transport;
 
