@@ -56,6 +56,7 @@ mod accounts;
 mod backend_choice;
 mod backup_ops;
 pub mod conf;
+pub mod data_dir_lock;
 mod error;
 pub mod event;
 mod handles;
