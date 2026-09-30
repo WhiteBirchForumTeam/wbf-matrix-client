@@ -2,7 +2,7 @@
 //!
 //! 它是 local-interface.md §9 閘門鏈裡「RPC 轉換 ⇔ daemon handle」那一格：把 JSON 的 `params`
 //! 反序列化成 core 的型別、叫一個 core 方法、把回傳序列化回去。**命令列的 arg 之後也走這裡**
-//! （§0.2：arg → RPC 訊息 → 同一個 `call`），🚫 不留第二套分派。
+//! （architecture-v2.md §0.2：arg → RPC 訊息 → 同一個 `call`），🚫 不留第二套分派。
 //!
 //! | 子模組 | method |
 //! |---|---|

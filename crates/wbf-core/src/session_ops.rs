@@ -4,7 +4,7 @@
 //! room-key-backup.md §7 與 local-cache-db.md §5。
 //!
 //! 🚫 這裡的訊息**不提任何命令名字**（`wbf-cli key-backup recovery` 那種）：core 不知道
-//! 呼叫它的是 rpc-cli、Desktop 還是 Android（§3）。它只說**條件**，前端照
+//! 呼叫它的是 rpc-cli、Desktop 還是 Android（architecture-v2.md §3）。它只說**條件**，前端照
 //! [`CoreErrorKind::HistoryWouldBeLost`] 補上自己的那句話。
 
 use serde::Serialize;
@@ -48,7 +48,7 @@ impl Core {
     /// ⚠️ `m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊的 crypto
     /// store 會擋登入（"account in the store doesn't match"，2026-09-07 實跑踩到）。
     ///
-    /// 🚫 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（§10.8）。
+    /// 🚫 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（room-key-backup.md §8）。
     ///
     /// Args:
     ///     user: 完整 mxid, example: "@bob:matrix.org"
@@ -84,7 +84,7 @@ impl Core {
     ///    ⭐ 放最後是 fail closed：前面任何一步失敗，目錄還在，`account status` 看得到殘留、重跑 destroy 能接著清。
     ///
     /// ⚠️ 這個命令**連 recovery key 一起摧毀**，所以之後 server 上那份備份永遠解不開。
-    /// 🚫 呼叫端要先問過使用者：core 不做「你確定嗎」，那是前端的事（§3）。
+    /// 🚫 呼叫端要先問過使用者：core 不做「你確定嗎」，那是前端的事（architecture-v2.md §3）。
     pub async fn destroy_account(
         &self,
         user: &str,
@@ -109,7 +109,7 @@ impl Core {
 
         let report = self.forget_cached_account(&account, &server, user).await?;
 
-        // DB 先、檔案後（§6 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。
+        // DB 先、檔案後（local-cache-db.md §5 的忘掉鏈）：列已經刪了，現在刪池裡沒人指的檔。
         // 刪不掉只說一聲，下次 media-gc 的 sweep 會再收（整個 server 目錄被刪時也一起走）。
         let pool = self.pool_of(&account)?;
         let mut pool_files_removed = 0u64;
@@ -305,7 +305,7 @@ impl Core {
         // 長活的引擎握著 `m/` 的 sqlite：先丟掉才刪得掉（Windows）。
         self.forget_crypto_engine(account).await;
         account.delete_matrix_store()?;
-        // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（§10.7）。
+        // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（room-key-backup.md §7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。
         room_keys::del_snapshot(&account.dir)?;
         accounts::clear_current_if(&self.data_dir, account)?;
@@ -640,7 +640,7 @@ fn remove_error(path: &std::path::Path, error: std::io::Error) -> CoreError {
 
 /// 閘門擋下來時的訊息：`why` 是這一次為什麼擋，後面接一律相同的出路。
 ///
-/// 🚫 **不提命令名字**：core 不知道呼叫它的是誰（§3）。前端看到
+/// 🚫 **不提命令名字**：core 不知道呼叫它的是誰（architecture-v2.md §3）。前端看到
 /// [`CoreErrorKind::HistoryWouldBeLost`] 再補上自己那句 `wbf-cli …`。
 fn refusal(account: &AccountDir, why: &str) -> CoreError {
     CoreError::new(
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn the_refusal_says_the_condition_but_never_names_a_command() {
-        // 🚫 core 不知道呼叫它的是 rpc-cli、Desktop 還是 Android（§3）。
+        // 🚫 core 不知道呼叫它的是 rpc-cli、Desktop 還是 Android（architecture-v2.md §3）。
         let dir = std::env::temp_dir().join(format!("wbf-core-refusal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

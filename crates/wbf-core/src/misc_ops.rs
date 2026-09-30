@@ -276,7 +276,7 @@ impl Core {
     /// `&mut dyn Read`，而那是 trait object——architecture-v2.md §6 明文說公開介面上
     /// 🚫 不要有 trait object（過不了 FFI、序列化不了）。
     ///
-    /// 為什麼還是放這裡：§4.8 定了 daemon 模型下**上傳走資料平面的 HTTP PUT**
+    /// 為什麼還是放這裡：local-interface.md §8 定了 daemon 模型下**上傳走資料平面的 HTTP PUT**
     /// （Android 的 SAF 只給 `content://`，根本沒有路徑可傳）。所以這條路徑在 daemon
     /// 落地時會**整個被 PUT 取代**，不是要長期維護的介面。
     /// 🚫 daemon 不要把它開成 RPC method；rpc-cli 用它讀 stdin，到此為止。

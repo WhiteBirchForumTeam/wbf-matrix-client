@@ -6,7 +6,7 @@
 # 環境變數：WBF_SERVER（預設 http://127.0.0.1:6167）、WBF_USER（預設 alice）、WBF_PASSWORD_FILE（必要）、
 # WBF_ACCEPT_SIZE_MIB（預設 200；想快一點就給小的）。
 # 任一步失敗就 exit 非 0 並印出是哪一步。
-# 執行順序與規格 §8 的編號不同（三種 cipher 先跑，因為 seek／續傳／串流都要它的 manifest）；
+# 執行順序與wbf-cli-spec.md §8 的編號不同（三種 cipher 先跑，因為 seek／續傳／串流都要它的 manifest）；
 # 每一步的標題括號裡是規格的步驟號。
 set -euo pipefail
 

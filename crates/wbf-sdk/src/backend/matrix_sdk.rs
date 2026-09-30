@@ -154,7 +154,7 @@ impl MatrixBackend {
         let member_count = room.joined_members_count();
         let is_direct = room.is_direct().await.unwrap_or(false);
 
-        // chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；§3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
+        // chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；chat-model.md §3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
         let (kind, direct_peer) = if is_direct && member_count == 2 {
             let peer = room
                 .direct_targets()
@@ -392,7 +392,7 @@ pub struct BackupStatus {
     /// `has_recovery_key`——🚫 名字不要承諾我們驗不到的事。
     ///
     /// **只有 `Enabled` 算數**：`Unknown`、`Incomplete`、`Disabled` 一律當作沒有
-    /// （fail closed，§10.7 的閘門靠這個判斷）。
+    /// （fail closed，room-key-backup.md §7 的閘門靠這個判斷）。
     pub recovery_enabled: bool,
     /// 上游 `RecoveryState` 的名字，給人看的。
     pub recovery_state: String,

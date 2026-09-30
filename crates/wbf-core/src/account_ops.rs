@@ -28,7 +28,7 @@ pub struct WhoAmI {
 pub struct AccountStatus {
     pub accounts: Vec<crate::AccountSummary>,
     /// `s/` 底下有目錄但一個都解不開時該說的那句話（換過 `local.key`、或舊版留下的）。
-    /// ⚠️ 這是**資料**不是顯示：前端自己決定要印還是要跳視窗（§3）。
+    /// ⚠️ 這是**資料**不是顯示：前端自己決定要印還是要跳視窗（architecture-v2.md §3）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub undecryptable_hint: Option<String>,
 }

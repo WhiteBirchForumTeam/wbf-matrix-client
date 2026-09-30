@@ -58,7 +58,7 @@ const HEARTBEAT_FIRST_SEQ: u32 = u32::MAX;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
-/// 一個要 Ack 的請求怎麼等（§6）。🚨 預設 `attempts = 1`：重送是冪等的呼叫點自己開的。
+/// 一個要 Ack 的請求怎麼等（ws-receive-dispatch.md §6）。🚨 預設 `attempts = 1`：重送是冪等的呼叫點自己開的。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AckPolicy {
     /// 總共送幾次（含第一次）。0 當 1。
@@ -114,7 +114,7 @@ impl Shared {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// 唯一的關線路徑（§7）：第一個叫到的人做事，之後的都是 no-op。
+    /// 唯一的關線路徑（ws-receive-dispatch.md §7）：第一個叫到的人做事，之後的都是 no-op。
     /// 順序是先 `fail_all` 再 abort：在等的人先拿到錯，task 才停（abort 自己那個 task 也可以：它在下一個 await 點才停）。
     fn shut_down(&self, reason: &str) {
         if self.closed.swap(true, Ordering::SeqCst) {
@@ -141,7 +141,7 @@ pub struct WsLink {
 }
 
 impl WsLink {
-    /// 起兩個 task 加預設的心跳（`Heartbeat::DEFAULT`）。`hook` 每收一個 pack 叫一次（§4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
+    /// 起兩個 task 加預設的心跳（`Heartbeat::DEFAULT`）。`hook` 每收一個 pack 叫一次（ws-receive-dispatch.md §4，在表鎖之外）；沒接 UI 就給 `sessions::no_hook()`。
     pub fn start<S: FrameSource, K: FrameSink>(source: S, sink: K, hook: ReceivedHook) -> WsLink {
         WsLink::start_with_heartbeat(source, sink, hook, Heartbeat::DEFAULT)
     }

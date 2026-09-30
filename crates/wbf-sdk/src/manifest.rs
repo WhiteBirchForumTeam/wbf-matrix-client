@@ -1,4 +1,4 @@
-//! wbf-cli-spec.md §5 的 manifest 與 §6 的上傳狀態檔。兩者都含 `key`，寫檔時是機密。
+//! wbf-cli-spec.md §5 的 manifest 與 wbf-cli-spec.md §6 的上傳狀態檔。兩者都含 `key`，寫檔時是機密。
 
 use serde::{Deserialize, Serialize};
 

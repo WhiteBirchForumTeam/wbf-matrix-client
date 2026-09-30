@@ -35,7 +35,7 @@
 //!
 //! 📎 鎖檔**不刪、也不寫東西進去**：刪掉會跟「另一個程序正要開它」對撞；而「誰握著」不放這裡 ——
 //! Windows 的排他鎖連讀都擋，所以寫進去的字沒人讀得到。⭐ 那個問題已經有答案了：
-//! `<data dir>/daemon.json` 裡有現在這個 daemon 的 `pid` 與 `instance`（§4.3）。
+//! `<data dir>/daemon.json` 裡有現在這個 daemon 的 `pid` 與 `instance`（local-interface.md §3）。
 //!
 //! 📎 用的是 `std::fs::File::try_lock`（Rust 1.89 起在標準庫裡，本專案 MSRV 1.95）——
 //! 🚫 不引 `fs2`／`fs4`：標準庫已經有同一個東西了。

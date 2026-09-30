@@ -1,12 +1,12 @@
 //! core 的錯誤型別。
 //!
 //! **為什麼不直接用 `SdkError`**（PR #24 審查 salvia＋rumia）：`SdkError` 只 derive 了
-//! `Debug`，序列化不了。而 core 的公開面之後要被 RPC 包住，§4.6 定的回應形狀是
+//! `Debug`，序列化不了。而 core 的公開面之後要被 RPC 包住，local-interface.md §6 定的回應形狀是
 //! `code` ＋ `msg`——所以錯誤必須是**結構化、可序列化**的東西，不能是一句人話。
 //!
 //! # 🚫 這裡刻意**沒有**號碼
 //!
-//! §4.6：「`code` 是穩定的整數，一個意思一個號碼、**定了就不改**」，而那張表的權威位置是
+//! local-interface.md §6：「`code` 是穩定的整數，一個意思一個號碼、**定了就不改**」，而那張表的權威位置是
 //! `rpc-spec.md`（還沒寫）。在規格還沒寫的時候先配號碼，等於現在就兌現一個「不能改」的
 //! 承諾——所以這裡只定**種類**（[`CoreErrorKind`]），號碼等 `rpc-spec.md` 一起定
 //!（維護者 2026-09-11 定）。
@@ -23,7 +23,7 @@ use wbf_sdk::SdkError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoreErrorKind {
-    /// vault 還沒解鎖。RPC 那端對應 §4.5 的「只接受 `hello` 與 `vault.unlock`」。
+    /// vault 還沒解鎖。RPC 那端對應 local-interface.md §5 的「只接受 `hello` 與 `vault.unlock`」。
     Locked,
     /// 這個資料目錄還沒有 `local.key`——沒登入過。
     NoKeyFile,

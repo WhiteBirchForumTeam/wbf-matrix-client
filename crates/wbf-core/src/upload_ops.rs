@@ -71,7 +71,7 @@ impl Core {
 
     /// 上傳一個檔案，然後把它當附件送進房間。
     ///
-    /// 🚫 **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（§3）。前端要先問
+    /// 🚫 **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（architecture-v2.md §3）。前端要先問
     /// [`Core::conversation`]，再用 [`crate::cipher_for_plaintext_room`] 決定 `cipher`。
     pub async fn send_file(
         &self,

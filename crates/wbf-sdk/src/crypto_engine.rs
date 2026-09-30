@@ -3,7 +3,7 @@
 //! 網路、水位、銷毀都在這個 crate 自己手上；🚫 沒有 `/sync`、🚫 沒有 matrix-sdk 的 `Client`。
 //!
 //! 這是 wbf-sdk 裡**第二個**碰上游的地方（第一個是 `backend/matrix_sdk`）；兩者共用同一個 sqlite crypto store（`m/`），
-//! ⚠️ 同一時間只能有一個持有者（§13 第 9 條）——過渡期由呼叫端保證不同時開。
+//! ⚠️ 同一時間只能有一個持有者（e2ee-walkthrough.md §13 第 9 條）——過渡期由呼叫端保證不同時開。
 //!
 //! 涵蓋到哪：金鑰上傳／查詢／claim、收 to-device、把房間金鑰分給一群人、先分金鑰再加密帶房間版本號送出（`Event/Send`）、
 //! 解密（WS 收到的密文 → 要寫進 cache 的樣子）。1506 之後重拿房間狀態是呼叫端的事（daemon 自動做，e2ee-rpc.md）。
@@ -117,7 +117,7 @@ pub struct OlmEngine {
     machine: OlmMachine,
     /// crypto store 與 `td.json` 所在的 `m/`。
     store_dir: PathBuf,
-    /// 最近一次 `/keys/query` 回答這個人的 body（整份）：拿來重算裝置雜湊跟成員清單上的比（server §3.4）。
+    /// 最近一次 `/keys/query` 回答這個人的 body（整份）：拿來重算裝置雜湊跟成員清單上的比（wbfuwunel 的 wbf-room-device-version.md §3.4）。
     /// 只在記憶體：重開就重查。
     last_keys_query: Mutex<BTreeMap<String, serde_json::Value>>,
 }
@@ -347,7 +347,7 @@ impl OlmEngine {
             .map_err(|error| SdkError::Protocol(format!("decrypted event is not JSON: {error}")))
     }
 
-    /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 server §3.4 重算的比。
+    /// 成員清單上的裝置雜湊，跟我們最近一次 `/keys/query` 答案照 wbfuwunel 的 wbf-room-device-version.md §3.4 重算的比。
     ///
     /// Return:
     ///     Vec<String>  對不上的人（排序）。沒查過的人、server 說 `unhashable` 的人不算；我們自己算不出來的（到不了）**算對不上**——寬可多查一次，不拿舊金鑰送
@@ -767,9 +767,9 @@ impl OlmEngine {
     }
 }
 
-/// 房間金鑰發給誰（§13 第 8 條：要明確選，🚫 不默默用預設）。
+/// 房間金鑰發給誰（e2ee-walkthrough.md §13 第 8 條：要明確選，🚫 不默默用預設）。
 ///
-/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。server 規格 §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
+/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。wbfuwunel 的 wbf-room-device-version.md §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
 /// 要每個帳號都 bootstrap 過交叉簽章才有意義——client 這邊還沒做（`SigningKeysUpload` 只有號碼），現在選它等於發給零台裝置。
 /// ✅ 交叉簽章做好之後要換成 `IdentityBasedStrategy`，這裡是唯一要改的地方。
 pub fn room_key_share_settings() -> EncryptionSettings {
@@ -784,7 +784,7 @@ fn more_is_only_meaningful_with_items(window: &DeviceWindow) -> bool {
     !window.items.is_empty() && window.more
 }
 
-/// 只把 Olm session 的密文交給狀態機解，信任要求先照上游的預設（🚨 送出那一半決定「誰收得到金鑰」時要明確選，§13 第 8 條）。
+/// 只把 Olm session 的密文交給狀態機解，信任要求先照上游的預設（🚨 送出那一半決定「誰收得到金鑰」時要明確選，e2ee-walkthrough.md §13 第 8 條）。
 fn decryption_settings() -> DecryptionSettings {
     DecryptionSettings {
         sender_device_trust_requirement: TrustRequirement::Untrusted,

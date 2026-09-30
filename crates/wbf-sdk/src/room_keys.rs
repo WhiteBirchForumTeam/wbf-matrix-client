@@ -4,7 +4,7 @@
 //! 為什麼要有它：房間金鑰（Megolm inbound session）平常只活在 matrix-sdk 的 `crypto.db` 裡，
 //! 那個目錄 `logout` 會刪、壞掉也叫人刪。server 端的標準 backup 是主力，但在使用者產生
 //! recovery key 之前，**解開它的私鑰也只在本機的 crypto store 裡**——所以本地這一份是那段期間
-//! 唯一救得回歷史的東西（§10.2）。
+//! 唯一救得回歷史的東西（room-key-backup.md §2）。
 //!
 //! 這個模組只回答兩件事：**檔案放哪**、**用什麼 passphrase**。真正的匯出與匯入是上游做的
 //! （`MatrixBackend::save_room_key_snapshot` / `import_room_key_snapshot`），所以這裡不吃

@@ -80,7 +80,7 @@ impl ToDeviceState {
         }
     }
 
-    /// `ItemsDestroyed` 回來之後叫：只拿掉**真的回來的那些**（§4 第 1、3 條）。
+    /// `ItemsDestroyed` 回來之後叫：只拿掉**真的回來的那些**（to-device-client.md §4 第 1、3 條）。
     ///
     /// Args:
     ///     destroyed: example: &[4712]

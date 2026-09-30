@@ -45,7 +45,7 @@ pub fn dir(data_dir: &Path) -> PathBuf {
 ///     user_id: 完整 mxid, example: "@alice:localhost"
 /// Return:
 ///     Ok(PathBuf)   `<data dir>/r/<b58>_<b58>`
-///     Err(Usage)    加密後的名字太長（§11.4）
+///     Err(Usage)    加密後的名字太長（vault-and-keys.md §2.4）
 pub fn path_of(data_dir: &Path, vault: &Vault, user_id: &str) -> Result<PathBuf, SdkError> {
     let name = to_dir_name(
         &vault.account_dir_key(),

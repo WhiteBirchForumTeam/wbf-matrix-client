@@ -30,7 +30,7 @@ pub async fn run(cli: Cli) -> Result<(), CoreError> {
     result
 }
 
-/// ⚠️ 自動生成（§10.3）在**這裡之後**：三個條件之一是「這次命令成功結束」。
+/// ⚠️ 自動生成（wbf-cli-spec.md §10.3）在**這裡之後**：三個條件之一是「這次命令成功結束」。
 async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> {
     match command {
         Command::Login(args) => login_command(context, &args).await,
@@ -203,7 +203,7 @@ fn find_password_file(args: &LoginArgs, conf: &Conf) -> Option<PathBuf> {
         .or_else(|| conf.find("PASSWORD_FILE").map(PathBuf::from))
 }
 
-/// 開關型的值寫回 conf 時長什麼樣（§10.4 只認得這兩個字）。
+/// 開關型的值寫回 conf 時長什麼樣（wbf-cli-spec.md §10.4 只認得這兩個字）。
 fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
 }
@@ -226,9 +226,9 @@ pub struct Context {
     /// `SERVER_BACKUP`：標準 Matrix key backup 開著嗎（room-key-backup.md §3）。
     /// ⚠️ 認不得的值落到 `true`——壞掉要壞在「備份還開著」那一邊。
     pub server_backup: bool,
-    /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 §10.4）。同樣落到 `true`。
+    /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 wbf-cli-spec.md §10.4）。同樣落到 `true`。
     pub local_room_keys: bool,
-    /// 這次實際生效的值，給自動生成用（§10.3）。🚫 裡面沒有秘密。
+    /// 這次實際生效的值，給自動生成用（wbf-cli-spec.md §10.3）。🚫 裡面沒有秘密。
     effective: Vec<wbf_core::conf::Entry>,
     /// `--data-dir`／`WBF_DATA_DIR` 有給嗎——自動生成的三個條件之一。
     data_dir_was_given: bool,
@@ -236,7 +236,7 @@ pub struct Context {
     warned_about_backups: std::sync::OnceLock<()>,
 }
 
-/// conf 認得的鍵。⚠️ 加新鍵時要回來加一筆，不然它會被當成「認不得」印警告（§10.4）——
+/// conf 認得的鍵。⚠️ 加新鍵時要回來加一筆，不然它會被當成「認不得」印警告（wbf-cli-spec.md §10.4）——
 /// 那是**警告**不是錯誤，所以漏掉只會吵，不會讓命令壞掉。
 const KNOWN_CONF_KEYS: &[&str] = &[
     "SERVER",
@@ -259,7 +259,7 @@ impl Context {
     /// 「兩者都沒給」——conf 接手。⚠️ 這也是那幾個旗標拿掉 clap 預設值的理由：留著預設值
     /// 就永遠不是 `None`，conf 會被一個「使用者根本沒打」的值蓋掉。
     fn from(cli: &Cli) -> Result<Context, CoreError> {
-        // ⚠️ 資料目錄不能從 conf 來：conf 就在它裡面（§10.1）。
+        // ⚠️ 資料目錄不能從 conf 來：conf 就在它裡面（wbf-cli-spec.md §10.1）。
         let data_dir = match &cli.data_dir {
             Some(path) => path.clone(),
             None => default_data_dir()?,
@@ -289,7 +289,7 @@ impl Context {
                 eprintln!("{warning}");
             }
         }
-        // 這次實際生效的值。🚫 不放 token、password、passphrase 的檔案路徑（§10.5）。
+        // 這次實際生效的值。🚫 不放 token、password、passphrase 的檔案路徑（wbf-cli-spec.md §10.5）。
         let effective = vec![
             Entry {
                 section: "general",
@@ -341,7 +341,7 @@ impl Context {
                     .or_else(|| conf.find("PASSPHRASE_FILE").map(PathBuf::from)),
             },
             server_override: server.clone(),
-            // 🚫 token 不從 conf 來（§10.5）：秘密不落地在明文檔裡。
+            // 🚫 token 不從 conf 來（wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
             token_override: cli.token.clone(),
             quiet: cli.quiet,
             transport,
@@ -397,7 +397,7 @@ impl Context {
     ///
     /// 這次命令要對誰、哪台 server、備份開著嗎——core 幾乎每個方法都要這三件事。
     ///
-    /// 📎 `server_backup` 是 conf 的值：**前端的決定**，core 不讀 conf（§3）。
+    /// 📎 `server_backup` 是 conf 的值：**前端的決定**，core 不讀 conf（architecture-v2.md §3）。
     pub fn target(&self) -> wbf_core::Target {
         wbf_core::Target {
             user: self.account_override.clone(),
@@ -641,7 +641,7 @@ fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), Cor
 
 /// `key-backup <action>`（wbf-cli-spec.md §3.6；room-key-backup.md）。
 ///
-/// ⚠️ conf 的兩個開關在**這一層**判斷：core 被叫到就做，「要不要叫它」是前端的決定（§3）。
+/// ⚠️ conf 的兩個開關在**這一層**判斷：core 被叫到就做，「要不要叫它」是前端的決定（architecture-v2.md §3）。
 async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Result<(), CoreError> {
     let core = context.core()?;
     let target = context.target();
@@ -720,7 +720,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
     }
 }
 
-/// 使用者明說要做的事，被 conf 的開關關掉了（§10.4）。
+/// 使用者明說要做的事，被 conf 的開關關掉了（wbf-cli-spec.md §10.4）。
 ///
 /// ⚠️ 🚫 不靜默跳過：命令是他打的，回一句「好了」卻什麼都沒做，比拒絕更糟。
 /// 訊息要說出**是哪個鍵**關的，不然他得自己翻檔案找。
@@ -736,7 +736,7 @@ fn refuse_switched_off(key: &str, what: &str) -> CoreError {
 
 /// `account destroy <mxid>`：裝置層加資料層。
 ///
-/// rpc-cli 在這裡只做一件事：**問「你確定嗎」**。🚫 core 不做確認（§3）。
+/// rpc-cli 在這裡只做一件事：**問「你確定嗎」**。🚫 core 不做確認（architecture-v2.md §3）。
 async fn destroy_account_command(
     context: &Context,
     user: &str,
@@ -1094,7 +1094,7 @@ mod conf_precedence_tests {
 
     #[test]
     fn the_conf_file_supplies_the_password_file_path_when_the_flag_did_not() {
-        // ⚠️ 進 conf 的是**路徑**不是秘密（§10.5）——秘密是那個檔的內容，它從來不進 conf。
+        // ⚠️ 進 conf 的是**路徑**不是秘密（wbf-cli-spec.md §10.5）——秘密是那個檔的內容，它從來不進 conf。
         let dir = scratch("pwfile");
         std::fs::write(
             dir.join(wbf_core::conf::CONF_FILE_NAME),
@@ -1133,7 +1133,7 @@ PASSWORD_FILE=/tmp/from-conf
         let context = Context::from(&cli_with(&dir)).unwrap();
         assert_eq!(
             context.token_override, None,
-            "🚫 token 不從 conf 來（§10.5）"
+            "🚫 token 不從 conf 來（wbf-cli-spec.md §10.5）"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1153,7 +1153,7 @@ PASSWORD_FILE=/tmp/from-conf
         );
         assert!(written.contains("; flag or env"), "{written}");
         assert!(written.contains("SERVER_BACKUP=on"), "{written}");
-        // 🚫 秘密與「秘密在哪」的路徑都不寫（§10.5）。
+        // 🚫 秘密與「秘密在哪」的路徑都不寫（wbf-cli-spec.md §10.5）。
         assert!(!written.contains("ACCESS_TOKEN") && !written.contains("PASSPHRASE_FILE"));
 
         // 讀回來就是同一組值。

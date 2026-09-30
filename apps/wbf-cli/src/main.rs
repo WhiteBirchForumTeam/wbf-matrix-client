@@ -391,7 +391,7 @@ fn main() -> ExitCode {
 /// wbf-cli-spec.md §4 的 exit code。
 ///
 /// ⚠️ 對的是 **`CoreErrorKind`** 而不是訊息：那正是 core 把錯誤結構化的理由
-/// （PR #24 審查 salvia／rumia）。daemon 那邊同一張表會變成 §4.6 的 `code` 整數。
+/// （PR #24 審查 salvia／rumia）。daemon 那邊同一張表會變成 local-interface.md §6 的 `code` 整數。
 ///
 /// Args:
 ///     error: example: CoreError::new(CoreErrorKind::Integrity, "...")

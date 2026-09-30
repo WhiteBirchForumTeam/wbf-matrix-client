@@ -1,7 +1,7 @@
 //! 媒體儲存池（media-pool.md）：對上層是「開檔、順序 append、讀、刪」的完整明文檔；落地時整個池加密，一把金鑰
 //! （`Vault::media_store_key()`）。
 //!
-//! 落地格式（§8.1 說「池內部怎麼分段是實作細節」，就在這裡定）：
+//! 落地格式（media-pool.md §1 說「池內部怎麼分段是實作細節」，就在這裡定）：
 //!
 //! ```text
 //! 檔頭 32 byte：magic "WBFP"(4) ‖ version u8 = 1 ‖ 保留 3 byte ‖ segment_size u32 LE ‖ nonce_base 16 byte ‖ 保留 4 byte
@@ -11,7 +11,7 @@
 //!
 //! - 順序 append：`PoolWriter` 湊滿一段就封一段；`finish()` 封最後的短段、fsync、回明文的 BLAKE3。
 //! - 續傳：`PoolWriter::resume()` 把最後那個不完整的段解回記憶體、檔截到該段起點，接著寫；BLAKE3 從頭重算（本機讀，便宜）。
-//! - 檔名是明文 hash（§8.2），寫完才知道；寫的時候用呼叫者給的暫存名，`finish()` 回 hash 由呼叫者 rename（`adopt`）。
+//! - 檔名是明文 hash（media-pool.md §2），寫完才知道；寫的時候用呼叫者給的暫存名，`finish()` 回 hash 由呼叫者 rename（`adopt`）。
 //! - 段索引進 nonce 與 AAD：把第 3 段搬到第 5 段解不開；nonce_base 每檔隨機：同內容的兩個暫存檔密文不同（去重靠 hash，不靠密文）。
 //! - 暫定段（`sync()` 寫在檔尾、之後會被截掉重封）用段號最高位設 1 的 nonce：同段號的暫定段與正式段是兩個 nonce，每個 nonce 只封一次。
 //!
@@ -28,7 +28,7 @@ use crate::error::SdkError;
 use crate::vault::Key32;
 
 pub const POOL_DIR_NAME: &str = "media";
-/// 下載中的暫存檔放這裡（§8.2：暫存名用 `media.id`）。
+/// 下載中的暫存檔放這裡（media-pool.md §2：暫存名用 `media.id`）。
 pub const PENDING_DIR_NAME: &str = "pending";
 
 const MAGIC: &[u8; 4] = b"WBFP";
@@ -114,7 +114,7 @@ impl MediaPool {
         })
     }
 
-    /// 接著寫一個暫存檔：明文只信任到 `trusted_plain_len`（§8.3 的「截到 chunks_written × chunk_size」），之後的丟掉。
+    /// 接著寫一個暫存檔：明文只信任到 `trusted_plain_len`（media-pool.md §3 的「截到 chunks_written × chunk_size」），之後的丟掉。
     ///
     /// Args:
     ///     trusted_plain_len: example: 20 * 65536
@@ -182,7 +182,7 @@ impl MediaPool {
         })
     }
 
-    /// 暫存檔寫完了：搬到 `media/<hh>/<hash>`。已經有同 hash 的檔（別的 mxc 同內容）就丟掉暫存檔、用既有的（去重，§8.2）。
+    /// 暫存檔寫完了：搬到 `media/<hh>/<hash>`。已經有同 hash 的檔（別的 mxc 同內容）就丟掉暫存檔、用既有的（去重，media-pool.md §2）。
     ///
     /// Return:
     ///     Ok(bool)   true = 這次搬進去的；false = 池裡本來就有

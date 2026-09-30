@@ -30,7 +30,7 @@ pub struct LoginResult {
 impl Core {
     /// 建這個資料目錄的 `local.key`。
     ///
-    /// ⚠️ 「要不要設 passphrase」是**前端的決定**（§3），所以它在這裡就是一個參數：
+    /// ⚠️ 「要不要設 passphrase」是**前端的決定**（architecture-v2.md §3），所以它在這裡就是一個參數：
     /// 給 `Some(bytes)` 就是 passphrase 模式，`None` 就是 plain。🚫 core 不問、不猜。
     ///
     /// Return:
@@ -104,7 +104,7 @@ impl Core {
         // account-session.md §3：先探活（不帶 token），再決定走哪一邊。探不到當一般 Matrix（探活自己的規矩：只算這一次）。
         let speaks_wbf = self.get_backend_kind_of_server(server).await == BackendKind::WbfSdk;
         let session = if speaks_wbf {
-            // wbf：標準 HTTP `/login`（自己包的那支），🚫 不建 Client。之後房間、訊息、媒體、金鑰全走 WS（§2）。
+            // wbf：標準 HTTP `/login`（自己包的那支），🚫 不建 Client。之後房間、訊息、媒體、金鑰全走 WS（account-session.md §2）。
             let mut session =
                 wbf_sdk::login::login_with_password(server, user, password, device_name).await?;
             session.backend = Some(SessionBackend::WbfSdk);

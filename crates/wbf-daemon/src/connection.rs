@@ -109,7 +109,7 @@ impl Connection {
             ));
         }
         self.last_inbound = pack_type;
-        // 解得開但不是 JSON → 協議層（§1.4 的 BAD_FRAME）：這條連線的封裝壞了。
+        // 解得開但不是 JSON → 協議層（rpc-spec.md §1.4 的 BAD_FRAME）：這條連線的封裝壞了。
         let value: Value = match serde_json::from_slice(&json_bytes) {
             Ok(value) => value,
             Err(error) => {

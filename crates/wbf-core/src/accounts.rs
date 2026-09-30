@@ -5,7 +5,7 @@
 //!   local.key                          一台機器一把主金鑰（vault）
 //!   current                             目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"
 //!   r/<b58>_<b58>                       recovery key（recovery.rs）；🚫 logout 不碰
-//!   s/<b58>_<b58>/                      正規化過的 server host，加密（§11.2）
+//!   s/<b58>_<b58>/                      正規化過的 server host，加密（vault-and-keys.md §2.2）
 //!     cache.db                          這個 server 上所有帳號共用的快取
 //!     a/<b58>_<b58>/                    localpart，加密
 //!       session.sealed                  這個帳號的 session（第三把子金鑰封住）
@@ -66,7 +66,7 @@ impl AccountDir {
     ///     user: mxid 或 localpart, example: "@alice:localhost"
     /// Return:
     ///     Ok(AccountDir)
-    ///     Err(Usage)   localpart 是空的、或加密後的名字太長（§11.4）
+    ///     Err(Usage)   localpart 是空的、或加密後的名字太長（vault-and-keys.md §2.4）
     pub fn locate(
         data_dir: &Path,
         key: &Key32,
@@ -219,7 +219,7 @@ pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap
                 continue;
             };
             map.add_server(server_host.clone(), server_dir_name);
-            // localpart 的密文綁著它上面那層的 host 明文（§11.2），所以 scope 要帶進去。
+            // localpart 的密文綁著它上面那層的 host 明文（vault-and-keys.md §2.2），所以 scope 要帶進去。
             let scope = DirScope::Account {
                 server_host: &server_host,
             };
@@ -580,12 +580,12 @@ pub fn find_account_of_current(data_dir: &Path, key: &Key32, current: &str) -> O
 
 /// `http://localhost:6167` → `localhost:6167`；`https://matrix.example.org` → `matrix.example.org`（預設 port 不帶）。
 ///
-/// ⚠️ 這是**加密的輸入**（§11.3），不是檔名了：所以要正規化到底（小寫），
+/// ⚠️ 這是**加密的輸入**（vault-and-keys.md §2.3），不是檔名了：所以要正規化到底（小寫），
 /// 🚫 不再過濾 `[A-Za-z0-9._-]` —— 那是為了當檔名才做的，留著只會讓不同的 host 撞成同一個目錄。
 pub fn server_host_of(server: &str) -> String {
     // scheme 先小寫再比：`HTTPS://x:443` 與 `https://x:443` 必須算同一台，
     // 不然 443 只在其中一邊被當成預設 port 拿掉，同一個 server 長出兩個目錄
-    // （PR #19 審查 rumia🟢／salvia🟡4；正是 §11.3 要根除的形狀）。
+    // （PR #19 審查 rumia🟢／salvia🟡4；正是 vault-and-keys.md §2.3 要根除的形狀）。
     let lowered = server.to_lowercase();
     let without_scheme = lowered
         .trim_end_matches('/')
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn server_host_is_lowercased_so_one_server_gets_one_directory() {
-        // 加密是逐 byte 的：漏了這一步，同一台 server 打成大寫就會長出第二個目錄（§11.3）。
+        // 加密是逐 byte 的：漏了這一步，同一台 server 打成大寫就會長出第二個目錄（vault-and-keys.md §2.3）。
         assert_eq!(
             server_host_of("https://MATRIX.example.ORG"),
             server_host_of("https://matrix.example.org")

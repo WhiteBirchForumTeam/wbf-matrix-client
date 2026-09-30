@@ -46,7 +46,7 @@ impl Core {
     /// Args:
     ///     server_backup: conf 的 `SERVER_BACKUP`（wbf-cli-spec.md §10）, example: true
     ///
-    /// ⚠️ 這個旗標由**呼叫端**帶進來，🚫 core 自己不讀 conf——那是「代前端做決定」（§3）。
+    /// ⚠️ 這個旗標由**呼叫端**帶進來，🚫 core 自己不讀 conf——那是「代前端做決定」（architecture-v2.md §3）。
     pub(crate) async fn backend_of(
         &self,
         account: &AccountDir,
@@ -84,7 +84,7 @@ impl Core {
 
     /// 這個帳號所屬 server 的 `cache.db`（local-cache-db.md §5，同 server 的帳號共用）。
     ///
-    /// server 不符、解不開就重建（§1），重建時發一個 `Progress` 事件說一聲——
+    /// server 不符、解不開就重建（local-cache-db.md §1），重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
         #[cfg(test)]
@@ -291,7 +291,7 @@ pub(crate) fn get_raw_cache_opens_for(server_dir: &std::path::Path) -> usize {
 }
 
 /// wbf 帳號不建 matrix-sdk 的 Client（account-session.md §2），所以還掛在 Client 上的那幾支對它是**關的**——
-/// 講清楚是哪一支、為什麼、去哪看清單（§6），🚫 不靜默失效、不裝成「連不上」。
+/// 講清楚是哪一支、為什麼、去哪看清單（account-session.md §6），🚫 不靜默失效、不裝成「連不上」。
 ///
 /// Args:
 ///     account: 哪個帳號

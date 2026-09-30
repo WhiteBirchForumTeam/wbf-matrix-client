@@ -1,6 +1,6 @@
 //! 對著 `docs/design/wire/wbf-vectors.json`（從 server repo 複製）跑。
 //! 這裡紅 = 這個 crate 與 server 的線上格式漂移了，或複製的向量檔過期了。
-//! 規格書 §11 寫了 client 該驗什麼；每個段落一個測試。
+//! wbfuwunel 的 chunked-upload-spec.md §11 寫了 client 該驗什麼；每個段落一個測試。
 
 use serde::Deserialize;
 use wbf_wire::{crc32c, DecodeError, EncodeError, EncryptedFileInfo, Kind, Pack};
@@ -75,7 +75,7 @@ fn crc32c_vectors() {
             vector.input_hex
         );
     }
-    // 規格 §9 的自檢向量，寫死一份以免向量檔本身被改壞。
+    // wbfuwunel 的 chunked-upload-spec.md §9 的自檢向量，寫死一份以免向量檔本身被改壞。
     assert_eq!(crc32c(b"123456789"), 0xE306_9283);
 }
 

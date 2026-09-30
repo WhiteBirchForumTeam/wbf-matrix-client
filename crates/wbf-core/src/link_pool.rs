@@ -1,6 +1,6 @@
 //! 連線池（link-pool.md）：一個帳號五條線，各司其職；daemon 在解鎖、登入之後把五條都開起來（`link_keeper.rs`），平常要用時發現死了也重開。
 //!
-//! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，§7 的接縫）——
+//! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，link-pool.md §7 的接縫）——
 //! 正式的在 `Core::open_link`（session → `Channel::connect` → `hello`），測試的用記憶體對接。
 //! 池自己🚫 不在背景做事：定時看線、重開是 `link_keeper.rs` 的鉤子（daemon 叫）；🚫 不知道訂閱的內容（那是用線的人的事）。
 
@@ -91,7 +91,7 @@ impl LinkPool {
             .clone()
     }
 
-    /// 拿那條線來用：沒開就開、發現死了就重開，然後把 guard 交出去（一條線一次一個命令，§5）。
+    /// 拿那條線來用：沒開就開、發現死了就重開，然後把 guard 交出去（一條線一次一個命令，link-pool.md §5）。
     ///
     /// Args:
     ///     role: example: LinkRole::Misc

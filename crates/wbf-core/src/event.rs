@@ -5,7 +5,7 @@
 //! 給你」這種東西，channel 有。
 //!
 //! 🚫 core **不印任何東西**。`eprintln!` 對 rpc-cli 是對的，對 daemon 是把訊息丟進虛空
-//! （沒有人在看那個 stderr），對 Android 更是。誰要顯示、顯示成什麼樣，是前端的事（§3）。
+//! （沒有人在看那個 stderr），對 Android 更是。誰要顯示、顯示成什麼樣，是前端的事（architecture-v2.md §3）。
 
 use tokio::sync::broadcast;
 
@@ -17,7 +17,7 @@ const EVENT_QUEUE: usize = 256;
 /// core 發生的事。
 ///
 /// ⚠️ 每個 variant 的欄位都要是**可序列化的簡單型別**：它們會變成 RPC 的推播訊息
-/// （§4.6 的「沒有 `id` 的請求」）。🚫 不要在這裡放 handle、路徑以外的 `PathBuf`、
+/// （local-interface.md §6 的「沒有 `id` 的請求」）。🚫 不要在這裡放 handle、路徑以外的 `PathBuf`、
 /// 或任何帶秘密的東西。
 ///
 /// 📎 有 `Serialize`／`Deserialize`：daemon 那層要把它原樣送過 RPC，而**現在**補比
@@ -137,11 +137,11 @@ pub enum SyncState {
 
 /// core 內部拿來發事件的那一端。
 ///
-/// 🚫 **crate 內部限定**：`progress` 收 `impl Into<String>`，而 §7 明文說公開介面上
+/// 🚫 **crate 內部限定**：`progress` 收 `impl Into<String>`，而 architecture-v2.md §6 明文說公開介面上
 /// 不要有 `impl Trait`。前端要聽事件走 [`Core::subscribe`]，拿到的是 receiver
 /// ——那個形狀跨得過 RPC 與 uniffi（PR #24 審查 rumia🟡1／salvia🟡1）。
 ///
-/// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（§4.7「允許多條連線，每條都平等」），
+/// 📎 `broadcast` 而不是 `mpsc`：允許多條連線各自訂閱（local-interface.md §7「允許多條連線，每條都平等」），
 /// 而且**沒有訂閱者時發送是零成本的**——rpc-cli 在 `--quiet` 下就是這種情況。
 #[derive(Clone)]
 pub(crate) struct EventSink {

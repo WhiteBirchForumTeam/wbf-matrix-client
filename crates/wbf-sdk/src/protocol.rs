@@ -220,22 +220,22 @@ pub const BRIDGE_KEYS_UPLOAD: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Keys,
     subtype: 0x20,
 };
-/// `POST /_matrix/client/v3/keys/query`（§0x21）。
+/// `POST /_matrix/client/v3/keys/query`（bridge-specs `0x17-keys.md` §0x21）。
 pub const BRIDGE_KEYS_QUERY: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Keys,
     subtype: 0x21,
 };
-/// `POST /_matrix/client/v3/keys/claim`（§0x22）。⚠️ claim 走的那把就從對方的庫存消失。
+/// `POST /_matrix/client/v3/keys/claim`（bridge-specs `0x17-keys.md` §0x22）。⚠️ claim 走的那把就從對方的庫存消失。
 pub const BRIDGE_KEYS_CLAIM: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Keys,
     subtype: 0x22,
 };
-/// `POST /_matrix/client/v3/keys/device_signing/upload`（§0x24）。換掉既有的交叉簽章金鑰要 UIAA（index.md §1.5），第一次上傳不用。
+/// `POST /_matrix/client/v3/keys/device_signing/upload`（bridge-specs `0x17-keys.md` §0x24）。換掉既有的交叉簽章金鑰要 UIAA（index.md §1.5），第一次上傳不用。
 pub const BRIDGE_SIGNING_KEYS_UPLOAD: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Keys,
     subtype: 0x24,
 };
-/// `POST /_matrix/client/v3/keys/signatures/upload`（§0x25）。
+/// `POST /_matrix/client/v3/keys/signatures/upload`（bridge-specs `0x17-keys.md` §0x25）。
 pub const BRIDGE_SIGNATURES_UPLOAD: BridgedEndpoint = BridgedEndpoint {
     kind: Kind::Keys,
     subtype: 0x25,
@@ -711,7 +711,7 @@ pub fn event_seqs(event: &serde_json::Value) -> (Option<i64>, Option<i64>) {
 }
 
 /// `Event/Send` 的請求 meta（wbfuwunel 的 media-attachments.md §3、wbfuwunel `wbf-room-device-version.md` §7）。
-/// `attachments` 是這則訊息用到的 mxc，server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（spec §12）。
+/// `attachments` 是這則訊息用到的 mxc，server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（wbfuwunel 的 chunked-upload-spec.md §12）。
 /// 鍵序就是線上的 JSON 序（向量逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SendRequest {
@@ -970,7 +970,7 @@ fn gap_when_missing() -> bool {
 
 // ---- Device（kind 0x16）：to-device 佇列的原生 pack（wbfuwunel `wbf-to-device.md` §3；client 端的解讀在 to-device-client.md）----
 //
-// 跟 `Event` 那組刻意不同的三處（server §3.1）：**順序舊→新**；`ot`／`nt` 不是 `fs`／`ls`（兩邊方向相反，🚫 不混用）；
+// 跟 `Event` 那組刻意不同的三處（wbfuwunel 的 wbf-to-device.md §3.1）：**順序舊→新**；`ot`／`nt` 不是 `fs`／`ls`（兩邊方向相反，🚫 不混用）；
 // 每則的 count 不在事件裡，在 meta 的 `counts`（跟 data 一一對應）。
 // 📎 訂閱（`Subscribe`／`Push`／`CryptoState`）要能收非回應的 pack，通道還沒有那個能力（daemon-runtime 第 4 階段）；
 // 這裡先只有 `Fetch`／`Batch`／`ItemsDestroy`／`ItemsDestroyed` 這條「拉」的路，`Subscribe` 只有編碼。
@@ -1146,7 +1146,7 @@ pub fn device_items_destroy(counts: &[u64], id: u64, seq: u32) -> Pack {
     }
 }
 
-/// `Device/Batch` 的 meta（server §3）。
+/// `Device/Batch` 的 meta（wbfuwunel 的 wbf-to-device.md §3）。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct DeviceBatchMeta {
     /// 這一窗總共幾則（≤ limit）。

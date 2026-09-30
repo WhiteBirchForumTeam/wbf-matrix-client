@@ -221,7 +221,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
     // daemon 重開（真正的「鎖上」就是這條，rpc-spec.md §3.1）。
     // ⚠️ **先停掉第一個**：`daemon.shutdown` → 關連線 → 等它收攤 → 確認舊 port 不收連線了。
-    // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 §0.2 禁止的，而且那樣
+    // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 architecture-v2.md §0.2 禁止的，而且那樣
     // 就算 shutdown 壞掉這條測試也會綠（PR #31 審查 cirno🔴）。
     stop_daemon(daemon, client).await;
     let daemon = start_daemon(dir.path()).await;

@@ -31,7 +31,7 @@ matrix-sdk = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk", default-
 # E2EE 的狀態機（`OlmMachine`）：只當加解密的引用，網路自己走 WS（e2ee-walkthrough.md §13）。跟 matrix-sdk 同一棵 vendor 樹，版本一定一致。
 matrix-sdk-crypto = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk-crypto", optional = true }
 futures-core = { version = "0.3", optional = true }
-# cache.db（local-cache-db.md §3）：SQLCipher，raw key 由 vault 導出。Windows 編 OpenSSL 要 Strawberry Perl（§3 的建置需求）。
+# cache.db（local-cache-db.md §3）：SQLCipher，raw key 由 vault 導出。Windows 編 OpenSSL 要 Strawberry Perl（local-cache-db.md §3 的建置需求）。
 rusqlite = { version = "0.40", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "limits", "cache"], optional = true }
 
 [features]

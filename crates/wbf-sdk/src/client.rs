@@ -988,7 +988,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(summary)
     }
 
-    /// `Event/Send`：送事件並宣告附件（wbfuwunel 的 media-attachments.md §3、spec §12）。
+    /// `Event/Send`：送事件並宣告附件（wbfuwunel 的 media-attachments.md §3、wbfuwunel 的 chunked-upload-spec.md §12）。
     /// ⚠️ server 端還是提案（2026-09-06），`Hello.features` 有 `attachments` 才能用；沒有就走 HTTP 加 `X-Wbf-Attachments`。
     ///
     /// Args:

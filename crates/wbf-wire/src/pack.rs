@@ -1,4 +1,4 @@
-//! pack：固定 32 byte 外框 + meta + data，兩段各一個 CRC-32C（規格 §2）。
+//! pack：固定 32 byte 外框 + meta + data，兩段各一個 CRC-32C（wbfuwunel 的 chunked-upload-spec.md §2）。
 //!
 //! 版面（所有整數 big-endian）：
 //! ```text

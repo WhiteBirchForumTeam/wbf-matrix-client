@@ -71,7 +71,7 @@ pub fn conversation_from_state(
         .collect();
     let member_count = joined.len() as u64;
 
-    // chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；§3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
+    // chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；chat-model.md §3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
     let (kind, direct_peer) = if !direct_peers.is_empty() && member_count == 2 {
         (ConversationKind::Direct, direct_peers.first().cloned())
     } else if needed_to_send >= 100 {
