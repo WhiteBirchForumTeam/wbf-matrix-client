@@ -813,6 +813,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 🚨 一般開庫那條路也一樣（PR #66 審查 cirno 🟡1）：同一台 server 的第二個帳號用別的拼法（沒有 scheme）第一次開庫，
+    /// 🚫 不准把第一個帳號寫下的那份當成別台 server 的整份重建；唯一寫入者與繞過它的連線（`cache_of`）都照庫記的身分開。
+    #[tokio::test]
+    async fn opening_the_cache_with_another_spelling_of_the_same_server_keeps_it() {
+        let (dir, core) = scratch_unlocked("open-spelled-differently");
+        let alice = account_of(&core, &dir, "@alice:localhost");
+        let bob = account_of(&core, &dir, "@bob:localhost");
+        let server_dir = alice.server_dir();
+        seed_events(&core, &alice, "@alice:localhost", "$a");
+        core.close_server_cache(&server_dir).unwrap();
+
+        let raw = core.cache_of(&bob, "localhost:6167").unwrap();
+        assert_eq!(raw.history("@alice:localhost", "!r", None, 10).unwrap().len(), 1, "cache_of 不准重建");
+        drop(raw);
+        let alice_view = core
+            .server_cache_of(&bob, "LOCALHOST:6167")
+            .unwrap()
+            .read()
+            .await
+            .history("@alice:localhost", "!r", None, 10)
+            .unwrap();
+        assert_eq!(alice_view.len(), 1, "🚨 唯一寫入者也不准重建：alice 的快取要留著");
+        drop(alice_view);
+        core.close_server_cache(&server_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 既有的庫記的 host 跟要處理的 server 不同：拒絕，🚫 不重建、🚫 不動它（fail closed）。
     #[tokio::test]
     async fn processing_an_existing_cache_of_another_host_is_refused_and_leaves_it_alone() {

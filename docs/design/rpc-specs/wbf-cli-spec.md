@@ -39,6 +39,7 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 ### 3.1 帳號：`account` 一族（維護者 2026-09-09 定）
 
 **多帳號是前提，不是附加功能**（維護者 2026-09-09）：CLI 與 UI 都要能同時登入多個帳號，甚至同時跑起來。
+📌 現況（過渡）：`wbf-cli` 還不走 RPC，所以它跟 daemon 🚫 不能同時對同一個資料目錄跑——它先拿 `daemon.lock`，daemon 在跑就整個拒絕，兩個 `wbf-cli` 也不能並發（/docs/design/overview/architecture-v2.md §0.2）。改走 RPC 之後才能跟 daemon 同時用。
 所以帳號目錄一帳號一套（§7），`m/`（matrix-sdk 的 store，裝置狀態）也一帳號一套 —— 這正是拿帳號當那個 store 分界的理由。
 `current` 只回答一個問題：**沒帶 `--account` 時用誰**。
 

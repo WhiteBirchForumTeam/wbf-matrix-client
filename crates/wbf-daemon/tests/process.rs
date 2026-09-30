@@ -273,7 +273,7 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
     assert!(!second.status.success(), "第二個不該起得來");
     let complaint = String::from_utf8_lossy(&second.stderr);
     assert!(
-        complaint.contains("another daemon is already using this data directory"),
+        complaint.contains("is already using this data directory"),
         "{complaint}"
     );
     assert!(second.stdout.is_empty(), "起不來就🚫 不該印 ready");

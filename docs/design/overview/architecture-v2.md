@@ -45,8 +45,8 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 ⭐ 這條寫進型別裡（`StartMode`，`crates/wbf-daemon/src/main.rs`），🚫 不散在各處 `if cli.serve`：兩種起法的差別
 **不只是要不要開 port**，還包括要不要拿寫權、要不要寫 `daemon.json`、要不要宣告 ready。
 
-**資料目錄的獨佔：OS 鎖＋寫權**（維護者 2026-09-13）。daemon 對 `<data dir>/daemon.lock` 拿一把 OS 層的鎖
-（`crates/wbf-daemon/src/lock.rs`，`std::fs::File::try_lock`／`try_lock_shared`），**拿不到就不做**，
+**資料目錄的獨佔：OS 鎖＋寫權**（維護者 2026-09-13）。要寫資料目錄的程序（daemon、`apps/wbf-cli`）對 `<data dir>/daemon.lock` 拿一把 OS 層的鎖
+（`crates/wbf-core/src/data_dir_lock.rs`，兩邊共用這一份；`std::fs::File::try_lock`／`try_lock_shared`），**拿不到就不做**，
 而且這一步排在碰那個目錄任何東西之前（尤其是刪舊的 `daemon.json`）。
 
 | 誰 | 拿哪一種 | 效果 |
@@ -87,8 +87,9 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 - ⚠️ 鎖是**勸告式**的：只擋有來問的程序，🚫 擋不住直接開 `cache.db` 亂寫的程式。
 - 🚨 **資料目錄綁定 daemon，前端只能發 RPC 請 daemon 改**（維護者 2026-09-30）：「不拿 `daemon.lock` 卻寫資料是非法侵占。」
   任何前端（UI、rpc-cli）🚫 不越過 daemon 直接碰資料目錄。
-  ❌ 現況違反這條：`apps/wbf-cli` 直接叫 core、不拿這把鎖，可以跟 `daemon -s` 同時寫同一個目錄。
-  要改成走 RPC（它就是 rpc-cli 的前身，§6）；改完之前的過渡，至少讓它先拿 `daemon.lock` 的排他鎖、拿不到就拒絕。
+  現況：`apps/wbf-cli` 還是直接叫 core，但碰資料目錄任何東西之前先拿 `daemon.lock` 的排他鎖、拿不到就拒絕（`commands.rs` 的 `lock_data_dir`）：
+  daemon 跑著時它整個被拒（連唯讀的命令也是），兩個 `wbf-cli` 也不能同時跑。
+  還沒做：改成走 RPC（它就是 rpc-cli 的前身，§6），到時候才能跟 daemon 同時用。
 - ⭐ 用 OS 的鎖而不是「寫 pid 進檔案再檢查它活著嗎」：後者必然有 race，而且 `kill -9` 之後
   會留下擋住下一次的殘留鎖；OS 的鎖由核心在程序結束時自動放手。
 

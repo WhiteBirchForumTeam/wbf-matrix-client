@@ -84,7 +84,8 @@ impl Core {
 
     /// 這個帳號所屬 server 的 `cache.db`（/docs/design/storage/local-cache-db.md §5，同 server 的帳號共用）。
     ///
-    /// server 不符、解不開就重建（/docs/design/storage/local-cache-db.md §1），重建時發一個 `Progress` 事件說一聲——
+    /// 解不開、舊 schema 就重建（/docs/design/storage/local-cache-db.md §1）；既有的庫照它自己記的 server 開，host 不同就拒絕、🚫 不重建
+    /// （[`Core::find_recorded_cache_identity`]）。重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
         #[cfg(test)]
@@ -95,9 +96,11 @@ impl Core {
                 .entry(account.server_dir())
                 .or_insert(0) += 1;
         }
-        let identity = CacheIdentity {
-            server: server.to_string(),
-        };
+        let identity = self
+            .find_recorded_cache_identity(&account.server_dir(), server)?
+            .unwrap_or_else(|| CacheIdentity {
+                server: server.to_string(),
+            });
         let (cache, outcome) =
             Cache::open(&account.server_dir(), &self.vault()?.cache_key(), &identity)?;
         match outcome {
@@ -170,6 +173,42 @@ impl Core {
         self.open_server_cache(account, server, OpenWhen::FileExists)
     }
 
+    /// 開 `cache.db` 用哪個身分：**既有的庫照它自己 `meta` 記的**，🚫 不拿呼叫端的字串逐字比對。
+    /// 三條開庫的路（[`Core::cache_of`]、`OpenWhen::Always`、`OpenWhen::FileExists`）都在這裡決定，只有這一處。
+    ///
+    /// ⚠️ 為什麼：`session.server` 只去掉結尾的 `/`，scheme、大小寫照存；同一台 server 的兩個帳號拼法不同
+    /// （`http://localhost:6167` 與 `localhost:6167`）時，目錄照正規化的 host 是同一個，
+    /// 但逐字比對會把那份庫當成別台 server 的、整份刪掉重建——另一個帳號的快取與只存在本機的已讀、隱藏標記一起沒了
+    /// （PR #66 審查 cirno 🟡1；destroy 那條是同一個形狀）。
+    ///
+    /// Args:
+    ///     dir: `<data dir>/s/<加密的 server 名>`
+    ///     server: 呼叫端手上的 server 字串, example: "localhost:6167"
+    /// Return:
+    ///     Ok(Some(CacheIdentity))  有可用的庫（檔在、解得開、schema 對），而且 host 跟 `server` 同一台
+    ///     Ok(None)                 沒有可用的庫（沒檔、解不開、舊 schema）：要開的話照 `server` 建或重建
+    ///     Err(Usage)               庫記的 host 跟 `server` 不同：拒絕，🚫 不重建（fail closed）
+    fn find_recorded_cache_identity(
+        &self,
+        dir: &std::path::Path,
+        server: &str,
+    ) -> Result<Option<CacheIdentity>, CoreError> {
+        let Some(recorded) = Cache::read_identity(dir, &self.vault()?.cache_key())? else {
+            return Ok(None);
+        };
+        if crate::accounts::server_host_of(&recorded.server) != crate::accounts::server_host_of(server) {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                format!(
+                    "the cache in {} belongs to {}, not {server}; it was left untouched",
+                    dir.display(),
+                    recorded.server
+                ),
+            ));
+        }
+        Ok(Some(recorded))
+    }
+
     fn open_server_cache(
         &self,
         account: &AccountDir,
@@ -184,28 +223,13 @@ impl Core {
         if let Some(existing) = registry.get(&dir) {
             return Ok(Some(existing.clone()));
         }
-        let identity = match when {
-            OpenWhen::Always => CacheIdentity {
+        let identity = match (self.find_recorded_cache_identity(&dir, server)?, when) {
+            (Some(recorded), _) => recorded,
+            // 只是要處理既有資料，而沒有可用的庫：🚫 不為了它建一個空的。
+            (None, OpenWhen::FileExists) => return Ok(None),
+            (None, OpenWhen::Always) => CacheIdentity {
                 server: server.to_string(),
             },
-            OpenWhen::FileExists => {
-                let Some(recorded) = Cache::read_identity(&dir, &self.vault()?.cache_key())? else {
-                    return Ok(None);
-                };
-                if crate::accounts::server_host_of(&recorded.server)
-                    != crate::accounts::server_host_of(server)
-                {
-                    return Err(CoreError::new(
-                        CoreErrorKind::Usage,
-                        format!(
-                            "the cache in {} belongs to {}, not {server}; it was left untouched",
-                            dir.display(),
-                            recorded.server
-                        ),
-                    ));
-                }
-                recorded
-            }
         };
         let (cache, outcome) = crate::server_cache::ServerCache::open(
             &dir,

@@ -153,7 +153,7 @@ hash 前 96 bit 相同——生日界是 2^48 個明文，而這裡的明文是�
 #### 2.4.1 ⚠️ 真正咬人的不是單段長度，是**整條路徑**（2026-09-09 實測）
 
 Windows 的 `MAX_PATH` 是 **260**，而加密把兩段目錄名從 19 字元（`localhost_6167` ＋ `alice`）
-撐到 106。實測 `matrix-sdk-event-cache.sqlite3`（`m/` 裡最長的檔名）的完整路徑：
+撐到 106。當時實測 `matrix-sdk-event-cache.sqlite3` 的完整路徑（那時 `m/` 裡最長的檔名；現在 `m/` 只開 state 與 crypto，最長是 `matrix-sdk-crypto.sqlite3-wal`，29 字元，比下表短）：
 
 | | 加密名字合計 | 最長路徑（data dir 39 字元） |
 |---|---|---|

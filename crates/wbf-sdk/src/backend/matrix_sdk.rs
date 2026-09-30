@@ -583,8 +583,8 @@ fn store_open_error(store_dir: &Path, error: &dyn std::fmt::Display) -> SdkError
     let path = store_dir.display().to_string();
     // ⚠️ 路徑太長時 sqlite 也回「開不了」，2026-09-09 實測被誤報成「金鑰不對」，
     // 害人去刪一個其實沒問題的目錄。Windows 的 MAX_PATH 是 260，
-    // 我們開的 store 檔名最長是 matrix-sdk-crypto.sqlite3（25 字元）。
-    if cfg!(windows) && path.chars().count() + 26 > 250 {
+    // 我們開的 store 最長的檔名是 WAL 檔 matrix-sdk-crypto.sqlite3-wal（29 字元，加一個分隔符 30）。
+    if cfg!(windows) && path.chars().count() + 30 > 250 {
         SdkError::Usage(format!(
             "cannot open the matrix store at {path}: the path is {} characters and Windows \
              refuses paths over 260 - move the data dir somewhere shorter (--data-dir)",

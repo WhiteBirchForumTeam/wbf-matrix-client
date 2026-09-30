@@ -222,8 +222,9 @@ fn lock_data_dir(data_dir: &std::path::Path) -> Result<wbf_core::data_dir_lock::
         LockError::HeldByAnother(_) => CoreError::new(
             CoreErrorKind::Usage,
             format!(
-                "a daemon is running on {} and owns it; this command would write the data directory behind its back - \
-                 send it to the daemon over RPC instead, or stop the daemon first",
+                "another program (a running daemon, or another wbf-cli command) holds {}; \
+                 this wbf-cli cannot talk to the daemon over RPC yet, so it refuses rather than write behind its back - \
+                 stop the daemon (or wait for the other command) first",
                 data_dir.display()
             ),
         ),
@@ -1070,7 +1071,7 @@ mod conf_precedence_tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, CoreErrorKind::Usage);
-        assert!(error.message.contains("over RPC"), "{}", error.message);
+        assert!(error.message.contains("stop the daemon"), "{}", error.message);
         drop(daemon);
         assert!(Context::from(&cli_with(&dir)).is_ok(), "daemon 放手之後照常");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1108,6 +1109,8 @@ mod conf_precedence_tests {
         assert!(!context.server_backup);
         // 🚫 沒寫的鍵落到安全值，不是落到 false。
         assert!(context.local_room_keys);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1129,6 +1132,8 @@ mod conf_precedence_tests {
         );
         // conf 說 http、旗標說 ws → 旗標贏。
         assert_eq!(context.transport, Transport::WebSocket);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1140,6 +1145,8 @@ mod conf_precedence_tests {
         assert_eq!(context.transport, Transport::WebSocket);
         // 兩個開關的安全值都是「開著」。
         assert!(context.server_backup && context.local_room_keys);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1176,9 +1183,14 @@ PASSWORD_FILE=/tmp/from-conf
             Some(std::path::PathBuf::from("/tmp/from-flag"))
         );
         // 兩邊都沒有就是 None（呼叫端會去問終端）。
-        let empty = Context::from(&cli_with(&scratch("pwfile-empty"))).unwrap();
+        let empty_dir = scratch("pwfile-empty");
+        let empty = Context::from(&cli_with(&empty_dir)).unwrap();
         assert_eq!(find_password_file(&login_args(None), &empty.conf), None);
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
+        drop(empty);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
     }
 
     #[test]
@@ -1194,6 +1206,8 @@ PASSWORD_FILE=/tmp/from-conf
             context.token_override, None,
             "🚫 token 不從 conf 來（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）"
         );
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1222,6 +1236,8 @@ PASSWORD_FILE=/tmp/from-conf
             again.server_override.as_deref(),
             Some("http://from-flag:6167")
         );
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(again);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1237,6 +1253,8 @@ PASSWORD_FILE=/tmp/from-conf
             std::fs::read_to_string(&path).unwrap(),
             "[general]\nSERVER=http://mine:6167\n"
         );
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1250,6 +1268,8 @@ PASSWORD_FILE=/tmp/from-conf
         context.data_dir_was_given = false;
         context.write_conf_if_asked_for().unwrap();
         assert!(!dir.join(wbf_core::conf::CONF_FILE_NAME).exists());
+        // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
+        drop(context);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

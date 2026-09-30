@@ -73,7 +73,7 @@ impl std::fmt::Display for LockError {
         match self {
             LockError::HeldByAnother(path) => write!(
                 formatter,
-                "another daemon is already using this data directory (lock: {}); \
+                "another program (a daemon, or a wbf-cli command) is already using this data directory (lock: {}); \
                  stop it first, or use a different --data-dir",
                 path.display()
             ),
