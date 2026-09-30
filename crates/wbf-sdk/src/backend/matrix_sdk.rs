@@ -24,7 +24,9 @@ use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
 use matrix_sdk::ruma::events::MessageLikeEventType;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
-use matrix_sdk::SqliteStoreConfig;
+use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
+use matrix_sdk::store::StoreConfig;
+use matrix_sdk::{SqliteCryptoStore, SqliteStateStore, SqliteStoreConfig};
 use matrix_sdk::{Client, Room, SessionMeta};
 
 use crate::chat::{
@@ -544,38 +546,56 @@ async fn build_client(
     server_backup: bool,
 ) -> Result<Client, SdkError> {
     std::fs::create_dir_all(store_dir)?;
-    // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
     // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（/docs/design/storage/local-cache-db.md §4.3）。
-    let store_config = SqliteStoreConfig::new(store_dir).key(Some(store_key.as_bytes()));
+    let sqlite_config = SqliteStoreConfig::new(store_dir).key(Some(store_key.as_bytes()));
+    // 🚫 不用 `sqlite_store_with_config_and_cache_path`：它四個 store 都開成 sqlite 檔。
+    // 我們只要 state（sync 位置、房間狀態）與 crypto（金鑰）落地；event cache 與 media 留在 `StoreConfig` 預設的記憶體版——
+    // 聊天紀錄的權威是 cache.db、媒體在我們自己的池（維護者 2026-09-30，/docs/design/storage/local-cache-db.md §4.1）。
+    let state_store = SqliteStateStore::open_with_config(&sqlite_config)
+        .await
+        .map_err(|error| store_open_error(store_dir, &error))?;
+    let crypto_store = SqliteCryptoStore::open_with_config(&sqlite_config)
+        .await
+        .map_err(|error| store_open_error(store_dir, &error))?;
+    // 跨程序鎖的持有者名照上游 builder 的預設（"main"）。
+    let stores = StoreConfig::new(CrossProcessLockConfig::multi_process("main"))
+        .state_store(state_store)
+        .crypto_store(crypto_store);
     Client::builder()
         .homeserver_url(server)
+        // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
         .request_config(RequestConfig::new().timeout(crate::channel::REQUEST_TIMEOUT))
         .with_encryption_settings(backup_encryption_settings(server_backup))
-        .sqlite_store_with_config_and_cache_path(store_config, None::<&Path>)
+        .store_config(stores)
         .build()
         .await
-        .map_err(|error| match error {
-            // 開不了 store 通常是兩個原因之一，而它們的處置完全不同——所以先分辨再報。
-            matrix_sdk::ClientBuildError::SqliteStore(error) => {
-                let path = store_dir.display().to_string();
-                // ⚠️ 路徑太長時 sqlite 也回「開不了」，2026-09-09 實測被誤報成「金鑰不對」，
-                // 害人去刪一個其實沒問題的目錄。Windows 的 MAX_PATH 是 260，
-                // 上游的 store 檔名最長是 matrix-sdk-event-cache.sqlite3（30 字元）。
-                if cfg!(windows) && path.chars().count() + 31 > 250 {
-                    SdkError::Usage(format!(
-                        "cannot open the matrix store at {path}: the path is {} characters and Windows \
-                         refuses paths over 260 - move the data dir somewhere shorter (--data-dir)",
-                        path.chars().count()
-                    ))
-                } else {
-                    // store 是上游自己的狀態（裝置、sync、它的快取），聊天紀錄的權威在 cache.db：刪掉重新 login 就好；不做遷移（/docs/design/storage/local-cache-db.md §1）。
-                    SdkError::Usage(format!(
-                        "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
-                    ))
-                }
-            }
-            other => SdkError::Network(format!("matrix client: {other}")),
-        })
+        .map_err(|error| SdkError::Network(format!("matrix client: {error}")))
+}
+
+/// 開不了 matrix store 的錯：通常是兩個原因之一，而它們的處置完全不同——所以先分辨再報。
+///
+/// Args:
+///     store_dir: example: "<data dir>/s/…/a/…/m"
+///     error: 上游的 `OpenStoreError`
+/// Return:
+///     SdkError::Usage   路徑太長（Windows）、或金鑰對不上（叫人刪目錄重新 login）
+fn store_open_error(store_dir: &Path, error: &dyn std::fmt::Display) -> SdkError {
+    let path = store_dir.display().to_string();
+    // ⚠️ 路徑太長時 sqlite 也回「開不了」，2026-09-09 實測被誤報成「金鑰不對」，
+    // 害人去刪一個其實沒問題的目錄。Windows 的 MAX_PATH 是 260，
+    // 我們開的 store 檔名最長是 matrix-sdk-crypto.sqlite3（25 字元）。
+    if cfg!(windows) && path.chars().count() + 26 > 250 {
+        SdkError::Usage(format!(
+            "cannot open the matrix store at {path}: the path is {} characters and Windows \
+             refuses paths over 260 - move the data dir somewhere shorter (--data-dir)",
+            path.chars().count()
+        ))
+    } else {
+        // store 是上游自己的狀態（裝置、sync），聊天紀錄的權威在 cache.db：刪掉重新 login 就好；不做遷移（/docs/design/storage/local-cache-db.md §1）。
+        SdkError::Usage(format!(
+            "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
+        ))
+    }
 }
 
 /// matrix-sdk 的錯誤分類到我們的：server 回了 Matrix 的 `errcode`（M_FORBIDDEN…）→ `Server`（code 就是 errcode），其他 → `Network`。
