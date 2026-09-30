@@ -37,7 +37,7 @@ homeserver ──wbf protocol (WS) / Matrix HTTP──> daemon ──encrypted J
 | [`crates/wbf-wire`](crates/wbf-wire) | Wire codec: packs, `EncryptedFileInfo`, CRC-32C. Pure functions, no async | ✅ Done — tested against the server's golden vectors |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | Protocol client: per-chunk AEAD, WebSocket channel, chunked upload / download / seek / resume / streaming, encrypted vault, `cache.db`, media pool, matrix-sdk adapter | 🟢 Working |
 | [`crates/wbf-core`](crates/wbf-core) | Everything a command *does*: accounts, rooms, messages, media, backend probing, the single writer for `cache.db`. No CLI, no RPC | 🟢 Working |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | The daemon binary `wbf-matrix-client-daemon`: RPC server, data-directory locking, token lifecycle | 🟡 RPC methods wired; push, subscriptions, cancel and the media HTTP plane not yet |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | The daemon binary `wbf-matrix-client-daemon`: RPC server, data-directory locking, token lifecycle | 🟢 RPC methods, push subscriptions, per-account upstream links kept open by the daemon, E2EE for text messages. ⏳ Not yet: `cancel`, the media HTTP plane |
 | [`apps/wbf-cli`](apps/wbf-cli) | Command-line frontend `wbf-cli`: login, rooms, send, watch, upload, download, seek, accounts, media cache | 🟢 Working (calls `wbf-core` directly for now) |
 | Desktop / Android / Python | Frontends over RPC | ⏳ Not started |
 
@@ -72,20 +72,21 @@ A few notes:
 
 ## Documentation
 
-Design documents live in [`docs/design`](docs/design). They are written in Traditional Chinese.
+Design documents live in [`docs/design`](docs/design), one folder per topic; start from the index, [`docs/design/index.md`](docs/design/index.md). They are written in Traditional Chinese.
 
-| Document | Covers |
+| Folder | Covers |
 |---|---|
-| [`architecture-v2.md`](docs/design/overview/architecture-v2.md) | Layers: daemon, RPC, frontends; the two planes; tokens and encryption |
-| [`rpc-spec.md`](docs/design/rpc-specs/rpc-spec.md) | Every RPC method, error code, push message, and the media HTTP API |
-| [`daemon-runtime.md`](docs/design/daemon/daemon-runtime.md) | How the running daemon handles many accounts, the single `cache.db` writer, local vs. upstream reads |
-| [`local-cache-db.md`](docs/design/storage/local-cache-db.md) | The encrypted vault, `cache.db` schema, and media pool |
-| [`chat-model.md`](docs/design/rooms/chat-model.md) | Conversations, peers, messages, roles — and how they map onto Matrix |
-| [`wbf-cli-spec.md`](docs/design/rpc-specs/wbf-cli-spec.md) | CLI commands, flags, output, exit codes |
-| [`wbf-client-convention-for-chunk.md`](docs/design/media/wbf-client-convention-for-chunk.md) | Client-to-client conventions for chunk encryption, streaming, and seeking |
-| [`to-device-client.md`](docs/design/keys/to-device-client.md) | Wiring up to-device messages (`0x16 Device`) |
-| [`plan-v1.md`](docs/design/overview/plan-v1.md) | v1 scope, layout, dependencies, milestones |
-| [`handover.md`](docs/handover.md) | Where things stand right now, known gaps, next steps |
+| [`overview/`](docs/design/overview) | Layers (daemon, RPC, frontends) and how loosely we couple to upstream matrix-rust-sdk |
+| [`rpc-specs/`](docs/design/rpc-specs) | What frontends see: every RPC method and push, the local control/data planes, the CLI |
+| [`daemon/`](docs/design/daemon) | The running daemon: many accounts, the single `cache.db` writer, sessions, the per-account link pool |
+| [`rooms/`](docs/design/rooms) | Conversations, peers, messages, roles — and the room subscription link |
+| [`messages/`](docs/design/messages) | Edits and redactions, read markers |
+| [`keys/`](docs/design/keys) | End-to-end encryption: the RPC surface, the key link, to-device, room-key backup |
+| [`storage/`](docs/design/storage) | The encrypted vault and keys, the `cache.db` schema |
+| [`media/`](docs/design/media) | Chunk encryption conventions between clients, the local media pool |
+| [`wire/`](docs/design/wire) | Golden vectors copied from the server |
+
+[`docs/handover.md`](docs/handover.md) says where things stand right now, known gaps, and next steps.
 
 ## Related projects
 
@@ -147,7 +148,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 | [`crates/wbf-wire`](crates/wbf-wire) | 線上協議的 codec：pack、`EncryptedFileInfo`、CRC-32C。純函數、無 async | ✅ 完成 —— 對著 server 的黃金向量測 |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | 協議 client：每塊 AEAD、WebSocket 通道、分塊上傳／下載／seek／續傳／串流、加密 vault、`cache.db`、媒體池、matrix-sdk adapter | 🟢 可用 |
 | [`crates/wbf-core`](crates/wbf-core) | 每個命令「做什麼」：帳號、房間、訊息、媒體、backend 探測、`cache.db` 的單一寫入者。沒有命令列、沒有 RPC | 🟢 可用 |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟡 RPC method 已接上；推播、訂閱、cancel、媒體 HTTP 平面還沒有 |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE。⏳ 還沒有：`cancel`、媒體 HTTP 平面 |
 | [`apps/wbf-cli`](apps/wbf-cli) | 命令列前端 `wbf-cli`：登入、房間、送訊息、watch、上傳、下載、seek、多帳號、媒體快取 | 🟢 可用（目前直接叫 `wbf-core`） |
 | 桌面／Android／Python | 走 RPC 的前端 | ⏳ 還沒開始 |
 
@@ -182,20 +183,21 @@ git submodule update --init
 
 ## 文件
 
-設計文件在 [`docs/design`](docs/design)，以繁體中文撰寫。
+設計文件在 [`docs/design`](docs/design)，一個資料夾一個題目；從索引 [`docs/design/index.md`](docs/design/index.md) 開始看。以繁體中文撰寫。
 
-| 文件 | 內容 |
+| 資料夾 | 內容 |
 |---|---|
-| [`architecture-v2.md`](docs/design/overview/architecture-v2.md) | 分層：daemon、RPC、前端；兩個平面；token 與加密 |
-| [`rpc-spec.md`](docs/design/rpc-specs/rpc-spec.md) | 每一條 RPC method、錯誤碼、推播訊息，以及媒體的 HTTP API |
-| [`daemon-runtime.md`](docs/design/daemon/daemon-runtime.md) | daemon 跑起來之後：多帳號、`cache.db` 的單一寫入者、本地讀與上游拉 |
-| [`local-cache-db.md`](docs/design/storage/local-cache-db.md) | 加密的 vault、`cache.db` 的 schema、媒體池 |
-| [`chat-model.md`](docs/design/rooms/chat-model.md) | 對話、對象、訊息、角色 —— 以及它們怎麼對到 Matrix |
-| [`wbf-cli-spec.md`](docs/design/rpc-specs/wbf-cli-spec.md) | 命令列的命令、參數、輸出、exit code |
-| [`wbf-client-convention-for-chunk.md`](docs/design/media/wbf-client-convention-for-chunk.md) | client 之間的約定：區塊加密、串流、seek |
-| [`to-device-client.md`](docs/design/keys/to-device-client.md) | to-device 訊息（`0x16 Device`）怎麼接 |
-| [`plan-v1.md`](docs/design/overview/plan-v1.md) | v1 範圍、佈局、依賴、里程碑 |
-| [`handover.md`](docs/handover.md) | 現在在哪、已知的洞、下一步 |
+| [`overview/`](docs/design/overview) | 分層（daemon、RPC、前端），以及跟上游 matrix-rust-sdk 怎麼保持鬆耦合 |
+| [`rpc-specs/`](docs/design/rpc-specs) | 前端看得到的：每一條 RPC method 與推播、本地的控制／資料平面、命令列 |
+| [`daemon/`](docs/design/daemon) | daemon 跑起來之後：多帳號、`cache.db` 的單一寫入者、會話、每個帳號的連線池 |
+| [`rooms/`](docs/design/rooms) | 對話、對象、訊息、角色，以及房間的訂閱線 |
+| [`messages/`](docs/design/messages) | 編輯與撤回、已讀 |
+| [`keys/`](docs/design/keys) | 端對端加密：RPC 面、金鑰線、to-device、房間金鑰備份 |
+| [`storage/`](docs/design/storage) | 加密的 vault 與金鑰、`cache.db` 的 schema |
+| [`media/`](docs/design/media) | client 之間的區塊加密約定、本地媒體池 |
+| [`wire/`](docs/design/wire) | 從 server 複製的黃金向量 |
+
+[`docs/handover.md`](docs/handover.md) 講現在在哪、已知的洞、下一步。
 
 ## 關聯專案
 

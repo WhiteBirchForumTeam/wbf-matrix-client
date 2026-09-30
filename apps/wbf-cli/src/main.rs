@@ -13,7 +13,7 @@
     )
 )]
 //! wbf-cli：介面照 `docs/design/rpc-specs/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
-//! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
+//! 每個命令在 `commands.rs`（帳號、上傳下載、備份…）、`rooms.rs`（房間）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
 //! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2.md §6）。
 
 mod commands;
@@ -391,7 +391,7 @@ fn main() -> ExitCode {
 /// wbf-cli-spec.md §4 的 exit code。
 ///
 /// ⚠️ 對的是 **`CoreErrorKind`** 而不是訊息：那正是 core 把錯誤結構化的理由
-/// （PR #24 審查 salvia／rumia）。daemon 那邊同一張表會變成 local-interface.md §6 的 `code` 整數。
+/// （PR #24 審查 salvia／rumia）。daemon 那邊同一張表是 rpc-spec.md §5 的 `code` 整數。
 ///
 /// Args:
 ///     error: example: CoreError::new(CoreErrorKind::Integrity, "...")

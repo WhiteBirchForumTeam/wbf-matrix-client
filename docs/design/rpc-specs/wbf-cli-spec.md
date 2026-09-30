@@ -10,15 +10,15 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 ## 1. 權限從哪來
 
-所有 `/_wbf/v1/*` 請求都要 `Authorization: Bearer <access_token>`。token 是 Matrix 登入發的，拿它**不需要 matrix-sdk**：
-一個 `POST /_matrix/client/v3/login`（`m.login.password`）就有。所以 `login` 從第 2 步就存在，用純 HTTP 做。
+所有 wbf 請求（WS 升級、`POST /_wbf/v1/pack`）都要 `Authorization: Bearer <access_token>`。token 是 Matrix 登入發的。
+`login` 先探這台 server 講不講 wbf（account-session.md §1）：
 
-| 步驟 | `login` 做什麼 | 拿不到什麼 |
+| server | `login` 怎麼做 | 裝置金鑰 |
 |---|---|---|
-| 第 2 步 | HTTP 登入、拿 `access_token`、`user_id`、`device_id`，存進 session 檔 | 沒有裝置金鑰、沒有 E2EE。能上傳下載，不能進加密房間送事件 |
-| 第 3 步 | 換成 matrix-sdk 的登入，同一個 session 檔多存 SDK 的 store 位置 | —— |
+| wbfuwunel | 標準 HTTP `POST /_matrix/client/v3/login`（`m.login.password`），🚫 不經 matrix-sdk | `m/` 由我們的 `OlmEngine` 開（account-session.md §3） |
+| 一般 Matrix | matrix-sdk 的登入 | matrix-sdk 的 store 在 `m/` |
 
-也接受外面給的 token（`--token` 或環境變數），給 Element 那邊登入過的人與腳本用。
+也接受外面給的 token（`--token` 或環境變數），給 Element 那邊登入過的人與腳本用。這條路不碰 vault、不碰帳號目錄，所以沒有快取（§3.5）。
 
 ## 2. 全域參數
 
@@ -44,16 +44,14 @@ exit code 說明失敗類別；所以它能被腳本串起來，驗收腳本就�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `login --user <mxid> [--password-file <path>] [--device-name <name>]`<br>`account add …`（同一件事的另一個名字） | 登入、把 session 封進這個帳號目錄的 `session.sealed`，**登入成功自動切成 `current`** 並印一行 switch 提示（§3.1.1）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server", "switched_from" }` |
-| `account status` | 列本機所有帳號：**掃雙層**（`s/` 再 `a/`）逐一解密目錄名（vault-and-keys.md §2.5）。⚠️ **要解鎖**（`passphrase` 模式會問，或吃 `--passphrase-file`），因為目錄名是加密的；這跟 2026-09-09 之前的「不開 vault」不一樣。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy`。⚠️ **登出的帳號是 `null`**：目錄名只解得出 localpart 與 host，組不出可靠的 mxid，🚫 不自己拼一個 | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
+| `login --user <mxid> [--password-file <path>] [--device-name <name>]`<br>`account add …`（同一件事的另一個名字） | 登入（要 `--server`，或 `WBF_SERVER`／conf 的 `SERVER`）、把 session 封進這個帳號目錄的 `session.sealed`，**登入成功自動切成 `current`** 並印一行 switch 提示（§3.1.1）。資料目錄裡沒有 `local.key` 就建一把：給了 `--passphrase-file` 就是 `passphrase` 模式，否則 `plain`。多個帳號可以同時登入著。`--password-file` 整檔就是密碼（去掉結尾一個換行）；沒給就從終端讀（不回顯）。🚫 沒有 `--password <pw>`、🚫 不接受環境變數給密碼：兩者都會留在 shell 歷史與 `ps` 輸出裡 | `{ "user_id", "device_id", "server", "switched_from" }` |
+| `account status` | 列本機所有帳號：**掃雙層**（`s/` 再 `a/`）逐一解密目錄名（vault-and-keys.md §2.5）。⚠️ **要解鎖**（`passphrase` 模式會問，或吃 `--passphrase-file`），因為目錄名是加密的。解不開的目錄跳過並警告，🚫 不猜不刪。哪個是 `current`、各自登入了沒。**`user_id` 是完整 mxid**，拿來就能直接餵給 `account switch`／`del`／`destroy`。⚠️ **登出的帳號是 `null`**：目錄名只解得出 localpart 與 host，組不出可靠的 mxid，🚫 不自己拼一個 | `[{ "user_id", "server", "localpart", "logged_in", "current" }…]` |
 | `account switch <user>` | 只改 `current`，不連 server。印 switch 提示（§3.1.1）。指到沒登入的帳號會警告但照切（下一個要連線的命令才會失敗） | `{ "ok": true, "current", "switched_from" }` |
-| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`m/`、**`k/`**（維護者 2026-09-09：離開這台機器就清乾淨，room-key-backup.md §7）；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到，PR #11 那版寫錯了）。**閘門兩關**（room-key-backup.md §7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才確認得了「刪完之後這裡還有東西打得開那份備份」。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著）。📌 **wbf 帳號**（account-session.md §6）：沒有 matrix-sdk 的 Client，第 ① 關問不出來就當沒過（fail closed），只剩第 ② 關：這台保管著 recovery key 才放行，不然 1021、要 `--accept-history-loss` | `{ "ok": true, "user" }` |
-| `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。**最後刪帳號目錄**；那台 server 一個帳號都不剩就整個 server 目錄（含 `cache.db` 與媒體池）一起刪 —— `account status` 再也列不出它（#25，維護者 2026-09-15）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed", "recovery_key_destroyed", "account_dir_removed", "server_dir_removed" }` |
-| `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id" }` |
+| `logout [--accept-history-loss]`<br>`account del <user> [--accept-history-loss]` | **裝置層**：`POST /_matrix/client/v3/logout` 讓 token 失效，刪這個帳號的 `session.sealed`、`m/`、**`k/`**（維護者 2026-09-09：離開這台機器就清乾淨，room-key-backup.md §7）；`current` 指到它就清掉。**`cache.db` 裡的紀錄留著**（之後再登入還在），`local.key` 也留著。例外：這個 server 最後一個帳號登出時，`cache.db` 一起刪（沒有主人了）。`logout` 就是 `account del <current 帳號>`。`m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊 crypto store 會擋登入（2026-09-07 實跑踩到）。**閘門兩關**（room-key-backup.md §7）：① server 上有 backup ＆ `recovery().state() == Enabled`；② 這台機器保管著這個帳號的 recovery key（§3.6.1）。⚠️ 第 ① 關只說得出「SSSS 設好了」，說不出那串字在誰手上——第 ② 關才確認得了「刪完之後這裡還有東西打得開那份備份」。任一關不過就 exit 1，要 `--accept-history-loss` 才走。🚫 不問使用者手打 recovery key（我們自己就保管著）。📌 **wbf 帳號**（account-session.md §6）：沒有 matrix-sdk 的 Client，第 ① 關問不出來就當沒過（fail closed），只剩第 ② 關：這台保管著 recovery key 才放行，不然 1021、要 `--accept-history-loss` | `{ "ok": true, "user" }` |
+| `account destroy <user> [--yes] [--accept-history-loss]` | **裝置層加資料層**：先做 `account del <user>` 那一整套，再跑忘掉鏈（§3.5）把這個帳號在 `cache.db` 裡**獨有**的東西清掉 —— 只有他同步過的事件、只有那些事件指的媒體、沒人再認領的池檔、沒事件也沒清單的房間。**別的帳號也持有的一律不動**（維護者 2026-09-09 的原話：扣除別人帳號的持有）。**最後刪帳號目錄**；那台 server 一個帳號都不剩就整個 server 目錄（含 `cache.db` 與媒體池）一起刪 —— `account status` 再也列不出它（維護者 2026-09-15）。沒 `--yes` 就終端確認，提示要講明會刪掉什麼 | `{ "ok", "user", "events_removed", "media_removed", "pool_files_removed", "recovery_key_destroyed", "account_dir_removed", "server_dir_removed" }` |
+| `whoami` | `GET /_matrix/client/v3/account/whoami` | `{ "user_id", "device_id", "server" }` |
 | `set-passphrase [--new-passphrase-file <path>]` | 給 `local.key` 設或改 passphrase（沒給檔就從終端讀兩次）。只重包主金鑰，`session.sealed` 與 `m/` 不動 | `{ "ok": true, "mode": "passphrase" }` |
 | `remove-passphrase` | 拿掉 passphrase，`local.key` 回到 `plain` | `{ "ok": true, "mode": "plain" }` |
-
-⚠️ 舊名 `accounts` 與 `forget-account` **移除**（維護者 2026-09-09）：碰到就報錯並指向新名字，不留別名。
 
 🔑 **`<user>` 一律是完整 mxid**（維護者 2026-09-09）：`@bob:matrix.org`，🚫 不省略 server name。
 `account switch`／`del`／`destroy` 的位置參數都一樣 —— 這些命令會登出、會刪檔，變更的對象不該靠猜。
@@ -132,7 +130,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | `status <upload_id>` | 印 `Status` 的 Ack |
 | `abort <upload_id> [--file <path>]` | 送 `Abort`；給 `--file` 就順便刪它旁邊的狀態檔（狀態檔跟著檔案放，只有 id 找不到它） |
 
-- `--cipher` 預設：偵測到硬體 AES 用 `aes-256-gcm`，否則 `chacha20-poly1305`（wbf-client-convention-for-chunk.md §3）。`none` 是明文模式；第 2 步沒有房間，所以要不要警告是第 3 步 `send` 的事，這裡直接照做。
+- `--cipher` 預設：偵測到硬體 AES 用 `aes-256-gcm`，否則 `chacha20-poly1305`（wbf-client-convention-for-chunk.md §3）。`none` 是明文模式；`upload` 沒有房間，要不要警告是 `send` 的事（§3.4），這裡直接照做。
 - `--chunk-size` 沒給就照wbf-client-convention-for-chunk.md §2 的表選；給了就照給的（要在 server 允許的範圍，不然 Create 會被拒）。
 - `--sha256`：上傳時順便算整檔明文雜湊寫進描述與 manifest。串流模式一律算（反正要讀過一遍）。
 - **續傳**：`upload` 開始前在檔案旁寫狀態檔（§6）。同一個 `upload <file>` 再跑一次，看到狀態檔就先 `Status`，從 `received` 接著送，用**同一把** key 與 nonce_base（同一個上傳，不是重傳）。Seal 成功後刪狀態檔。
@@ -176,28 +174,29 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 `chunks_read` 就是驗收「不必下載前面」的證據：`--at 150000000` 時它必須只有一個元素。
 
-### 3.4 房間（第 3 步，2026-09-06 做了第一版）
+### 3.4 房間
 
-從第 3 步起 `login` 走 matrix-sdk（拿到有裝置金鑰的 session，E2EE 房間才解得開），store 放帳號目錄的 `m/`（§7）。
-這些命令都先做一次增量 sync（timeout 0）再動作，所以看到的是現況。
+一般 Matrix 帳號走 matrix-sdk（有裝置金鑰的 session，store 在帳號目錄的 `m/`，§7）；wbf 帳號不建 Client，房間走 WS 橋、
+金鑰由 `OlmEngine` 開 `m/`（account-session.md §2）。`rooms`／`read`／`files` 一律先問上游、寫進快取、再從快取讀回來
+（RPC 的 `sync: both`，rpc-spec.md §2），所以看到的是現況；`--from-cache` 才只讀本地（§3.5）。
 
 | 命令 | 做什麼 |
 |---|---|
 | `rooms` | 列出加入的房間：chat-model.md §2.1 的 `Conversation` 陣列（`id`、`kind`、`name`、`topic`、`encrypted`、`member_count`、`my_power_level`、`can_send_message`、`direct_peer`） |
-| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }` |
-| `send <room_id> --file <file> [--caption <c>] [--cipher …] [--chunk-size …] [--sha256] [--manifest <out>] [--yes]` | upload（含續傳）後把wbf-client-convention-for-chunk.md §5 的事件送進房間；印 `{ "event_id", "mxc" }`。房間沒 E2EE：**送之前印警告並要求確認**（wbf-client-convention-for-chunk.md §5.1）、強制 `cipher: none`（給別的 `--cipher` 就 exit 1：加密區塊的 key 會公開）；`--yes` 跳過確認給腳本用。⚠️ 一般 Matrix 帳號附件宣告（wbf-client-convention-for-chunk.md §5.2）帶不出去，stderr 會印警告；📌 **wbf 帳號**事件走 `Event/Send`、附件宣告成立（`attachment_declared: true`），加密房在上傳之前就拒（1100；account-session.md §6） |
+| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }`。📌 **wbf 帳號的加密房**：還沒做——CLI 不帶 `room_devices`，回 1100（RPC 那邊怎麼送見 rpc-spec.md §3.3） |
+| `send <room_id> --file <file> [--caption <c>] [--cipher …] [--chunk-size …] [--sha256] [--manifest <out>] [--yes]` | upload（含續傳）後把 wbf-client-convention-for-chunk.md §5 的事件送進房間；印 `{ "event_id", "mxc" }`。房間沒 E2EE：**送之前印警告並要求確認**（wbf-client-convention-for-chunk.md §5.1）、強制 `cipher: none`（給別的 `--cipher` 就 exit 1：加密區塊的 key 會公開）；`--yes` 跳過確認給腳本用。⚠️ 一般 Matrix 帳號附件宣告（wbf-client-convention-for-chunk.md §5.2）帶不出去，stderr 會印警告；📌 **wbf 帳號**事件走 `Event/Send`、附件宣告成立（`attachment_declared: true`），加密房在上傳之前就拒（1100；account-session.md §6） |
 | `watch <room_id> tail \| wait <秒> \| once [--since <token>]` | 從 `/sync` 等**新**事件（現在起），來一個立刻印一個，一行一個 JSON。三種模式見 §3.4.2。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印。📌 **wbf 帳號拒絕**（1100）：沒有 `/sync` 的迴圈，新訊息走 daemon 的訂閱＋推播（account-session.md §6） |
-| `ping` | `Hello` 加 `Ping`，印 server 回的 features 與上限。除錯用，第 2 步就有 |
+| `ping` | `Hello` 加 `Ping`，印 server 回的 features 與上限。除錯用 |
 
 #### 3.4.1 讀房間
 
-`watch` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令（`read`、`files` 第 3 步做了；`room` 還沒，`rooms` 的輸出已經有它大部分的欄位）：
+`watch` 只看得到現在起的新事件。讀歷史、找檔案、看房間本身，是另外三個問題，各一個命令（`room` 還沒做，`rooms` 的輸出已經有它大部分的欄位）：
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `room <room_id>`（還沒） | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
-| `read <room_id> [--limit <n>] [--before <token>] [--type <名>…] [--sender <mxid>]` | 歷史：`GET .../rooms/{id}/messages?dir=b`，從最新往回。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁的 token 不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`undecryptable`、`outdated`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": token \| null }`，`next` 是 null 表示到頭了 |
-| `files <room_id> [--limit <n>] [--before <token>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
+| `room <room_id>`（還沒做） | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
+| `read <room_id> [--limit <n>] [--before <event_id>] [--type <名>…] [--sender <mxid>]` | 歷史，從最新往回（上游怎麼問：wbf 走 `Event/Recent`、一般 Matrix 走 `/context`＋`/messages`，rpc-spec.md §3.3）。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`undecryptable`、`outdated`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": event_id \| null }`，`next` 是 null 表示到頭了 |
+| `files <room_id> [--limit <n>] [--before <event_id>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
 
 事件的統一形狀（`read`、`watch`、`files` 都用）就是 chat-model.md §2.3 的 `Message` 序列化：
 
@@ -234,9 +233,9 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 - **結束時 stderr 印一行 `since`**，下次用 `--since` 接著等，中間進來的不漏。這也是 `wait` 連續呼叫的接法；`since` 自己不落地，理由同 §3.4.1 的 `next`。
 - **只印這個房間的。** `/sync` 回來的是全部房間，其他房間的丟掉；要看全部就開幾個 `watch`。
 - **自己送的也印**（`sender` 是自己），腳本自己濾。`once` 不把自己的算進「第一則」，不然 `send` 完接著 `once` 永遠等到的是自己。
-- **第 2 步的 session 在加密房間照樣能用**，只是每則都 `decrypted: false`；`once` 還是算有回應。
+- **解不開的事件照印**（`decrypted: false`）；`once` 還是算有回應。
 
-### 3.5 本地快取（local-cache-db.md §5，2026-09-07）
+### 3.5 本地快取（local-cache-db.md §5）
 
 `cache.db` 在 `s/<b58>_<b58>/`（§7），**同一個 server 上的所有帳號共用一份**，SQLCipher 整檔加密，金鑰是 vault 的第一把子金鑰。**快取不是權威**：server 不符、schema 版本不對、解不開，開檔時直接刪掉重建，stderr 說一聲。
 
@@ -248,15 +247,15 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 | 命令 | 做什麼 | stdout |
 |---|---|---|
-| `recent [--limit <n>] [--window <n>] [--batch <n>] [--from-scratch]` | `Event/Recent`（只走 WS；`--transport http` 會拿到 `Unsupported`）。三層（維護者 2026-09-08 定）：`--limit` 是**這一輪總共要幾則**（預設 10000，0 = 拉到追平），底層拆成一次 `Recent` 一窗 `--window` 則（預設 320、server 上限 500 先 clamp），server 每 `--batch` 則回一個 Batch（預設 10、上限 100）；要 1000 就是 320、320、320、40 四窗。每個 Batch 寫一次快取；一窗 `tc == 要的` 就帶 `before = 最後的 ls` 再一窗，`tc < 要的` 是追平（`caught_up`）；湊滿 `--limit` 也停（stderr 說更舊的還沒進快取）。水位一律是第一窗第一個 Batch 的 `fs`（比它新的全拿到了），中途斷線或 server 回錯就 exit、已寫的有效、水位不動。等待：第一窗每個 Batch 之間 60 秒、之後 10 秒。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "windows", "batches", "caught_up", "cg_seq_before", "cg_seq_after" }` |
-| `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的，排序照 `r_seq`。`--before` 跟不帶時一樣是**上一頁印的 `next`（那頁最舊那則的 `event_id`）**。🚫 **沒有 `r_seq` 的房間（一般 Matrix server）不答**、錨點不在快取也不答（exit 2）：那種房不從快取回答，拿掉 `--from-cache` 去問 server（rpc-spec.md §3.3） | 與不帶時同形 |
+| `recent [--limit <n>] [--window <n>] [--batch <n>] [--from-scratch]` | `Event/Recent`（只走 WS；`--transport http` 或對方不是 wbf 就 exit 1：這個功能在那條路上是關的，rpc-spec.md §2）。三層（維護者 2026-09-08 定）：`--limit` 是**這一輪總共要幾則**（預設 10000，0 = 拉到追平），底層拆成一次 `Recent` 一窗 `--window` 則（預設 320、server 上限 500 先 clamp），server 每 `--batch` 則回一個 Batch（預設 10、上限 100）；要 1000 就是 320、320、320、40 四窗。每個 Batch 寫一次快取；一窗 `tc == 要的` 就帶 `before = 最後的 ls` 再一窗，`tc < 要的` 是追平（`caught_up`）；湊滿 `--limit` 也停（stderr 說更舊的還沒進快取）。水位一律是第一窗第一個 Batch 的 `fs`（比它新的全拿到了），中途斷線或 server 回錯就 exit、已寫的有效、水位不動。等待：第一窗每個 Batch 之間 60 秒、之後 10 秒。`--from-scratch` 不帶 `cg_seq`。server 要有 `recent` feature | `{ "pulled", "written", "windows", "batches", "caught_up", "cg_seq_before", "cg_seq_after" }` |
+| `read … --from-cache`、`files … --from-cache` | 不連 server，從快取讀這個帳號同步過的，排序照 `r_seq`。`--before` 跟不帶時一樣是**上一頁印的 `next`（那頁最舊那則的 `event_id`）**。🚫 **沒有 `r_seq` 的房間（一般 Matrix server）不答**、錨點不在快取也不答（1100，exit 1）：那種房不從快取回答，拿掉 `--from-cache` 去問 server（rpc-spec.md §3.3） | 與不帶時同形 |
 | `account destroy <user> [--yes]` | 忘掉鏈（裝置層那一半在 §3.1）：刪這個帳號的同步紀錄／房間清單／水位線／已讀 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。順手刪掉已經沒人用的池檔（DB 先、檔案後；刪不掉只說一聲，`media-gc` 的 sweep 會再收）。**這個帳號的 `k/` 也一起刪**（它就是「摧毀本機紀錄」，跟 `logout` 一致，room-key-backup.md §7）；沒 `--yes` 的確認提示要把這件事講出來 | 見 §3.1 |
 | `media-stats` | 媒體池的狀態：池目錄、`bytes_on_disk` 加總、完整檔數、半成品數、`pending/` 裡的檔數、最久沒用的時間 | `{ "pool_dir", "bytes_on_disk", "complete_files", "incomplete_files", "pending_on_disk", "oldest_last_used_at" }` |
 | `media-gc [--quota-mib <n>] [--protect-days <d>]` | 先掃孤兒（DB 說有檔不在 → 當沒有；沒列認領的暫存檔 → 刪；過保護期的半成品 → 刪；`media/<hh>/` 裡沒任何列指著的完成檔 → 刪），再照 media-pool.md §5 清到配額以下：只刪保護期外的、最久沒用的先、同 hash 被多個 mxc 指著的檔不刪。預設 2048 MiB、7 天。保護期內全滿了不刪不擋，stderr 提示 | `{ "bytes_before", "bytes_after", "files_removed", "still_over_quota", "swept_missing_files", "swept_pending", "swept_orphan_files" }` |
 
 寫穿：`rooms` 把房間列表、`read`／`files`／`watch` 把印過的事件順手寫進快取（帶著這個帳號的 mxid）。**寫穿失敗只在 stderr 說一聲，命令照樣成功**（快取壞了的代價是重拉）。`--token` 模式沒有 vault 也沒有帳號目錄，沒有快取：`--from-cache` 與 `recent` 會 exit 1。
 
-### 3.6 房間金鑰備份（room-key-backup.md，2026-09-09 定，PR #19 已實作）
+### 3.6 房間金鑰備份（room-key-backup.md，維護者 2026-09-09 定）
 
 房間金鑰有兩份備份：server 端的標準 Matrix key backup，與本地帳號目錄 `k/` 的加密快照。
 兩個開關都在 conf 的 `[backup]`（§10），預設都是 `on`。
@@ -375,7 +374,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
              "chunk_size": 65536, "file_size": 132056, "name": "video.mkv", "mimetype": "video/x-matroska", "sha256": "…" } }
 ```
 
-- `block` 逐字就是第 3 步 `send --file` 放進事件 `org.wbftw.wbfuwunel.chunked` 的東西；第 2 步沒有房間，manifest 就是「事件」的替身。
+- `block` 逐字就是 `send --file` 放進事件區塊 `org.wbftw.wbfuwunel.chunked` 的東西；`upload` 沒有房間，manifest 就是「事件」的替身。
 - 含 `key`，所以 manifest 檔要當機密：寫檔時權限只給自己（Unix `0600`；Windows 放在使用者目錄）。`--manifest` 沒給就印到 stdout。
 
 ## 6. 上傳狀態檔（續傳用）
@@ -413,38 +412,35 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
   s/<b58>_<b58>/                 **server host 加密後的名字**（vault-and-keys.md §2.2）：外面看不出這台機器連過哪家
     cache.db                     這個 server 上所有帳號共用的快取（§3.5；local-cache-db.md §5）
     a/
-      <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 §11.2），第六把子金鑰
-        session.sealed           { "server", "user_id", "device_id", "access_token", "store_dir" } 用第三把子金鑰封住
+      <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（vault-and-keys.md §2.2），第六把子金鑰
+        session.sealed           { "server", "user_id", "device_id", "access_token", "store_dir"?, "backend"? } 用第三把子金鑰封住（backend：account-session.md §2）
         m/                       matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
-        k/snapshot               本地房間金鑰備份（room-key-backup.md §4），全量快照一個檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（§10.7 的閘門）
+        k/snapshot               本地房間金鑰備份（room-key-backup.md §4），全量快照一個檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（room-key-backup.md §7 的閘門）
     media/                       媒體儲存池（media-pool.md）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
 ```
 
 - **兩層目錄名都是加密的**（vault-and-keys.md §2）：`<base58 nonce>_<base58 密文>`，底線分隔（Base58 字母表沒有 `_`）。
   ⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母：兩段加密名字就吃掉 106 字元，
-  而 Windows 的 `MAX_PATH` 是 260（vault-and-keys.md §2.4.1，2026-09-09 實測撞到）。上層是正規化過的 server host（小寫、非預設 port 才帶），下層是 localpart。要知道是哪家、是誰得解密，所以連 `account status` 都要先解鎖（§11.6）。真正的 server URL 與 mxid 仍然在 `session.sealed` 裡，不從目錄名反推。
+  而 Windows 的 `MAX_PATH` 是 260（vault-and-keys.md §2.4.1，2026-09-09 實測撞到）。上層是正規化過的 server host（小寫、非預設 port 才帶），下層是 localpart。要知道是哪家、是誰得解密，所以連 `account status` 都要先解鎖（vault-and-keys.md §2.6）。真正的 server URL 與 mxid 仍然在 `session.sealed` 裡，不從目錄名反推。
 - 哪個帳號：`--account` → `current`。`login` 寫 `current`；`logout` 的帳號是 `current` 就清掉。
 - `local.key` 為什麼在頂層不在帳號底下：主金鑰的定位是「這台機器」（vault-and-keys.md §1），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase，沒有理由。
 - `cache.db` 為什麼在 server 層：`r_seq`／`g_seq` 是 fork server 發的，同一個 room 在不同 homeserver 上序號不同；共用範圍就是同一個 server 的帳號（§3.5）。
-- **明文目錄名的舊佈局（含 PR #11 那版）一律不遷移**：維護者 2026-09-09 定——server 從未上線、client 從未被使用，breaking 就 breaking。舊目錄在 §11.5 的掃描裡本來就解不開、會被跳過；一個都解不開時印一行提示叫人刪掉 data dir 重新 `login`（vault-and-keys.md §2.7）。
+- **明文目錄名的舊佈局一律不遷移**：維護者 2026-09-09 定——server 從未上線、client 從未被使用，breaking 就 breaking。舊目錄在 vault-and-keys.md §2.5 的掃描裡本來就解不開、會被跳過；一個都解不開時印一行提示叫人刪掉 data dir 重新 `login`（vault-and-keys.md §2.7）。
 
 🚫 任何命令的輸出、log、錯誤訊息都不印 `access_token`、主金鑰、子金鑰、passphrase、password。
 
-### 7.1 🚫 沒有 unlock ticket（2026-09-13 拿掉）
+### 7.1 🚫 沒有 unlock ticket（維護者 2026-09-13）
 
 `local.key` 是 `passphrase` 模式時，**每個命令都要 passphrase**：`--passphrase-file` → 問終端（不回顯）。
+🚫 不為了省打字讓明文主金鑰落地（沒有 `unlock.ticket`、`lock` 命令、`--unlock-ttl`、conf 的 `UNLOCK_TTL`）。
 
-以前這裡有一張仿 `sudo` 的 **unlock ticket**（解鎖成功後把明文主金鑰加 `expires_at` 寫進
-`<data dir>/unlock.ticket` 15 分鐘，期內的命令不再問）。維護者 2026-09-13 拿掉它：
-
-- ⭐ **那個痛點沒有了**：daemon 常駐、解鎖一次（architecture-v2.md §1），而 daemon 起著的時候單發命令
-  本來就不准碰資料庫（§0.2）—— 所以單發只剩 debug／test 的用途、一次一個，省下的那幾次打字
-  **換不到「明文主金鑰落地 15 分鐘」**。
-- 跟著消失的：`lock` 命令、`--unlock-ttl`、conf 的 `UNLOCK_TTL`、`<data dir>/unlock.ticket`。
+- ⭐ 理由：daemon 常駐、解鎖一次（architecture-v2.md §1），而 daemon 起著的時候單發命令
+  本來就不准碰資料庫（architecture-v2.md §0.2）—— 所以單發只剩 debug／test 的用途、一次一個，省下的那幾次打字
+  **換不到「明文主金鑰落地」**。
 - 📎 **UI 的 lock 不是這個東西**：UI 有自己的 lock／unlock，但它鎖的是 UI 那一層，🚫 不動 daemon
   （rpc-spec.md §3.1）。真正要讓金鑰離開記憶體就是 `daemon.shutdown`。
 
-## 8. 驗收腳本（第 2 步交付的一部分）
+## 8. 驗收腳本
 
 `scripts/acceptance.sh`（Windows 跑 Git Bash），對著本機 wbfuwunel 驗上傳、下載、seek、續傳、串流：
 
@@ -457,21 +453,21 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 6. `cat 原檔 | upload --stream` → 同第 3 條。
 7. 三種 `--cipher` 各跑一次第 2、3 條。
 
-實作：`scripts/acceptance.sh`，`WBF_PASSWORD_FILE=<檔> scripts/acceptance.sh`；`WBF_ACCEPT_SIZE_MIB` 可以縮小檔案快速跑。
-第 5 步的「殺掉」走 HTTP 通道（一塊一個請求，慢到來得及殺），殺完先 `status` 確認 `finished` 是 false 才算數。
-2026-09-05 對本機 wbfuwunel 跑 200 MiB 全過，79 秒。
+跑法：`WBF_PASSWORD_FILE=<檔> scripts/acceptance.sh`；`WBF_ACCEPT_SIZE_MIB` 可以縮小檔案快速跑。
+第 5 條的「殺掉」走 HTTP 通道（一塊一個請求，慢到來得及殺），殺完先 `status` 確認 `finished` 是 false 才算數。
 
 ## 9. 明確不做的
 
 - 沒有互動模式、沒有進度條以外的 UI。
 - 不存密碼，只存 token。
-- 第 3 步還沒做的：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載（chat-model.md §6）。
 - 🚫 `key-backup` 不做「刪掉 server 上的 backup version」（不可逆，而且會連帶其他裝置，room-key-backup.md §9）。
 - 🚫 conf 不改寫已經存在的檔、不寫秘密（§10.3、§10.5）。
 - 🚫 不把目錄名的對照表落地成明文索引（vault-and-keys.md §2.5）：那等於把剛加密的東西再寫一次明文。
 - 🚫 不把 `--password-file` 也改成原始 bytes（vault-and-keys.md §3.4）：password 要送給 server，它本來就是字串。
 
-## 10. conf 檔：不用每次指定環境變數（維護者 2026-09-09 要求，✅ 2026-09-10 實作）
+還沒做（不是不做）：`room`、建房、邀請、改權限、置頂、已讀送出、裝置驗證、標準附件下載（chat-model.md §6）。
+
+## 10. conf 檔：不用每次指定環境變數（維護者 2026-09-09 要求）
 
 ### 10.1 在哪、長怎樣
 
@@ -495,7 +491,7 @@ SERVER_BACKUP=on          ; 標準 Matrix key backup（room-key-backup.md §3）
 LOCAL_ROOM_KEYS=on        ; 本地加密金鑰池（同 §10.4）
 
 [read]
-READ_RECEIPTS=private     ; 已讀回執送上游時公不公開；private（預設）／public（read-receipts.md §3）
+READ_RECEIPTS=private     ; 已讀回執送上游時公不公開；private（預設）／public（read-receipts.md §3；還沒做）
 
 [media]
 QUOTA_MIB=2048
@@ -542,7 +538,7 @@ clap 免費給），🚫 不要在 `Settings::load` 裡自己讀 `std::env` —�
 - **認不得的區段或鍵**：印一行警告到 stderr，忽略它，命令照跑。（conf 要往前相容：舊版 CLI 讀到新版寫的鍵不該整個掛掉。）
 - ⚠️ **`READ_RECEIPTS` 的安全值是 `private`**：只正面認得 `public` 才公開，其餘一律 private
   （拼錯、空的、認不得的值都是）。⭐ 壞在「別人看不到你已讀」，🚫 不壞在「你被看見了」——
-  後者不可回收（read-receipts.md §3）。
+  後者不可回收（read-receipts.md §3）。還沒做：conf 還不認得 `[read]` 區段（讀到會警告、忽略）。
 - **認得的鍵、認不得的值**：⚠️ 開關型的鍵（`SERVER_BACKUP`、`LOCAL_ROOM_KEYS`）**只正面認得 `on` 與 `off`**（不分大小寫）；
   其他任何值（`true`、`1`、`yes`、拼錯的 `of`）一律警告並落到**安全值**，也就是 `on`。
   判斷一律寫成「**正面認得 `off` 才關**」，🚫 不寫成「不等於 `on` 就關」—— 壞掉的時候要壞在「備份還開著」那一邊，不是「以為開著、其實沒開」。

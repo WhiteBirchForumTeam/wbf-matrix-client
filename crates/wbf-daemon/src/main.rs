@@ -12,8 +12,8 @@
         clippy::string_slice
     )
 )]
-//! `wbf-matrix-client-daemon`：這一版只有 `-s`（常駐）。單發命令（`daemon <命令>`，architecture-v2.md §0.2）
-//! 與資料平面在下一支 PR。
+//! `wbf-matrix-client-daemon`：只有 `-s`（常駐）。還沒做：單發命令（`daemon <命令>`，architecture-v2.md §0.2）、
+//! 資料平面（local-interface.md §8）。
 //!
 //! 起動的順序照 local-interface.md §3 的五步（前端寫 token → spawn → **daemon 宣告 ready** →
 //! 前端抹掉 token 檔 → 之後只在記憶體裡）。⭐ 這支負責的是第 3 步，而「宣告 ready」是**一個邊緣**，

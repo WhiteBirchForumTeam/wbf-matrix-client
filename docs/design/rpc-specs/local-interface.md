@@ -31,7 +31,7 @@
 **因為前端可能是瀏覽器，而瀏覽器不能開裸 TCP socket**（維護者 2026-09-09：Desktop 可能先用 web
 當速成框架試 RPC）。JS 只有 WebSocket、fetch、WebTransport 三種，其中只有 WS 是雙向的。
 
-📎 中途評估過**裸 TCP ＋ NDJSON**（一行一個 JSON，省掉 WS 的握手與 frame），
+📎 評估過**裸 TCP ＋ NDJSON**（一行一個 JSON，省掉 WS 的握手與 frame），
 在「所有前端都是原生程式」的前提下它更輕。web 前端一進來這個前提就沒了，所以放棄。
 📎 也評估過 **UDS／named pipe**（省 port、認證交給檔案權限），查完跨平台之後放棄：
 Rust 在 Windows 沒有 `UnixListener`，而 **Python 在 Windows 根本不支援 `AF_UNIX`**——
@@ -54,7 +54,7 @@ Kotlin 的 OkHttp 內建，JS 原生。
 | 4 | 前端 | 收到 ready（或自己 `hello` 成功）之後**抹掉**那個檔 |
 | 5 | — | 此後 token 只活在兩個程序的記憶體裡，**磁碟上沒有** |
 
-- ⚠️ **daemon 讀完就不再回頭讀那個路徑**，所以第 4 步刪掉它不會讓任何東西壞掉（`loopback.rs`
+- ⚠️ **daemon 讀完就不再回頭讀那個路徑**，所以第 4 步刪掉它不會讓任何東西壞掉（`crates/wbf-daemon/tests/loopback.rs`
   有一條測這件事）。反過來說，🚫 **不要設計「重讀 token」**——那會把第 5 步整個推翻。
 - 🚨 **誰起的誰動**（維護者 2026-09-13）：token 檔屬於**叫起 daemon 的那個程序**。
   daemon **默認完全不動它** —— 🚫 不抹、🚫 不刪、🚫 不改權限、🚫 不寫回去。它只讀一次。
@@ -111,7 +111,7 @@ aad     = "wbf-rpc v1"
   而且它的 JSON **跟正常回應同一個形狀**（`code` 9xxx、`result.close`），前端的 frame 翻譯器只有一條路。
 - **加密是 daemon 的全局狀態 `encryption_enforced`，預設開**：開著時 client 送 `0x01` 一律拒絕；
   只有走密文呼叫 `daemon.set_encryption { enforced: false }` 才降級（除錯用，rpc-spec.md §1.1）。
-  🚫 所以 `hello` **不必再帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
+  🚫 所以 `hello` **不帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
   （正式名稱、`wbf-matrix` 開頭，rpc-spec.md §1.3）。
 - frame 上限 **1 MiB**：超過就關連線（🚫 不讓對方用一個巨大 frame 把記憶體吃光）；
   這個數字跟 §8「超過就走資料平面」是同一個。
@@ -131,27 +131,25 @@ aad     = "wbf-rpc v1"
 
 ## 5 daemon 的兩段式狀態
 
-daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.key` 解得開；`passphrase` 模式解不開）。
-解不開就**停在未解鎖狀態**——但兩個 port 照樣開著：
+daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫一次不帶參數的 `vault.unlock`）——但兩個 port 照樣開著：
 
 | | 控制平面（WS） | 資料平面（HTTP） |
 |---|---|---|
-| **未解鎖** | 開著，但只接受 `hello` 與 `vault.unlock`，其他一律回 `locked` | **503 Service Unavailable** |
+| **未解鎖** | 開著，但只接受 `hello`、`daemon.*`、`vault.*`；其他一律回 `1001`（有 `local.key` 但鎖著）或 `1002`（還沒有 `local.key`，去 `vault.create`） | **503 Service Unavailable** |
 | **已解鎖** | 全部 method | 正常 |
 
 ```jsonc
-{ "method": "vault.unlock", "params": { "passphrase_file": "/path/to/pw" }, "id": 1 }
-// 或 { "passphrase_base64": "…" }：passphrase 是任意 bytes（vault-and-keys.md §3），不一定是字串
+{ "method": "vault.unlock", "params": { "passphrase_base64": "…" }, "id": 1 }
+// passphrase 是任意 bytes（vault-and-keys.md §3），不一定是字串；plain 模式不帶 params
 ```
 
 - **passphrase 只留在 daemon 的記憶體裡，直到 daemon 關閉**（維護者 2026-09-09）。
-  ⚠️ 所以 `unlock.ticket`（明文主金鑰落地 15 分鐘，vault-and-keys.md §1 自己標記為妥協）**整個消失**——
-  這是 daemon 最直接的安全收穫。📎 2026-09-13 起連 CLI 那一側也沒有了（同本文）：那個痛點不存在了。
+  所以不需要 `unlock.ticket` 那種「明文主金鑰落地」的妥協（vault-and-keys.md §1）——這是 daemon 最直接的安全收穫。
 - 🚫 **沒有「鎖回去」**：`Core` 解鎖一次就活到程序結束，daemon 沒有 `vault.lock`（rpc-spec.md §3.1）。
   UI 的 lock／unlock 是 **UI 自己那一層**的事 —— daemon 照樣連著、照樣寫 DB、照樣發通知，
   ⭐ 因為使用者按 lock 通常只是暫時離開，回來要看到這段時間的訊息。真的要讓金鑰離開記憶體
   就是 `daemon.shutdown` 再 `daemon -s`。
-- 🚫 daemon **不自己去問終端**：那樣 Desktop 與 Android 沒辦法解鎖。passphrase 一律從 RPC 進來。
+- 🚫 daemon **不自己去問終端**：那樣 Desktop 與 Android 沒辦法解鎖。passphrase 一律從 RPC 進來（🚫 也不收 `passphrase_file`，rpc-spec.md §3.1）。
 - 未解鎖時資料平面回 **503 而不是 404**：媒體確實存在，只是現在打不開——這個區別對前端有意義。
 
 ## 6 訊息形狀（加密之前的內容）
@@ -162,14 +160,14 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 ⚠️ 但**回應的形狀不一樣**（標準是 `result`／`error` 二選一，這裡是 `code`／`msg` 平鋪），
 所以 🚫 **不宣告 `"jsonrpc": "2.0"`**，也不要拿現成的 JSON-RPC library 來接——
 與其假裝相容然後在某個角落炸掉，不如一開始就說清楚這是自己的東西。
-版本識別走 `hello` 的 `protocol` 欄位（§4）。
+版本識別走 `hello` 的 `protocol` 欄位（rpc-spec.md §1.3）。
 
 **請求**：
 
 ```json
 {
   "method": "room.send_text",
-  "params": { "account": "@alice:localhost", "room": "!abc:localhost", "body": "hi" },
+  "params": { "user": "@alice:localhost", "room": "!abc:localhost", "body": "hi" },
   "id": 1
 }
 ```
@@ -203,7 +201,7 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 ```json
 {
   "method": "room.message",
-  "params": { "account": "…", "room": "…", "message": { } }
+  "params": { "user": "…", "room": "…", "message": { } }
 }
 ```
 
@@ -223,7 +221,7 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 - **`method` 是 `名詞.動詞`**（`account.add`、`room.send_text`、`media.open`），不是 CLI 的字串命令列——
   🚫 不要讓前端組命令列字串再由 daemon 解析，那是把 shell 的問題搬進 RPC。
 - **`code` 是穩定的整數**：`0` 是成功，其他值一個意思一個號碼、**定了就不改**（前端會拿它做判斷）。
-  `msg` 是給人看的，🚫 前端不要拿它做邏輯。code 表在 `rpc-spec.md`。
+  `msg` 是給人看的，🚫 前端不要拿它做邏輯。code 表在 rpc-spec.md §5。
 - **失敗時 `result` 是 `null`**，🚫 不要省略那個欄位——欄位固定在，弱型別的前端少一種 undefined 要處理。
 - **推播要先訂閱**（`subscribe`／`unsubscribe`），🚫 不預設把所有事件推給每條連線。
 - **framing 由 WS 給**：一個 binary frame 就是一則訊息，🚫 我們不自己切。
@@ -241,9 +239,11 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 ## 8 大資料走資料平面，不走 RPC
 
+還沒做：daemon 還沒開資料平面（`media.open`／`media.create` 與兩個 HTTP 路徑，rpc-spec.md §6、§10）。
+
 ⚠️ 下載一個 2 GB 的檔不可能塞進 JSON，改成 binary frame 串流也會逼**每個前端各自實作一次串流組裝**。
 
-⚠️ 而且**不能給檔案路徑**（2026-09-09 維護者指出，這是初稿的錯）：媒體池裡的東西是**加密的**
+⚠️ 而且**不能給檔案路徑**（維護者 2026-09-09）：媒體池裡的東西是**加密的**
 （media-pool），給前端一個池裡的路徑，它讀到的是密文；daemon 先解密寫到某個路徑，那就是
 **明文落地**——整個加密池的意義就沒了。
 
@@ -276,7 +276,7 @@ http://127.0.0.1:<data port>/media/<resource token>
 **播放／顯示**：
 
 ```jsonc
-{ "method": "media.open", "params": { "account": "…", "event": "$xyz" }, "id": 9 }
+{ "method": "media.open", "params": { "user": "…", "room": "…", "event_id": "$xyz" }, "id": 9 }
 { "code": 0, "msg": "ok", "id": 9, "result": {
     "url": "http://127.0.0.1:51235/media/9f3a…",
     "mimetype": "video/x-matroska", "size": 1073741824, "expires_in": 3600 } }
@@ -288,10 +288,9 @@ http://127.0.0.1:<data port>/media/<resource token>
 **上傳**：
 
 ```jsonc
-{ "method": "media.create", "params": { "account": "…", "room": "…", "name": "video.mkv" }, "id": 12 }
-{ "code": 0, "msg": "ok", "result": { "url": "http://127.0.0.1:51235/upload/7c1b…" }, "id": 12 }
-// 前端 PUT bytes 進去；daemon 邊收邊加密邊走 chunk 上傳
-{ "method": "progress", "params": { "id": 12, "done": 52428800, "total": 1073741824 } }
+{ "method": "media.create", "params": { "user": "…", "room": "…", "name": "video.mkv" }, "id": 12 }
+{ "code": 0, "msg": "ok", "result": { "upload_id": 77, "mxc": "…", "url": "http://127.0.0.1:51235/upload/7c1b…", "expires_in": 3600 }, "id": 12 }
+// 前端 PUT bytes 進去；daemon 邊收邊加密邊走 chunk 上傳。進度就是 PUT 送出去多少，🚫 不走 RPC（rpc-spec.md §4）
 ```
 
 ⚠️ **Android 沒有別的選擇**：SAF 給的是 `content://` URI，**根本沒有檔案路徑可給**。
@@ -300,7 +299,7 @@ http://127.0.0.1:<data port>/media/<resource token>
 **另存新檔**（使用者明確要把明文放到自己選的位置）仍然走路徑：
 
 ```jsonc
-{ "method": "media.save_to", "params": { "account": "…", "event": "$xyz", "out": "/home/me/video.mkv" }, "id": 15 }
+{ "method": "media.save_to", "params": { "user": "…", "manifest": { … }, "out": "/home/me/video.mkv" }, "id": 15 }
 ```
 
 這裡明文落地是**使用者要的**，不是我們偷偷做的——這條界線要守住。rpc-cli 的 `download -o` 就是它。
@@ -321,7 +320,7 @@ http://127.0.0.1:<data port>/media/<resource token>
 整條閘門鏈，從外到內：
 
 ```
-homeserver  <=>  daemon 的 WS 協議層（wire、四條連線 architecture-v2.md §5.1）
+homeserver  <=>  daemon 的 WS 協議層（wire、五條連線 architecture-v2.md §5.1.1）
             <=>  daemon handle（命令本體：core）
             <=>  RPC 轉換（JSON ↔ handle 的型別；命令列 arg 也在這裡轉，architecture-v2.md §0.2）
             <=>  本地 WS（加密的 JSON，開給前端）
@@ -336,11 +335,11 @@ homeserver  <=>  daemon 的 WS 協議層（wire、四條連線 architecture-v2.m
 | 1 | 前端 → daemon | RPC `media.create`（§8）：檔名、大小、目標房間 |
 | 2 | daemon → server | 去 server **建檔**（`Upload/Create`），拿回檔案的 URL／id |
 | 3 | daemon → 前端 | RPC 回 result：server 的 URL ＋ 資料平面的 PUT URL |
-| 4 | 前端 → daemon | 以那個 URL 為基礎**發一則附件訊息**（RPC `room.send`，內容是明文） |
+| 4 | 前端 → daemon | 以那個 `upload_id` 為基礎**發一則附件訊息**（RPC `room.send_attachment`，內容是明文） |
 | 5 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（wbf-client-convention-for-chunk.md §5.2）在這一步帶 |
 | 6 | 前端 → daemon | **同時**開始 PUT bytes 到資料平面的 URL（一個 HTTP 連線，不斷送） |
 | 7 | daemon → server | 邊收邊做 chunk 加密、邊走 `Upload/*` 上傳到 homeserver |
-| 8 | daemon → 前端 | 不斷回 `progress`（§8） |
+| 8 | daemon → 前端 | `Seal` 完成之後 PUT 才回 `200`，body 是 manifest（rpc-spec.md §6.2）。進度就是 PUT 送出去多少，🚫 不走 RPC |
 
 ⚠️ 第 4 與第 6 步**並行**：訊息不必等檔案傳完才發（訊息裡只有 URL 與描述），
 接收端拿到訊息時檔案可能還在傳——這正是分片協議與 `seek` 存在的原因（wbf-client-convention-for-chunk.md §7）。
