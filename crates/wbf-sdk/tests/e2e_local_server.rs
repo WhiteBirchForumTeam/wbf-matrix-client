@@ -457,3 +457,50 @@ async fn the_heartbeat_keeps_a_quiet_line_alive_against_the_real_server() {
     client.ping().await.expect("ping after heartbeats");
     logout(&session).await.expect("logout");
 }
+
+/// 一般 Matrix 帳號那條路（matrix-sdk 的 Client）只把 state 與 crypto 落地（維護者 2026-09-30，/docs/design/storage/local-cache-db.md §4.1）：
+/// wbfuwunel 也是一台標準 Matrix server，所以直接用 `MatrixBackend::login` 走得到（登入流程本身會探活走 wbf、碰不到這條）。
+/// 登入、同步、列房間都照常，store 目錄裡只有 `matrix-sdk-state` 與 `matrix-sdk-crypto` 兩個 sqlite，🚫 沒有 event cache 與 media。
+#[cfg(feature = "matrix")]
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn the_matrix_sdk_client_keeps_only_state_and_crypto_on_disk() {
+    use wbf_sdk::chat::ChatBackend;
+    let Some(target) = target() else {
+        eprintln!("skipped: WBF_E2E_SERVER / WBF_E2E_USER / WBF_E2E_PASSWORD_FILE not set");
+        return;
+    };
+    let store_dir = std::env::temp_dir().join(format!("wbf-e2e-m-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let key = wbf_sdk::vault::Key32([5u8; 32]);
+    let (backend, session) = wbf_sdk::backend::matrix_sdk::MatrixBackend::login(
+        &target.server,
+        &target.user,
+        &target.password,
+        "wbf-e2e-two-stores",
+        &store_dir,
+        &key,
+        false,
+    )
+    .await
+    .expect("matrix-sdk login");
+    backend
+        .sync_once(None, std::time::Duration::ZERO)
+        .await
+        .expect("sync_once");
+    backend.conversations().await.expect("conversations");
+    let mut stores: Vec<String> = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".sqlite3"))
+        .collect();
+    stores.sort();
+    assert_eq!(
+        stores,
+        vec!["matrix-sdk-crypto.sqlite3".to_string(), "matrix-sdk-state.sqlite3".to_string()],
+        "只有 state 與 crypto 落地"
+    );
+    drop(backend);
+    logout(&session).await.expect("logout");
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
