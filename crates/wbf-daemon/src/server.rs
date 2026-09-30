@@ -1,7 +1,7 @@
 //! 控制平面的 listener：`ws://127.0.0.1:<port>`，一條連線一個 `Connection` 加一個 writer task。
 //!
 //! 這裡只做 socket 與 frame 的搬運；判斷全在 `connection.rs`（該不該加密、hello）與
-//! `handle.rs`（method）。收到不是 binary 的 frame 一律 `BAD_FRAME`（rpc-spec §1：沒有 text frame）。
+//! `handle.rs`（method）。收到不是 binary 的 frame 一律 `BAD_FRAME`（rpc-spec.md §1：沒有 text frame）。
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -127,7 +127,7 @@ async fn serve_connection(
 
     // `Connection` 由這個 task 獨佔；handle 的呼叫各自 spawn，回應經 channel 回來再由這裡封包。
     let connection = Arc::new(tokio::sync::Mutex::new(Connection::new(keys, policy)));
-    // 這條連線訂了什麼、現在有哪些請求在跑（rpc-spec §3.9、§4：`progress` 不用訂，發那個請求的連線自己收得到）。
+    // 這條連線訂了什麼、現在有哪些請求在跑（rpc-spec.md §3.9、§4：`progress` 不用訂，發那個請求的連線自己收得到）。
     // ⚠️ std 的 Mutex：只在同步的一小段裡拿，🚫 不跨 await。
     let subscriptions = Arc::new(std::sync::Mutex::new(Subscriptions::default()));
     let in_flight = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
@@ -277,7 +277,7 @@ fn sealed_or_log(sealed: Result<Vec<u8>, std::io::Error>, what: &str) -> Option<
 }
 
 /// 這條連線的推播 task（link-pool.md §6）：core 的每一則事件 → 要不要送由訂閱集合與「是不是自己發的工作」決定 → 封包送出。
-/// 讀太慢被覆蓋掉 n 則 → 送 `desync { missed: n }`（daemon-runtime §5.3）。連線關了（writer 沒了）就結束。
+/// 讀太慢被覆蓋掉 n 則 → 送 `desync { missed: n }`（daemon-runtime.md §5.3）。連線關了（writer 沒了）就結束。
 async fn forward_pushes(
     handle: Arc<Handle>,
     connection: Arc<tokio::sync::Mutex<Connection>>,
@@ -329,7 +329,7 @@ async fn forward_pushes(
     }
 }
 
-/// `subscribe`／`unsubscribe`（rpc-spec §3.9）：改這條連線的集合，回改完之後的。
+/// `subscribe`／`unsubscribe`（rpc-spec.md §3.9）：改這條連線的集合，回改完之後的。
 fn subscription_response(
     subscriptions: &std::sync::Mutex<Subscriptions>,
     request: &Request,

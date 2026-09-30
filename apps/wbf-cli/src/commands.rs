@@ -1,4 +1,4 @@
-//! 每個命令一個函數，照 CLI 規格 §3。stdout 只有結果 JSON（`seek` 例外：明文 bytes），進度與警告在 stderr。
+//! 每個命令一個函數，照 wbf-cli-spec.md §3。stdout 只有結果 JSON（`seek` 例外：明文 bytes），進度與警告在 stderr。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
                 logout(&session?).await?;
                 return print_json(&json!({ "ok": true }));
             }
-            // `logout` 就是 `account del <current 帳號>`（CLI 規格 §3.1）。
+            // `logout` 就是 `account del <current 帳號>`（wbf-cli-spec.md §3.1）。
             let current = context.core()?.current_user_id()?;
             let result = log_out(context, &current, accept_history_loss).await?;
             print_json(&json!({ "ok": true, "user": result.user }))
@@ -187,7 +187,7 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
     }
 }
 
-/// `login` 要讀哪個 password 檔：旗標沒給就用 conf 的 `PASSWORD_FILE`（CLI 規格 §10.5）。
+/// `login` 要讀哪個 password 檔：旗標沒給就用 conf 的 `PASSWORD_FILE`（wbf-cli-spec.md §10.5）。
 ///
 /// ⚠️ 存進 conf 的是**路徑**，秘密是那個檔的**內容**——它從來不進 conf，自動生成也不寫這個鍵。
 ///
@@ -211,7 +211,7 @@ fn on_off(value: bool) -> String {
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
 pub struct Context {
     pub unlock: UnlockOptions,
-    /// 常駐狀態（architecture-v2 §6）。⚠️ 現在一個命令建一個、命令結束就丟；
+    /// 常駐狀態（architecture-v2.md §6）。⚠️ 現在一個命令建一個、命令結束就丟；
     /// daemon 接手之後它會活過整個程序，而這裡的程式碼不必改——這正是先做 `wbf-core` 的理由。
     ///
     /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次。
@@ -221,9 +221,9 @@ pub struct Context {
     pub token_override: Option<String>,
     pub quiet: bool,
     pub transport: Transport,
-    /// 這次讀到的 conf（CLI 規格 §10）。命令自己的旗標沒給時從這裡拿預設。
+    /// 這次讀到的 conf（wbf-cli-spec.md §10）。命令自己的旗標沒給時從這裡拿預設。
     pub conf: Conf,
-    /// `SERVER_BACKUP`：標準 Matrix key backup 開著嗎（room-key-backup §3）。
+    /// `SERVER_BACKUP`：標準 Matrix key backup 開著嗎（room-key-backup.md §3）。
     /// ⚠️ 認不得的值落到 `true`——壞掉要壞在「備份還開著」那一邊。
     pub server_backup: bool,
     /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 §10.4）。同樣落到 `true`。
@@ -253,7 +253,7 @@ const KNOWN_CONF_KEYS: &[&str] = &[
 ];
 
 impl Context {
-    /// 優先序：**旗標 > 環境變數 > conf > 內建預設**（CLI 規格 §10.2），每個值各自比一次。
+    /// 優先序：**旗標 > 環境變數 > conf > 內建預設**（wbf-cli-spec.md §10.2），每個值各自比一次。
     ///
     /// 旗標與環境變數由 clap 合在一起處理（`env = "WBF_…"`），所以這裡看到 `None` 就是
     /// 「兩者都沒給」——conf 接手。⚠️ 這也是那幾個旗標拿掉 clap 預設值的理由：留著預設值
@@ -356,8 +356,8 @@ impl Context {
     /// `--token` 模式：**不碰 vault、不碰帳號目錄**，直接拿那個 token 講話。
     ///
     /// ⚠️ 這條路徑刻意**不經過 `Core`**：core 的世界是「一個有 vault 的資料目錄」，
-    /// 而 `--token` 正是要繞過那整件事（除錯與腳本用，CLI 規格 §2）。
-    /// 📎 它在 daemon 模型下是什麼意思還沒定（architecture-v2 §6.1 的開放項）。
+    /// 而 `--token` 正是要繞過那整件事（除錯與腳本用，wbf-cli-spec.md §2）。
+    /// 📎 它在 daemon 模型下是什麼意思還沒定（architecture-v2.md §6.1 的開放項）。
     ///
     /// ⚠️ 打一次 `whoami` 填真的 `user_id`：續傳狀態檔的 `is_for` 要靠它分辨「不是你的
     /// 上傳」，填佔位值會讓兩把不同的 token 比成相等（PR #6 審查 rumia🟡2）。
@@ -452,7 +452,7 @@ impl Context {
         }
     }
 
-    /// 自動生成 `wbf.conf`（CLI 規格 §10.3）。三個條件都要成立，這裡管前兩個，
+    /// 自動生成 `wbf.conf`（wbf-cli-spec.md §10.3）。三個條件都要成立，這裡管前兩個，
     /// 第三個（命令成功）由呼叫點決定——它在 `dispatch` 的結果是 `Ok` 之後才叫。
     ///
     /// 🚫 已經存在的永遠不改寫，連補鍵都不做：那是使用者的檔，不是我們的狀態檔。
@@ -469,7 +469,7 @@ impl Context {
         Ok(())
     }
 
-    /// 備份被關掉時，任何會拿到房間金鑰的命令印一次（CLI 規格 §3.6）。
+    /// 備份被關掉時，任何會拿到房間金鑰的命令印一次（wbf-cli-spec.md §3.6）。
     ///
     /// ⚠️ 一個命令只印一次：`rooms::backend` 在同一個命令裡可能被叫不只一次，
     /// 而重複三次的警告等於沒有警告。
@@ -514,7 +514,7 @@ impl Context {
     }
 }
 
-/// `login`／`account add`（CLI 規格 §3.1）。
+/// `login`／`account add`（wbf-cli-spec.md §3.1）。
 ///
 /// rpc-cli 在這裡只做三件前端的事：**把密碼生出來**、**決定要不要設 passphrase**、
 /// 印出來。登入本身在 `Core`。
@@ -523,7 +523,7 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), CoreEr
     let server = context.server_override.clone().ok_or_else(|| {
         CoreError::new(CoreErrorKind::Usage, "login needs --server (or WBF_SERVER)")
     })?;
-    // conf 的 `PASSWORD_FILE` 補上旗標沒給的那格（CLI 規格 §10.5：它是**路徑**不是秘密）。
+    // conf 的 `PASSWORD_FILE` 補上旗標沒給的那格（wbf-cli-spec.md §10.5：它是**路徑**不是秘密）。
     let password_file = find_password_file(args, &context.conf);
     let password = match password_file.as_deref() {
         Some(path) => read_password_file(path)?,
@@ -539,7 +539,7 @@ async fn login_command(context: &Context, args: &LoginArgs) -> Result<(), CoreEr
     print_value(&result)
 }
 
-/// `account <action>`（CLI 規格 §3.1）。多帳號是前提：一台機器上可以同時登入好幾個，
+/// `account <action>`（wbf-cli-spec.md §3.1）。多帳號是前提：一台機器上可以同時登入好幾個，
 /// `current` 只回答「沒帶 `--account` 時用誰」。
 async fn account_command(context: &Context, action: AccountAction) -> Result<(), CoreError> {
     match action {
@@ -633,13 +633,13 @@ fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), Cor
                     "no recovery key is kept here for {user}; run `key-backup recovery` while logged in as them"
                 ))
             })?;
-            // 會印秘密的第二個命令（另一個是 `key-backup recovery`）。CLI 規格 §3.6。
+            // 會印秘密的第二個命令（另一個是 `key-backup recovery`）。wbf-cli-spec.md §3.6。
             print_json(&json!({ "user": user, "recovery_key": key.as_str() }))
         }
     }
 }
 
-/// `key-backup <action>`（CLI 規格 §3.6；room-key-backup.md）。
+/// `key-backup <action>`（wbf-cli-spec.md §3.6；room-key-backup.md）。
 ///
 /// ⚠️ conf 的兩個開關在**這一層**判斷：core 被叫到就做，「要不要叫它」是前端的決定（§3）。
 async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Result<(), CoreError> {
@@ -768,9 +768,9 @@ async fn destroy_account_command(
 // | 模式 | 走哪 | 為什麼 |
 // |---|---|---|
 // | 登入中 | `Core` | 有 vault、有帳號目錄、有快取與媒體池 |
-// | `--token` | 直接開通道 | 那個模式的定義就是「不碰 vault、不碰帳號目錄」（CLI 規格 §2） |
+// | `--token` | 直接開通道 | 那個模式的定義就是「不碰 vault、不碰帳號目錄」（wbf-cli-spec.md §2） |
 //
-// 📎 `--token` 在 daemon 模型下是什麼意思還沒定（architecture-v2 §6.1 的開放項）。
+// 📎 `--token` 在 daemon 模型下是什麼意思還沒定（architecture-v2.md §6.1 的開放項）。
 
 /// `--token` 模式的通道：不碰 vault，直接拿那串 token 講話。
 ///
@@ -939,7 +939,7 @@ async fn download_with_raw_client(
     let report = match result {
         Ok(report) => report,
         Err(error) => {
-            // 🚫 半成品不留：下次會被當成完整的用（CLI 規格 §4 exit 3 的語意）。
+            // 🚫 半成品不留：下次會被當成完整的用（wbf-cli-spec.md §4 exit 3 的語意）。
             drop(file);
             let _ = std::fs::remove_file(out);
             return Err(error.into());
@@ -983,7 +983,7 @@ async fn seek_command(
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&result.bytes)?;
     stdout.flush()?;
-    // ⚠️ 摘要是**結果**不是進度，所以 `--quiet` 也印（CLI 規格 §3.3.1）。
+    // ⚠️ 摘要是**結果**不是進度，所以 `--quiet` 也印（wbf-cli-spec.md §3.3.1）。
     // bytes 已經寫出去了；摘要印不出來就用 exit code 講，🚫 不假裝成功。
     let summary = json_value_of(&result.summary(at, len))?;
     eprintln!("{summary}");
@@ -998,7 +998,7 @@ fn print_json(value: &serde_json::Value) -> Result<(), CoreError> {
 
 #[cfg(test)]
 mod conf_precedence_tests {
-    //! 優先序（CLI 規格 §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次。
+    //! 優先序（wbf-cli-spec.md §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次。
     //!
     //! 🚫 這裡不設環境變數：`std::env::set_var` 是行程全域的，跟同時跑的測試會互相汙染。
     //! 環境變數那一格由 clap 負責（`env = "WBF_…"`），它把旗標與環境合成同一個 `Option`——

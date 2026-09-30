@@ -1,4 +1,4 @@
-//! 一條 RPC 連線的狀態機（rpc-spec §1.1–§1.4）：bytes 進、`Inbound` 出；訊息進、bytes 出。
+//! 一條 RPC 連線的狀態機（rpc-spec.md §1.1–§1.4）：bytes 進、`Inbound` 出；訊息進、bytes 出。
 //!
 //! 這裡**不碰 socket、不碰 core**，所以整個可以離線測。它負責的判斷只有三個：
 //! 1. 這包能不能拆（`pack`）、拆出來是不是 JSON；
@@ -15,7 +15,7 @@ use crate::message::{code, CloseReason, Request, Response};
 use crate::pack::{self, PackError, PackType, RpcKeys, Side};
 use crate::protocol;
 
-/// 全 daemon 共用的加密狀態（rpc-spec §1.1）：預設開。關掉只為除錯。
+/// 全 daemon 共用的加密狀態（rpc-spec.md §1.1）：預設開。關掉只為除錯。
 #[derive(Clone)]
 pub struct EncryptionPolicy(Arc<AtomicBool>);
 
@@ -42,7 +42,7 @@ pub enum Inbound {
     Request(Request),
     /// 協議層錯誤：先送這個 `Response`（明文），再關連線。
     Close(Response),
-    /// 一則請求層的錯誤（寫壞的請求）：回完**連線照用**（rpc-spec §5.1 的 `100`）。
+    /// 一則請求層的錯誤（寫壞的請求）：回完**連線照用**（rpc-spec.md §5.1 的 `100`）。
     Reply(Response),
 }
 
@@ -121,7 +121,7 @@ impl Connection {
             }
         };
         // 是 JSON 但不是一個請求（沒有 `method`、`id` 不是整數…）→ **請求層的 100**，
-        // 連線照用（rpc-spec §5.1）。🚫 不因為一則寫壞的請求就關掉整條連線。
+        // 連線照用（rpc-spec.md §5.1）。🚫 不因為一則寫壞的請求就關掉整條連線。
         let request: Request = match serde_json::from_value(value.clone()) {
             Ok(request) => request,
             Err(error) => {
@@ -186,7 +186,7 @@ impl Connection {
                 ),
             ));
         };
-        // 重複的 hello 只重談一次；已談定的連線再 hello 不換版本（rpc-spec §1.3）。
+        // 重複的 hello 只重談一次；已談定的連線再 hello 不換版本（rpc-spec.md §1.3）。
         let protocol = *self.protocol.get_or_insert(agreed);
         Inbound::HelloAccepted {
             id: request.id,
@@ -220,7 +220,7 @@ impl Connection {
         )
     }
 
-    /// 協議層的 close 通知**一律明文**（rpc-spec §1.4）：對方可能沒有金鑰。
+    /// 協議層的 close 通知**一律明文**（rpc-spec.md §1.4）：對方可能沒有金鑰。
     pub fn seal_close(&self, notice: &Response) -> Result<Vec<u8>, std::io::Error> {
         self.seal(PackType::Plain, &Self::serialize_json(notice, "Response")?)
     }
@@ -390,7 +390,7 @@ mod tests {
         let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "[1,2,3]"));
         assert_eq!(close_code(&inbound), Some(9003));
 
-        // hello 之後寫壞的請求：回 100，🚫 連線不關（rpc-spec §5.1）。
+        // hello 之後寫壞的請求：回 100，🚫 連線不關（rpc-spec.md §5.1）。
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
         connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
         let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "[1,2,3]"));

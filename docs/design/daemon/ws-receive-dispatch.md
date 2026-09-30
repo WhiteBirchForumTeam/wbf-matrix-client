@@ -1,6 +1,6 @@
 # WS 收包分派：一條連線、任何順序、依會話表交付
 
-> 維護者 2026-09-21 定的形狀（daemon-runtime §10 的第 4 階段，SDK 這一半）。
+> 維護者 2026-09-21 定的形狀（daemon-runtime.md §10 的第 4 階段，SDK 這一半）。
 > 之前 `WsChannel` 是「送一個、等一個」，而且把不是回覆的推播丟在地上（PR #49 的暫時做法）——
 > 維護者指出那是設計錯誤：**送一個等一個沒錯，錯的是「下一個收到的就是我的回覆」**。
 > 收到什麼就依它的種類處理，順序完全亂掉也不該出事；會話狀態另外維護一張 id 表。
@@ -12,7 +12,7 @@
 永遠不等回覆；收進來的每個 pack 由讀取 task 查表交給在等的那個人，沒人等就是「無主」，計數、不亂交。
 每個收到的 pack 都會經過一個**鉤子**，之後 daemon 的 RPC 面拿它決定要不要送到 UI；這一層只呼叫，不判斷。
 
-跟 server 那邊同形（wire-format §5：兩端對稱的四步「封裝 → 送出 → 接收 → 拆包 → 派發」；
+跟 server 那邊同形（wbf-wire-format.md §5：兩端對稱的四步「封裝 → 送出 → 接收 → 拆包 → 派發」；
 server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/` 的註冊表）。
 
 ## 1. 三層，各回答一個問題
@@ -24,16 +24,16 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
 | **連線** | `link.rs` | 把上面兩個接起來：`WsLink` 起兩個 task、給呼叫端「登記 → 送 → 等」的 API；關線時把表清掉 | 重連。那是第 8 階段監督者的事 |
 | 通道 | `channel.rs`（既有） | `WsChannel` 變成 `WsLink` 的薄殼，`PackChannel` 介面**不動**：`HttpChannel`、假 server、`WbfClient` 一個字不改 | |
 
-⭐ 分線的設計（architecture-v2 §5.1.1：房間、金鑰、媒體、雜項；落地是五條，link-pool.md §1）**不進這一層**。一條 `WsLink` 一張表；daemon 開五條就是五個實例，
+⭐ 分線的設計（architecture-v2.md §5.1.1：房間、金鑰、媒體、雜項；落地是五條，link-pool.md §1）**不進這一層**。一條 `WsLink` 一張表；daemon 開五條就是五個實例，
 哪個命令走哪條線由 daemon 決定，link 自己不知道它是做什麼的。這就是「通用」：只用一條線也行，只是擠。
 
 ## 2. 會話表的鍵：`id` 是會話的名字，`seq` 是會話內的計數
 
-照 wire-format §4.1（PR #42 定案）。兩種鍵：
+照 wbfuwunel 的 wbf-wire-format.md §4.1（PR #42 定案）。兩種鍵：
 
 | 鍵 | 誰 | 一個項目收幾個 pack |
 |---|---|---|
-| `Session(id)` | 具名會話：`Recent`、`Device/Fetch`、`ItemsDestroy`、`Subscribe`（`id` 由 client 選，`id::SESSION` 型別） | 多個：所有抄這個 `id` 的 pack，包含推播（`Push`、`CryptoState`、`DeviceChanged`）與 **`Superseded`**（它的 `id` 就是訂閱的 id，wire-format §3.4） |
+| `Session(id)` | 具名會話：`Recent`、`Device/Fetch`、`ItemsDestroy`、`Subscribe`（`id` 由 client 選，`id::SESSION` 型別） | 多個：所有抄這個 `id` 的 pack，包含推播（`Push`、`CryptoState`、`DeviceChanged`）與 **`Superseded`**（它的 `id` 就是訂閱的 id，wbfuwunel 的 wbf-wire-format.md §3.4） |
 | `Reply { id, seq }` | 一問一答：`Hello`、`Ping`、`Info`、`Read`、`Send`、橋、`Upload/Chunk`／`Status`／`Seal`／`Abort`、`Unsubscribe` | 一個：`id` 與 `seq` 都抄回的那個 Control 回應 |
 
 ### 2.1 分派規則（讀取 task 每收一個 pack 走一次）
@@ -54,7 +54,7 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
   （例：拿訂閱的 id 送 `Unsubscribe`）——那個 Ack 會進訂閱的收件匣。現在 `WbfClient` 每個命令都發新的會話 id，沒有這個問題；
   這條是給以後的人看的。
 - 🚨 **fail closed**：無主的 pack 🚫 永遠不交給「剛好在等」的人。第 4 條之前沒有任何「猜」。
-- 🚨 **登記一定在送出之前**。回覆比登記早到就變無主——server 那邊補窗曾因「先收窗再註冊」漏事件（wbf-event-push.md §7），同型的錯。
+- 🚨 **登記一定在送出之前**。回覆比登記早到就變無主——server 那邊補窗曾因「先收窗再註冊」漏事件（wbfuwunel 的 wbf-event-push.md §7），同型的錯。
 
 ### 2.2 為什麼是 `Reply { id, seq }` 而不是 `Unordered(seq)`
 
@@ -105,7 +105,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
   `Received.session`／`route` 是查表那一刻的答案；交付在放鎖之後，中間項目被拿掉的話交付會算成無主（差一個 pack、只影響計數）。
 - **要不要送到 UI 是鉤子那頭決定的**（之後 daemon 的 RPC 面那支「送到 UI」的函數）。link 只有呼叫，沒有過濾。
 - 鉤子是同步、不可等待的：要做慢事（寫庫、推 RPC）就自己丟進自己的佇列，讀取 task 不被它拖住。
-  daemon-runtime §4.1 的「先寫庫、後發事件」仍由那頭守。
+  daemon-runtime.md §4.1 的「先寫庫、後發事件」仍由那頭守。
 - 鉤子與會話表是兩條路：會話項交付給在等的呼叫者，鉤子交付給 UI 那條線。同一個 pack 兩邊都拿得到。
 
 ## 5. 送出：一條佇列、一個 task、天然保序
@@ -135,7 +135,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 - `WsLink::request_with_policy(pack, AckPolicy { attempts, timeout })`：登記一次，逾時而且還有次數就**原樣**重送（同 id、同 seq、同 bytes）。
   第一次的回覆晚到與第二次的回覆同鍵：先到的交付，後到的無主，計數。
 - 🚨 **預設 `attempts = 1`，不重送**。fail closed：`Upload/Create` 重送會開出兩個上傳。冪等的呼叫點自己開：
-  `Chunk`（現在就有 `Corrupt` 重送一次）、`Event/Send`（server 以 `txn_id` 去重）、`Session/Login`（wire-format §6.3.2 維護者建議 3 秒沒回重送、連三次算無回應）。
+  `Chunk`（現在就有 `Corrupt` 重送一次）、`Event/Send`（server 以 `txn_id` 去重）、`Session/Login`（wbfuwunel 的 wbf-wire-format.md §6.3.2 維護者建議 3 秒沒回重送、連三次算無回應）。
 - 哪些要 Ack 看 `WANT_ACK`，跟現在一樣。
 
 ## 7. 關線：表整張清空，每一項收到錯
@@ -172,6 +172,6 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 
 ## 10. 之後
 
-- e2ee-walkthrough §16.5 第 8、10 列與 to-device-client §8 第 4、5 列可以勾（推播收得到、`Superseded` 收得到）。
-- daemon 第 4 階段的另一半（daemon-runtime §5：推播封裝、`desync`、兩條佇列）接在鉤子後面。
+- e2ee-walkthrough.md §16.5 第 8、10 列與 to-device-client.md §8 第 4、5 列可以勾（推播收得到、`Superseded` 收得到）。
+- daemon 第 4 階段的另一半（daemon-runtime.md §5：推播封裝、`desync`、兩條佇列）接在鉤子後面。
 - `Subscribe` 帶 `cd_seq` 補窗、`Event/Subscribe`（0x04）的 codec 是第 6 階段，這一支只保證通道收得到。

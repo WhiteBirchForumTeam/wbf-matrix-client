@@ -182,11 +182,11 @@ fn encode_rejects_reserved_flags() {
     assert_eq!(bit5.encode(), Err(EncodeError::ReservedFlags(0x20)));
 }
 
-/// 向量檔的每個 id 都要說得出自己是什麼型別（wire-format §2.2）。
+/// 向量檔的每個 id 都要說得出自己是什麼型別（wbfuwunel 的 wbf-wire-format.md §2.2）。
 ///
 /// ⚠️ 這條補的是 `packs_decode_and_re_encode_identically` 看不見的洞：codec 只搬 8 個 byte，
 /// 裸的 `10`（型別 0x00、值 10）跟組好的 `0x01…0a` 對它一樣好，所以 server 那邊漏組型別時
-/// 這裡整片綠，只有對真 server 跑才會收到 `InvalidRequest`（handover §5）。
+/// 這裡整片綠，只有對真 server 跑才會收到 `InvalidRequest`（handover.md §5）。
 #[test]
 fn every_vector_id_carries_a_type_byte_we_know() {
     use wbf_wire::pack::id;

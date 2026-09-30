@@ -23,7 +23,7 @@ pub enum WatchMode {
     Tail,
     /// 等這麼多秒就回來。
     Wait { seconds: u64 },
-    /// 等到**別人**送的第一則就回來（自己送的不算，CLI 規格 §3.4.2）。
+    /// 等到**別人**送的第一則就回來（自己送的不算，wbf-cli-spec.md §3.4.2）。
     Once { timeout_seconds: Option<u64> },
 }
 
@@ -122,7 +122,7 @@ impl Core {
                 })
                 .collect();
             // 🚨 寫跟事件**一起**進 queue：事件由寫入者在 commit 之後發，
-            // 所以收到通知的人去讀本地一定讀得到（daemon-runtime §2.3）。
+            // 所以收到通知的人去讀本地一定讀得到（daemon-runtime.md §2.3）。
             let writer_me = me.clone();
             cache.post(
                 move |cache| {
@@ -152,7 +152,7 @@ impl Core {
     /// 這是快取的**主要進料口**；`history`／`files`／`watch` 只是順手寫穿。
     ///
     /// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（server 的
-    /// pack-pipeline §6.4）；下次再跑會從水位重來。
+    /// wbfuwunel 的 pack-pipeline.md §6.4）；下次再跑會從水位重來。
     ///
     /// 水位（`cg_seq`）**只由這支動**（room-sync.md）：推播不碰它。起點由 UI 定：帶 `since` 就從那裡起（UI 手上有每則 `room.message`
     /// 的 `g_seq` 與上次回的 `cg_seq_after`），沒帶就用存的上一次 Recent 的水位；拉完把水位推到這次最新的 `fs`。
@@ -171,7 +171,7 @@ impl Core {
     ) -> Result<RecentSummary, CoreError> {
         let account = self.account_or_current(target)?;
         let (cache, me) = self.server_cache_and_me(&account)?;
-        // 🚨 `Recent` 只有 wbf 講得出來（回應是一串 `Batch`，pack-pipeline §6）——
+        // 🚨 `Recent` 只有 wbf 講得出來（回應是一串 `Batch`，wbfuwunel 的 pack-pipeline.md §6）——
         // 走 `http` 或對方不是 wbf 的話，這個功能就是**關的**，而閘門會說出是哪一個理由。
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
@@ -210,7 +210,7 @@ impl Core {
 
 /// 補窗 job（`sync.recent` 與 `room_sync` 共用）：從 `cg_seq` 起一窗一窗拉、每批寫一次 DB、最後才推水位。
 ///
-/// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（server 的 pack-pipeline §6.4）；下次再跑會從水位重來。
+/// ⚠️ 中途斷線或 server 回錯：已寫進快取的**有效**，水位不動（wbfuwunel 的 pack-pipeline.md §6.4）；下次再跑會從水位重來。
 ///
 /// Args:
 ///     client: 已經 hello 過的線（`Recent` 要 `recent` feature）
@@ -319,7 +319,7 @@ pub(crate) async fn pull_recent(
     }
     if let Some(new_cg_seq) = summary.new_cg_seq {
         // 🚨 水位最後才推進，而且**跟事件走同一條 queue** —— 這樣「事件還沒寫進去、
-        // 水位卻前進了」不可能發生（daemon-runtime §2.3）。
+        // 水位卻前進了」不可能發生（daemon-runtime.md §2.3）。
         let me_here = me.to_string();
         cache
             .run(move |cache| cache.set_cg_seq(&me_here, new_cg_seq))

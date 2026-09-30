@@ -1,4 +1,4 @@
-//! 線上規格 §3、§4 的記憶體版 server，實作 `PackChannel`，讓上傳／下載管線不用真 server 就能測。
+//! wbfuwunel 的 chunked-upload-spec.md §3、§4 的記憶體版 server，實作 `PackChannel`，讓上傳／下載管線不用真 server 就能測。
 //! 它照規格拒絕（`OutOfOrder`、`Conflict`、`NotFound`…），並提供故障旋鈕（掉 Ack、竄改一塊）。
 //! 它不是權威：與真 server 的差異由 `e2e_local_server.rs` 抓。
 
@@ -286,7 +286,7 @@ impl FakeServer {
         }
     }
 
-    /// `Event/Send`（media-attachments §3 ＋ wbf-room-device-version §7）：收下並發一個假的 event_id；
+    /// `Event/Send`（wbfuwunel 的 media-attachments.md §3 ＋ wbfuwunel 的 wbf-room-device-version.md §7）：收下並發一個假的 event_id；
     /// `current_room_version` 有設時，`m.room.encrypted` 帶的 `room_version` 對不上就回 1506（meta 帶目前的號碼）。
     fn send(
         &mut self,
@@ -573,7 +573,7 @@ impl FakeServer {
         features
     }
 
-    /// `Event/Recent` 一窗 → 一串 `Batch`（pack-pipeline §6）：只在 `(cg_seq, before)` 之間數 `limit` 則，每 `batch` 則一個 Batch。
+    /// `Event/Recent` 一窗 → 一串 `Batch`（wbfuwunel 的 pack-pipeline.md §6）：只在 `(cg_seq, before)` 之間數 `limit` 則，每 `batch` 則一個 Batch。
     fn recent_batches(&self, request: &Pack) -> Vec<Pack> {
         let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
         let limit = meta["limit"].as_u64().unwrap_or(320).clamp(1, 500) as usize;
@@ -640,7 +640,7 @@ impl FakeServer {
         packs
     }
 
-    /// `Device/Fetch` 一窗 → 一串 `Device/Batch`（wbf-to-device.md §3）：只要 count > cd_seq 的，舊→新，最多 `limit` 則，
+    /// `Device/Fetch` 一窗 → 一串 `Device/Batch`（wbfuwunel 的 wbf-to-device.md §3）：只要 count > cd_seq 的，舊→新，最多 `limit` 則，
     /// 每 `device_batch_size` 則一個 Batch；meta 帶 `counts`（跟 data 一一對應）、`ot`／`nt`。
     fn device_batches(&self, request: &Pack) -> Vec<Pack> {
         let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
@@ -758,7 +758,7 @@ impl FakeServer {
         replies
     }
 
-    /// `Device/Subscribe`（不帶 `cd_seq`）→ `Ack` 再 `CryptoState`（wbf-e2ee.md §3.3）；`device_id` 缺了 → `InvalidRequest`。
+    /// `Device/Subscribe`（不帶 `cd_seq`）→ `Ack` 再 `CryptoState`（wbfuwunel 的 wbf-e2ee.md §3.3）；`device_id` 缺了 → `InvalidRequest`。
     fn subscribe_replies(&mut self, request: &Pack) -> Vec<Pack> {
         let meta: serde_json::Value = serde_json::from_slice(&request.meta).unwrap_or_default();
         let reply = |kind: Kind, subtype: u8, seq: u32, meta: serde_json::Value| Pack {

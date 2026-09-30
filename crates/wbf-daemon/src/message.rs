@@ -1,4 +1,4 @@
-//! 加密之前的訊息形狀（local-interface §6）與 code 表（rpc-spec §5、§1.4）。
+//! 加密之前的訊息形狀（local-interface.md §6）與 code 表（rpc-spec.md §5、§1.4）。
 //!
 //! 只有兩種形狀：`Request`（有 `id` 要回、沒 `id` 是推播）與 `Response`（`code`／`msg`／`result`／`id`
 //! 平鋪，🚫 不是 JSON-RPC 的 `result`／`error` 二選一）。協議層的 close 通知**也是 `Response`**
@@ -43,7 +43,7 @@ pub struct Response {
     /// 「沒帶的時候預設是什麼」，🚫 不必去記規格。不認得 `sync` 的 method 這個欄位**不在**。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<wbf_core::SyncMode>,
-    /// 失敗時順手帶回來的東西（rpc-spec §5.3）：只有少數錯誤有，例：`room_devices_changed`（1401）帶 daemon 自動重拿的房間狀態。
+    /// 失敗時順手帶回來的東西（rpc-spec.md §5.3）：只有少數錯誤有，例：`room_devices_changed`（1401）帶 daemon 自動重拿的房間狀態。
     /// 沒有就**不在**（跟 `sync` 一樣），成功回應永遠沒有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
@@ -87,7 +87,7 @@ impl Response {
         response
     }
 
-    /// 協議層的 close 通知（rpc-spec §1.4）：同一個形狀，`code` 9xxx，`result.close` 給人讀 log。
+    /// 協議層的 close 通知（rpc-spec.md §1.4）：同一個形狀，`code` 9xxx，`result.close` 給人讀 log。
     pub fn close(id: Option<u64>, reason: CloseReason, msg: impl Into<String>) -> Response {
         Response {
             code: reason.code(),
@@ -100,7 +100,7 @@ impl Response {
     }
 }
 
-/// 請求層的 RPC 錯誤（rpc-spec §5.1）：daemon 自己擋下、沒碰 core、連線照用。
+/// 請求層的 RPC 錯誤（rpc-spec.md §5.1）：daemon 自己擋下、沒碰 core、連線照用。
 pub mod code {
     pub const OK: u32 = 0;
     pub const BAD_REQUEST: u32 = 100;
@@ -111,12 +111,12 @@ pub mod code {
     pub const DAEMON_SHUTTING_DOWN: u32 = 107;
     /// daemon 自己組不出回應（它的 bug）。🚫 不是前端的錯，所以🚫 不關連線。
     pub const INTERNAL: u32 = 108;
-    /// 這個 daemon 沒有寫這個資料目錄的權（別人握著排他鎖，architecture-v2 §0.2）。
+    /// 這個 daemon 沒有寫這個資料目錄的權（別人握著排他鎖，architecture-v2.md §0.2）。
     /// ⚠️ 這**不是**「vault 鎖著」（那是 1001）：它是「這個目錄現在是別人的」。
     pub const NO_WRITE_ACCESS: u32 = 109;
 }
 
-/// 協議層：這條連線本身出了問題，回完就關（rpc-spec §1.4）。
+/// 協議層：這條連線本身出了問題，回完就關（rpc-spec.md §1.4）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseReason {
     BadToken,
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(Response::from_core_error(Some(1), &error).code, 1001);
     }
 
-    /// 帶 `data` 的錯誤（`room_devices_changed` 帶 daemon 自動重拿的房間狀態，rpc-spec §5.3）：`data` 原樣進回應，`result` 仍是 null；
+    /// 帶 `data` 的錯誤（`room_devices_changed` 帶 daemon 自動重拿的房間狀態，rpc-spec.md §5.3）：`data` 原樣進回應，`result` 仍是 null；
     /// 沒 `data` 的錯誤回應裡**沒有**這個欄位（🚫 不送 `null`）。
     #[test]
     fn core_error_data_rides_along_and_is_absent_when_there_is_none() {

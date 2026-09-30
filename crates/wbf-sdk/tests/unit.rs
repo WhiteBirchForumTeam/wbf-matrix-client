@@ -95,7 +95,7 @@ fn chunk_opened_under_wrong_index_is_rejected() {
 
 #[test]
 fn chunk_opened_with_description_nonce_is_rejected() {
-    // 描述與塊的 AAD 不同，拿描述密文當塊解必須失敗（約定 §3：網域分開）。
+    // 描述與塊的 AAD 不同，拿描述密文當塊解必須失敗（wbf-client-convention-for-chunk.md §3：網域分開）。
     let file_cipher = fixed(Cipher::Aes256Gcm);
     let sealed = file_cipher
         .seal_description(DescriptionSlot::Create, b"0123456789abcdef")
@@ -236,7 +236,7 @@ fn length_helpers_reject_zero_chunk_size_and_out_of_range_index() {
     assert_eq!(chunk_count(u64::MAX, 1), None, "more chunks than indices");
 }
 
-/// `Event/Recent` 對著 server 產生的 `wbf-vectors.json`（pack-pipeline §6）：請求要逐 byte 一樣（meta 的鍵序也是，
+/// `Event/Recent` 對著 server 產生的 `wbf-vectors.json`（wbfuwunel 的 pack-pipeline.md §6）：請求要逐 byte 一樣（meta 的鍵序也是，
 /// `id` 是 client 選的），回應是 `Event/Batch`，data 是 u32 大端長度前綴的事件。
 #[test]
 fn event_recent_and_batch_match_server_vectors() {
@@ -491,7 +491,7 @@ fn length_prefixed_events_round_trip_and_reject_misaligned_data() {
     assert!(split_length_prefixed(&extra).is_err(), "one trailing byte");
 }
 
-/// `Event/Send` 的 meta 鍵序照 media-attachments.md §3：room_id、type、txn_id、attachments。
+/// `Event/Send` 的 meta 鍵序照 wbfuwunel 的 media-attachments.md §3：room_id、type、txn_id、attachments。
 #[test]
 fn event_send_meta_shape() {
     use wbf_sdk::protocol::{self, SendRequest};

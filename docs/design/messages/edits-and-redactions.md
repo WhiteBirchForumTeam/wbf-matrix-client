@@ -190,7 +190,7 @@ backend 的 `history` 回 `EventPage`（原樣、照上游順序，`next` 從原
 - 🚫 **不寫**：沒有 `event_id` 或 `sender` 的（佔位值相等會讓 edit 的 sender 比對放行）；事件自帶的 `room_id` 跟參數不一樣的。
 - 同一則再來：`raw_event`／`r_seq`／`g_seq` 只從 NULL 補；server 蓋了 `redacted_because` 就 `is_redacted = 1`（只升不降）；
   原本是 `general`、這次帶明文 → 照明文分類，當作第一次處理。其他一律不動（`content_json` 不被覆蓋）。
-- msg／edit 的內容是約定 §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）。
+- msg／edit 的內容是wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）。
 - 每一則寫入時都查「有沒有 redact、edit 在等這則」，redact 先處理；自己是 edit／redact 時，目標在就處理，不在就等。
 
 **讀取**：`find_current_edit` 照 §5；reaction 🚨 只算讀者自己同步過、沒 hide、沒被 redact 的（PR #39 審查 rumia🟡、cirno💡1、salvia）。

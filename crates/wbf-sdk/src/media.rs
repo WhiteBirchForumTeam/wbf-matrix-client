@@ -133,7 +133,7 @@ pub async fn fetch<C: PackChannel>(
         )));
     }
     let finished = writer.finish()?;
-    // 明文 sha256（約定 §3.1 第 5 條）由 verify 過的塊逐塊保證；這裡另有 BLAKE3 當檔名。
+    // 明文 sha256（wbf-client-convention-for-chunk.md §3.1 第 5 條）由 verify 過的塊逐塊保證；這裡另有 BLAKE3 當檔名。
     pool.adopt(&pending_name, &finished.hash_hex)?;
     let bytes_on_disk = pool.bytes_on_disk(&finished.hash_hex)?;
     cache.media_finish(

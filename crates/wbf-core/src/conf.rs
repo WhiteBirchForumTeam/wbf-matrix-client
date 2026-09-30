@@ -1,4 +1,4 @@
-//! `wbf.conf`：不用每次指定環境變數（CLI 規格 §10）。
+//! `wbf.conf`：不用每次指定環境變數（wbf-cli-spec.md §10）。
 //!
 //! ```ini
 //! ; 分號或井號開頭是註解
@@ -308,7 +308,7 @@ pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, CoreE
     // 只吃掉換行**不吃**後面的空白——結果是我們自己寫給人看的檔長出一排怪縮排
     // （2026-09-12 真 server 驗證時看到的）。
     let mut text = String::from(concat!(
-        "; wbf.conf —— wbf-cli 自動生成的一份起手式（CLI 規格 §10.3）
+        "; wbf.conf —— wbf-cli 自動生成的一份起手式（wbf-cli-spec.md §10.3）
 ",
         "; 每個值後面註明它這次是哪來的。改這個檔不影響已經登入的帳號。
 ",

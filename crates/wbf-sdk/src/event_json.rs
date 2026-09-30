@@ -1,4 +1,4 @@
-//! 原始 Matrix 事件 JSON → 我們的 `Message`（chat-model §2.3、§3.4）。
+//! 原始 Matrix 事件 JSON → 我們的 `Message`（chat-model.md §2.3、§3.4）。
 //!
 //! 這裡只有 serde_json 與聊天模型，沒有 matrix-sdk：`/sync`、`/messages`、`Event/Recent` 回來的事件都長這樣，
 //! 所以 `backend/matrix_sdk`（feature `matrix`）與 `recent`（純 WS）共用同一份轉換，不會漂移。
@@ -8,15 +8,15 @@ use crate::chat::{Attachment, Message, MessageKind, Reaction};
 use crate::incoming::IncomingEvent;
 use crate::protocol::event_seqs;
 
-/// 約定 §5 的 msgtype 與區塊 key。
+/// wbf-client-convention-for-chunk.md §5 的 msgtype 與區塊 key。
 pub const FILE_MSGTYPE: &str = "org.wbftw.wbfuwunel.file";
 pub const CHUNKED_BLOCK_KEY: &str = "org.wbftw.wbfuwunel.chunked";
 
-/// 約定 §5 的檔案事件 content（`m.room.message`，msgtype 是 [`FILE_MSGTYPE`]）。
+/// wbf-client-convention-for-chunk.md §5 的檔案事件 content（`m.room.message`，msgtype 是 [`FILE_MSGTYPE`]）。
 /// matrix-sdk 那條路（`Room::send`）與 wbf 那條路（`Event/Send`）共用這一份，送出去的事件才不會漂。
 ///
 /// Args:
-///     attachment: example: &Attachment { mxc: "mxc://localhost/1122334455667788".into(), block: <約定 §5 的區塊> }
+///     attachment: example: &Attachment { mxc: "mxc://localhost/1122334455667788".into(), block: <wbf-client-convention-for-chunk.md §5 的區塊> }
 ///     caption: example: Some("看這個")
 /// Return:
 ///     Ok(Value)     `{"msgtype": FILE_MSGTYPE, "body": "<caption>\n<name>（WBF 分塊檔，需要 WBF client 才能開）", "url": mxc, CHUNKED_BLOCK_KEY: block, "caption"?: caption}`
@@ -160,7 +160,7 @@ pub fn message_from_json(raw: &serde_json::Value) -> Message {
         edited_by: None,
         reactions: Vec::new(),
         // 原始 JSON 裡的 `m.room.encrypted` 就是還沒解的加密事件：`Some(false)` 帶原因，不是 None（None 是「本來就不是加密事件」，
-        // chat-model §2.3）。matrix-sdk 的 adapter 解得開會覆蓋成 `Some(true)`。
+        // chat-model.md §2.3）。matrix-sdk 的 adapter 解得開會覆蓋成 `Some(true)`。
         decrypted: if event_type == "m.room.encrypted" {
             Some(false)
         } else {
@@ -207,7 +207,7 @@ pub(crate) fn kind_from_content(
                             .and_then(|value| value.as_str())
                             .map(str::to_string),
                     },
-                    // 約定 §5：區塊缺、v 不認得、cipher 不認得 → 當成解不開的檔，顯示 body。
+                    // wbf-client-convention-for-chunk.md §5：區塊缺、v 不認得、cipher 不認得 → 當成解不開的檔，顯示 body。
                     Err(reason) => MessageKind::Unsupported {
                         event_type: format!("{event_type}/{msgtype} ({reason})"),
                         body,
@@ -340,7 +340,7 @@ pub(crate) fn relation_of(raw: &serde_json::Value) -> Option<Relation> {
 }
 
 /// 一頁裡的關係事件折進目標：`m.reaction` 聚合成 `reactions`、`m.replace` 覆蓋內容並標 `edited_by`、redaction 標 `Deleted`。
-/// 目標不在這一頁的關係事件照原樣留著（`Unsupported`），不丟。範圍只有這一頁（chat-model §3.4）。
+/// 目標不在這一頁的關係事件照原樣留著（`Unsupported`），不丟。範圍只有這一頁（chat-model.md §3.4）。
 pub(crate) fn aggregate(
     conversation: &str,
     items: Vec<(Message, Option<Relation>)>,

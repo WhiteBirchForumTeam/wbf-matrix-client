@@ -1,4 +1,4 @@
-//! 對著真的 wbfuwunel 跑（wbf-cli-spec §8 的驗收項目，SDK 層那幾條）。平常 `#[ignore]`；要跑：
+//! 對著真的 wbfuwunel 跑（wbf-cli-spec.md §8 的驗收項目，SDK 層那幾條）。平常 `#[ignore]`；要跑：
 //!
 //! ```text
 //! WBF_E2E_SERVER=http://127.0.0.1:6167 WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=<檔> \
@@ -255,7 +255,7 @@ async fn upload_download_seek_resume_stream_against_real_server() {
     );
 }
 
-/// 標準 `GET /_matrix/client/v1/media/download/{server}/{id}`：分塊媒體整份給（線上規格 §4.2）。
+/// 標準 `GET /_matrix/client/v1/media/download/{server}/{id}`：分塊媒體整份給（wbfuwunel 的 chunked-upload-spec.md §4.2）。
 async fn standard_media_download(server: &str, access_token: &str, mxc: &str) -> Vec<u8> {
     let path = mxc.strip_prefix("mxc://").expect("mxc");
     let url = format!(

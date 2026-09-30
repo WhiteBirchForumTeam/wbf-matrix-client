@@ -70,7 +70,7 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 
 | `cipher` | 演算法 | 什麼時候選 |
 |---|---|---|
-| `chacha20-poly1305` | ChaCha20-Poly1305，IETF 版（RFC 8439） | 沒有硬體 AES 的平台（多數手機的純軟體路徑）。線上規格 §7 的建議值 |
+| `chacha20-poly1305` | ChaCha20-Poly1305，IETF 版（RFC 8439） | 沒有硬體 AES 的平台（多數手機的純軟體路徑）。wbfuwunel 的 chunked-upload-spec.md §7 的建議值 |
 | `aes-256-gcm` | AES-256-GCM（NIST SP 800-38D） | 有硬體 AES（x86 AES-NI、ARMv8 Crypto Extensions）時比 ChaCha 快，且常見於硬體安全晶片 |
 
   SDK 的預設：偵測到硬體 AES 就 `aes-256-gcm`，否則 `chacha20-poly1305`；UI 可以覆蓋成固定一種。
@@ -117,8 +117,8 @@ Wi-Fi 或有線才值得用大塊。判斷不出線路類型就當行動網路�
 
 - 欄位與 §5 房間事件的區塊一模一樣，**只少 `key`**。兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕。
 - 塊數不寫：從 `file_size` 與 `chunk_size` 算得出來，server 的 `Info` 也會回。
-- `Seal` 帶的描述是最終版，整份覆蓋 `Create` 那份（線上規格 §3.4）。`Seal` 是約定：固定大小與串流都一樣要帶，一條規則。
-  沒 `Seal` 的上傳不會留下半成品：server 在 `media_upload_ttl` 內沒收到新塊就整個清掉（線上規格 §3.5），所以描述不會因為少一次 `Seal` 而漂移。
+- `Seal` 帶的描述是最終版，整份覆蓋 `Create` 那份（wbfuwunel 的 chunked-upload-spec.md §3.4）。`Seal` 是約定：固定大小與串流都一樣要帶，一條規則。
+  沒 `Seal` 的上傳不會留下半成品：server 在 `media_upload_ttl` 內沒收到新塊就整個清掉（wbfuwunel 的 chunked-upload-spec.md §3.5），所以描述不會因為少一次 `Seal` 而漂移。
 - 不認得的 key 忽略（與 Matrix 事件同一規則），本文新增選用欄位不用升 `v`。
 
 加密模式的描述加密：同一把 `key`、`aad = "wbf-desc-v1"`，nonce 用保留的塊索引，`Create` 與 `Seal` 各一個，因為兩份內容不同，不能共用 nonce：
@@ -245,7 +245,7 @@ Read(mxc, chunk=i) → ct_i → 解密 → pt_i[off..]
 本文的可執行版本：[`wbf-client-vectors.json`](wbf-client-vectors.json)，由 `crates/wbf-sdk/tests/client_vectors.rs` 產生
 （`WBF_WRITE_CLIENT_VECTORS=1 cargo test -p wbf-sdk --test client_vectors`）。內容：三個 `cipher` 各一個檔，固定 `key`、
 `nonce_base`、40 byte 明文切 16 byte 一塊（三塊，最後一塊 8 byte）、每塊的 nonce 與密文、`Create` 與 `Seal` 兩份描述的
-JSON 與密文、對應的事件區塊；§7 的 seek 算例（含 CLI 規格 §3.3.1 的 70K 那個）；一組必須被拒絕的區塊樣本，`error` 是拒絕的原因。
+JSON 與密文、對應的事件區塊；§7 的 seek 算例（含 wbf-cli-spec.md §3.3.1 的 70K 那個）；一組必須被拒絕的區塊樣本，`error` 是拒絕的原因。
 
 它證明的是「實作沒有變」，不是「實作是對的」：後者靠 `tests/unit.rs` 裡對 RFC 8439 §2.8.2 與 NIST GCM Test Case 16 的兩條，
 確認底下的 AEAD 就是標準的那個；nonce、AAD、索引的構造則要讀本文的人對著 `chunk_crypto.rs` 看。
@@ -255,7 +255,7 @@ JSON 與密文、對應的事件區塊；§7 的 seek 算例（含 CLI 規格 §
 
 - 邊上傳邊看（server 還沒有推送）。
 - 多把金鑰／金鑰輪替：一檔一把，換就重傳。
-- 與 Matrix 標準附件（`m.file` 加 `file`）相容：線上規格 §10 說只有單塊可能相容，v1 不做。
+- 與 Matrix 標準附件（`m.file` 加 `file`）相容：wbfuwunel 的 chunked-upload-spec.md §10 說只有單塊可能相容，v1 不做。
 
 ## 11. 要維護者決定的
 

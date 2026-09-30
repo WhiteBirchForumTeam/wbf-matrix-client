@@ -78,7 +78,7 @@ impl Core {
     /// 把 crypto store 裡的金鑰推上 server 的備份，**傳完才回來**。
     ///
     /// Args:
-    ///     also_save_snapshot: 順手也更新本地快照（room-key-backup §5：兩份備份的用途
+    ///     also_save_snapshot: 順手也更新本地快照（room-key-backup.md §5：兩份備份的用途
     ///         不同，但沒有理由讓使用者記得跑兩個命令）。呼叫端把本地那份關掉時傳 `false`
     pub async fn upload_room_keys(
         &self,

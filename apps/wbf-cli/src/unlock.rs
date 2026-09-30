@@ -3,13 +3,13 @@
 //! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼（只有 `login` 用）。
 //! passphrase 來源的優先順序：`--passphrase-file` → `local.key` 是 `Plain` 就不用 passphrase → 問終端。
 //! ⚠️ 這整個模組是「**一個命令一個程序**」的產物：問終端、讀 passphrase 檔，都是為了
-//! 「每次執行都要重新解鎖」而存在。daemon 常駐之後（architecture-v2 §1、local-interface.md §5）passphrase
+//! 「每次執行都要重新解鎖」而存在。daemon 常駐之後（architecture-v2.md §1、local-interface.md §5）passphrase
 //! 改從 RPC 的 `vault.unlock` 進來——所以 🚫 這些都沒有搬進 `wbf-core`。
 //! 這裡的責任是「把 passphrase 生出來」，解鎖本身交給 `Core`。
 //!
 //! 🚫 **沒有 `unlock.ticket`**（維護者 2026-09-13 拿掉）：那張票是仿 `sudo`、為了「每個命令都要
 //! 重新解鎖」而把**明文主金鑰落地** 15 分鐘的妥協。daemon 之後單發命令只剩 debug／test 的用途
-//! （常駐時碰資料庫的命令一律跳錯，architecture-v2 §0.2），省那幾次打字換不到落地一份主金鑰。
+//! （常駐時碰資料庫的命令一律跳錯，architecture-v2.md §0.2），省那幾次打字換不到落地一份主金鑰。
 
 use std::path::{Path, PathBuf};
 use wbf_core::{Core, CoreError, CoreErrorKind};
@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 /// 舊版（PR #9 之前）的明文 session 檔；看到它只提示，不讀。
 const LEGACY_SESSION_FILE_NAME: &str = "session.json";
 
-/// CLI 規格 §7 的預設資料目錄。
+/// wbf-cli-spec.md §7 的預設資料目錄。
 ///
 /// Return:
 ///     Ok(PathBuf)      Windows `%APPDATA%\wbf-cli`；macOS `~/Library/Application Support/wbf-cli`；
@@ -117,7 +117,7 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, CoreError
     Ok(Zeroizing::new(std::fs::read(path)?))
 }
 
-/// `--password-file` 的規則（CLI 規格 §3.1）：整檔就是那句話，去掉結尾一個換行。
+/// `--password-file` 的規則（wbf-cli-spec.md §3.1）：整檔就是那句話，去掉結尾一個換行。
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>, CoreError> {
     let text = Zeroizing::new(std::fs::read_to_string(path)?);
     let trimmed = text
@@ -191,7 +191,7 @@ mod tests {
 
     /// 這一側的責任是「把 passphrase 生出來」，所以測的是**來源的優先序**，
     /// 🚫 不是解鎖本身（那在 `wbf-core` 的測試裡）。
-    /// 中文加一個 0x00：兩者以前都過不了 `read_to_string`（vault-and-keys §3）。
+    /// 中文加一個 0x00：兩者以前都過不了 `read_to_string`（vault-and-keys.md §3）。
     const BINARY_PASSPHRASE: &[u8] = "早安\u{0}世界".as_bytes();
 
     fn new_core(options: &UnlockOptions) -> Core {

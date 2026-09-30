@@ -1,4 +1,4 @@
-//! 對真的 wbfuwunel 走一遍網路型 method（rpc-spec §10 判準：走我們自己的 WS 才算做完）。
+//! 對真的 wbfuwunel 走一遍網路型 method（rpc-spec.md §10 判準：走我們自己的 WS 才算做完）。
 //!
 //! `--ignored`；環境變數：
 //!   WBF_E2E_SERVER        example: http://localhost:6167
@@ -11,7 +11,7 @@
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
 //! 對**真的 server** 也成立 —— 登入寫出來的 `session.sealed` 與 matrix store 都是用那把被 passphrase
-//! 包住的主金鑰派生的，所以 daemon 重開之後要能用同一句 passphrase 解回來（rpc-spec §3.1）。
+//! 包住的主金鑰派生的，所以 daemon 重開之後要能用同一句 passphrase 解回來（rpc-spec.md §3.1）。
 
 use std::sync::Arc;
 
@@ -25,11 +25,11 @@ use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
 
 const TOKEN: [u8; 256] = [7u8; 256];
-/// base64("hunter2")。passphrase 是任意 bytes（vault-and-keys §3），RPC 上一律 base64。
+/// base64("hunter2")。passphrase 是任意 bytes（vault-and-keys.md §3），RPC 上一律 base64。
 const PASSPHRASE_BASE64: &str = "aHVudGVyMg==";
 
 /// 一個跑著的 daemon。⚠️ 拿著 `task` 才停得掉它 —— 「重開」必須是**真的停掉再起**，
-/// 🚫 不是「再起一個」：兩個 daemon 同時開同一個資料目錄正是 architecture-v2 §0.2 禁止的事
+/// 🚫 不是「再起一個」：兩個 daemon 同時開同一個資料目錄正是 architecture-v2.md §0.2 禁止的事
 /// （PR #31 審查 cirno🔴）。
 struct Daemon {
     port: u16,
@@ -148,7 +148,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let password = std::fs::read_to_string(password_file).unwrap();
     let password = password.strip_suffix('\n').unwrap_or(&password).to_string();
 
-    // data dir 用短路徑：加密過的目錄名很長（handover §4 9b）。
+    // data dir 用短路徑：加密過的目錄名很長（handover.md §4 9b）。
     let dir = tempfile::Builder::new()
         .prefix("wd")
         .tempdir_in(std::env::temp_dir())
@@ -156,7 +156,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let daemon = start_daemon(dir.path()).await;
     let mut client = Client::connect(daemon.port).await;
 
-    // fresh 資料目錄的起手式（rpc-spec §3.1）：🚫 account.add 不替前端建 vault，
+    // fresh 資料目錄的起手式（rpc-spec.md §3.1）：🚫 account.add 不替前端建 vault，
     // 而「要不要 passphrase」就在**建的這一步**決定，🚫 不是登入之後再重包。
     let reply = client
         .call(
@@ -219,7 +219,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         .expect("instance")
         .to_string();
 
-    // daemon 重開（真正的「鎖上」就是這條，rpc-spec §3.1）。
+    // daemon 重開（真正的「鎖上」就是這條，rpc-spec.md §3.1）。
     // ⚠️ **先停掉第一個**：`daemon.shutdown` → 關連線 → 等它收攤 → 確認舊 port 不收連線了。
     // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 §0.2 禁止的，而且那樣
     // 就算 shutdown 壞掉這條測試也會綠（PR #31 審查 cirno🔴）。

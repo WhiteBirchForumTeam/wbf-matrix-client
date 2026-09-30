@@ -1,7 +1,7 @@
-//! 事件區塊 `org.wbftw.wbfuwunel.chunked` 與描述（約定 §4、§5）。
+//! 事件區塊 `org.wbftw.wbfuwunel.chunked` 與描述（wbf-client-convention-for-chunk.md §4、§5）。
 //!
 //! 兩者是同一組欄位，描述只少 `key`，所以用同一個 struct，用兩個檢查函數分別問
-//! 「這份能當事件區塊嗎」「這份能當描述嗎」。不認得的欄位忽略（約定 §4）。
+//! 「這份能當事件區塊嗎」「這份能當描述嗎」。不認得的欄位忽略（wbf-client-convention-for-chunk.md §4）。
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -9,12 +9,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::cipher::{Cipher, KEY_LEN};
 
-/// 本 SDK 認得的約定版本（約定 §8）。
+/// 本 SDK 認得的約定版本（wbf-client-convention-for-chunk.md §8）。
 pub const CONVENTION_V: u32 = 1;
 /// `nonce_base` 的長度，byte。
 pub const NONCE_BASE_LEN: usize = 8;
 
-/// 事件區塊，也是描述（`key` 為 None 的那份）。欄位語意見約定 §4 的表。
+/// 事件區塊，也是描述（`key` 為 None 的那份）。欄位語意見wbf-client-convention-for-chunk.md §4 的表。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkedBlock {
     pub v: u32,
@@ -42,7 +42,7 @@ pub struct ChunkedBlock {
     pub sha256: Option<String>,
 }
 
-/// 檢查不過的原因。任一個都是「當成解不開的檔」（約定 §5）。
+/// 檢查不過的原因。任一個都是「當成解不開的檔」（wbf-client-convention-for-chunk.md §5）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockError {
     UnknownVersion(u32),
@@ -76,7 +76,7 @@ impl std::fmt::Display for BlockError {
 impl std::error::Error for BlockError {}
 
 impl ChunkedBlock {
-    /// 約定 §3.1 第 1 條，事件區塊那一面：加密模式要有 `key` 與 `nonce_base`，明文模式兩者都不能有，
+    /// wbf-client-convention-for-chunk.md §3.1 第 1 條，事件區塊那一面：加密模式要有 `key` 與 `nonce_base`，明文模式兩者都不能有，
     /// `file_size` 必要。
     ///
     /// Return:
@@ -93,7 +93,7 @@ impl ChunkedBlock {
         Ok(())
     }
 
-    /// 約定 §4：描述永遠沒有 `key`；`file_size` 可以缺（串流的 `Create`）。
+    /// wbf-client-convention-for-chunk.md §4：描述永遠沒有 `key`；`file_size` 可以缺（串流的 `Create`）。
     ///
     /// Return:
     ///     Ok(())            是一份合法描述
@@ -128,7 +128,7 @@ impl ChunkedBlock {
         Ok(())
     }
 
-    /// 事件區塊去掉 `key` 就是描述（約定 §4：「只少 `key`」）。
+    /// 事件區塊去掉 `key` 就是描述（wbf-client-convention-for-chunk.md §4：「只少 `key`」）。
     ///
     /// Return:
     ///     ChunkedBlock  `key` 為 None，其他欄位照抄
@@ -164,7 +164,7 @@ impl ChunkedBlock {
         Ok(block)
     }
 
-    /// 兩份對不上就拒絕（約定 §4：「兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕」）。
+    /// 兩份對不上就拒絕（wbf-client-convention-for-chunk.md §4：「兩份不一致時以事件為準；下載端可以拿描述交叉核對，不一致就拒絕」）。
     /// 只比兩邊都有的欄位：描述可能缺 `file_size`／`sha256`（串流的 `Create` 那份）。
     ///
     /// Args:
@@ -190,7 +190,7 @@ impl ChunkedBlock {
     }
 }
 
-/// `Option<[u8; N]>` 與 base64 字串互轉（RFC 4648 標準字母表、帶 `=`，約定 §4）。長度不對就拒絕。
+/// `Option<[u8; N]>` 與 base64 字串互轉（RFC 4648 標準字母表、帶 `=`，wbf-client-convention-for-chunk.md §4）。長度不對就拒絕。
 macro_rules! base64_fixed_option {
     ($module:ident, $len:expr) => {
         mod $module {

@@ -71,7 +71,7 @@ pub enum CoreErrorKind {
 }
 
 impl CoreErrorKind {
-    /// RPC 的 `code`（rpc-spec §5.2）。**號碼定了就不改**；同族留了縫給之後拆出來的 variant。
+    /// RPC 的 `code`（rpc-spec.md §5.2）。**號碼定了就不改**；同族留了縫給之後拆出來的 variant。
     ///
     /// ⚠️ 這張表只能在這裡：daemon 那層🚫 不要另外維護一份對照——兩份就會漂。
     ///
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn rpc_codes_are_the_ones_in_rpc_spec_section_5_2() {
-        // 逐字對 rpc-spec §5.2：這裡改了就是規格改了，反過來也一樣。
+        // 逐字對 rpc-spec.md §5.2：這裡改了就是規格改了，反過來也一樣。
         let table = [
             (CoreErrorKind::Locked, 1001),
             (CoreErrorKind::NoKeyFile, 1002),

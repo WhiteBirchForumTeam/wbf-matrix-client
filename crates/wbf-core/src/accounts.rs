@@ -1,4 +1,4 @@
-//! 每個帳號的資料放哪（CLI 規格 §7；local-cache-db.md §4.6、vault-and-keys.md §2）：
+//! 每個帳號的資料放哪（wbf-cli-spec.md §7；local-cache-db.md §4.6、vault-and-keys.md §2）：
 //!
 //! ```text
 //! <data dir>/
@@ -133,7 +133,7 @@ impl AccountDir {
     /// 登出的閘門才剛開過一次 backend 去問 recovery 狀態，那個 handle 關掉與 OS 真的放手之間有延遲。
     /// 所以這裡**重試幾次**（2026-09-13 對真 server 跑 daemon e2e 時遇到，第二次跑就過了 —— 典型的 race）。
     /// 🚫 重試完還是不行就回錯，不吞掉：那時多半是**別的程序**開著同一個 store（例如一個常駐的
-    /// daemon 加一個單發命令，architecture-v2 §0.2），而那件事必須讓呼叫端知道。
+    /// daemon 加一個單發命令，architecture-v2.md §0.2），而那件事必須讓呼叫端知道。
     pub fn delete_matrix_store(&self) -> Result<(), SdkError> {
         const TRIES: u32 = 10;
         const WAIT: std::time::Duration = std::time::Duration::from_millis(100);

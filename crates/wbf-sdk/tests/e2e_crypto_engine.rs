@@ -7,7 +7,7 @@
 //!
 //! ⚠️ `--test-threads=1`：兩條測試都用同一個帳號（alice），並行跑會互相分到對方裝置的房間金鑰、互相推 CryptoState。
 //!
-//! 走的是 e2ee-walkthrough §6 那條最容易漏的路：同一個帳號的**兩台裝置** A、B，各自只靠 WS（橋 ＋ `Device/Fetch`）——
+//! 走的是 e2ee-walkthrough.md §6 那條最容易漏的路：同一個帳號的**兩台裝置** A、B，各自只靠 WS（橋 ＋ `Device/Fetch`）——
 //! A 上傳金鑰、查到 B、跟 B claim OTK 建 Olm、把一個加密房的房間金鑰用 to-device 發給 B；B 用 `Device/Fetch` 拉、匯進自己的
 //! OlmMachine、拿到那把房間金鑰、叫 server 銷毀、再拉一次是空的。🚫 全程沒有 `/sync`、沒有 matrix-sdk 的 `Client`。
 #![cfg(feature = "matrix")]
@@ -434,7 +434,7 @@ async fn http_post(session: &Session, path: &str, body: serde_json::Value) -> se
 /// 用 `Recent` 把這個房的密文事件拉下來（新→舊）直到看到 `wanted_event_id`，交給引擎解。
 /// 實跑（2026-09-21）是 0 次輪詢就看到；留著輪詢只是防 server 端寫入與索引之間哪天出現一拍。
 /// 📎 曾經以為 Recent 看不到帶 room_version 的加密訊息，追下去是 txn_id 跨輪重用被 server 去重、拿到上一輪別的房的 event_id——
-/// 不是 Recent 的問題（見 e2ee-walkthrough §16.4）。
+/// 不是 Recent 的問題（見 e2ee-walkthrough.md §16.4）。
 async fn read_room_events(
     device: &mut Device,
     room_id: &str,

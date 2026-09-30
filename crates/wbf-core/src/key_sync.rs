@@ -215,7 +215,7 @@ impl Core {
         true
     }
 
-    /// 說出口的退出（wbf-to-device.md §4）：下線前對訂閱線送 `Device/Unsubscribe`。線沒開就沒事；失敗只講一聲（token 之後也撤了）。
+    /// 說出口的退出（wbfuwunel 的 wbf-to-device.md §4）：下線前對訂閱線送 `Device/Unsubscribe`。線沒開就沒事；失敗只講一聲（token 之後也撤了）。
     pub(crate) async fn unsubscribe_keys_of(&self, account: &AccountDir) {
         let pool = self
             .link_pools

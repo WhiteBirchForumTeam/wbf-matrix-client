@@ -132,7 +132,7 @@ async fn manifest_roundtrips_through_json_and_keeps_key_secret_shape() {
 
 #[tokio::test]
 async fn seek_semantics_match_cli_spec_3_3_1() {
-    // chunk_size 64，位置 70：對應 CLI 規格 §3.3.1 的 64K／70K 例子，縮小 1024 倍。
+    // chunk_size 64，位置 70：對應 wbf-cli-spec.md §3.3.1 的 64K／70K 例子，縮小 1024 倍。
     let mut server = FakeServer::new();
     let plaintext = sample(200);
     let manifest = upload_fixed(&mut server, Cipher::Aes256Gcm, 64, &plaintext).await;
@@ -547,7 +547,7 @@ async fn hello_ping_status_abort() {
     );
 }
 
-/// wbfuwunel 對 `Create` 的回應標頭 id 是新上傳 id（線上規格 §2 說抄請求的 0，server 實際放新 id）：兩種都要收；
+/// wbfuwunel 對 `Create` 的回應標頭 id 是新上傳 id（wbfuwunel 的 chunked-upload-spec.md §2 說抄請求的 0，server 實際放新 id）：兩種都要收；
 /// 標頭 id 是別的值、或非 `Create` 的回應不抄回 id，都要拒。
 #[tokio::test]
 async fn create_ack_header_id_variants() {
@@ -643,7 +643,7 @@ fn recent_fixture(count: i64) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// pack-pipeline §6：一窗多個 Batch、`more: true` 就帶 `before` 再一窗、水位是第一窗第一個 Batch 的 fs。
+/// wbfuwunel 的 pack-pipeline.md §6：一窗多個 Batch、`more: true` 就帶 `before` 再一窗、水位是第一窗第一個 Batch 的 fs。
 #[tokio::test]
 async fn recent_sync_pulls_windows_until_caught_up() {
     let mut server = FakeServer::new();

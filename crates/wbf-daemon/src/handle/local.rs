@@ -20,7 +20,7 @@ fn decode_passphrase(field: Option<String>) -> Result<Option<Zeroizing<Vec<u8>>>
     }
 }
 
-/// 建這個資料目錄的 `local.key`（rpc-spec §3.1）。**要 passphrase 模式就在這一步給**。
+/// 建這個資料目錄的 `local.key`（rpc-spec.md §3.1）。**要 passphrase 模式就在這一步給**。
 ///
 /// ⭐ 這條是 fresh 資料目錄唯一的起手式，🚫 `account.add` 不替前端偷建一把 plain 的 ——
 /// 那會逼想要 passphrase 的前端「先落一份 plain 再重包」，中間那段磁碟上就是沒有 passphrase 保護的

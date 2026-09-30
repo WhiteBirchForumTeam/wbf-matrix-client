@@ -207,7 +207,7 @@ impl Cache {
                 .map_err(db_error)?;
             // 🚨 **只准 0 → 1，🚫 不准 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
             // 「沒加密」—— 過期的、別的帳號舊的、有 bug 的 —— 都🚫 不准把已知加密的房間蓋回明文。
-            // ⭐ 蓋回去的下一步就是送檔時用 `cipher: none` 把區塊金鑰公開出去（約定 §5.1）。
+            // ⭐ 蓋回去的下一步就是送檔時用 `cipher: none` 把區塊金鑰公開出去（wbf-client-convention-for-chunk.md §5.1）。
             let mut mark_encryption = transaction
                 .prepare_cached(
                     "UPDATE rooms SET encrypted = CASE WHEN encrypted = 1 THEN 1 ELSE ?2 END WHERE id = ?1",
@@ -422,8 +422,8 @@ impl Cache {
         })
     }
 
-    /// 歷史，從最新往回（CLI 規格 §3.4.1 的 `read`，只是來源是快取）。只回這個帳號同步過、而且沒藏的。
-    /// 有 `r_seq` 的房間照 `r_seq` 排；沒有的退到 `origin_server_ts`（chat-model §4.3 的退化表）。
+    /// 歷史，從最新往回（wbf-cli-spec.md §3.4.1 的 `read`，只是來源是快取）。只回這個帳號同步過、而且沒藏的。
+    /// 有 `r_seq` 的房間照 `r_seq` 排；沒有的退到 `origin_server_ts`（chat-model.md §4.3 的退化表）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -550,7 +550,7 @@ impl Cache {
     /// ⭐ 用在「問完上游、寫進去、再從本地讀回這一頁」：上游決定**哪幾則、什麼順序**
     /// （`Recent` 照 `g_seq`、`/messages` 照拓樸序），本地決定**每一則長什麼樣**
     /// （已解密的明文不會被密文蓋掉、`hidden` 的不出來、別的帳號的看不到）。
-    /// 🚫 **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（chat-model §4.3）。
+    /// 🚫 **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（chat-model.md §4.3）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -978,7 +978,7 @@ impl Cache {
             .map_err(db_error)
     }
 
-    /// Delete for me（chat-model §5）：只對這個帳號藏；再同步同一則也不會跑回來（`hidden` 不被 sync 動）。
+    /// Delete for me（chat-model.md §5）：只對這個帳號藏；再同步同一則也不會跑回來（`hidden` 不被 sync 動）。
     /// 那則不在這個帳號的同步紀錄裡就什麼都不做（沒看過的東西沒有可藏的）。
     ///
     /// Return:
@@ -1512,7 +1512,7 @@ fn set_current_edit(
 
 /// 剛寫進來（或剛解開）的一則（§7.4）。🚫 **不改任何一列的 `content_json`**。
 ///
-/// - msg／edit 的內容是約定 §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
+/// - msg／edit 的內容是wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
 /// - 等著這則的 redact、edit（先到的）→ 現在處理
 /// - 自己是 edit／redact → 目標在就處理，不在就等
 fn process_event(transaction: &Transaction<'_>, room: i64, event: i64) -> Result<(), SdkError> {
@@ -1677,7 +1677,7 @@ fn apply_redaction(
     }
 }
 
-/// 內容是約定 §5 的檔：建 `media`（已有就不動）與 `event_media`。
+/// 內容是wbf-client-convention-for-chunk.md §5 的檔：建 `media`（已有就不動）與 `event_media`。
 fn link_media_of(
     transaction: &Transaction<'_>,
     event: i64,

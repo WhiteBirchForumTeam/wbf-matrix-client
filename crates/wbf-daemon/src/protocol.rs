@@ -1,7 +1,7 @@
-//! `hello` 的兩關（rpc-spec §1.3）：client 名字、protocol 協商表。純函數。
+//! `hello` 的兩關（rpc-spec.md §1.3）：client 名字、protocol 協商表。純函數。
 
 /// daemon 會講的 protocol 版本。**新的在前**。
-/// ⚠️ 從這裡拿掉一個版本＝breaking：舊前端一連上來就被拒絕。這是刻意的（rpc-spec §1.3）。
+/// ⚠️ 從這裡拿掉一個版本＝breaking：舊前端一連上來就被拒絕。這是刻意的（rpc-spec.md §1.3）。
 pub const SUPPORTED_PROTOCOLS: &[u32] = &[1];
 
 /// client 正式名稱的前綴。不是這個開頭的一律拒絕。

@@ -1,4 +1,4 @@
-//! 線上規格 §1、§3、§4 的訊息：怎麼組請求 pack、怎麼讀回應。
+//! wbfuwunel 的 chunked-upload-spec.md §1、§3、§4 的訊息：怎麼組請求 pack、怎麼讀回應。
 //!
 //! 這裡不碰網路、不碰加密：輸入輸出都是 `Pack` 與 JSON。通道在 `channel`，加密在 `chunk_crypto`。
 
@@ -9,7 +9,7 @@ use wbf_wire::{EncryptedFileInfo, Kind, Pack};
 
 use crate::error::SdkError;
 
-/// `Hello` 的 meta（線上規格 §1）。
+/// `Hello` 的 meta（wbfuwunel 的 chunked-upload-spec.md §1）。
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// `Hello.features` 裡唯一 server 會讀的字串（wbfuwunel `wbf-room-device-version.md` §6.2）。
@@ -69,7 +69,7 @@ pub fn status(upload_id: u64, seq: u32) -> Pack {
 }
 
 /// Args:
-///     description_data: 最終描述，取代 `Create` 那份（約定 §4：一律帶）
+///     description_data: 最終描述，取代 `Create` 那份（wbf-client-convention-for-chunk.md §4：一律帶）
 pub fn seal(upload_id: u64, description_data: Vec<u8>, seq: u32) -> Pack {
     upload_request(upload::SEAL, upload_id, seq, description_data)
 }
@@ -128,7 +128,7 @@ fn download_request(subtype: u8, seq: u32, meta: serde_json::Value) -> Pack {
 
 // ---- 回應 ----
 
-/// 線上規格 §2 的回應規則：Control、`IS_RESPONSE`、id 與 seq 抄請求的；`Ack` 過、`Error` 變 `SdkError::Server`。
+/// wbfuwunel 的 chunked-upload-spec.md §2 的回應規則：Control、`IS_RESPONSE`、id 與 seq 抄請求的；`Ack` 過、`Error` 變 `SdkError::Server`。
 ///
 /// Args:
 ///     request: 送出去的那個
@@ -143,7 +143,7 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
             response.kind, response.flags
         )));
     }
-    // id 與 seq 都要抄回（線上規格 §2）。唯一的放寬：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭，
+    // id 與 seq 都要抄回（wbfuwunel 的 chunked-upload-spec.md §2）。唯一的放寬：wbfuwunel 對 `Create` 的回應把新發的上傳 id 放在標頭，
     // 所以只有 `Create` 允許標頭 id 不是 0，而 `create_upload` 會再拿它對 Ack meta 的 `id`。其他 id 0 的請求
     // （Hello、Ping、Info、Read）回應 id 必須是 0。
     let is_create = request.kind == Kind::Upload && request.subtype == upload::CREATE;
@@ -165,10 +165,10 @@ pub fn expect_ack(request: &Pack, response: Pack) -> Result<Pack, SdkError> {
 
 // ---- 橋：pack 帶 flags bit4，server 轉成內部 HTTP 請求交給 Matrix 端點（wbfuwunel `wbf-api-bridge.md`）----
 //
-// 🚨 **號碼的權威在 server 的 `docs/bridge-specs/index.md`**（wire-format §3.2 只列原生的）。這裡只抄**用得到的**那幾個，
+// 🚨 **號碼的權威在 server 的 `docs/bridge-specs/index.md`**（wbfuwunel 的 wbf-wire-format.md §3.2 只列原生的）。這裡只抄**用得到的**那幾個，
 // 用到一個抄一個，🚫 不整張表搬過來 —— 搬過來的那份不會知道 server 改了。
 
-/// server 在 `Hello.features` 宣告「橋在」的字串（wbf-api-bridge.md §3 批 3-C）。沒宣告的 server 不送橋的 pack。
+/// server 在 `Hello.features` 宣告「橋在」的字串（wbfuwunel 的 wbf-api-bridge.md §3 批 3-C）。沒宣告的 server 不送橋的 pack。
 pub const BRIDGE_FEATURE: &str = "bridge";
 /// server 宣告「`0x16 Device` 的原生 pack（to-device 佇列）在」的字串（同上）。
 pub const DEVICE_FEATURE: &str = "device";
@@ -426,7 +426,7 @@ pub struct HelloAck {
     pub chunk_size_default: u32,
     pub chunk_size_large: u32,
     pub data_max_bytes: u64,
-    /// pack-pipeline §6：`Recent` 一窗的預設與上限；舊 server 沒有這些欄，None 時 client 用自己的預設（`RECENT_*`）。
+    /// wbfuwunel 的 pack-pipeline.md §6：`Recent` 一窗的預設與上限；舊 server 沒有這些欄，None 時 client 用自己的預設（`RECENT_*`）。
     #[serde(default)]
     pub recent_default_limit: Option<u32>,
     #[serde(default)]
@@ -435,7 +435,7 @@ pub struct HelloAck {
     pub recent_default_batch: Option<u32>,
     #[serde(default)]
     pub recent_max_batch: Option<u32>,
-    /// pack-pipeline §2.1：每個 device 最多幾條 WS；超過 server 回 `TooManyConnections`。
+    /// wbfuwunel 的 pack-pipeline.md §2.1：每個 device 最多幾條 WS；超過 server 回 `TooManyConnections`。
     #[serde(default)]
     pub max_connections_per_device: Option<u32>,
 }
@@ -476,7 +476,7 @@ pub struct SealAck {
     pub mxc: String,
 }
 
-/// 線上規格 §4.1：整檔媒體（舊上傳）的分塊欄位是 null。
+/// wbfuwunel 的 chunked-upload-spec.md §4.1：整檔媒體（舊上傳）的分塊欄位是 null。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct InfoAck {
     pub total_len: u64,
@@ -499,14 +499,14 @@ pub struct ReadAck {
     pub total_len: u64,
 }
 
-// ---- Event（kind 0x14）：server 的 room-seq-and-recent.md §2、media-attachments.md §3 ----
+// ---- Event（kind 0x14）：wbfuwunel 的 room-seq-and-recent.md §2、wbfuwunel 的 media-attachments.md §3 ----
 
 /// `unsigned` 裡 server 加的每房連續序號（第一個事件是 1；聯邦補回的歷史 0、−1、…）。
 pub const R_SEQ_KEY: &str = "org.wbftw.wbfuwunel.r_seq";
 /// `unsigned` 裡 server 加的本站全域序號，跨房間可比大小，client 當水位線。
 pub const G_SEQ_KEY: &str = "org.wbftw.wbfuwunel.g_seq";
 
-/// `Recent` 的預設與上限（server 的 `wbf_recent_*`；pack-pipeline §6.1）。server 的 `Hello` 有給就用它的。
+/// `Recent` 的預設與上限（server 的 `wbf_recent_*`；wbfuwunel 的 pack-pipeline.md §6.1）。server 的 `Hello` 有給就用它的。
 pub const RECENT_DEFAULT_LIMIT: u32 = 320;
 pub const RECENT_MAX_LIMIT: u32 = 500;
 pub const RECENT_DEFAULT_BATCH: u32 = 10;
@@ -551,7 +551,7 @@ pub fn recent(request: &RecentRequest, id: u64, seq: u32) -> Result<Pack, SdkErr
     })
 }
 
-/// `Event/Batch` 的 meta（pack-pipeline §6.2）。
+/// `Event/Batch` 的 meta（wbfuwunel 的 pack-pipeline.md §6.2）。
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 pub struct BatchMeta {
     /// total count：這一窗總共幾則（≤ limit），同一窗每個 Batch 都一樣。
@@ -710,7 +710,7 @@ pub fn event_seqs(event: &serde_json::Value) -> (Option<i64>, Option<i64>) {
     (read(R_SEQ_KEY), read(G_SEQ_KEY))
 }
 
-/// `Event/Send` 的請求 meta（media-attachments.md §3、wbfuwunel `wbf-room-device-version.md` §7）。
+/// `Event/Send` 的請求 meta（wbfuwunel 的 media-attachments.md §3、wbfuwunel `wbf-room-device-version.md` §7）。
 /// `attachments` 是這則訊息用到的 mxc，server 讀不到 E2EE 內容，靠它替媒體 +1；不宣告的媒體過保護期會被清掉（spec §12）。
 /// 鍵序就是線上的 JSON 序（向量逐 byte 比），不要重排。
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1028,7 +1028,7 @@ pub fn device_subscribe(
     })
 }
 
-/// `Device/Subscribe` 之後這條會話上會來的每一種（wbf-to-device.md §3）：先 `Ack`（登記好了）、再 `CryptoState`（自己的金鑰存量），
+/// `Device/Subscribe` 之後這條會話上會來的每一種（wbfuwunel 的 wbf-to-device.md §3）：先 `Ack`（登記好了）、再 `CryptoState`（自己的金鑰存量），
 /// 之後佇列有新東西就 `Push`（跟 `Batch` 同一種切法，這裡解好：吹推來的與主動拉的走同一支匯入，維護者 2026-09-24）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscribeReply {
@@ -1043,7 +1043,7 @@ pub enum SubscribeReply {
     },
 }
 
-/// `Device/Push` 的 meta（wbf-to-device.md §3）：跟 `Batch` 少了 `tc`／`r`／`more`，多了 `gap`。
+/// `Device/Push` 的 meta（wbfuwunel 的 wbf-to-device.md §3）：跟 `Batch` 少了 `tc`／`r`／`more`，多了 `gap`。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct DevicePushMeta {
     /// 這一包幾則。
@@ -1106,7 +1106,7 @@ pub fn parse_subscribe_reply(request: &Pack, response: &Pack) -> Result<Subscrib
     }
 }
 
-/// `Device/Unsubscribe`：說出口的退出（wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
+/// `Device/Unsubscribe`：說出口的退出（wbfuwunel 的 wbf-to-device.md §4）——解除這條連線對裝置佇列的持有；回 `Ack {}`，沒訂也是 no-op。
 /// 🚨 下線前要叫：不叫的話這條連線退了卻還佔著裝置，別的連線得靠搶佔才進得來。斷線 server 會自動退，但那是「沒說出口的退出」，兩條路都要有。
 ///
 /// Args:

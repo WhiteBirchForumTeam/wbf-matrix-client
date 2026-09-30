@@ -55,7 +55,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 > | 起法 | 什麼時候拿 |
 > |---|---|
 > | `-s` | **啟動的第一件事**（`-s` 就是「我要寫」的意思）。拿不到就不啟動 —— 🚫 不要起來之後才發現寫不了 |
-> | 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（rpc-spec §5.1），🚫 不重試、🚫 不降級成唯讀跑一半 |
+> | 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（rpc-spec.md §5.1），🚫 不重試、🚫 不降級成唯讀跑一半 |
 > | `--version` 這類 | 🚫 **不拿**：它連讀都不用（clap 印完就結束，根本走不到資料目錄） |
 >
 > **檢查點只有一個**：`Handle::call()` 進 dispatch 之前。判準是**反過來寫**的 ——
@@ -141,7 +141,7 @@ store，結果不是鎖住就是壞資料。規則：
 
 | 痛 | 現在 | daemon 之後 |
 |---|---|---|
-| **每個命令都要解鎖** | 以前靠 `unlock.ticket` 省打字：**明文主金鑰落地** 15 分鐘。2026-09-13 連它一起拿掉了（vault-and-keys §1） | 解鎖一次，主金鑰只在 daemon 的記憶體裡。**那個妥協整個消失** |
+| **每個命令都要解鎖** | 以前靠 `unlock.ticket` 省打字：**明文主金鑰落地** 15 分鐘。2026-09-13 連它一起拿掉了（vault-and-keys.md §1） | 解鎖一次，主金鑰只在 daemon 的記憶體裡。**那個妥協整個消失** |
 | **matrix-sdk 的 store 是獨佔的** | Desktop 開著就不能同時用 CLI（`crypto.db` 被鎖）。上游為此有 `enable_cross_process_store_lock`，但那是 iOS notification extension 的權宜之計，代價是每次操作搶鎖 | 一個程序持有 store，問題不存在 |
 | **收不了推送** | roadmap 要把 event（含金鑰的 to-device）改走 WS 推送，而一命令一程序的東西**沒有人在線上收**，斷開的期間就是漏 | daemon 常駐，連線與游標由它維護 |
 
@@ -241,7 +241,7 @@ daemon 常駐、但連線會斷（手機切背景、筆電睡眠、網路換手�
 
 ### 5.1 事件流是**每個帳號一組**（維護者 2026-09-13 定）
 
-daemon 的推播（rpc-spec §4）不是憑空來的：**每個已經登入的帳號，daemon 都對它的 homeserver
+daemon 的推播（rpc-spec.md §4）不是憑空來的：**每個已經登入的帳號，daemon 都對它的 homeserver
 維持一組連線**，事件從那裡進來、解密、寫進資料庫，然後才變成 RPC 的推播。
 
 ```
@@ -253,7 +253,7 @@ daemon 的推播（rpc-spec §4）不是憑空來的：**每個已經登入的�
 - ⚠️ **「一組」不是「一條」**：對 wbfuwunel 是四條 WS（§5.1.1），對一般 homeserver 是一條
   HTTP 的 sync。所以三個帳號同時登入、都在 wbf server 上，就是 **12 條 WS**。
 - 帳號各自獨立：一個帳號的連線斷了、落後了、被登出了，🚫 不影響別的帳號。
-  推播因此**一定帶 `user`**（rpc-spec §4）——前端要分得出這是誰的事件。
+  推播因此**一定帶 `user`**（rpc-spec.md §4）——前端要分得出這是誰的事件。
 - 📎 這也是 `sync.state` 推播的來源：它講的是**那一個帳號**跟它的 server 之間的狀態，
   🚫 不是「daemon 連上網了沒」。
 
@@ -265,10 +265,10 @@ daemon 的推播（rpc-spec §4）不是憑空來的：**每個已經登入的�
 | **wbfuwunel**（我們自己那套） | **四條 WS**（§5.1.1） | `Event/Push` 推送＋`Recent` 補洞 |
 
 - ⭐ 判準是**「這台 server 講不講 wbf-pack」**，🚫 不是網域名、🚫 不是使用者設定裡的一個勾。
-  問法是現成的：`Hello`／`Ping` 拿 `ServerHello` 的 features（rpc-spec §3.8 的 `server.ping`）。
+  問法是現成的：`Hello`／`Ping` 拿 `ServerHello` 的 features（rpc-spec.md §3.8 的 `server.ping`）。
 - **不確定就落到 HTTP**：連不上 WS、`Hello` 不回、features 認不得 —— 一律當成一般 homeserver。
   ⭐ 壞在「用了比較慢但一定能動的那條」，🚫 不壞在「以為對方懂我們的協議」。
-- conf 的 `TRANSPORT`（CLI 規格 §10）是**上限不是下限**：設成 `http` 就一律 HTTP（除錯用）；
+- conf 的 `TRANSPORT`（wbf-cli-spec.md §10）是**上限不是下限**：設成 `http` 就一律 HTTP（除錯用）；
   設成 `ws`（預設）仍然要探測，探不到照樣 HTTP。
 
 ### 5.1.1 對 wbfuwunel：一個帳號開**四條** WS，一條一個用途（維護者 2026-09-12 定）
@@ -331,7 +331,7 @@ apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出�
 所以那個還沒定的決策**不會擋住開工**：先做 `wbf-core`，它兩條路都要。
 ✅ **2026-09-12 做完了**（#24），而 RPC vs uniffi 仍然沒定——這正是「先做 core」想買到的東西。
 
-- **`wbf-sdk` 保持是純 library**（architecture-v2 §8 的方向不變）：core 是它的使用者，不是它的一部分。
+- **`wbf-sdk` 保持是純 library**（architecture-v2.md §8 的方向不變）：core 是它的使用者，不是它的一部分。
 - **`wbf-daemon` 同時是 library 與 binary**：Desktop 內嵌用 library，其他人 spawn binary。
 - ⚠️ **`wbf-core` 的公開介面不能假設「同程序」**：方法收 `&self`、參數與回傳用簡單型別、
   事件用 channel 而不是回呼引用、自己持有 tokio runtime 不要求宿主提供。
@@ -343,10 +343,10 @@ apps/wbf-cli        ✅ 瘦身了（#24）：只剩參數解析與 JSON 輸出�
 
 ### 6.1 現在那支 CLI 的假設要重新檢視
 
-CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印一個 JSON 物件）都建立在
+wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout 只印一個 JSON 物件）都建立在
 「它是開發與除錯工具，不是產品面」上。變成 rpc-cli 之後：
 
-- ~~`unlock.ticket` 可以拿掉~~ ✅ 2026-09-13 拿掉了（§1、vault-and-keys §1）。
+- ~~`unlock.ticket` 可以拿掉~~ ✅ 2026-09-13 拿掉了（§1、vault-and-keys.md §1）。
 - `--token` 模式要重想：那是「不碰 vault、不碰帳號目錄」的路徑，在 daemon 模型下是什麼意思？
 - stdout「只印一個 JSON 物件」對 `watch` 這種串流命令本來就有例外（JSON Lines），RPC 的推播會讓這種情況變多。
 
@@ -366,7 +366,7 @@ CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印�
    `share_room_key`、`get_missing_sessions`。
    ⚠️ 順帶更正一個一直寫錯的說法：`Room` 上**根本沒有 `encrypt`**（公開或私有都沒有），
    所以「fork 露出 `Room::encrypt` **vs** 走 `OlmMachine`」不是二選一——**兩條路都是走 `OlmMachine`**，
-   差別只在怎麼拿到它。chat-model §6 與 handover §7 的同一句話要跟著改。
+   差別只在怎麼拿到它。chat-model.md §6 與 handover.md §7 的同一句話要跟著改。
    📎 有一條不用 fork 的路但不能出貨：`Client::olm_machine_for_testing()` 是 `pub`，
    掛在 `testing` feature 底下，而那個 feature 會把 `wiremock`、`matrix-sdk-test`、
    `assert_matches2` 拖進出貨的 binary。當 spike 驗接線可以。
@@ -390,7 +390,7 @@ CLI 規格 §9 那些簡化（沒有互動模式、不存密碼、stdout 只印�
    Android 仍然不走 web。所以候選分兩批：短期的 web（Tauri／Electron／純瀏覽器頁面），
    長期若要原生則是 egui／iced／slint／gtk-rs 這一類。
    ⚠️ 原生 Rust GUI 的傳統弱項（長列表虛擬化、IME 中文輸入）要單獨驗；web 那批沒有這個問題，
-   但多一層 runtime。評估維度見 handover §7。
+   但多一層 runtime。評估維度見 handover.md §7。
 
 ## 8. 耦合方向：上游 SDK 是可以拆掉的零件，不是地基（維護者 2026-09-05 定）
 

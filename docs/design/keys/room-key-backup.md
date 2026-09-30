@@ -22,7 +22,7 @@
 | 防什麼 | 這台機器整個沒了（有 recovery key 之後才真的做得到，見 §3） | 意外：`crypto.db` 壞掉、`matrix/` 被刪掉重 `login`、server 端資料沒了 |
 | 加密 | backup 的 curve25519 公鑰加密，私鑰在 crypto store（設了 recovery key 之後才進 SSSS） | 第五把子金鑰（`local.key` 導出，vault-and-keys.md §1） |
 | 寫入時機 | 上游的背景 task，靠 sync 觸發；**CLI 靠 `key-backup upload` 追平**（§6） | **命令觸發**：`key-backup save`，`upload` 時順手一起（§5） |
-| 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，CLI 規格 §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
+| 開關 | 預設開，可以在 conf 關掉（`SERVER_BACKUP=off`，wbf-cli-spec.md §10） | 預設開，可以關（`LOCAL_ROOM_KEYS=off`） |
 | 生命週期 | 跟帳號走，`logout` 不動它 | **跟這台機器上的這個帳號走：`logout` 連它一起刪**（維護者 2026-09-09，§7） |
 | 互通性 | 有：Element 之類的 client 用同一份 | 沒有：只有這個 client 讀得懂 |
 
@@ -40,8 +40,8 @@ fork server（wbfuwunel）已經有完整實作（`src/api/client/backup/`、`sr
   > 所以在使用者顯式產生 recovery key 之前，server 上那份備份**換一台機器也解不開** ——
   > 它防的是「本機 crypto.db 壞掉」，不是「換裝置」。
 
-  這句話要出現在警告裡（警告的原文在 CLI 規格 §3.6），不能只說「你還沒設 recovery key」。
-- **recovery key 不自動印**（維護者定）。顯式入口是 `key-backup recovery`（CLI 規格 §3.6）：走上游的 `recovery().enable()`，
+  這句話要出現在警告裡（警告的原文在 wbf-cli-spec.md §3.6），不能只說「你還沒設 recovery key」。
+- **recovery key 不自動印**（維護者定）。顯式入口是 `key-backup recovery`（wbf-cli-spec.md §3.6）：走上游的 `recovery().enable()`，
   把 recovery key 印**一次**並說明拿不回來（只能 reset）。同一個命令會把它封進 `<data dir>/r/`（§8）——
   🚫 但仍然不進 conf、不進 log，而且那份保管**不算「使用者擁有」**（同一台機器，一起被拿走就一起沒了）。
 - 關掉（`SERVER_BACKUP=off`）就是 `auto_enable_backups: false` 且不跑上傳；**已經在 server 上的 version 不動、不刪**
@@ -117,7 +117,7 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 | 情形 | `m/` | `k/` | 怎麼把歷史找回來 |
 |---|---|---|---|
 | **意外**：store 壞掉、金鑰對不上，照 vault-and-keys.md §1.1 的指示手動刪 `matrix/` 重新 `login` | 被刪 | **留著** | 重 `login` 後 `key-backup import` 把快照餵回新的 crypto store |
-| **有意**：`logout`／`account del <user>`（同一件事，CLI 規格 §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
+| **有意**：`logout`／`account del <user>`（同一件事，wbf-cli-spec.md §3.1） | 被刪（Matrix logout 讓裝置失效，留著會擋下一次 `login`） | **一起刪** | 靠 server 那份加 recovery key（所以有閘門，見下） |
 | **有意**：`account destroy <user>` | 被刪（它包含 `del`） | **一起刪** | 同上。它多做的是資料層：這個帳號在 `cache.db` 裡**獨有**的紀錄（別人也持有的不動） |
 
 📎 **to-device 的水位（`cd_seq`）住在 `m/` 裡面，所以這張表的每一列它都自動跟著對**
@@ -152,7 +152,7 @@ server 那份裡。原本的設計把它寫成「同步寫、不能漏」，那�
 `RecoveryState` 是 `Unknown`／`Incomplete`、問不到 server。🚫 不寫成「沒有 recovery key 才擋」——
 那樣新增一種狀態就默默放行；要壞就壞在「多擋一次」那一邊。
 
-擋下來的時候印的訊息要直接給下一步（原文在 CLI 規格 §3.6）：先跑 `key-backup recovery` 產生 recovery key，
+擋下來的時候印的訊息要直接給下一步（原文在 wbf-cli-spec.md §3.6）：先跑 `key-backup recovery` 產生 recovery key，
 server 那份就變成換裝置也解得開的備份，再 `logout` 就沒有損失。
 
 📎 副作用（好的）：這讓「recovery key 延後」不會被無限期延後 —— **延到第一次 `logout` 為止**。

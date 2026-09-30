@@ -587,7 +587,7 @@ fn decode_key32(text: &str, field: &str) -> Result<Key32, SdkError> {
     Ok(Key32(array))
 }
 
-/// 含金鑰或 token 的檔：Unix 0600 建立；Windows 靠使用者目錄的 ACL（CLI 規格 §5）。
+/// 含金鑰或 token 的檔：Unix 0600 建立；Windows 靠使用者目錄的 ACL（wbf-cli-spec.md §5）。
 /// 先寫到同目錄的暫存檔再 rename：寫到一半斷電不會留下半個 `local.key`。
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
     use std::io::Write;

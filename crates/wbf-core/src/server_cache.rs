@@ -1,8 +1,8 @@
-//! 一個 server 的 `cache.db`：**唯一的寫入者**，加一條給讀的連線（daemon-runtime §2）。
+//! 一個 server 的 `cache.db`：**唯一的寫入者**，加一條給讀的連線（daemon-runtime.md §2）。
 //!
 //! ## 為什麼要這一層
 //!
-//! `cache.db` 是**一個 server 一份、那台機器上這個 server 的所有帳號共用**（local-cache-db §5）。
+//! `cache.db` 是**一個 server 一份、那台機器上這個 server 的所有帳號共用**（local-cache-db.md §5）。
 //! daemon 常駐之後，兩個帳號的上游會話會**同時**往裡面寫，而 SQLite 的寫是排他的。
 //!
 //! ⚠️ **不是因為會馬上失敗**（2026-09-13 實測釘正）：`rusqlite` 開連線時就設了
@@ -171,7 +171,7 @@ impl ServerCache {
         drop(reader);
     }
 
-    /// 還有幾件在排隊。⚠️ 一直漲就是寫得比收得慢（daemon-runtime §2.2）。
+    /// 還有幾件在排隊。⚠️ 一直漲就是寫得比收得慢（daemon-runtime.md §2.2）。
     pub(crate) fn queued(&self) -> usize {
         self.queued.load(Ordering::SeqCst)
     }
@@ -297,7 +297,7 @@ mod tests {
         }
     }
 
-    /// `run` 回來就代表**真的落地了**：另一條路徑立刻讀得到（daemon-runtime §2.5）。
+    /// `run` 回來就代表**真的落地了**：另一條路徑立刻讀得到（daemon-runtime.md §2.5）。
     #[tokio::test]
     async fn run_returns_only_after_the_write_landed() {
         let dir = scratch("run");

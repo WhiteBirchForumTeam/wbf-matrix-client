@@ -1,5 +1,5 @@
 //! wbf 帳號的房間（account-session.md §6）：沒有 matrix-sdk 的 Client，房間清單走橋（`JoinedRooms` ＋ 每房 `GetState` ＋ `m.direct`），
-//! 送事件走 `Event/Send`（附件宣告終於帶得出去，約定 §5.2）。
+//! 送事件走 `Event/Send`（附件宣告終於帶得出去，wbf-client-convention-for-chunk.md §5.2）。
 //!
 //! 加密房的文字走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）；加密房的**檔案**還送不了（加密附件沒接，e2ee-rpc.md §6）。
 //! ⚠️ 「加不加密」問的是**這一刻的狀態**（`GetState`），🚫 不用快取：過期的「沒加密」會把明文送進已經加密的房。
@@ -156,7 +156,7 @@ impl Core {
             .is_some_and(|content| is_encryption_content(&content)))
     }
 
-    /// `Event/Send` 一則事件（明文 content），附件在 meta 裡宣告（約定 §5.2）。
+    /// `Event/Send` 一則事件（明文 content），附件在 meta 裡宣告（wbf-client-convention-for-chunk.md §5.2）。
     /// 🚫 不檢查加不加密：呼叫端先過 [`Core::wbf_refuse_if_encrypted`]（送檔那條在上傳**之前**就要問，不然白傳）。
     ///
     /// Args:

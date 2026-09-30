@@ -45,7 +45,7 @@
   每處理完一個事件（含 60 秒閒置逾時）：有「要拉」就 pull_to_device 一次；失敗就留著，下一個事件或下一分鐘再拉（🚫 不原地狂試）
   CryptoState            → 存量交給狀態機，它要補（不到 50 把、fallback key 到期）就走 Keys 線上傳（e2ee-rpc.md §5）
   訂閱結束（server 送 Error：被同一裝置後來的連線接手的 1505；或線死了）→ keys.state: stopped 帶原因、關掉這格線（link.state: closed）、task 結束
-                           🚫 task 不重訂（to-device-client §5.1）；關線是為了讓看線迴圈下一輪看到它不在、重開重訂
+                           🚫 task 不重訂（to-device-client.md §5.1）；關線是為了讓看線迴圈下一輪看到它不在、重開重訂
                            （2026-09-29 之前不關線，因為房間訂閱在同一條線上）
 登出：停兩個 task → Device/Unsubscribe（說出口的退出）→ close_links → 丟掉長活引擎 → 刪 m/
 ```
@@ -53,7 +53,7 @@
 - **同一支**：`OlmEngine::import_items(client, items)`＝匯進 crypto store（commit 了才回）→ `cd_seq` 與待銷毀清單落地（`m/td.json`）→
   對 server `ItemsDestroy` 那一批 → 只清回來的。`Fetch` 的一窗與推來的一包都是 `(count, 事件)` 舊→新，差別只在 meta（`Batch` 多 `tc`／`r`／`more`，`Push` 多 `gap`），
   解的那半也共用（`parse_device_items`）。core 不解封包、不碰 store。
-- **`Fetch`／`ItemsDestroy` 走金鑰那條線**：server 只讓持有這台裝置佇列的連線銷毀（to-device-client §8 實跑補的那條），所以 task 用線時跟池 `reuse` `Keys` 那一格
+- **`Fetch`／`ItemsDestroy` 走金鑰那條線**：server 只讓持有這台裝置佇列的連線銷毀（to-device-client.md §8 實跑補的那條），所以 task 用線時跟池 `reuse` `Keys` 那一格
   ——`reuse` 只拿開著的線，🚫 不開（開線是 `open_link` 的事，會再跑一次 `init_connection`、換掉 task 自己）。線不在就講一聲：東西還在 server 佇列裡，下次開線的追平會拉回。
 - **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）：server 的佇列沒有洞——每一則存到我們 `ItemsDestroy` 才刪（無窮 TTL），`Fetch` 舊→新從頭給。
   所以 `Fetch` 🚫 不帶 `cd_seq`，讓 server 從最舊還沒銷毀的給；`ItemsDestroy` 是唯一的「處理完了」。`m/td.json` 的 `cd_seq` 只是紀錄，🚫 不當游標。

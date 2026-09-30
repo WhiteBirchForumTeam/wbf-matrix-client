@@ -3,7 +3,7 @@
 > 維護者 2026-09-22／23 定，原話在 §0。實作：sdk `protocol.rs`／`client.rs` 的 `Event/Subscribe`／`Unsubscribe`／`Push` codec 與
 > `room_subscription`；core `room_sync.rs`（`init_connection`、收推播的 task）；`sync.recent` 多一個 `since`。
 > server 的語意在 wbfuwunel `wbf-event-push.md`（推送）與 `room-seq-and-recent.md`（`Recent`）。
-> 🚫 這支**不接開／關訂閱線的 RPC**：daemon 的訂閱（rpc-spec §3.9，每條 RPC 連線想收什麼）與 daemon 跟上游是兩件事（中繼），先純一點。
+> 🚫 這支**不接開／關訂閱線的 RPC**：daemon 的訂閱（rpc-spec.md §3.9，每條 RPC 連線想收什麼）與 daemon 跟上游是兩件事（中繼），先純一點。
 > 📌 2026-09-29 維護者定：訂閱線**總是由 daemon 搞定**——`vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（link-pool.md §3.1）；
 > 房間與金鑰各自一條線（`LinkRole::Rooms`／`Keys`）。UI 要不要收推播是 RPC 的 `subscribe`，🚫 沒有 `sync.open`／`sync.close`。
 
@@ -80,7 +80,7 @@ UI
 - RPC（開／關訂閱線的命令）：🚫 不做（維護者 2026-09-29：訂閱線總是由 daemon 搞定）。原本給測試用的 `open_subscriptions`／`close_subscriptions` 拿掉了，開線走 `ensure_links`。
 - 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：做了，在 [key-sync.md](../keys/key-sync.md)（同一條線上另一個會話）。
 - 背景重開：做了，link-pool.md §3.1。task 內 panic 那條路也是（PR #58 審查 cirno #661 🟢）：panic 不走 `pool.close`，會留下「線活著、沒 task」而且沒有 `closed`——
-  文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime §10 第 8 階段）。
+  文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime.md §10 第 8 階段）。
 - ~~`DeviceChanged`~~：✅ 2026-09-29 原樣轉成 `CoreEvent::DeviceChanged`（RPC `devices.changed`）給 UI（e2ee-rpc.md §4）。
 - ~~密文解密~~：✅ 2026-09-29 推來的有金鑰就解，密文明文一起存；沒金鑰只存密文，金鑰到了由金鑰那半補解（e2ee-rpc.md §6）。
 

@@ -154,7 +154,7 @@ impl MatrixBackend {
         let member_count = room.joined_members_count();
         let is_direct = room.is_direct().await.unwrap_or(false);
 
-        // chat-model §3.1：m.direct 有它且成員剛好兩個才是 Direct；§3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
+        // chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；§3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
         let (kind, direct_peer) = if is_direct && member_count == 2 {
             let peer = room
                 .direct_targets()
@@ -200,7 +200,7 @@ impl ChatBackend for MatrixBackend {
         self.describe(&room).await
     }
 
-    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（chat-model §4.3：`event_id` 是可攜的權威）。
+    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（chat-model.md §4.3：`event_id` 是可攜的權威）。
     /// 標準 Matrix 沒有「從某則事件往前翻」的 API，所以分兩步：
     ///
     /// 1. `/context/{event_id}` 拿到**那一則之前**的 token（`prev_batch_token`）；
@@ -261,7 +261,7 @@ impl ChatBackend for MatrixBackend {
         Ok(response.response.event_id.to_string())
     }
 
-    /// ⚠️ 附件宣告（約定 §5.2）這一版帶不出去：`Room::send` 不能加 header，`Event/Send` 在 server 端還是提案。
+    /// ⚠️ 附件宣告（wbf-client-convention-for-chunk.md §5.2）這一版帶不出去：`Room::send` 不能加 header，`Event/Send` 在 server 端還是提案。
     /// 所以 server 的媒體計數不會 +1，這則的附件過保護期會被清（等 server 定案；到時這裡改走 `WbfClient::send_event`，
     /// 那需要自己 Megolm 加密，也就是 `RoomCrypto` 出現的時候）。呼叫者要知道這件事，CLI 會印警告。
     async fn send_file(
@@ -361,7 +361,7 @@ impl ChatBackend for MatrixBackend {
 /// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，🚫 不一開機就全下載。
 ///
 /// Args:
-///     server_backup: conf 的 `SERVER_BACKUP`（CLI 規格 §10）, example: true
+///     server_backup: conf 的 `SERVER_BACKUP`（wbf-cli-spec.md §10）, example: true
 /// Return:
 ///     EncryptionSettings   `server_backup` 是 false 時只有 `auto_enable_backups` 關掉
 fn backup_encryption_settings(server_backup: bool) -> EncryptionSettings {
@@ -376,7 +376,7 @@ fn backup_encryption_settings(server_backup: bool) -> EncryptionSettings {
     }
 }
 
-/// `key-backup status` 印的東西（CLI 規格 §3.6）。🚫 不含任何金鑰內容。
+/// `key-backup status` 印的東西（wbf-cli-spec.md §3.6）。🚫 不含任何金鑰內容。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackupStatus {
     /// server 上有沒有 backup version。

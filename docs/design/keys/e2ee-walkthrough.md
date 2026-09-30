@@ -81,7 +81,7 @@ matrix-sdk 的 `room.send` 在裡面依序做：
 
 **我們**：`MatrixBackend::send_text` → `room.send`，①–⑧ 全在 matrix-sdk 裡，送之前 `sync_once`。
 **改走 WS 的缺口**：②③⑤ 的 `/keys/query`、`/keys/claim`、`/sendToDevice` 不在橋上；② 的「誰髒了」要 `device_lists.changed`，WS 沒有；
-⑦ 可以換成原生 `Event/Send`（`0x14/0x02`），而且**能帶 `attachments`**（附件宣告，約定 §5.2 一直卡住的那件事）。
+⑦ 可以換成原生 `Event/Send`（`0x14/0x02`），而且**能帶 `attachments`**（附件宣告，wbf-client-convention-for-chunk.md §5.2 一直卡住的那件事）。
 
 ## 4. Bob 的 B1 收到並解開 Alice 的訊息
 
@@ -327,7 +327,7 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
 | **2**（✅ 已做） | 橋的通用入口 `WbfClient::call_bridge`（先過 `Hello.features` 的 `bridge` 閘門；`IS_BRIDGED` 的請求／回覆，形狀取自 PR #43）＋ `Kind::Room`／`Keys`；`room_device_versions` 打 Members；`send_to_device`；`/keys/*` 五支的 `BridgedEndpoint` 常數（第 3 支的 OlmMachine 迴圈直接用 `call_bridge`） | 🚫 |
 | **3a**（✅ 已做） | **收與發金鑰**：`crypto_engine::OlmEngine`（feature `matrix`）——同一個 sqlite crypto store（`m/`）上的 `OlmMachine`，`send_outgoing_requests` 把 KeysUpload／Query／Claim／SignaturesUpload／發 to-device 全部走橋，`receive_to_device` 把 `Device/Fetch` 拉到的推進去（回新的 `RoomKeyInfo`），`share_room_key` 把房間金鑰分給一群人，`mark_users_changed` 是 1506 之後重查的入口。`0x16` 的 `Fetch`／`Batch`／`Subscribe`（不帶 `cd_seq`）／`ItemsDestroy`／`ItemsDestroyed`／`CryptoState` 編解碼與 `WbfClient::device_*`；`to_device_state`（`cd_seq` 與待銷毀清單落在 `m/`）。對真 server 走通：同帳號兩台裝置，房間金鑰只靠 WS 從 A 到 B（`tests/e2e_crypto_engine.rs`） | 🚫 |
 | **3b**（✅ 已做） | **送**：`OlmEngine::refresh_room_devices`（一支例行程序：成員清單 → diff → 只重查變的人 → 雜湊對一次、不對再查、還不對就拒發 → `share_room_key`）、`encrypt_and_send`（`encrypt_room_event_raw` → `Event/Send` 帶 `room_version`；1506 是 `Ok(RoomDevicesChanged)` 不是 Err）、`decrypt_room_event`；分享策略明確選 `AllDevices`（交叉簽章做好前 `IdentityBased` 等於發給零台）。**#45 的驗收對真 server 走通**（`tests/e2e_crypto_engine.rs::issue_45_acceptance_…`：Bob 登新裝置 → Alice 帶舊號碼送 → 1506 → refresh 只比出 Bob → 金鑰補到 B2 → 同 txn_id 重送接受 → B2 與 B1 都解得開） | ✅ 只有「送出那台」的連線宣告（e2e 裡 Alice 的 A）；2026-09-29 起 daemon 與 CLI 的 `Misc`／`Rooms` 線宣告（e2ee-rpc.md §2） |
-| **4**（✅ 已做，SDK 那一半） | 推播：通道能收非回應的 pack（`Event/Push`、`Device/Push`、`CryptoState`、`DeviceChanged`、`Superseded`）——`WsChannel` 底下換成 `link::WsLink`（讀取 task ＋ 送出 task ＋ 會話表，`ws-receive-dispatch.md`），推播依訂閱的 id 進 `Subscription` handle（`WbfClient::device_subscription`），每個收到的 pack 經過一個鉤子給之後的 RPC 面。`Subscribe` 帶 `cd_seq` 補窗與 `Event/Subscribe` 的 codec 是第 6 階段；daemon 那一半（daemon-runtime §5）已接在鉤子後面：推播封裝在 `push.rs`（2026-09-29 起含 `devices.changed`），UI 讀太慢漏掉的發 `desync`（`server.rs`）；`DeviceChanged` 的 `gap` 原樣轉給 UI、🚫 daemon 不因推播叫 refresh（e2ee-rpc.md §4） | 🚫 |
+| **4**（✅ 已做，SDK 那一半） | 推播：通道能收非回應的 pack（`Event/Push`、`Device/Push`、`CryptoState`、`DeviceChanged`、`Superseded`）——`WsChannel` 底下換成 `link::WsLink`（讀取 task ＋ 送出 task ＋ 會話表，`ws-receive-dispatch.md`），推播依訂閱的 id 進 `Subscription` handle（`WbfClient::device_subscription`），每個收到的 pack 經過一個鉤子給之後的 RPC 面。`Subscribe` 帶 `cd_seq` 補窗與 `Event/Subscribe` 的 codec 是第 6 階段；daemon 那一半（daemon-runtime.md §5）已接在鉤子後面：推播封裝在 `push.rs`（2026-09-29 起含 `devices.changed`），UI 讀太慢漏掉的發 `desync`（`server.rs`）；`DeviceChanged` 的 `gap` 原樣轉給 UI、🚫 daemon 不因推播叫 refresh（e2ee-rpc.md §4） | 🚫 |
 
 🚨 為什麼 1、2、3a 不能宣告：宣告的連線送加密訊息漏帶號碼是 `InvalidRequest`，而它們還沒有「送出前比對」——宣告了就是把自己所有加密訊息擋掉。
 
@@ -350,7 +350,7 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
 
 ### 16.5 整套分發邏輯對照 server 的設計（維護者 2026-09-21 要求逐條確認）
 
-server 那邊的設計（`wbf-room-device-version.md` §1、§5.1、§6、§7.2；`wbf-event-push.md` §1；`wbf-to-device.md` §4）一句話：**幾乎都靠版本號**——
+server 那邊的設計（`wbfuwunel 的 wbf-room-device-version.md` §1、§5.1、§6、§7.2；`wbfuwunel 的 wbf-event-push.md` §1；`wbfuwunel 的 wbf-to-device.md` §4）一句話：**幾乎都靠版本號**——
 房間版本號變了就代表成員或裝置有變，去看誰的裝置版本號不一樣，只重查那個人，狀態機比出哪台裝置新了／沒了，補發或輪換。
 推播只是加速，正確性由送出時的 1506 守；下線說出口退訂，上線主動確認一次，訂閱中也沒有空窗。**由 UI 主導什麼時候做；SDK 只負責每一步能正常呼叫、收到東西自動處理對。**
 

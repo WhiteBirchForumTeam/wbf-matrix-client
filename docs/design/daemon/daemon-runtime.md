@@ -34,7 +34,7 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 ```
 <data dir>/
   local.key                    一台機器一把主金鑰
-  daemon.lock  daemon.json     獨佔與 ready（architecture-v2 §0.2、local-interface.md §3）
+  daemon.lock  daemon.json     獨佔與 ready（architecture-v2.md §0.2、local-interface.md §3）
   s/<加密的 server 名>/
     cache.db                   🚨 **一個 server 一份，這台機器上所有這個 server 的帳號共用**
     media/                     媒體池：一個加密池、一把鑰，不分帳號
@@ -76,7 +76,7 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 | 3 | **成本**。每個操作都 `Cache::open` 要付一次 SQLCipher 導金鑰。連線留著重用 |
 | 4 | 那 5 秒真的用完時**仍然會失敗** —— 單一寫入者連這個尾巴也消掉 |
 
-📎 為什麼 daemon 的排他鎖（architecture-v2 §0.2）不管這件事：那把鎖擋的是**別的程序**。
+📎 為什麼 daemon 的排他鎖（architecture-v2.md §0.2）不管這件事：那把鎖擋的是**別的程序**。
 同一個 daemon 裡面的兩個 task 都在鎖的**裡面**，它一個字都沒說。
 
 ⭐ 值得記住：**「我以為的 bug」查下去不存在，但那個結構仍然該做** —— 差別在於現在寫得出
@@ -301,11 +301,11 @@ daemon 這邊 `account.switch` 只決定「沒帶 `user` 的命令預設對誰�
 - **點開房間 = 先 `sync: "local"`**（立刻有東西看），**之後**才視情況補洞。
   🚫 不要「先去 server 拉完再顯示」——那是把毫秒變成秒。
 - 有沒有洞是**看得出來的**：`cache.db` 的 `events` 有 `r_seq`（房內序號），
-  一段連續的 `r_seq` 中間缺號就是洞（local-cache-db §5）。有洞才發第二個 `sync: "both"`。
+  一段連續的 `r_seq` 中間缺號就是洞（local-cache-db.md §5）。有洞才發第二個 `sync: "both"`。
 - 補洞的範圍是**那一個房間**，🚫 不是全域 `Recent`。全域 `Recent` 是 UI 起來時另外叫的 `sync.recent`（§4.3），🚫 不是 daemon 自己的事。
 - 🚨 **往回翻一律拿 `event_id`**（維護者 2026-09-14）：UI 拿手上最舊那則當 `before`，`both` **永遠問上游**、
   寫進去、照上游順序從本地讀回。daemon 換算：wbf 查本地 `g_seq` → `Recent{rooms, before}`；matrix `/context` → `/messages`。
-  🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 rpc-spec §3.3「往回翻」。
+  🚫 一般 Matrix 房（沒有 `r_seq`）`local` 不答。細節與理由在 rpc-spec.md §3.3「往回翻」。
   📎 #32 的權宜守門 `before_for_upstream_page` 拿掉了：三種 `sync` 同一種座標，它沒有存在的理由。
 
 ### 3.5 ⚠️ 現況與這個模型的落差
@@ -404,7 +404,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 ### 4.1 一個帳號一組會話
 
 誰開、什麼時候開關、傳輸怎麼選（探到 wbf 走 WS——2026-09-29 起一個帳號五條，link-pool.md §1——否則落 HTTP）、斷線退避與 `sync.state`
-三個狀態 —— 這些在 architecture-v2 §5.1／§5.1.1 定了。執行期要補的是**事件進來之後的順序**：
+三個狀態 —— 這些在 architecture-v2.md §5.1／§5.1.1 定了。執行期要補的是**事件進來之後的順序**：
 
 ```
 事件進來 ──> 解密 ──> post 給那個 server 的寫入者（§2.3），⚠️ **事件跟著工作一起交出去**
@@ -436,7 +436,7 @@ struct Work {
 
 - **事件各自進來、各自解密**（金鑰是每帳號的），但**寫進同一個 `cache.db`**。
 - 事件本體（`events` 表）是**共用的**：同一則訊息 A 與 B 都收到，庫裡只有一列。
-- **「誰看得到」是另一張表**（`events_synced_log`，local-cache-db §5）：
+- **「誰看得到」是另一張表**（`events_synced_log`，local-cache-db.md §5）：
   一則事件對每個看得到它的帳號各有一列。⭐ 這就是「混存但不混視野」的機制。
 - 所以 §2.2 那個「一個 server 一個寫入者」不只是為了避免撞鎖，
   也是因為**兩個帳號寫的是同一批列**（`rooms`、`users`、`events` 都要 upsert）。
@@ -472,7 +472,7 @@ struct Work {
 **要，而且預設全收。** 使用者正在看帳號 A，帳號 B 來了訊息 —— UI 要能在側邊欄顯示未讀。
 所以：
 
-- `subscribe` 不帶 `user` ＝ **全部帳號**（rpc-spec §3.9）。帶了才是只收那一個。
+- `subscribe` 不帶 `user` ＝ **全部帳號**（rpc-spec.md §3.9）。帶了才是只收那一個。
 - 🚫 **daemon 不替 UI 決定「哪些值得看」**：它只送「發生了什麼」，
   要不要響、要不要跳紅點、要不要靜音某個帳號 —— 那是 UI 的事（§6）。
 
@@ -487,7 +487,7 @@ struct Work {
   ⭐ 全部都是本地讀，很便宜，所以這個補救是廉價的。
 - 🚫 **不重播**（我們沒有留著那些事件），🚫 **也不假裝沒事**。
 
-📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（architecture-v2 §5.1.1）。
+📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（architecture-v2.md §5.1.1）。
 ⭐ 我們自己的推播是同一個問題，🚫 沒有理由用不同的答案。
 
 ### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13 更正）
@@ -546,7 +546,7 @@ struct Work {
 
 ## 7. 進度歸誰：`job`
 
-長工作的進度必須說得出是哪一個請求的（rpc-spec §4 的 `progress.id`），可是 core 不知道
+長工作的進度必須說得出是哪一個請求的（rpc-spec.md §4 的 `progress.id`），可是 core 不知道
 「請求」這種東西，而三個長工作的事件在同一條廣播上是交錯的。
 
 做法是 `crates/wbf-core/src/job.rs`：daemon 把整個工作包在 `run_as_job(請求的 id, …)` 裡，
@@ -576,7 +576,7 @@ let response = tokio::select! {
 
   | 工作 | 取消之後 |
   |---|---|
-  | 上傳 | 狀態檔還在（CLI 規格 §6），可續傳；🚫 不自動去 `abort` server 那邊 |
+  | 上傳 | 狀態檔還在（wbf-cli-spec.md §6），可續傳；🚫 不自動去 `abort` server 那邊 |
   | 下載 | 媒體池的段是可續的；`no_cache` 的直接下載刪掉半個檔 |
   | `sync.recent` | 水位只在整批寫完之後前進，所以🚫 不會留下「假裝拉過」的洞 |
 
@@ -587,7 +587,7 @@ let response = tokio::select! {
 | vault 鎖著 | 🚫 不起上游會話（token 在 `session.sealed` 裡，讀不到） |
 | 沒有寫權（別的 daemon 佔著） | 🚫 不起上游會話；會寫的 method 回 `109` |
 | 上游斷線，但有請求正在跑 | 那個請求照它自己的錯誤路徑失敗（`1300`），🚫 不掛在那裡等重連 |
-| 前端關掉連線 | 訂閱沒了；**它發起的長工作繼續跑**（rpc-spec §1.2），進度沒人收就沒人收 |
+| 前端關掉連線 | 訂閱沒了；**它發起的長工作繼續跑**（rpc-spec.md §1.2），進度沒人收就沒人收 |
 | `cache.db` 寫失敗 | ⚠️ 上游會話**不能就這樣往前走**：水位（`cg_seq`）沒推進才是對的，下次重連會重拉那一段 |
 | daemon 關閉 | 先停上游會話 → 等在跑的請求收攤 → 關 listener |
 
@@ -611,7 +611,7 @@ let response = tokio::select! {
 ## 11. 明確不做的
 
 - 🚫 **不重播掉掉的事件**：推播是「不用輪詢」，不是「保證看得到全部」。掉了就重查（本地讀很便宜）。
-- 🚫 **不把「這台 server 是 wbf」寫進設定檔**：每次起會話重探（architecture-v2 §5.1）。
+- 🚫 **不把「這台 server 是 wbf」寫進設定檔**：每次起會話重探（architecture-v2.md §5.1）。
 - 🚫 **不做跨帳號的合併事件流**：每個帳號各自一組，要合併是 UI 的事。
 - 🚫 **不在 daemon 裡做通知政策**（§6）。
 - 🚫 **不做「UI 現在在看哪個帳號」的伺服器端狀態**（§3.2）。
@@ -642,7 +642,7 @@ let response = tokio::select! {
 **為什麼誘人**：§2 那一整章（單一寫入者、queue、回執）**會直接消失** ——
 一個帳號一個庫、一個寫入者，天生沒有競爭。刪帳號也變成 `rm` 一個檔。
 
-🚫 **不走**（而且這是 2026-08 就定案的，local-cache-db §5）：
+🚫 **不走**（而且這是 2026-08 就定案的，local-cache-db.md §5）：
 
 - 同一個房間裡的兩個帳號會**各存一份**全部事件與媒體指針，而群組房間裡這是常態。
 - 跨帳號的東西（搜尋、媒體去重）會從「一句 SQL」變成「N 個庫合併」。
@@ -662,7 +662,7 @@ let response = tokio::select! {
 **為什麼誘人**：少一層翻譯。
 
 🚫 **不走**：`user` 是 core 知道的，但 `id`（哪個請求）、訂閱、加密、每條連線的過濾都是 daemon 的。
-core 一旦認識「連線」與「請求 id」，architecture-v2 §6 那條「公開面只有可序列化 DTO」就破了 ——
+core 一旦認識「連線」與「請求 id」，architecture-v2.md §6 那條「公開面只有可序列化 DTO」就破了 ——
 ⭐ 而那條是 uniffi／FFI 那條路的前提。
 
 ### 12.5 這次檢視改掉的四件事

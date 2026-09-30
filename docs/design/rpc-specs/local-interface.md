@@ -75,7 +75,7 @@ Kotlin 的 OkHttp 內建，JS 原生。
    它出現時，port 一定已經在聽，而且一定不是上一次的。
 3. 同時 **stdout 印一行 JSON**：`{"ready":true,"rpc_port":…,"data_port":…,"pid":…,"instance":"<uuid>"}`。
    spawn daemon 的那個程序手上有 pipe，這樣它不必去 watch 檔案。🚫 stdout 只有這一行，其餘一律 stderr。
-   📎 `instance` 是這次啟動鑄的 UUID v4，`hello` 與 `daemon.info` 回的是**同一個**（rpc-spec §1.3）：
+   📎 `instance` 是這次啟動鑄的 UUID v4，`hello` 與 `daemon.info` 回的是**同一個**（rpc-spec.md §1.3）：
    前端拿它判斷「還是剛才那一個 daemon 嗎」——⚠️ 🚫 不要拿 port 或 pid 判斷，那兩個都會被重複使用。
 4. daemon 結束時刪掉 `daemon.json`。
 
@@ -92,7 +92,7 @@ Kotlin 的 OkHttp 內建，JS 原生。
 ## 4 每則控制訊息都加密（token 就是金鑰材料）
 
 **WS 上一律 binary frame**，每個 frame 是 RPC 自己的極簡 pack：`ver(1) ‖ type(1) ‖ data`
-（維護者 2026-09-12 定；欄位與兩個階段的規則在 rpc-spec §1，這裡只放密碼學的部分）。
+（維護者 2026-09-12 定；欄位與兩個階段的規則在 rpc-spec.md §1，這裡只放密碼學的部分）。
 `type = 0x02` 時 `data` 是密文：
 
 ```
@@ -106,13 +106,13 @@ aad     = "wbf-rpc v1"
 - **nonce 每則隨機 24 byte**：XChaCha 的 nonce 夠長，隨機碰撞機率可忽略，不必維護計數器
   （計數器碰到重連就要處理狀態）。
 - **加密本身就是認證**：沒有 token 就送不出解得開的包，第一包就驗不過 → 關連線。
-  ⚠️ 但**關之前先送一包 `type = 0x01`（明文）講原因**（`BAD_TOKEN` 之類，rpc-spec §1.4）——
+  ⚠️ 但**關之前先送一包 `type = 0x01`（明文）講原因**（`BAD_TOKEN` 之類，rpc-spec.md §1.4）——
   不然 token 錯的人只看到斷線，什麼提示都沒有。`0x01` 在預設狀態下**只有這一種用途**，
   而且它的 JSON **跟正常回應同一個形狀**（`code` 9xxx、`result.close`），前端的 frame 翻譯器只有一條路。
 - **加密是 daemon 的全局狀態 `encryption_enforced`，預設開**：開著時 client 送 `0x01` 一律拒絕；
-  只有走密文呼叫 `daemon.set_encryption { enforced: false }` 才降級（除錯用，rpc-spec §1.1）。
+  只有走密文呼叫 `daemon.set_encryption { enforced: false }` 才降級（除錯用，rpc-spec.md §1.1）。
   🚫 所以 `hello` **不必再帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
-  （正式名稱、`wbf-matrix` 開頭，rpc-spec §1.3）。
+  （正式名稱、`wbf-matrix` 開頭，rpc-spec.md §1.3）。
 - frame 上限 **1 MiB**：超過就關連線（🚫 不讓對方用一個巨大 frame 把記憶體吃光）；
   這個數字跟 §8「超過就走資料平面」是同一個。
 
@@ -141,13 +141,13 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 ```jsonc
 { "method": "vault.unlock", "params": { "passphrase_file": "/path/to/pw" }, "id": 1 }
-// 或 { "passphrase_base64": "…" }：passphrase 是任意 bytes（vault-and-keys §3），不一定是字串
+// 或 { "passphrase_base64": "…" }：passphrase 是任意 bytes（vault-and-keys.md §3），不一定是字串
 ```
 
 - **passphrase 只留在 daemon 的記憶體裡，直到 daemon 關閉**（維護者 2026-09-09）。
-  ⚠️ 所以 `unlock.ticket`（明文主金鑰落地 15 分鐘，vault-and-keys §1 自己標記為妥協）**整個消失**——
+  ⚠️ 所以 `unlock.ticket`（明文主金鑰落地 15 分鐘，vault-and-keys.md §1 自己標記為妥協）**整個消失**——
   這是 daemon 最直接的安全收穫。📎 2026-09-13 起連 CLI 那一側也沒有了（同本文）：那個痛點不存在了。
-- 🚫 **沒有「鎖回去」**：`Core` 解鎖一次就活到程序結束，daemon 沒有 `vault.lock`（rpc-spec §3.1）。
+- 🚫 **沒有「鎖回去」**：`Core` 解鎖一次就活到程序結束，daemon 沒有 `vault.lock`（rpc-spec.md §3.1）。
   UI 的 lock／unlock 是 **UI 自己那一層**的事 —— daemon 照樣連著、照樣寫 DB、照樣發通知，
   ⭐ 因為使用者按 lock 通常只是暫時離開，回來要看到這段時間的訊息。真的要讓金鑰離開記憶體
   就是 `daemon.shutdown` 再 `daemon -s`。
@@ -257,7 +257,7 @@ daemon 起來的第一件事是**試著自解密**（`plain` 模式的 `local.ke
 
 既然不能給路徑，剩下的通用介面就只有 **URL**。所以 loopback HTTP 不是多造一個輪子，
 是**把加密池接上這些現成輪子的唯一接頭**。Range 也不是額外工作：媒體池的 64 KiB 分段
-本來就是為隨機讀設計的（media-pool §1），`seek` 的語意早就定好了（約定 §7）。
+本來就是為隨機讀設計的（media-pool.md §1），`seek` 的語意早就定好了（wbf-client-convention-for-chunk.md §7）。
 
 **資料平面的認證：每個資源一張 capability URL，🚫 沒有全域 token**
 
@@ -337,12 +337,12 @@ homeserver  <=>  daemon 的 WS 協議層（wire、四條連線 architecture-v2.m
 | 2 | daemon → server | 去 server **建檔**（`Upload/Create`），拿回檔案的 URL／id |
 | 3 | daemon → 前端 | RPC 回 result：server 的 URL ＋ 資料平面的 PUT URL |
 | 4 | 前端 → daemon | 以那個 URL 為基礎**發一則附件訊息**（RPC `room.send`，內容是明文） |
-| 5 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（約定 §5.2）在這一步帶 |
+| 5 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（wbf-client-convention-for-chunk.md §5.2）在這一步帶 |
 | 6 | 前端 → daemon | **同時**開始 PUT bytes 到資料平面的 URL（一個 HTTP 連線，不斷送） |
 | 7 | daemon → server | 邊收邊做 chunk 加密、邊走 `Upload/*` 上傳到 homeserver |
 | 8 | daemon → 前端 | 不斷回 `progress`（§8） |
 
 ⚠️ 第 4 與第 6 步**並行**：訊息不必等檔案傳完才發（訊息裡只有 URL 與描述），
-接收端拿到訊息時檔案可能還在傳——這正是分片協議與 `seek` 存在的原因（約定 §7）。
+接收端拿到訊息時檔案可能還在傳——這正是分片協議與 `seek` 存在的原因（wbf-client-convention-for-chunk.md §7）。
 ⚠️ 第 5 步失敗與第 7 步失敗是**兩件事**，各自回錯誤、各自可重試，🚫 不要綁成一個交易。
 

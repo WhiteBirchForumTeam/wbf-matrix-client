@@ -1,6 +1,6 @@
 //! 帳號家族的操作：列出、切換、找出「使用者打的那串是誰」，以及 recovery key 的查詢。
 //!
-//! ⚠️ 這裡的每個公開方法都**收字串、回可序列化的 DTO**（architecture-v2 §6）。
+//! ⚠️ 這裡的每個公開方法都**收字串、回可序列化的 DTO**（architecture-v2.md §6）。
 //! `AccountDir`、`DataDirMap`、`Session`、`Vault` 一個都不過邊界——帳號的身分在邊界上
 //! 就是一串 **mxid**（PR #24 審查 cirno🔴）。
 
@@ -142,7 +142,7 @@ impl Core {
 
     // ---- 以下 pub(crate)：回傳裡有 `AccountDir`，不過邊界 ----
 
-    /// `switch`／`del`／`destroy` 的 `<user>`：**一律完整 mxid**（CLI 規格 §3.1）——
+    /// `switch`／`del`／`destroy` 的 `<user>`：**一律完整 mxid**（wbf-cli-spec.md §3.1）——
     /// 這些命令會登出、會刪檔，變更的對象不該靠猜。只給 localpart 就報錯並列出本機的帳號，
     /// 🚫 不推測、🚫 不拿唯一一個頂替。
     pub(crate) fn find_account_by_full_mxid(
@@ -185,7 +185,7 @@ impl Core {
         }
     }
 
-    /// 改 `current`，並發一個 `Progress` 事件（CLI 規格 §3.1.1 的 switch 提示）。
+    /// 改 `current`，並發一個 `Progress` 事件（wbf-cli-spec.md §3.1.1 的 switch 提示）。
     ///
     /// Return:
     ///     Ok(Some(String))   換掉的是誰

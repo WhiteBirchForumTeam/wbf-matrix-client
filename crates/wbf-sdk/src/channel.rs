@@ -1,4 +1,4 @@
-//! 通道（線上規格 §1）：WebSocket 主要、HTTP 給測試與腳本。
+//! 通道（wbfuwunel 的 chunked-upload-spec.md §1）：WebSocket 主要、HTTP 給測試與腳本。
 //!
 //! `PackChannel` 的契約是「送一個、等一個」與「送一個、收到呼叫者說停」（`request_stream`：`Event/Recent` 的回應是一串 `Batch`）。
 //! WebSocket 底下是 `link::WsLink`（ws-receive-dispatch.md）：送與收是兩個 task，回覆依會話表交付，所以推播與回覆交錯、順序亂掉都不出事；
@@ -366,7 +366,7 @@ impl PackChannel for HttpChannel {
             .bytes()
             .await
             .map_err(|error| SdkError::Network(format!("http pack body: {error}")))?;
-        // 線上規格 §1：HTTP 一律 200，沒 token 401 但 body 仍是 pack。其他狀態碼是 server 之外的東西（proxy）在講話。
+        // wbfuwunel 的 chunked-upload-spec.md §1：HTTP 一律 200，沒 token 401 但 body 仍是 pack。其他狀態碼是 server 之外的東西（proxy）在講話。
         match status.as_u16() {
             200 => Ok(Pack::decode(&body)?),
             // body 是 pack 就照 pack 的 Error 走；不是（proxy 的 401 頁）也要是 Unauthorized，跟 WebSocket 升級被拒同一個分類。

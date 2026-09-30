@@ -8,7 +8,7 @@
 > - daemon：`room.refresh_devices`、`room.send_text` 多兩個參數、錯誤回應的 `data`、`devices.changed` 推播。
 >
 > server 的語意在 wbfuwunel `wbf-room-device-version.md`（房間版本號、1506、`DeviceChanged`）與 `wbf-e2ee.md`（`CryptoState`）。
-> 這份取代 e2ee-walkthrough §16.6 那張「誰呼叫」的表（09-21 版的「daemon 存快照、補完發狀態訊息」被這版精確化）。
+> 這份取代 e2ee-walkthrough.md §16.6 那張「誰呼叫」的表（09-21 版的「daemon 存快照、補完發狀態訊息」被這版精確化）。
 
 ## 0. 規矩（維護者原話，2026-09-29）
 
@@ -92,7 +92,7 @@
   "data": { "room_version": 9, "members": { "@bob:localhost": "4-0a1b2c3d4e", … }, "shared": 1, "txn_id": "wbf-…" } }
 ```
 
-- `1401 room_devices_changed` 是 RPC 的號碼（rpc-spec §5.2，server 家族 1400 裡拆出來的；server 那邊叫 1506，訊息裡照帶）。
+- `1401 room_devices_changed` 是 RPC 的號碼（rpc-spec.md §5.2，server 家族 1400 裡拆出來的；server 那邊叫 1506，訊息裡照帶）。
 - `data` 就是新的 `RoomDevices` ＋ `shared` ＋ 這則的 `txn_id`（UI 沒給的話是 daemon 產的）：UI 存下它、用同一個 `txn_id` 重送就過。
 - 重拿也失敗：`data` 只有 `{ txn_id, current_room_version }`，`msg` 說明，UI 自己叫 `room.refresh_devices`。
 - 🚫 **daemon 不自動重送**（09-21 那條仍成立：使用者可能已經撤回或改了，重送的政策在 UI）。
@@ -139,7 +139,7 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 - **加密附件**：`room.send_file` 在加密房拒絕。
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
-- **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，e2ee-walkthrough §16）。
+- **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，e2ee-walkthrough.md §16）。
 - **補解寫失敗的那批不會自動重試**（PR #62 審查 rumia 🟡1）：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
   那把金鑰已經匯入，之後不會再觸發補解（只有同一把金鑰再來才會）。要不要加一個觸發點（例如 `room.history` 讀到未解的就試一次）待維護者決定。
 - ~~沒對真 server 跑過~~：2026-09-30 server 重編後跑過了，見 §9 最後一項。

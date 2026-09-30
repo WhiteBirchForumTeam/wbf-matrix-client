@@ -7,7 +7,7 @@
 > |---|---|
 > | vault-and-keys.md §1 主金鑰、兩種鎖法、三把子金鑰、`session.sealed` | ✅ 第一個 PR：`wbf-sdk::vault`（`Vault::create`／`open`／`read_mode`／`set_unlock`、`seal_session`／`unseal_session`）、CLI 的 `unlock.rs`。實作與這裡的差異見 vault-and-keys.md §1.1 |
 > | §4.3 matrix-sdk store 用第二把子金鑰 | ✅ 同一個 PR：`SqliteStoreConfig::key`，不走 PBKDF2 |
-> | §3、§5 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，CLI 規格 §3.1，實作還沒跟上）。§5 的 schema 就是實作的（v2）；建置需求見 §3 |
+> | §3、§5 `cache.db`（SQLCipher） | ✅ 第二個 PR：`wbf-sdk::cache`（feature `cache`）、CLI 的 `recent`／`--from-cache`／寫穿、多帳號混存（當時叫 `accounts`／`forget-account`；命令名 2026-09-09 改成 `account` 一族，wbf-cli-spec.md §3.1，實作還沒跟上）。§5 的 schema 就是實作的（v2）；建置需求見 §3 |
 > | room-key-backup.md 房間金鑰備份（server 一份、本地一份、recovery key 獨立保管） | ✅ 2026-09-09 做了：`EncryptionSettings`、`key-backup status`／`upload`／`save`／`import`／`restore`／`recovery`、`logout` 的兩關閘門、`room_keys` 模組、`r/` 資料夾與 `recovery list`／`show`。room-key-backup.md §4 的本地格式實作時改成全量快照（原因寫在那一節）。✅ 2026-09-10 補上 conf 的兩個開關（`SERVER_BACKUP`／`LOCAL_ROOM_KEYS`）與關掉時的警告 |
 > | vault-and-keys.md §2 路徑兩層都加密、vault-and-keys.md §3 passphrase 是任意 bytes | ✅ vault-and-keys.md §2 2026-09-09 做了（`account_dir`）、vault-and-keys.md §3 2026-09-10 做了（`read_passphrase_file`）。兩者都 breaking，而維護者 2026-09-09 明說不寫遷移（server 從未上線、client 從未被使用）：舊 data dir 直接刪，舊 `local.key` 解不開也直接刪 |
 > | media-pool.md 媒體儲存池 | ✅ 第三個 PR：`wbf-sdk::media_pool`（池的落地格式）、`wbf-sdk::media`（fetch／gc／sweep 的接法）、CLI `download` 走快取、`media-stats`／`media-gc`。格式與續傳細節見 media-pool.md §1、§3 的「實作」段 |
@@ -34,12 +34,12 @@
 |---|---|
 | 房間列表與 metadata | room_id、名稱、是否 E2EE、成員數、最後活動時間 |
 | 時間線事件，**解密後的明文** | 含 `org.wbftw.wbfuwunel.chunked` 區塊（裡面有媒體金鑰）。這是整個 DB 非加密不可的理由 |
-| 每房的閱讀位置 | `read`／`watch` 接著看用。📎 翻頁 token 🚫 不存：往回翻一律拿 `event_id` 當錨（rpc-spec §3.3） |
+| 每房的閱讀位置 | `read`／`watch` 接著看用。📎 翻頁 token 🚫 不存：往回翻一律拿 `event_id` 當錨（rpc-spec.md §3.3） |
 | 已知的 manifest | 就是事件區塊加 mxc，給 `files`／`download` 用；不另存一份，從事件查 |
 
 | 不存 | 理由 |
 |---|---|
-| 密碼 | 永遠不存（CLI 規格 §9） |
+| 密碼 | 永遠不存（wbf-cli-spec.md §9） |
 | 媒體內容 | **不進 DB**，整檔明文放進加密的儲存池（media-pool.md）；DB 只放指針（`media`、`event_media`） |
 | session 與 token | **不進 DB**（維護者 2026-09-05 定）：另外用同一把主金鑰導出的第三把子金鑰鎖一次，見 vault-and-keys.md §1 與 §4.6 的 `session.sealed` |
 
@@ -157,7 +157,7 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 --   NULL ＝ 不知道（只因為收到事件才建出來的列）、0 ＝ 明文、1 ＝ 加密。
 --   🚫 不是 NOT NULL DEFAULT 0：預設成 0 等於預設「明文」，那是最危險的預設。
 --   🚨 只准 0 → 1，不准 1 → 0：Matrix 房間一開加密就關不掉，所以一份過期的「沒加密」（別的帳號舊的、有 bug 的）
---   不准把它蓋回明文 —— 蓋回去的下一步是送檔用 `cipher: none`，把區塊金鑰公開出去（約定 §5.1）。
+--   不准把它蓋回明文 —— 蓋回去的下一步是送檔用 `cipher: none`，把區塊金鑰公開出去（wbf-client-convention-for-chunk.md §5.1）。
 --   ⭐ 放 rooms 不放 room_list：加不加密是房間的性質、對每個帳號都一樣；room_list 是「這個帳號看到的樣子」。
 --   讀的時候（list_conversations）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
 CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
@@ -184,7 +184,7 @@ CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NUL
 CREATE INDEX events_by_time ON events (room, origin_server_ts);
 CREATE INDEX events_by_ref ON events (room, ref_event_id) WHERE ref_event_id IS NOT NULL;   -- 「誰參照這則」
 
--- 同步紀錄：哪個 user 真的從 server 拿到過哪一則，至少一次。hidden = Delete for me（chat-model §5）：
+-- 同步紀錄：哪個 user 真的從 server 拿到過哪一則，至少一次。hidden = Delete for me（chat-model.md §5）：
 -- 再同步只更新 last_synced_at，不動 hidden；讀取濾掉 hidden = 1。
 CREATE TABLE events_synced_log (
   event INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
@@ -210,7 +210,7 @@ CREATE TABLE sync_state (
   user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   cg_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL) WITHOUT ROWID;
 
--- 本地 offset（chat-model §3.5）：一人一房一列，指事件列。
+-- 本地 offset（chat-model.md §3.5）：一人一房一列，指事件列。
 CREATE TABLE read_positions (
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
   user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -247,14 +247,14 @@ CREATE INDEX event_media_by_media ON event_media (media);
 規則：
 
 - **寫入**（`upsert_events(user_id, room_id, &[IncomingEvent])`，一個房間、一個 transaction）：mxid／room_id 換成整數 id（`INSERT OR IGNORE` 再 `SELECT id`）→ 事件照 edits-and-redactions.md 寫入與處理（`raw_event` 只寫一次、`content_json` 不被密文蓋掉、file 內容建 `media`（已有就不動）與 `event_media`）→ `events_synced_log(event, user)` upsert（新列 `hidden = 0`，已有只更新 `last_synced_at`）。
-- **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0 AND class IN ('msg', 'general')`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model §4.3 的退化表）。每列從 `content_json` 組回 `Message`（edits-and-redactions.md §8）；`files` 另加 `json_extract(content_json, '$.msgtype')` 是約定 §5 的檔、而且沒被 redact。
+- **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0 AND class IN ('msg', 'general')`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（chat-model.md §4.3 的退化表）。每列從 `content_json` 組回 `Message`（edits-and-redactions.md §8）；`files` 另加 `json_extract(content_json, '$.msgtype')` 是wbf-client-convention-for-chunk.md §5 的檔、而且沒被 redact。
 - **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。**預設不叫它；`account del`（即 `logout`）不叫它，只有 `account destroy` 叫**；這個 server 最後一個帳號登出時 CLI 直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
   ⚠️ **`destroy` 的順序**（#25，維護者 2026-09-15）：閘門 → 忘掉鏈（**趁 `cache.db` 還在**，走這台 server 的唯一寫入者 `ServerCache`，🚫 不另開 `cache_of` 連線；`cache.db` 不在就不開，🚫 不為了忘掉而建一個空的）→ 池檔 → 裝置層（登出）→ recovery key → 刪目錄。🚨 **登入、登出、destroy 全程握著 `<data dir>/account.lock`**（PR #40 審查 rumia🔴 第三輪，維護者 2026-09-15：仿 `daemon.lock`）：OS 層的排他鎖、拿不到就回 `account_busy`（1013）、🚫 不排隊；檔案不刪、不寫內容；整個資料目錄一把（鎖檔名🚫 不帶 server 或帳號，否則在外面留痕跡）。所以 destroy 期間不會有登入冒出新目錄，反之亦然 —— 下面的「再看一次 `a/`」降為防線，🚫 不是同步。🚨 **最後一個帳號時另外放 `s/<b58>/to_be_deleted.lock`**（維護者 2026-09-15）：磁碟上的標記、🚫 不是 OS 鎖，程序當掉也還在；清理的第一步放下；收尾時 `a/` 收掉之後先把 server 目錄**改名、名字最前面加 🗑️**（`s/🗑️<b58>_<b58>`），再收 `to_be_deleted.lock`、刪那個目錄（維護者 2026-09-15）。改名之後原本的路徑就不在了，之後登入這台 server 建的是新目錄；沒刪完的 `🗑️…` 掃描時一律跳過、也不觸發「local.key 換過了」的提示；改名目標已經存在就停下不覆蓋。它在的時候登入這台 server 一律回 `server_pending_removal`（1014），🚫 core 不自己收拾，訊息說出要手動刪的目錄。🚨 **回 Err ⇒ 帳號目錄還在**（PR #40 審查 rumia🔴×2）：它一不在，重跑 destroy 就找不到這個帳號。同 server 還有別的帳號就只刪它；它是最後一個時：先 `close_server_cache`（關不掉就停，什麼都沒刪）→ 刪 `s/<b58>/` 裡 `a/` 以外的東西（`cache.db`、媒體池）→ **再看一次** `a/` 是不是只剩它（中途有人建了新帳號就只刪它、不收 server 目錄）→ 刪帳號目錄 → 收掉已經空了的 `a/` 與 `s/<b58>/`。最後這一步 🚫 **不回 Err**：帳號已經不在，回 Err 等於叫人重跑卻找不到它；留下的只可能是空目錄（或剛冒出來的新帳號，`remove_dir` 不會碰），只發一則 progress 說明。
 - 解不開的加密事件也存（`decrypted = 0`、`class = general`、密文在 `raw_event`），之後明文到了才處理（edits-and-redactions.md §4）；不存等於每次都要重拉。`recent` 拿到的原始 `m.room.encrypted` 就是這樣存的。
 - **威脅模型的邊界（PR #13 審查 rumia 🟡1，維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
 - **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`（PR #13 審查 salvia 🟢3、cirno）。
 - **洞**：有 `r_seq` 的 room，「快取裡有哪些」就是 `r_seq` 的集合，缺的就是洞，不存 token。沒有 `r_seq` 的 room 只快取最新一段連續視窗。
-- **開 app 的同步**（UI 的順序，維護者定）：先刷房間清單（`room_list`）→ `Event/Recent` 帶這個帳號的 `cg_seq` 一窗一窗拉（每個 `Batch` 寫一次 DB：事件進 `events` 加 `events_synced_log`），Batch 說 `more: true` 就帶 `before = 最後的 ls` 再一窗；追平（`more: false`，或空窗）才把**第一窗第一個 Batch 的 `fs`** 寫回 `sync_state`。🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`，中途斷線不推水位（server 的 pack-pipeline §6.4）→ 點進房間才刷該房歷史（`/messages`）。
+- **開 app 的同步**（UI 的順序，維護者定）：先刷房間清單（`room_list`）→ `Event/Recent` 帶這個帳號的 `cg_seq` 一窗一窗拉（每個 `Batch` 寫一次 DB：事件進 `events` 加 `events_synced_log`），Batch 說 `more: true` 就帶 `before = 最後的 ls` 再一窗；追平（`more: false`，或空窗）才把**第一窗第一個 Batch 的 `fs`** 寫回 `sync_state`。🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`，中途斷線不推水位（wbfuwunel 的 pack-pipeline.md §6.4）→ 點進房間才刷該房歷史（`/messages`）。
 
 ### 5.1 實作備註
 

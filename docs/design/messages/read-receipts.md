@@ -30,7 +30,7 @@ UI 分離之後那個等式不成立了 —— **只有 UI 說看過了才算看
 | `server` | 只送上游的 read receipt，🚫 不寫本地（對帳用，跟 daemon-runtime.md §3.1 同一套語意） |
 | `both` | 送上游 ＋ 寫本地 |
 
-- **位置怎麼指**：`event_id` 是權威，`g_seq`／`r_seq` 是算術用的捷徑（local-cache-db §5）。
+- **位置怎麼指**：`event_id` 是權威，`g_seq`／`r_seq` 是算術用的捷徑（local-cache-db.md §5）。
   三個至少要給一個；給 seq 的時候 daemon 自己去查那一則的 `event_id` 再送上游
   —— ⚠️ Matrix 的 read receipt 吃的是 `event_id`，🚫 沒有序號這種東西。
 - **未讀數還是算出來的**（`read_positions` 對 `events`），🚫 不是一個推播欄位。

@@ -22,7 +22,7 @@ pub struct LoginResult {
     pub user_id: String,
     pub device_id: String,
     pub server: String,
-    /// 登入成功自動切成 current（CLI 規格 §3.1.1）；換掉的是誰。
+    /// 登入成功自動切成 current（wbf-cli-spec.md §3.1.1）；換掉的是誰。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub switched_from: Option<String>,
 }
@@ -62,7 +62,7 @@ impl Core {
     /// Args:
     ///     user: mxid 或 localpart, example: "@alice:localhost"
     ///     password: 🚫 不印、不 log；⚠️ 它要送給 homeserver，所以是**字串**不是任意
-    ///         bytes（vault-and-keys §3.4：跟 passphrase 分家的理由）
+    ///         bytes（vault-and-keys.md §3.4：跟 passphrase 分家的理由）
     ///     device_name: example: "wbf-cli"
     pub async fn log_in(
         &self,

@@ -141,7 +141,7 @@ pub struct RecentSync {
     pub events: u64,
     pub last_ls: Option<i64>,
     /// true = 一窗回來說 `more: false`（回到了 `cg_seq`）；false = 被 `max_events` 停下，`last_ls` 以下到舊水位之間還沒拿
-    /// （那段之後靠逐房翻頁補，local-cache-db §5 的「洞」）。
+    /// （那段之後靠逐房翻頁補，local-cache-db.md §5 的「洞」）。
     pub caught_up: bool,
 }
 
@@ -453,7 +453,7 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     /// 一串回應的請求（`Recent`、`Device/Fetch`、`ItemsDestroy`）用的會話號：client 自己選，從 1 起、永遠不是 0。
-    /// 型別 byte 是 SESSION（wire-format §2.2）：沒帶 server 回 InvalidRequest「carries none」（2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
+    /// 型別 byte 是 SESSION（wbfuwunel 的 wbf-wire-format.md §2.2）：沒帶 server 回 InvalidRequest「carries none」（2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
     fn next_session_id(&mut self) -> u64 {
         self.next_stream_id =
             self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
@@ -796,7 +796,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(())
     }
 
-    /// 線上規格 §4.1。
+    /// wbfuwunel 的 chunked-upload-spec.md §4.1。
     ///
     /// Return:
     ///     Ok((InfoAck, Vec<u8>))   meta 與 data（server 存的那份描述，原樣）
@@ -806,7 +806,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok((info, ack.data))
     }
 
-    /// 線上規格 §4.2：整整一塊，照上傳時的 bytes。這裡只驗 `len` 與 data 長度一致；解密與長度規則在下載端。
+    /// wbfuwunel 的 chunked-upload-spec.md §4.2：整整一塊，照上傳時的 bytes。這裡只驗 `len` 與 data 長度一致；解密與長度規則在下載端。
     pub async fn read_chunk(
         &mut self,
         mxc: &str,
@@ -832,7 +832,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok((read, ack.data))
     }
 
-    /// `Event/Recent` 的**一窗**（pack-pipeline §6）：送請求、收一串 `Event/Batch` 直到 `r = 0`。
+    /// `Event/Recent` 的**一窗**（wbfuwunel 的 pack-pipeline.md §6）：送請求、收一串 `Event/Batch` 直到 `r = 0`。
     /// 每個 Batch 交給 `on_batch`（新到舊）；`Hello.features` 有 `recent` 才能用。
     ///
     /// Args:
@@ -900,7 +900,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(window)
     }
 
-    /// 整輪同步（pack-pipeline §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉，拉到追平或湊滿 `plan.max_events`。
+    /// 整輪同步（wbfuwunel 的 pack-pipeline.md §6.4 的水位規則）：從 `cg_seq` 起一窗一窗拉，拉到追平或湊滿 `plan.max_events`。
     /// 三層：上層要 `max_events` 則 → 底層每次 `Recent` 要一窗（`window`，≤ 500）→ server 每 `batch` 則回一個 `Batch`。
     /// 最後一窗會縮成剩下的數量，總量剛好不多拿。
     /// - 一窗收完且最後一個 Batch 說 `more: false`：追平（`caught_up`）。
@@ -988,7 +988,7 @@ impl<C: PackChannel> WbfClient<C> {
         Ok(summary)
     }
 
-    /// `Event/Send`：送事件並宣告附件（media-attachments.md §3、spec §12）。
+    /// `Event/Send`：送事件並宣告附件（wbfuwunel 的 media-attachments.md §3、spec §12）。
     /// ⚠️ server 端還是提案（2026-09-06），`Hello.features` 有 `attachments` 才能用；沒有就走 HTTP 加 `X-Wbf-Attachments`。
     ///
     /// Args:

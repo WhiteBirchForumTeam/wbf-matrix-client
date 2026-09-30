@@ -99,7 +99,7 @@ pub struct OutgoingRoomEvent {
 }
 
 /// `encrypt_and_send` 的結果：送進去了，或被 1506 擋下來。
-/// 被擋不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 補金鑰、UI 決定重送，e2ee-walkthrough §16.6）。
+/// 被擋不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 補金鑰、UI 決定重送，e2ee-walkthrough.md §16.6）。
 #[derive(Debug)]
 pub enum SendOutcome {
     Sent {
@@ -166,7 +166,7 @@ impl OlmEngine {
         })
     }
 
-    /// 點進房間、被 1506 擋、（將來）收到 `DeviceChanged` 都叫這一支（e2ee-walkthrough §16.6：一支例行程序、三個觸發點）：
+    /// 點進房間、被 1506 擋、（將來）收到 `DeviceChanged` 都叫這一支（e2ee-walkthrough.md §16.6：一支例行程序、三個觸發點）：
     /// 拿這一刻的成員清單與版本號 → 跟上一份比出誰變了 → 只重查那些人 → 雜湊對一次（不對再查一次，還不對就拒絕）→
     /// 把房間金鑰補給每台還沒有的裝置（有人離開由上游決定輪換）。
     ///
@@ -802,7 +802,7 @@ fn parse_user_ids(users: &[String]) -> Result<Vec<OwnedUserId>, SdkError> {
 }
 
 /// ruma 組請求時，要 token 的端點沒給 token 會直接拒絕；這裡給一個占位字串——只取 body，header 整個丟掉，
-/// 真正的 `Authorization` 由橋在 server 那端用這條連線的 session 填（wbf-api-bridge.md §2.2 規則 1，client 蓋不掉）。
+/// 真正的 `Authorization` 由橋在 server 那端用這條連線的 session 填（wbfuwunel 的 wbf-api-bridge.md §2.2 規則 1，client 蓋不掉）。
 const PLACEHOLDER_ACCESS_TOKEN: &str = "not-sent-over-the-bridge";
 
 /// ruma 請求組成 HTTP 請求（用一個假的 base URL）只為了拿它的 body bytes。

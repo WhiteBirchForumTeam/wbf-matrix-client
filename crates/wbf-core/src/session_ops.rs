@@ -285,7 +285,7 @@ impl Core {
                 // 成了：先收掉跟上游的 task（它握著訂閱線的 handle），再關線——順序反了 task 會看到 Network 才結束，一樣收得掉，但這樣乾淨。
                 self.stop_room_sync_of(account).await;
                 self.stop_key_sync_of(account).await;
-                // 說出口的退出（wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
+                // 說出口的退出（wbfuwunel 的 wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
                 self.unsubscribe_keys_of(account).await;
                 // token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（link-pool.md §3）。
                 // `close_all` 等正在用線的命令做完才收那條；遠端先關了的只是丟掉，不二次跳錯。

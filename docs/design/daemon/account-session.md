@@ -21,7 +21,7 @@
 
 ## 1. 探活：不帶 token 的 WS Hello，以 server 為鍵
 
-- server 允許不帶 Bearer 的升級：未登入的連線只接受 `Hello`／`Ping`，30 秒沒登入自己關（wire-format §6.3.3）。所以探活**不需要帳號**：
+- server 允許不帶 Bearer 的升級：未登入的連線只接受 `Hello`／`Ping`，30 秒沒登入自己關（wbfuwunel 的 wbf-wire-format.md §6.3.3）。所以探活**不需要帳號**：
   `WsChannel::connect_anonymous(server)` → `hello` → 看 `protocol` 認不認得 → 丟掉那條線。
 - 探測結果以 **server URL** 為鍵（`Core::backends`）。之前以帳號目錄為鍵，是因為拿那個帳號的 token 去探（PR #33 審查 rumia：A 的 token 壞了不能拖累 B）；不帶 token 之後這個理由沒了，
   而「這台 server 講不講 wbf」本來就是 server 的事實。探不到（連不上、Hello 不回）**只算這一次**、不寫進去，下次重探。
@@ -82,7 +82,7 @@ server #85 把上限放到 8 之後，2026-09-29 拆成兩條，而且由 daemon
 |---|---|---|
 | `room.list`／`room.get` 的 `server`／`both` | Client 的 /sync | 橋 `JoinedRooms`（0x13/0x28）＋`m.direct`（`GetAccountData` 0x11/0x25）＋每房 `GetState`（0x14/0x21）組 `Conversation`，`both` 寫進 `room_list`；`local` 不變。⚠️ N 間房是 N＋2 次往返；狀態超過 2 MiB 的房 server 回 `TooLarge`，整個呼叫失敗（講出來比少列一間好） |
 | `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機；wbfuwunel #78 之前 server 去重不分裝置，2026-09-26 已修，隨機照舊）；加密與否問這一刻的單項 `GetStateEvent` `m.room.encryption`（0x14/0x22，不會像全量 `GetState` 在大房間被 `TooLarge` 擋）、🚫 不用快取；**加密房**：2026-09-29 起先分金鑰、加密、帶 UI 給的 `room_devices.room_version` 送（e2ee-rpc.md §3）；沒帶 `room_devices` 是 1100 |
-| `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（約定 §5.2 的宣告終於成立，`attachment_declared: true`）；加密房在**上傳之前**就拒。兩邊的 content 同一份（`event_json::file_message_content`） |
+| `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（wbf-client-convention-for-chunk.md §5.2 的宣告終於成立，`attachment_declared: true`）；加密房在**上傳之前**就拒。兩邊的 content 同一份（`event_json::file_message_content`） |
 | `room.history` 錨點不在本地 | `/context` | 拒絕（1100），等 wbfuwunel #64 的 `before_event_id`；`sync=both` 先把錨點寫進快取就翻得下去 |
 | `watch`（CLI） | /sync 的迴圈 | 拒絕（1100）：daemon 的新訊息走訂閱＋推播（第 6 階段） |
 | `backup.*`、`recovery.*` | Client 的備份與 SSSS | **拒絕、回明確的錯**（1100，`backend_of` 擋；🚫 不靜默失效）；搬到 crypto 層＋橋（`BackupMachine`、`SecretStorageKey`、橋的 `/room_keys`、account data）排在 E2EE 的 RPC 面之後 |

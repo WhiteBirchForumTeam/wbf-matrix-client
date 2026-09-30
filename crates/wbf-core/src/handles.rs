@@ -3,7 +3,7 @@
 //! ⚠️ 這整個模組是 **`pub(crate)`**，而且要一直是。`Session`（裡面有 `access_token`）、
 //! `MatrixBackend`、`Cache`、`MediaPool` 全是程序內的 handle：序列化不了、跨不了 FFI，
 //! 而 `Session` 還帶著秘密——**它一個欄位都不該離開這個 crate**
-//!（architecture-v2 §6；PR #24 審查 cirno🔴）。
+//!（architecture-v2.md §6；PR #24 審查 cirno🔴）。
 //!
 //! 外面看得到的是 `Core` 上那些回**可序列化 DTO** 的方法；handle 活在這裡，被它們用。
 
@@ -44,7 +44,7 @@ impl Core {
     /// 這個帳號的 matrix-sdk backend（store 在帳號目錄的 `m/`，金鑰是第二把子金鑰）。
     ///
     /// Args:
-    ///     server_backup: conf 的 `SERVER_BACKUP`（CLI 規格 §10）, example: true
+    ///     server_backup: conf 的 `SERVER_BACKUP`（wbf-cli-spec.md §10）, example: true
     ///
     /// ⚠️ 這個旗標由**呼叫端**帶進來，🚫 core 自己不讀 conf——那是「代前端做決定」（§3）。
     pub(crate) async fn backend_of(
@@ -113,7 +113,7 @@ impl Core {
         Ok(cache)
     }
 
-    /// 這個帳號所屬 server 的 `cache.db` 的**寫入者＋讀連線**（daemon-runtime §2）。
+    /// 這個帳號所屬 server 的 `cache.db` 的**寫入者＋讀連線**（daemon-runtime.md §2）。
     ///
     /// ⭐ **一個 server dir 一份，開了就留著**：多個寫入者就沒有順序可言（水位會倒退），
     /// 而且每次重開都要付一次 SQLCipher 導金鑰。

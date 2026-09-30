@@ -14,7 +14,7 @@
 )]
 //! wbf-cli：介面照 `docs/design/rpc-specs/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
 //! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
-//! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §6）。
+//! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2.md §6）。
 
 mod commands;
 mod recent;
@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use wbf_core::{CoreError, CoreErrorKind};
 
-/// CLI 規格 §2 的全域參數。
+/// wbf-cli-spec.md §2 的全域參數。
 #[derive(Parser)]
 #[command(name = "wbf-cli", version, about = "wbfuwunel 的命令列")]
 pub struct Cli {
@@ -37,19 +37,19 @@ pub struct Cli {
     /// 直接給 access token，跳過 session 檔。不印、不寫進任何輸出
     #[arg(long, global = true, env = "WBF_ACCESS_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
-    /// 資料目錄（local.key、current、s/<b58>/cache.db、s/<b58>/a/<b58>/…），預設見 CLI 規格 §7
+    /// 資料目錄（local.key、current、s/<b58>/cache.db、s/<b58>/a/<b58>/…），預設見 wbf-cli-spec.md §7
     #[arg(long, global = true, env = "WBF_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// 用哪個帳號（mxid 或 localpart）；沒給就是最後一次 login 的那個。同名 localpart 在多個 server 時要配 --server
     #[arg(long, global = true, env = "WBF_ACCOUNT")]
     pub account: Option<String>,
-    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（CLI 規格 §10.1）
+    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（wbf-cli-spec.md §10.1）
     #[arg(long, global = true, env = "WBF_CONFIG")]
     pub config: Option<PathBuf>,
     /// 整檔就是 passphrase（解 local.key 的那句話，不是 Matrix 帳號密碼）；沒給就從終端讀（不回顯）
     #[arg(long, global = true, env = "WBF_PASSPHRASE_FILE")]
     pub passphrase_file: Option<PathBuf>,
-    /// stdout 只印 JSON（預設就是；現在是刻意的 no-op，留著是為了之後加人類可讀模式時介面不變，CLI 規格 §2）
+    /// stdout 只印 JSON（預設就是；現在是刻意的 no-op，留著是為了之後加人類可讀模式時介面不變，wbf-cli-spec.md §2）
     #[arg(long, global = true)]
     pub json: bool,
     /// stderr 不印進度
@@ -149,17 +149,17 @@ pub enum Command {
         #[arg(long)]
         accept_history_loss: bool,
     },
-    /// 帳號：新增、列出、切換、登出、摧毀（CLI 規格 §3.1）
+    /// 帳號：新增、列出、切換、登出、摧毀（wbf-cli-spec.md §3.1）
     Account {
         #[command(subcommand)]
         action: AccountAction,
     },
-    /// 房間金鑰備份：狀態、上傳、產生 recovery key（CLI 規格 §3.6）
+    /// 房間金鑰備份：狀態、上傳、產生 recovery key（wbf-cli-spec.md §3.6）
     KeyBackup {
         #[command(subcommand)]
         action: KeyBackupAction,
     },
-    /// 這台機器保管著誰的 recovery key（room-key-backup §8）
+    /// 這台機器保管著誰的 recovery key（room-key-backup.md §8）
     Recovery {
         #[command(subcommand)]
         action: RecoveryAction,
@@ -192,7 +192,7 @@ pub enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// 整檔下載，全部檢查照約定 §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（media-pool）
+    /// 整檔下載，全部檢查照wbf-client-convention-for-chunk.md §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（media-pool）
     Download {
         #[arg(long)]
         manifest: PathBuf,
@@ -202,9 +202,9 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
     },
-    /// 媒體快取的狀態：池的大小、幾個檔、半成品（CLI 規格 §3.5）
+    /// 媒體快取的狀態：池的大小、幾個檔、半成品（wbf-cli-spec.md §3.5）
     MediaStats,
-    /// 媒體快取清理：超過配額就從最久沒用的刪，保護期內不刪（media-pool §5）；順便掃孤兒
+    /// 媒體快取清理：超過配額就從最久沒用的刪，保護期內不刪（media-pool.md §5）；順便掃孤兒
     MediaGc {
         /// 配額，MiB；預設 2048，可用 conf 的 QUOTA_MIB 改
         #[arg(long)]
@@ -213,7 +213,7 @@ pub enum Command {
         #[arg(long)]
         protect_days: Option<u64>,
     },
-    /// 只讀含 --at 的那一塊，明文寫到 stdout（CLI 規格 §3.3.1）
+    /// 只讀含 --at 的那一塊，明文寫到 stdout（wbf-cli-spec.md §3.3.1）
     Seek {
         #[arg(long)]
         manifest: PathBuf,
@@ -222,13 +222,13 @@ pub enum Command {
         #[arg(long)]
         len: Option<u64>,
     },
-    /// 列出加入的房間（CLI 規格 §3.4）
+    /// 列出加入的房間（wbf-cli-spec.md §3.4）
     Rooms,
-    /// 送文字或檔案進房間；檔案先上傳再送約定 §5 的事件
+    /// 送文字或檔案進房間；檔案先上傳再送wbf-client-convention-for-chunk.md §5 的事件
     Send(SendArgs),
-    /// 等新事件，來一則立刻印一則，JSON Lines（CLI 規格 §3.4.2）
+    /// 等新事件，來一則立刻印一則，JSON Lines（wbf-cli-spec.md §3.4.2）
     Watch(WatchArgs),
-    /// Event/Recent：把 cache.db 水位線之後的事件跨房間拉回來寫進快取，直到追平或湊滿 --limit（CLI 規格 §3.5）
+    /// Event/Recent：把 cache.db 水位線之後的事件跨房間拉回來寫進快取，直到追平或湊滿 --limit（wbf-cli-spec.md §3.5）
     Recent {
         /// 這一輪總共最多幾則（上層要的數量）；0 = 拉到追平為止。預設 10000，可用 conf 的 MAX_EVENTS 改
         #[arg(long)]
@@ -243,7 +243,7 @@ pub enum Command {
         #[arg(long)]
         from_scratch: bool,
     },
-    /// 歷史，從最新往回（CLI 規格 §3.4.1）
+    /// 歷史，從最新往回（wbf-cli-spec.md §3.4.1）
     Read {
         room: String,
         #[arg(long, default_value_t = 50)]
@@ -251,7 +251,7 @@ pub enum Command {
         /// 接上一頁印的 next：那頁最舊那則的 event_id（只要比它舊的）；有沒有 --from-cache 都一樣
         #[arg(long)]
         before: Option<String>,
-        /// 不連 server，從 cache.db 讀（CLI 規格 §3.5）
+        /// 不連 server，從 cache.db 讀（wbf-cli-spec.md §3.5）
         #[arg(long)]
         from_cache: bool,
         /// client 端過濾：事件 type，可多個
@@ -269,7 +269,7 @@ pub enum Command {
         before: Option<String>,
         #[arg(long)]
         save: Option<PathBuf>,
-        /// 不連 server，從 cache.db 讀（CLI 規格 §3.5）
+        /// 不連 server，從 cache.db 讀（wbf-cli-spec.md §3.5）
         #[arg(long)]
         from_cache: bool,
     },
@@ -326,7 +326,7 @@ pub struct UploadArgs {
     /// chacha20-poly1305、aes-256-gcm、none；預設依硬體
     #[arg(long)]
     pub cipher: Option<String>,
-    /// 明文塊大小；沒給照約定 §2 的表
+    /// 明文塊大小；沒給照wbf-client-convention-for-chunk.md §2 的表
     #[arg(long)]
     pub chunk_size: Option<u32>,
     /// 串流的線路：mobile（預設）或 wifi
@@ -388,7 +388,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// CLI 規格 §4 的 exit code。
+/// wbf-cli-spec.md §4 的 exit code。
 ///
 /// ⚠️ 對的是 **`CoreErrorKind`** 而不是訊息：那正是 core 把錯誤結構化的理由
 /// （PR #24 審查 salvia／rumia）。daemon 那邊同一張表會變成 §4.6 的 `code` 整數。

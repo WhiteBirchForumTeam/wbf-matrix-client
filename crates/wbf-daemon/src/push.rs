@@ -1,4 +1,4 @@
-//! 推播（rpc-spec §4、link-pool.md §6）：core 的每一則事件變成一則沒有 `id` 的請求，**這裡決定要不要送**——
+//! 推播（rpc-spec.md §4、link-pool.md §6）：core 的每一則事件變成一則沒有 `id` 的請求，**這裡決定要不要送**——
 //! 訂閱集合（每條 RPC 連線一份）＋「自己發的長工作的進度不用訂」。維護者：「rpc 發送到 UI 的 function 裡面判斷這個包要不要過去」。
 
 use std::collections::HashSet;
@@ -8,7 +8,7 @@ use wbf_core::CoreEvent;
 
 use crate::message::Request;
 
-/// 一條 RPC 連線訂了什麼（rpc-spec §3.9）。連線關了就沒了。
+/// 一條 RPC 連線訂了什麼（rpc-spec.md §3.9）。連線關了就沒了。
 #[derive(Default, Debug)]
 pub struct Subscriptions {
     events: HashSet<String>,
@@ -73,7 +73,7 @@ pub struct Push {
     pub request: Request,
     /// 這則是哪個帳號的。
     pub user: Option<String>,
-    /// 這則屬於哪個長工作（`progress`／`note`）：發那個請求的連線不用訂也收得到（rpc-spec §4）。
+    /// 這則屬於哪個長工作（`progress`／`note`）：發那個請求的連線不用訂也收得到（rpc-spec.md §4）。
     pub job: Option<u64>,
 }
 
@@ -90,10 +90,10 @@ pub(crate) fn insert_field(params: &mut serde_json::Value, key: &str, value: ser
     }
 }
 
-/// core 的事件 → 推播。名字與欄位照 rpc-spec §4。
+/// core 的事件 → 推播。名字與欄位照 rpc-spec.md §4。
 pub fn push_of(event: &CoreEvent) -> Push {
     match event {
-        // `id` 沒有就不帶（rpc-spec §4 的 `id?`），🚫 不送 `null`（PR #53 審查 cirno 🟡2）。
+        // `id` 沒有就不帶（rpc-spec.md §4 的 `id?`），🚫 不送 `null`（PR #53 審查 cirno 🟡2）。
         CoreEvent::Note { job, text } => {
             let mut params = json!({ "note": text });
             if let Some(job) = job {
@@ -228,7 +228,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
     }
 }
 
-/// 這條連線漏掉了 `missed` 則（daemon-runtime §5.3）。🚫 不重播、🚫 不假裝沒事。
+/// 這條連線漏掉了 `missed` 則（daemon-runtime.md §5.3）。🚫 不重播、🚫 不假裝沒事。
 pub fn desync(missed: u64) -> Request {
     Request::push("desync", json!({ "missed": missed }))
 }
@@ -314,7 +314,7 @@ mod tests {
             link.request.params,
             json!({ "user": "@a:x", "role": "keys", "state": "closed", "reason": "logged out" })
         );
-        // keys.state（rpc-spec §4、key-sync.md §2）：數字只在 caught_up 帶、理由只在 stopped 帶。
+        // keys.state（rpc-spec.md §4、key-sync.md §2）：數字只在 caught_up 帶、理由只在 stopped 帶。
         let caught_up = push_of(&CoreEvent::Keys {
             user: "@a:x".into(),
             state: wbf_core::KeysState::CaughtUp,

@@ -37,7 +37,7 @@ local.key（0600）
 
   🚫 **沒有 `unlock.ticket`**（維護者 2026-09-13 拿掉）。它原本仿 `sudo`：解鎖成功後把**明文主金鑰**
   加 `expires_at` 寫進 `<data dir>/unlock.ticket` 15 分鐘，省掉「每個命令都要再問一次 passphrase」。
-  ⭐ 拿掉的理由是**那個痛點沒有了**：daemon 常駐、解鎖一次（architecture-v2 §1），而單發命令在 daemon
+  ⭐ 拿掉的理由是**那個痛點沒有了**：daemon 常駐、解鎖一次（architecture-v2.md §1），而單發命令在 daemon
   起著的時候本來就不准碰資料庫（local-cache-db.md §0.2），所以它退化成只在 debug／test 用、一次一個的工具 ——
   省那幾次打字換不到「明文主金鑰落地 15 分鐘」。
 
@@ -209,7 +209,7 @@ account destroy @BOB:matrix.org
            by an older build, delete it and run `login` again
   ```
 
-- 📎 順帶：`servers/` 兩層都改了之後，CLI 規格 §7 那條「PR #11 的單一目錄佈局要報錯」也失去意義了
+- 📎 順帶：`servers/` 兩層都改了之後，wbf-cli-spec.md §7 那條「PR #11 的單一目錄佈局要報錯」也失去意義了
   （那個佈局同樣解不開、同樣被跳過）。實作時可以一併拿掉那段檢查。
 
 #### 2.4.1 ⚠️ 真正咬人的不是單段長度，是**整條路徑**（2026-09-09 實測）

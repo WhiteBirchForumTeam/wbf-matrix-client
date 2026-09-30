@@ -1,4 +1,4 @@
-//! `cipher` 欄位：三個值、怎麼選預設、一次 AEAD 呼叫（約定 §3）。
+//! `cipher` 欄位：三個值、怎麼選預設、一次 AEAD 呼叫（wbf-client-convention-for-chunk.md §3）。
 //!
 //! 這裡只管「用哪個演算法」；nonce、AAD、索引的規則在 `chunk_crypto`。
 
@@ -29,7 +29,7 @@ impl Cipher {
     ///     name: `cipher` 欄位的字串, example: "aes-256-gcm"
     /// Return:
     ///     Some(Cipher)  三個認得的值之一
-    ///     None          其他任何字串（約定 §5：拒絕）
+    ///     None          其他任何字串（wbf-client-convention-for-chunk.md §5：拒絕）
     pub fn from_name(name: &str) -> Option<Cipher> {
         match name {
             "chacha20-poly1305" => Some(Cipher::ChaCha20Poly1305),
@@ -55,7 +55,7 @@ impl Cipher {
         !matches!(self, Cipher::None)
     }
 
-    /// SDK 的預設（約定 §3）：有硬體 AES 就 `Aes256Gcm`，否則 `ChaCha20Poly1305`。永遠不回 `None`：
+    /// SDK 的預設（wbf-client-convention-for-chunk.md §3）：有硬體 AES 就 `Aes256Gcm`，否則 `ChaCha20Poly1305`。永遠不回 `None`：
     /// 明文模式是房間決定的，不是預設。
     ///
     /// Return:

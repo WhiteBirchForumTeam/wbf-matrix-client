@@ -44,7 +44,7 @@
 //! - 🚫 **不問終端**：passphrase 一律由呼叫端餵進來（§4.5——那樣 Desktop 與 Android
 //!   才解得開）。⚠️ 所以 `unlock` 吃的是 bytes，不是「檔案路徑」也不是「去問使用者」。
 //! - 🚫 **不寫任何「解鎖狀態」到磁碟**：以前 CLI 有一張 `unlock.ticket`（明文主金鑰落地 15 分鐘），
-//!   2026-09-13 整條拿掉了（vault-and-keys §1）。解鎖狀態只活在這個物件裡。
+//!   2026-09-13 整條拿掉了（vault-and-keys.md §1）。解鎖狀態只活在這個物件裡。
 //! - 🚫 **不管 UI 狀態、不管顯示格式、不代前端做決定**（§3）。
 
 // ⚠️ 這兩個是**內部**：它們的型別（`DataDirMap`、`AccountDir`）帶著路徑與 `Vault`，
@@ -59,7 +59,7 @@ pub mod conf;
 mod error;
 pub mod event;
 mod handles;
-/// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec §4）。
+/// 「現在跑的是哪一個工作」——事件的歸屬（rpc-spec.md §4）。
 pub mod job;
 mod key_sync;
 mod link_keeper;
@@ -119,7 +119,7 @@ pub struct Target {
     /// 哪台 server：同名 localpart 在多個 server 時消歧，或覆蓋 session 裡那個。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
-    /// conf 的 `SERVER_BACKUP`（CLI 規格 §10）。
+    /// conf 的 `SERVER_BACKUP`（wbf-cli-spec.md §10）。
     ///
     /// ⚠️ 由**呼叫端**帶進來：core 不讀 conf，那是「代前端做決定」（§3）。
     /// 🚫 預設是 `false`，但那只是 `Default` 的值——真正的預設（開著）在前端那邊，
@@ -151,7 +151,7 @@ impl Target {
 ///
 /// **解鎖一次**：`unlock` 成功之後主金鑰活在這個物件裡，直到它被丟掉。
 /// ⚠️ 這正是 `unlock.ticket`（明文主金鑰落地 15 分鐘）不再存在的原因——
-/// 常駐之後沒有人需要把它寫到磁碟上（vault-and-keys §1，2026-09-13 拿掉）。
+/// 常駐之後沒有人需要把它寫到磁碟上（vault-and-keys.md §1，2026-09-13 拿掉）。
 ///
 /// 🚫 `Core` 自己**不會**去問終端、不讀 passphrase 檔。那些是前端的事。
 pub struct Core {
@@ -161,12 +161,12 @@ pub struct Core {
     /// core 往外講話的唯一管道（§7：事件用 channel）。🚫 core 不印東西。
     pub(crate) events: EventSink,
     /// 一個 server dir 一份：那個 `cache.db` 的**唯一寫入者**與讀連線
-    /// （`server_cache`、daemon-runtime §2）。⚠️ 開一次就留著 ——
+    /// （`server_cache`、daemon-runtime.md §2）。⚠️ 開一次就留著 ——
     /// 每次重開要付 SQLCipher 導金鑰的成本，而且**多個寫入者就沒有順序可言**。
     pub(crate) server_caches: std::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<crate::server_cache::ServerCache>>,
     >,
-    /// **一個帳號一格**：那個帳號探到的 backend（architecture-v2 §5.1）。
+    /// **一個帳號一格**：那個帳號探到的 backend（architecture-v2.md §5.1）。
     ///
     /// ⚠️ 只在記憶體裡，🚫 **不寫進設定檔** —— 「這台是不是 wbf」是 server 那邊的事實，
     /// 它會變（升級、降級），而寫進檔案的那份不會有人通知你它過期了。
@@ -243,7 +243,7 @@ impl Core {
     /// 所有 `cache.db` 寫入者加起來還有幾件在排隊。
     ///
     /// Return:
-    ///     usize  0 = 都寫完了；⚠️ 一直漲就是**寫得比收得慢**（daemon-runtime §2.2）
+    ///     usize  0 = 都寫完了；⚠️ 一直漲就是**寫得比收得慢**（daemon-runtime.md §2.2）
     ///
     /// ⭐ queue 沒有上限是刻意的（丟掉已經收到的事件比慢更糟），所以它**必須看得見** ——
     /// daemon 把這個數字放進 `daemon.info`。
@@ -283,7 +283,7 @@ impl Core {
 
     /// 解鎖。**冪等**：已經解開就直接回 `Ok`，🚫 不重跑 Argon2。
     ///
-    /// ⚠️ `passphrase` 是**原始 bytes**（vault-and-keys §3）：它可以是中文、可以是一個
+    /// ⚠️ `passphrase` 是**原始 bytes**（vault-and-keys.md §3）：它可以是中文、可以是一個
     /// mp3。🚫 這一層不驗 UTF-8、不去尾換行——那些是「怎麼拿到 passphrase」的問題，
     /// 屬於前端（`rpc-cli` 讀檔或問終端，Desktop 從輸入框，Android 從對話框）。
     ///
@@ -357,7 +357,7 @@ impl Core {
     ///
     /// - **`login`**：`local.key` 還不存在，vault 是**建**出來的。🚫 `Core` 不長出「建」
     ///   的那半——那需要「要不要設 passphrase」的政策，是前端的決定（§3）。
-    /// - **daemon 的 `vault.create`**（rpc-spec §3.1）：同一件事走 RPC 進來，「要不要 passphrase」
+    /// - **daemon 的 `vault.create`**（rpc-spec.md §3.1）：同一件事走 RPC 進來，「要不要 passphrase」
     ///   由前端在那一步決定。
     ///
     /// **冪等**，跟 [`Core::unlock`] 一樣：已經有一把就把傳進來的丟掉、回原本那把。
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_binary_passphrase_goes_in_as_raw_bytes() {
-        // vault-and-keys §3：passphrase 是任意 bytes，這一層一個都不動。
+        // vault-and-keys.md §3：passphrase 是任意 bytes，這一層一個都不動。
         let dir = scratch("bytes");
         let passphrase = "早安\u{0}世界".as_bytes();
         Vault::create(

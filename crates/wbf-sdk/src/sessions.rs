@@ -14,7 +14,7 @@ use wbf_wire::{Kind, Pack};
 
 use crate::error::SdkError;
 
-/// `id` 是會話的名字，`seq` 是會話內的計數（wire-format §4.1）。
+/// `id` 是會話的名字，`seq` 是會話內的計數（wbfuwunel 的 wbf-wire-format.md §4.1）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionKey {
     /// 具名會話：所有抄這個 `id` 的 pack 都是它的（含推播與 `Superseded`）。`id` 不是 0。

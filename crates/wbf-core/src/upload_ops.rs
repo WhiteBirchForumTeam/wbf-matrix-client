@@ -1,9 +1,9 @@
 //! 上傳：分塊、續傳、封存成 manifest，以及「上傳完當成附件送進房間」。
 //!
 //! ⚠️ **續傳狀態檔寫在使用者那個檔案旁邊**（`<file>.wbf-upload.json`）。那個位置是
-//! rpc-cli 時代定的（CLI 規格 §3.3），在 daemon 模型下**不一定對**——daemon 可能根本
+//! rpc-cli 時代定的（wbf-cli-spec.md §3.3），在 daemon 模型下**不一定對**——daemon 可能根本
 //! 沒有那個目錄的寫入權（Android 的 SAF 給的是 `content://`，連路徑都沒有）。
-//! 🚫 這一輪**照原樣搬，不在這裡發明新答案**；記成 architecture-v2 §7 的一條開著的項目。
+//! 🚫 這一輪**照原樣搬，不在這裡發明新答案**；記成 architecture-v2.md §7 的一條開著的項目。
 
 use std::path::{Path, PathBuf};
 
@@ -51,7 +51,7 @@ pub struct SendFileResult {
     /// （2026-09-12 真 server 驗證抓到：重構時這一步掉了，而且是靜默的）。
     #[serde(skip)]
     pub manifest: Manifest,
-    /// ⚠️ 附件**有沒有向 server 宣告**（約定 §5.2）。現在一律是 `false`：
+    /// ⚠️ 附件**有沒有向 server 宣告**（wbf-client-convention-for-chunk.md §5.2）。現在一律是 `false`：
     /// matrix-sdk 的 `Room::send` 不能加 header、server 的 `Event/Send` 還是提案。
     /// 🚫 沒宣告的上傳過了保護期會被掃掉——這個欄位就是讓前端講得出這件事。
     pub attachment_declared: bool,
@@ -83,7 +83,7 @@ impl Core {
     ) -> Result<SendFileResult, CoreError> {
         let account = self.account_or_current(target)?;
         if self.is_wbf_account(&account)? {
-            // wbf 帳號：事件走 `Event/Send`，附件在 meta 裡宣告（約定 §5.2 終於成立）。加密房在**上傳之前**就拒，不白傳。
+            // wbf 帳號：事件走 `Event/Send`，附件在 meta 裡宣告（wbf-client-convention-for-chunk.md §5.2 終於成立）。加密房在**上傳之前**就拒，不白傳。
             self.wbf_refuse_if_encrypted(&account, room).await?;
             let manifest = self
                 .upload_with_account(&account, request, transport)
@@ -120,7 +120,7 @@ impl Core {
             mxc: manifest.mxc.clone(),
             block: manifest.block.clone(),
         };
-        // 約定 §5.2：附件宣告這一版帶不出去。⚠️ 講清楚，🚫 不裝作沒事——
+        // wbf-client-convention-for-chunk.md §5.2：附件宣告這一版帶不出去。⚠️ 講清楚，🚫 不裝作沒事——
         // 沒被引用的上傳過了 server 的保護期就會被掃掉。
         self.events.progress(format!(
             "attachment {} is NOT declared to the server (no Event/Send yet); an unreferenced upload is swept after the server's grace period",
@@ -238,7 +238,7 @@ impl Core {
     }
 }
 
-/// 續傳狀態檔就放在那個檔案旁邊（CLI 規格 §3.3）。
+/// 續傳狀態檔就放在那個檔案旁邊（wbf-cli-spec.md §3.3）。
 pub(crate) fn remove_resume_state(file: &Path) -> Result<(), CoreError> {
     remove_if_exists(&state_path_for(file))
 }
