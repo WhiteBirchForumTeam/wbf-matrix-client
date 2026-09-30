@@ -69,6 +69,7 @@ mod login_ops;
 mod media_ops;
 mod misc_ops;
 mod recovery;
+mod room_crypto;
 mod room_sync;
 mod rooms_ops;
 mod server_cache;
@@ -98,6 +99,7 @@ pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{DirectDownloadResult, DownloadResult, MediaGcReport, MediaStats};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
+pub use room_crypto::{RoomDevices, RoomDevicesRefresh, SendOptions};
 pub use rooms_ops::{
     cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, MessagePage, SyncMode,
 };

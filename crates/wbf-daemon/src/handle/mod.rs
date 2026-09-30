@@ -328,6 +328,7 @@ impl Handle {
             "room.list" => Box::pin(rooms::room_list(self, core, params)),
             "room.get" => Box::pin(rooms::room_get(self, core, params)),
             "room.send_text" => Box::pin(rooms::room_send_text(self, core, params)),
+            "room.refresh_devices" => Box::pin(rooms::room_refresh_devices(self, core, params)),
             "room.send_file" => Box::pin(rooms::room_send_file(self, core, params)),
             "room.history" => Box::pin(rooms::room_history(self, core, params)),
             "room.files" => Box::pin(rooms::room_files(self, core, params)),
@@ -761,6 +762,7 @@ mod tests {
                 "room.send_text",
                 json!({ "room": "!r:localhost", "body": "hi" }),
             ),
+            ("room.refresh_devices", json!({ "room": "!r:localhost" })),
             (
                 "room.send_file",
                 json!({ "room": "!r:localhost", "path": dir.path().join("nope").display().to_string() }),
@@ -811,6 +813,15 @@ mod tests {
         handle.core().await.create_vault(None).unwrap();
         let cases = [
             ("room.send_text", json!({ "room": "!r:localhost" })),
+            (
+                "room.send_text",
+                json!({ "room": "!r:localhost", "body": "hi", "room_devices": { "room_version": "seven" } }),
+            ),
+            ("room.refresh_devices", json!({})),
+            (
+                "room.refresh_devices",
+                json!({ "room": "!r:localhost", "previous": { "members": {} } }),
+            ),
             (
                 "room.history",
                 json!({ "room": "!r:localhost", "limit": 10, "sync": "elsewhere" }),

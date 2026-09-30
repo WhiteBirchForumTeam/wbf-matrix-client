@@ -100,6 +100,7 @@ impl Core {
                     "m.room.message",
                     content,
                     vec![manifest.mxc.clone()],
+                    wbf_sdk::protocol::new_txn_id()?,
                 )
                 .await?;
             return Ok(SendFileResult {

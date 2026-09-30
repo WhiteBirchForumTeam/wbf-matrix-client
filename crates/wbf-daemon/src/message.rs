@@ -43,6 +43,10 @@ pub struct Response {
     /// 「沒帶的時候預設是什麼」，🚫 不必去記規格。不認得 `sync` 的 method 這個欄位**不在**。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<wbf_core::SyncMode>,
+    /// 失敗時順手帶回來的東西（rpc-spec §5.3）：只有少數錯誤有，例：`room_devices_changed`（1401）帶 daemon 自動重拿的房間狀態。
+    /// 沒有就**不在**（跟 `sync` 一樣），成功回應永遠沒有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl Response {
@@ -53,6 +57,7 @@ impl Response {
             result,
             id,
             sync: None,
+            data: None,
         }
     }
 
@@ -70,12 +75,16 @@ impl Response {
             result: Value::Null,
             id,
             sync: None,
+            data: None,
         }
     }
 
     /// core 的錯誤 → `code` 用 [`wbf_core::CoreErrorKind::rpc_code`]（那張表只在 core 那邊）。
+    /// `data` 原樣帶（core 那邊有的才有）。
     pub fn from_core_error(id: Option<u64>, error: &CoreError) -> Response {
-        Response::error(id, error.kind.rpc_code(), error.message.clone())
+        let mut response = Response::error(id, error.kind.rpc_code(), error.message.clone());
+        response.data = error.data.clone();
+        response
     }
 
     /// 協議層的 close 通知（rpc-spec §1.4）：同一個形狀，`code` 9xxx，`result.close` 給人讀 log。
@@ -86,6 +95,7 @@ impl Response {
             result: serde_json::json!({ "close": reason.name() }),
             id,
             sync: None,
+            data: None,
         }
     }
 }
@@ -182,6 +192,27 @@ mod tests {
     fn core_errors_carry_the_core_code() {
         let error = CoreError::new(CoreErrorKind::Locked, "locked");
         assert_eq!(Response::from_core_error(Some(1), &error).code, 1001);
+    }
+
+    /// 帶 `data` 的錯誤（`room_devices_changed` 帶 daemon 自動重拿的房間狀態，rpc-spec §5.3）：`data` 原樣進回應，`result` 仍是 null；
+    /// 沒 `data` 的錯誤回應裡**沒有**這個欄位（🚫 不送 `null`）。
+    #[test]
+    fn core_error_data_rides_along_and_is_absent_when_there_is_none() {
+        let state =
+            serde_json::json!({ "room_version": 9, "members": {}, "shared": 0, "txn_id": "t2" });
+        let error =
+            CoreError::new(CoreErrorKind::RoomDevicesChanged, "stale").with_data(state.clone());
+        let json = serde_json::to_value(Response::from_core_error(Some(5), &error)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "code": 1401, "msg": "stale", "result": null, "id": 5, "data": state })
+        );
+        let plain = serde_json::to_value(Response::from_core_error(
+            Some(6),
+            &CoreError::new(CoreErrorKind::Locked, "locked"),
+        ))
+        .unwrap();
+        assert!(plain.get("data").is_none(), "{plain}");
     }
 
     #[test]

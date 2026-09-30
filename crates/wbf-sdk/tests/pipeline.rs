@@ -1536,7 +1536,13 @@ mod with_crypto_engine {
             attachments: Vec::new(),
         };
         let sent = engine
-            .encrypt_and_send(&mut client, &refresh, &message)
+            .encrypt_and_send(
+                &mut client,
+                &refresh.room_id,
+                refresh.versions.room_version,
+                &refresh.versions.members.keys().cloned().collect::<Vec<_>>(),
+                &message,
+            )
             .await
             .unwrap();
         assert!(matches!(sent, SendOutcome::Sent { .. }), "{sent:?}");
@@ -1554,7 +1560,13 @@ mod with_crypto_engine {
         let mut client = WbfClient::new(&mut server);
         client.hello("test", &[]).await.unwrap();
         let stale = engine
-            .encrypt_and_send(&mut client, &refresh, &message)
+            .encrypt_and_send(
+                &mut client,
+                &refresh.room_id,
+                refresh.versions.room_version,
+                &refresh.versions.members.keys().cloned().collect::<Vec<_>>(),
+                &message,
+            )
             .await
             .unwrap();
         let SendOutcome::RoomDevicesChanged {
@@ -1571,6 +1583,95 @@ mod with_crypto_engine {
         );
         drop(client);
         assert_eq!(server.sent_events.len(), 1, "被擋的那則沒進去");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 從沒在這個房分過金鑰（沒 refresh 過、daemon 剛重開、UI 手上已經有號碼）就直接送：`encrypt_and_send` 自己先分金鑰再加密，
+    /// 🚫 不會撞上游「沒有 outbound session」的 panic（維護者 2026-09-29：金鑰的分發由 daemon 自動做）。
+    /// 送出去的是密文、帶 UI 給的號碼；自己解得開自己剛送的那則（`to_incoming` 走 Decrypted、密文照帶）。
+    #[tokio::test]
+    async fn sending_without_a_prior_refresh_shares_the_room_key_first_instead_of_panicking() {
+        use wbf_sdk::crypto_engine::{OutgoingRoomEvent, SendOutcome};
+        use wbf_sdk::incoming::IncomingEvent;
+        let members = serde_json::json!({
+            "chunk": [joined("@alice:localhost", &format!("1-{}", hash_of_no_keys("@alice:localhost")))],
+            "org.wbftw.room_version": 7
+        });
+        let (engine, mut server, dir) = engine_and_server("send-first", members).await;
+        server.current_room_version = Some(7);
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        let message = OutgoingRoomEvent {
+            event_type: "m.room.message".into(),
+            content: serde_json::json!({ "msgtype": "m.text", "body": "first" }),
+            txn_id: "t-first".into(),
+            attachments: Vec::new(),
+        };
+        let sent = engine
+            .encrypt_and_send(
+                &mut client,
+                "!r:localhost",
+                7,
+                &["@alice:localhost".to_string()],
+                &message,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(sent, SendOutcome::Sent { .. }), "{sent:?}");
+        drop(client);
+        let (_, event_type, room_version) = server.sent_events.last().cloned().unwrap();
+        let content = server.sent_contents.last().cloned().unwrap();
+        assert_eq!(
+            (event_type.as_str(), room_version),
+            ("m.room.encrypted", Some(7))
+        );
+
+        let echoed = serde_json::json!({
+            "type": "m.room.encrypted", "event_id": "$mine", "room_id": "!r:localhost",
+            "sender": "@alice:localhost", "origin_server_ts": 1,
+            "content": serde_json::from_slice::<serde_json::Value>(&content).unwrap(),
+        });
+        match engine.to_incoming("!r:localhost", echoed.clone()).await {
+            IncomingEvent::Decrypted {
+                ciphertext,
+                cleartext,
+            } => {
+                assert_eq!(ciphertext, Some(echoed), "密文照帶");
+                assert_eq!(cleartext["content"]["body"], "first");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `to_incoming`：明文原樣；解不開（沒有那把房間金鑰）的密文照存、帶原因，🚫 不丟。
+    #[tokio::test]
+    async fn to_incoming_keeps_plaintext_and_stores_what_it_cannot_decrypt() {
+        use wbf_sdk::incoming::IncomingEvent;
+        let (engine, _server, dir) = engine_and_server("to-incoming", serde_json::json!({})).await;
+        let plain = serde_json::json!({
+            "type": "m.room.message", "event_id": "$p", "sender": "@b:localhost",
+            "origin_server_ts": 1, "content": { "msgtype": "m.text", "body": "hi" },
+        });
+        assert!(matches!(
+            engine.to_incoming("!r:localhost", plain).await,
+            IncomingEvent::Plain { .. }
+        ));
+        let foreign = serde_json::json!({
+            "type": "m.room.encrypted", "event_id": "$x", "sender": "@b:localhost",
+            "origin_server_ts": 1,
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2", "sender_key": "c2VuZGVy",
+                "session_id": "bm90LWEtcmVhbC1zZXNzaW9u", "device_id": "B", "ciphertext": "AwgAEnAA"
+            },
+        });
+        match engine.to_incoming("!r:localhost", foreign.clone()).await {
+            IncomingEvent::Undecrypted { ciphertext, reason } => {
+                assert_eq!(ciphertext, foreign);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

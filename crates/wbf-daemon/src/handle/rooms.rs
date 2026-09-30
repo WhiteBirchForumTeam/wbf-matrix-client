@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use wbf_core::{cipher_for_plaintext_room, Core, HistoryQuery, SyncMode, UploadRequest};
+use wbf_core::{
+    cipher_for_plaintext_room, Core, HistoryQuery, RoomDevices, SendOptions, SyncMode,
+    UploadRequest,
+};
 use wbf_sdk::RecentPlan;
 
 use super::{
@@ -49,19 +52,55 @@ pub(super) async fn room_get(handle: &Handle, core: &Core, params: Value) -> Out
     )
 }
 
+/// 加密房要帶 `room_devices`（UI 存的那份，`room.refresh_devices` 回的）；被擋回 1401，`data` 是 daemon 自動重拿的房間狀態（e2ee-rpc.md §3）。
 pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
         room: String,
         body: String,
+        #[serde(default)]
+        room_devices: Option<RoomDevices>,
+        #[serde(default)]
+        txn_id: Option<String>,
         #[serde(flatten)]
         target: TargetParams,
     }
     let params: Params = parse_params(params)?;
+    let options = SendOptions {
+        room_devices: params.room_devices,
+        txn_id: params.txn_id,
+    };
     let event_id = core
-        .send_text(&params.room, &params.body, &handle.target(&params.target))
+        .send_text(
+            &params.room,
+            &params.body,
+            &options,
+            &handle.target(&params.target),
+        )
         .await?;
     Ok(json!({ "event_id": event_id }))
+}
+
+/// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。
+/// 回的 `{room_version, members, shared}` UI 存下來，送出時整份當 `room_devices` 帶回來（e2ee-rpc.md §2）。
+pub(super) async fn room_refresh_devices(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        #[serde(default)]
+        previous: Option<RoomDevices>,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let refreshed = core
+        .refresh_room_devices(
+            &params.room,
+            params.previous.as_ref(),
+            &handle.target(&params.target),
+        )
+        .await?;
+    Ok(json!(refreshed))
 }
 
 /// 路徑版（rpc-spec §3.3）：daemon 自己讀檔、上傳、送事件，一則回應。

@@ -33,16 +33,17 @@
        Device/Subscribe{device_id}（不帶 cd_seq）→ Ack ＋ CryptoState
        Ack 之前推來的（early pushes）→ 不單獨匯：還沒銷、還在佇列裡，下面的追平會一起拉回
        pull_to_device：Fetch（🚫 不帶 cd_seq：server 從佇列最舊還沒銷毀的給）一窗一窗到 more=false，每窗 import_items   ← 同一支
-       發 keys.state: caught_up（匯了幾則、幾把新房間金鑰）
-       起收金鑰的 task（握 Arc<OlmEngine>、Arc<LinkPool>、EventSink、訂閱會話）
+       發 keys.state: caught_up（匯了幾則、幾把新房間金鑰）；這幾窗帶來的新房間金鑰 → 去 cache 補解（e2ee-rpc.md §6）
+       訂閱時跟著來的 CryptoState 交給狀態機 → send_outgoing_requests：上傳裝置金鑰、一次性金鑰、fallback key（e2ee-rpc.md §5；失敗只講一聲）
+       起收金鑰的 task（握 Arc<OlmEngine>、Arc<LinkPool>、Arc<ServerCache>、EventSink、訂閱會話）
        ⚠️ 這一段回錯（m/ 開不起來、Subscribe 被拒、追平壞包）＝這條線沒開成：fail loud，
           因為「金鑰沒在收」靠 UI 看不出來，線開不起來看得出來（PR #60 審查 cirno 🟡；接受的取捨）。
           沒進 store 的都還在佇列裡，下次開線的追平會拉回（rumia 🟡：恢復靠重開線——2026-09-29 起看線迴圈每 15 秒試一次）
 收金鑰的 task（佇列頭就是水位：沒銷的都還在，從頭拉一次就回來）
-  Push{gap:false, items} → pool.reuse(Keys) 拿線 → import_items → keys.state: caught_up
+  Push{gap:false, items} → pool.reuse(Keys) 拿線 → import_items → keys.state: caught_up → 帶來的新房間金鑰去 cache 補解、發 room.message
   Push{gap:true} / import_items 回錯 / 一包解不開 / 本地收件匣滿過 / CryptoState{gap:true} → 記「要拉」
   每處理完一個事件（含 60 秒閒置逾時）：有「要拉」就 pull_to_device 一次；失敗就留著，下一個事件或下一分鐘再拉（🚫 不原地狂試）
-  CryptoState            → 講一聲（OTK 存量的用途是補上傳金鑰：E2EE 的 RPC 面那支）
+  CryptoState            → 存量交給狀態機，它要補（不到 50 把、fallback key 到期）就走 Keys 線上傳（e2ee-rpc.md §5）
   訂閱結束（server 送 Error：被同一裝置後來的連線接手的 1505；或線死了）→ keys.state: stopped 帶原因、關掉這格線（link.state: closed）、task 結束
                            🚫 task 不重訂（to-device-client §5.1）；關線是為了讓看線迴圈下一輪看到它不在、重開重訂
                            （2026-09-29 之前不關線，因為房間訂閱在同一條線上）
@@ -70,12 +71,12 @@
 |---|---|
 | 上線追平完、或推來一包匯完 | `keys.state { user, state: "caught_up", imported, room_keys }`——`room_keys` 是這一輪帶進來的新房間金鑰數，UI 拿它決定要不要重解密文 |
 | 訂閱結束（被接手、線死） | `keys.state { user, state: "stopped", reason }`：這台裝置不再收金鑰 |
-| 線不在、匯入失敗、拉失敗、CryptoState | `Note`，只是講一聲 |
+| 線不在、匯入失敗、拉失敗、上傳金鑰失敗、補解失敗 | `Note`，只是講一聲 |
+| 新房間金鑰讓 cache 裡的舊密文解開了 | 每一則一個 `room.message`（同 `event_id`，UI 當更新；e2ee-rpc.md §6） |
 
 ## 3. 不在這支
 
-- `DeviceChanged`（房間訂閱那個會話送來）→ `refresh_room_devices`：core 還沒有那支例行程序（e2ee-walkthrough §16.6），E2EE 的 RPC 面接。
-- OTK／裝置金鑰上傳、`org.wbftw.device_versions` 的宣告：同上。
+- ~~`DeviceChanged` → `refresh_room_devices`、OTK／裝置金鑰上傳、`org.wbftw.device_versions` 的宣告~~：✅ 2026-09-29 做了（e2ee-rpc.md）。`DeviceChanged` 由房間那條線原樣轉給 UI，refresh 是 UI 叫的。
 - ~~金鑰獨立一條線、訂閱線被關主動重開~~：✅ 2026-09-29 做了（link-pool.md §1、§3.1）。
 
 ## 4. 測試

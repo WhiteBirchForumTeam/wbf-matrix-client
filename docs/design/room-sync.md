@@ -81,8 +81,8 @@ UI
 - 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：做了，在 [key-sync.md](key-sync.md)（同一條線上另一個會話）。
 - 背景重開：做了，link-pool.md §3.1。task 內 panic 那條路也是（PR #58 審查 cirno #661 🟢）：panic 不走 `pool.close`，會留下「線活著、沒 task」而且沒有 `closed`——
   文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime §11 第 8 階段）。
-- 密文解密：推來的密文原樣存（local-cache-db.md §7.2）。
-- `DeviceChanged`（同一個訂閱會話送來）：認得、不消費，E2EE 那支接。
+- ~~`DeviceChanged`~~：✅ 2026-09-29 原樣轉成 `CoreEvent::DeviceChanged`（RPC `devices.changed`）給 UI（e2ee-rpc.md §4）。
+- ~~密文解密~~：✅ 2026-09-29 推來的有金鑰就解，密文明文一起存；沒金鑰只存密文，金鑰到了由金鑰那半補解（e2ee-rpc.md §6）。
 
 ## 6. 測試
 

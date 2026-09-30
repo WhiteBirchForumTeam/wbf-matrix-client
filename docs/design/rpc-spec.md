@@ -302,7 +302,8 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 |---|---|---|---|
 | `room.list` | `{ user?, server?, sync? }`。**有 `sync`**（§2） | `[Conversation]`（chat-model §2.1） | `list_conversations`。⚠️ core 現在只有「先跟上游 sync 一輪」那條，`local` 要接 `cache.db` 的 `room_list` |
 | `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation` | `conversation`。同上 |
-| `room.send_text` | `{ room, body, user?, server? }` | `{ event_id }` | `send_text` |
+| `room.send_text` | `{ room, body, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（e2ee-rpc.md §3） | `{ event_id }` | `send_text`。加密房：先分金鑰、加密、帶 `room_version` 送；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3），🚫 不自動重送 |
+| `room.refresh_devices` | `{ room, previous?, user?, server? }`。`previous` 是 UI 手上的上一份（`{ room_version, members }`）：帶了只重查裝置版本號變了的人 | `{ room_version, members: { mxid: "序號-雜湊" }, shared }`——**UI 存下來**，送出時整份當 `room_devices` 帶回來；`shared` 是這輪補發了幾個 to-device | `refresh_room_devices`：拿成員清單與版本號 → 只重查變了的人 → 雜湊對不上重查一次、還不對就拒（fail closed）→ 把房間金鑰補給還沒有的裝置（e2ee-rpc.md §2）。wbf 帳號才有；一般 Matrix 1100 |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（CLI 規格 §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, upload_id, caption?, user?, server? }`。**資料平面版**的後半：`media.create` 之後、bytes 還在 PUT 的時候就能送（architecture-v2 §4.9 第 4 步） | `{ event_id, mxc, attachment_declared }` | ⚠️ core 沒有——現在 `send_file` 是「傳完再送」一條龍。要拆成「建檔→（送事件 ∥ 傳 bytes）」 |
 | `room.history` | `{ room, limit, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「往回翻：`before` 與 `next`」 |
@@ -407,12 +408,13 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | method | params | 什麼時候 |
 |---|---|---|
 | `progress` | `{ id: number, done: number, total?: number, note?: string }`。`id` 是**哪個請求**的進度 | 長工作跑的時候。`total` 不知道就不帶（串流）。`note` 給人看，🚫 不做邏輯 |
-| `room.message` | `{ user, room, message: Message }`（chat-model §2.2，含 `decrypted`／`undecryptable_reason`） | 這個帳號收到一則新訊息（sync 或 `Event/Push` 進來、解完密、寫進快取**之後**） |
+| `room.message` | `{ user, room, message: Message }`（chat-model §2.2，含 `decrypted`／`undecryptable_reason`） | 這個帳號收到一則新訊息（sync 或 `Event/Push` 進來、解完密、寫進快取**之後**）。金鑰晚到、之後補解開的舊訊息也再發一次（**同一個 `event_id`**，UI 當更新，e2ee-rpc.md §6）；`sync.recent` 拉到的不發（UI 拉完自己讀） |
 | `sync.state` | `{ user, state: "connected"\|"disconnected"\|"catching_up"\|"caught_up", cg_seq? }` | 跟 server 的連線狀態變了 |
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖或鎖上了——多條連線各自平等（§4.7），所以要互相通知 |
 | `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事。⚠️ **這是連線層的訊號**：它只保證「這條連線漏了某些事件」，🚫 不保證漏掉的裡面有它訂的那些（daemon 不替每條訂閱各記一份 lag）；寧可多報一次重讀，🚫 不假裝沒漏。什麼都沒訂的連線不收它 |
 | `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
 | `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }`（2026-09-29 起房間與金鑰的訂閱各自一條；之前的 `subscriptions` 不再出現） | 這個帳號對 homeserver 的某一條線開了或關了（link-pool.md §4）。五條線由 daemon 在 `vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（link-pool.md §3.1）。⚠️ 「關了」不是即時的：線死後大約一分鐘內才被看到 |
+| `devices.changed` | `{ user, changed_user, device_version, rooms: { room: room_version }, gap }`（e2ee-rpc.md §4） | `Rooms` 線上 server 推來「某人的裝置變了」，原樣轉。daemon 自己🚫 不動作；要不要對開著的房 `room.refresh_devices` 是 UI 的事（`gap: true` ＝ 前面有推送被丟，開著的房都 refresh 一次） |
 | `keys.state` | `{ user, state: "caught_up"\|"stopped", imported?, room_keys?, reason? }`（key-sync.md §2） | 這個帳號的金鑰訂閱：`caught_up`＝一批 to-device 匯完、銷毀完（`imported` 則、`room_keys` 把新房間金鑰——UI 拿它決定要不要重解密文）；`stopped`＝這條訂閱結束了（被同一裝置後來的連線接手、線死了）：金鑰那條線跟著關，daemon 的看線迴圈下一輪（最多 15 秒）重開、重訂，重訂完會再來一則 `caught_up`。維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」 |
 | `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
@@ -466,6 +468,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | 1200 | `io` | 1 |
 | 1300 | `network` | 4 |
 | 1400 | `server` | 2 |
+| 1401 | `room_devices_changed` | 2 |
 | 1500 | `integrity` | 3 |
 | 1600 | `timeout` | 5 |
 
@@ -476,6 +479,15 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 - `msg` 就是 `CoreError.message`，給人看。**`kind` 的名字不另外放進回應**——`code` 就是它，一個欄位夠了（§4.6）。
 - RPC 層錯誤（1xx）的 exit code 一律 **1**（用法錯），除了 `105` 是 **130**（跟 Ctrl-C 一樣的慣例）。
 - 協議層（9xxx）的 exit code：`9001` token 錯 → **1**；其餘 → **4**（網路：連線建不起來）。
+- `room_devices_changed`（1401）：加密訊息被 server 擋（server 的 1506 `RoomDevicesChanged`：帶的房間版本號過期）。訊息**沒送**；daemon 已經自動重拿房間狀態、補了金鑰，新的狀態在 `data`（§5.3）。
+
+### 5.3 錯誤回應的 `data`
+
+少數錯誤會順手帶東西回來，放在回應的 `data`（`result` 照樣是 `null`）；**沒有就不在**（🚫 不送 `null`），成功回應永遠沒有。
+
+| code | `data` |
+|---|---|
+| 1401 `room_devices_changed` | 重拿成功：`{ room_version: u64, members: { mxid: "序號-雜湊" }, shared: 非負整數, txn_id: string }`——前三個就是新的 `room_devices`（UI 存下、重送時帶回來），`txn_id` 是這則用的（UI 沒給的話是 daemon 產的，重送用同一個）。重拿也失敗：`{ txn_id: string, current_room_version: u64 或 null }`（server 沒給號碼時是 null），UI 自己叫 `room.refresh_devices` |
 
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）
 
@@ -583,7 +595,9 @@ backup.status → account.del`（`tests/real_server.rs`，`--ignored`）。
 | `account.whoami` | ✅ | HTTP `/whoami` | 🔁 |
 | `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | 🔁 |
 | `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋 `JoinedRooms`＋`GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（account-session.md §6） |
-| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send` 明文（加密房 1100）；一般 Matrix：`Room::send` | ✅ wbf（加密等 E2EE 的 RPC 面）／🔁 一般 server |
+| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房先分金鑰、加密、帶 `room_version`，e2ee-rpc.md §3）；一般 Matrix：`Room::send` | ✅ wbf（加密 2026-09-29，2026-09-30 真 server 驗過）／🔁 一般 server |
+| `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** 橋 `Members`＋`/keys/query`＋`/keys/claim`＋`sendToDevice` | ✅ 2026-09-29（2026-09-30 真 server 驗過） |
+| `devices.changed` 推播 | ✅ `CoreEvent::DeviceChanged` | **WS** `Event/DeviceChanged`（`Rooms` 線宣告 `org.wbftw.device_versions`） | ✅ 2026-09-29 |
 | `room.send_file` | ✅ | 上傳 **WS** ＋ 事件：wbf 帳號 **WS** `Event/Send` 帶 `attachments`（`attachment_declared: true`）；一般 Matrix matrix-sdk | ✅ wbf／🔁 一般 server |
 | `room.send_attachment`、`media.create` | ❌ | — | ❌ |
 | `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（等 wbfuwunel #64） | ✅ wbf／🔁 一般 server |

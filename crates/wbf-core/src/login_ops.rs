@@ -186,7 +186,7 @@ impl Core {
     }
 
     /// wbf 帳號的 `m/`：**只有 crypto store**，由 `OlmEngine` 開（account-session.md §2；裝置身分金鑰在這一步生出來，
-    /// 上傳等 E2EE 那支）。這裡只要它建好，引擎本身丟掉；長活的引擎 E2EE 的 RPC 面再接。
+    /// 開 `Keys` 線時才上傳，e2ee-rpc.md §5）。這裡只要它建好，引擎本身丟掉；長活的引擎在 `key_sync` 的 `crypto_engines` 表裡共用。
     ///
     /// 🚨 建不起來就把半套的 `m/` 刪掉再回錯（token 由 `log_in` 的 rollback 撤）：🚫 不留一個「登入了、但沒有金鑰庫」的帳號——
     /// 那種帳號下一次碰到 E2EE 才發現，而那時已經有人把房間金鑰發給一台不存在的裝置。

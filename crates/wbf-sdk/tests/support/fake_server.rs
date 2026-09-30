@@ -75,6 +75,8 @@ pub struct FakeServer {
     pub current_room_version: Option<u64>,
     /// `Event/Send` 收下的：(room_id, type, room_version)。
     pub sent_events: Vec<(String, String, Option<u64>)>,
+    /// 同一批的 content（data 原樣），跟 `sent_events` 一一對齊。
+    pub sent_contents: Vec<Vec<u8>>,
 }
 
 /// 名字 → 序號（wbfuwunel `wbf-wire-format.md` §3.4）。只給這個假 server 用：
@@ -310,6 +312,7 @@ impl FakeServer {
             }
         }
         self.sent_events.push((room_id, event_type, room_version));
+        self.sent_contents.push(request.data.to_vec());
         Ok((
             serde_json::json!({ "event_id": format!("$fake-{}", self.sent_events.len()) }),
             Vec::new(),

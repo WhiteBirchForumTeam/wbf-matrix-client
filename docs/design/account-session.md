@@ -52,7 +52,7 @@
 - 順序：登入 → 目錄改成權威拼法 → **建 `m/`** → 封 session。🚨 **rollback 範圍＝拿到 token 之後到 session 封好**：這中間任一步失敗（正規目錄已存在、rename、建 `m/`、封檔）
   都把那個 token 撤掉（best effort 的 HTTP `/logout`）、清這次自己建的 `m/`，再回原錯（PR #56 審查 rumia 🔴）。🚫 不在 server 上留一台本地沒有 session 的裝置；
   一般 Matrix 那條路同一個 rollback（它以前也有這個窗）。
-- `m/` 由 `OlmEngine::open` 建（同一把 `matrix_store_key`）。裝置金鑰的上傳（`send_outgoing_requests`）跟 E2EE 那支一起接；在那之前這台裝置在 server 上沒有裝置金鑰，別人加密不到它——這是刻意的過渡，不是漏。
+- `m/` 由 `OlmEngine::open` 建（同一把 `matrix_store_key`）。登入這一步只建、不上傳；裝置金鑰的上傳（`send_outgoing_requests`）2026-09-29 起在開 `Keys` 線時做（e2ee-rpc.md §5，同 §6 那張表）。
 - 「每個連線打一次登入 token，確保連線真的登入」＝ 池開線的 `hello`：Bearer 升級過了不算，Hello 回來才算。
 
 ## 4. 登出（兩種 backend 同一套順序）
@@ -81,13 +81,13 @@ server #85 把上限放到 8 之後，2026-09-29 拆成兩條，而且由 daemon
 | 功能 | 一般 Matrix（走 Client） | wbf 帳號（不建 Client） |
 |---|---|---|
 | `room.list`／`room.get` 的 `server`／`both` | Client 的 /sync | 橋 `JoinedRooms`（0x13/0x28）＋`m.direct`（`GetAccountData` 0x11/0x25）＋每房 `GetState`（0x14/0x21）組 `Conversation`，`both` 寫進 `room_list`；`local` 不變。⚠️ N 間房是 N＋2 次往返；狀態超過 2 MiB 的房 server 回 `TooLarge`，整個呼叫失敗（講出來比少列一間好） |
-| `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機；wbfuwunel #78 之前 server 去重不分裝置，2026-09-26 已修，隨機照舊）；**加密房拒絕**（1100，問的是這一刻的單項 `GetStateEvent` `m.room.encryption`（0x14/0x22，不會像全量 `GetState` 在大房間被 `TooLarge` 擋）、🚫 不用快取），E2EE 那支接 `encrypt_and_send` |
+| `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機；wbfuwunel #78 之前 server 去重不分裝置，2026-09-26 已修，隨機照舊）；加密與否問這一刻的單項 `GetStateEvent` `m.room.encryption`（0x14/0x22，不會像全量 `GetState` 在大房間被 `TooLarge` 擋）、🚫 不用快取；**加密房**：2026-09-29 起先分金鑰、加密、帶 UI 給的 `room_devices.room_version` 送（e2ee-rpc.md §3）；沒帶 `room_devices` 是 1100 |
 | `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（約定 §5.2 的宣告終於成立，`attachment_declared: true`）；加密房在**上傳之前**就拒。兩邊的 content 同一份（`event_json::file_message_content`） |
 | `room.history` 錨點不在本地 | `/context` | 拒絕（1100），等 wbfuwunel #64 的 `before_event_id`；`sync=both` 先把錨點寫進快取就翻得下去 |
 | `watch`（CLI） | /sync 的迴圈 | 拒絕（1100）：daemon 的新訊息走訂閱＋推播（第 6 階段） |
 | `backup.*`、`recovery.*` | Client 的備份與 SSSS | **拒絕、回明確的錯**（1100，`backend_of` 擋；🚫 不靜默失效）；搬到 crypto 層＋橋（`BackupMachine`、`SecretStorageKey`、橋的 `/room_keys`、account data）排在 E2EE 的 RPC 面之後 |
 | 登出閘門的「server 那份救得回來嗎」 | Client 問 backup status | 問不到 → 只認本機的 recovery key 或 `accept_history_loss`（fail closed，1021） |
-| 裝置金鑰上傳（`/keys/upload`） | Client 登入就傳 | **還沒傳**：`m/` 建了、身分金鑰生了，上傳跟 E2EE 那支一起接（§3）。在那之前別人加密不到這台裝置 |
+| 裝置金鑰上傳（`/keys/upload`） | Client 登入就傳 | 2026-09-29 起開 `Keys` 線時上傳（裝置金鑰＋一次性金鑰＋fallback key），`CryptoState` 一到就補（e2ee-rpc.md §5） |
 
 ## 7. 測試
 
@@ -98,5 +98,5 @@ server #85 把上限放到 8 之後，2026-09-29 拆成兩條，而且由 daemon
   路由（session 指向沒人聽的位址）：`room.list`／`get`／`send_text` 到開線才失敗（`Network`，🚫 不是「log in again」），`backup.status`／`watch`／錨點不在本地的 `history` 是 `Usage`、登出閘門是 `HistoryWouldBeLost`；
   `room_state.rs`：Group／Direct（要 m.direct 且兩人）／Channel（門檻 100）、v12 建房者無限、字串型 power level、沒有 algorithm 的 encryption 不算加密、名字的後備順序；`file_message_content` 的形狀；
   登入的 rollback：迷你 HTTP 回的 `user_id` 跟打的不同、而那個正規目錄已經存在 → 登入回 `Usage`，迷你 HTTP 要收到第二個請求 `POST /logout`（token 撤了），打字算出來的目錄沒有 session 也沒有 `m/`；
-  真 server（daemon `real_server`）：`room.list sync=both` 走橋、`room.send_text` 走 `Event/Send`（前面的加密確認走 `GetStateEvent`）、加密房的 `send_text` 1100（選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁 1100。
+  真 server（daemon `real_server`）：`room.list sync=both` 走橋、`room.send_text` 走 `Event/Send`（前面的加密確認走 `GetStateEvent`）、加密房沒帶 `room_devices` 的 `send_text` 1100（選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁走 wbf（錨點由推播寫進本地；錨點不在本地的拒答改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
   ⚠️ 沒測的：`send_file` 走 `Event/Send`（沒有 daemon 的 e2e）、封 session 失敗那條 rollback（製造不出來：沒有可以讓 `seal_session` 失敗的接縫）、一般 Matrix 那條路的登入（沒有一台不講 wbf 的 server；它的程式沒動）。

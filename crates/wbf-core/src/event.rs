@@ -64,6 +64,20 @@ pub enum CoreEvent {
         /// 關的理由；開的時候是 `None`。
         reason: Option<String>,
     },
+    /// 房間那條線上 server 推來「某個人的裝置變了」（`Event/DeviceChanged`）：原樣轉給 UI，要不要 `room.refresh_devices` 是 UI 的事
+    /// （維護者 2026-09-29：房間版本號存在 UI；e2ee-rpc.md §4）。daemon 自己🚫 不動作。
+    DeviceChanged {
+        /// 收到這則的帳號
+        user: String,
+        /// 裝置變了的那個人, example: "@bob:localhost"
+        changed_user: String,
+        /// 他的新裝置版本號, example: "4-0a1b2c3d4e"
+        device_version: String,
+        /// 受影響的房間 → 新的房間版本號
+        rooms: std::collections::BTreeMap<String, u64>,
+        /// true ＝ 這條連線前面有推送被丟掉（UI 該把開著的房都 refresh 一次）
+        gap: bool,
+    },
     /// 這個帳號的金鑰訂閱（`key_sync.rs`）怎麼了：追平了幾把、或停了（被另一台裝置接手、線死了）。
     /// 維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」這台裝置還在不在收金鑰。
     Keys {
