@@ -23,8 +23,7 @@ PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照�
 **還沒有**：UI；加密附件（加密房送檔仍拒）；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
 已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面 HTTP；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
-⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8）；
-matrix-sdk `Client` 那條要不要改回只開 crypto 與 state 兩個 store（`/docs/design/storage/local-cache-db.md` §4）。
+⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8；§7 第 1 項先照預設做）。
 
 ## 2. 讀哪些文件、什麼順序
 
