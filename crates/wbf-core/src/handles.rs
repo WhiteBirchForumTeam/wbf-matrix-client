@@ -152,9 +152,15 @@ impl Core {
     /// 用在「只是要處理既有資料」的路徑（`destroy` 的忘掉鏈），🚫 不先 `exists()` 再另外呼叫開庫。
     /// ⚠️ 還剩的窗口：`log_out` 的 `close_server_cache` 與刪檔之間沒有同一把鎖（既有行為，不在這裡）。
     ///
+    /// 🚨 **既有的庫照它自己記的 server 開，🚫 不拿 `server` 參數去比對**：參數可能是使用者打的 `--server`，
+    /// 拼法（scheme、大小寫、結尾的 `/`）跟庫裡記的不同時，[`wbf_sdk::cache::Cache::open`] 會當成別台 server 的庫
+    /// 整份刪掉重建——同 server 其他帳號的快取、只存在本機的已讀與隱藏標記一起沒了。
+    /// 目錄本來就是照正規化的 host 找到的；連 host 都對不上就拒絕（fail closed），🚫 不猜、🚫 不重建。
+    ///
     /// Return:
     ///     Ok(Some(Arc<ServerCache>))  已經開著、或檔案在而開起來了
-    ///     Ok(None)                    沒開著、而且沒有 `cache.db`
+    ///     Ok(None)                    沒開著、而且沒有 `cache.db`（或解不開、不是這一版的 schema：這裡不動它）
+    ///     Err(Usage)                  庫裡記的 server 跟 `server` 的 host 不同
     ///     Err(...)                    開不了（磁碟、金鑰）
     pub(crate) fn find_server_cache_if_present(
         &self,
@@ -178,11 +184,28 @@ impl Core {
         if let Some(existing) = registry.get(&dir) {
             return Ok(Some(existing.clone()));
         }
-        if when == OpenWhen::FileExists && !dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists() {
-            return Ok(None);
-        }
-        let identity = CacheIdentity {
-            server: server.to_string(),
+        let identity = match when {
+            OpenWhen::Always => CacheIdentity {
+                server: server.to_string(),
+            },
+            OpenWhen::FileExists => {
+                let Some(recorded) = Cache::read_identity(&dir, &self.vault()?.cache_key())? else {
+                    return Ok(None);
+                };
+                if crate::accounts::server_host_of(&recorded.server)
+                    != crate::accounts::server_host_of(server)
+                {
+                    return Err(CoreError::new(
+                        CoreErrorKind::Usage,
+                        format!(
+                            "the cache in {} belongs to {}, not {server}; it was left untouched",
+                            dir.display(),
+                            recorded.server
+                        ),
+                    ));
+                }
+                recorded
+            }
         };
         let (cache, outcome) = crate::server_cache::ServerCache::open(
             &dir,

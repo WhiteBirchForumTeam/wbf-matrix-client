@@ -1815,6 +1815,46 @@ fn media_row_id(
 
 // ---- 開檔 ----
 
+impl Cache {
+    /// 這份既有的 `cache.db` 說自己是哪個 server 的；🚫 不建、🚫 不重建、🚫 不動它。
+    /// 給「只是要處理既有資料」的路徑用（destroy 的忘掉鏈）：那種路徑拿使用者打的 server 字串去開，
+    /// 拼法一不同就會被 [`Cache::open`] 當成別台 server 的庫而整份刪掉重建（同 server 的其他帳號一起沒了）。
+    ///
+    /// Args:
+    ///     dir: example: "<data dir>/s/<b58 nonce>_<b58 密文>"
+    ///     key: example: vault.cache_key()
+    /// Return:
+    ///     Ok(Some(CacheIdentity))  檔在、解得開、schema 是這一版
+    ///     Ok(None)                 沒有檔、解不開、或不是這一版的 schema（下一次正常開會重建，這裡不動它）
+    ///     Err(Usage)               這個 build 沒有 SQLCipher
+    pub fn read_identity(dir: &Path, key: &Key32) -> Result<Option<CacheIdentity>, SdkError> {
+        let path = dir.join(CACHE_FILE_NAME);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let connection = match open_with_key(&path, key) {
+            Ok(connection) => connection,
+            Err(SdkError::Io(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let read_meta = |key: &str| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        };
+        if read_meta("schema_version").as_deref() != Some(&SCHEMA_VERSION.to_string()) {
+            return Ok(None);
+        }
+        Ok(read_meta("server").map(|server| CacheIdentity { server }))
+    }
+}
+
 /// Return:
 ///     Ok(Some(Cache))   開得起來、server 與版本都對
 ///     Ok(None)          解不開、不是我們的 schema、server 或版本不符 → 呼叫者刪檔重建
