@@ -721,11 +721,18 @@ mod tests {
     ) -> String {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Ok(CoreEvent::Message { message, .. }) = seen.recv().await {
-                    if message.id == event_id && message.decrypted == Some(true) {
-                        if let MessageKind::Text { body, .. } = &message.kind {
-                            return body.clone();
+                match seen.recv().await {
+                    Ok(CoreEvent::Message { message, .. }) => {
+                        if message.id == event_id && message.decrypted == Some(true) {
+                            if let MessageKind::Text { body, .. } = &message.kind {
+                                return body.clone();
+                            }
                         }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    // 事件來源收攤了就不會再來：🚫 不空轉到 30 秒逾時（PR #62 審查 cirno 🟢）。
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("the event channel closed before {event_id} arrived decrypted")
                     }
                 }
             }
