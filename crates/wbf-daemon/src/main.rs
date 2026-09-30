@@ -39,8 +39,8 @@ use zeroize::Zeroizing;
     about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端"
 )]
 struct Cli {
-    /// 常駐：開本地 RPC 的 WS，等前端來連
-    #[arg(short = 's', long = "server")]
+    /// 常駐：開本地 RPC 的 WS，等前端來連（🚫 長旗標不叫 `--server`：那個字只指 homeserver，/docs/design/overview/architecture-v2.md §0.1）
+    #[arg(short = 's', long = "serve")]
     serve: bool,
     /// 資料目錄
     #[arg(long, env = "WBF_DATA_DIR")]
