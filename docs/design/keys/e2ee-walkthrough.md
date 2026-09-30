@@ -37,7 +37,7 @@ POST /createRoom
                     content: { algorithm: m.megolm.v1.aes-sha2, rotation_period_ms?, rotation_period_msgs? } }]
 ```
 
-- `m.room.encryption` 一旦出現就**關不掉** —— 所以 `cache.db` 的 `rooms.encrypted` 只升不降（local-cache-db.md §6）。
+- `m.room.encryption` 一旦出現就**關不掉** —— 所以 `cache.db` 的 `rooms.encrypted` 只升不降（local-cache-db.md §5）。
 - 這一步**還沒有任何金鑰**，只是宣告這個房要加密。
 - `history_visibility`（`shared`／`invited`／`joined`）決定之後**邀請中**的人要不要也收到金鑰（第 2、8 步）。
 
@@ -102,7 +102,7 @@ matrix-sdk 的 `room.send` 在裡面依序做：
 📎 Megolm 密文外殼的 `session_id` 與 message index **不用金鑰就讀得到**，所以「哪些列等哪把金鑰」查得出來。
 
 **我們**：
-- matrix-sdk 那條（`/sync`、`/messages`）：①② 在 SDK 裡，交出明文（`raw_event` 是 NULL，local-cache-db.md §7.7）。
+- matrix-sdk 那條（`/sync`、`/messages`）：①② 在 SDK 裡，交出明文（`raw_event` 是 NULL，edits-and-redactions.md §7）。
 - WS 那條（`Recent`）：只有 ② 的密文，而且**不解**，存成 `general`。
 
 ## 5. Bob 回話
@@ -125,7 +125,7 @@ B2 讀得到什麼：
 
 - ✅ ④ 之後 Alice 送的。
 - ❌ **B2 登入前**的歷史：B2 沒有那段金鑰。補救三條：
-  - **金鑰備份**：B2 用 recovery key 打開 server 上的備份，拿回 B1 存進去的房間金鑰（我們有 `key-backup`，local-cache-db.md §10）。
+  - **金鑰備份**：B2 用 recovery key 打開 server 上的備份，拿回 B1 存進去的房間金鑰（我們有 `key-backup`，room-key-backup.md）。
   - **向自己的其他裝置要**：B2 發 `m.room_key_request`，B1 **只在確認 B2 是 Bob 本人（交叉簽章驗證過）時**才轉 `m.forwarded_room_key`。
   - **邀請時一起給歷史金鑰**（MSC4268 的 room key bundle；vendor 的 `OlmMachine::share_room_key_bundle_data`）。
 
@@ -183,7 +183,7 @@ B2 讀得到什麼：
 ① POST /rooms/{room}/leave（之後可 /forget）
 ② 自己：丟掉這個房的 outbound session；不再收到這個房的事件
 ③ 其他人：下一次說話時收件人少了 Alice → 輪換 → Alice 讀不到之後的
-④ Alice 本地：已收的歷史與 inbound session 還在 → 以前的仍解得開；cache.db 照 local-cache-db.md §7 保留，清不清是 destroy 的事
+④ Alice 本地：已收的歷史與 inbound session 還在 → 以前的仍解得開；cache.db 照 edits-and-redactions.md 保留，清不清是 destroy 的事
 ```
 
 ## 11. 容易漏的清單

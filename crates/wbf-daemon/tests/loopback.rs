@@ -233,7 +233,7 @@ async fn shutdown_notifies_open_connections_and_stops_accepting() {
     );
 }
 
-/// architecture-v2 §4.3 的第 4、5 步：前端在 ready 之後**抹掉** token 檔，而 daemon 照樣服務。
+/// local-interface §3 的第 4、5 步：前端在 ready 之後**抹掉** token 檔，而 daemon 照樣服務。
 ///
 /// ⭐ 這條釘住的是「daemon 讀完就不再回頭讀那個路徑」—— 哪天有人加了一段「重讀 token」
 /// （例如想支援換 token），這裡會紅，而那正是要停下來想的時候。

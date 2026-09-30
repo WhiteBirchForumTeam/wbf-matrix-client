@@ -1,7 +1,7 @@
 //! 房間命令（CLI 規格 §3.4）：`rooms`、`send`、`watch`、`read`、`files`。
 //!
 //! ⚠️ 這一層**只做三件事**：把旗標翻成 core 的參數、問使用者（確認）、印出來。
-//! 做什麼在 `wbf-core`（architecture-v2 §7）——包括寫穿快取、過濾、翻頁那些。
+//! 做什麼在 `wbf-core`（architecture-v2 §6）——包括寫穿快取、過濾、翻頁那些。
 
 use std::io::Write;
 use std::path::Path;

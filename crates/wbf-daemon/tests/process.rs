@@ -1,4 +1,4 @@
-//! 真的把 daemon 這個**程序**跑起來（architecture-v2 §4.3 的第 2–5 步）。
+//! 真的把 daemon 這個**程序**跑起來（local-interface §3 的第 2–5 步）。
 //!
 //! 上面兩個測試檔都是在同一個程序裡叫 `RpcServer::bind`，所以 `main.rs` 那一段
 //! ——讀 token 檔、清掉舊的 `daemon.json`、綁好之後才寫、stdout 宣告 ready、結束時收拾——
@@ -24,7 +24,7 @@ struct Ready {
     pid: u32,
 }
 
-/// 像前端那樣放一個 token 檔：**Unix 0600**（architecture-v2 §4.3 的第 1 步）。
+/// 像前端那樣放一個 token 檔：**Unix 0600**（local-interface §3 的第 1 步）。
 ///
 /// 🚨 🚫 不要用 `std::fs::write`：那會套 umask（常見 0644），而 daemon 對別人讀得到的 token 檔是
 /// **fail closed** 的 —— 於是 Unix 上每個 process 測試都會在 `spawn_daemon` 就死掉，
@@ -220,7 +220,7 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-/// token 檔別人讀得到就**拒絕啟動**（fail closed，architecture-v2 §4.3）。
+/// token 檔別人讀得到就**拒絕啟動**（fail closed，local-interface §3）。
 /// Windows 靠目錄 ACL，那裡這條檢查一律過，所以只在 Unix 跑。
 #[cfg(unix)]
 #[test]
@@ -338,7 +338,7 @@ fn serving_and_a_one_shot_command_at_the_same_time_is_refused() {
     assert!(!dir.path().join(wbf_daemon::lock::LOCK_FILE_NAME).exists());
 }
 
-/// token 檔長度不對就不啟動，而且**講得出原因**（`TOKEN_LEN`，architecture-v2 §4.3）。
+/// token 檔長度不對就不啟動，而且**講得出原因**（`TOKEN_LEN`，local-interface §3）。
 ///
 /// 📎 這條同時是 `spawn_daemon` 那個診斷路徑的實跑：daemon 起不來的時候，
 /// 測試要看得到它的抱怨，🚫 不是對著一行空的 stdout 猜。

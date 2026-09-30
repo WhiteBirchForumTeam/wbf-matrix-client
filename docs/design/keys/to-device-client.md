@@ -77,7 +77,7 @@ server 的 `add_to_device_event` 用的是 `globals.next_count()`——**跟 PDU
 而把它寫在 `m/` 裡面，那件事**不需要任何人記得去做**——🚫 不是「刪 store 時順手也刪水位」
 那種散在各處的承諾（全域 A6：漏掉的那個不會 fail closed）。
 
-📎 `sync_state` 那張表是 `cg_seq` 的家，`cd_seq` 不進去；local-cache-db §6 的 schema
+📎 `sync_state` 那張表是 `cg_seq` 的家，`cd_seq` 不進去；local-cache-db §5 的 schema
 旁邊有一行註記說明它為什麼不在那裡。
 
 🔲 **還沒定的只剩落地格式**：`m/` 裡面是 matrix-sdk 自己的 store（我們🚫 不動它的 schema），
@@ -163,7 +163,7 @@ id = 它自己當初 Subscribe 用的 id
 ## 6. to-device 有**自己的一條連線**，而那條線上仍有兩段會話
 
 ⭐ **daemon 跟 server 開四條 WS，金鑰是獨立的一條**（維護者 2026-09-12 定，
-architecture-v2 §6.1）：房間一條、**金鑰一條**、媒體一條、雜項一條。
+architecture-v2 §5.1）：房間一條、**金鑰一條**、媒體一條、雜項一條。
 
 🚨 **這件事對 to-device 特別重要**，因為 server 端的送出佇列是**每條連線一份**的：
 佇列滿了 server 就丟推送並標 `gap`。房間事件掉了可以 `Recent` 重拉、媒體掉了可以重下，

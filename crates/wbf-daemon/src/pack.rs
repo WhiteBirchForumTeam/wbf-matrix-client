@@ -4,7 +4,7 @@
 //! 🚫 不共用 codec。
 //!
 //! 這個檔只做 bytes ↔ (type, JSON bytes)：明文直接放、密文用 token 導出的兩把金鑰
-//! （architecture-v2 §4.4）。**哪些該加密**不在這裡判斷——那是 `connection.rs` 的事，
+//! （local-interface §4）。**哪些該加密**不在這裡判斷——那是 `connection.rs` 的事，
 //! 而且只能在那一個地方判斷。
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -15,7 +15,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const PACK_VERSION: u8 = 0x01;
 /// 一個 frame 的上限（含前綴）。跟「超過就走資料平面」是同一個數。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
-/// `daemon.token` 的長度（architecture-v2 §4.3）。不是恰好這麼長就拒，不接受「夠長就好」。
+/// `daemon.token` 的長度（local-interface §3）。不是恰好這麼長就拒，不接受「夠長就好」。
 pub const TOKEN_LEN: usize = 256;
 
 const NONCE_LEN: usize = 24;

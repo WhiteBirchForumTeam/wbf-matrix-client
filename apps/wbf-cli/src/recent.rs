@@ -1,5 +1,5 @@
 //! `recent`：`Event/Recent` 一窗一窗把 `cg_seq` 之後的事件跨房間拉回來寫進 `cache.db`
-//! （local-cache-db.md §6「開 app 的同步」、server 的 pack-pipeline §6）。
+//! （local-cache-db.md §5「開 app 的同步」、server 的 pack-pipeline §6）。
 //!
 //! ⚠️ 做什麼在 `wbf_core::Core::recent`；這裡只是把結果印出來。
 

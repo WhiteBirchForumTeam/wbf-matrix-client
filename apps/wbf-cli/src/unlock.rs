@@ -1,9 +1,9 @@
-//! CLI 怎麼打開 vault（local-cache-db.md §4 的 CLI 那一列）：資料目錄在哪、passphrase 從哪來。
+//! CLI 怎麼打開 vault（vault-and-keys.md §1 的 CLI 那一列）：資料目錄在哪、passphrase 從哪來。
 //!
 //! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼（只有 `login` 用）。
 //! passphrase 來源的優先順序：`--passphrase-file` → `local.key` 是 `Plain` 就不用 passphrase → 問終端。
 //! ⚠️ 這整個模組是「**一個命令一個程序**」的產物：問終端、讀 passphrase 檔，都是為了
-//! 「每次執行都要重新解鎖」而存在。daemon 常駐之後（architecture-v2 §1、§4.5）passphrase
+//! 「每次執行都要重新解鎖」而存在。daemon 常駐之後（architecture-v2 §1、local-interface.md §5）passphrase
 //! 改從 RPC 的 `vault.unlock` 進來——所以 🚫 這些都沒有搬進 `wbf-core`。
 //! 這裡的責任是「把 passphrase 生出來」，解鎖本身交給 `Core`。
 //!
@@ -98,7 +98,7 @@ impl UnlockOptions {
     }
 }
 
-/// `--passphrase-file` 的規則（local-cache-db.md §12）：**整檔原始 bytes**。
+/// `--passphrase-file` 的規則（vault-and-keys.md §3）：**整檔原始 bytes**。
 ///
 /// 🚫 不去尾換行、🚫 不驗 UTF-8、🚫 不 trim：passphrase 只餵給本機的 Argon2id，永遠不出這台
 /// 機器，所以它可以是中文、可以是一個 mp3。⚠️ 這代表 `echo hunter2 > pw`（結尾有 `\n`）跟
@@ -191,7 +191,7 @@ mod tests {
 
     /// 這一側的責任是「把 passphrase 生出來」，所以測的是**來源的優先序**，
     /// 🚫 不是解鎖本身（那在 `wbf-core` 的測試裡）。
-    /// 中文加一個 0x00：兩者以前都過不了 `read_to_string`（local-cache-db §12）。
+    /// 中文加一個 0x00：兩者以前都過不了 `read_to_string`（vault-and-keys §3）。
     const BINARY_PASSPHRASE: &[u8] = "早安\u{0}世界".as_bytes();
 
     fn new_core(options: &UnlockOptions) -> Core {

@@ -62,7 +62,7 @@ impl Core {
     /// Args:
     ///     user: mxid 或 localpart, example: "@alice:localhost"
     ///     password: 🚫 不印、不 log；⚠️ 它要送給 homeserver，所以是**字串**不是任意
-    ///         bytes（local-cache-db §12.4：跟 passphrase 分家的理由）
+    ///         bytes（vault-and-keys §3.4：跟 passphrase 分家的理由）
     ///     device_name: example: "wbf-cli"
     pub async fn log_in(
         &self,

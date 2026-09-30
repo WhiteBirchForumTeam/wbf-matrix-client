@@ -199,9 +199,9 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照約定 §5。**送出時同一個請求要宣告 `attachments`**（約定 §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
 | `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
-| `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（local-cache-db.md §7.2、§7.6，維護者 2026-09-14） |
+| `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（edits-and-redactions.md §2、§6，維護者 2026-09-14） |
 | `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
-| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（local-cache-db.md §7.5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
+| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（edits-and-redactions.md §5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
 | `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>` |
 | `System` | `m.room.member`、`m.room.name`、`m.room.topic`、`m.room.power_levels`、`m.room.encryption`、`m.room.pinned_events`… |
 | `Unsupported` | 其他所有 type。**不丟**，這是 fail-safe：至少讓人看到「這裡有東西」 |
@@ -256,7 +256,7 @@ pub enum Update {
 
 現在的實作：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。
 ⚠️ 第 3 步實作的變體是 `NewEvents { conversation, events: Vec<IncomingEvent> }`（上游給的**原樣**，關係事件也在），🚫 不是 `NewMessage`：
-快取要存原樣（local-cache-db.md §7），通知由 core 用 `event_json::messages_from_incoming` 折好再發。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（CLI 規格 §3.4.2）。
+快取要存原樣（edits-and-redactions.md），通知由 core 用 `event_json::messages_from_incoming` 折好再發。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（CLI 規格 §3.4.2）。
 之後換自己的協定：server 推 pack，adapter 翻成同一個 `Update`，CLI／UI 不動。
 
 ### 4.3 順序：為什麼不能用時間戳排序
@@ -319,7 +319,7 @@ pub enum Update {
 > - **`RoomCrypto` trait 這一版沒有**：加密完全在 matrix-sdk 的 `Room::send`／`TimelineEvent` 裡，我們沒碰 `OlmMachine`，沒東西可包；
 >   接管送訊息（附件宣告需要）那一版才會出現。空的 trait 是儀式，不先立。
 > - **附件宣告（約定 §5.2）帶不出去**：matrix-sdk 的 `Room::send` 不能加 header、server 的 `Event/Send` 還是提案；CLI 送檔案時印警告。
->   要帶就得自己 Megolm 加密再走 `Event/Send`，走的是 `OlmMachine::encrypt_room_event_raw`（那是 `pub`）。⚠️ `Room` 上沒有 `encrypt`，所以這裡不是「fork vs OlmMachine」的二選一——只差一行 `pub(crate) fn base_client()` → `pub` 就拿得到 `OlmMachine`（維護者 2026-09-10 建了 fork，architecture-v2 §8.3）。等 server 的 `Event/Send` 定案再做。
+>   要帶就得自己 Megolm 加密再走 `Event/Send`，走的是 `OlmMachine::encrypt_room_event_raw`（那是 `pub`）。⚠️ `Room` 上沒有 `encrypt`，所以這裡不是「fork vs OlmMachine」的二選一——只差一行 `pub(crate) fn base_client()` → `pub` 就拿得到 `OlmMachine`（維護者 2026-09-10 建了 fork，architecture-v2 §7.3）。等 server 的 `Event/Send` 定案再做。
 > - 聚合（edit／reaction／redaction 折進目標）只在同一頁內；目標不在頁裡的關係事件照原樣留著。
 
 1. `Backend` trait 與 `matrix_sdk` adapter；`conversations`、`conversation`、`history`、`send_text`、`send_file`、`watch`。

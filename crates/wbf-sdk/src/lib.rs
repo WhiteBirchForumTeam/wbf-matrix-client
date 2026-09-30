@@ -25,11 +25,11 @@
 //! - `client` + `upload` + `download`：`WbfClient`，一條通道上的命令。
 //! - `login`：純 HTTP 拿 token。
 //! - `manifest`：CLI 印的 manifest 與上傳狀態檔。
-//! - `media_pool`：媒體儲存池（local-cache-db.md §8），整檔明文的加密池；`media`（feature `cache`）把下載管線、池與 `cache.db` 接起來。
-//! - `cache`（feature `cache`）：`cache.db`，SQLCipher 的本地快取（local-cache-db.md §6）；金鑰從 `vault` 來。
-//! - `vault`：本地金鑰庫（`local.key`、子金鑰、`session.sealed`），local-cache-db.md §4。
+//! - `media_pool`：媒體儲存池（media-pool.md），整檔明文的加密池；`media`（feature `cache`）把下載管線、池與 `cache.db` 接起來。
+//! - `cache`（feature `cache`）：`cache.db`，SQLCipher 的本地快取（local-cache-db.md §5）；金鑰從 `vault` 來。
+//! - `vault`：本地金鑰庫（`local.key`、子金鑰、`session.sealed`），vault-and-keys.md §1。
 //!
-//! - `incoming`：上游給的事件原樣（`IncomingEvent`）、一頁的游標、事件分類與 edit 的有效性規則（local-cache-db.md §7）。
+//! - `incoming`：上游給的事件原樣（`IncomingEvent`）、一頁的游標、事件分類與 edit 的有效性規則（edits-and-redactions.md）。
 //! - `event_json`：原始 Matrix 事件 JSON → `Message`，matrix backend 與 `recent` 共用。
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，唯一 `use matrix_sdk` 的地方。
 //! - `device_version`：裝置版本號與房間版本號（server 的 `wbf-room-device-version.md`）：成員清單怎麼讀、1506 之後跟誰重查、雜湊怎麼自己重算。

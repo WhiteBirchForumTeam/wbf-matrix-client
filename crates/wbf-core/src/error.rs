@@ -48,7 +48,7 @@ pub enum CoreErrorKind {
     ServerPendingRemoval,
     /// 這台機器沒保管這個帳號的 recovery key（`key-backup restore` 要它）。
     NoRecoveryKeyHere,
-    /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（local-cache-db.md §10.7）。
+    /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（room-key-backup.md §7）。
     ///
     /// ⚠️ core 的訊息只說**條件**，🚫 不提命令名字——前端看到這個 kind 再補上自己那句
     /// （rpc-cli 說 `wbf-cli key-backup recovery`，Desktop 可能是一個按鈕）。

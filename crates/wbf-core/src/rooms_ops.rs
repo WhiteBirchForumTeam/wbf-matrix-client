@@ -321,7 +321,7 @@ impl Core {
             let messages = wbf_sdk::event_json::messages_from_incoming(room, &page.events);
             return Ok((messages, page.next));
         }
-        // `Both`：**原樣**寫進去等它落地（local-cache-db.md §7），再用這一頁的 event_id 讀回。
+        // `Both`：**原樣**寫進去等它落地（edits-and-redactions.md），再用這一頁的 event_id 讀回。
         // ⭐ 上游決定**哪幾則、什麼順序**，本地決定**每一則長什麼樣**（已解密的明文不會被密文蓋掉、
         // 別頁的 edit／redact／reaction 已經套上、`hidden` 的不出來）。
         // 🚫 不從本地「照 r_seq 重讀一頁」：非 fork server 的事件沒有 r_seq。

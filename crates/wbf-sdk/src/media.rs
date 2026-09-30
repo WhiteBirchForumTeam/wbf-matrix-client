@@ -1,4 +1,4 @@
-//! 媒體快取的接法（local-cache-db.md §8.3、§8.5、§8.7）：下載管線、儲存池（`media_pool`）與 `cache.db`（`cache`）三者怎麼一起動。
+//! 媒體快取的接法（media-pool.md §3、§5、§7）：下載管線、儲存池（`media_pool`）與 `cache.db`（`cache`）三者怎麼一起動。
 //!
 //! - `fetch`：快取有完整檔就從池開；沒有就邊下邊 append 進池，進度在記憶體、每 `PROGRESS_FLUSH` 快照一次到 DB，
 //!   中斷從上次快照的塊數續（檔截到那裡，之後的不信）。完成算 hash → adopt 進池（同 hash 去重）→ DB 寫齊。

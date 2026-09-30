@@ -3,7 +3,7 @@
 //! ⚠️ 這整個模組是 **`pub(crate)`**，而且要一直是。`Session`（裡面有 `access_token`）、
 //! `MatrixBackend`、`Cache`、`MediaPool` 全是程序內的 handle：序列化不了、跨不了 FFI，
 //! 而 `Session` 還帶著秘密——**它一個欄位都不該離開這個 crate**
-//!（architecture-v2 §7；PR #24 審查 cirno🔴）。
+//!（architecture-v2 §6；PR #24 審查 cirno🔴）。
 //!
 //! 外面看得到的是 `Core` 上那些回**可序列化 DTO** 的方法；handle 活在這裡，被它們用。
 
@@ -82,7 +82,7 @@ impl Core {
         Ok(self.session_of(account)?.backend == Some(SessionBackend::WbfSdk))
     }
 
-    /// 這個帳號所屬 server 的 `cache.db`（local-cache-db.md §6，同 server 的帳號共用）。
+    /// 這個帳號所屬 server 的 `cache.db`（local-cache-db.md §5，同 server 的帳號共用）。
     ///
     /// server 不符、解不開就重建（§1），重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
@@ -250,7 +250,7 @@ impl Core {
         }
     }
 
-    /// 這個帳號所屬 server 的媒體儲存池（local-cache-db.md §8），跟 `cache.db` 同層。
+    /// 這個帳號所屬 server 的媒體儲存池（media-pool.md），跟 `cache.db` 同層。
     pub(crate) fn pool_of(&self, account: &AccountDir) -> Result<MediaPool, CoreError> {
         Ok(MediaPool::open(
             &account.server_dir(),

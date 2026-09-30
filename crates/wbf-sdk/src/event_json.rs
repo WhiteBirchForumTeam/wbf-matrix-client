@@ -69,7 +69,7 @@ pub fn messages_from_json(conversation: &str, raws: &[serde_json::Value]) -> Vec
 }
 
 /// 上游一頁（`IncomingEvent`，照上游順序）→ 顯示用的 `Message`，關係事件折進**同一頁**的目標（`aggregate`）。
-/// 給不寫庫的路（`sync=server`、watch 的通知）；寫庫的路讀回本地處理過的樣子（local-cache-db.md §7）。
+/// 給不寫庫的路（`sync=server`、watch 的通知）；寫庫的路讀回本地處理過的樣子（edits-and-redactions.md）。
 ///
 /// Args:
 ///     conversation: room_id，sync 的事件沒帶時補上

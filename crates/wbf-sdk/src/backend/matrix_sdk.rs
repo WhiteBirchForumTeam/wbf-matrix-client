@@ -47,7 +47,7 @@ pub struct MatrixBackend {
 
 impl MatrixBackend {
     /// 登入：拿到裝置與 token，store 落在 `store_dir`（crypto 與 state 兩個 sqlite，plan-v1 §7.1 說的「非存不可」）。
-    /// store 用 `store_key` 包住它自己的 `StoreCipher`（local-cache-db.md §5.3）：這把是 `Vault::matrix_store_key()`。
+    /// store 用 `store_key` 包住它自己的 `StoreCipher`（local-cache-db.md §4.3）：這把是 `Vault::matrix_store_key()`。
     ///
     /// Args:
     ///     server: example: "http://localhost:6167"
@@ -351,7 +351,7 @@ impl ChatBackend for MatrixBackend {
     }
 }
 
-/// server 端房間金鑰備份的設定（local-cache-db.md §10.3）。
+/// server 端房間金鑰備份的設定（room-key-backup.md §3）。
 ///
 /// `auto_enable_backups`：`login` 之後 server 上沒有 backup version 就建一個，並開始上傳。
 /// ⚠️ 建 version 時 **backup 的私鑰只存在本機 crypto store**，沒進 SSSS —— 所以在使用者跑
@@ -414,7 +414,7 @@ impl MatrixBackend {
         Ok(BackupStatus {
             exists_on_server,
             enabled_locally: backups.are_enabled().await,
-            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（local-cache-db.md §10.7）。
+            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（room-key-backup.md §7）。
             recovery_enabled: matches!(recovery_state, RecoveryState::Enabled),
             recovery_state: format!("{recovery_state:?}"),
         })
@@ -423,7 +423,7 @@ impl MatrixBackend {
     /// 把 crypto store 裡的房間金鑰推上 server，**傳完才回來**（`key-backup upload`）。
     ///
     /// 為什麼要有這個命令：上游的上傳是背景 task，而 `BackupUploadingTask` 的 `Drop` 直接
-    /// `abort()`——CLI 一個命令跑完就 exit，那個 task 可能一筆都還沒送出去（local-cache-db.md §10.6）。
+    /// `abort()`——CLI 一個命令跑完就 exit，那個 task 可能一筆都還沒送出去（room-key-backup.md §6）。
     ///
     /// Return:
     ///     Ok(())        追平了
@@ -437,7 +437,7 @@ impl MatrixBackend {
             .map_err(|error| SdkError::Network(format!("key backup upload: {error}")))
     }
 
-    /// 把 crypto store 裡的**全部**房間金鑰倒進本地快照（`key-backup save`；local-cache-db.md §10.4）。
+    /// 把 crypto store 裡的**全部**房間金鑰倒進本地快照（`key-backup save`；room-key-backup.md §4）。
     ///
     /// 上游直接寫檔，金鑰不經過我們的記憶體。先寫 `temp_path` 再 rename 到 `path`：
     /// 寫到一半斷電不會把上一份好的蓋成半個檔。
@@ -545,7 +545,7 @@ async fn build_client(
 ) -> Result<Client, SdkError> {
     std::fs::create_dir_all(store_dir)?;
     // 與 channel::REQUEST_TIMEOUT 同一個數：server 黑洞了就回錯，不讓 CLI 掛死（PR #9 審查 rumia 🟢3）。
-    // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（local-cache-db.md §5.3）。
+    // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（local-cache-db.md §4.3）。
     let store_config = SqliteStoreConfig::new(store_dir).key(Some(store_key.as_bytes()));
     Client::builder()
         .homeserver_url(server)
@@ -686,7 +686,7 @@ mod context_plan_tests {
     }
 
     /// 🚨 **`next` 從原始順序取**（PR #36 審查 rumia🔴）。這一頁新到舊是 `[$t, $r]`，最舊的 `$r` 是**對 `$t` 的 reaction**：
-    /// 顯示時會折進 `$t`，但下一頁要從 `$r` 之前問 —— 而且 `$r` 本身要原樣留著給快取存（local-cache-db.md §7）。
+    /// 顯示時會折進 `$t`，但下一頁要從 `$r` 之前問 —— 而且 `$r` 本身要原樣留著給快取存（edits-and-redactions.md）。
     #[test]
     fn a_timeline_page_keeps_every_raw_event_and_its_next_is_the_oldest() {
         let target = plaintext(serde_json::json!({

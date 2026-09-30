@@ -141,7 +141,7 @@ pub struct RecentSync {
     pub events: u64,
     pub last_ls: Option<i64>,
     /// true = 一窗回來說 `more: false`（回到了 `cg_seq`）；false = 被 `max_events` 停下，`last_ls` 以下到舊水位之間還沒拿
-    /// （那段之後靠逐房翻頁補，local-cache-db §6 的「洞」）。
+    /// （那段之後靠逐房翻頁補，local-cache-db §5 的「洞」）。
     pub caught_up: bool,
 }
 

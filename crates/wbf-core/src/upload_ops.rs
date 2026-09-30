@@ -3,7 +3,7 @@
 //! ⚠️ **續傳狀態檔寫在使用者那個檔案旁邊**（`<file>.wbf-upload.json`）。那個位置是
 //! rpc-cli 時代定的（CLI 規格 §3.3），在 daemon 模型下**不一定對**——daemon 可能根本
 //! 沒有那個目錄的寫入權（Android 的 SAF 給的是 `content://`，連路徑都沒有）。
-//! 🚫 這一輪**照原樣搬，不在這裡發明新答案**；記成 architecture-v2 §8 的一條開著的項目。
+//! 🚫 這一輪**照原樣搬，不在這裡發明新答案**；記成 architecture-v2 §7 的一條開著的項目。
 
 use std::path::{Path, PathBuf};
 

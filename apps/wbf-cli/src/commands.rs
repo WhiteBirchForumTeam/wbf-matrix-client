@@ -211,7 +211,7 @@ fn on_off(value: bool) -> String {
 /// 全域參數解析完的樣子：server 與 token 從哪來，只在這裡決定一次。
 pub struct Context {
     pub unlock: UnlockOptions,
-    /// 常駐狀態（architecture-v2 §7）。⚠️ 現在一個命令建一個、命令結束就丟；
+    /// 常駐狀態（architecture-v2 §6）。⚠️ 現在一個命令建一個、命令結束就丟；
     /// daemon 接手之後它會活過整個程序，而這裡的程式碼不必改——這正是先做 `wbf-core` 的理由。
     ///
     /// 一個命令只解鎖一次：`session()` 與房間命令的 store 都從它拿，不然 Argon2 跑兩次。
@@ -223,7 +223,7 @@ pub struct Context {
     pub transport: Transport,
     /// 這次讀到的 conf（CLI 規格 §10）。命令自己的旗標沒給時從這裡拿預設。
     pub conf: Conf,
-    /// `SERVER_BACKUP`：標準 Matrix key backup 開著嗎（local-cache-db §10.3）。
+    /// `SERVER_BACKUP`：標準 Matrix key backup 開著嗎（room-key-backup §3）。
     /// ⚠️ 認不得的值落到 `true`——壞掉要壞在「備份還開著」那一邊。
     pub server_backup: bool,
     /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 §10.4）。同樣落到 `true`。
@@ -357,7 +357,7 @@ impl Context {
     ///
     /// ⚠️ 這條路徑刻意**不經過 `Core`**：core 的世界是「一個有 vault 的資料目錄」，
     /// 而 `--token` 正是要繞過那整件事（除錯與腳本用，CLI 規格 §2）。
-    /// 📎 它在 daemon 模型下是什麼意思還沒定（architecture-v2 §7.1 的開放項）。
+    /// 📎 它在 daemon 模型下是什麼意思還沒定（architecture-v2 §6.1 的開放項）。
     ///
     /// ⚠️ 打一次 `whoami` 填真的 `user_id`：續傳狀態檔的 `is_for` 要靠它分辨「不是你的
     /// 上傳」，填佔位值會讓兩把不同的 token 比成相等（PR #6 審查 rumia🟡2）。
@@ -545,7 +545,7 @@ async fn account_command(context: &Context, action: AccountAction) -> Result<(),
     match action {
         AccountAction::Add(args) => login_command(context, &args).await,
         AccountAction::Status => {
-            // 目錄名是加密的（local-cache-db.md §11），所以列帳號要先解鎖。
+            // 目錄名是加密的（vault-and-keys.md §2），所以列帳號要先解鎖。
             let status = context.core()?.account_status()?;
             // ⚠️ 「一個都解不開」的提示是 core 給的**資料**；要不要印是前端的決定。
             if let Some(hint) = &status.undecryptable_hint {
@@ -618,7 +618,7 @@ fn with_recovery_hint(error: CoreError) -> CoreError {
     ))
 }
 
-/// `recovery <action>`：這台機器保管著誰的 recovery key（local-cache-db.md §10.8）。
+/// `recovery <action>`：這台機器保管著誰的 recovery key（room-key-backup.md §8）。
 ///
 /// 🚫 不連 server：這些檔案是本機的東西，`list` 連內容都不解（只解檔名）。
 fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), CoreError> {
@@ -639,7 +639,7 @@ fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), Cor
     }
 }
 
-/// `key-backup <action>`（CLI 規格 §3.6；local-cache-db.md §10）。
+/// `key-backup <action>`（CLI 規格 §3.6；room-key-backup.md）。
 ///
 /// ⚠️ conf 的兩個開關在**這一層**判斷：core 被叫到就做，「要不要叫它」是前端的決定（§3）。
 async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Result<(), CoreError> {
@@ -770,7 +770,7 @@ async fn destroy_account_command(
 // | 登入中 | `Core` | 有 vault、有帳號目錄、有快取與媒體池 |
 // | `--token` | 直接開通道 | 那個模式的定義就是「不碰 vault、不碰帳號目錄」（CLI 規格 §2） |
 //
-// 📎 `--token` 在 daemon 模型下是什麼意思還沒定（architecture-v2 §7.1 的開放項）。
+// 📎 `--token` 在 daemon 模型下是什麼意思還沒定（architecture-v2 §6.1 的開放項）。
 
 /// `--token` 模式的通道：不碰 vault，直接拿那串 token 講話。
 ///
@@ -905,7 +905,7 @@ async fn download_command(
     };
     let target = context.target();
     // 登入中且沒說 `--no-cache`：走媒體快取（池裡有就不連 server；沒有就邊下邊進池、
-    // 可續傳），再從池複製到 `--out`（local-cache-db.md §8.7）。
+    // 可續傳），再從池複製到 `--out`（media-pool.md §7）。
     if !no_cache && context.token_override.is_none() {
         let result = context
             .core()?

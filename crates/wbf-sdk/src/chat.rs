@@ -122,7 +122,7 @@ pub struct Message {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "update", rename_all = "snake_case")]
 pub enum Update {
-    /// 一個房間新到的事件，**原樣、照上游順序**（關係事件也在裡面）：寫庫的人要原樣（local-cache-db.md §7），
+    /// 一個房間新到的事件，**原樣、照上游順序**（關係事件也在裡面）：寫庫的人要原樣（edits-and-redactions.md），
     /// 要顯示的人自己折（`event_json::messages_from_incoming`）。
     NewEvents {
         conversation: String,
@@ -158,7 +158,7 @@ pub trait ChatBackend {
     ///
     /// 🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token ——
     /// UI 不分 server 是誰，一律拿手上最舊那則往回問（chat-model §4.3、rpc-spec §3.3）。
-    /// 回的是**原樣**的事件（local-cache-db.md §7：原始事件存庫、顯示另外折）。
+    /// 回的是**原樣**的事件（edits-and-redactions.md：原始事件存庫、顯示另外折）。
     async fn history(
         &self,
         id: &str,

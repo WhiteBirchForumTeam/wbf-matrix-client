@@ -14,7 +14,7 @@
 )]
 //! wbf-cli：介面照 `docs/design/rpc-specs/wbf-cli-spec.md`。這個檔只有參數定義、分派、exit code；
 //! 每個命令在 `commands.rs`（第 2 步）、`rooms.rs`（第 3 步）、`recent.rs`（快取進料）；vault 怎麼解鎖在 `unlock.rs`，
-//! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §7）。
+//! 每個帳號的資料放哪、vault 解鎖一次，在 `wbf-core`（architecture-v2 §6）。
 
 mod commands;
 mod recent;
@@ -81,7 +81,7 @@ pub struct LoginArgs {
 pub enum AccountAction {
     /// 登入一個帳號並切成 current（等同 login）
     Add(LoginArgs),
-    /// 列出本機所有帳號。⚠️ 要解鎖：目錄名是加密的（local-cache-db.md §11）
+    /// 列出本機所有帳號。⚠️ 要解鎖：目錄名是加密的（vault-and-keys.md §2）
     Status,
     /// 換預設帳號（只改 current，不連 server）
     Switch {
@@ -92,7 +92,7 @@ pub enum AccountAction {
     Del {
         /// 完整 mxid，example: @bob:matrix.org
         user: String,
-        /// 明知 server 上的備份還解不開，照樣登出（local-cache-db.md §10.7）
+        /// 明知 server 上的備份還解不開，照樣登出（room-key-backup.md §7）
         #[arg(long)]
         accept_history_loss: bool,
     },
@@ -103,13 +103,13 @@ pub enum AccountAction {
         /// 不問確認（腳本用）
         #[arg(long)]
         yes: bool,
-        /// 明知 server 上的備份還解不開，照樣登出（local-cache-db.md §10.7）
+        /// 明知 server 上的備份還解不開，照樣登出（room-key-backup.md §7）
         #[arg(long)]
         accept_history_loss: bool,
     },
 }
 
-/// recovery key 的本機保管（local-cache-db.md §10.8）。
+/// recovery key 的本機保管（room-key-backup.md §8）。
 /// 它跟帳號目錄分開放，所以 `logout` 不會刪掉——那正是它存在的意義。
 #[derive(Subcommand)]
 pub enum RecoveryAction {
@@ -122,7 +122,7 @@ pub enum RecoveryAction {
     },
 }
 
-/// 房間金鑰備份（local-cache-db.md §10）。
+/// 房間金鑰備份（room-key-backup.md）。
 #[derive(Subcommand)]
 pub enum KeyBackupAction {
     /// server 上的 backup、secret storage 設好了沒、本地快照存在嗎／多大／什麼時候存的
@@ -145,7 +145,7 @@ pub enum Command {
     Login(LoginArgs),
     /// 讓 current 帳號的 token 失效；刪它的 session.sealed 與 m/（等同 `account del <current>`）
     Logout {
-        /// 明知 server 上的備份還解不開，照樣登出（會失去這個帳號的歷史，local-cache-db.md §10.7）
+        /// 明知 server 上的備份還解不開，照樣登出（會失去這個帳號的歷史，room-key-backup.md §7）
         #[arg(long)]
         accept_history_loss: bool,
     },
@@ -159,7 +159,7 @@ pub enum Command {
         #[command(subcommand)]
         action: KeyBackupAction,
     },
-    /// 這台機器保管著誰的 recovery key（local-cache-db §10.8）
+    /// 這台機器保管著誰的 recovery key（room-key-backup §8）
     Recovery {
         #[command(subcommand)]
         action: RecoveryAction,
@@ -192,7 +192,7 @@ pub enum Command {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// 整檔下載，全部檢查照約定 §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（local-cache-db §8）
+    /// 整檔下載，全部檢查照約定 §3.1。登入中就走媒體快取：池裡有就不連 server，沒有就邊下邊進池（media-pool）
     Download {
         #[arg(long)]
         manifest: PathBuf,
@@ -204,7 +204,7 @@ pub enum Command {
     },
     /// 媒體快取的狀態：池的大小、幾個檔、半成品（CLI 規格 §3.5）
     MediaStats,
-    /// 媒體快取清理：超過配額就從最久沒用的刪，保護期內不刪（local-cache-db §8.5）；順便掃孤兒
+    /// 媒體快取清理：超過配額就從最久沒用的刪，保護期內不刪（media-pool §5）；順便掃孤兒
     MediaGc {
         /// 配額，MiB；預設 2048，可用 conf 的 QUOTA_MIB 改
         #[arg(long)]

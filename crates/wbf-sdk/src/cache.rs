@@ -1,4 +1,4 @@
-//! `cache.db`：本地快取（local-cache-db.md §1、§3、§6）。SQLCipher 整檔加密，raw key 是 `Vault::cache_key()`。
+//! `cache.db`：本地快取（local-cache-db.md §1、§3、§5）。SQLCipher 整檔加密，raw key 是 `Vault::cache_key()`。
 //!
 //! **一個 server 一個檔、多帳號混存**（維護者 2026-09-07 定）：事件只存一份；誰看得到哪一則由 `events_synced_log` 逐則記
 //! （server 經任一條路給過這個 user 的才算），沒有列就看不到——fail closed，不用 r_seq 下界去猜可見性。

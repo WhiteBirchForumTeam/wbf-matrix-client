@@ -1,4 +1,4 @@
-//! recovery key 的本機保管（local-cache-db.md §10.8；維護者 2026-09-09 定）：
+//! recovery key 的本機保管（room-key-backup.md §8；維護者 2026-09-09 定）：
 //!
 //! ```text
 //! <data dir>/r/<b58>_<b58>             檔名是 `recovery-key@bob:matrix.org` 加密後的樣子

@@ -1,6 +1,6 @@
 //! 帳號家族的操作：列出、切換、找出「使用者打的那串是誰」，以及 recovery key 的查詢。
 //!
-//! ⚠️ 這裡的每個公開方法都**收字串、回可序列化的 DTO**（architecture-v2 §7）。
+//! ⚠️ 這裡的每個公開方法都**收字串、回可序列化的 DTO**（architecture-v2 §6）。
 //! `AccountDir`、`DataDirMap`、`Session`、`Vault` 一個都不過邊界——帳號的身分在邊界上
 //! 就是一串 **mxid**（PR #24 審查 cirno🔴）。
 

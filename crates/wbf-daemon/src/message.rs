@@ -1,4 +1,4 @@
-//! 加密之前的訊息形狀（architecture-v2 §4.6）與 code 表（rpc-spec §5、§1.4）。
+//! 加密之前的訊息形狀（local-interface §6）與 code 表（rpc-spec §5、§1.4）。
 //!
 //! 只有兩種形狀：`Request`（有 `id` 要回、沒 `id` 是推播）與 `Response`（`code`／`msg`／`result`／`id`
 //! 平鋪，🚫 不是 JSON-RPC 的 `result`／`error` 二選一）。協議層的 close 通知**也是 `Response`**

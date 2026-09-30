@@ -1,4 +1,4 @@
-//! `backup.*`（rpc-spec §3.7；local-cache-db §10）。
+//! `backup.*`（rpc-spec §3.7；room-key-backup）。
 //!
 //! conf 的兩個開關在這裡生效（CLI 規格 §3.6 同一套規則）：
 //! `SERVER_BACKUP=off` → `backup.upload` 整個拒絕；`LOCAL_ROOM_KEYS=off` → `backup.save` 拒絕、

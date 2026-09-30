@@ -25,7 +25,7 @@ use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
 
 const TOKEN: [u8; 256] = [7u8; 256];
-/// base64("hunter2")。passphrase 是任意 bytes（local-cache-db §12），RPC 上一律 base64。
+/// base64("hunter2")。passphrase 是任意 bytes（vault-and-keys §3），RPC 上一律 base64。
 const PASSPHRASE_BASE64: &str = "aHVudGVyMg==";
 
 /// 一個跑著的 daemon。⚠️ 拿著 `task` 才停得掉它 —— 「重開」必須是**真的停掉再起**，

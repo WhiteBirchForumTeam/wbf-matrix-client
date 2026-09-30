@@ -134,7 +134,7 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
     )
 }
 
-/// 明文落地是**使用者要的**（architecture-v2 §4.8）。`no_cache` 不進池直接寫。
+/// 明文落地是**使用者要的**（local-interface §8）。`no_cache` 不進池直接寫。
 pub(super) async fn media_save_to(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {

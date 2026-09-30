@@ -1,4 +1,4 @@
-//! 上游給的事件原樣（`IncomingEvent`）、一頁的游標（`EventPage`），與事件的分類規則（local-cache-db.md §7）。
+//! 上游給的事件原樣（`IncomingEvent`）、一頁的游標（`EventPage`），與事件的分類規則（edits-and-redactions.md）。
 //!
 //! ⭐ 「收到了什麼」與「最後該顯示什麼」是兩件事：這裡只回答前者與「它屬於哪一類、參照誰」；
 //! 顯示用的 `Message` 在 `event_json`，存法在 `cache`。這裡只有 serde_json，沒有 matrix-sdk、沒有 SQL。
@@ -169,7 +169,7 @@ impl EventPage {
     }
 }
 
-/// 事件的類別（`events.class`，local-cache-db.md §7.3）。字串是格式的一部分。
+/// 事件的類別（`events.class`，edits-and-redactions.md §3）。字串是格式的一部分。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventClass {
     /// 還看不懂的（沒解開的密文）。
@@ -220,7 +220,7 @@ pub struct Classified {
     pub ref_event_id: Option<String>,
 }
 
-/// 照明文分類（local-cache-db.md §7.4）。
+/// 照明文分類（edits-and-redactions.md §4）。
 ///
 /// ⚠️ 狀態事件（有 `state_key`）一律是 msg，🚫 不會被當成 edit —— spec 規定 edit 不能是狀態事件。
 /// ⚠️ 缺 `m.new_content` 的 `m.replace` 不是有效的 edit（spec），當 msg 顯示它自己的 `body`（fallback）。
@@ -309,7 +309,7 @@ pub struct ReplacementSide<'a> {
     pub was_encrypted: bool,
 }
 
-/// spec「validity of replacement events」（local-cache-db.md §7.5 的表）。
+/// spec「validity of replacement events」（edits-and-redactions.md §5 的表）。
 ///
 /// 🚨 **不是正面認得有效，就是無效**：任何一條說不出來（例如 type 缺）都拒絕。兩條是資安相關：
 /// sender 不同（別人改你的訊息）、加密的目標配明文的 edit（用明文蓋掉加密訊息）。

@@ -1,6 +1,6 @@
 //! RPC 的 handle：一個 `Request` 進、一個 `Response` 出（rpc-spec §3）。
 //!
-//! 它是 architecture-v2 §4.9 閘門鏈裡「RPC 轉換 ⇔ daemon handle」那一格：把 JSON 的 `params`
+//! 它是 local-interface §9 閘門鏈裡「RPC 轉換 ⇔ daemon handle」那一格：把 JSON 的 `params`
 //! 反序列化成 core 的型別、叫一個 core 方法、把回傳序列化回去。**命令列的 arg 之後也走這裡**
 //! （§0.2：arg → RPC 訊息 → 同一個 `call`），🚫 不留第二套分派。
 //!
@@ -47,7 +47,7 @@ pub const KEEP_LINKS_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// 一直開不起來時，間隔最長拉到多久。
 pub const KEEP_LINKS_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// 未解鎖時也接受的 method（architecture-v2 §4.5）。其他一律 `1001`。
+/// 未解鎖時也接受的 method（local-interface §5）。其他一律 `1001`。
 /// 這個 method **保證不碰資料目錄**嗎？
 ///
 /// Args:
@@ -393,7 +393,7 @@ impl Handle {
 
     /// 「該開的線都開著嗎」的鉤子（`Core::ensure_links`，link-pool.md §3.1，維護者 2026-09-29）：`vault.unlock`、`account.add` 成功之後叫。
     /// 背景跑，🚫 不擋那個 RPC 的回應（五條線×每個帳號、金鑰還要追平）；開關各自發 `link.state`，開不起來的發 `Note`。
-    /// conf 的 `TRANSPORT = http` 是上限（architecture-v2 §6.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
+    /// conf 的 `TRANSPORT = http` 是上限（architecture-v2 §5.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
     /// 已經有一輪在跑時，core 那邊自己跳過（`ensuring_links` 旗），這裡不必再擋。
     async fn start_ensuring_links(&self) {
         if self.settings.transport == Transport::Http || self.is_shutting_down() {

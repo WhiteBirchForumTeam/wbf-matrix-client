@@ -123,7 +123,7 @@ pub fn get_backend_for(
 const PROBE_CLIENT_NAME: &str = "wbf-client probe";
 
 impl crate::Core {
-    /// 這台 homeserver 講不講 wbf 協議。**探測，🚫 不是設定**（architecture-v2 §6.1；account-session.md §1）。
+    /// 這台 homeserver 講不講 wbf 協議。**探測，🚫 不是設定**（architecture-v2 §5.1；account-session.md §1）。
     ///
     /// ⭐ **不確定一律回 [`BackendKind::MatrixSdk`]**：連不上、`Hello` 不回、回來的東西看不懂——
     /// 全部當成一般 homeserver。壞在「用了比較慢但一定能動的那條」，🚫 不壞在「以為對方懂我們的協議」。

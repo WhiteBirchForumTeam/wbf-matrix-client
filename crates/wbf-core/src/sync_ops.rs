@@ -109,7 +109,7 @@ impl Core {
             if conversation != room {
                 return WatchControl::Continue;
             }
-            // 通知給折好的訊息；庫裡存原樣（關係事件也存，local-cache-db.md §7）。
+            // 通知給折好的訊息；庫裡存原樣（關係事件也存，edits-and-redactions.md）。
             let messages = messages_from_incoming(&conversation, &events);
             // 自己送的也發出去（呼叫端自己濾），但 `once` 不把自己的算「第一則」。
             let any_from_others = messages.iter().any(|message| message.sender != me);

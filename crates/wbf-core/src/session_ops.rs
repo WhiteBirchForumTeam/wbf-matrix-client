@@ -1,7 +1,7 @@
 //! 登出與摧毀：裝置層（`session.sealed`、`m/`、`k/`）與資料層（`cache.db` 的忘掉鏈）。
 //!
 //! ⚠️ 這一家是**會刪檔**的，所以 fail closed 的規矩最多；每一條的理由都在
-//! local-cache-db.md §10.7 與 §6。
+//! room-key-backup.md §7 與 local-cache-db.md §5。
 //!
 //! 🚫 這裡的訊息**不提任何命令名字**（`wbf-cli key-backup recovery` 那種）：core 不知道
 //! 呼叫它的是 rpc-cli、Desktop 還是 Android（§3）。它只說**條件**，前端照
@@ -151,7 +151,7 @@ impl Core {
         })
     }
 
-    /// 忘掉鏈（local-cache-db.md §6），走這台 server 的**唯一寫入者**。
+    /// 忘掉鏈（local-cache-db.md §5），走這台 server 的**唯一寫入者**。
     ///
     /// 🚫 `cache.db` 不在就不開：開了等於為了「忘掉」建一個空的出來（#25 同一支的 bug）。
     /// 🚫 不拿使用者打的字串去查 `users` 列：那裡存的是權威 mxid，精確比對差一個大小寫
@@ -324,7 +324,7 @@ impl Core {
         Ok(described)
     }
 
-    /// `logout`／`account del`／`account destroy` 的閘門（local-cache-db.md §10.7）。
+    /// `logout`／`account del`／`account destroy` 的閘門（room-key-backup.md §7）。
     ///
     /// 這些命令會連 `m/`（crypto store）與 `k/`（本地快照）一起刪。在還沒有 recovery key 的
     /// 預設狀態下，**server 端備份的私鑰就在那個 store 裡**——照樣登出的話歷史就回不來了。
@@ -423,7 +423,7 @@ impl Core {
     }
 }
 
-/// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（local-cache-db.md §10.7）。
+/// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（room-key-backup.md §7）。
 ///
 /// 🚫 不寫成「沒有 recovery key 才擋」：上游哪天多一種 `RecoveryState`，那種寫法會默默放行。
 fn is_history_recoverable(status: Option<&BackupStatus>) -> bool {

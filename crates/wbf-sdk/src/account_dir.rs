@@ -1,4 +1,4 @@
-//! 資料目錄裡兩層目錄名的加密（local-cache-db.md §11）。
+//! 資料目錄裡兩層目錄名的加密（vault-and-keys.md §2）。
 //!
 //! ```text
 //! s/<b58 nonce>_<b58 密文>/            ← 正規化過的 server host
@@ -48,7 +48,7 @@ pub enum DirScope<'a> {
     Server,
     /// `s/<…>/a/<這一段>/`，明文是 localpart；綁住它上面那層的 host 明文。
     Account { server_host: &'a str },
-    /// `r/<這一段>`，明文是 `recovery-key@bob:matrix.org`（local-cache-db.md §10.8）。
+    /// `r/<這一段>`，明文是 `recovery-key@bob:matrix.org`（room-key-backup.md §8）。
     ///
     /// 它**不在帳號目錄底下**，因為 `logout` 要把帳號目錄整個清掉而 recovery key 要留著：
     /// 前者是“這台機器上的裝置狀態”，後者是“回到 server 備份的鑰匙”。

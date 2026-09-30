@@ -1,4 +1,4 @@
-//! 本地金鑰庫（local-cache-db.md §4、§5.3、§5.6）：一把 32 byte 主金鑰放 `local.key`，
+//! 本地金鑰庫（vault-and-keys.md §1、local-cache-db.md §4.3、§4.6）：一把 32 byte 主金鑰放 `local.key`，
 //! 明文（`Plain`）或被 passphrase 包住（`PassphraseWrapped`）；子金鑰用 BLAKE3 從主金鑰導出，不落地。
 //! `session.sealed` 用第三把子金鑰封住 session 與 token。
 //!
@@ -77,7 +77,7 @@ impl std::fmt::Debug for Key32 {
 pub enum Unlock {
     NoPassphrase,
     /// 🚫 不接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
-    /// ⚠️ **原始 bytes，不是字串**（local-cache-db.md §12）：passphrase 只餵給本機的
+    /// ⚠️ **原始 bytes，不是字串**（vault-and-keys.md §3）：passphrase 只餵給本機的
     /// Argon2id，永遠不出這台機器，所以它可以是 UTF-8 的中文、可以是一個 mp3。
     /// 🚫 不驗 UTF-8、🚫 不去尾換行——那是 `--password-file`（要送給 homeserver）的規則。
     Passphrase(Zeroizing<Vec<u8>>),
@@ -304,12 +304,12 @@ impl Vault {
         self.derive(MEDIA_STORE_KEY_CONTEXT)
     }
 
-    /// 本地的房間金鑰備份（`room_keys`；local-cache-db.md §10.4）：檔案內容的加密與檔名的 keyed hash 都用它。
+    /// 本地的房間金鑰備份（`room_keys`；room-key-backup.md §4）：檔案內容的加密與檔名的 keyed hash 都用它。
     pub fn room_key_backup_key(&self) -> Key32 {
         self.derive(ROOM_KEY_BACKUP_KEY_CONTEXT)
     }
 
-    /// 資料目錄裡兩層目錄名的加密（`account_dir`；local-cache-db.md §11.2）。
+    /// 資料目錄裡兩層目錄名的加密（`account_dir`；vault-and-keys.md §2.2）。
     /// `s/` 與 `a/` 共用這一把，靠 aad 分。
     pub fn account_dir_key(&self) -> Key32 {
         self.derive(ACCOUNT_DIR_KEY_CONTEXT)
@@ -360,7 +360,7 @@ impl Vault {
     ///
     /// ⚠️ 這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台機器上，
     /// 一起被拿走就一起沒了。閘門（CLI 的 `refuse_if_history_would_be_lost`）拿它當第 2 關，
-    /// 🚫 不問使用者（local-cache-db.md §10.8）。
+    /// 🚫 不問使用者（room-key-backup.md §8）。
     ///
     /// Args:
     ///     path: example: "<data dir>/r/<b58 nonce>_<b58 密文>"

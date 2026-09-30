@@ -1,4 +1,4 @@
-//! core 往外講話的唯一管道（architecture-v2 §7：**事件用 channel，不用回呼引用**）。
+//! core 往外講話的唯一管道（architecture-v2 §6：**事件用 channel，不用回呼引用**）。
 //!
 //! 為什麼不是回呼：回呼綁著呼叫端的生命週期，而 core 之後可能被 RPC 包住（呼叫端在
 //! 另一個程序）或被 uniffi 包住（呼叫端在 JVM 裡）。跨那兩條邊界都沒有「借一個 closure
@@ -41,15 +41,15 @@ pub enum CoreEvent {
         /// 給人看的一句話，例如 "chunk 3/10"。
         text: String,
     },
-    /// 收到一則訊息（`watch`、或 daemon 的上游會話，architecture-v2 §6.1）。
+    /// 收到一則訊息（`watch`、或 daemon 的上游會話，architecture-v2 §5.1）。
     /// 串流的東西走事件，🚫 不等收齊再一次回 ——`watch tail` 永遠不會「收齊」。
     Message {
-        /// **哪個帳號的**。⚠️ 事件是每個帳號一組的（architecture-v2 §6.1），
+        /// **哪個帳號的**。⚠️ 事件是每個帳號一組的（architecture-v2 §5.1），
         /// 所以每個帳號相關的事件都要說得出是誰的，🚫 不能讓前端猜。
         user: String,
         message: Box<wbf_sdk::chat::Message>,
     },
-    /// 這個帳號跟它的 homeserver 之間的狀態變了（architecture-v2 §6.1）。
+    /// 這個帳號跟它的 homeserver 之間的狀態變了（architecture-v2 §5.1）。
     SyncState {
         user: String,
         state: SyncState,

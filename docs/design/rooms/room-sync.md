@@ -80,7 +80,7 @@ UI
 - RPC（開／關訂閱線的命令）：🚫 不做（維護者 2026-09-29：訂閱線總是由 daemon 搞定）。原本給測試用的 `open_subscriptions`／`close_subscriptions` 拿掉了，開線走 `ensure_links`。
 - 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：做了，在 [key-sync.md](../keys/key-sync.md)（同一條線上另一個會話）。
 - 背景重開：做了，link-pool.md §3.1。task 內 panic 那條路也是（PR #58 審查 cirno #661 🟢）：panic 不走 `pool.close`，會留下「線活著、沒 task」而且沒有 `closed`——
-  文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime §11 第 8 階段）。
+  文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime §10 第 8 階段）。
 - ~~`DeviceChanged`~~：✅ 2026-09-29 原樣轉成 `CoreEvent::DeviceChanged`（RPC `devices.changed`）給 UI（e2ee-rpc.md §4）。
 - ~~密文解密~~：✅ 2026-09-29 推來的有金鑰就解，密文明文一起存；沒金鑰只存密文，金鑰到了由金鑰那半補解（e2ee-rpc.md §6）。
 

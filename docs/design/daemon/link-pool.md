@@ -1,6 +1,6 @@
 # 連線池：一個帳號五條線，各司其職；daemon 解鎖／登入後全開，背景看著、死了重開
 
-> 維護者 2026-09-21 定的形狀（architecture-v2 §6.1.1 四條線的落地版；daemon-runtime §11 第 4 階段 daemon 那半、第 7 階段的連線部分）。
+> 維護者 2026-09-21 定的形狀（architecture-v2 §5.1.1 四條線的落地版；daemon-runtime §10 第 4 階段 daemon 那半、第 7 階段的連線部分）。
 > 📌 2026-09-29 維護者改了兩件事（§1、§3.1）：房間與金鑰的訂閱**各自一條**（server #85 把每台裝置的 WS 上限放到 8）；
 > 訂閱**總是由 daemon 搞定**——解鎖、登入之後五條全開，常駐時有個背景迴圈看著，被關掉的重開。
 > 前提是 PR #52：`WsLink` 能收任何 pack、每個收到的 pack 過 `ReceivedHook`（`ws-receive-dispatch.md`）。這份文件講的是**誰擁有那些 link、什麼時候開關、命令怎麼挑線**。
@@ -20,7 +20,7 @@
 | `Upload` | `Upload/*` | 資料平面，長時間高頻寫，最會塞爆佇列——只能塞爆自己 |
 | `Download` | `Download/*`（`Read`、串流） | 同上；跟上傳分開，一邊塞爆不拖另一邊（維護者 2026-09-21：媒體開兩條） |
 | `Rooms` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件） | 推播線，不跟資料平面共享佇列；量大但可重拉 |
-| `Keys` | `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件），以及 `Device/Fetch`／`ItemsDestroy`（拉、銷毀：server 只讓持有裝置佇列的那條連線銷毀，維護者 2026-09-24 同意） | 🚨 **掉了就沒了**：它必須有一條安靜的線，不跟任何大流量共享佇列（architecture-v2 §6.1.1 原本的設計；2026-09-21 到 09-29 跟 `Rooms` 共用過一條，因為 server 那時每台裝置只給 4 條 WS） |
+| `Keys` | `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件），以及 `Device/Fetch`／`ItemsDestroy`（拉、銷毀：server 只讓持有裝置佇列的那條連線銷毀，維護者 2026-09-24 同意） | 🚨 **掉了就沒了**：它必須有一條安靜的線，不跟任何大流量共享佇列（architecture-v2 §5.1.1 原本的設計；2026-09-21 到 09-29 跟 `Rooms` 共用過一條，因為 server 那時每台裝置只給 4 條 WS） |
 
 - ⭐ 分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind：`Misc` 收各種 kind。例外是 `Device/Fetch`／`ItemsDestroy`：它們是拉窗、不是訂閱，
   但 server 只讓**持有這台裝置佇列的那條連線**銷毀（to-device-client §8 實跑補的），所以跟著金鑰的訂閱走：收金鑰的 task 用線時跟池 `reuse` 那一格（key-sync.md §1）。
@@ -109,7 +109,7 @@
 | `account.add` 成功 | 同上 |
 | 常駐期間 | `Handle::keep_links_open`：`RpcServer::run` 起的背景迴圈，每 15 秒一輪；那一輪有開不起來的就把間隔加倍（上限 5 分鐘），一輪全順就回到 15 秒。`daemon.shutdown` 一廣播就停（睡到一半也停），`run` 結束也 abort 它 |
 
-- conf 的 `TRANSPORT = http` 是上限（architecture-v2 §6.1）：一律 HTTP，🚫 不開 WS 線，觸發與迴圈都不跑。
+- conf 的 `TRANSPORT = http` 是上限（architecture-v2 §5.1）：一律 HTTP，🚫 不開 WS 線，觸發與迴圈都不跑。
 - 被 server 關掉的訂閱（`Rooms` 的訂閱會話結束、`Keys` 被接手的 1505）：task 關掉那格 → 下一輪（最多 15 秒）重開、重訂。
   ⚠️ 1505 是「同一台**裝置**後來的連線接手」，裝置 id 只有這個資料目錄的 session 有，而資料目錄同時只有一個 daemon 能寫（architecture-v2 §0.2 的寫入鎖）——
   所以不會跟別人互踢。要是真有兩個程式拿同一個 session（例如資料目錄被整份複製到另一台），兩邊會每一輪互相接手一次；那是複製資料目錄的錯，這裡🚫 不替它設計。
@@ -142,7 +142,7 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 
 - `subscribe { events: [...], user? }`／`unsubscribe { events }`：**每條 RPC 連線一份**訂閱集合，連線關了就沒了。`"*"` 全訂。
 - 每條 RPC 連線一個推播 task：`core.subscribe()` 拿 broadcast receiver → 每則 `CoreEvent` 對訂閱集合過濾（事件名 ＋ `user`）→ `seal_push`。
-  🚫 不預設推任何東西（architecture-v2 §4.7）；`progress` 例外：發長工作的那條連線自動收到自己請求的 `progress`（§4）。
+  🚫 不預設推任何東西（local-interface §7）；`progress` 例外：發長工作的那條連線自動收到自己請求的 `progress`（§4）。
 - 收到 `RecvError::Lagged(n)` → 送 `desync { missed: n }`（daemon-runtime §5.3）：🚫 不重播、🚫 不假裝沒事。
 - 維護者 2026-09-29：「`sync.open`、`sync.close` 應該是指是否要推到 RPC UI 端的一個 flag。訂閱連線這件事總是由 daemon 搞定。」
   那個 flag 就是這裡的 `subscribe`／`unsubscribe`（例如 `subscribe { events: ["room.message", "keys.state"] }`），所以🚫 沒有另外的 `sync.open`／`sync.close`：

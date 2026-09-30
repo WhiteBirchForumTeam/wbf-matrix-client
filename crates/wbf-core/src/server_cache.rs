@@ -2,7 +2,7 @@
 //!
 //! ## 為什麼要這一層
 //!
-//! `cache.db` 是**一個 server 一份、那台機器上這個 server 的所有帳號共用**（local-cache-db §6）。
+//! `cache.db` 是**一個 server 一份、那台機器上這個 server 的所有帳號共用**（local-cache-db §5）。
 //! daemon 常駐之後，兩個帳號的上游會話會**同時**往裡面寫，而 SQLite 的寫是排他的。
 //!
 //! ⚠️ **不是因為會馬上失敗**（2026-09-13 實測釘正）：`rusqlite` 開連線時就設了

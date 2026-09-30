@@ -1,4 +1,4 @@
-//! 每個帳號的資料放哪（CLI 規格 §7；local-cache-db.md §5.6、§11）：
+//! 每個帳號的資料放哪（CLI 規格 §7；local-cache-db.md §4.6、vault-and-keys.md §2）：
 //!
 //! ```text
 //! <data dir>/
@@ -185,7 +185,7 @@ struct ServerEntry {
     accounts: Vec<Mapping>,
 }
 
-/// 掃 `s/*/a/*` 兩層與 `r/`，解密每一段名字，做成 map（local-cache-db.md §11.5）。
+/// 掃 `s/*/a/*` 兩層與 `r/`，解密每一段名字，做成 map（vault-and-keys.md §2.5）。
 ///
 /// 解不開的一律跳過（fail closed）：可能是別把 `local.key` 建的，也可能是舊版留下的明文佈局。
 /// 🚫 不猜、🚫 不刪、🚫 不報錯——當它不存在。
@@ -209,7 +209,7 @@ pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap
                 continue;
             }
             let server_dir_name = server_entry.file_name().to_string_lossy().into_owned();
-            // destroy 改名後還沒刪完的舊目錄：垃圾，🚫 不當成 server（local-cache-db.md §6）。
+            // destroy 改名後還沒刪完的舊目錄：垃圾，🚫 不當成 server（local-cache-db.md §5）。
             if crate::account_lock::is_to_be_deleted_dir_name(&server_dir_name) {
                 continue;
             }
@@ -408,7 +408,7 @@ impl DataDirMap {
     }
 
     /// `s/` 底下有目錄，但一個都解不開 —— 多半是舊版（明文目錄名）留下的，或換過 `local.key`。
-    /// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（local-cache-db.md §11.7）。
+    /// 維護者 2026-09-09：不寫遷移，砍掉重來，所以這裡只回一句提示給呼叫者印（vault-and-keys.md §2.7）。
     ///
     /// Return:
     ///     Some(String)   該印的那一行

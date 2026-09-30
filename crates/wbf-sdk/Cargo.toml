@@ -18,7 +18,7 @@ wbf-wire = { path = "../wbf-wire" }
 sha2 = "0.10"
 hex = "0.4"
 blake3 = "1"
-# 目錄名的 Base58（local-cache-db.md §11.2）：字母表沒有 0OIl 也沒有底線，所以 `_` 能當分隔符。
+# 目錄名的 Base58（vault-and-keys.md §2.2）：字母表沒有 0OIl 也沒有底線，所以 `_` 能當分隔符。
 bs58 = "0.5"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
@@ -39,7 +39,7 @@ default = []
 # 第 3 步的房間 backend：唯一 use matrix_sdk 的地方是 src/backend/matrix_sdk.rs（plan-v1 §7.2）。
 # 預設關：wbf-sdk 本體不拖 matrix-sdk，apps/wbf-cli 才開。
 matrix = ["dep:matrix-sdk", "dep:matrix-sdk-crypto", "dep:futures-core"]
-# 本地快取 cache.db（local-cache-db.md §6）。與 matrix feature 的 store 共用同一份 libsqlite3-sys（feature 統一後是 SQLCipher 版）。
+# 本地快取 cache.db（local-cache-db.md §5）。與 matrix feature 的 store 共用同一份 libsqlite3-sys（feature 統一後是 SQLCipher 版）。
 cache = ["dep:rusqlite"]
 
 [dev-dependencies]
