@@ -51,8 +51,8 @@ pub struct SendFileResult {
     /// （2026-09-12 真 server 驗證抓到：重構時這一步掉了，而且是靜默的）。
     #[serde(skip)]
     pub manifest: Manifest,
-    /// ⚠️ 附件**有沒有向 server 宣告**（wbf-client-convention-for-chunk.md §5.2）。現在一律是 `false`：
-    /// matrix-sdk 的 `Room::send` 不能加 header、server 的 `Event/Send` 還是提案。
+    /// ⚠️ 附件**有沒有向 server 宣告**（wbf-client-convention-for-chunk.md §5.2）。wbf 帳號走 `Event/Send`，一律是 `true`；
+    /// 一般 Matrix 帳號走 matrix-sdk 的 `Room::send`，不能加 header，一律是 `false`。
     /// 🚫 沒宣告的上傳過了保護期會被掃掉——這個欄位就是讓前端講得出這件事。
     pub attachment_declared: bool,
 }

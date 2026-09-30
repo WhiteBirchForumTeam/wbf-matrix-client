@@ -1,10 +1,10 @@
 # 訂閱線的內容：訂閱房間事件、推播寫進快取；水位只由 UI 的 Recent 動
 
 > 維護者 2026-09-22／23 定，原話在 §0。實作：sdk `protocol.rs`／`client.rs` 的 `Event/Subscribe`／`Unsubscribe`／`Push` codec 與
-> `room_subscription`；core `room_sync.rs`（`init_connection`、收推播的 task）；`sync.recent` 多一個 `since`。
-> server 的語意在 wbfuwunel `wbf-event-push.md`（推送）與 `room-seq-and-recent.md`（`Recent`）。
+> `room_subscription`；core `room_sync.rs`（`init_connection`、收推播的 task）；`sync.recent` 的 `since`（daemon `handle/rooms.rs`、core `sync_ops.rs`）。
+> server 的語意在 wbfuwunel 的 wbf-event-push.md（推送）與 wbfuwunel 的 room-seq-and-recent.md（`Recent`）。
 > 🚫 這支**不接開／關訂閱線的 RPC**：daemon 的訂閱（rpc-spec.md §3.9，每條 RPC 連線想收什麼）與 daemon 跟上游是兩件事（中繼），先純一點。
-> 📌 2026-09-29 維護者定：訂閱線**總是由 daemon 搞定**——`vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（link-pool.md §3.1）；
+> 維護者 2026-09-29 定：訂閱線**總是由 daemon 搞定**——`vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（link-pool.md §3.1）；
 > 房間與金鑰各自一條線（`LinkRole::Rooms`／`Keys`）。UI 要不要收推播是 RPC 的 `subscribe`，🚫 沒有 `sync.open`／`sync.close`。
 
 ## 0. 規矩（維護者原話）
@@ -35,7 +35,7 @@
 UI
   起來時 sync.recent（全局、g_seq 游標）：帶 since（它自己記的起點：上次的 cg_seq_after、或手上最後一則 room.message 的 g_seq），
   沒帶就用 daemon 存的上一次 Recent 的水位；回應 caught_up 是 false 就再叫。補不補、補到哪，全是 UI 的事。
-  點進房間 room.history（單房）：本地翻頁用 r_seq；sync=both 打上游 Recent{rooms:[這房], before: 這房最舊那則的 g_seq}（PR #35–#39，這支沒動）。
+  點進房間 room.history（單房）：本地翻頁用 r_seq；sync=both 打上游 Recent{rooms:[這房], before: 這房最舊那則的 g_seq}（跟訂閱線無關）。
 誰開這條線：Core::ensure_links（link_keeper.rs）——daemon 在 vault.unlock／account.add 之後、與常駐的看線迴圈每一輪叫它；開的時候就訂了
 ```
 
@@ -43,13 +43,13 @@ UI
   但**不推水位**——所以下次 UI 叫 Recent（沒帶 `since`）會從上次 Recent 的水位重拉，推播已經寫過的那段重寫一次（冪等）；推播漏掉的那段自然補回。
   UI 想省這一趟就帶 `since`＝它手上最後一則的 `g_seq`，代價是漏掉的不補——維護者：永遠拿不到也不管。
 - **daemon 沒有洞的概念**：server 的 `gap`、本地收件匣滿、一包解不開、cache 寫失敗、存不了的事件——都只講一聲（`Note`）、繼續收。
-  之前那版（PR #58 的 6a774f9 到 88360e4）在 daemon 裡凍結水位、判「什麼算洞」，維護者 2026-09-23 拿掉：誰記有沒有漏是 UI 的事。
+  維護者 2026-09-23 定：🚫 daemon 不凍結水位、不判「什麼算洞」——誰記有沒有漏是 UI 的事。
 - **跟官方 Matrix 同形**：`Push` 是 `/sync` 迴圈只追加 server 給的、`sync.recent` 是 client 決定何時往回補的 `/messages`。
 - **`Subscribe` 不帶 `cg_seq`**：server 的補窗有上限、截斷只給一個 gap bit；反正補窗是 UI 的事，daemon 不要它。
 - **訂閱是純的**：一包來寫一包，`seq` 跳號不管。
 - **訂閱會話結束＝那條線作廢**：server 送 `Error`（例如被另一台裝置接手的 1505）時 socket 可能還活著，池的殞死偵測（`is_closed`）看不出來——
-  task 收攤時自己 `LinkPool::close(Rooms, "the room subscription ended: …")`，`link.state: closed` 由池發、UI 不必等；看線迴圈下一輪看到那格是空的才會重開、重訂
-  （PR #58 審查 rumia #655／cirno #658：之前 task 只發事件不關線，池把活著的舊線交回去、永遠不再訂）。🚫 task 自己不重訂：重開的只有看線迴圈這一條路。
+  task 收攤時自己 `LinkPool::close(Rooms, "the room subscription ended: …")`，`link.state: closed` 由池發、UI 不必等；看線迴圈下一輪看到那格是空的才會重開、重訂。
+  理由：只發事件不關線的話，池會把活著的舊線交回去、永遠不再訂。🚫 task 自己不重訂：重開的只有看線迴圈這一條路。
 
 ## 2. 存不了的事件
 
@@ -61,7 +61,8 @@ UI
 
 | 什麼時候 | 發什麼 |
 |---|---|
-| 每包 commit 之後 | 每則一個 `room.message`（自己送的也發，收的人自己濾；密文原樣、`decrypted: false`） |
+| 每包 commit 之後 | 每則一個 `room.message`（自己送的也發，收的人自己濾；加密的有金鑰就解好再發，沒金鑰的是 `undecryptable`、`decrypted: false`） |
+| 推來 `DeviceChanged` | 原樣轉成 `devices.changed`，要不要 refresh 是 UI 的事（e2ee-rpc.md §4） |
 | 漏包（gap／丟包／壞包／寫失敗／存不了） | 一則 `Note`，只是講一聲 |
 | 線開／關 | 池的 `link.state`（`rooms`）；task 因訂閱結束而關線時 `closed` 帶「the room subscription ended: …」 |
 
@@ -72,17 +73,17 @@ UI
 - 一個帳號一個 task（`Core::room_syncs`）；線重開時 `init_connection` 換掉舊的（舊的線已經死了）。
 - 登出：`stop_room_sync_of` 先收 task，再 `close_links`。`Core` 丟掉：handle 的 `Drop` abort task。
 - task 🚫 不握 `Core`、不握線：握 `Arc<ServerCache>`、`EventSink`、訂閱的會話、池的 `Arc`（只為了收攤時關那格）。
-  金鑰的 `Device/Subscribe` 2026-09-29 起在自己那條線（`Keys`）上，跟這個 task 無關。
-- `Event/Unsubscribe` 的 codec 與 `room_unsubscribe` 在 sdk 裡（對著向量），core 現在不用它：關訂閱線就是關線，server 斷線自動退訂。
+  金鑰的 `Device/Subscribe` 在自己那條線（`Keys`）上，跟這個 task 無關。
+- `Event/Unsubscribe` 的 codec 與 `room_unsubscribe` 在 sdk 裡（對著向量），core 不用它：關訂閱線就是關線，server 斷線自動退訂。
 
 ## 5. 不在這支
 
-- RPC（開／關訂閱線的命令）：🚫 不做（維護者 2026-09-29：訂閱線總是由 daemon 搞定）。原本給測試用的 `open_subscriptions`／`close_subscriptions` 拿掉了，開線走 `ensure_links`。
-- 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：做了，在 [key-sync.md](../keys/key-sync.md)（同一條線上另一個會話）。
-- 背景重開：做了，link-pool.md §3.1。task 內 panic 那條路也是（PR #58 審查 cirno #661 🟢）：panic 不走 `pool.close`，會留下「線活著、沒 task」而且沒有 `closed`——
+- RPC（開／關訂閱線的命令）：🚫 不做（維護者 2026-09-29：訂閱線總是由 daemon 搞定）。開線走 `ensure_links`。
+- 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：key-sync.md。
+- 背景重開：link-pool.md §3.1。
+- 密文解密：`room_crypto.rs`（task 寫庫前叫它）。推來的有金鑰就解，密文明文一起存；沒金鑰只存密文，金鑰到了由金鑰那半補解（e2ee-rpc.md §6）。
+- 還沒做：task 內 panic 的收攤。panic 不走 `pool.close`，會留下「線活著、沒 task」而且沒有 `closed`；
   文件化的結束路徑（Error／線死／`stop_room_sync_of`）都收口了，panic 要監督者統一收攤（daemon-runtime.md §10 第 8 階段）。
-- ~~`DeviceChanged`~~：✅ 2026-09-29 原樣轉成 `CoreEvent::DeviceChanged`（RPC `devices.changed`）給 UI（e2ee-rpc.md §4）。
-- ~~密文解密~~：✅ 2026-09-29 推來的有金鑰就解，密文明文一起存；沒金鑰只存密文，金鑰到了由金鑰那半補解（e2ee-rpc.md §6）。
 
 ## 6. 測試
 

@@ -3,7 +3,7 @@
 //! 這裡只有資料與契約，沒有 Matrix：`matrix_sdk::Room`、ruma 的型別不出現在這個檔（architecture-v2.md §8）。
 //! 第一個實作在 `backend/matrix_sdk.rs`；之後自己的 WS 協定是同一個 trait 的另一個實作。
 //!
-//! 與 chat-model.md 的差異（第 3 步先做的縮小版，文件那邊同步標了）：
+//! 與 chat-model.md §2 模型的差異（清單在同一份文件 §6）：
 //! - id 用 `String`，不另外包 newtype；對外仍是不透明字串。
 //! - `SystemEvent` 先用 `event_type` 加一行文字，不逐種列 enum。
 //! - `watch` 是 callback 而不是 `Stream`：sync 迴圈在 backend 手上，CLI 的 tail／wait／once 用回傳值控制。
@@ -118,7 +118,7 @@ pub struct Message {
     pub g_seq: Option<i64>,
 }
 
-/// watch 流的一則（chat-model.md §4.2 的縮小版：第 3 步只有新訊息與房間層的變化）。
+/// watch 流的一則（chat-model.md §4.2 的子集：只有新訊息與房間層的變化）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "update", rename_all = "snake_case")]
 pub enum Update {
@@ -128,7 +128,7 @@ pub enum Update {
         conversation: String,
         events: Vec<IncomingEvent>,
     },
-    /// 第 3 步只有這一個房間層的變化；「新加入的房間」用 `conversations()` 看，watch 還不推。
+    /// 房間層的變化只有這一個；「新加入的房間」用 `conversations()` 看，watch 還不推。
     ConversationLeft { id: String },
 }
 
@@ -147,7 +147,7 @@ pub struct WatchEnd {
     pub stopped_by_callback: bool,
 }
 
-/// 聊天的動作（chat-model.md §2.6 第 3 步的子集）。上傳不在這裡：那是 `WbfClient` 的事，與 backend 無關。
+/// 聊天的動作（chat-model.md §2.6 的子集）。上傳不在這裡：那是 `WbfClient` 的事，與 backend 無關。
 #[allow(async_fn_in_trait)]
 pub trait ChatBackend {
     async fn conversations(&self) -> Result<Vec<Conversation>, SdkError>;
@@ -170,8 +170,8 @@ pub trait ChatBackend {
     ///     Ok(String)   event_id
     async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError>;
 
-    /// 送wbf-client-convention-for-chunk.md §5 的事件。⚠️ 附件宣告（wbf-client-convention-for-chunk.md §5.2）目前沒有路可帶：matrix-sdk 不能在送訊息的請求加 header，
-    /// server 的 `Event/Send` 也還是提案；實作要在回傳前把這件事講清楚（見 `backend/matrix_sdk.rs`）。
+    /// 送wbf-client-convention-for-chunk.md §5 的事件。⚠️ 附件宣告（wbf-client-convention-for-chunk.md §5.2）在這條路帶不出去：matrix-sdk 不能在送訊息的請求加 header；
+    /// 實作要在回傳前把這件事講清楚（見 `backend/matrix_sdk.rs`）。wbf 帳號不走這個 trait，它走 `Event/Send`、有宣告。
     async fn send_file(
         &self,
         id: &str,

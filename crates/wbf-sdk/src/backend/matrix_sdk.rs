@@ -261,9 +261,9 @@ impl ChatBackend for MatrixBackend {
         Ok(response.response.event_id.to_string())
     }
 
-    /// ⚠️ 附件宣告（wbf-client-convention-for-chunk.md §5.2）這一版帶不出去：`Room::send` 不能加 header，`Event/Send` 在 server 端還是提案。
-    /// 所以 server 的媒體計數不會 +1，這則的附件過保護期會被清（等 server 定案；到時這裡改走 `WbfClient::send_event`，
-    /// 那需要自己 Megolm 加密，也就是 `RoomCrypto` 出現的時候）。呼叫者要知道這件事，CLI 會印警告。
+    /// ⚠️ 附件宣告（wbf-client-convention-for-chunk.md §5.2）這條路帶不出去：`Room::send` 不能加 header。
+    /// 所以 server 的媒體計數不會 +1，這則的附件過保護期會被清。呼叫者要知道這件事，CLI 會印警告。
+    /// wbf 帳號不走這裡：它走 `Event/Send` 宣告附件（wbf-core 的 `upload_ops.rs`）。
     async fn send_file(
         &self,
         id: &str,
