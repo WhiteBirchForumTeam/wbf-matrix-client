@@ -155,6 +155,8 @@ mod tests {
             "v.mkv",
             "content://media/external/video/12",
             "http://127.0.0.1/v.mkv",
+            // 只有 scheme 檢查擋得住：切掉前 7 個字元剛好剩 `//home/…`。
+            "xfile:///home/me/v.mkv",
             "file:/home/me/v.mkv",
             "file://server/share/v.mkv",
             "file://C:/Users/me/v.mkv",
@@ -223,9 +225,11 @@ mod tests {
             open_local_source(&entry(None, 40)).is_none(),
             "沒有 source_uri"
         );
+        // 目錄的「大小」故意設成跟它的 metadata 一樣：只剩 `is_file` 擋得住（Linux 開得了目錄；Windows 連開都開不了）。
         let directory_uri = uri.replace("v%201.bin", "");
+        let directory_size = std::fs::metadata(&dir).unwrap().len();
         assert!(
-            open_local_source(&entry(Some(directory_uri), 0)).is_none(),
+            open_local_source(&entry(Some(directory_uri), directory_size)).is_none(),
             "目錄"
         );
         std::fs::remove_file(&file).unwrap();
