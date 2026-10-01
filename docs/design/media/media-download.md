@@ -26,6 +26,7 @@
 | **位置表** | 塊號 → 它在 seek 暫存檔的第幾格。記憶體裡的陣列，O(1) |
 | **mxc 的狀態** | 一個 mxc 在 daemon 裡的東西：manifest、驗過的參數、主檔寫到哪、暫存檔與位置表、正在拉哪幾塊。同一個 mxc 只有一份；job 與 seek 都用它 |
 | **job** | 「把這個 mxc 順序拉完」這件事：`{ mxc, next, total, … }`（§5.2）。一塊一步 |
+| **downloading 表** | 每帳號一張 `HashMap<mxc, Arc<Downloading>>`：正在拉的檔，裡面有取消旗標與進度；開始拉時放進去、拉完或取消時自己拿掉（§5.2） |
 | **下載佇列** | 每個帳號一條，排著 job，**一次一個** |
 | **下載 worker** | 每個帳號一個 task，只有它用那個帳號的 `Download` 線拉檔；有 seek 與 job 兩個收件匣，seek 先（§5.1） |
 | **`Download` 線** | 連線池裡每個帳號五條 WS 線之一（/docs/design/daemon/link-pool.md），專跑 `Download/*`（kind `0x04`） |
@@ -242,17 +243,28 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 
 worker 每次只做**一塊**：做完一塊回頭看收件匣，所以 seek 最多等一塊的傳輸時間（§6.2）。
 
-### 5.2 job 長什麼樣
+### 5.2 job 與 downloading 表
 
 ```
-DownloadJob {
+DownloadJob {                                       排在佇列裡的東西
     mxc,            要下載哪個檔                      example: "mxc://localhost/000000000000004d"
     next,           下一塊要拉第幾塊（位置）           example: 123
     total,          總塊數；不知道是 0                 example: 456
     manifest,       區塊（檔案金鑰），驗過的參數（§3.2）
-    cancelled,      取消旗標
+}
+
+downloading: HashMap<mxc, Arc<Downloading>>         每個帳號一張（維護者 2026-10-01）
+Downloading {                                       一個正在下載的檔，所有塊共用這一份
+    cancelled: AtomicBool,                          取消旗標
+    done:      AtomicU32,                           已落地的塊數（= next）
+    total:     AtomicU32,                           總塊數（0 = 還不知道）
 }
 ```
+
+- **什麼時候放進去**：worker 第一次開始拉這個 job（§5.4 第 0 步之前）。還在佇列裡排著的 job **不在表裡**。
+- **什麼時候拿掉**：最後一包落地、或處理一包時發現旗標是 true——**由 worker 自己拿掉自己**，🚫 別人不替它拿。
+- **每個塊的請求都帶著同一份 `Arc<Downloading>`**：取消只要把 `cancelled` 設成 true，之後收到的封包就只處理當下那一包（落地），🚫 不再往下拉。
+- `done`／`total` 也在這裡：`media.queue` 與進度推播（§5.5）直接讀它，🚫 不必去問 worker。
 
 ### 5.3 建一個 job：先看 DB 與檔案
 
@@ -262,7 +274,7 @@ DownloadJob {
 |---|---|
 | `media` 列 `complete = 1`、池檔在 | 🚫 不建 job：已經有了 |
 | 有本機原檔（/docs/design/rpc-specs/data-plane.md §8.1） | 🚫 不建 job（`media.save_to` 例外：它要的是池或原檔裡的 bytes，直接從原檔複製） |
-| 這個 mxc 已經在佇列裡 | 🚫 不重複建 |
+| 這個 mxc 已經在 `downloading` 表或佇列裡 | 🚫 不重複建 |
 | 有 pending 主檔 | **從檔案確定進度**：驗檔長、逐段解（§4.1 續傳）→ 已寫 `k` 段 → `next = ⌊k × segment_size / chunk_size⌋`；DB 的 `segments_written` 只當提示，🚫 不當依據 |
 | 都沒有 | `next = 0` |
 | `total` | 區塊在手（有 `file_size`、`chunk_size`）就算 `ceil(file_size / chunk_size)`；不知道就填 **0**，第一步問 `Info` 再補 |
@@ -273,28 +285,37 @@ DownloadJob {
 
 ```
 worker 取佇列頭的 job：
+  第一次 → downloading.insert(mxc, Arc<Downloading>{ cancelled: false, done: next, total })
   0. total == 0 → Info（§3.2）驗過、填 total
-  1. 封一個「落地後續」：{ job, 落地後 next + 1, total }
+  1. 封一個塊請求：{ chunk: next, 落地後 next + 1, total, 那一份 Arc<Downloading> }
   2. 拿第 next 塊：
        位置表有（§4.2）→ 從 seek 暫存檔讀那一格、用池金鑰解開   ← 不走網路
        沒有             → Download/Read { mxc, chunk: next }，驗長度、用檔案金鑰解開（§3.3）
-  3. 明文餵進主檔（湊滿一段才封、才 append，§4.1）→ 這一塊落地結束
-  4. 觸發落地後續：
-       job.cancelled          → 停：主檔與暫存檔留著，從佇列移除        ← 取消插在這裡
-       next + 1 == total      → 收尾（§4.1）、刪暫存檔、推最後一則進度、拿下一個 job
+  3. 明文餵進主檔（湊滿一段才封、才 append，§4.1）→ 這一塊落地結束 → done = next + 1
+  4. 觸發落地後續（看塊請求帶來的那一份）：
+       cancelled == true      → 停：主檔與暫存檔留著；downloading.remove(mxc)       ← 取消在這裡生效
+       next + 1 == total      → 收尾（§4.1）、刪暫存檔、推最後一則進度；downloading.remove(mxc)；拿下一個 job
        否則                    → next += 1，回到 worker（先看有沒有 seek 請求）
 ```
 
 - **取消**只在「一塊落地之後」生效：正在拉的那一塊會拉完、寫完，所以主檔永遠停在整塊（整段）的邊界上。
-- **壞檔**（§3.2、§3.3）→ job 移除、`media` 列 reset、推一則失敗。
-- **網路斷**：job 停在 `next`，線重開（/docs/design/daemon/link-pool.md §3.1）後從同一塊接著拉。
+- **壞檔**（§3.2、§3.3）→ job 移除、`downloading.remove(mxc)`、`media` 列 reset、推一則失敗。
+- **網路斷**：job 停在 `next`（還在表裡），線重開（/docs/design/daemon/link-pool.md §3.1）後從同一塊接著拉。
 - **沒人看的時候照樣拉完**（Downloading 就是拉完）。**暫停**之後才加，加的時候只停這個收件匣，🚫 不停 seek。
+
+**`media.cancel { mxc }`**：
+
+| 這個 mxc 在哪 | 做什麼 |
+|---|---|
+| `downloading` 表裡（正在拉） | `cancelled = true`。worker 處理完手上那一包就停、自己從表裡拿掉 |
+| 佇列裡（還沒開始） | 從佇列拿掉（它不在表裡） |
+| 都不在 | 回 `cancelled: false` |
 
 ### 5.5 進度：daemon 負責（維護者 2026-10-01）
 
 背景下載沒有 HTTP 連線可以看，所以進度由 daemon 管、由 daemon 報：
 
-- **狀態在 job 裡**（`next`／`total`）；DB 每 1.5 秒寫一次段數（顯示用，§4.4）。
+- **狀態在 `downloading` 表裡**（`done`／`total`，§5.2）；DB 每 1.5 秒寫一次段數（顯示用，§4.4）。
 - **推播 `media.download`**（要先 `subscribe`，/docs/design/rpc-specs/rpc-spec.md §4）：
   `{ mxc, state: "queued"|"downloading"|"complete"|"cancelled"|"failed", done: next, total, user }`。
   每個 job **最多每秒一則**，加上每次狀態改變一則（排進、開始、完成、取消、失敗）——🚫 不是每塊一則（那會把 `room.message` 擠掉，/docs/design/daemon/daemon-runtime.md §5.4）。
@@ -342,7 +363,7 @@ worker 做完手上這一塊就先處理它。
 | `media.download` | `{ mxc } \| { room, event_id } \| { manifest }`，`user?`、`server?` | `{ state, done, total }` | 建 job（§5.3）。已經完整或有原檔就直接回 `complete`／`local_source` |
 | `media.open` | 同上 | `{ url, mimetype?, size, state }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`queued`。不完整也沒原檔 → 順便建 job |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 佇列現在的樣子，第一個是正在拉的 |
-| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 還沒開始 → 拿掉；下到一半 → 落地後停（§5.4） |
+| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 正在拉 → 設 `downloading[mxc].cancelled`，處理完手上那一包就停；排著 → 從佇列拿掉（§5.4） |
 | 推播 `media.download` | — | `{ mxc, state, done, total, user }` | §5.5 |
 
 `media.save_to` 的參數不變，行為改成排隊（§5.5 最後）。
@@ -395,7 +416,8 @@ worker 做完手上這一塊就先處理它。
 - 池格式 v2：寫讀、1 byte 的檔、剛好整段、跨段；檔長不是整數倍 → 截；最後一段解不開 → 截；翻一個 bit／錯金鑰／段搬位置都拒；長度欄超過 segment_size 拒。
 - seek 暫存檔：寫讀、最後一塊補滿；重開時截掉半格、重建位置表、同塊號重複留第一個、塊號超出拒、chunk_size 對不上整個刪；格的 AEAD 綁塊號（改塊號就解不開）。
 - 位置表：O(1) 查、`slots[i] = s + 1` 在 fsync 之後。
-- 佇列：一次一個、先進先出、取消（還沒開始／下到一半）、壞檔移除、重複排不重複。
+- 佇列：一次一個、先進先出、壞檔移除、重複排不重複（佇列裡或 `downloading` 表裡都算）。
+- 取消：排著的從佇列拿掉、不在表裡；正在拉的設旗標後**只再落地手上那一包**（假 server 計 `Read` 次數）、自己從表裡拿掉；完成也從表裡拿掉；取消後再排一次從斷點接。
 - seek：seek 時佇列讓線（最多等一塊）、同一塊兩個 GET 只拉一次、主檔追上時從暫存檔搬（不走網路，假 server 計數）、主檔完成刪暫存檔。
 - GET 路由：五種來源各一、一個 Range 橫跨主檔與現拉、Range 超出檔尾 416。
 - 斷點表（§8）每一列一條。
@@ -408,3 +430,4 @@ worker 做完手上這一塊就先處理它。
 3. **`media.save_to` 也排隊**（§5.5）。
 4. **背景下載的進度由 daemon 負責**（§5.5）：job 記著、推播 `media.download`（每個 job 最多每秒一則＋狀態改變）、`media.queue` 可以問。
 5. **佇列是一塊一步的 job**（§5.4）：「拉第 `next` 塊 → 落地 → 觸發後續（`next + 1`）」，取消插在落地之後。
+6. **取消旗標放在 `downloading` 表**（§5.2）：key 是 mxc，所有塊共用同一份；設成 true 就只處理當下那一包；拉完或取消時自己從表裡拿掉。
