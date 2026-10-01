@@ -511,9 +511,20 @@ async fn sweep_resets_missing_files_and_removes_what_nobody_claims() {
     assert!(!cache.find_media(&manifest.mxc).unwrap().unwrap().complete);
     assert_eq!(pool.list_pending().unwrap(), vec![busy_name.clone()]);
 
-    // 過了保護期的半成品（沒人在下載它）也刪。
-    drop(busy_download);
+    // 過了保護期：還在下載的（worker 握著）照樣不碰——線斷了很久的下載，檔案很久沒動，但它還是活的。
     let later = SystemTime::now() + Duration::from_secs(8 * 24 * 3600);
+    let swept = media::sweep(
+        &mut cache,
+        &pool,
+        Duration::from_secs(7 * 24 * 3600),
+        later,
+        &in_use,
+    )
+    .unwrap();
+    assert_eq!(swept.removed_pending, 0, "{swept:?}");
+    assert_eq!(pool.list_pending().unwrap(), vec![busy_name.clone()]);
+    // 沒人在下載它了：過了保護期的半成品刪掉。
+    drop(busy_download);
     let swept = media::sweep(
         &mut cache,
         &pool,
