@@ -138,7 +138,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 ```
 
 - **控制平面** —— JSON 訊息走綁在 `127.0.0.1` 的 WebSocket，用 XChaCha20-Poly1305 加密，金鑰由每次啟動的 token 導出。
-- **資料平面**（*規劃中*）—— 本機 HTTP，支援 `Range`，播放器與檢視器可以直接串流媒體。⚠️ 還沒實作。
+- **資料平面** —— 本機 HTTP，媒體的 bytes 只走這裡：上傳是 `PUT`（邊收邊加密邊傳到 homeserver）；下載支援 `Range`、讓播放器直接串流（*還沒實作*）。規格在 [`docs/design/rpc-specs/data-plane.md`](docs/design/rpc-specs/data-plane.md)。
 - **backend 怎麼選** —— `transport: ws`（預設）＝ wbf 協議；`transport: http` ＝ 標準 Matrix。對一般 homeserver 指定 `ws` 是 no-op，🚫 不是錯誤。
 
 ## 專案結構
@@ -148,7 +148,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 | [`crates/wbf-wire`](crates/wbf-wire) | 線上協議的 codec：pack、`EncryptedFileInfo`、CRC-32C。純函數、無 async | ✅ 完成 —— 對著 server 的黃金向量測 |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | 協議 client：每塊 AEAD、WebSocket 通道、分塊上傳／下載／seek／續傳／串流、加密 vault、`cache.db`、媒體池、matrix-sdk adapter | 🟢 可用 |
 | [`crates/wbf-core`](crates/wbf-core) | 每個命令「做什麼」：帳號、房間、訊息、媒體、backend 探測、`cache.db` 的單一寫入者。沒有命令列、沒有 RPC | 🟢 可用 |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE。⏳ 還沒有：`cancel`、媒體 HTTP 平面 |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE、資料平面的上傳（`PUT`，加密房的附件）。⏳ 還沒有：`cancel`；資料平面的讀（`GET /media`、`media.open`） |
 | [`apps/wbf-cli`](apps/wbf-cli) | 命令列前端 `wbf-cli`：登入、房間、送訊息、watch、上傳、下載、seek、多帳號、媒體快取 | 🟢 可用（目前直接叫 `wbf-core`） |
 | 桌面／Android／Python | 走 RPC 的前端 | ⏳ 還沒開始 |
 

@@ -230,7 +230,8 @@ CREATE TABLE media (
   complete INTEGER NOT NULL,            -- 1 = 整檔都在
   bytes_on_disk INTEGER NOT NULL,       -- 配額用
   created_at INTEGER NOT NULL,          -- 下載（建立）時間
-  last_used_at INTEGER NOT NULL);       -- 最後一次看過
+  last_used_at INTEGER NOT NULL,        -- 最後一次看過
+  source_uri TEXT);                     -- 這台機器上傳它時 UI 給的原檔位置（URI）；讀的時候原檔在、大小對得上就讀它（/docs/design/rpc-specs/data-plane.md §8.1）
 CREATE INDEX media_lru ON media (last_used_at);
 CREATE INDEX media_by_pool_file ON media (pool_file) WHERE pool_file IS NOT NULL;   -- 同一個檔被幾個 mxc 指著，清檔前要問
 

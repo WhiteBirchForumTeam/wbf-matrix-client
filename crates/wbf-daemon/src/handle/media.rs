@@ -1,18 +1,63 @@
 //! `upload.*`、`media.info`／`save_to`、`server.ping`（/docs/design/rpc-specs/rpc-spec.md §3.5、§3.6、§3.8）。都有 `transport`。
 //!
-//! 還沒有：`media.open`（要 `PoolReader` 接 HTTP Range）、`media.create`（要 core 把建檔與送事件拆開）。
+//! `media.create` 只建檔、鑄 token：bytes 走資料平面的 PUT（`data_plane.rs`，/docs/design/rpc-specs/data-plane.md）。
+//! 還沒有：`media.open`（要 `PoolReader` 接 HTTP Range）。
 
 use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use wbf_core::{Core, SyncMode, UploadRequest};
+use wbf_core::{Core, NewUpload, SyncMode, UploadRequest};
 use wbf_sdk::Manifest;
 
 use super::{
     invalid_params, parse_params, to_result, Fail, Handle, Outcome, TargetParams, TransportParam,
     DAEMON_NAME, DAEMON_VERSION,
 };
+use crate::data_plane::{UploadMeta, UPLOAD_META_HEADER, UPLOAD_PATH};
+use crate::message::code;
+
+/// 資料平面的上傳第一步（/docs/design/rpc-specs/data-plane.md §4.1）：去 server 建檔、回一個 PUT 的 URL。
+/// URL 只帶「用途 ‖ mxc」；整個上傳狀態（含檔案金鑰）放進 `Wbf-Upload-Meta` header，兩者都用共享 token 加密，daemon 🚫 不另外記。
+/// 發訊息是 UI 在 PUT 回 manifest 之後另外叫的 `room.send_attachment`，🚫 不是這裡的事。
+pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(flatten)]
+        upload: NewUpload,
+        /// 原檔在這台機器的位置，URI（/docs/design/rpc-specs/data-plane.md §8.1）。意義由 UI 定，daemon 🚫 不驗、只原樣帶著。
+        #[serde(default)]
+        source_uri: Option<String>,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    // 沒有資料平面（單發命令）就不去 server 建檔：建了也沒有地方收 bytes。
+    let (Some(data_port), Some(keys)) = (handle.data_port().await, handle.access_keys()) else {
+        return Err(Fail::Rpc(
+            code::BAD_REQUEST,
+            "this daemon has no data plane (it was not started with -s), so nothing could receive the bytes".into(),
+        ));
+    };
+    let upload = core
+        .create_upload(&params.upload, &handle.target(&params.target))
+        .await?;
+    let encrypted = handle.is_encryption_enforced();
+    let url_key = keys.to_upload_url_key(&upload.mxc, encrypted)?;
+    let meta = keys.to_upload_meta(
+        &UploadMeta {
+            upload: upload.clone(),
+            source_uri: params.source_uri,
+        },
+        encrypted,
+    )?;
+    Ok(json!({
+        "upload_id": upload.upload_id,
+        "mxc": upload.mxc,
+        "url": format!("http://127.0.0.1:{data_port}{UPLOAD_PATH}{url_key}"),
+        "headers": { UPLOAD_META_HEADER: meta },
+    }))
+}
 
 pub(super) async fn upload_file(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]

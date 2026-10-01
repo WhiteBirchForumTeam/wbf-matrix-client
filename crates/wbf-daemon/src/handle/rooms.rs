@@ -12,7 +12,7 @@ use wbf_core::{
     cipher_for_plaintext_room, Core, HistoryQuery, RoomDevices, SendOptions, SyncMode,
     UploadRequest,
 };
-use wbf_sdk::RecentPlan;
+use wbf_sdk::{Manifest, RecentPlan};
 
 use super::{
     parse_params, to_result, Handle, Outcome, TargetParams, TransportParam, DAEMON_NAME,
@@ -79,6 +79,39 @@ pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) 
         )
         .await?;
     Ok(json!({ "event_id": event_id }))
+}
+
+/// 資料平面版的送檔最後一步（/docs/design/rpc-specs/data-plane.md §5）：UI 打 HTTP 傳完、拿到 manifest 之後，把那份 manifest 帶回來叫這支發訊息。
+/// daemon 🚫 不記傳完的上傳。加密房跟 `room.send_text` 一樣要 `room_devices`、被擋回 1401；重送用同一份 manifest 與 `txn_id`，檔案🚫 不必重傳。
+pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        manifest: Manifest,
+        #[serde(default)]
+        caption: Option<String>,
+        #[serde(default)]
+        room_devices: Option<RoomDevices>,
+        #[serde(default)]
+        txn_id: Option<String>,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let options = SendOptions {
+        room_devices: params.room_devices,
+        txn_id: params.txn_id,
+    };
+    let event_id = core
+        .send_attachment(
+            &params.room,
+            &params.manifest,
+            params.caption.as_deref(),
+            &options,
+            &handle.target(&params.target),
+        )
+        .await?;
+    Ok(json!({ "event_id": event_id, "mxc": params.manifest.mxc, "attachment_declared": true }))
 }
 
 /// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。

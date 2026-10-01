@@ -145,10 +145,8 @@ impl Core {
     /// 被 1506 擋 → 自動 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人）→ 回 `RoomDevicesChanged`，`data` 是新狀態加 `txn_id`。
     ///
     /// Args:
-    ///     event_type: example: "m.room.message"
-    ///     content: 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
+    ///     message: 明文的事件；`attachments` 跟密文同一個 `Event/Send` 宣告, example: OutgoingRoomEvent { event_type: "m.room.message".into(), content: json!({"msgtype":"m.text","body":"hi"}), txn_id: "wbf-1727600000-3".into(), attachments: vec![] }
     ///     devices: UI 手上那份
-    ///     txn_id: example: "wbf-1727600000-3"
     /// Return:
     ///     Ok(String)                 event_id
     ///     Err(RoomDevicesChanged)    訊息沒送；`data`：`{room_version, members, shared, txn_id}`（重拿成功）或 `{txn_id, current_room_version}`（重拿也失敗，UI 自己叫 `room.refresh_devices`）
@@ -158,10 +156,8 @@ impl Core {
         &self,
         account: &AccountDir,
         room: &str,
-        event_type: &str,
-        content: Value,
+        message: OutgoingRoomEvent,
         devices: &RoomDevices,
-        txn_id: String,
     ) -> Result<String, CoreError> {
         let engine = self.olm_engine_of(account).await?;
         let previous = devices.to_versions()?;
@@ -174,12 +170,7 @@ impl Core {
                 LinkRole::Misc,
             )
             .await?;
-        let message = OutgoingRoomEvent {
-            event_type: event_type.to_string(),
-            content,
-            txn_id: txn_id.clone(),
-            attachments: Vec::new(),
-        };
+        let txn_id = message.txn_id.clone();
         let outcome = engine
             .encrypt_and_send(&mut client, room, devices.room_version, &members, &message)
             .await?;
@@ -322,18 +313,6 @@ mod tests {
 
     use super::*;
     use crate::test_support::*;
-
-    /// 假 server 的橋不存金鑰（查什麼都回空的）：這個人的裝置雜湊就是「沒有任何金鑰」的那個值。
-    fn members_body(room_version: u64) -> Value {
-        let hash = wbf_sdk::device_version::compute_device_keys_hash(ME, &json!({})).unwrap();
-        json!({
-            "chunk": [{
-                "type": "m.room.member", "state_key": ME, "content": { "membership": "join" },
-                "unsigned": { "org.wbftw.device_version": format!("1-{hash}") }
-            }],
-            "org.wbftw.room_version": room_version
-        })
-    }
 
     /// 一條放進池裡的 `Misc`（記憶體對接的假 server）；這個房加密、成員只有自己、房間版本號 7。
     async fn encrypted_room_on_misc(core: &Core, account: &AccountDir) -> FakeServer {

@@ -1419,6 +1419,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1441,6 +1447,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -4233,8 +4240,10 @@ dependencies = [
 name = "wbf-core"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "wbf-sdk",
  "wbf-wire",
@@ -4247,15 +4256,21 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "bs58",
+ "bytes",
  "chacha20poly1305 0.10.1",
  "clap",
  "futures-util",
  "getrandom 0.2.17",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "uuid",
  "wbf-core",
  "wbf-sdk",

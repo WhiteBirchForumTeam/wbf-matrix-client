@@ -20,8 +20,8 @@ PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照�
 - **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
 
-**還沒有**：UI；加密附件（加密房送檔仍拒）；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
-已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面 HTTP；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
+**還沒有**：UI；路徑版送檔進加密房（資料平面那條可以）；一般 Matrix 帳號的傳統上傳；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
+已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面的讀（`media.open`／`GET /media`）；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 ⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8；§7 第 1 項先照預設做）。
 
@@ -113,7 +113,8 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
   push.rs                `Subscriptions`（每連線一份：名字集合＋選填 `user`）、`push_of`（`CoreEvent` → 推播名與 params，照 /docs/design/rpc-specs/rpc-spec.md §4）、`desync`、`parse_subscription_params`
   token.rs               token 檔的三遍覆蓋抹除（隨機 → 0xFF → 0x00 → 刪）與權限檢查；⚠️ daemon 預設不動 token，誰起的誰動
   main.rs                `-s` 常駐（先拿寫權、讀 token 與 conf、寫 daemon.json）。沒有 `-s` ＝單發，⚠️ **還沒實作**（會報錯講清楚）；
-                         兩個都帶也報錯。資料平面還沒有
+                         兩個都帶也報錯。控制平面與資料平面一起開、一起停
+  data_plane.rs          資料平面：URL 與 meta（共享 token 加密；URL 只帶「用途 ‖ mxc」、上傳狀態在 `Wbf-Upload-Meta` header）與 hyper 的 HTTP listener（`PUT /upload/mxc/…`、Host 檢查）
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
   tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、
                          token 檔 daemon 不動、shutdown 之後程序結束並收走 daemon.json
@@ -222,7 +223,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
-| **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 排在 §7 第 1 項 | 加密房送檔仍拒；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
+| **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 排在 §7 第 1 項 | 加密房送檔（路徑版）仍拒，資料平面那條可以；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
 | 交叉簽章沒 bootstrap | client 還沒接；server 的橋都有了（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`／`0x25`，驗證訊息走 to-device） | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
 | PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（`Recent` 收 `before_event_id`） | 跳到訊息還是兩個來回 |
@@ -234,14 +235,14 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
-1. **E2EE 收尾**：加密附件（WBF 的檔案本來就用每檔金鑰分塊加密，區塊金鑰放在事件裡；加密房只要讓這則事件走 `encrypt_and_send`、帶附件宣告；被 1506 擋時錯誤的 `data` 帶回已上傳的附件，重送不用再傳一次）、
-   讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
+1. **資料平面的讀與 E2EE 收尾**：`media.open`／`GET /media`（原檔優先、有快取讀池、沒快取先順序拉進池，`/docs/design/rpc-specs/data-plane.md` §8）；
+   官方 Matrix 的傳統上傳（§7）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
 2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
 之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
-資料平面 HTTP 與附件訊息的完整流程（`/docs/design/rpc-specs/local-interface.md` §9）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC；
+資料平面的讀（`media.open`／`GET /media` 的 Range，`/docs/design/rpc-specs/data-plane.md` §8）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC；
 UI 框架比較；串流／seek 對著媒體池讀（`/docs/design/media/media-pool.md` §6）。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
 ⏳ 懸著等維護者：`media.db` 拆檔（維護者：「等要做的時候再討論」）。

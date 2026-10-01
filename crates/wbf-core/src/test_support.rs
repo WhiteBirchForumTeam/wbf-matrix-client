@@ -14,7 +14,7 @@ use wbf_sdk::protocol::{
 };
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
 use wbf_sdk::WsLink;
-use wbf_wire::pack::{control, device, event, flags};
+use wbf_wire::pack::{control, device, event, flags, upload};
 use wbf_wire::{Kind, Pack};
 
 use crate::accounts::AccountDir;
@@ -64,6 +64,18 @@ pub(crate) async fn core_with_wbf_account(dir: &std::path::Path) -> (Core, Accou
     .await
     .unwrap();
     (core, account)
+}
+
+/// 橋 `Members` 的 body：房裡只有自己。假 server 的橋不存金鑰（查什麼都回空的），所以裝置雜湊是「沒有任何金鑰」的那個值。
+pub(crate) fn members_body(room_version: u64) -> Value {
+    let hash = wbf_sdk::device_version::compute_device_keys_hash(ME, &json!({})).unwrap();
+    json!({
+        "chunk": [{
+            "type": "m.room.member", "state_key": ME, "content": { "membership": "join" },
+            "unsigned": { "org.wbftw.device_version": format!("1-{hash}") }
+        }],
+        "org.wbftw.room_version": room_version
+    })
 }
 
 /// 一則 to-device（`m.dummy`：OlmMachine 認得、吃了不留痕），`count` 就是它在佇列裡的號。
@@ -205,7 +217,26 @@ pub(crate) struct FakeServer {
     pub(crate) current_room_version: Arc<Mutex<Option<u64>>>,
     /// `Event/Send` 收下的：(room_id, type, room_version, txn_id, content)。
     pub(crate) sent_events: SentEvents,
+    /// `Event/Send` 每則宣告的附件（跟 `sent_events` 同順序）。
+    pub(crate) sent_attachments: Arc<Mutex<Vec<Vec<String>>>>,
+    /// `Upload/*` 建的上傳，key 是上傳 id（從 1 開始）。
+    pub(crate) uploads: FakeUploads,
 }
+
+/// 假 server 上的一個上傳：收到的密文塊照索引排、`Seal` 帶的描述。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FakeUpload {
+    pub(crate) mxc: String,
+    /// 串流是 None。
+    pub(crate) chunk_count: Option<u32>,
+    pub(crate) chunks: Vec<Vec<u8>>,
+    pub(crate) finished: bool,
+    pub(crate) sealed: bool,
+    /// 測試設：server 說這個上傳**之前**被截斷過——只有 `Status` 的 Ack 帶（模擬截斷發生在被跳過的上一輪，這一輪的 `Chunk` Ack 不會再說）。
+    pub(crate) truncated: bool,
+}
+
+pub(crate) type FakeUploads = Arc<Mutex<std::collections::BTreeMap<u64, FakeUpload>>>;
 
 pub(crate) type SentEvents = Arc<Mutex<Vec<(String, String, Option<u64>, String, Vec<u8>)>>>;
 
@@ -240,6 +271,9 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let room_is_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let current_room_version: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let sent_events: SentEvents = Arc::new(Mutex::new(Vec::new()));
+    let sent_attachments: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let uploads: FakeUploads = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let (attachments_t, uploads_t) = (sent_attachments.clone(), uploads.clone());
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -292,6 +326,15 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                             )
                         }
                         _ => {
+                            let declared = meta["attachments"]
+                                .as_array()
+                                .map(|mxcs| {
+                                    mxcs.iter()
+                                        .filter_map(|mxc| mxc.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            attachments_t.lock().unwrap().push(declared);
                             let mut sent = sent_t.lock().unwrap();
                             sent.push((
                                 room_id,
@@ -311,6 +354,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                         }
                     }
                 }
+                (Kind::Upload, _) => upload_reply(&pack, &uploads_t),
                 (Kind::Control, control::HELLO) => response(
                     Kind::Control,
                     control::ACK,
@@ -500,6 +544,81 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         room_is_encrypted,
         current_room_version,
         sent_events,
+        sent_attachments,
+        uploads,
+    }
+}
+
+/// `Upload/*` 的回答（wbfuwunel 的 /docs/design/chunked-upload-spec.md §3）：只照順序收塊、不驗密文。
+fn upload_reply(pack: &Pack, uploads: &FakeUploads) -> Pack {
+    let mut uploads = uploads.lock().unwrap();
+    let ack = |meta: Value| {
+        response(
+            Kind::Control,
+            control::ACK,
+            pack.id,
+            pack.seq,
+            meta,
+            Vec::new(),
+        )
+    };
+    let chunk_ack = |upload: &FakeUpload| {
+        json!({ "received": upload.chunks.len(), "chunk_count": upload.chunk_count,
+                "total_len": upload.chunks.iter().map(Vec::len).sum::<usize>(),
+                "finished": upload.finished, "truncated": false })
+    };
+    match pack.subtype {
+        upload::CREATE => {
+            let info = wbf_wire::EncryptedFileInfo::from_bytes(&pack.meta).unwrap();
+            let id = uploads.len() as u64 + 1;
+            let mxc = format!("mxc://fake/{id:016x}");
+            uploads.insert(
+                id,
+                FakeUpload {
+                    mxc: mxc.clone(),
+                    chunk_count: (info.file_size != 0).then_some(info.chunk_count),
+                    ..FakeUpload::default()
+                },
+            );
+            ack(json!({ "id": id, "mxc": mxc, "chunk_size": info.chunk_size,
+                        "chunk_max_bytes": 1048576, "expires_at": 0 }))
+        }
+        upload::CHUNK => {
+            let upload = uploads.get_mut(&pack.id).unwrap();
+            let received = upload.chunks.len() as u32;
+            if pack.seq > received {
+                return response(
+                    Kind::Control,
+                    control::ERROR,
+                    pack.id,
+                    pack.seq,
+                    json!({ "code": "OutOfOrder", "code_id": 1503, "message": "gap", "expected_seq": received }),
+                    Vec::new(),
+                );
+            }
+            if pack.seq == received && !upload.finished {
+                upload.chunks.push(pack.data.to_vec());
+                let count = upload.chunks.len() as u32;
+                upload.finished =
+                    pack.flags & flags::IS_LAST != 0 || upload.chunk_count == Some(count);
+            }
+            ack(chunk_ack(upload))
+        }
+        upload::STATUS => {
+            let upload = uploads.get(&pack.id).unwrap();
+            let mut meta = chunk_ack(upload);
+            meta["chunk_size"] = json!(16);
+            meta["truncated"] = json!(upload.truncated);
+            meta["file_size"] = Value::Null;
+            ack(meta)
+        }
+        upload::SEAL => {
+            let upload = uploads.get_mut(&pack.id).unwrap();
+            assert!(upload.finished, "Seal before the last chunk");
+            upload.sealed = true;
+            ack(json!({ "mxc": upload.mxc }))
+        }
+        other => panic!("fake server got Upload subtype {other}"),
     }
 }
 

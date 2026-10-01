@@ -160,10 +160,10 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 |---|---|---|---|
 | daemon ↔ server | **wbf-pack**（二進位） | 是（E2EE 的密文在裡面流動） | **是**：server 不可信 |
 | 前端 ↔ daemon（控制） | **加密的 JSON over WS** | 是（XChaCha20-Poly1305，token 導出的金鑰） | **否**：同一台機器、同一個使用者 |
-| 前端 ↔ daemon（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上；靠 capability URL 擋） | 否 |
+| 前端 ↔ daemon（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上；靠 daemon 用共享 token 加密發的 URL 擋） | 否 |
 
 ⚠️ 控制平面**加密的收穫主要是完整性**（/docs/design/rpc-specs/local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與 token 檔。
-資料平面則刻意**不加密**：它要餵給播放器與圖片元件，那些只吃普通的 HTTP；防護靠 capability URL（/docs/design/rpc-specs/local-interface.md §8）。
+資料平面則刻意**不加密**：它要餵給播放器與圖片元件，那些只吃普通的 HTTP；防護靠 daemon 用共享 token 加密發的 URL（/docs/design/rpc-specs/data-plane.md §2）。維護者 2026-09-30 再確認：本機 bytes 先明文，機密模式是之後的伏筆（/docs/design/rpc-specs/data-plane.md §9）。
 
 ## 3. daemon 的職責邊界
 
@@ -288,7 +288,7 @@ crates/wbf-wire     pack 的 codec
 crates/wbf-sdk      協議、chunk 加解密、cache.db、媒體池、vault、matrix backend、crypto 引擎（OlmEngine）
 crates/wbf-core     常駐狀態（多帳號 session、解鎖一次）、連線池、事件分發、命令本體。**沒有 RPC**
 crates/wbf-daemon   core ＋ RPC 服務。library ＋ binary（wbf-matrix-client-daemon）。**自己的命令列**也在這裡（§0.2）
-                    還沒做：資料平面（data_port 現在是 0）、單發命令
+                    資料平面（`data_plane.rs`）：上傳做了，讀（`GET /media`）還沒。還沒做：單發命令
 apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）。
                     還沒做：改成 rpc-cli——只封裝 RPC 訊息、丟到本地 WS（§0.2），那時才改名
 ```
@@ -330,10 +330,10 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
 - **第 4 點：daemon 的生命週期**：誰負責關掉它、閒置多久自己結束、多個前端同時連著時誰說了算。
   兩個 daemon 搶同一個資料目錄已經有答案：§0.2 的排他鎖，後來的起不來。
   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。要等 Desktop 的實際使用模式出來再定。
-- **第 5 點：資料平面 token 的 TTL 與撤銷**：TTL 多長（播一部長片要多久？）、`logout` 時要不要立刻讓所有 token 失效
-  （應該要）、同一個資源重複開要不要發新 token。暫定值在 /docs/design/rpc-specs/rpc-spec.md §6.2。
+- ~~第 5 點：資料平面 token 的 TTL 與撤銷~~ 已定（維護者 2026-09-30）：🚫 沒有 TTL、🚫 沒有 token 表。URL 是用共享 token 加密的 access key，
+  daemon 重開就全部失效，帳號登出之後 core 照樣拒（/docs/design/rpc-specs/data-plane.md §2）。
 - **第 6 點：縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（/docs/design/rpc-specs/local-interface.md §8 的 1 MiB 規則），
-  還是發一張涵蓋多個資源的 token？後者違反「一張 token 一個資源」，要想清楚再定。
+  還是發一個涵蓋多個資源的 URL？後者違反「一個 URL 一個資源」，要想清楚再定。
 - **第 7 點：RPC 還是 uniffi**（這份文件假設 RPC）：
   📎 **Desktop 一旦走 web，這題實質上倒向 RPC**——web 前端沒有別的路。uniffi 只剩 Android 用得上。
   RPC 的**唯一**硬理由是**程序隔離＝安全隔離**——UI 要解圖片、解影片，那是 CVE 大戶；

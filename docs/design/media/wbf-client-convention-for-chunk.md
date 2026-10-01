@@ -208,7 +208,7 @@ client 的規則：
 - 上傳完到送出前的空窗：媒體計數是 0，靠保護期撐著；保護期是 server 的設定，client 不假設它多長，**上傳完就盡快送**，不要先上傳一堆再慢慢寫訊息。
 
 `wbf-sdk` 的落點：`protocol::send_event`／`SendRequest`、`WbfClient::send_event`。
-還沒做：matrix-sdk 那條（HTTP）還不帶 `X-Wbf-Attachments`；加密房的附件還沒接（/docs/design/keys/e2ee-rpc.md §8）。
+加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5、§6）：宣告跟密文同一個 `Event/Send`。還沒做：matrix-sdk 那條（HTTP）還不帶 `X-Wbf-Attachments`。
 
 ## 6. 串流上傳（大小未知）
 

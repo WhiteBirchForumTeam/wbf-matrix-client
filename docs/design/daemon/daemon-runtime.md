@@ -420,10 +420,10 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 ### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13）
 
 **媒體的 bytes 從來不經過 RPC 通道**，所以「一個 2 GB 上傳發上萬則 `progress`、把 `room.message` 擠掉」這個情境不存在。
-還沒做：daemon 的資料平面 HTTP（下面的 PUT／GET）；現在只有路徑版的 method。
+上傳的 PUT 做了（/docs/design/rpc-specs/data-plane.md）；讀的 GET 還沒。
 
 ```
-上傳：UI ──HTTP PUT chunk──> daemon ──組裝、加密──> homeserver
+上傳：UI ──HTTP PUT bytes──> daemon ──切塊、加密──> homeserver
       ⭐ 進度 = UI 自己那個 HTTP 請求送出去多少，🚫 不是 daemon 推回來的數字
 
 下載：UI ──HTTP GET──> daemon ──向 homeserver 要 chunk──> 邊拿邊吐給 UI

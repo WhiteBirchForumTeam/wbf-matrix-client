@@ -20,11 +20,19 @@ blake3 = "1"
 getrandom = "0.2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# 資料平面 URL 裡的 access key（/docs/design/rpc-specs/data-plane.md §2）；跟 wbf-sdk 目錄名的 Base58 同一份。
+bs58 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs"] }
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
+# 資料平面的 HTTP（/docs/design/rpc-specs/data-plane.md）：hyper 本來就在依賴樹裡（reqwest），這裡只多開 server 那半。
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -153,7 +153,7 @@ impl<C: PackChannel> WbfClient<C> {
             let sealed = file_cipher.seal_chunk(index, plain)?;
             let is_last = index + 1 == total;
             match self
-                .send_one_chunk(state.upload_id, index, sealed, is_last)
+                .send_chunk(state.upload_id, index, sealed, is_last)
                 .await
             {
                 Ok(ack) => {
@@ -241,7 +241,7 @@ impl<C: PackChannel> WbfClient<C> {
             file_size += pending.len() as u64;
             let sealed = file_cipher.seal_chunk(index, &pending)?;
             let ack = self
-                .send_one_chunk(state.upload_id, index, sealed, is_last)
+                .send_chunk(state.upload_id, index, sealed, is_last)
                 .await?;
             index += 1;
             on_progress(index, None);
@@ -290,8 +290,17 @@ impl<C: PackChannel> WbfClient<C> {
         })
     }
 
-    /// 一塊的請求：seq 是塊索引，不走 `call` 的計數器。`Corrupt` 重送一次（wbfuwunel 的 /docs/design/chunked-upload-spec.md §5）。
-    async fn send_one_chunk(
+    /// 送一塊（已經 `seal_chunk` 過的）：seq 是塊索引，不走 `call` 的計數器。`Corrupt` 重送一次（wbfuwunel 的 /docs/design/chunked-upload-spec.md §5）。
+    /// 給「一塊借一次線」的呼叫者（core 的資料平面上傳：整個上傳握著線，別的上傳就得等它傳完）。
+    ///
+    /// Args:
+    ///     upload_id: `Create` 回的, example: 7
+    ///     index: 塊索引, example: 0
+    ///     is_last: 固定大小是 `index + 1 == chunk_count`；串流是「讀到 EOF 了」
+    /// Return:
+    ///     Ok(ChunkAck)      `received` 是 server 下一塊要的索引
+    ///     Err(SdkError)     `Server`（`OutOfOrder` 的 meta 帶 `expected_seq`、`Truncated`…）、`Network`
+    pub async fn send_chunk(
         &mut self,
         upload_id: u64,
         index: u32,

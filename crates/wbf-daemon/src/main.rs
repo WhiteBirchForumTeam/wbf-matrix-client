@@ -12,8 +12,8 @@
         clippy::string_slice
     )
 )]
-//! `wbf-matrix-client-daemon`：只有 `-s`（常駐）。還沒做：單發命令（`daemon <命令>`，/docs/design/overview/architecture-v2.md §0.2）、
-//! 資料平面（/docs/design/rpc-specs/local-interface.md §8）。
+//! `wbf-matrix-client-daemon`：只有 `-s`（常駐）：控制平面（RPC）與資料平面（/docs/design/rpc-specs/data-plane.md）兩個 port。
+//! 還沒做：單發命令（`daemon <命令>`，/docs/design/overview/architecture-v2.md §0.2）。
 //!
 //! 起動的順序照 /docs/design/rpc-specs/local-interface.md §3 的五步（前端寫 token → spawn → **daemon 宣告 ready** →
 //! 前端抹掉 token 檔 → 之後只在記憶體裡）。⭐ 這支負責的是第 3 步，而「宣告 ready」是**一個邊緣**，
@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use wbf_daemon::connection::EncryptionPolicy;
+use wbf_daemon::data_plane::{AccessKeys, DataServer};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::RpcKeys;
 use wbf_daemon::server::RpcServer;
@@ -53,6 +54,9 @@ struct Cli {
     /// RPC 的 port；0 就隨機，寫進 <data dir>/daemon.json
     #[arg(long, default_value_t = 0)]
     rpc_port: u16,
+    /// 資料平面（媒體 bytes 的 HTTP）的 port；0 就隨機，寫進 <data dir>/daemon.json
+    #[arg(long, default_value_t = 0)]
+    data_port: u16,
     /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）
     #[arg(long, env = "WBF_CONFIG")]
     config: Option<PathBuf>,
@@ -151,6 +155,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // 資料平面的 URL 也用同一份 token 導鑰（/docs/design/rpc-specs/data-plane.md §2），導完 token 就不留。
+    let access_keys = AccessKeys::from_token(&token);
     drop(token);
 
     let ready_path = cli.data_dir.join("daemon.json");
@@ -175,6 +181,7 @@ fn main() -> ExitCode {
         }
         let policy = EncryptionPolicy::enforced();
         let handle = Handle::new(&cli.data_dir, policy.clone(), settings);
+        handle.set_access_keys(access_keys);
 
         // 🚨 **`-s` 的第一件事：拿寫權**（/docs/design/overview/architecture-v2.md §0.2）。`-s` 就是「我要寫」的意思，
         // 所以🚫 不等到第一個寫請求才拿 —— 拿不到就不該啟動（fail closed）。
@@ -204,13 +211,20 @@ fn main() -> ExitCode {
             }
         };
         let rpc_port = server.local_addr().map(|addr| addr.port()).unwrap_or(0);
-        // 資料平面還沒有：data_port 先 0。
-        handle.set_ports(rpc_port, 0).await;
+        let data_server = match DataServer::bind(cli.data_port, handle.clone()).await {
+            Ok(data_server) => data_server,
+            Err(error) => {
+                eprintln!("cannot bind the data plane port: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let data_port = data_server.local_addr().map(|addr| addr.port()).unwrap_or(0);
+        handle.set_ports(rpc_port, data_port).await;
         // `instance` 是這次啟動的 UUID：port 會被重複使用、pid 會被回收，**它不會** ——
         // 前端拿它回答「我現在講話的還是剛才那一個 daemon 嗎」（維護者 2026-09-13）。
         let info = serde_json::json!({
             "rpc_port": rpc_port,
-            "data_port": 0,
+            "data_port": data_port,
             "pid": std::process::id(),
             "instance": handle.instance(),
         });
@@ -227,17 +241,17 @@ fn main() -> ExitCode {
             serde_json::json!({
                 "ready": true,
                 "rpc_port": rpc_port,
-                "data_port": 0,
+                "data_port": data_port,
                 "pid": std::process::id(),
                 "instance": handle.instance(),
             })
         );
-        eprintln!("listening on ws://127.0.0.1:{rpc_port}");
+        eprintln!("listening on ws://127.0.0.1:{rpc_port} (RPC) and http://127.0.0.1:{data_port} (data plane)");
         eprintln!(
             "ready; now shred {} (the daemon will not read it again)",
             token_path.display()
         );
-        server.run().await;
+        tokio::join!(server.run(), data_server.run());
         let _ = std::fs::remove_file(&ready_path);
         ExitCode::SUCCESS
     })

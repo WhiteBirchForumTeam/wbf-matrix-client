@@ -1,12 +1,14 @@
 //! wbf 帳號的房間（/docs/design/daemon/account-session.md §6）：沒有 matrix-sdk 的 Client，房間清單走橋（`JoinedRooms` ＋ 每房 `GetState` ＋ `m.direct`），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
 //!
-//! 加密房的文字走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）；加密房的**檔案**還送不了（加密附件沒接，/docs/design/keys/e2ee-rpc.md §8）。
+//! 加密房的訊息走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
+//! 路徑版的 `send_file` 還拒加密房（/docs/design/keys/e2ee-rpc.md §8）。
 //! ⚠️ 「加不加密」問的是**這一刻的狀態**（`GetState`），🚫 不用快取：過期的「沒加密」會把明文送進已經加密的房。
 
 use serde_json::Value;
 
 use wbf_sdk::chat::Conversation;
+use wbf_sdk::crypto_engine::OutgoingRoomEvent;
 use wbf_sdk::protocol::SendRequest;
 use wbf_sdk::room_state::{conversation_from_state, direct_peers_of_room, is_encryption_content};
 use wbf_sdk::Transport;
@@ -86,13 +88,47 @@ impl Core {
         options: &SendOptions,
     ) -> Result<String, CoreError> {
         let content = serde_json::json!({ "msgtype": "m.text", "body": body });
+        let encrypted = self.wbf_is_room_encrypted(account, room).await?;
+        self.wbf_send_message(account, room, encrypted, content, Vec::new(), options)
+            .await
+    }
+
+    /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
+    /// 附件在**同一個請求**裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2），加密房也一樣。
+    ///
+    /// Args:
+    ///     encrypted: 呼叫端剛問過的 [`Core::wbf_is_room_encrypted`]（送檔要先拿它核對區塊，所以由呼叫端問）
+    ///     content: 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
+    ///     attachments: 這則用到的 mxc, example: vec!["mxc://localhost/1122334455667788".into()]
+    ///     options: 加密房要 `room_devices`；`txn_id` 重送用, example: &SendOptions::default()
+    /// Return:
+    ///     Ok(String)                 event_id
+    ///     Err(Usage)                 加密房但沒帶 `room_devices`
+    ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
+    ///     Err(Server)                `Conflict`：某個附件 mxc 不是本站的、找不到、不是自己傳的、或有墓碑
+    pub(crate) async fn wbf_send_message(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        encrypted: bool,
+        content: Value,
+        attachments: Vec<String>,
+        options: &SendOptions,
+    ) -> Result<String, CoreError> {
         let txn_id = match &options.txn_id {
             Some(txn_id) => txn_id.clone(),
             None => wbf_sdk::protocol::new_txn_id()?,
         };
-        if !self.wbf_is_room_encrypted(account, room).await? {
+        if !encrypted {
             return self
-                .wbf_send_event(account, room, "m.room.message", content, Vec::new(), txn_id)
+                .wbf_send_event(
+                    account,
+                    room,
+                    "m.room.message",
+                    content,
+                    attachments,
+                    txn_id,
+                )
                 .await;
         }
         let Some(devices) = &options.room_devices else {
@@ -104,11 +140,17 @@ impl Core {
                 ),
             ));
         };
-        self.wbf_send_encrypted(account, room, "m.room.message", content, devices, txn_id)
+        let message = OutgoingRoomEvent {
+            event_type: "m.room.message".to_string(),
+            content,
+            txn_id,
+            attachments,
+        };
+        self.wbf_send_encrypted(account, room, message, devices)
             .await
     }
 
-    /// 這個房間現在加密了就拒絕：送檔還沒有加密那條（加密附件是另一件事），明文的 `Event/Send` 不該進加密房。
+    /// 這個房間現在加密了就拒絕：**路徑版**的送檔（`send_file`）還沒有加密那條；加密房的附件走資料平面（`attachment_ops.rs`）。明文的 `Event/Send` 不該進加密房。
     ///
     /// Return:
     ///     Ok(())       沒加密
@@ -135,7 +177,7 @@ impl Core {
     /// Return:
     ///     Ok(bool)   true ＝ 有 `m.room.encryption` 而且形狀認得
     ///     Err(...)   問不到（線開不起來、server 拒）——🚫 不當成沒加密：不確定就不送明文
-    async fn wbf_is_room_encrypted(
+    pub(crate) async fn wbf_is_room_encrypted(
         &self,
         account: &AccountDir,
         room: &str,

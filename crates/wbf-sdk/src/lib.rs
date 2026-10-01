@@ -34,6 +34,7 @@
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，房間這一側唯一 `use matrix_sdk` 的地方（E2EE 引擎在 `crypto_engine`）。
 //! - `device_version`：裝置版本號與房間版本號（server 的 `wbf-room-device-version.md`）：成員清單怎麼讀、1506 之後跟誰重查、雜湊怎麼自己重算。
 //! - `to_device_state`：to-device 的 `cd_seq` 與待銷毀清單，落在 `m/`（/docs/design/keys/to-device-client.md §2、§4）。
+//! - `local_source`（feature `cache`）：這台機器上的原檔——UI 給的 `media.source_uri` 怎麼解、大小對得上才讀它（/docs/design/rpc-specs/data-plane.md §8.1）。
 //! - `crypto_engine`（feature `matrix`）：`OlmMachine` 只當狀態機用——to-device 推進去、`outgoing_requests` 走橋送出去、房間金鑰分給一群人（/docs/design/keys/e2ee-walkthrough.md §13）。
 
 pub mod account_dir;
@@ -55,6 +56,8 @@ pub mod error_code;
 pub mod event_json;
 pub mod incoming;
 pub mod link;
+#[cfg(feature = "cache")]
+pub mod local_source;
 pub mod login;
 pub mod manifest;
 #[cfg(feature = "cache")]

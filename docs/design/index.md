@@ -17,6 +17,7 @@
 |---|---|
 | [`/docs/design/rpc-specs/rpc-spec.md`](rpc-specs/rpc-spec.md) | 前端 ↔ daemon 的每一條 method、`params`／`result`、錯誤碼、推播 |
 | [`/docs/design/rpc-specs/local-interface.md`](rpc-specs/local-interface.md) | 本地介面：控制平面與資料平面兩個 port、token、每則訊息的加密、訊息形狀、閘門鏈 |
+| [`/docs/design/rpc-specs/data-plane.md`](rpc-specs/data-plane.md) | 資料平面怎麼用：用共享 token 加密的 URL、`PUT /upload`、上傳的兩步（HTTP 傳完 → RPC 帶 mxc 發訊息）、附件宣告、一般 Matrix 的傳統上傳、`GET /media` |
 | [`/docs/design/rpc-specs/wbf-cli-spec.md`](rpc-specs/wbf-cli-spec.md) | 命令列的命令、參數、輸出、exit code、狀態檔、conf 檔、驗收腳本 |
 
 ## `daemon/`：daemon 跑起來之後
