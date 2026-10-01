@@ -2,10 +2,10 @@
 //!
 //! | 這裡 | 別處 |
 //! |---|---|
-//! | access key（[`AccessKeys`]）：URL 裡那段，用共享 token 加密的上傳狀態 | `media.create` 鑄（`handle/media.rs`） |
+//! | URL 與 meta（[`AccessKeys`]）：URL 裡那段是共享 token 加密的「用途 ‖ mxc」，上傳狀態在 `Wbf-Upload-Meta` header | `media.create` 鑄（`handle/media.rs`） |
 //! | HTTP listener（[`DataServer`]）：路徑、Host、狀態碼、把 body 交給 core | 怎麼切塊、加密、上傳（`Core::receive_upload`） |
 //!
-//! 🚫 沒有 token 表、沒有 TTL（維護者 2026-09-30）：URL 自己帶著上傳的一切，daemon 解得開就是它發的；
+//! 🚫 沒有 token 表、沒有 TTL（維護者 2026-09-30）：URL 與 header 帶著上傳的一切，daemon 解得開就是它發的；
 //! 能活多久、要不要拒，是 server 的事。唯一的表是「正在收的上傳」，只活在那條連線的期間。🚫 這裡不印東西。
 
 use std::collections::HashSet;
@@ -15,6 +15,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use bytes::Bytes;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -34,20 +36,24 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::handle::Handle;
 use crate::message::code;
 
-/// 上傳的路徑前綴；後面接 access key（/docs/design/rpc-specs/data-plane.md §3）。
+/// 上傳的路徑前綴；後面接 URL key（/docs/design/rpc-specs/data-plane.md §3）。
 pub const UPLOAD_PATH: &str = "/upload/mxc/";
-/// access key 從共享 token 導鑰的 context（跟 RPC 的兩把分開，/docs/design/rpc-specs/local-interface.md §4）。
+/// PUT 時帶上傳狀態的 header（`media.create` 給，/docs/design/rpc-specs/data-plane.md §2）。
+pub const UPLOAD_META_HEADER: &str = "Wbf-Upload-Meta";
+/// 資料平面從共享 token 導鑰的 context（跟 RPC 的兩把分開，/docs/design/rpc-specs/local-interface.md §4）。
 const ACCESS_CONTEXT: &str = "wbf-matrix-client data plane v1";
-const ACCESS_AAD: &[u8] = b"wbf-data v1";
+const URL_AAD: &[u8] = b"wbf-data url v1";
+/// meta 的 AAD 後面再接 mxc：一份 meta 只配得上它那個 URL。
+const META_AAD: &[u8] = b"wbf-data meta v1 ";
 const NONCE_LEN: usize = 24;
-/// 加密模式：`e_` ＋ base58(nonce ‖ 密文)。
+/// 加密模式：`e_` ＋ 密文（URL 用 base58，header 用 base64url）。
 const ENCRYPTED_PREFIX: &str = "e_";
-/// 明文模式（`daemon.set_encryption` 關掉時）：`c_` ＋ base58(明文)。
+/// 明文模式（`daemon.set_encryption` 關掉時）：`c_` ＋ 同一段明文、不加密。
 const PLAIN_PREFIX: &str = "c_";
-/// 明文裡的第一個 byte：這把 key 是做什麼的。下載的 key 拿來上傳要被拒。
+/// URL 明文的第一個 byte：這個 URL 是做什麼的。下載的 URL 拿來上傳要被拒。
 const PURPOSE_UPLOAD: u8 = 0x01;
 
-/// 從共享 token 導出的那一把，只拿來封／開 access key。
+/// 從共享 token 導出的那一把，只拿來封／開資料平面的 URL 與 meta。
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AccessKeys {
     key: [u8; 32],
@@ -62,86 +68,40 @@ impl AccessKeys {
         }
     }
 
-    /// 一個上傳的 access key（URL 裡 `/upload/mxc/` 後面那段）。
+    /// 上傳 URL 裡 `/upload/mxc/` 後面那段：用途 ‖ mxc。
     ///
     /// Args:
-    ///     upload: `Core::create_upload` 回的（含檔案金鑰）
+    ///     mxc: example: "mxc://localhost/000000000000004d"
     ///     encrypted: daemon 現在是不是加密模式；是就 `e_`（token 加密），不是就 `c_`（明文、只給除錯）
     /// Return:
-    ///     Ok(String)       example: "e_3mJr7AoUXx2Wqd…"
-    ///     Err(CoreError)   OS 給不出亂數、序列化不了（`Io`）
-    pub fn to_upload_access(
-        &self,
-        upload: &UploadState,
-        encrypted: bool,
-    ) -> Result<String, CoreError> {
-        let mut plain = Zeroizing::new(vec![PURPOSE_UPLOAD]);
-        let json = Zeroizing::new(serde_json::to_vec(upload).map_err(|error| {
-            CoreError::new(
-                CoreErrorKind::Io,
-                format!("cannot serialise the upload: {error}"),
-            )
-        })?);
-        plain.extend_from_slice(&json);
-        if !encrypted {
-            return Ok(format!(
-                "{PLAIN_PREFIX}{}",
-                bs58::encode(&*plain).into_string()
-            ));
-        }
-        let mut nonce = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce).map_err(|error| {
-            CoreError::new(
-                CoreErrorKind::Io,
-                format!("no randomness for an access key: {error}"),
-            )
-        })?;
-        let sealed = XChaCha20Poly1305::new(&self.key.into())
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &plain,
-                    aad: ACCESS_AAD,
-                },
-            )
-            .map_err(|_| CoreError::new(CoreErrorKind::Io, "cannot seal an access key"))?;
-        let mut bytes = nonce.to_vec();
-        bytes.extend_from_slice(&sealed);
+    ///     Ok(String)       example: "e_3mJr7AoUXx2Wqd…"（約 100 個字元）
+    ///     Err(CoreError)   OS 給不出亂數（`Io`）
+    pub fn to_upload_url_key(&self, mxc: &str, encrypted: bool) -> Result<String, CoreError> {
+        let mut plain = vec![PURPOSE_UPLOAD];
+        plain.extend_from_slice(mxc.as_bytes());
+        let bytes = match encrypted {
+            true => self.seal(&plain, URL_AAD)?,
+            false => plain,
+        };
         Ok(format!(
-            "{ENCRYPTED_PREFIX}{}",
+            "{}{}",
+            prefix_of(encrypted),
             bs58::encode(bytes).into_string()
         ))
     }
 
-    /// 開一個上傳的 access key。
+    /// 開上傳 URL 那段。
     ///
     /// Args:
-    ///     access: URL 裡那段, example: "e_3mJr7AoUXx2Wqd…"
+    ///     url_key: URL 裡那段, example: "e_3mJr7AoUXx2Wqd…"
     ///     encryption_enforced: daemon 現在是不是加密模式；是的話 `c_` 一律不收（fail closed）
     /// Return:
-    ///     Some(UploadState)   這個 daemon 發的上傳 key
-    ///     None                不是我們發的、被改過、別的 daemon（token 不同）發的、用途不對、形狀不對、加密模式下的 `c_`
-    pub fn open_upload_access(
-        &self,
-        access: &str,
-        encryption_enforced: bool,
-    ) -> Option<UploadState> {
-        let plain = if let Some(encoded) = access.strip_prefix(ENCRYPTED_PREFIX) {
-            let bytes = bs58::decode(encoded).into_vec().ok()?;
-            let nonce = bytes.get(..NONCE_LEN)?;
-            let sealed = bytes.get(NONCE_LEN..)?;
-            Zeroizing::new(
-                XChaCha20Poly1305::new(&self.key.into())
-                    .decrypt(
-                        XNonce::from_slice(nonce),
-                        Payload {
-                            msg: sealed,
-                            aad: ACCESS_AAD,
-                        },
-                    )
-                    .ok()?,
-            )
-        } else if let Some(encoded) = access.strip_prefix(PLAIN_PREFIX) {
+    ///     Some(String)   mxc
+    ///     None           不是我們發的、被改過、別的 daemon（token 不同）發的、用途不對、形狀不對、加密模式下的 `c_`
+    pub fn open_upload_url_key(&self, url_key: &str, encryption_enforced: bool) -> Option<String> {
+        let plain = if let Some(encoded) = url_key.strip_prefix(ENCRYPTED_PREFIX) {
+            self.open(&bs58::decode(encoded).into_vec().ok()?, URL_AAD)?
+        } else if let Some(encoded) = url_key.strip_prefix(PLAIN_PREFIX) {
             if encryption_enforced {
                 return None;
             }
@@ -149,12 +109,112 @@ impl AccessKeys {
         } else {
             return None;
         };
-        let (purpose, json) = plain.split_first()?;
+        let (purpose, mxc) = plain.split_first()?;
         if *purpose != PURPOSE_UPLOAD {
             return None;
         }
-        serde_json::from_slice(json).ok()
+        String::from_utf8(mxc.to_vec()).ok()
     }
+
+    /// `Wbf-Upload-Meta` header 的值：整份上傳狀態（含檔案金鑰），加密時綁定它的 mxc。
+    ///
+    /// Args:
+    ///     upload: `Core::create_upload` 回的
+    ///     encrypted: 同 [`AccessKeys::to_upload_url_key`]
+    /// Return:
+    ///     Ok(String)       example: "e_Qk3v…"（base64url，約 450 個字元）
+    ///     Err(CoreError)   OS 給不出亂數、序列化不了（`Io`）
+    pub fn to_upload_meta(
+        &self,
+        upload: &UploadState,
+        encrypted: bool,
+    ) -> Result<String, CoreError> {
+        let json = Zeroizing::new(serde_json::to_vec(upload).map_err(|error| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("cannot serialise the upload: {error}"),
+            )
+        })?);
+        let encoded = match encrypted {
+            true => URL_SAFE_NO_PAD.encode(self.seal(&json, &meta_aad(&upload.mxc))?),
+            false => URL_SAFE_NO_PAD.encode(&*json),
+        };
+        Ok(format!("{}{encoded}", prefix_of(encrypted)))
+    }
+
+    /// 開 `Wbf-Upload-Meta`，而且它要是**這個 URL 的** meta。
+    ///
+    /// Args:
+    ///     meta: header 的值, example: "e_Qk3v…"
+    ///     mxc: 從 URL 開出來的那個, example: "mxc://localhost/000000000000004d"
+    ///     encryption_enforced: 同 [`AccessKeys::open_upload_url_key`]
+    /// Return:
+    ///     Some(UploadState)   這個 daemon 為這個 mxc 發的
+    ///     None                不是我們發的、被改過、是別的上傳的（mxc 對不上）、形狀不對、加密模式下的 `c_`
+    pub fn open_upload_meta(
+        &self,
+        meta: &str,
+        mxc: &str,
+        encryption_enforced: bool,
+    ) -> Option<UploadState> {
+        let json = if let Some(encoded) = meta.strip_prefix(ENCRYPTED_PREFIX) {
+            self.open(&URL_SAFE_NO_PAD.decode(encoded).ok()?, &meta_aad(mxc))?
+        } else if let Some(encoded) = meta.strip_prefix(PLAIN_PREFIX) {
+            if encryption_enforced {
+                return None;
+            }
+            Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).ok()?)
+        } else {
+            return None;
+        };
+        let upload: UploadState = serde_json::from_slice(&json).ok()?;
+        // 加密的已經被 AAD 綁住；明文的沒有，所以兩種都再對一次（A6：不靠上游記得綁）。
+        (upload.mxc == mxc).then_some(upload)
+    }
+
+    /// Return:
+    ///     Ok(Vec<u8>)      nonce(24) ‖ 密文
+    ///     Err(CoreError)   OS 給不出亂數、AEAD 底層回錯（`Io`）
+    fn seal(&self, plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, CoreError> {
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce).map_err(|error| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("no randomness for the data plane: {error}"),
+            )
+        })?;
+        let sealed = XChaCha20Poly1305::new(&self.key.into())
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad })
+            .map_err(|_| CoreError::new(CoreErrorKind::Io, "cannot seal for the data plane"))?;
+        let mut bytes = nonce.to_vec();
+        bytes.extend_from_slice(&sealed);
+        Ok(bytes)
+    }
+
+    /// Return:
+    ///     Some(明文)   解得開
+    ///     None         太短、被改過、別的鑰匙、AAD 對不上
+    fn open(&self, bytes: &[u8], aad: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        let nonce = bytes.get(..NONCE_LEN)?;
+        let sealed = bytes.get(NONCE_LEN..)?;
+        XChaCha20Poly1305::new(&self.key.into())
+            .decrypt(XNonce::from_slice(nonce), Payload { msg: sealed, aad })
+            .ok()
+            .map(Zeroizing::new)
+    }
+}
+
+fn prefix_of(encrypted: bool) -> &'static str {
+    match encrypted {
+        true => ENCRYPTED_PREFIX,
+        false => PLAIN_PREFIX,
+    }
+}
+
+fn meta_aad(mxc: &str) -> Vec<u8> {
+    let mut aad = META_AAD.to_vec();
+    aad.extend_from_slice(mxc.as_bytes());
+    aad
 }
 
 /// 正在收的上傳（server、上傳 id）：同一個上傳同時只收一條 PUT（兩條交錯送，串流的塊會亂）。只活在連線期間。
@@ -286,7 +346,25 @@ async fn route(
     let Some(keys) = handle.access_keys() else {
         return not_found();
     };
-    let Some(upload) = keys.open_upload_access(&access, handle.is_encryption_enforced()) else {
+    let enforced = handle.is_encryption_enforced();
+    let Some(mxc) = keys.open_upload_url_key(&access, enforced) else {
+        return not_found();
+    };
+    let Some(meta) = request
+        .headers()
+        .get(UPLOAD_META_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return error_reply(
+            StatusCode::BAD_REQUEST,
+            code::INVALID_PARAMS,
+            format!(
+                "missing the {UPLOAD_META_HEADER} header: send the headers media.create returned"
+            ),
+        );
+    };
+    // 開不開得了、是不是這個 URL 的：都不是就跟不認得的 URL 一樣 404（🚫 不分辨原因）。
+    let Some(upload) = keys.open_upload_meta(meta, &mxc, enforced) else {
         return not_found();
     };
     let Some(_receiving) = receiving.begin(&upload) else {
@@ -451,70 +529,116 @@ mod tests {
         }
     }
 
-    /// 同一把 token 封的開得回同一份上傳（含檔案金鑰）；每次封都不一樣（nonce 隨機），但都能重複開——URL 可以重用。
+    /// URL 只帶「用途 ‖ mxc」、短而且看不出是哪個檔；meta 開得回整份上傳（含檔案金鑰）。每次封都不一樣（nonce 隨機），都能重複開——URL 可以重用。
     #[test]
-    fn an_access_key_opens_back_to_the_same_upload_as_many_times_as_asked() {
+    fn the_url_carries_only_the_mxc_and_the_meta_carries_the_upload() {
         let keys = AccessKeys::from_token(&[7u8; 256]);
         let original = upload(7, Some(40));
-        let first = keys.to_upload_access(&original, true).unwrap();
-        let second = keys.to_upload_access(&original, true).unwrap();
-        assert!(first.starts_with("e_"), "{first}");
+        let first = keys.to_upload_url_key(&original.mxc, true).unwrap();
+        let second = keys.to_upload_url_key(&original.mxc, true).unwrap();
+        assert!(first.starts_with("e_") && first.len() < 120, "{first}");
         assert_ne!(first, second, "nonce 每次隨機");
-        for access in [&first, &first, &second] {
+        assert!(!first.contains("localhost"), "加密的 URL 看不出是哪個檔");
+        for url_key in [&first, &first, &second] {
             assert_eq!(
-                keys.open_upload_access(access, true),
-                Some(original.clone())
+                keys.open_upload_url_key(url_key, true),
+                Some(original.mxc.clone())
             );
         }
-        assert!(
-            !first.contains(&original.mxc) && !first.contains("localhost"),
-            "加密模式的 URL 看不出是哪個檔"
+        let meta = keys.to_upload_meta(&original, true).unwrap();
+        assert!(meta.starts_with("e_"), "{meta}");
+        assert_eq!(
+            keys.open_upload_meta(&meta, &original.mxc, true),
+            Some(original.clone())
+        );
+        assert_eq!(
+            keys.open_upload_meta(&meta, &original.mxc, true),
+            Some(original)
         );
     }
 
-    /// 不是這個 daemon 發的一律不認（A5：不是正面認得就拒）：別的 token、改過一個字、截斷、亂寫、別的前綴。
+    /// 一份 meta 只配得上它那個 URL：A 檔的 meta 配 B 檔的 URL 一律拒（加密模式靠 AAD，明文模式靠再對一次 mxc）。
     #[test]
-    fn a_key_that_this_daemon_did_not_issue_is_refused() {
+    fn a_meta_of_another_upload_does_not_fit_this_url() {
         let keys = AccessKeys::from_token(&[7u8; 256]);
-        let access = keys.to_upload_access(&upload(7, Some(40)), true).unwrap();
-        let other_daemon = AccessKeys::from_token(&[8u8; 256]);
-        assert_eq!(other_daemon.open_upload_access(&access, true), None);
+        let (a, b) = (upload(1, Some(40)), upload(2, Some(40)));
+        let meta_of_a = keys.to_upload_meta(&a, true).unwrap();
+        assert_eq!(keys.open_upload_meta(&meta_of_a, &b.mxc, true), None);
+        let plain_meta_of_a = keys.to_upload_meta(&a, false).unwrap();
+        assert_eq!(keys.open_upload_meta(&plain_meta_of_a, &b.mxc, false), None);
+        assert_eq!(
+            keys.open_upload_meta(&plain_meta_of_a, &a.mxc, false),
+            Some(a)
+        );
+    }
 
-        let mut tampered = access.clone().into_bytes();
+    /// 不是這個 daemon 發的一律不認（A5：不是正面認得就拒）：別的 token、改過一個字、截斷、亂寫、別的前綴、用途不對。
+    #[test]
+    fn what_this_daemon_did_not_issue_is_refused() {
+        let keys = AccessKeys::from_token(&[7u8; 256]);
+        let original = upload(7, Some(40));
+        let url_key = keys.to_upload_url_key(&original.mxc, true).unwrap();
+        let meta = keys.to_upload_meta(&original, true).unwrap();
+        let other_daemon = AccessKeys::from_token(&[8u8; 256]);
+        assert_eq!(other_daemon.open_upload_url_key(&url_key, true), None);
+        assert_eq!(
+            other_daemon.open_upload_meta(&meta, &original.mxc, true),
+            None
+        );
+
+        let mut tampered = url_key.clone().into_bytes();
         let last = tampered.len() - 1;
         tampered[last] = if tampered[last] == b'2' { b'3' } else { b'2' };
         let tampered = String::from_utf8(tampered).unwrap();
-        assert_eq!(keys.open_upload_access(&tampered, true), None);
+        assert_eq!(keys.open_upload_url_key(&tampered, true), None);
         assert_eq!(
-            keys.open_upload_access(&access[..access.len() - 5], true),
+            keys.open_upload_url_key(&url_key[..url_key.len() - 5], true),
+            None
+        );
+        assert_eq!(
+            keys.open_upload_meta(&meta[..meta.len() - 5], &original.mxc, true),
             None
         );
         for junk in ["", "e_", "e_0OIl", "x_abc", "../../etc/passwd", "e_111"] {
-            assert_eq!(keys.open_upload_access(junk, true), None, "{junk}");
+            assert_eq!(keys.open_upload_url_key(junk, true), None, "{junk}");
+            assert_eq!(
+                keys.open_upload_meta(junk, &original.mxc, true),
+                None,
+                "{junk}"
+            );
         }
 
-        // 用途不對（例如之後的下載 key）：解得開也不收。
+        // 用途不對（例如之後的下載 URL）：解得開也不收。
         let mut plain = vec![0x02];
-        plain.extend(serde_json::to_vec(&upload(7, Some(40))).unwrap());
+        plain.extend_from_slice(original.mxc.as_bytes());
         let wrong_purpose = format!("c_{}", bs58::encode(plain).into_string());
-        assert_eq!(keys.open_upload_access(&wrong_purpose, false), None);
+        assert_eq!(keys.open_upload_url_key(&wrong_purpose, false), None);
     }
 
     /// 明文模式（`c_`）只在 daemon 關掉加密時收；加密模式下拿 `c_` 來一律拒（fail closed）。
     #[test]
-    fn a_plain_key_is_taken_only_while_encryption_is_off() {
+    fn plain_keys_are_taken_only_while_encryption_is_off() {
         let keys = AccessKeys::from_token(&[7u8; 256]);
         let original = upload(9, None);
-        let plain = keys.to_upload_access(&original, false).unwrap();
-        assert!(plain.starts_with("c_"), "{plain}");
+        let url_key = keys.to_upload_url_key(&original.mxc, false).unwrap();
+        let meta = keys.to_upload_meta(&original, false).unwrap();
+        assert!(url_key.starts_with("c_") && meta.starts_with("c_"));
         assert_eq!(
-            keys.open_upload_access(&plain, false),
+            keys.open_upload_url_key(&url_key, false),
+            Some(original.mxc.clone())
+        );
+        assert_eq!(keys.open_upload_url_key(&url_key, true), None);
+        assert_eq!(
+            keys.open_upload_meta(&meta, &original.mxc, false),
             Some(original.clone())
         );
-        assert_eq!(keys.open_upload_access(&plain, true), None);
+        assert_eq!(keys.open_upload_meta(&meta, &original.mxc, true), None);
         // 加密的那種兩個模式都收。
-        let encrypted = keys.to_upload_access(&original, true).unwrap();
-        assert_eq!(keys.open_upload_access(&encrypted, false), Some(original));
+        let encrypted = keys.to_upload_url_key(&original.mxc, true).unwrap();
+        assert_eq!(
+            keys.open_upload_url_key(&encrypted, false),
+            Some(original.mxc)
+        );
     }
 
     /// 同一個上傳同時只收一條 PUT；guard 丟掉（PUT 怎麼結束都一樣，含 future 被 hyper 丟掉）就解除。

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wbf_daemon::connection::EncryptionPolicy;
-use wbf_daemon::data_plane::{AccessKeys, DataServer, UPLOAD_PATH};
+use wbf_daemon::data_plane::{AccessKeys, DataServer, UPLOAD_META_HEADER, UPLOAD_PATH};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::settings::Settings;
 use wbf_sdk::{Cipher, FileCipher, UploadState};
@@ -84,11 +84,15 @@ fn upload_of_nobody() -> UploadState {
     }
 }
 
-fn put_path_of(upload: &UploadState, encrypted: bool) -> String {
-    let access = AccessKeys::from_token(&TOKEN)
-        .to_upload_access(upload, encrypted)
-        .unwrap();
-    format!("{UPLOAD_PATH}{access}")
+/// `media.create` 會給的那一對：PUT 的路徑、`Wbf-Upload-Meta` 那一行 header（含結尾的 CRLF）。
+fn put_of(upload: &UploadState, encrypted: bool) -> (String, String) {
+    let keys = AccessKeys::from_token(&TOKEN);
+    let url_key = keys.to_upload_url_key(&upload.mxc, encrypted).unwrap();
+    let meta = keys.to_upload_meta(upload, encrypted).unwrap();
+    (
+        format!("{UPLOAD_PATH}{url_key}"),
+        format!("{UPLOAD_META_HEADER}: {meta}\r\n"),
+    )
 }
 
 /// 未解鎖一律 503（東西在，只是打不開）；解鎖之後：不是這個 daemon 發的 URL 404、方法不對 405、別的路徑 404。
@@ -96,22 +100,23 @@ fn put_path_of(upload: &UploadState, encrypted: bool) -> String {
 async fn locked_is_503_and_foreign_urls_paths_and_methods_are_told_apart() {
     let dir = tempfile::tempdir().unwrap();
     let (handle, port, _task) = start(dir.path()).await;
-    let path = put_path_of(&upload_of_nobody(), true);
+    let (path, meta) = put_of(&upload_of_nobody(), true);
+    let headers = format!("{meta}Content-Length: 0\r\n");
 
-    let (status, _, body) = send(port, "PUT", &path, "Content-Length: 0\r\n", b"").await;
+    let (status, _, body) = send(port, "PUT", &path, &headers, b"").await;
     assert_eq!(status, 503);
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["code"], 1001, "{body}");
 
     handle.core().await.create_vault(None).unwrap();
     let other_daemon = AccessKeys::from_token(&[8u8; 256])
-        .to_upload_access(&upload_of_nobody(), true)
+        .to_upload_url_key(&upload_of_nobody().mxc, true)
         .unwrap();
     let (status, _, _) = send(
         port,
         "PUT",
         &format!("{UPLOAD_PATH}{other_daemon}"),
-        "Content-Length: 0\r\n",
+        &headers,
         b"",
     )
     .await;
@@ -127,9 +132,38 @@ async fn locked_is_503_and_foreign_urls_paths_and_methods_are_told_apart() {
         "/media/mxc/e_abc",
         &path.replace("/mxc/", "/"),
     ] {
-        let (status, _, _) = send(port, "PUT", path, "Content-Length: 0\r\n", b"").await;
+        let (status, _, _) = send(port, "PUT", path, &headers, b"").await;
         assert_eq!(status, 404, "{path}");
     }
+}
+
+/// URL 只帶 mxc，上傳狀態在 `Wbf-Upload-Meta`：沒帶是 400（講清楚要帶什麼）；帶了別的上傳的 meta 跟不認得一樣 404。
+#[tokio::test]
+async fn the_meta_header_is_required_and_must_belong_to_the_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, port, _task) = start(dir.path()).await;
+    handle.core().await.create_vault(None).unwrap();
+    let (path, meta) = put_of(&upload_of_nobody(), true);
+
+    let (status, _, body) = send(port, "PUT", &path, "Content-Length: 40\r\n", &[0u8; 40]).await;
+    assert_eq!(status, 400);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["msg"].as_str().unwrap().contains(UPLOAD_META_HEADER),
+        "{body}"
+    );
+
+    let mut other = upload_of_nobody();
+    other.upload_id = 2;
+    other.mxc = "mxc://localhost/0000000000000002".into();
+    let (_, meta_of_other) = put_of(&other, true);
+    let headers = format!("{meta_of_other}Content-Length: 40\r\n");
+    let (status, _, _) = send(port, "PUT", &path, &headers, &[0u8; 40]).await;
+    assert_eq!(status, 404, "別的上傳的 meta 配不上這個 URL");
+
+    let headers = format!("{meta}Content-Length: 40\r\n");
+    let (status, _, _) = send(port, "PUT", &path, &headers, &[0u8; 40]).await;
+    assert_eq!(status, 400, "配得上就交給 core（這個帳號不在）");
 }
 
 /// DNS rebinding：網頁把自己的網域指到 127.0.0.1，瀏覽器送的 Host 是那個網域——一律 403，🚫 不看 URL。
@@ -138,42 +172,28 @@ async fn a_request_that_does_not_name_loopback_as_its_host_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (handle, port, _task) = start(dir.path()).await;
     handle.core().await.create_vault(None).unwrap();
-    let path = put_path_of(&upload_of_nobody(), true);
+    let (path, meta) = put_of(&upload_of_nobody(), true);
+    let headers = format!("{meta}Content-Length: 40\r\n");
     for host in ["evil.example", "evil.example:80", "127.0.0.1.evil.example"] {
-        let (status, _, _) = send_as(
-            host,
-            port,
-            "PUT",
-            &path,
-            "Content-Length: 40\r\n",
-            &[0u8; 40],
-        )
-        .await;
+        let (status, _, _) = send_as(host, port, "PUT", &path, &headers, &[0u8; 40]).await;
         assert_eq!(status, 403, "Host {host:?}");
     }
     for host in ["localhost", "LOCALHOST:1", "127.0.0.1", "[::1]:8080"] {
-        let (status, _, _) = send_as(
-            host,
-            port,
-            "PUT",
-            &path,
-            "Content-Length: 40\r\n",
-            &[0u8; 40],
-        )
-        .await;
+        let (status, _, _) = send_as(host, port, "PUT", &path, &headers, &[0u8; 40]).await;
         assert_ne!(status, 403, "Host {host:?}");
     }
 }
 
-/// 明文模式的 URL（`c_`）：加密模式下一律不收；`daemon.set_encryption` 關掉之後才收。
+/// 明文模式的 URL 與 meta（`c_`）：加密模式下一律不收；`daemon.set_encryption` 關掉之後才收。
 #[tokio::test]
 async fn a_plain_url_is_taken_only_while_encryption_is_off() {
     let dir = tempfile::tempdir().unwrap();
     let (handle, port, _task) = start(dir.path()).await;
     handle.core().await.create_vault(None).unwrap();
-    let path = put_path_of(&upload_of_nobody(), false);
+    let (path, meta) = put_of(&upload_of_nobody(), false);
     assert!(path.contains("/c_"), "{path}");
-    let (status, _, _) = send(port, "PUT", &path, "Content-Length: 40\r\n", &[0u8; 40]).await;
+    let headers = format!("{meta}Content-Length: 40\r\n");
+    let (status, _, _) = send(port, "PUT", &path, &headers, &[0u8; 40]).await;
     assert_eq!(status, 404, "加密模式下 c_ 等於不存在");
 
     let reply = handle
@@ -184,7 +204,7 @@ async fn a_plain_url_is_taken_only_while_encryption_is_off() {
         })
         .await;
     assert_eq!(reply.code, 0, "{}", reply.msg);
-    let (status, _, _) = send(port, "PUT", &path, "Content-Length: 40\r\n", &[0u8; 40]).await;
+    let (status, _, _) = send(port, "PUT", &path, &headers, &[0u8; 40]).await;
     assert_eq!(status, 400, "收了、交給 core（這個帳號不在）");
 }
 
@@ -195,9 +215,10 @@ async fn a_failed_put_leaves_the_url_usable_again() {
     let dir = tempfile::tempdir().unwrap();
     let (handle, port, _task) = start(dir.path()).await;
     handle.core().await.create_vault(None).unwrap();
-    let path = put_path_of(&upload_of_nobody(), true);
+    let (path, meta) = put_of(&upload_of_nobody(), true);
 
-    let (status, _, body) = send(port, "PUT", &path, "Content-Length: 39\r\n", &[0u8; 39]).await;
+    let headers = format!("{meta}Content-Length: 39\r\n");
+    let (status, _, body) = send(port, "PUT", &path, &headers, &[0u8; 39]).await;
     assert_eq!(status, 400);
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["code"], 102, "{body}");
@@ -209,9 +230,9 @@ async fn a_failed_put_leaves_the_url_usable_again() {
         "{body}"
     );
 
+    let headers = format!("{meta}Content-Length: 40\r\n");
     for _ in 0..2 {
-        let (status, _, body) =
-            send(port, "PUT", &path, "Content-Length: 40\r\n", &[0u8; 40]).await;
+        let (status, _, body) = send(port, "PUT", &path, &headers, &[0u8; 40]).await;
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status, 400, "{body}");
         assert!(

@@ -3,6 +3,7 @@
 ```
 http://127.0.0.1:<data port>
   PUT /upload/mxc/e_<base58>   UI → daemon：明文 bytes，daemon 邊收邊做 chunk 加密邊傳到 homeserver，傳完回 manifest
+                               ＋ header Wbf-Upload-Meta: e_<base64url>（上傳狀態）
   PUT /upload/mxc/c_<base58>   同上，明文模式（daemon.set_encryption 關掉時才收）
   GET /media/mxc/e_<base58>    daemon → UI：邊拉邊解密邊吐，支援 Range（還沒做，§8）
 ```
@@ -20,17 +21,18 @@ method 的總表在 /docs/design/rpc-specs/rpc-spec.md §3.6、§3.3；這份是
 1. **HTTP**：`media.create` 拿一個 PUT 的 URL → `PUT` bytes → 回應是 manifest（有 `mxc` 與含金鑰的區塊）。
 2. **RPC**：`room.send_attachment` 帶那份 manifest → daemon 組事件、送進房間。
 
-🚫 daemon **不替 UI 發訊息**，也🚫 **不記上傳**：上傳的狀態在 URL 裡（§2），傳完的東西在 UI 手上（manifest）。daemon 是連線的載體。
+🚫 daemon **不替 UI 發訊息**，也🚫 **不記上傳**：上傳的狀態在 PUT 的 header 裡（§2），傳完的東西在 UI 手上（manifest）。daemon 是連線的載體。
 
 ```
 UI                                   daemon                               homeserver
  │ RPC media.create {room,name,size}   │                                      │
  │────────────────────────────────────>│  Upload/Create（描述已加密）         │
  │                                     │─────────────────────────────────────>│
- │ {upload_id, mxc, url}               │<─────────────────────────────────────│
+ │ {upload_id, mxc, url, headers}      │<─────────────────────────────────────│
  │<────────────────────────────────────│                                      │
  │                                     │                                      │
  │ HTTP PUT /upload/mxc/e_… (bytes…)   │  Upload/Chunk × N（每塊各自加密）    │
+ │   Wbf-Upload-Meta: e_…              │                                      │
  │────────────────────────────────────>│─────────────────────────────────────>│
  │                                     │  Upload/Seal（最終描述）             │
  │ 200 manifest                        │─────────────────────────────────────>│
@@ -53,32 +55,49 @@ UI                                   daemon                               homese
 |---|---|---|
 | UI | 叫 `media.create`、PUT bytes、看 PUT 送出去多少當進度、拿 manifest 叫 `room.send_attachment` | — |
 | daemon 的 handle | 建檔之後把上傳狀態封進 URL | `crates/wbf-daemon/src/handle/media.rs`、`rooms.rs` |
-| daemon 的資料平面 | 開 URL（access key）、Host 檢查、狀態碼、把 body 交給 core | `crates/wbf-daemon/src/data_plane.rs` |
+| daemon 的資料平面 | 開 URL 與 meta、Host 檢查、狀態碼、把 body 交給 core | `crates/wbf-daemon/src/data_plane.rs` |
 | core | 建檔（決定加不加密）、收 bytes 切塊加密上傳、送附件事件（加密房先 Megolm） | `crates/wbf-core/src/attachment_ops.rs` |
 | sdk | `Upload/*` 的每一個請求、`FileCipher`、事件 content | `crates/wbf-sdk/src/upload.rs`、`chunk_crypto.rs`、`event_json.rs` |
 
 core 不知道 HTTP：bytes 從一個 `AsyncRead` 進來。建好的上傳（`UploadState`，**含檔案金鑰**）由呼叫端帶著、每一步交回來；
 core 每一步都**自己再核對**「這個上傳是不是這個帳號的」、「這份 manifest 是不是這台 server 的」，🚫 不靠 daemon 記得查。
 
-## 2. URL：用共享 token 加密的 access key（維護者 2026-09-30 定）
+## 2. URL 與 meta：都用共享 token 加密（維護者 2026-09-30 定）
+
+**URL 只帶「用途 ‖ mxc」**，上傳要的其他東西（含檔案金鑰）放在 PUT 的 header（維護者 2026-09-30）：
 
 ```
-access_key = "e_" + base58( nonce(24) ‖ XChaCha20-Poly1305(k_data, nonce, aad = "wbf-data v1", plain) )
-plain      = 用途(1 byte，上傳 = 0x01) ‖ UploadState 的 JSON
-k_data     = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
+URL   /upload/mxc/e_<base58( nonce(24) ‖ XChaCha20-Poly1305(k_data, aad = "wbf-data url v1", 用途(1) ‖ mxc) )>
+meta  Wbf-Upload-Meta: e_<base64url( nonce(24) ‖ XChaCha20-Poly1305(k_data, aad = "wbf-data meta v1 " ‖ mxc, UploadState JSON) )>
+k_data = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
 ```
 
+實際長相（2 GB 影片，`media.create` 回的）：
+
+```
+用途 ‖ mxc            0x01 ‖ mxc://localhost/000000000000004d                        → URL 那段約 100 個字元
+UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localhost","upload_id":77,
+                       "mxc":"mxc://localhost/000000000000004d","chunk_max_bytes":69632,
+                       "block":{"v":1,"cipher":"chacha20-poly1305","key":"<32 byte>","nonce_base":"<8 byte>",
+                       "chunk_size":65536,"file_size":2147483648,"name":"v.mkv","mimetype":"video/x-matroska"}}
+                                                                                     → header 約 500 個字元
+```
+
+- **為什麼 URL 用加密、不用 hash**：下載的 URL 要交給播放器，而播放器🚫 不能加 header——URL 自己要開得回 mxc。上傳下載同一套。
+- **meta 綁住它的 mxc**（AAD 接 mxc）：A 檔的 meta 配 B 檔的 URL 解不開；明文模式沒有 AAD，所以解開之後兩種都再對一次 mxc。
+- **header 名字** `Wbf-Upload-Meta`：用連字號（有些代理會丟掉名字帶底線的 header）、🚫 不加 `X-`（RFC 6648）。
+  `media.create` 直接回 `headers: { "Wbf-Upload-Meta": "…" }`，UI 照抄。
 - **共享 token** 就是 UI 產生、交給 daemon 的那份 `daemon.token`（/docs/design/rpc-specs/local-interface.md §3），RPC 的兩把鑰也從它導出；
   資料平面的這把用另一個 context，跟 RPC 的分開。
 - **daemon 解得開就是它發的**：🚫 沒有 token 表、🚫 沒有 TTL。上傳能活多久、要不要拒，是 server 的事（維護者 2026-09-30：
   「daemon 應該是更純的連線載體」）。
-- **URL 可以重用**：同一個 URL 可以一直 PUT（續傳，§4.3）；nonce 每次隨機，所以同一個上傳鑄兩次會得到兩個不同但都有效的 URL。
-- **URL 看不出是哪個檔**：mxc、帳號、檔名、檔案金鑰都在密文裡。它會進播放器與 HTTP 元件的 log，那些 log 只看得到一串 base58。
-- **失效的時候**：daemon 重開（UI 每次重新產生 token，舊 URL 就解不開了）、帳號登出（core 那邊沒有 session，照樣拒）。
-- **用途**寫在密文裡：之後下載的 URL（§8）拿來上傳會被拒。
-- 認不得的 URL（別的 token 發的、被改過一個字、用途不對、形狀不對）一律 **404**，🚫 不分辨原因。
-- **明文模式**：`daemon.set_encryption { enforced: false }`（除錯用，/docs/design/rpc-specs/rpc-spec.md §3.1）時 `media.create` 發 `c_` ＋ base58(plain)。
-  加密模式下拿 `c_` 來一律 404（fail closed）；加密的 `e_` 兩個模式都收。
+- **可以重用**：同一組 URL 與 meta 可以一直 PUT（續傳，§4.3）；nonce 每次隨機，所以同一個上傳鑄兩次會得到兩組不同但都有效的值。
+- **URL 看不出是哪個檔**：mxc 在密文裡。URL 會進播放器與 HTTP 元件的 log，那些 log 只看得到一串 base58；檔案金鑰只在 header。
+- **失效的時候**：daemon 重開（UI 每次重新產生 token，舊的就解不開了）、帳號登出（core 那邊沒有 session，照樣拒）。
+- **用途**寫在 URL 的密文裡：下載的 URL（§8）拿來上傳會被拒。
+- 認不得的 URL 或 meta（別的 token 發的、被改過一個字、用途不對、meta 不是這個 URL 的、形狀不對）一律 **404**，🚫 不分辨原因。沒帶 meta 是 **400**（講清楚要帶什麼）。
+- **明文模式**：`daemon.set_encryption { enforced: false }`（除錯用，/docs/design/rpc-specs/rpc-spec.md §3.1）時，URL 是 `c_` ＋ base58(用途 ‖ mxc)、
+  meta 是 `c_` ＋ base64url(JSON)，都不加密。加密模式下拿 `c_` 來一律 404（fail closed）；加密的 `e_` 兩個模式都收。
 - **Host 檢查**：Host 標頭不是 `127.0.0.1`、`localhost`、`[::1]`（帶不帶 port 都可以）一律 **403**。擋的是 DNS rebinding：
   網頁把自己的網域指到 127.0.0.1 之後，瀏覽器送的 Host 是那個網域。
 - **未解鎖一律 503**：東西在，只是現在打不開（/docs/design/rpc-specs/local-interface.md §5）。
@@ -92,9 +111,9 @@ k_data     = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
 
 | 方法 | 路徑 | 狀況 |
 |---|---|---|
-| `PUT` | `/upload/mxc/<access key>` | §4 |
-| 其他方法 | `/upload/mxc/<access key>` | **405**，`Allow: PUT` |
-| `GET` | `/media/mxc/<access key>` | 還沒做（§8），現在是 404 |
+| `PUT` | `/upload/mxc/<URL key>`，帶 `Wbf-Upload-Meta` | §4 |
+| 其他方法 | `/upload/mxc/<URL key>` | **405**，`Allow: PUT` |
+| `GET` | `/media/mxc/<URL key>` | 還沒做（§8），現在是 404 |
 | 任何 | 其他路徑 | **404** |
 | 任何 | Host 不是 loopback | **403**（§2） |
 
@@ -108,7 +127,8 @@ k_data     = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
 → { "method": "media.create", "params": { "room": "!r:localhost", "name": "v.mkv", "size": 2147483648, "mimetype": "video/x-matroska" }, "id": 12 }
 ← { "code": 0, "msg": "ok", "id": 12, "result": {
       "upload_id": 77, "mxc": "mxc://localhost/000000000000004d",
-      "url": "http://127.0.0.1:51235/upload/mxc/e_3mJr7AoUXx2Wqd…" } }
+      "url": "http://127.0.0.1:51235/upload/mxc/e_3mJr7AoUXx2Wqd…",
+      "headers": { "Wbf-Upload-Meta": "e_Qk3vT0…" } } }
 ```
 
 | params | 必要？ | example | 說明 |
@@ -133,10 +153,11 @@ k_data     = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
 - 一般 Matrix 帳號現在是 1100（§7）。
 - `upload_id` 給 `upload.status`／`upload.abort` 用；UI 送訊息用的是 PUT 回的 manifest（§5）。
 
-### 4.2 `PUT /upload/mxc/<access key>`
+### 4.2 `PUT /upload/mxc/<URL key>`
 
 | | |
 |---|---|
+| header | `Wbf-Upload-Meta`：`media.create` 回的 `headers` 照抄。沒帶 **400** |
 | body | 明文 bytes，**一條連線送到底**。`Content-Length` 或 chunked transfer 都可以 |
 | `Content-Length` | 有帶的話，固定大小的上傳必須**剛好等於** `size`，不然 **400**、🚫 不讀 body |
 | 回 | **200**，body 是 manifest（/docs/design/rpc-specs/wbf-cli-spec.md §5）。**回應在 `Seal` 之後才到**，所以 PUT 的回應就是「傳完了」 |
@@ -148,9 +169,9 @@ k_data     = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
 
 | 狀態碼 | 什麼時候 | body 的 `code` |
 |---|---|---|
-| **400** | body 比 `size` 短或長、`Content-Length` 對不上或不是數字、串流的 body 是空的、串流已經傳過又 PUT、上傳不是這個帳號的、找不到帳號 | 102（`Content-Length`）／1100 |
+| **400** | 沒帶 `Wbf-Upload-Meta`、body 比 `size` 短或長、`Content-Length` 對不上或不是數字、串流的 body 是空的、串流已經傳過又 PUT、上傳不是這個帳號的、找不到帳號 | 102（header、`Content-Length`）／1100 |
 | **403** | Host 不是 loopback | — |
-| **404** | 不是這個 daemon 發的 URL；帳號已經登出 | —／1012 |
+| **404** | 不是這個 daemon 發的 URL 或 meta；meta 不是這個 URL 的；帳號已經登出 | —／1012 |
 | **409** | 這個上傳已經有一條 PUT 在收 | 106 |
 | **502** | homeserver 拒絕、連不上、逾時；包括「這個上傳 server 那邊已經沒有了」（例如傳完之後又 PUT） | 1400／1300／1600 |
 | **503** | vault 還沒解鎖 | 1001 |
@@ -161,7 +182,7 @@ k_data     = BLAKE3 derive_key("wbf-matrix-client data plane v1", 共享 token)
 | 上一次 | 這一次 |
 |---|---|
 | 還在收 | **409** |
-| 固定大小、斷了 | **續傳**：UI 再送一次**整個** body；daemon 先問 server 收到第幾塊，收過的塊照讀（要算整檔 SHA-256）但🚫 不再送 |
+| 固定大小、斷了 | **續傳**：UI 用同一組 URL 與 header 再送一次**整個** body；daemon 先問 server 收到第幾塊，收過的塊照讀（要算整檔 SHA-256）但🚫 不再送 |
 | 串流、斷了 | **400**：server 不能續傳串流（新的 body 對不上已經在 server 的塊），重新 `media.create` |
 | 傳完了 | **502**：server 已經把這個上傳收掉。UI 手上的 manifest 就是結果，🚫 不必再問 |
 
@@ -259,21 +280,43 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 - 🚫 不能整檔讀進記憶體：`/upload` 一個請求送完整個檔，所以是「PUT 進來的 body 直接串流成 `/upload` 的 body」，daemon 手上只有一小段。
 - 這條路的檔案用的是 Matrix 標準格式，別的 Matrix client 看得懂；wbf 的分塊檔只有 wbf client 看得懂（/docs/design/media/wbf-client-convention-for-chunk.md §5）。
 
-## 8. 讀：`GET /media/mxc/<access key>`（還沒做）
+## 8. 讀：`GET /media/mxc/<URL key>`（還沒做；預定的設計）
 
-`media.open` 發一個讀的 URL（access key 的用途是「下載」），播放器／圖片元件直接拿 URL 發 `Range`。URL 可以重用，所以 seek 沒問題（§2）。
+下載🚫 不需要 header：播放器只吃 URL。daemon 拿 URL 開出來的 mxc **查自己的資料庫**就有其他一切。
+
+**URL**：跟上傳同一套（§2），用途是 `0x02`，明文多帶**是哪個帳號**：
+
+```
+/media/mxc/e_<base58( nonce ‖ XChaCha20-Poly1305(k_data, "wbf-data url v1", 0x02 ‖ mxid ‖ 0x00 ‖ mxc) )>
+```
+
+為什麼要帶帳號：`cache.db` 是**一台 server 一份、多個帳號共用**（/docs/design/storage/local-cache-db.md），哪個帳號看得到哪則事件記在
+`events_synced_log`。不帶帳號的話，daemon 在 GET 時就無從判斷「這個 URL 是替誰開的」，只能信任發 URL 那一刻的判斷——帳號登出、
+事件被藏起來之後 URL 照樣能用。帶了就能在**每一次 GET** 重新檢查（A5：不是正面認得就拒）。
+
+**`media.open { mxc }` 與每一次 GET 都做的事**：
+
+| 步 | 查什麼 | 在哪 |
+|---|---|---|
+| 1 | 這個 mxc 有沒有 `media` 列 | `media.mxc` |
+| 2 | 引用它的事件 | `event_media` → `events` |
+| 3 | 那些事件裡，**這個帳號看得到**的（有 `events_synced_log` 列、沒 `hidden`） | `events_synced_log` |
+| 4 | 從看得到的那則事件拿區塊（含檔案金鑰）；加密房用解密後的 `content_json` | `events.content_json` |
+| 5 | 有完整的快取就讀媒體池（64 KiB 段各自 AEAD，Range 直接 seek）；沒有就逐塊向 server 拉、解、切 | `media.pool_file`／`Download/Read` |
+
+- 任一步找不到 → `media.open` 回 1100、GET 回 404。🚫 不會因為「mxc 對得上」就給：檔案金鑰只從這個帳號看得到的事件拿。
+- `media` 表🚫 存金鑰（現在也沒有）：金鑰只在事件裡，事件的可見性就是金鑰的可見性。
 
 | | |
 |---|---|
-| 來源 | `media.open` 的 `url` |
 | 支援 | `Range: bytes=a-b`（單一 range）；沒 `Range` 就整檔 |
-| 回 | `200`（整檔）／`206 Partial Content`（有 Range）；`Content-Type` 是 manifest 的 mimetype，沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length` |
+| 回 | `200`（整檔）／`206 Partial Content`（有 Range）；`Content-Type` 是區塊的 mimetype，沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length` |
 | `416` | Range 超出檔尾 |
-| `404` | 不是這個 daemon 發的 URL |
+| `404` | 不是這個 daemon 發的 URL、或這個帳號（已經）看不到那個檔 |
 | `503` | 未解鎖 |
 | `502` | 從 server 拉塊失敗。⚠️ 半途失敗時 HTTP 已經回 200 了，只能斷連線 |
 
-- daemon 邊解密邊吐（快取裡有完整檔就讀媒體池的 64 KiB 段，沒有就逐塊向 server 拉），🚫 不整檔進記憶體。
+- URL 可以重用，播放器 seek 沒問題；daemon 邊解密邊吐，🚫 不整檔進記憶體。
 - 🚨 **上游慢下來的時候：停止送 bytes，但連線開著**（維護者 2026-09-13 定）。🚫 不回空回應（UI 會以為傳完了）、🚫 不斷線（UI 會以為失敗了）；
   拿不到才斷，還在拿就等。🚫 逾時不要設得比 homeserver 的慢速還短。
 - 下載進度就是這個 GET 收到多少 bytes，🚫 不走 RPC。
@@ -313,7 +356,7 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | 項目 | 狀態 | 測試 |
 |---|---|---|
 | `media.create`、`PUT /upload/mxc/…`、`room.send_attachment`（wbf 帳號，明文房與加密房，固定大小與串流） | ✅ | core `attachment_ops::tests`、daemon `data_plane::tests` 與 `tests/data_plane.rs`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms` |
-| access key（`e_`／`c_`、別的 token 發的拒、被改過的拒、用途不對的拒）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
+| URL 與 meta（`e_`／`c_`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
 | 一般 Matrix 帳號的傳統上傳（§7） | ❌ 下一支 | |
 | `media.open`、`GET /media`（§8） | ❌ | |

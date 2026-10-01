@@ -266,9 +266,9 @@ http://127.0.0.1:<data port>/upload/mxc/e_<base58>
 http://127.0.0.1:<data port>/media/mxc/e_<base58>
 ```
 
-- `e_` 後面是用共享 token 加密的 access key，帶著這個資源要的一切（維護者 2026-09-30）：daemon 解得開就是它發的，🚫 不記、🚫 沒有 TTL。
+- `e_` 後面是用共享 token 加密的「用途 ‖ mxc」，上傳另外在 header 帶加密的上傳狀態（維護者 2026-09-30）：daemon 解得開就是它發的，🚫 不記、🚫 沒有 TTL。
 - **可以重複使用**。⚠️ 不能「用一次就失效」：播放器 seek 一次就是一次新的 Range 請求，一個影片會發幾十次。
-- access key **放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
+- 認得「是哪個資源」的那段**放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
   （Android 的 ExoPlayer 可以設，很多圖片元件不行）。任何吃 URL 的東西都能直接用。
 - 代價老實寫：URL 會進到那個元件自己的 log。它是一串密文，看不出是哪個檔；讀得到那份 log 的人在 daemon 活著的期間可以拿它抓檔。
 - 認不得的 URL：一律 **404**，🚫 不分辨原因（那會變成探測工具）。

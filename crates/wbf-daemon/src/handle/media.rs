@@ -14,11 +14,11 @@ use super::{
     invalid_params, parse_params, to_result, Fail, Handle, Outcome, TargetParams, TransportParam,
     DAEMON_NAME, DAEMON_VERSION,
 };
-use crate::data_plane::UPLOAD_PATH;
+use crate::data_plane::{UPLOAD_META_HEADER, UPLOAD_PATH};
 use crate::message::code;
 
 /// 資料平面的上傳第一步（/docs/design/rpc-specs/data-plane.md §4.1）：去 server 建檔、回一個 PUT 的 URL。
-/// URL 裡的 access key 帶著整個上傳狀態、用共享 token 加密，daemon 🚫 不另外記。
+/// URL 只帶「用途 ‖ mxc」；整個上傳狀態（含檔案金鑰）放進 `Wbf-Upload-Meta` header，兩者都用共享 token 加密，daemon 🚫 不另外記。
 /// 發訊息是 UI 在 PUT 回 manifest 之後另外叫的 `room.send_attachment`，🚫 不是這裡的事。
 pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
@@ -39,11 +39,14 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
     let upload = core
         .create_upload(&params.upload, &handle.target(&params.target))
         .await?;
-    let access = keys.to_upload_access(&upload, handle.is_encryption_enforced())?;
+    let encrypted = handle.is_encryption_enforced();
+    let url_key = keys.to_upload_url_key(&upload.mxc, encrypted)?;
+    let meta = keys.to_upload_meta(&upload, encrypted)?;
     Ok(json!({
         "upload_id": upload.upload_id,
         "mxc": upload.mxc,
-        "url": format!("http://127.0.0.1:{data_port}{UPLOAD_PATH}{access}"),
+        "url": format!("http://127.0.0.1:{data_port}{UPLOAD_PATH}{url_key}"),
+        "headers": { UPLOAD_META_HEADER: meta },
     }))
 }
 

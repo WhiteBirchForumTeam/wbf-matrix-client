@@ -537,12 +537,19 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     assert_eq!(created["code"], 0, "media.create: {created}");
     let mxc = created["result"]["mxc"].clone();
     let url = created["result"]["url"].as_str().unwrap().to_string();
-    assert!(url.contains("/upload/mxc/e_"), "{url}");
+    assert!(
+        url.contains("/upload/mxc/e_") && url.len() < 160,
+        "URL 只帶用途與 mxc：{url}"
+    );
+    assert!(
+        created["result"]["headers"]["Wbf-Upload-Meta"].is_string(),
+        "上傳狀態在 header：{created}"
+    );
     assert!(
         !url.contains(mxc.as_str().unwrap().trim_start_matches("mxc://")),
         "加密的 URL 看不出是哪個檔：{url}"
     );
-    let (status, manifest) = put(daemon.data_port, &created["result"]["url"], &body).await;
+    let (status, manifest) = put(daemon.data_port, &created["result"], &body).await;
     assert_eq!(status, 200, "{manifest}");
     assert_eq!(manifest["mxc"], mxc);
     assert_eq!(manifest["block"]["cipher"], "none", "明文房的附件是明文");
@@ -568,12 +575,12 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
         )
         .await;
     assert_eq!(created["code"], 0, "media.create: {created}");
-    let url = created["result"]["url"].clone();
-    let (status, manifest) = put(daemon.data_port, &url, &body).await;
+    let upload = created["result"].clone();
+    let (status, manifest) = put(daemon.data_port, &upload, &body).await;
     assert_eq!(status, 200, "{manifest}");
     assert_ne!(manifest["block"]["cipher"], "none", "加密房的附件要加密");
     assert!(manifest["block"]["key"].is_string());
-    let (status, again) = put(daemon.data_port, &url, &body).await;
+    let (status, again) = put(daemon.data_port, &upload, &body).await;
     assert_eq!(
         status, 502,
         "傳完的再 PUT 一次，server 那邊已經沒有這個上傳：{again}"
@@ -629,7 +636,7 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
         )
         .await;
     assert_eq!(created["code"], 0, "media.create: {created}");
-    let (status, manifest) = put(daemon.data_port, &created["result"]["url"], &body).await;
+    let (status, manifest) = put(daemon.data_port, &created["result"], &body).await;
     assert_eq!(status, 200, "{manifest}");
     assert_eq!(manifest["block"]["file_size"], body.len());
     let sent = client
@@ -643,13 +650,19 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     stop_daemon(daemon, client).await;
 }
 
-/// 裸 TCP 送一個 PUT（`Connection: close`，讀到 EOF）。
+/// 裸 TCP 送一個 PUT（`Connection: close`，讀到 EOF）：URL 與 header 照 `media.create` 回的。
 ///
 /// Return:
 ///     (u16, Value)   (狀態碼, JSON body)
-async fn put(port: u16, url: &Value, body: &[u8]) -> (u16, Value) {
+async fn put(port: u16, created: &Value, body: &[u8]) -> (u16, Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let url = url.as_str().unwrap();
+    let url = created["url"].as_str().unwrap();
+    let headers: String = created["headers"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| format!("{name}: {}\r\n", value.as_str().unwrap()))
+        .collect();
     let path = url
         .strip_prefix(&format!("http://127.0.0.1:{port}"))
         .unwrap_or_else(|| panic!("{url} is not on the data port {port}"));
@@ -657,7 +670,7 @@ async fn put(port: u16, url: &Value, body: &[u8]) -> (u16, Value) {
         .await
         .unwrap();
     let head = format!(
-        "PUT {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "PUT {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await.unwrap();
