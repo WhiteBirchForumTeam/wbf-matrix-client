@@ -531,7 +531,8 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     let created = client
         .call(
             "media.create",
-            json!({ "room": room, "name": "plain.bin", "size": body.len(), "mimetype": "application/octet-stream" }),
+            json!({ "room": room, "name": "plain.bin", "size": body.len(), "mimetype": "application/octet-stream",
+                     "source_uri": "file:///nowhere/plain.bin" }),
         )
         .await;
     assert_eq!(created["code"], 0, "media.create: {created}");

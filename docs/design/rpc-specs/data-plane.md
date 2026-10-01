@@ -142,6 +142,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 | `mimetype` | 選填 | `"video/x-matroska"` | |
 | `cipher` | 選填 | `"aes-256-gcm"` | 沒給用這台機器的預設；給了要跟房間對得上 |
 | `chunk_size` | 選填 | `65536` | 沒給：固定大小照檔案大小挑，串流用行動網路那一檔（小塊，斷了少重送） |
+| `source_uri` | 選填 | `"file:///home/me/v.mkv"` | 原檔在這台機器的位置，**URI**（§8.1）。意義由 UI 定，daemon 🚫 不驗；傳完記進 `media` 列，之後讀這個檔優先讀原檔 |
 | `user`／`server` | 選填 | | 哪個帳號（/docs/design/rpc-specs/rpc-spec.md §2） |
 
 **加不加密由房間決定**（/docs/design/media/wbf-client-convention-for-chunk.md §5.1），在建檔時就擋：
@@ -155,6 +156,8 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 - `size: 0` 是 1100：協議沒有零塊的上傳。
 - 一般 Matrix 帳號現在是 1100（§7）。
 - `upload_id` 給 `upload.status`／`upload.abort` 用；UI 送訊息用的是 PUT 回的 manifest（§5）。
+- `source_uri` 跟上傳狀態一起封在 `Wbf-Upload-Meta` 裡（§2），PUT 傳完（`Seal` 成功、而且 server 沒截斷）才寫進 `media` 列；
+  寫不進去只發一則提醒、PUT 照樣回 200（檔已經在 server 上了）。
 
 ### 4.2 `PUT /upload/mxc/<URL key>`
 
@@ -317,6 +320,34 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 
 - 下載進度就是這個 GET 收到多少 bytes，🚫 不走 RPC。
 
+### 8.1 路由：本機原檔優先（維護者 2026-10-01 定）
+
+讀一個 mxc 時，**先看 `media` 列有沒有 `source_uri`**——這台機器上傳它時 UI 給的原檔位置：
+
+```
+media 列在，而且 source_uri 不是空的
+  → 照下面的規則解成本機路徑 → 是一般檔、大小剛好等於 media.file_size → 直接讀原檔
+  → 任何一步不成立 → 當成「本機沒有原檔」，走上面那張表（池）
+```
+
+- **為什麼優先**：從池拿要先確認要的那一段下載了沒，很複雜；從原檔拿什麼都不用管——🚫 不觸發下載、🚫 不碰池、🚫 不動 DB（不 touch `last_used_at`、不發任何事件）。
+- **大小相同就信**：這是猜，不是驗證（🚫 不算 hash，大檔太貴）。原檔被改過但大小沒變，讀到的就是改過的內容——接受，原檔是使用者自己的。
+- **`source_uri` 一律是 URI**，意義由 UI 決定，daemon 只有猜的權力。解的規則（`wbf_sdk::local_source`）：
+
+| 寫法 | daemon 怎麼解 |
+|---|---|
+| `file:///home/me/v.mkv` | `/home/me/v.mkv` |
+| `file:///C:/Users/me/v.mkv` | Windows：`C:/Users/me/v.mkv`（去掉磁碟機代號前那個 `/`） |
+| `file:///Users/me/v.mkv`（在 Windows 上） | 路徑以 `/` 開頭、沒有磁碟機：**目前磁碟的根** |
+| `file://localhost/home/me/v.mkv` | 同第一列（host 是 `localhost` 等於空） |
+| `%20`、`%E5%BD%B1` 這類 | 照 RFC 3986 百分比解碼，結果要是 UTF-8 |
+| 裸路徑 `/home/me/v.mkv`、`C:\…`、相對路徑 | **非法**：當成本機沒有原檔 |
+| `file://server/share/…`（別的 host）、`file:/x`、百分比編碼壞、含 NUL | 同上 |
+| `content://…`（Android） | 同上；之後要支援得靠 NDK 那邊解，到時候再說 |
+
+- **約定**：UI 一律給 `file://` 開頭的 URI，🚫 不要直接給 `/絕對路徑`。daemon 🚫 不擋非法的值（`media.create` 照收、照記），只是讀的時候不走本機。
+- 只有**這台機器傳的**檔才有 `source_uri`；別人傳來的、或 UI 沒給的，一律走池。
+
 ## 9. 本機這一段的取捨：現在是明文（維護者 2026-09-30 定）
 
 UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 token 加密發的」。老實寫清楚這條線擋得住誰、擋不住誰：
@@ -355,6 +386,7 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
 | 一般 Matrix 帳號的傳統上傳（§7） | ❌ 下一支 | |
-| `media.open`、`GET /media`（§8，有快取讀池、沒快取先順序拉進池） | ❌ 下一支 | |
+| `media.open`、`GET /media`（§8，原檔優先、有快取讀池、沒快取先順序拉進池） | ❌ 下一支 | |
+| `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對（§8.1） | ✅（讀的那一端等 `GET /media`） | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
 | UI 指定從第幾 byte 續傳 | ❌ | |
 | 機密模式（§9） | ❌ 伏筆 | |

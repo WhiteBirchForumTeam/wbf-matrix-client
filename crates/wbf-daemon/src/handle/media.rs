@@ -14,7 +14,7 @@ use super::{
     invalid_params, parse_params, to_result, Fail, Handle, Outcome, TargetParams, TransportParam,
     DAEMON_NAME, DAEMON_VERSION,
 };
-use crate::data_plane::{UPLOAD_META_HEADER, UPLOAD_PATH};
+use crate::data_plane::{UploadMeta, UPLOAD_META_HEADER, UPLOAD_PATH};
 use crate::message::code;
 
 /// 資料平面的上傳第一步（/docs/design/rpc-specs/data-plane.md §4.1）：去 server 建檔、回一個 PUT 的 URL。
@@ -25,6 +25,9 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
     struct Params {
         #[serde(flatten)]
         upload: NewUpload,
+        /// 原檔在這台機器的位置，URI（/docs/design/rpc-specs/data-plane.md §8.1）。意義由 UI 定，daemon 🚫 不驗、只原樣帶著。
+        #[serde(default)]
+        source_uri: Option<String>,
         #[serde(flatten)]
         target: TargetParams,
     }
@@ -41,7 +44,13 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
         .await?;
     let encrypted = handle.is_encryption_enforced();
     let url_key = keys.to_upload_url_key(&upload.mxc, encrypted)?;
-    let meta = keys.to_upload_meta(&upload, encrypted)?;
+    let meta = keys.to_upload_meta(
+        &UploadMeta {
+            upload: upload.clone(),
+            source_uri: params.source_uri,
+        },
+        encrypted,
+    )?;
     Ok(json!({
         "upload_id": upload.upload_id,
         "mxc": upload.mxc,

@@ -25,6 +25,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::StreamReader;
 use wbf_core::{Core, CoreError, CoreErrorKind, Target};
@@ -52,6 +53,15 @@ const PLAIN_PREFIX: &str = "c-";
 const SEPARATOR: char = '_';
 /// URL 明文的第一個 byte：這個 URL 是做什麼的。下載的 URL 拿來上傳要被拒。
 const PURPOSE_UPLOAD: u8 = 0x01;
+
+/// `Wbf-Upload-Meta` 裡封的東西：上傳狀態，加上 UI 給的原檔位置（/docs/design/rpc-specs/data-plane.md §8.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadMeta {
+    pub upload: UploadState,
+    /// `media.create` 的 `source_uri`，原樣；daemon 不解它，傳完記進 `media` 列。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
+}
 
 /// 從共享 token 導出的那一把，只拿來封／開資料平面的 URL 與 meta。
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -99,26 +109,22 @@ impl AccessKeys {
         String::from_utf8(mxc.to_vec()).ok()
     }
 
-    /// `Wbf-Upload-Meta` header 的值：整份上傳狀態（含檔案金鑰），加密時綁定它的 mxc。
+    /// `Wbf-Upload-Meta` header 的值：整份上傳狀態（含檔案金鑰）與原檔位置，加密時綁定它的 mxc。
     ///
     /// Args:
-    ///     upload: `Core::create_upload` 回的
+    ///     meta: 上傳狀態是 `Core::create_upload` 回的；`source_uri` 是 UI 給的
     ///     encrypted: 同 [`AccessKeys::to_upload_url_key`]
     /// Return:
     ///     Ok(String)       example: "e-Hq3TbQ…_8Pz2Lw…"（約 520 個字元）
     ///     Err(CoreError)   OS 給不出亂數、序列化不了（`Io`）
-    pub fn to_upload_meta(
-        &self,
-        upload: &UploadState,
-        encrypted: bool,
-    ) -> Result<String, CoreError> {
-        let json = Zeroizing::new(serde_json::to_vec(upload).map_err(|error| {
+    pub fn to_upload_meta(&self, meta: &UploadMeta, encrypted: bool) -> Result<String, CoreError> {
+        let json = Zeroizing::new(serde_json::to_vec(meta).map_err(|error| {
             CoreError::new(
                 CoreErrorKind::Io,
                 format!("cannot serialise the upload: {error}"),
             )
         })?);
-        self.to_text(&json, &meta_aad(&upload.mxc), encrypted)
+        self.to_text(&json, &meta_aad(&meta.upload.mxc), encrypted)
     }
 
     /// 開 `Wbf-Upload-Meta`，而且它要是**這個 URL 的** meta。
@@ -128,18 +134,18 @@ impl AccessKeys {
     ///     mxc: 從 URL 開出來的那個, example: "mxc://localhost/000000000000004d"
     ///     encryption_enforced: 同 [`AccessKeys::open_upload_url_key`]
     /// Return:
-    ///     Some(UploadState)   這個 daemon 為這個 mxc 發的
+    ///     Some(UploadMeta)    這個 daemon 為這個 mxc 發的
     ///     None                不是我們發的、被改過、是別的上傳的（mxc 對不上）、形狀不對、加密模式下的 `c-`
     pub fn open_upload_meta(
         &self,
         meta: &str,
         mxc: &str,
         encryption_enforced: bool,
-    ) -> Option<UploadState> {
+    ) -> Option<UploadMeta> {
         let json = self.open_text(meta, &meta_aad(mxc), encryption_enforced)?;
-        let upload: UploadState = serde_json::from_slice(&json).ok()?;
+        let meta: UploadMeta = serde_json::from_slice(&json).ok()?;
         // 加密的已經被 AAD 綁住；明文的沒有，所以兩種都再對一次（A6：不靠上游記得綁）。
-        (upload.mxc == mxc).then_some(upload)
+        (meta.upload.mxc == mxc).then_some(meta)
     }
 
     /// Return:
@@ -351,26 +357,27 @@ async fn route(
         );
     };
     // 開不開得了、是不是這個 URL 的：都不是就跟不認得的 URL 一樣 404（🚫 不分辨原因）。
-    let Some(upload) = keys.open_upload_meta(meta, &mxc, enforced) else {
+    let Some(meta) = keys.open_upload_meta(meta, &mxc, enforced) else {
         return not_found();
     };
-    let Some(_receiving) = receiving.begin(&upload) else {
+    let Some(_receiving) = receiving.begin(&meta.upload) else {
         return error_reply(
             StatusCode::CONFLICT,
             code::BUSY,
             "this upload already has a PUT in progress",
         );
     };
-    put_upload(&handle, &core, &upload, request).await
+    put_upload(&handle, &core, &meta, request).await
 }
 
 /// 一個 PUT：body 是明文，一條連線送到底；回應在 `Seal` 之後才到，body 是 manifest（/docs/design/rpc-specs/data-plane.md §4）。
 async fn put_upload(
     handle: &Handle,
     core: &Core,
-    upload: &UploadState,
+    meta: &UploadMeta,
     request: Request<Incoming>,
 ) -> Reply {
+    let upload = &meta.upload;
     if let Err(message) = check_content_length(&request, upload.block.file_size) {
         return error_reply(StatusCode::BAD_REQUEST, code::INVALID_PARAMS, message);
     }
@@ -387,7 +394,7 @@ async fn put_upload(
     let mut body = StreamReader::new(frames);
     // ⚠️ 裝箱：matrix-sdk 的 future 很深，讓編譯器一路推 `Send` 會撞 E0275（遞迴上限）；handle 的 dispatch 也是這樣切的。
     let receiving: Pin<Box<dyn Future<Output = Result<Manifest, CoreError>> + Send + '_>> =
-        Box::pin(core.receive_upload(upload, &mut body, &target));
+        Box::pin(core.receive_upload(upload, &mut body, meta.source_uri.as_deref(), &target));
     match receiving.await {
         Ok(manifest) => manifest_reply(&manifest),
         Err(error) => core_error_reply(&error),
@@ -516,6 +523,13 @@ mod tests {
         }
     }
 
+    fn meta_of(upload: &UploadState) -> UploadMeta {
+        UploadMeta {
+            upload: upload.clone(),
+            source_uri: Some("file:///home/me/v.bin".into()),
+        }
+    }
+
     /// URL 只帶「用途 ‖ mxc」、短而且看不出是哪個檔；meta 開得回整份上傳（含檔案金鑰）。每次封都不一樣（nonce 隨機），都能重複開——URL 可以重用。
     #[test]
     fn the_url_carries_only_the_mxc_and_the_meta_carries_the_upload() {
@@ -535,15 +549,15 @@ mod tests {
                 Some(original.mxc.clone())
             );
         }
-        let meta = keys.to_upload_meta(&original, true).unwrap();
+        let meta = keys.to_upload_meta(&meta_of(&original), true).unwrap();
         assert!(meta.starts_with("e-"), "{meta}");
         assert_eq!(
             keys.open_upload_meta(&meta, &original.mxc, true),
-            Some(original.clone())
+            Some(meta_of(&original))
         );
         assert_eq!(
             keys.open_upload_meta(&meta, &original.mxc, true),
-            Some(original)
+            Some(meta_of(&original))
         );
     }
 
@@ -552,13 +566,13 @@ mod tests {
     fn a_meta_of_another_upload_does_not_fit_this_url() {
         let keys = AccessKeys::from_token(&[7u8; 256]);
         let (a, b) = (upload(1, Some(40)), upload(2, Some(40)));
-        let meta_of_a = keys.to_upload_meta(&a, true).unwrap();
+        let meta_of_a = keys.to_upload_meta(&meta_of(&a), true).unwrap();
         assert_eq!(keys.open_upload_meta(&meta_of_a, &b.mxc, true), None);
-        let plain_meta_of_a = keys.to_upload_meta(&a, false).unwrap();
+        let plain_meta_of_a = keys.to_upload_meta(&meta_of(&a), false).unwrap();
         assert_eq!(keys.open_upload_meta(&plain_meta_of_a, &b.mxc, false), None);
         assert_eq!(
             keys.open_upload_meta(&plain_meta_of_a, &a.mxc, false),
-            Some(a)
+            Some(meta_of(&a))
         );
     }
 
@@ -568,7 +582,7 @@ mod tests {
     fn the_meta_is_bound_to_its_mxc_by_the_aad_not_only_by_the_json() {
         let keys = AccessKeys::from_token(&[7u8; 256]);
         let (a, b) = (upload(1, Some(40)), upload(2, Some(40)));
-        let json_of_b = serde_json::to_vec(&b).unwrap();
+        let json_of_b = serde_json::to_vec(&meta_of(&b)).unwrap();
         let forged = keys.to_text(&json_of_b, &meta_aad(&a.mxc), true).unwrap();
         assert_eq!(keys.open_upload_meta(&forged, &b.mxc, true), None);
     }
@@ -579,7 +593,7 @@ mod tests {
         let keys = AccessKeys::from_token(&[7u8; 256]);
         let original = upload(7, Some(40));
         let url_key = keys.to_upload_url_key(&original.mxc, true).unwrap();
-        let meta = keys.to_upload_meta(&original, true).unwrap();
+        let meta = keys.to_upload_meta(&meta_of(&original), true).unwrap();
         let other_daemon = AccessKeys::from_token(&[8u8; 256]);
         assert_eq!(other_daemon.open_upload_url_key(&url_key, true), None);
         assert_eq!(
@@ -631,7 +645,7 @@ mod tests {
         let keys = AccessKeys::from_token(&[7u8; 256]);
         let original = upload(9, None);
         let url_key = keys.to_upload_url_key(&original.mxc, false).unwrap();
-        let meta = keys.to_upload_meta(&original, false).unwrap();
+        let meta = keys.to_upload_meta(&meta_of(&original), false).unwrap();
         assert!(url_key.starts_with("c-") && meta.starts_with("c-"));
         assert_eq!(
             keys.open_upload_url_key(&url_key, false),
@@ -640,7 +654,7 @@ mod tests {
         assert_eq!(keys.open_upload_url_key(&url_key, true), None);
         assert_eq!(
             keys.open_upload_meta(&meta, &original.mxc, false),
-            Some(original.clone())
+            Some(meta_of(&original))
         );
         assert_eq!(keys.open_upload_meta(&meta, &original.mxc, true), None);
         // 加密的那種兩個模式都收。

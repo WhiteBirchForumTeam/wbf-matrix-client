@@ -99,9 +99,14 @@ impl Core {
     /// 一塊借一次上傳線：整個檔握著線的話，另一個檔的 `create_upload` 就得等這個傳完。
     /// 固定大小可以續傳：同一個上傳再 PUT 一次整個 body，server 收過的塊照讀（整檔 SHA-256 要它們）但不再送。串流不能續傳。
     ///
+    /// 傳完之後，UI 有給原檔位置（`source_uri`）就記進這個 mxc 的 `media` 列（/docs/design/rpc-specs/data-plane.md §8.1）：
+    /// 之後讀這個檔，原檔在、大小對得上就直接讀它。🚫 不檢查 URI 解不解得了——意義是 UI 定的，讀的時候才猜。
+    /// 記不起來只發一則提醒、照樣回 manifest：檔已經在 server 上了，讓 PUT 失敗只會逼 UI 重傳一個已經 `Seal` 的檔。
+    ///
     /// Args:
     ///     upload: `create_upload` 回的那份
     ///     body: PUT 的 body
+    ///     source_uri: `media.create` 時 UI 給的, example: Some("file:///home/me/v.mkv")
     /// Return:
     ///     Ok(Manifest)   已 `Seal`；`block.sha256` 一定有
     ///     Err(Usage)     不是這個帳號的上傳、body 比 `size` 短或長、串流的 body 是空的
@@ -111,6 +116,7 @@ impl Core {
         &self,
         upload: &UploadState,
         body: &mut R,
+        source_uri: Option<&str>,
         target: &Target,
     ) -> Result<Manifest, CoreError> {
         let account = self.account_or_current(target)?;
@@ -136,10 +142,28 @@ impl Core {
             .seal_upload(upload, &final_block)
             .await?;
         if truncated {
+            // server 那份比原檔短：🚫 不記原檔，不然讀的人拿到的是 server 上沒有的後半段。
             self.events.progress(format!(
                 "warning: the server truncated {} at its size limit",
                 manifest.mxc
             ));
+        } else if let Some(source_uri) = source_uri {
+            // 走單一寫入者（server_cache.rs），🚫 不另開一條寫入連線。
+            let (manifest_here, source_uri) = (manifest.clone(), source_uri.to_string());
+            let remembered = match self.server_cache_and_me(&account) {
+                Ok((cache, _)) => {
+                    cache
+                        .run(move |cache| cache.media_remember_source(&manifest_here, &source_uri))
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = remembered {
+                self.events.progress(format!(
+                    "warning: {} is uploaded, but its local source could not be remembered: {error}",
+                    manifest.mxc
+                ));
+            }
         }
         Ok(manifest)
     }
@@ -559,7 +583,7 @@ mod tests {
     ) -> (UploadState, Manifest) {
         let state = core.create_upload(request, target).await.unwrap();
         let manifest = core
-            .receive_upload(&state, &mut &bytes[..], target)
+            .receive_upload(&state, &mut &bytes[..], None, target)
             .await
             .unwrap();
         (state, manifest)
@@ -582,7 +606,7 @@ mod tests {
         assert_ne!(state.block.cipher, Cipher::None, "加密房的附件要加密");
         assert!(state.block.key.is_some());
         let manifest = core
-            .receive_upload(&state, &mut &original[..], &target)
+            .receive_upload(&state, &mut &original[..], None, &target)
             .await
             .unwrap();
         assert_eq!(manifest.mxc, state.mxc);
@@ -732,7 +756,7 @@ mod tests {
             .await
             .unwrap();
         let short = core
-            .receive_upload(&state, &mut &original[..20], &target)
+            .receive_upload(&state, &mut &original[..20], None, &target)
             .await
             .unwrap_err();
         assert_eq!(short.kind, CoreErrorKind::Usage);
@@ -744,7 +768,7 @@ mod tests {
         );
 
         let manifest = core
-            .receive_upload(&state, &mut &original[..], &target)
+            .receive_upload(&state, &mut &original[..], None, &target)
             .await
             .unwrap();
         assert_eq!(
@@ -759,7 +783,7 @@ mod tests {
             .unwrap();
         let long = body(41);
         let refused = core
-            .receive_upload(&other, &mut &long[..], &target)
+            .receive_upload(&other, &mut &long[..], None, &target)
             .await
             .unwrap_err();
         assert!(
@@ -783,7 +807,7 @@ mod tests {
         assert_eq!(state.block.file_size, None);
         let empty: &[u8] = &[];
         let refused = core
-            .receive_upload(&state, &mut &empty[..], &target)
+            .receive_upload(&state, &mut &empty[..], None, &target)
             .await
             .unwrap_err();
         assert_eq!(refused.kind, CoreErrorKind::Usage, "空的串流沒有零塊的上傳");
@@ -825,7 +849,7 @@ mod tests {
             .unwrap();
         stolen.user_id = "@b:localhost".into();
         let refused = core
-            .receive_upload(&stolen, &mut &original[..], &target)
+            .receive_upload(&stolen, &mut &original[..], None, &target)
             .await
             .unwrap_err();
         assert!(
@@ -834,6 +858,46 @@ mod tests {
         );
         assert!(upload.uploads.lock().unwrap()[&2].chunks.is_empty());
         assert!(misc.sent_events.lock().unwrap().is_empty());
+    }
+
+    /// UI 給的原檔位置在傳完時記進 `media` 列（/docs/design/rpc-specs/data-plane.md §8.1）；🚫 不檢查它解不解得了——那是讀的時候的事。沒給就不建列。
+    #[tokio::test]
+    async fn the_local_source_is_remembered_once_the_upload_is_sealed() {
+        let dir = scratch("attach-source");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (_misc, _upload) = misc_and_upload(&core, &account, false).await;
+        let target = Target::default();
+        let original = body(40);
+
+        let state = core
+            .create_upload(&new_upload(Some(ROOM), Some(40)), &target)
+            .await
+            .unwrap();
+        let manifest = core
+            .receive_upload(
+                &state,
+                &mut &original[..],
+                Some("file:///home/me/v.bin"),
+                &target,
+            )
+            .await
+            .unwrap();
+        let (cache, _) = core.cache_and_me(&account).unwrap();
+        let entry = cache
+            .find_media(&manifest.mxc)
+            .unwrap()
+            .expect("傳完就有列");
+        assert_eq!(entry.source_uri.as_deref(), Some("file:///home/me/v.bin"));
+        assert_eq!(entry.file_size, 40);
+        assert_eq!(entry.name.as_deref(), Some("v.bin"));
+        assert!(!entry.complete, "池裡還沒有：只是記下原檔在哪");
+
+        let (_, without) =
+            uploaded(&core, &new_upload(Some(ROOM), Some(40)), &original, &target).await;
+        assert!(
+            cache.find_media(&without.mxc).unwrap().is_none(),
+            "沒給 source_uri 就不建列"
+        );
     }
 
     /// 串流不能續傳：server 已經收過塊的串流再 PUT，新 body 對不上舊的塊，拒絕（要重新 `create_upload`）。
@@ -846,7 +910,7 @@ mod tests {
 
         let (state, _) = uploaded(&core, &new_upload(None, None), &body(40), &target).await;
         let refused = core
-            .receive_upload(&state, &mut &body(40)[..], &target)
+            .receive_upload(&state, &mut &body(40)[..], None, &target)
             .await
             .unwrap_err();
         assert_eq!(refused.kind, CoreErrorKind::Usage);

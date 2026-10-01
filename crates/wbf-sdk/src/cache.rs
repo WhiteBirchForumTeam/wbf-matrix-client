@@ -28,8 +28,9 @@ use crate::incoming::{
 use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
-/// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改。
-const SCHEMA_VERSION: i64 = 5;
+/// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改；
+/// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）。
+const SCHEMA_VERSION: i64 = 6;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +108,9 @@ pub struct MediaEntry {
     pub bytes_on_disk: u64,
     pub created_at: i64,
     pub last_used_at: i64,
+    /// 這台機器上傳它時 UI 給的原檔位置（URI，例 `file:///home/me/v.mkv`）；None ＝ 不是從這裡傳的、或 UI 沒給。
+    /// ⚠️ 意義由 UI 決定，daemon 只能猜：讀的時候照 /docs/design/rpc-specs/data-plane.md §8.1 的規則解，解不了或大小不對就當不存在。
+    pub source_uri: Option<String>,
 }
 
 /// `forget_account` 的結果：清了什麼、哪些池檔已經沒人指、可以刪。
@@ -1008,7 +1012,7 @@ impl Cache {
     pub fn find_media(&self, mxc: &str) -> Result<Option<MediaEntry>, SdkError> {
         self.connection
             .query_row(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
                  FROM media WHERE mxc = ?1",
                 params![mxc],
                 media_entry_from_row,
@@ -1043,6 +1047,40 @@ impl Cache {
         transaction.commit().map_err(db_error)?;
         self.find_media(mxc)?
             .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished after insert")))
+    }
+
+    /// 這台機器剛傳完一個檔：建（或取）它的列、記下 UI 給的原檔位置（/docs/design/rpc-specs/data-plane.md §8.1）。
+    /// 列可能比事件早到（事件要等訂閱線推回來）：事件那邊是 `INSERT OR IGNORE`，不會蓋掉這裡的。
+    ///
+    /// Args:
+    ///     manifest: 剛 `Seal` 完的那份（列的檔名、大小、塊大小、sha256 都從它來）
+    ///     source_uri: UI 在 `media.create` 給的, example: "file:///home/me/v.mkv"
+    /// Return:
+    ///     Ok(())
+    ///     Err(Io)   DB 寫不了
+    pub fn media_remember_source(
+        &mut self,
+        manifest: &crate::manifest::Manifest,
+        source_uri: &str,
+    ) -> Result<(), SdkError> {
+        let block = &manifest.block;
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        media_row_id(
+            &transaction,
+            &manifest.mxc,
+            block.name.as_deref(),
+            block.mimetype.as_deref(),
+            block_hash(block.sha256.as_deref()).as_deref(),
+            manifest.file_size(),
+            block.chunk_size,
+        )?;
+        transaction
+            .execute(
+                "UPDATE media SET source_uri = ?2 WHERE mxc = ?1",
+                params![manifest.mxc, source_uri],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)
     }
 
     /// `media.id`：池裡暫存檔的名字（/docs/design/media/media-pool.md §2）。
@@ -1132,7 +1170,7 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
                  FROM media WHERE complete = 1 ORDER BY last_used_at ASC, mxc",
             )
             .map_err(db_error)?;
@@ -1147,7 +1185,7 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
                  FROM media WHERE complete = 0 AND chunks_written > 0 ORDER BY mxc",
             )
             .map_err(db_error)?;
@@ -1315,6 +1353,7 @@ fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry>
         bytes_on_disk: row.get::<_, i64>(9)? as u64,
         created_at: row.get(10)?,
         last_used_at: row.get(11)?,
+        source_uri: row.get(12)?,
     })
 }
 
@@ -1981,7 +2020,8 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                hash TEXT,
                file_size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
                chunks_written INTEGER NOT NULL, complete INTEGER NOT NULL, bytes_on_disk INTEGER NOT NULL,
-               created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+               created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
+               source_uri TEXT);
              CREATE INDEX media_lru ON media (last_used_at);
              CREATE INDEX media_by_pool_file ON media (pool_file) WHERE pool_file IS NOT NULL;
              CREATE TABLE event_media (

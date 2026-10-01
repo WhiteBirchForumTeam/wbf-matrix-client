@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wbf_daemon::connection::EncryptionPolicy;
-use wbf_daemon::data_plane::{AccessKeys, DataServer, UPLOAD_META_HEADER, UPLOAD_PATH};
+use wbf_daemon::data_plane::{AccessKeys, DataServer, UploadMeta, UPLOAD_META_HEADER, UPLOAD_PATH};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::settings::Settings;
 use wbf_sdk::{Cipher, FileCipher, UploadState};
@@ -88,7 +88,15 @@ fn upload_of_nobody() -> UploadState {
 fn put_of(upload: &UploadState, encrypted: bool) -> (String, String) {
     let keys = AccessKeys::from_token(&TOKEN);
     let url_key = keys.to_upload_url_key(&upload.mxc, encrypted).unwrap();
-    let meta = keys.to_upload_meta(upload, encrypted).unwrap();
+    let meta = keys
+        .to_upload_meta(
+            &UploadMeta {
+                upload: upload.clone(),
+                source_uri: None,
+            },
+            encrypted,
+        )
+        .unwrap();
     (
         format!("{UPLOAD_PATH}{url_key}"),
         format!("{UPLOAD_META_HEADER}: {meta}\r\n"),
