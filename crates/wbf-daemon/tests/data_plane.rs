@@ -128,8 +128,8 @@ async fn locked_is_503_and_foreign_urls_paths_and_methods_are_told_apart() {
         "/",
         "/upload/",
         "/upload/mxc/",
-        "/upload/mxc/e_abc",
-        "/media/mxc/e_abc",
+        "/upload/mxc/e-abc_def",
+        "/media/mxc/e-abc_def",
         &path.replace("/mxc/", "/"),
     ] {
         let (status, _, _) = send(port, "PUT", path, &headers, b"").await;
@@ -184,17 +184,17 @@ async fn a_request_that_does_not_name_loopback_as_its_host_is_refused() {
     }
 }
 
-/// 明文模式的 URL 與 meta（`c_`）：加密模式下一律不收；`daemon.set_encryption` 關掉之後才收。
+/// 明文模式的 URL 與 meta（`c-`）：加密模式下一律不收；`daemon.set_encryption` 關掉之後才收。
 #[tokio::test]
 async fn a_plain_url_is_taken_only_while_encryption_is_off() {
     let dir = tempfile::tempdir().unwrap();
     let (handle, port, _task) = start(dir.path()).await;
     handle.core().await.create_vault(None).unwrap();
     let (path, meta) = put_of(&upload_of_nobody(), false);
-    assert!(path.contains("/c_"), "{path}");
+    assert!(path.contains("/c-"), "{path}");
     let headers = format!("{meta}Content-Length: 40\r\n");
     let (status, _, _) = send(port, "PUT", &path, &headers, &[0u8; 40]).await;
-    assert_eq!(status, 404, "加密模式下 c_ 等於不存在");
+    assert_eq!(status, 404, "加密模式下 c- 等於不存在");
 
     let reply = handle
         .call(wbf_daemon::message::Request {

@@ -262,11 +262,11 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 **資料平面的認證：URL 本身就是憑證，🚫 沒有全域 token、🚫 沒有 token 表**（格式在 /docs/design/rpc-specs/data-plane.md §2）
 
 ```
-http://127.0.0.1:<data port>/upload/mxc/e_<base58>
-http://127.0.0.1:<data port>/media/mxc/e_<base58>
+http://127.0.0.1:<data port>/upload/mxc/e-<B58 nonce>_<B58 密文>
+http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 ```
 
-- `e_` 後面是用共享 token 加密的「用途 ‖ mxc」，上傳另外在 header 帶加密的上傳狀態（維護者 2026-09-30）：daemon 解得開就是它發的，🚫 不記、🚫 沒有 TTL。
+- `e-` 後面是用共享 token 加密的「用途 ‖ mxc」，上傳另外在 header 帶加密的上傳狀態（維護者 2026-09-30）：daemon 解得開就是它發的，🚫 不記、🚫 沒有 TTL。
 - **可以重複使用**。⚠️ 不能「用一次就失效」：播放器 seek 一次就是一次新的 Range 請求，一個影片會發幾十次。
 - 認得「是哪個資源」的那段**放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
   （Android 的 ExoPlayer 可以設，很多圖片元件不行）。任何吃 URL 的東西都能直接用。
@@ -277,7 +277,7 @@ http://127.0.0.1:<data port>/media/mxc/e_<base58>
 ```jsonc
 { "method": "media.open", "params": { "user": "…", "room": "…", "event_id": "$xyz" }, "id": 9 }
 { "code": 0, "msg": "ok", "id": 9, "result": {
-    "url": "http://127.0.0.1:51235/media/mxc/e_9f3aKq…",
+    "url": "http://127.0.0.1:51235/media/mxc/e-9f3aKq…_Lp7Wd…",
     "mimetype": "video/x-matroska", "size": 1073741824 } }
 ```
 

@@ -486,7 +486,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
 ///
 /// | 步驟 | 驗什麼 |
 /// |---|---|
-/// | 明文房：建檔 → PUT → 送附件（帶 manifest） | URL 是 `e_` 加密的、看不出 mxc；區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
+/// | 明文房：建檔 → PUT → 送附件（帶 manifest） | URL 是 `e-` 加密的、看不出 mxc；區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
 /// | 加密房：建檔 → PUT → 送附件（帶 `room_devices`） | 區塊有金鑰；送出去的是密文、附件在同一個請求宣告 |
 /// | 同一個 URL 傳完再 PUT 一次 | 🚫 不是 200：server 已經收掉這個上傳 |
 /// | `media.save_to` 那份 manifest | 從 server 拉回來、解開，跟 PUT 的 bytes 一樣 |
@@ -538,7 +538,7 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     let mxc = created["result"]["mxc"].clone();
     let url = created["result"]["url"].as_str().unwrap().to_string();
     assert!(
-        url.contains("/upload/mxc/e_") && url.len() < 160,
+        url.contains("/upload/mxc/e-") && url.len() < 160,
         "URL 只帶用途與 mxc：{url}"
     );
     assert!(

@@ -490,9 +490,9 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 
 ```jsonc
 → { "method": "media.create", "params": { "room": "!r:localhost", "name": "v.mkv", "size": 2147483648, "mimetype": "video/x-matroska" }, "id": 12 }
-← { "code": 0, "msg": "ok", "id": 12, "result": { "upload_id": 77, "mxc": "mxc://localhost/000000000000004d", "url": "http://127.0.0.1:51235/upload/mxc/e_3mJr7AoUXx2Wqd…" } }
+← { "code": 0, "msg": "ok", "id": 12, "result": { "upload_id": 77, "mxc": "mxc://localhost/000000000000004d", "url": "http://127.0.0.1:51235/upload/mxc/e-Hq3TbQ…_4kVn9s…", "headers": { "Wbf-Upload-Meta": "e-Hq3TbQ…_8Pz2Lw…" } } }
 
-   PUT http://127.0.0.1:51235/upload/mxc/e_3mJr7AoUXx2Wqd…   ← bytes 開始流；進度看這個 PUT 自己送出去多少
+   PUT http://127.0.0.1:51235/upload/mxc/e-Hq3TbQ…_4kVn9s…（帶 Wbf-Upload-Meta）   ← bytes 開始流；進度看這個 PUT 自己送出去多少
    …
    200，body 是 manifest（mxc、含金鑰的區塊）→ 傳完
 
