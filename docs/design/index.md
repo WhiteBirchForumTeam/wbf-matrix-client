@@ -66,6 +66,7 @@
 |---|---|
 | [`/docs/design/media/wbf-client-convention-for-chunk.md`](media/wbf-client-convention-for-chunk.md) | client 之間的約定：每塊怎麼加密、事件區塊、串流、seek |
 | [`/docs/design/media/media-pool.md`](media/media-pool.md) | 本地媒體池：整檔放進一個加密的池、配額與清理、池的檔案格式 |
+| [`/docs/design/media/media-download.md`](media/media-download.md) | 媒體下載（設計）：每帳號一條佇列、主檔順序寫、seek 暫存檔與 O(1) 位置表、池格式 v2、GET 的路由、斷點與原子性 |
 | [`/docs/design/media/wbf-client-vectors.json`](media/wbf-client-vectors.json) | 分塊約定的向量（sdk `tests/client_vectors.rs` 讀它） |
 
 ## `wire/`：線上格式的向量

@@ -299,16 +299,19 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 這跟媒體池原本的設計一致（/docs/design/media/media-pool.md §2）：池跟 `cache.db` 同層、同 server 的帳號共用、不分帳號、不要可見性——
 「拿得到 mxc 的人 server 就給他檔；可見性在事件那層擋過」。
 
-**兩段分開**：daemon ↔ homeserver 的下載**已經做好**（WS `Download/Info`＋`Read`，逐塊 AEAD 解密、順序 append 進媒體池、可續傳、
-整檔 SHA-256；`media.save_to` 就是它，真 server 驗過）。下一支只做 UI ↔ daemon 這段：
+**下載怎麼做的權威是 /docs/design/media/media-download.md**（維護者 2026-10-01 定）：每帳號一條下載佇列、一次順序拉一個檔進池的**主檔**；
+播放器 seek 到還沒拉到的地方，在同一條 `Download` 線上插隊拉那幾塊、順序 append 進 **seek 暫存檔**，用 O(1) 的位置表記位置；
+主檔追到時從暫存檔搬、不走網路；主檔完成就刪暫存檔。**每個檔都只被順序寫**。這裡只列 GET 由上往下找的來源（細節在 /docs/design/media/media-download.md §7.2）：
 
-| 情況 | 怎麼吐 | 要不要檔案金鑰 |
+| 先後 | 來源 | 要不要檔案金鑰 |
 |---|---|---|
-| 本地快取完整（`media.complete = 1`） | `wbf_sdk::media::open_cached(cache, pool, mxc)` 拿 `PoolReader`（明文位置的 `Read + Seek`，池用一把池金鑰、64 KiB 段各自 AEAD），seek 到 Range 起點吐明文 | 🚫 不要 |
-| 沒有快取 | 先用現成的順序下載（`media::fetch`）整檔拉進池，再照上一列吐。金鑰從引用這個 mxc 的事件拿（`event_media` → `events.content_json` 的區塊） | 要，從事件拿 |
+| 1 | 本機原檔（§8.1） | 🚫 不要 |
+| 2 | 池裡完整的主檔（`wbf_sdk::media::open_cached` → `PoolReader`，明文位置的 `Read + Seek`） | 🚫 不要（池金鑰） |
+| 3 | 主檔已寫的段（下載中） | 🚫 不要（池金鑰） |
+| 4 | seek 暫存檔（位置表裡有） | 🚫 不要（池金鑰） |
+| 5 | 現拉（seek）：`Download` 線插隊 `Read`，解開後存進暫存檔再吐 | 要，從事件拿（`event_media` → `events.content_json` 的區塊） |
 
-- 🚫 **沒快取時不做 seek**（維護者 2026-10-01：下載是順序的，seek 這部分很複雜）。大檔要等拉完才開始吐；之後要的話再談。
-- 快取完整之後，Range 就是對池檔 seek，播放器 seek 沒問題；URL 可以重用。daemon 邊解池的段邊吐，🚫 不整檔進記憶體。
+- URL 可以重用，播放器 seek 沒問題；daemon 邊讀邊吐，🚫 不整檔進記憶體。
 - mxc 屬於哪一份 `cache.db`（一台 server 一份）：用 mxc 的 server_name 對上本機帳號的網域；對不到就把幾份都找一遍。
 
 | | |
@@ -390,7 +393,7 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
 | 一般 Matrix 帳號的傳統上傳（§7） | ❌ 下一支 | |
-| `media.open`、`GET /media`（§8，原檔優先、有快取讀池、沒快取先順序拉進池） | ❌ 下一支 | |
+| `media.open`、`GET /media`、下載佇列、seek 暫存檔（§8，設計在 /docs/design/media/media-download.md） | ❌ 下一支 | |
 | `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對（§8.1） | ✅（讀的那一端等 `GET /media`） | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
 | UI 指定從第幾 byte 續傳 | ❌ | |
 | 機密模式（§9） | ❌ 伏筆 | |

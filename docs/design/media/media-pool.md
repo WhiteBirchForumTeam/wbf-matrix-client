@@ -73,8 +73,9 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 
 ## 6 先不做的
 
-- **串流與 seek 對著池讀**：之後 UI 要播中間一段，是對著池裡的完整檔 `Read + Seek`，不是對著分片；沒下載完的檔就先下載完（或只走 server 的 seek，不進池）。哪一種等 UI 那版再定。
-- **部分快取**（只存看過的那幾塊）：不做。檔要嘛完整、要嘛是續傳中的半成品。
+- **部分快取**（只存看過的那幾塊）：不做。檔要嘛完整、要嘛是續傳中的半成品（從第 0 段起連續）。
+- **seek**：已經設計好（維護者 2026-10-01，/docs/design/media/media-download.md）：主檔照舊只順序寫；seek 拉到的塊另外順序 append 進
+  旁邊的 seek 暫存檔、用位置表記位置，主檔追上時從那裡搬，完成就刪。上面那條「沒有部分快取」因此不變。
 
 ## 7 與下載管線的接法
 
@@ -84,6 +85,9 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 做法：`download.rs` 的 `read_and_open_chunk` 是 crate 內可見，`media::fetch` 用它逐塊拿；`WbfClient::download`（直接寫到 `Write`）留著給 `--no-cache` 與 `--token` 模式。三個模組的關係：`cache` 不知道池、`media_pool` 不知道 DB、下載管線不知道兩者，只有 `media.rs` 同時碰三者。
 
 ## 8 池的檔案格式（權威；`wbf-sdk::media_pool` 就是照這裡寫的，改這裡要換版本號）
+
+> ⚠️ 這是 **v1**（現在的程式）。**v2 已經設計好**（維護者 2026-10-01，/docs/design/media/media-download.md §4.1）：每段都寫滿、真實長度記在密文裡的 4 byte、
+> 沒有暫定段，所以檔長永遠可以驗算。v2 實作時取代這一節。
 
 **原理一句話**：對上層是一個完整的明文檔（`Write` 順序寫、`Read + Seek` 用明文位置讀）；落地時切成**固定 64 KiB 的明文段**各自 AEAD，因為段固定，任何明文位置都能用算術換成密文位置，不需要索引表。「整檔加密」講的是使用者看到的單位，不是密文不分段——gocryptfs（4 KiB）、Cryptomator（32 KiB）、age（64 KiB）都這樣。
 
