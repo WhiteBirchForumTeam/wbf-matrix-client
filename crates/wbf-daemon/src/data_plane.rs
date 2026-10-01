@@ -572,6 +572,18 @@ mod tests {
         );
     }
 
+    /// 加密的 meta 靠 AAD 綁住 mxc，不只靠解開後那次比對：一份「JSON 寫 B、但封的時候綁 A」的 meta 拿去配 B 的 URL 也開不了。
+    /// （daemon 自己發的 meta 兩邊一定一樣，所以只有直接用 `seal` 才造得出這種東西——這條就是單獨驗 AAD 那一層。）
+    #[test]
+    fn the_meta_is_bound_to_its_mxc_by_the_aad_not_only_by_the_json() {
+        let keys = AccessKeys::from_token(&[7u8; 256]);
+        let (a, b) = (upload(1, Some(40)), upload(2, Some(40)));
+        let json_of_b = serde_json::to_vec(&b).unwrap();
+        let sealed_for_a = keys.seal(&json_of_b, &meta_aad(&a.mxc)).unwrap();
+        let forged = format!("e_{}", URL_SAFE_NO_PAD.encode(sealed_for_a));
+        assert_eq!(keys.open_upload_meta(&forged, &b.mxc, true), None);
+    }
+
     /// 不是這個 daemon 發的一律不認（A5：不是正面認得就拒）：別的 token、改過一個字、截斷、亂寫、別的前綴、用途不對。
     #[test]
     fn what_this_daemon_did_not_issue_is_refused() {
