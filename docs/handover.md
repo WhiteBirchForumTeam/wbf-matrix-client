@@ -235,7 +235,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
-1. **資料平面的讀與 E2EE 收尾**：`media.open`／`GET /media`（原檔優先、有快取讀池、沒快取先順序拉進池，`/docs/design/rpc-specs/data-plane.md` §8）；
+1. **資料平面的讀與 E2EE 收尾**：下載佇列、`media.open`／`GET /media`、seek 暫存檔、池格式 v2（設計在 `/docs/design/media/media-download.md`）；
    官方 Matrix 的傳統上傳（§7）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
 2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
