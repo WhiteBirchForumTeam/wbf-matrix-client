@@ -1,206 +1,325 @@
-//! 媒體快取的接法（/docs/design/media/media-pool.md §3、§5、§7）：下載管線、儲存池（`media_pool`）與 `cache.db`（`cache`）三者怎麼一起動。
+//! 媒體快取的接法：下載的一個檔（[`MediaDownload`]）怎麼在主檔、seek 暫存檔與網路之間拿塊，加上配額清理與啟動掃描。
+//! 設計在 /docs/design/media/media-download.md（下載）與 /docs/design/media/media-pool.md §5（清理）。
 //!
-//! - `fetch`：快取有完整檔就從池開；沒有就邊下邊 append 進池，進度在記憶體、每 `PROGRESS_FLUSH` 快照一次到 DB，
-//!   中斷從上次快照的塊數續（檔截到那裡，之後的不信）。完成算 hash → adopt 進池（同 hash 去重）→ DB 寫齊。
+//! - [`MediaDownload`]：一個 mxc 的主檔（`PoolWriter`，池格式 v2）、seek 暫存檔（`SeekStore`）與 `Info` 驗過的參數。
+//!   主檔「往前一塊」先看 seek 暫存檔、沒有才上網拉；GET 要的塊先看本地（主檔已封的段、seek 暫存檔），沒有才現拉存進 seek 暫存檔。
+//!   **誰排隊、誰先、何時取消、DB 怎麼寫**不在這裡：那是 core 的下載 worker（`wbf_core::download_queue`）。
 //! - `collect_garbage`：配額 best effort、保護期內不刪、先刪檔再刪列、有人指著的池檔不刪（/docs/design/media/media-pool.md §5）。
-//! - `sweep`：啟動掃孤兒（DB 說有檔不在 → reset；pending 沒對應列 → 刪）。
+//! - `sweep`：掃孤兒（DB 說有檔但打不開 → reset；`pending/` 裡沒人認領、過期、不是池格式 v2 → 刪；沒人指著的完成檔 → 刪）。
 //!
-//! 這裡是三個模組唯一的交會點：`cache` 不知道池，`media_pool` 不知道 DB，下載管線不知道兩者。
+//! 這裡是池、seek 暫存檔、`cache.db` 與下載管線唯一的交會點：`cache` 不知道池，`media_pool` 不知道 DB，下載管線不知道兩者。
 
-use std::io::Write;
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::time::Duration;
+
+use zeroize::Zeroizing;
 
 use crate::cache::{Cache, MediaEntry};
 use crate::channel::PackChannel;
+use crate::chunk_crypto::{chunk_count, expected_plain_len};
 use crate::client::WbfClient;
+use crate::download::VerifiedTarget;
 use crate::error::SdkError;
 use crate::manifest::Manifest;
-use crate::media_pool::{MediaPool, PoolReader};
+use crate::media_pool::{Finished, MediaPool, PoolReader, PoolWriter, SEEK_SUFFIX};
+use crate::seek_store::SeekStore;
 
-/// 進度快照的間隔（/docs/design/media/media-pool.md §3：每 1–2 秒）。
+/// 進度快照的間隔（/docs/design/media/media-download.md §4.1：每 1.5 秒 fsync 一次並把段數寫回 DB）。
 pub const PROGRESS_FLUSH: Duration = Duration::from_millis(1500);
 /// /docs/design/media/media-pool.md §5 的預設。
 pub const DEFAULT_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PROTECT: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// `fetch` 回的：檔在池裡了，加上這次做了什麼。
-#[derive(Debug)]
-pub struct Fetched {
-    pub entry: MediaEntry,
-    pub outcome: FetchOutcome,
+/// 一個正在下載（或正在被 seek）的 mxc。只有下載 worker 握著它：主檔與 seek 暫存檔都只有一個寫入者。
+pub struct MediaDownload {
+    manifest: Manifest,
+    pending_name: String,
+    writer: PoolWriter,
+    /// seek 暫存檔：第一次 seek 才建；之前留下的（daemon 重開）在開檔時就接回來。
+    seek: Option<SeekStore>,
+    /// `Info` 驗過的參數：第一次要上網才問，之後每一塊都用它，🚫 不重問（/docs/design/media/media-download.md §3.2）。
+    target: Option<VerifiedTarget>,
+    file_size: u64,
+    chunk_size: u32,
+    chunk_count: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FetchOutcome {
-    /// 快取本來就有完整檔，沒碰網路。
-    CacheHit,
-    /// 這次下載的（`resumed_from` 是續傳起點的塊數，0 = 從頭）。
-    Downloaded { chunks: u32, resumed_from: u64 },
-}
+impl MediaDownload {
+    /// 開（續）這個 mxc 的主檔：有 pending 主檔就從檔案確定進度，沒有或不能續就從頭建（/docs/design/media/media-download.md §5.3）。
+    ///
+    /// Args:
+    ///     pool: 這台 server 的池
+    ///     pending_name: `cache.media_pending_name` 給的, example: "m12"
+    ///     manifest: 含 mxc 與區塊（檔案金鑰、`file_size`、`chunk_size`）
+    /// Return:
+    ///     Ok(MediaDownload)
+    ///     Err(Integrity)   區塊的 `file_size`／`chunk_size` 算不出塊數（0、或超過 u32）
+    ///     Err(Io)          主檔建不了
+    pub fn open(
+        pool: &MediaPool,
+        pending_name: &str,
+        manifest: &Manifest,
+    ) -> Result<MediaDownload, SdkError> {
+        let file_size = manifest.file_size();
+        let chunk_size = manifest.block.chunk_size;
+        let count = chunk_count(file_size, chunk_size)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                SdkError::Integrity(format!(
+                    "file_size {file_size} with chunk_size {chunk_size} gives no usable chunk count"
+                ))
+            })?;
+        let writer = match pool.resume_pending(pending_name, &manifest.mxc) {
+            Ok(writer) if writer.plain_len() <= file_size => writer,
+            // 不在、不是 v2、別人的、比檔還長（壞了）：從頭來。
+            _ => pool.create_pending(pending_name, &manifest.mxc)?,
+        };
+        let seek = match pool.seek_path(pending_name).exists() {
+            true => SeekStore::open(pool, pending_name, &manifest.mxc, chunk_size, count).ok(),
+            false => None,
+        };
+        Ok(MediaDownload {
+            manifest: manifest.clone(),
+            pending_name: pending_name.to_string(),
+            writer,
+            seek,
+            target: None,
+            file_size,
+            chunk_size,
+            chunk_count: count,
+        })
+    }
 
-/// 拿一個媒體：快取命中就直接回，沒有就下載進池。回來的 `entry.pool_file` 一定是 `Some`。
-///
-/// Args:
-///     manifest: 含 mxc、block（key、chunk_size、file_size、name、mimetype）
-///     on_progress: (已完成的塊, 總塊數)
-/// Return:
-///     Ok(Fetched)
-///     Err(Integrity)   某塊驗不過：這次下載中止、檔截回上次快照，下次續
-///     Err(Server／Network)  照下載管線的
-pub async fn fetch<C: PackChannel>(
-    client: &mut WbfClient<C>,
-    manifest: &Manifest,
-    cache: &mut Cache,
-    pool: &MediaPool,
-    on_progress: &mut (dyn FnMut(u32, u32) + Send),
-) -> Result<Fetched, SdkError> {
-    let block = &manifest.block;
-    let entry = cache.media_begin(
-        &manifest.mxc,
-        block.name.as_deref(),
-        block.mimetype.as_deref(),
-        block.sha256.as_deref(),
-        manifest.file_size(),
-        block.chunk_size,
-    )?;
-    if entry.complete {
-        // DB 說有：檔也要真的在、長度要對、校驗碼要跟這份 manifest 的區塊一致（/docs/design/media/media-pool.md §3「兩邊都問」；PR #14 審查 rumia 🟡1）。
-        // 任一不符就當沒快取，reset 後重下。
-        if cached_copy_matches(pool, &entry, manifest) {
-            cache.touch_media(&manifest.mxc)?;
-            return Ok(Fetched {
-                entry,
-                outcome: FetchOutcome::CacheHit,
-            });
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn chunk_count(&self) -> u32 {
+        self.chunk_count
+    }
+
+    /// 主檔下一塊要拉第幾塊：涵蓋「已寫的明文長度」那一點的塊（那塊在它之前的部分會丟掉）。
+    pub fn next_chunk(&self) -> u32 {
+        u32::try_from(self.writer.plain_len() / u64::from(self.chunk_size)).unwrap_or(u32::MAX)
+    }
+
+    /// 主檔已經收齊整個檔（還沒收尾）。
+    pub fn is_written(&self) -> bool {
+        self.writer.plain_len() == self.file_size
+    }
+
+    pub fn segments_written(&self) -> u64 {
+        self.writer.segments_written()
+    }
+
+    /// fsync 主檔（每 `PROGRESS_FLUSH` 一次）。
+    pub fn sync(&mut self) -> Result<(), SdkError> {
+        self.writer.sync()
+    }
+
+    /// 主檔往前一塊，**只用本地的**：下一塊在 seek 暫存檔就搬過來、不走網路（/docs/design/media/media-download.md §6.4）。
+    ///
+    /// Return:
+    ///     Ok(true)    搬了一塊
+    ///     Ok(false)   暫存檔沒有這一塊（或那一格解不開，已從位置表拿掉）：呼叫者上網拉
+    ///     Err(Io)     主檔寫不了
+    pub fn advance_from_seek_store(&mut self) -> Result<bool, SdkError> {
+        let index = self.next_chunk();
+        let Some(seek) = self.seek.as_mut() else {
+            return Ok(false);
+        };
+        let Some(plain) = seek.read(index)? else {
+            return Ok(false);
+        };
+        self.land(index, &plain)?;
+        Ok(true)
+    }
+
+    /// 主檔往前一塊，從 server 拉（`Download/Read`）。驗長度、用檔案金鑰解開；解不開重拉一次，還是不行就是壞檔。
+    ///
+    /// Return:
+    ///     Ok(())
+    ///     Err(Integrity)   `Info` 對不上區塊、或這一塊連兩次驗不過：整個檔當壞檔（fail closed）
+    ///     Err(Network)     線斷了：進度停在這裡，線回來之後從同一塊接著拉
+    ///     Err(Server)      server 拒絕（NotFound 等）
+    pub async fn advance_from_server<C: PackChannel>(
+        &mut self,
+        client: &mut WbfClient<C>,
+    ) -> Result<(), SdkError> {
+        let index = self.next_chunk();
+        let plain = self.read_from_server(client, index).await?;
+        self.land(index, &plain)
+    }
+
+    /// 第 `index` 塊，本地有就給：主檔已封的段、或 seek 暫存檔（/docs/design/media/media-download.md §7.2 第 3、4 列）。
+    ///
+    /// Return:
+    ///     Ok(Some(明文))   本地有
+    ///     Ok(None)         本地沒有：呼叫者現拉（`fetch_into_seek_store`）
+    ///     Err(Integrity)   塊號超出 chunk_count
+    ///     Err(Io)          主檔的段解不開
+    pub fn read_local_chunk(&mut self, index: u32) -> Result<Option<Zeroizing<Vec<u8>>>, SdkError> {
+        let (start, end) = self.chunk_range(index)?;
+        if end <= self.writer.sealed_plain_len() {
+            return Ok(Some(self.writer.read_sealed(start, end)?));
         }
-        cache.media_reset(&manifest.mxc)?;
-    }
-    let pending_name = cache
-        .media_pending_name(&manifest.mxc)?
-        .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished")))?;
-
-    // 續傳點：上次快照的塊數，而且塊大小要一樣（不一樣就等於沒得續）。檔截到那裡；截不了就從頭。
-    let chunk_size = block.chunk_size;
-    let resume_chunks = if entry.chunks_written > 0 && entry.chunk_size == chunk_size {
-        entry.chunks_written
-    } else {
-        0
-    };
-    let (mut writer, resumed_from) = match resume_chunks {
-        0 => (pool.create_pending(&pending_name)?, 0),
-        chunks => match pool.resume_pending(&pending_name, chunks * u64::from(chunk_size)) {
-            Ok(writer) => (writer, chunks),
-            Err(_) => (pool.create_pending(&pending_name)?, 0),
-        },
-    };
-    if resumed_from == 0 {
-        cache.media_progress(&manifest.mxc, 0, chunk_size)?;
+        match self.seek.as_mut() {
+            Some(seek) => seek.read(index),
+            None => Ok(None),
+        }
     }
 
-    let target = client.verify_target(manifest).await?;
-    let mut progress = ProgressFlusher::new();
-    let mut written_chunks = resumed_from;
-    let result: Result<(), SdkError> = async {
-        for index in (resumed_from as u32)..target.chunk_count {
-            let plain = client.read_and_open_chunk(manifest, &target, index).await?;
-            writer.write_all(&plain)?;
-            written_chunks += 1;
-            on_progress(index + 1, target.chunk_count);
-            if progress.due() {
-                writer.sync()?;
-                cache.media_progress(&manifest.mxc, written_chunks, chunk_size)?;
-                progress.flushed();
+    /// 現拉第 `index` 塊（seek）：驗過、append 進 seek 暫存檔、回明文（/docs/design/media/media-download.md §6.3）。
+    ///
+    /// Return:
+    ///     Ok(明文)
+    ///     Err(Integrity)／Err(Network)／Err(Server)   同 [`MediaDownload::advance_from_server`]
+    ///     Err(Usage)       chunk_count 太大、不給 seek 暫存檔（`seek_store::MAX_SEEK_CHUNKS`）
+    pub async fn fetch_into_seek_store<C: PackChannel>(
+        &mut self,
+        client: &mut WbfClient<C>,
+        pool: &MediaPool,
+        index: u32,
+    ) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+        let plain = self.read_from_server(client, index).await?;
+        if self.seek.is_none() {
+            self.seek = Some(SeekStore::open(
+                pool,
+                &self.pending_name,
+                &self.manifest.mxc,
+                self.chunk_size,
+                self.chunk_count,
+            )?);
+        }
+        if let Some(seek) = self.seek.as_mut() {
+            seek.append(index, &plain)?;
+        }
+        Ok(plain)
+    }
+
+    /// 收尾（/docs/design/media/media-download.md §4.1）：封最後一段、核對長度與區塊的 sha256、adopt 進池、刪 seek 暫存檔。
+    ///
+    /// Return:
+    ///     Ok(Finished)     `hash_hex` 就是池檔名
+    ///     Err(Integrity)   長度或 sha256 對不上：主檔與暫存檔都刪了，呼叫者把列 reset
+    ///     Err(Io)          寫不了、搬不了
+    pub fn finish(self, pool: &MediaPool) -> Result<Finished, SdkError> {
+        let MediaDownload {
+            manifest,
+            pending_name,
+            writer,
+            seek,
+            file_size,
+            ..
+        } = self;
+        drop(seek);
+        if writer.plain_len() != file_size {
+            let plain_len = writer.plain_len();
+            drop(writer);
+            discard(pool, &pending_name);
+            return Err(SdkError::Integrity(format!(
+                "the pending file has {plain_len} bytes, file_size says {file_size}"
+            )));
+        }
+        let finished = writer.finish()?;
+        if let Some(expected) = manifest.block.sha256.as_deref() {
+            if !expected.eq_ignore_ascii_case(&finished.sha256_hex) {
+                discard(pool, &pending_name);
+                return Err(SdkError::Integrity(format!(
+                    "sha256 mismatch: block {expected}, file {}",
+                    finished.sha256_hex
+                )));
             }
         }
+        pool.adopt(&pending_name, &finished.hash_hex)?;
+        pool.discard_seek(&pending_name)?;
+        Ok(finished)
+    }
+
+    /// 壞檔：主檔與 seek 暫存檔都刪（列由呼叫者 reset）。
+    pub fn discard(self, pool: &MediaPool) {
+        let pending_name = self.pending_name.clone();
+        drop(self);
+        discard(pool, &pending_name);
+    }
+
+    /// 第 `index` 塊的明文範圍 `[start, end)`。
+    fn chunk_range(&self, index: u32) -> Result<(u64, u64), SdkError> {
+        let len = expected_plain_len(self.file_size, self.chunk_size, index)
+            .ok_or_else(|| SdkError::Integrity(format!("chunk {index} is beyond chunk_count")))?;
+        let start = u64::from(index) * u64::from(self.chunk_size);
+        Ok((start, start + len as u64))
+    }
+
+    /// 拉一塊：第一次先 `Info` 驗區塊；驗長度、解開；解不開重拉一次（傳輸錯），還是不行就 Integrity。
+    async fn read_from_server<C: PackChannel>(
+        &mut self,
+        client: &mut WbfClient<C>,
+        index: u32,
+    ) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+        if self.target.is_none() {
+            self.target = Some(client.verify_target(&self.manifest).await?);
+        }
+        let Some(target) = self.target.as_ref() else {
+            return Err(SdkError::Integrity(
+                "the download target was not verified".into(),
+            ));
+        };
+        match client
+            .read_and_open_chunk(&self.manifest, target, index)
+            .await
+        {
+            Ok(plain) => Ok(Zeroizing::new(plain)),
+            Err(SdkError::Integrity(_)) => Ok(Zeroizing::new(
+                client
+                    .read_and_open_chunk(&self.manifest, target, index)
+                    .await?,
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 一塊落地：長度要對；這一塊在「已寫長度」之前的部分丟掉（續傳點可以在塊中間），其餘餵進主檔。
+    fn land(&mut self, index: u32, plain: &[u8]) -> Result<(), SdkError> {
+        let (start, end) = self.chunk_range(index)?;
+        if plain.len() as u64 != end - start {
+            return Err(SdkError::Integrity(format!(
+                "chunk {index} has {} bytes, expected {}",
+                plain.len(),
+                end - start
+            )));
+        }
+        let already = self.writer.plain_len();
+        if already < start || already >= end {
+            return Err(SdkError::Usage(format!(
+                "chunk {index} ({start}..{end}) does not continue the pending file at {already}"
+            )));
+        }
+        let rest = plain
+            .get((already - start) as usize..)
+            .ok_or_else(|| SdkError::Usage(format!("chunk {index} is shorter than its skip")))?;
+        std::io::Write::write_all(&mut self.writer, rest)?;
         Ok(())
     }
-    .await;
-    if let Err(error) = result {
-        // 中止：DB 停在上次快照（不往前推），檔留著給下次續。呼叫者看到的錯誤就是下載管線的；
-        // 這裡的 sync 失敗不能蓋掉它（PR #14 審查 rumia 🟢1）。
-        let _ = writer.sync();
-        drop(writer);
-        return Err(error);
-    }
-    if writer.plain_len() != target.file_size {
-        let plain_len = writer.plain_len();
-        drop(writer);
-        cache.media_progress(&manifest.mxc, 0, chunk_size)?;
-        pool.discard_pending(&pending_name)?;
-        return Err(SdkError::Integrity(format!(
-            "pool file has {plain_len} bytes, file_size says {}",
-            target.file_size
-        )));
-    }
-    let finished = writer.finish()?;
-    // 明文 sha256（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 5 條）由 verify 過的塊逐塊保證；這裡另有 BLAKE3 當檔名。
-    pool.adopt(&pending_name, &finished.hash_hex)?;
-    let bytes_on_disk = pool.bytes_on_disk(&finished.hash_hex)?;
-    cache.media_finish(
-        &manifest.mxc,
-        &finished.hash_hex,
-        u64::from(target.chunk_count),
-        finished.plain_len,
-        bytes_on_disk,
-    )?;
-    let entry = cache
-        .find_media(&manifest.mxc)?
-        .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished")))?;
-    Ok(Fetched {
-        entry,
-        outcome: FetchOutcome::Downloaded {
-            chunks: target.chunk_count - resumed_from as u32,
-            resumed_from,
-        },
-    })
 }
 
-/// 快取命中的三個條件：檔在池裡開得起來、明文長度等於區塊的 `file_size`、區塊帶 sha256 時要跟 `media.hash` 一致。
-/// 檔名本身是明文 BLAKE3，所以「內容跟 hash 對不對」由 finish 時算的 hash 保證；這裡擋的是列與檔對不上、或同一個 mxc 換了區塊。
-fn cached_copy_matches(pool: &MediaPool, entry: &MediaEntry, manifest: &Manifest) -> bool {
-    let Some(pool_file) = entry.pool_file.as_deref() else {
-        return false;
-    };
-    let Ok(reader) = pool.open_read(pool_file) else {
-        return false;
-    };
-    if reader.plain_len() != manifest.file_size() || entry.file_size != manifest.file_size() {
-        return false;
-    }
-    match (&entry.hash, &manifest.block.sha256) {
-        // 存的不是 `sha256:` 開頭（別種雜湊）就不比；是就逐字比。
-        (Some(stored), Some(sha256)) => stored
-            .strip_prefix("sha256:")
-            .is_none_or(|digest| digest.eq_ignore_ascii_case(sha256)),
-        _ => true,
-    }
+fn discard(pool: &MediaPool, pending_name: &str) {
+    // 刪不掉只是佔空間，下次掃描再收；🚫 不蓋掉呼叫者要回的錯。
+    let _ = pool.discard_pending(pending_name);
+    let _ = pool.discard_seek(pending_name);
 }
 
-/// 開快取裡的完整檔來讀；沒有或檔不在回 None（呼叫者去 `fetch`）。讀一次就 touch。
-pub fn open_cached(
-    cache: &mut Cache,
-    pool: &MediaPool,
-    mxc: &str,
-) -> Result<Option<PoolReader>, SdkError> {
-    let Some(entry) = cache.find_media(mxc)? else {
-        return Ok(None);
-    };
+/// 快取裡完整的那份還能用嗎：檔在、開得起來（池格式 v2）、明文長度等於列的 `file_size`。
+///
+/// Return:
+///     Some(PoolReader)   能用
+///     None               列說沒完成、沒有檔名、檔不在、打不開、長度不對
+pub fn open_complete(pool: &MediaPool, entry: &MediaEntry) -> Option<PoolReader> {
     if !entry.complete {
-        return Ok(None);
+        return None;
     }
-    let Some(pool_file) = entry.pool_file.as_deref() else {
-        return Ok(None);
-    };
-    match pool.open_read(pool_file) {
-        Ok(reader) => {
-            cache.touch_media(mxc)?;
-            Ok(Some(reader))
-        }
-        Err(_) => {
-            cache.media_reset(mxc)?;
-            Ok(None)
-        }
-    }
+    let reader = pool.open_read(entry.pool_file.as_deref()?).ok()?;
+    (reader.plain_len() == entry.file_size).then_some(reader)
 }
 
 /// `collect_garbage` 的結果。
@@ -272,86 +391,65 @@ pub fn collect_garbage(
 /// `sweep` 的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// DB 說完整但檔不在 → 列 reset 成「還沒下載」。
+    /// DB 說完整但檔不在（或不是池格式 v2）→ 列 reset 成「還沒下載」。
     pub reset_rows: u64,
-    /// `pending/` 裡沒人認領、或半成品過了保護期 → 刪掉的暫存檔數。
+    /// `pending/` 裡沒人認領、列已經完成、過了保護期、或不是池格式 v2 → 刪掉的暫存檔數（主檔與 `.seek` 都算）。
     pub removed_pending: u64,
-    /// `media/<hh>/` 裡沒有任何 `media` 列指著的完成檔（`forget-account` 之後、或 DB 重建之後留下的）→ 刪掉的數。
+    /// `media/<hh>/` 裡沒有任何 `media` 列指著的完成檔（`forget-account` 之後、DB 重建之後、v1 檔被 reset 之後）→ 刪掉的數。
     pub removed_orphan_files: u64,
 }
 
-/// 啟動時掃一次（/docs/design/media/media-pool.md §5 最後一條），三個方向：DB → 檔（說完整但檔不在 → reset）、`pending/` → DB（沒列認領或過保護期 → 刪）、
-/// `media/<hh>/` → DB（沒列指著的完成檔 → 刪；`forget_account` 刪掉孤兒列之後就是這裡收檔，PR #14 審查 rumia／salvia 🟡）。
+/// 掃一次孤兒（/docs/design/media/media-pool.md §5 最後一條、/docs/design/media/media-download.md §4.3、§11 第 1 條），三個方向：
+/// DB → 檔（說完整但打不開 → reset）、`pending/` → DB、`media/<hh>/` → DB（沒列指著 → 刪）。
+///
+/// Args:
+///     protect: 暫存檔多久沒動過算過期, example: Duration::from_secs(7 * 24 * 3600)
+///     now: 現在, example: SystemTime::now()
+///     in_use: 正在下載（下載 worker 握著）的暫存名，🚫 不碰, example: {"m12"}
 pub fn sweep(
     cache: &mut Cache,
     pool: &MediaPool,
     protect: Duration,
-    now_millis: i64,
+    now: std::time::SystemTime,
+    in_use: &HashSet<String>,
 ) -> Result<SweepReport, SdkError> {
-    let mut reset_rows = 0;
-    let mut removed_pending = 0;
+    let mut report = SweepReport::default();
     for entry in cache.list_media_by_last_used()? {
-        let present = entry
-            .pool_file
-            .as_deref()
-            .map(|pool_file| pool.open_read(pool_file).is_ok())
-            .unwrap_or(false);
-        if !present {
+        if open_complete(pool, &entry).is_none() {
             cache.media_reset(&entry.mxc)?;
-            reset_rows += 1;
-        }
-    }
-    let protect_millis = i64::try_from(protect.as_millis()).unwrap_or(i64::MAX);
-    let mut live_pending = std::collections::HashSet::new();
-    for entry in cache.list_media_incomplete()? {
-        let expired = now_millis.saturating_sub(entry.created_at) >= protect_millis;
-        let name = cache.media_pending_name(&entry.mxc)?.unwrap_or_default();
-        if expired {
-            pool.discard_pending(&name)?;
-            cache.media_reset(&entry.mxc)?;
-            removed_pending += 1;
-        } else {
-            live_pending.insert(name);
+            report.reset_rows += 1;
         }
     }
     for name in pool.list_pending()? {
-        if !live_pending.contains(&name) {
-            pool.discard_pending(&name)?;
-            removed_pending += 1;
+        let owner = name.strip_suffix(SEEK_SUFFIX).unwrap_or(&name).to_string();
+        if in_use.contains(&owner) {
+            continue;
+        }
+        let path = pool.pending_path(&name);
+        let claimed = cache
+            .find_media_by_pending_name(&owner)?
+            .is_some_and(|entry| !entry.complete);
+        let expired = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= protect);
+        let is_old_format = !name.ends_with(SEEK_SUFFIX) && !pool.is_current_pending(&name);
+        if !claimed || expired || is_old_format {
+            if name.ends_with(SEEK_SUFFIX) {
+                pool.discard_seek(&owner)?;
+            } else {
+                pool.discard_pending(&name)?;
+            }
+            report.removed_pending += 1;
         }
     }
-    let mut removed_orphan_files = 0;
     for pool_file in pool.list_files()? {
         // 沒人指著但還有把手開著（列剛被 reset、讀的人還沒關）：這一輪先留著，下次再收。
         if cache.media_references(&pool_file)? == 0 && !pool.is_open(&pool_file)? {
             pool.remove(&pool_file)?;
-            removed_orphan_files += 1;
+            report.removed_orphan_files += 1;
         }
     }
-    Ok(SweepReport {
-        reset_rows,
-        removed_pending,
-        removed_orphan_files,
-    })
-}
-
-/// 每 `PROGRESS_FLUSH` 才寫一次 DB 的小計時器。
-struct ProgressFlusher {
-    last_flush: Instant,
-}
-
-impl ProgressFlusher {
-    fn new() -> ProgressFlusher {
-        ProgressFlusher {
-            last_flush: Instant::now(),
-        }
-    }
-
-    fn due(&self) -> bool {
-        self.last_flush.elapsed() >= PROGRESS_FLUSH
-    }
-
-    fn flushed(&mut self) {
-        self.last_flush = Instant::now();
-    }
+    Ok(report)
 }

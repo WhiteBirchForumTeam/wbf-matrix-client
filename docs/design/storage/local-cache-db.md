@@ -135,7 +135,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v5，就是 `wbf-sdk::cache` 建的）
+## 5. 快取的 schema（v7，就是 `wbf-sdk::cache` 建的）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
 
@@ -225,8 +225,8 @@ CREATE TABLE media (
   name TEXT, mimetype TEXT,
   hash TEXT,                            -- 明文校驗碼 "<algo>:<hex>"：事件區塊有 sha256 就是 "sha256:…"（上傳者算的）；沒帶就下載完填 "blake3:…"（我們算的，同 pool_file）
   file_size INTEGER NOT NULL,           -- 明文總長，從事件區塊來
-  chunk_size INTEGER NOT NULL,          -- 下載時的塊大小，續傳截檔用
-  chunks_written INTEGER NOT NULL,      -- 最後一次快照時已 append 的塊數（/docs/design/media/media-pool.md §3，每 1–2 秒 flush）
+  chunk_size INTEGER NOT NULL,          -- 事件區塊的塊大小
+  segments_written INTEGER NOT NULL,    -- 池主檔已落地的完整段數（64 KiB 一段，每 1.5 秒寫一次）：只給顯示，🚫 不當續傳依據（/docs/design/media/media-download.md §4.1）
   complete INTEGER NOT NULL,            -- 1 = 整檔都在
   bytes_on_disk INTEGER NOT NULL,       -- 配額用
   created_at INTEGER NOT NULL,          -- 下載（建立）時間

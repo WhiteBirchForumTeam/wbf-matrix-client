@@ -27,7 +27,7 @@ homeserver ──wbf protocol (WS) / Matrix HTTP──> daemon ──encrypted J
 ```
 
 - **Control plane** — JSON messages over a WebSocket bound to `127.0.0.1`, encrypted with XChaCha20-Poly1305 using keys derived from a per-launch token.
-- **Data plane** *(planned)* — plain local HTTP with `Range` for media, so players and viewers can stream directly. Not implemented yet.
+- **Data plane** — plain local HTTP, the only way media bytes travel: uploads are a `PUT` (encrypted chunk by chunk on the way to the homeserver); reads are a `GET` with `Range`, so players and viewers stream directly and a seek fetches only the chunks it needs. Spec in [`docs/design/rpc-specs/data-plane.md`](docs/design/rpc-specs/data-plane.md).
 - **Backend choice** — `transport: ws` (the default) means the wbf protocol; `transport: http` means standard Matrix. Asking for `ws` against an ordinary homeserver is a no-op, not an error.
 
 ## Workspace
@@ -37,7 +37,7 @@ homeserver ──wbf protocol (WS) / Matrix HTTP──> daemon ──encrypted J
 | [`crates/wbf-wire`](crates/wbf-wire) | Wire codec: packs, `EncryptedFileInfo`, CRC-32C. Pure functions, no async | ✅ Done — tested against the server's golden vectors |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | Protocol client: per-chunk AEAD, WebSocket channel, chunked upload / download / seek / resume / streaming, encrypted vault, `cache.db`, media pool, matrix-sdk adapter | 🟢 Working |
 | [`crates/wbf-core`](crates/wbf-core) | Everything a command *does*: accounts, rooms, messages, media, backend probing, the single writer for `cache.db`. No CLI, no RPC | 🟢 Working |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | The daemon binary `wbf-matrix-client-daemon`: RPC server, data-directory locking, token lifecycle | 🟢 RPC methods, push subscriptions, per-account upstream links kept open by the daemon, E2EE for text messages. ⏳ Not yet: `cancel`, the media HTTP plane |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | The daemon binary `wbf-matrix-client-daemon`: RPC server, data-directory locking, token lifecycle | 🟢 RPC methods, push subscriptions, per-account upstream links kept open by the daemon, E2EE for text messages, the media data plane (upload, read with `Range`, a per-account download queue). ⏳ Not yet: RPC `cancel`, traditional `/_matrix/media` for ordinary Matrix servers |
 | [`apps/wbf-cli`](apps/wbf-cli) | Command-line frontend `wbf-cli`: login, rooms, send, watch, upload, download, seek, accounts, media cache | 🟢 Working (calls `wbf-core` directly for now) |
 | Desktop / Android / Python | Frontends over RPC | ⏳ Not started |
 
@@ -138,7 +138,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 ```
 
 - **控制平面** —— JSON 訊息走綁在 `127.0.0.1` 的 WebSocket，用 XChaCha20-Poly1305 加密，金鑰由每次啟動的 token 導出。
-- **資料平面** —— 本機 HTTP，媒體的 bytes 只走這裡：上傳是 `PUT`（邊收邊加密邊傳到 homeserver）；下載支援 `Range`、讓播放器直接串流（*還沒實作*）。規格在 [`docs/design/rpc-specs/data-plane.md`](docs/design/rpc-specs/data-plane.md)。
+- **資料平面** —— 本機 HTTP，媒體的 bytes 只走這裡：上傳是 `PUT`（邊收邊加密邊傳到 homeserver）；讀是 `GET` 支援 `Range`、讓播放器直接串流，seek 只拉需要的那幾塊。規格在 [`docs/design/rpc-specs/data-plane.md`](docs/design/rpc-specs/data-plane.md)。
 - **backend 怎麼選** —— `transport: ws`（預設）＝ wbf 協議；`transport: http` ＝ 標準 Matrix。對一般 homeserver 指定 `ws` 是 no-op，🚫 不是錯誤。
 
 ## 專案結構
@@ -148,7 +148,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 | [`crates/wbf-wire`](crates/wbf-wire) | 線上協議的 codec：pack、`EncryptedFileInfo`、CRC-32C。純函數、無 async | ✅ 完成 —— 對著 server 的黃金向量測 |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | 協議 client：每塊 AEAD、WebSocket 通道、分塊上傳／下載／seek／續傳／串流、加密 vault、`cache.db`、媒體池、matrix-sdk adapter | 🟢 可用 |
 | [`crates/wbf-core`](crates/wbf-core) | 每個命令「做什麼」：帳號、房間、訊息、媒體、backend 探測、`cache.db` 的單一寫入者。沒有命令列、沒有 RPC | 🟢 可用 |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE、資料平面的上傳（`PUT`，加密房的附件）。⏳ 還沒有：`cancel`；資料平面的讀（`GET /media`、`media.open`） |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE、資料平面的上傳（`PUT`，加密房的附件）與讀（`media.open` → `GET /media`、每帳號的下載佇列）。⏳ 還沒有：RPC 的 `cancel`；一般 Matrix server 的傳統 `/_matrix/media` |
 | [`apps/wbf-cli`](apps/wbf-cli) | 命令列前端 `wbf-cli`：登入、房間、送訊息、watch、上傳、下載、seek、多帳號、媒體快取 | 🟢 可用（目前直接叫 `wbf-core`） |
 | 桌面／Android／Python | 走 RPC 的前端 | ⏳ 還沒開始 |
 

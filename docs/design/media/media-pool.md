@@ -23,30 +23,25 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 - 目錄用前 2 hex 扇出（一個目錄不會塞幾萬個檔）。磁碟上能看到的只有「幾個檔、各多大」。
 - 池跟 `cache.db` 同層：同一個 server 的所有帳號共用，不分帳號、不要可見性（拿得到 mxc 的人 server 就給他檔；可見性在事件那層擋過）。
 
-## 3 下載時怎麼寫（只考慮 download 模式）
+## 3 下載時怎麼寫
 
-只做**順序整檔下載**：`download` 從第 0 塊拿到最後一塊，每解出一塊就 append 進池裡那個檔。串流與 seek 先不管（§6）。
+**一律順序寫**：主檔從第 0 塊拿到最後一塊，每解出一塊就 append 進池裡那個檔。誰排隊、seek 怎麼插隊、進度怎麼報，權威是 /docs/design/media/media-download.md；這裡只講池這一層。
 
 ```
-開始   ：cache.db 的 media 列（file 事件進快取時就建了，complete = 0）；池裡開一個新檔
-每一塊 ：解密 → 驗 → append 進檔 → 記憶體裡的 chunks_written += 1
-每 1–2 秒：把記憶體的 chunks_written 寫回 cache.db（一次 UPDATE），不每塊寫 DB
-結束   ：檔 fsync → cache.db 把 complete = 1、chunks_written = 總塊數、bytes_on_disk 寫齊
+開始   ：cache.db 的 media 列（file 事件進快取時就建了，complete = 0）；池裡開一個新檔（或接著寫舊的）
+每一塊 ：解密 → 驗 → 餵進 PoolWriter（湊滿一段才封、才 append）
+每 1.5 秒：fsync，把完整段數寫回 cache.db 的 segments_written（只給顯示）
+結束   ：封最後一段 → fsync → 改名進 media/<hh>/<hash> → cache.db 把 complete = 1、bytes_on_disk 寫齊
 ```
 
-- **進度在記憶體，DB 是每 1–2 秒的快照**（維護者定）。這樣 DB 不會被每塊一次的寫入打爆，而中斷最多重下一兩秒的量。
-- **中斷續傳**：下次開始前查到 `complete = 0` 的列，把池裡那個檔**截到 `chunks_written × chunk_size`**（最後一次快照之後 append 的塊可能只寫了一半，不信任它），從第 `chunks_written` 塊續。這跟 `wbf-sdk` 的上傳狀態檔是同一種思路：狀態說到哪就從哪開始，不猜。
-- **寫入順序**：先 append 檔、再更新 DB；反過來會出現「DB 說有、檔案沒有」。讀的時候 `complete = 1` 才當成有快取。
-- 一塊驗證失敗：這次下載中止、檔截回上次快照，下次續。與下載端現有的規則一致（完整性每塊各自驗）。
-
-**實作（`wbf-sdk::media`）**：
-- `fetch(client, manifest, cache, pool)`：`media_begin` 建或取列 → 完整且檔在就 `CacheHit`（touch）→ 不然決定續傳點（上次快照的 `chunks_written`，而且 `chunk_size` 要一樣）→ `pool.resume_pending` 或 `create_pending` → 逐塊 `read_and_open_chunk` 寫進 `PoolWriter`，每 1.5 秒（`PROGRESS_FLUSH`）`sync` 加 `media_progress` → 完成 `finish()` 拿 BLAKE3 → `adopt`（同 hash 去重）→ `media_finish`。中止時 DB 停在上次快照、檔留著。
-- **暫定段**：進度快照時記憶體裡湊不滿 64 KiB 的那段也要落地，不然快照指到的資料不在磁碟上、續不了。`PoolWriter::sync()` 把它先封成一個短段寫在檔尾，下次湊滿再把檔截回該段起點重封（每 1.5 秒重寫最多 64 KiB，可忽略）。續傳時 `resume_pending(trusted_len)` 解到 trusted_len 為止、把最後那個不完整段的明文放回記憶體、檔截到該段起點，BLAKE3 從頭重算。
-- 暫存檔名是 `m<media.id>`，在 `media/pending/`。
+- **檔案本身就是進度**：續傳時從第 0 段起逐段解開，完整的段就是寫到哪；DB 的段數🚫 不當依據（/docs/design/media/media-download.md §4.1）。
+- **寫入順序**：先落檔、再更新 DB；反過來會出現「DB 說有、檔案沒有」。讀的時候 `complete = 1` 而且池檔打得開、長度對才當成有快取。
+- 一塊驗證失敗：重拉一次，還是不行就是壞檔（主檔與暫存檔都刪、列 reset）。
+- 暫存檔名是 `m<media.id>`，在 `media/pending/`；seek 暫存檔是旁邊的 `m<media.id>.seek`。
 
 ## 4 DB 的指針
 
-表在 /docs/design/storage/local-cache-db.md §5（`media` 與 `event_media`）。沒有 bitmap：檔要嘛完整、要嘛是一個「寫到第 N 塊」的半成品，沒有中間有洞的狀態。
+表在 /docs/design/storage/local-cache-db.md §5（`media` 與 `event_media`）。沒有 bitmap：檔要嘛完整、要嘛是一個「寫到第 N 段」的半成品，沒有中間有洞的狀態（seek 拉到的塊在旁邊的暫存檔，不在主檔）。
 摧毀帳號的鏈（/docs/design/storage/local-cache-db.md §5 `forget_account`）走到 `media` 這一層時回傳沒人指的 `pool_file`，池刪檔。
 
 ## 5 配額與清理（維護者 2026-09-05 定）
@@ -69,74 +64,41 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
   只看這個程序就夠：資料目錄綁定 daemon（/docs/design/overview/architecture-v2.md §0.2）。
 - 事件快取不受這個配額（/docs/design/storage/local-cache-db.md §1）。
 
-**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now)` 啟動掃：DB 說完整但檔不在 → reset；半成品超過保護期 → 刪暫存檔加 reset；`pending/` 裡沒有列認領的 → 刪；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後留下的）→ 刪。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
+**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now, in_use)` 掃孤兒：DB 說完整但檔打不開（不在、池格式 v1）→ reset；`pending/` 的規則在 /docs/design/media/media-download.md §4.3（沒列認領、列已完成、v1、過期 → 刪，`in_use` 裡的（下載 worker 正開著的）🚫 不碰）；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後、v1 被 reset 之後留下的）→ 刪。daemon 在這個程序第一次起某台 server 的下載 worker 時掃一次。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
 
 ## 6 先不做的
 
 - **部分快取**（只存看過的那幾塊）：不做。檔要嘛完整、要嘛是續傳中的半成品（從第 0 段起連續）。
-- **seek**：已經設計好（維護者 2026-10-01，/docs/design/media/media-download.md）：主檔照舊只順序寫；seek 拉到的塊另外順序 append 進
+- **seek 不是部分快取**（維護者 2026-10-01，/docs/design/media/media-download.md）：主檔照舊只順序寫；seek 拉到的塊另外順序 append 進
   旁邊的 seek 暫存檔、用位置表記位置，主檔追上時從那裡搬，完成就刪。上面那條「沒有部分快取」因此不變。
 
 ## 7 與下載管線的接法
 
-下載管線是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；走快取時開始前問 `media` 有沒有 `complete = 1` 的列，有就直接從池裡讀整檔；沒有就照 §3 邊下邊 append。
-邊界仍在 `wbf-sdk`：CLI 與 UI 只看到一個檔的把手（`PoolReader`），不知道底下是池還是 server。
+下載管線是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；一個檔在主檔、seek 暫存檔與網路之間怎麼拿塊是 `wbf-sdk::media::MediaDownload`，
+誰、何時、做到哪是 core 的下載 worker（/docs/design/media/media-download.md §5）。讀的人只看到明文（`PoolReader` 或 GET 的 body），不知道底下是池還是 server。
 
-做法：`download.rs` 的 `read_and_open_chunk` 是 crate 內可見，`media::fetch` 用它逐塊拿；`WbfClient::download`（直接寫到 `Write`）留著給 `--no-cache` 與 `--token` 模式。三個模組的關係：`cache` 不知道池、`media_pool` 不知道 DB、下載管線不知道兩者，只有 `media.rs` 同時碰三者。
+三個模組的關係：`cache` 不知道池、`media_pool`／`seek_store` 不知道 DB、下載管線不知道兩者，只有 `media.rs` 同時碰三者。
+`WbfClient::download`（直接寫到 `Write`）留著給 CLI 的 `--no-cache` 與 `--token` 模式。
 
-## 8 池的檔案格式（權威；`wbf-sdk::media_pool` 就是照這裡寫的，改這裡要換版本號）
+## 8 池的檔案格式
 
-> ⚠️ 這是 **v1**（現在的程式）。**v2 已經設計好**（維護者 2026-10-01，/docs/design/media/media-download.md §4.1）：每段都寫滿、真實長度記在密文裡的 4 byte、
-> 沒有暫定段，所以檔長永遠可以驗算。v2 實作時取代這一節。
+**逐 byte 的版面是池格式 v2，權威在 /docs/design/media/media-download.md §4.1**（`wbf-sdk::media_pool` 照那裡寫；改版面要換版本號）。這一節講它為什麼長那樣。
 
 **原理一句話**：對上層是一個完整的明文檔（`Write` 順序寫、`Read + Seek` 用明文位置讀）；落地時切成**固定 64 KiB 的明文段**各自 AEAD，因為段固定，任何明文位置都能用算術換成密文位置，不需要索引表。「整檔加密」講的是使用者看到的單位，不是密文不分段——gocryptfs（4 KiB）、Cryptomator（32 KiB）、age（64 KiB）都這樣。
 
-**為什麼不能整檔一個 AEAD**：認證標籤要等最後一個 byte 才算得出來，邊下載邊寫沒有可以停的點、中斷後前半段驗不了、播影片跳到中間要從頭解到那裡。分段的代價是每段 16 byte（0.024%）加隨機讀多解最多 64 KiB。
+**為什麼不能整檔一個 AEAD**：認證標籤要等最後一個 byte 才算得出來，邊下載邊寫沒有可以停的點、中斷後前半段驗不了、播影片跳到中間要從頭解到那裡。
 
-**逐 byte**（所有整數 little-endian）：
+**為什麼每段都寫滿、長度記在密文裡**（v2，維護者 2026-10-01）：每段在磁碟上一樣大，檔長就能驗算——不是「檔頭 ＋ 整數筆」就一定是最後一段寫到一半，直接截掉；
+被 force 關掉最多丟最後一筆，不會留下讀得到的壞資料。真實長度在密文裡，改一個 bit 就解不開。代價是每段多 4 byte、最後一段補滿（1 byte 的檔也佔一整段）。
+v1 讓最後一段可以短、靠檔長推長度，進度快照還要把湊不滿的尾巴先封成「暫定段」、之後截掉重封——v2 把這兩件事都拿掉了；v1 的檔一律當壞檔重下（它是快取）。
 
-```
-偏移   長度   內容
-0      4      magic "WBFP"
-4      1      version = 1
-5      3      保留，全 0
-8      4      segment_size（u32）＝每段明文長度；目前寫 65536。從檔頭讀，不寫死：以後換數字舊檔照自己的檔頭解
-12     16     nonce_base，這個檔隨機（CSPRNG）
-28     4      保留，全 0
-32     …      段 0、段 1、…，緊接著放
+**跟 server 的 chunk 無關**：server 的 `chunk_size` 是傳輸單位、每檔可不同（事件區塊裡）；池的 `segment_size` 是儲存單位、寫在每個檔頭。下載時一個 chunk 的明文丟進 `PoolWriter`，它照自己的 64 KiB 切，兩邊不必對齊；續傳點落在塊中間時，涵蓋它的那一塊在續傳點之前的部分丟掉。
 
-第 i 段（i 從 0 起，u64）：
-  位置   = 32 + i × (segment_size + 16)
-  內容   = XChaCha20-Poly1305(
-             key   = 第四把子金鑰 "wbf-matrix-client media store v1"（32 byte，全池共用，/docs/design/storage/vault-and-keys.md §1）
-             nonce = nonce_base(16) ‖ u64_le(i)                     → 24 byte
-             aad   = "wbf-media-pool v1" ‖ nonce_base(16) ‖ u64_le(i)
-             明文  = 第 i 段明文 )
-  長度   = 明文長度 + 16（Poly1305 標籤；標籤是 MAC，裡面沒有欄位、不存長度）
-  規則   = 除了最後一段，明文長度一律等於 segment_size；最後一段是剩餘長度（可以短，可以剛好整段）
-```
+**檔名與目錄**：完成檔是 `media/<hash 前 2 hex>/<hash>`（hash = 明文 BLAKE3（32 byte），64 個小寫 hex 字元），下載中是 `media/pending/m<media.id>`，seek 暫存檔是 `media/pending/m<media.id>.seek`（版面在 /docs/design/media/media-download.md §4.2）。**檔案本身不帶任何 metadata**：原檔名、mimetype、校驗碼、mxc、大小都只在 `cache.db` 的 `media` 列（`name`／`mimetype`／`hash` 來自事件區塊，上傳者填的；`hash` 的形式是 `<algo>:<hex>`，區塊沒帶 sha256 時下載完用我們算的 BLAKE3 補成 `blake3:…`；同內容去重成一個池檔時，每個 mxc 各自保留自己的 name／mimetype／hash）。下載中的主檔檔頭多一個 4 byte 的 `owner`（mxc 的 BLAKE3 前 4 byte）：只用來認「這個暫存名還是不是同一個檔的」，🚫 不是 metadata、也不是安全邊界。磁碟上能看到的只有幾個檔、各多大。
 
-**推導**（沒有 per-segment 長度欄、沒有索引、沒有檔尾）：
+**安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；**每個段號只封一份明文**（續傳時重封的那段明文一定一樣；暫存名換了主人就整個重下，不續）；金鑰不進錯誤訊息。**不防**：能讀 `local.key` 的人（同 /docs/design/storage/vault-and-keys.md §1 的威脅模型）、檔案大小與數量。
 
-```
-密文總長 L；body = L − 32；S = segment_size + 16
-完整段數 = body / S；餘數 r = body % S
-明文總長 = 完整段數 × segment_size + (r == 0 ? 0 : r − 16)      // r 非 0 時必須 > 16，否則檔壞
-明文位置 p → 段號 i = p / segment_size，段內偏移 = p % segment_size
-```
+**快取命中的核對**（`media::open_complete`）：列說 `complete = 1`、池檔開得起來（池格式 v2、檔長是整數筆、最後一段解得開）、明文長度等於列的 `file_size`；任一不符就當沒有，重下。區塊帶 sha256 時，下載收尾就跟整檔的 SHA-256 比過，對不上不會進池。
 
-**寫入（`PoolWriter`）**：收明文進 segment_size 的緩衝，湊滿封一段 append；同時餵 BLAKE3。`finish()` 封最後的短段、fsync、回明文 BLAKE3 hex（就是檔名）。
-**暫定段**：進度快照前 `sync()` 把緩衝裡湊不滿的那段先封成短段寫在檔尾並 fsync，讓快照指到的每個 byte 都在磁碟上；下次要封正式的第 i 段時先把檔截回第 i 段的起點再寫。所以**檔中間永遠不會有短段**，短段只可能在檔尾。
-**續傳（`resume_pending(trusted_len)`）**：完整段數 = trusted_len / segment_size 逐段解開餵 BLAKE3；尾巴 = trusted_len % segment_size 從下一段解出來放回緩衝；檔截到完整段之後；接著寫。trusted_len 來自 DB 的 `chunks_written × chunk_size`，之後的資料一律不信。
-**讀取（`PoolReader`）**：`seek` 只改明文位置；`read` 算出段號、讀那一段解開、快取在記憶體，同段連續讀不重解。任何一段標籤不對回 `Io` 錯，上層當「檔壞了、重拉」（/docs/design/storage/local-cache-db.md §1）。
-
-**跟 server 的 chunk 無關**：server 的 `chunk_size` 是傳輸單位、每檔可不同（事件區塊裡）；池的 `segment_size` 是儲存單位、寫在每個檔頭。下載時一個 chunk 的明文丟進 `PoolWriter`，它照自己的 64 KiB 切，兩邊不必對齊；續傳點落在段中間也照上面的尾巴規則處理。
-
-**檔名與目錄**：完成檔是 `media/<hash 前 2 hex>/<hash>`（hash = 明文 BLAKE3（32 byte），64 個小寫 hex 字元），下載中是 `media/pending/m<media.id>`。**檔案本身不帶任何 metadata**：原檔名、mimetype、校驗碼、mxc、大小都只在 `cache.db` 的 `media` 列（`name`／`mimetype`／`hash` 來自事件區塊，上傳者填的；`hash` 的形式是 `<algo>:<hex>`，區塊沒帶 sha256 時下載完用我們算的 BLAKE3 補成 `blake3:…`；同內容去重成一個池檔時，每個 mxc 各自保留自己的 name／mimetype／hash）。磁碟上能看到的只有幾個檔、各多大。
-
-**安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；金鑰不進錯誤訊息。**暫定段用自己的 nonce**（段號最高位設 1）：同段號的暫定段與之後的正式段是兩個 nonce，每個 nonce 只封一次——AEAD 同 (key, nonce) 封兩份不同明文會漏 Poly1305 金鑰，這條路被堵死；段號因此只用 63 位。`resume_pending` 讀暫存檔尾巴時先用暫定 nonce、解不開再用正式的（尾巴可能是暫定段，也可能是快照點落在中間的正式整段）；完成檔裡永遠沒有暫定段。**不防**：能讀 `local.key` 的人（同 /docs/design/storage/vault-and-keys.md §1 的威脅模型）、檔案大小與數量。
-
-**快取命中的核對**：`fetch` 命中前比對池檔開得起來、明文長度等於區塊 `file_size`、區塊帶 sha256 時要等於 `media.hash`；任一不符 `media_reset` 重下。CLI 的 `sha256_verified` 只在這次真的下載才 true，命中報 false 並附 `hash`。
-
-**測試**（`media_pool.rs` 的單元測試）：跨段寫讀與 seek、去重、續傳在段中／段界／可信長度超過檔長要拒、翻一個 byte／錯金鑰／第 0 段搬到第 1 段都拒、空檔。
+**測試**：sdk `media_pool::tests`（格式本身）與 `tests/media_cache.rs`（跟 `cache.db` 一起），清單在 /docs/design/media/media-download.md §10。
 

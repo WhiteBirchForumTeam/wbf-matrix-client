@@ -7,8 +7,8 @@ use serde_json::json;
 
 use wbf_core::conf::{Conf, Entry};
 use wbf_core::Core;
-use wbf_core::UploadRequest;
 use wbf_core::{CoreError, CoreErrorKind};
+use wbf_core::{MediaRef, UploadRequest};
 use wbf_sdk::login::{logout, whoami};
 use wbf_sdk::{Channel, Manifest, Session, Transport, WbfClient};
 
@@ -937,12 +937,12 @@ async fn download_command(
         None => output_path_from_name(manifest.block.name.as_deref())?,
     };
     let target = context.target();
-    // 登入中且沒說 `--no-cache`：走媒體快取（池裡有就不連 server；沒有就邊下邊進池、
-    // 可續傳），再從池複製到 `--out`（/docs/design/media/media-pool.md §7）。
+    // 登入中且沒說 `--no-cache`：走媒體快取（池裡有就不連 server；沒有就排進下載佇列、可續傳），
+    // 再從池複製到 `--out`（/docs/design/media/media-download.md §5.5）。下載一律走 WS 的 `Download` 線，`--transport` 不影響這條。
     if !no_cache && context.token_override.is_none() {
         let result = context
             .core()?
-            .download_to(&manifest, &out, context.transport, &target)
+            .save_media_to(&MediaRef::Manifest(manifest), &out, false, &target)
             .await?;
         return print_value(&result);
     }
@@ -986,7 +986,7 @@ async fn download_with_raw_client(
 }
 
 async fn media_stats_command(context: &Context) -> Result<(), CoreError> {
-    let stats = context.core()?.media_stats(&context.target())?;
+    let stats = context.core()?.media_stats(&context.target()).await?;
     print_value(&stats)
 }
 
@@ -995,10 +995,10 @@ async fn media_gc_command(
     quota_mib: u64,
     protect_days: u64,
 ) -> Result<(), CoreError> {
-    let report =
-        context
-            .core()?
-            .collect_media_garbage(quota_mib, protect_days, &context.target())?;
+    let report = context
+        .core()?
+        .collect_media_garbage(quota_mib, protect_days, &context.target())
+        .await?;
     print_value(&report)
 }
 

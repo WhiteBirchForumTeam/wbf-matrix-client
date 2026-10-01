@@ -1,19 +1,20 @@
 //! 媒體儲存池（/docs/design/media/media-pool.md）：對上層是「開檔、順序 append、讀、刪」的完整明文檔；落地時整個池加密，一把金鑰
 //! （`Vault::media_store_key()`）。
 //!
-//! 落地格式（/docs/design/media/media-pool.md §1 說「池內部怎麼分段是實作細節」，就在這裡定）：
+//! 落地格式是池格式 v2（/docs/design/media/media-download.md §4.1）：
 //!
 //! ```text
-//! 檔頭 32 byte：magic "WBFP"(4) ‖ version u8 = 1 ‖ 保留 3 byte ‖ segment_size u32 LE ‖ nonce_base 16 byte ‖ 保留 4 byte
-//! 之後：第 i 段 = XChaCha20-Poly1305(key, nonce = nonce_base ‖ u64_le(i), aad = "wbf-media-pool v1" ‖ nonce_base ‖ u64_le(i), 明文段 i)
-//!       每段明文固定 SEGMENT_SIZE（64 KiB），只有最後一段可以短；密文段 = 明文 + 16 byte 標籤，固定偏移，所以能隨機讀。
+//! 檔頭 32 byte：magic "WBFP"(4) ‖ version u8 = 2 ‖ 保留 3 byte ‖ segment_size u32 LE ‖ nonce_base 16 byte ‖ owner u32 LE
+//! 之後：第 i 段 = XChaCha20-Poly1305(key, nonce = nonce_base ‖ u64_le(i), aad = "wbf-media-pool v2" ‖ nonce_base ‖ u64_le(i),
+//!                                     明文 = u32_le(len) ‖ data(len) ‖ 0 × (segment_size − len))
+//!       每段在磁碟上都是 R = 4 + segment_size + 16 byte：檔長一定是 32 + n × R，不是就是最後一段寫到一半。
 //! ```
 //!
-//! - 順序 append：`PoolWriter` 湊滿一段就封一段；`finish()` 封最後的短段、fsync、回明文的 BLAKE3。
-//! - 續傳：`PoolWriter::resume()` 把最後那個不完整的段解回記憶體、檔截到該段起點，接著寫；BLAKE3 從頭重算（本機讀，便宜）。
+//! - 順序 append：`PoolWriter` 湊滿一段就封一段；`finish()` 封最後一段（補滿、記真實長度）、fsync、回明文的 BLAKE3 與 SHA-256。
+//! - 續傳：`MediaPool::resume_pending` 截掉寫到一半的段、從第 0 段起逐段解開，碰到第一個解不開的就截到它前面；完整的段就是進度。
+//! - 每段只封一次：nonce 由段號決定，續傳時重封的那段明文一定一樣（就是檔案內容）。`owner` 是 mxc 的 BLAKE3 前 4 byte：
+//!   同一個暫存名換了主人（`cache.db` 重建後 id 重新編號）就不續，🚫 不把別的檔的段接進來、🚫 不拿同一個 nonce 封別的明文。
 //! - 檔名是明文 hash（/docs/design/media/media-pool.md §2），寫完才知道；寫的時候用呼叫者給的暫存名，`finish()` 回 hash 由呼叫者 rename（`adopt`）。
-//! - 段索引進 nonce 與 AAD：把第 3 段搬到第 5 段解不開；nonce_base 每檔隨機：同內容的兩個暫存檔密文不同（去重靠 hash，不靠密文）。
-//! - 暫定段（`sync()` 寫在檔尾、之後會被截掉重封）用段號最高位設 1 的 nonce：同段號的暫定段與正式段是兩個 nonce，每個 nonce 只封一次。
 //!
 //! 🚫 金鑰不進錯誤訊息、不 log。這裡沒有 SQL、沒有網路。
 
@@ -24,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::error::SdkError;
 use crate::vault::Key32;
@@ -31,21 +34,25 @@ use crate::vault::Key32;
 pub const POOL_DIR_NAME: &str = "media";
 /// 下載中的暫存檔放這裡（/docs/design/media/media-pool.md §2：暫存名用 `media.id`）。
 pub const PENDING_DIR_NAME: &str = "pending";
+/// seek 暫存檔的副檔名：`pending/m<id>.seek`（/docs/design/media/media-download.md §4.3）。
+pub const SEEK_SUFFIX: &str = ".seek";
 
 const MAGIC: &[u8; 4] = b"WBFP";
-const VERSION: u8 = 1;
+pub const POOL_FORMAT_VERSION: u8 = 2;
 const HEADER_LEN: u64 = 32;
 const NONCE_BASE_LEN: usize = 16;
 const TAG_LEN: u64 = 16;
-const AAD_PREFIX: &[u8] = b"wbf-media-pool v1";
-/// 明文段大小。64 KiB：跟最小的 chunk_size 一樣，每段 16 byte 標籤（0.02%），隨機讀一段只解 64 KiB。
+const LEN_FIELD: u64 = 4;
+const AAD_PREFIX: &[u8] = b"wbf-media-pool v2";
+/// 明文段大小。64 KiB：跟最小的常見 chunk_size 一樣，每段多 20 byte（長度欄＋標籤），隨機讀一段只解 64 KiB。
 pub const SEGMENT_SIZE: u32 = 65536;
 
 /// 這個程序裡開著的讀把手：完成檔的路徑 → 幾個 `PoolReader` 開著它。
 /// 🚫 清理（`collect_garbage`、`sweep`）不刪還有把手開著的檔（/docs/design/media/media-pool.md §5）。
 /// 記在程序層級、不記在 `MediaPool` 上：池每次用都是新開一個值，把手卻活得比它久。
 /// 只看這個程序就夠：資料目錄綁定 daemon，別的程序不准碰（/docs/design/overview/architecture-v2.md §0.2）。
-static OPEN_READERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> = std::sync::OnceLock::new();
+static OPEN_READERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::OnceLock::new();
 
 fn open_readers() -> std::sync::MutexGuard<'static, HashMap<PathBuf, usize>> {
     OPEN_READERS
@@ -65,6 +72,7 @@ pub struct MediaPool {
 struct Header {
     segment_size: u32,
     nonce_base: [u8; NONCE_BASE_LEN],
+    owner: u32,
 }
 
 impl MediaPool {
@@ -81,6 +89,11 @@ impl MediaPool {
         &self.dir
     }
 
+    /// 池金鑰（seek 暫存檔用同一把，/docs/design/media/media-download.md §4.2）。🚫 不出 sdk。
+    pub(crate) fn key(&self) -> &Key32 {
+        &self.key
+    }
+
     /// 完成檔的位置：`media/<hash 前 2 hex>/<hash>`。
     pub fn path_of(&self, pool_file: &str) -> Result<PathBuf, SdkError> {
         if pool_file.len() < 4 || !pool_file.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -94,116 +107,100 @@ impl MediaPool {
         Ok(self.dir.join(shard).join(pool_file))
     }
 
-    /// 下載中的暫存檔位置。
+    /// 下載中的主檔位置。
     pub fn pending_path(&self, pending_name: &str) -> PathBuf {
         self.dir.join(PENDING_DIR_NAME).join(pending_name)
     }
 
-    /// 開一個新的暫存檔從頭寫（已有同名暫存檔就覆蓋）。
-    pub fn create_pending(&self, pending_name: &str) -> Result<PoolWriter, SdkError> {
+    /// 這個主檔旁邊的 seek 暫存檔位置。
+    pub fn seek_path(&self, pending_name: &str) -> PathBuf {
+        self.dir
+            .join(PENDING_DIR_NAME)
+            .join(format!("{pending_name}{SEEK_SUFFIX}"))
+    }
+
+    /// 開一個新的主檔從頭寫（已有同名的就覆蓋）。
+    ///
+    /// Args:
+    ///     pending_name: example: "m12"
+    ///     mxc: 這個主檔是誰的（進檔頭的 `owner`）, example: "mxc://localhost/000000000000004d"
+    pub fn create_pending(&self, pending_name: &str, mxc: &str) -> Result<PoolWriter, SdkError> {
         let path = self.pending_path(pending_name);
-        let mut nonce_base = [0u8; NONCE_BASE_LEN];
-        getrandom::getrandom(&mut nonce_base)
-            .map_err(|error| SdkError::Io(std::io::Error::other(format!("csprng: {error}"))))?;
         let header = Header {
             segment_size: SEGMENT_SIZE,
-            nonce_base,
+            nonce_base: random_nonce_base()?,
+            owner: owner_of(mxc),
         };
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
         file.write_all(&encode_header(&header))?;
-        Ok(PoolWriter {
-            cipher: XChaCha20Poly1305::new(self.key.as_bytes().into()),
-            header,
-            file,
-            path,
-            segment_index: 0,
-            buffer: Vec::with_capacity(SEGMENT_SIZE as usize),
-            provisional_on_disk: false,
-            hasher: blake3::Hasher::new(),
-            plain_len: 0,
-        })
+        Ok(PoolWriter::new(self, header, file, path))
     }
 
-    /// 接著寫一個暫存檔：明文只信任到 `trusted_plain_len`（/docs/design/media/media-pool.md §3 的「截到 chunks_written × chunk_size」），之後的丟掉。
+    /// 接著寫一個主檔（/docs/design/media/media-download.md §4.1 的續傳）：截掉寫到一半的段、逐段解開，碰到第一個解不開的就截到它前面。
+    /// 檔已經寫完（最後一段是短的）時，那一段解回記憶體，`plain_len()` 就是整個檔，呼叫者直接 `finish()`。
     ///
     /// Args:
-    ///     trusted_plain_len: example: 20 * 65536
+    ///     pending_name: example: "m12"
+    ///     mxc: 要續的是誰的；跟檔頭的 `owner` 對不上就不續, example: "mxc://localhost/000000000000004d"
     /// Return:
-    ///     Ok(PoolWriter)   已定位到 trusted_plain_len，BLAKE3 已算到那裡
-    ///     Err(Io)          暫存檔不在、比 trusted_plain_len 短、或某段解不開（呼叫者當成從頭來）
-    pub fn resume_pending(
-        &self,
-        pending_name: &str,
-        trusted_plain_len: u64,
-    ) -> Result<PoolWriter, SdkError> {
+    ///     Ok(PoolWriter)   定位在最後一個完整段之後，BLAKE3／SHA-256 已算到那裡
+    ///     Err(Io)          檔不在、不是池格式 v2（v1 一律不續，/docs/design/media/media-download.md §11 第 1 條）、
+    ///                      段大小不是這一版的、owner 對不上——呼叫者從頭來（`create_pending`）
+    pub fn resume_pending(&self, pending_name: &str, mxc: &str) -> Result<PoolWriter, SdkError> {
         let path = self.pending_path(pending_name);
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let header = read_header(&mut file)?;
-        let cipher = XChaCha20Poly1305::new(self.key.as_bytes().into());
-        let segment_size = u64::from(header.segment_size);
-        let full_segments = trusted_plain_len / segment_size;
-        let tail = (trusted_plain_len % segment_size) as usize;
-        let mut hasher = blake3::Hasher::new();
-        for index in 0..full_segments {
-            let plain = read_segment(&cipher, &header, &mut file, index)?;
-            if plain.len() as u64 != segment_size {
-                return Err(pool_error(format!(
-                    "segment {index} is short ({} bytes) below the trusted length",
-                    plain.len()
-                )));
-            }
-            hasher.update(&plain);
+        if header.segment_size != SEGMENT_SIZE {
+            return Err(pool_error(format!(
+                "pending file has segment_size {}, this build writes {SEGMENT_SIZE}",
+                header.segment_size
+            )));
         }
-        let mut buffer = Vec::with_capacity(header.segment_size as usize);
-        if tail > 0 {
-            // 尾巴那段可能是 sync() 留的暫定段（自己的 nonce），也可能是已經封好的正式整段（快照點在它中間）。
-            let plain = match read_segment_as(&cipher, &header, &mut file, full_segments, true) {
-                Ok(plain) => plain,
-                Err(_) => read_segment(&cipher, &header, &mut file, full_segments)?,
+        if header.owner != owner_of(mxc) {
+            return Err(pool_error(
+                "pending file belongs to another media (its owner tag differs)".into(),
+            ));
+        }
+        let mut writer = PoolWriter::new(self, header, file, path);
+        let record = record_len(&header);
+        let on_disk = writer.file.metadata()?.len().saturating_sub(HEADER_LEN);
+        let records = on_disk / record;
+        for index in 0..records {
+            let Ok(segment) = open_segment(&writer.cipher, &header, &mut writer.file, index) else {
+                break;
             };
-            if plain.len() < tail {
-                return Err(pool_error(format!(
-                    "last segment has {} bytes, trusted length needs {tail}",
-                    plain.len()
-                )));
+            let data = segment.data()?;
+            writer.hash(data);
+            if segment.len == u64::from(header.segment_size) {
+                writer.segments_written = index + 1;
+                continue;
             }
-            let trusted = plain.get(..tail).ok_or_else(|| {
-                pool_error(format!(
-                    "last segment has {} bytes, trusted length needs {tail}",
-                    plain.len()
-                ))
-            })?;
-            buffer.extend_from_slice(trusted);
-            hasher.update(&buffer);
+            // 短段只能是最後一段（finish 封的）：後面還有東西就是壞的，從它截掉。
+            if index + 1 == records {
+                writer.buffer.extend_from_slice(data);
+                writer.holds_final_segment = true;
+            } else {
+                writer.rehash_up_to(index)?;
+            }
+            break;
         }
-        // 檔截到第 full_segments 段的起點；buffer 裡的短段等湊滿或 finish 再封。
-        file.set_len(segment_offset(&header, full_segments))?;
-        file.seek(SeekFrom::End(0))?;
-        Ok(PoolWriter {
-            cipher,
-            header,
-            file,
-            path,
-            segment_index: full_segments,
-            buffer,
-            provisional_on_disk: false,
-            hasher,
-            plain_len: trusted_plain_len,
-        })
+        writer.truncate_to_written()?;
+        Ok(writer)
     }
 
-    /// 暫存檔寫完了：搬到 `media/<hh>/<hash>`。已經有同 hash 的檔（別的 mxc 同內容）就丟掉暫存檔、用既有的（去重，/docs/design/media/media-pool.md §2）。
+    /// 主檔寫完了：搬到 `media/<hh>/<hash>`。已經有同 hash 的檔（別的 mxc 同內容）就丟掉主檔、用既有的（去重，/docs/design/media/media-pool.md §2）。
     ///
     /// Return:
     ///     Ok(bool)   true = 這次搬進去的；false = 池裡本來就有
     pub fn adopt(&self, pending_name: &str, hash_hex: &str) -> Result<bool, SdkError> {
         let target = self.path_of(hash_hex)?;
         let pending = self.pending_path(pending_name);
-        if target.exists() {
+        if target.exists() && self.open_read(hash_hex).is_ok() {
             std::fs::remove_file(&pending)?;
             return Ok(false);
         }
@@ -215,23 +212,53 @@ impl MediaPool {
         Ok(true)
     }
 
+    /// 這個主檔是不是這一版的池格式（掃描用：v1 一律當壞檔，/docs/design/media/media-download.md §11 第 1 條）。
+    ///
+    /// Return:
+    ///     bool  true ＝ 檔頭是池格式 v2；false ＝ 不在、太短、magic 不對、版本不是 2
+    pub fn is_current_pending(&self, pending_name: &str) -> bool {
+        File::open(self.pending_path(pending_name))
+            .ok()
+            .is_some_and(|mut file| read_header(&mut file).is_ok())
+    }
+
+    /// 刪主檔（不在也算成功）。seek 暫存檔另外刪（`discard_seek`）。
     pub fn discard_pending(&self, pending_name: &str) -> Result<(), SdkError> {
         remove_if_exists(&self.pending_path(pending_name))
     }
 
+    /// 刪 seek 暫存檔（不在也算成功）。
+    pub fn discard_seek(&self, pending_name: &str) -> Result<(), SdkError> {
+        remove_if_exists(&self.seek_path(pending_name))
+    }
+
     /// 讀一個完成檔：`Read + Seek` 的把手，位置是明文位置。
+    ///
+    /// Return:
+    ///     Ok(PoolReader)
+    ///     Err(Io)      檔不在、不是池格式 v2、檔長不是 32 + n × R、沒有段、最後一段解不開或長度不合
     pub fn open_read(&self, pool_file: &str) -> Result<PoolReader, SdkError> {
         let path = self.path_of(pool_file)?;
         let mut file = File::open(&path)?;
         let header = read_header(&mut file)?;
-        let cipher_len = file.metadata()?.len();
-        let plain_len = plain_len_from_cipher_len(&header, cipher_len)?;
+        let cipher = XChaCha20Poly1305::new(self.key.as_bytes().into());
+        let body = file.metadata()?.len().saturating_sub(HEADER_LEN);
+        let record = record_len(&header);
+        if body == 0 || body % record != 0 {
+            return Err(pool_error(format!(
+                "a complete pool file must hold whole segments, this one has {body} bytes after the header"
+            )));
+        }
+        let segments = body / record;
+        let last = open_segment(&cipher, &header, &mut file, segments - 1)?;
+        let plain_len = (segments - 1) * u64::from(header.segment_size) + last.len;
         *open_readers().entry(path.clone()).or_insert(0) += 1;
         Ok(PoolReader {
             path,
-            cipher: XChaCha20Poly1305::new(self.key.as_bytes().into()),
+            cipher,
             header,
             file,
+            segments,
             plain_len,
             position: 0,
             loaded_segment: None,
@@ -284,7 +311,7 @@ impl MediaPool {
         Ok(names)
     }
 
-    /// 掃 `pending/`：所有暫存檔名（啟動時對照 DB 清孤兒用）。
+    /// 掃 `pending/`：所有暫存檔名（主檔 `m<id>` 與 seek 暫存檔 `m<id>.seek` 都在；啟動時對照 DB 清孤兒用）。
     pub fn list_pending(&self) -> Result<Vec<String>, SdkError> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(self.dir.join(PENDING_DIR_NAME))? {
@@ -304,92 +331,178 @@ pub struct PoolWriter {
     header: Header,
     file: File,
     path: PathBuf,
-    segment_index: u64,
-    buffer: Vec<u8>,
-    /// `sync()` 把 buffer 先封成一個短的「暫定段」寫在檔尾，讓進度快照指到的資料真的在磁碟上；
-    /// 下次要封正式的第 `segment_index` 段時先把檔截回它的起點。
-    provisional_on_disk: bool,
-    hasher: blake3::Hasher,
+    /// 已經封好、落在檔裡的完整段數：這就是進度（/docs/design/media/media-download.md §4.1）。
+    segments_written: u64,
+    /// 還沒湊滿一段的明文。
+    buffer: Zeroizing<Vec<u8>>,
+    blake3: blake3::Hasher,
+    sha256: Sha256,
     plain_len: u64,
+    /// 續傳時載回的是 `finish` 封過的最後一段：檔已經完整，🚫 不准再寫（同一個段號會封到不同明文）。
+    holds_final_segment: bool,
 }
 
 /// `finish()` 的結果。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finished {
-    /// 明文的 BLAKE3，32 位小寫 hex；就是池裡的檔名。
+    /// 明文的 BLAKE3，64 位小寫 hex；就是池裡的檔名。
     pub hash_hex: String,
+    /// 明文的 SHA-256，64 位小寫 hex（跟區塊的 `sha256` 比，/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 5 條）。
+    pub sha256_hex: String,
     pub plain_len: u64,
+    /// 整個檔的段數（含最後一段）。
+    pub segments: u64,
     pub bytes_on_disk: u64,
 }
 
 impl PoolWriter {
+    fn new(pool: &MediaPool, header: Header, file: File, path: PathBuf) -> PoolWriter {
+        PoolWriter {
+            cipher: XChaCha20Poly1305::new(pool.key.as_bytes().into()),
+            header,
+            file,
+            path,
+            segments_written: 0,
+            buffer: Zeroizing::new(Vec::with_capacity(header.segment_size as usize)),
+            blake3: blake3::Hasher::new(),
+            sha256: Sha256::new(),
+            plain_len: 0,
+            holds_final_segment: false,
+        }
+    }
+
     /// 目前已收下的明文長度（含還沒封的 buffer）。
     pub fn plain_len(&self) -> u64 {
         self.plain_len
+    }
+
+    /// 已經落地的完整段數。
+    pub fn segments_written(&self) -> u64 {
+        self.segments_written
+    }
+
+    /// 已經落地、讀得回來的明文長度（完整段 × segment_size）。
+    pub fn sealed_plain_len(&self) -> u64 {
+        self.segments_written * u64::from(self.header.segment_size)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// 有暫定段就先把檔截回第 `segment_index` 段的起點。
-    fn drop_provisional(&mut self) -> Result<(), SdkError> {
-        if self.provisional_on_disk {
-            let start = segment_offset(&self.header, self.segment_index);
-            self.file.set_len(start)?;
-            self.file.seek(SeekFrom::Start(start))?;
-            self.provisional_on_disk = false;
+    fn hash(&mut self, data: &[u8]) {
+        self.blake3.update(data);
+        self.sha256.update(data);
+        self.plain_len += data.len() as u64;
+    }
+
+    /// 續傳時在第 `index` 段發現壞東西：雜湊得從頭重算到 `index` 之前（只有中間出現短段這種壞檔會走到）。
+    fn rehash_up_to(&mut self, index: u64) -> Result<(), SdkError> {
+        self.blake3 = blake3::Hasher::new();
+        self.sha256 = Sha256::new();
+        self.plain_len = 0;
+        self.segments_written = index;
+        for kept in 0..index {
+            let segment = open_segment(&self.cipher, &self.header, &mut self.file, kept)?;
+            let data = segment.data()?.to_vec();
+            self.blake3.update(&data);
+            self.sha256.update(&data);
+            self.plain_len += data.len() as u64;
         }
         Ok(())
     }
 
-    /// 把 buffer 封成正式的一段（湊滿了、或 finish 時的最後一段）。
+    /// 檔截到已寫的完整段之後，寫入位置移到檔尾。
+    fn truncate_to_written(&mut self) -> Result<(), SdkError> {
+        let end = segment_offset(&self.header, self.segments_written);
+        self.file.set_len(end)?;
+        self.file.seek(SeekFrom::Start(end))?;
+        Ok(())
+    }
+
+    /// 把 buffer 封成一段寫到檔尾（湊滿了、或 finish 時的最後一段）。
     fn seal_buffer(&mut self) -> Result<(), SdkError> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        self.drop_provisional()?;
         let sealed = seal_segment(
             &self.cipher,
             &self.header,
-            self.segment_index,
-            false,
+            self.segments_written,
             &self.buffer,
         )?;
+        self.file.seek(SeekFrom::Start(segment_offset(
+            &self.header,
+            self.segments_written,
+        )))?;
         self.file.write_all(&sealed)?;
-        self.segment_index += 1;
+        self.segments_written += 1;
         self.buffer.clear();
         Ok(())
     }
 
-    /// 封最後一段、fsync、回 hash。之後這個把手不能再寫。
+    /// 讀回已經落地的一段明文（GET 讀「主檔已寫的段」，/docs/design/media/media-download.md §7.2 第 3 列）。
+    ///
+    /// Args:
+    ///     start: 明文起點, example: 65536
+    ///     end: 明文終點（不含）；要在 `sealed_plain_len()` 之內, example: 131072
+    /// Return:
+    ///     Ok(Zeroizing<Vec<u8>>)   那一段明文
+    ///     Err(Usage)               超出已落地的部分
+    ///     Err(Io)                  某段解不開
+    pub fn read_sealed(&mut self, start: u64, end: u64) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+        if start > end || end > self.sealed_plain_len() {
+            return Err(SdkError::Usage(format!(
+                "read {start}..{end} is past the {} sealed bytes",
+                self.sealed_plain_len()
+            )));
+        }
+        let segment_size = u64::from(self.header.segment_size);
+        let mut out = Zeroizing::new(Vec::with_capacity((end - start) as usize));
+        let mut position = start;
+        while position < end {
+            let index = position / segment_size;
+            let segment = open_segment(&self.cipher, &self.header, &mut self.file, index)?;
+            let data = segment.data()?;
+            let from = (position - index * segment_size) as usize;
+            let to = ((end - index * segment_size).min(segment.len)) as usize;
+            let piece = data
+                .get(from..to)
+                .ok_or_else(|| pool_error(format!("segment {index} is shorter than {to} bytes")))?;
+            out.extend_from_slice(piece);
+            position = index * segment_size + to as u64;
+        }
+        // 讀的時候移了位置：下一次寫要回到檔尾。
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(out)
+    }
+
+    /// 封最後一段（補滿、記真實長度）、fsync、回 hash。之後這個把手不能再寫。
+    ///
+    /// Return:
+    ///     Ok(Finished)
+    ///     Err(Usage)   一個 byte 都沒有（協議沒有零塊的上傳，池也不存零段的檔）
+    ///     Err(Io)      寫不了
     pub fn finish(mut self) -> Result<Finished, SdkError> {
+        if self.plain_len == 0 {
+            return Err(SdkError::Usage(
+                "a pool file needs at least one byte".into(),
+            ));
+        }
         self.seal_buffer()?;
         self.file.sync_all()?;
         let bytes_on_disk = self.file.metadata()?.len();
         Ok(Finished {
-            hash_hex: self.hasher.finalize().to_hex().to_string(),
+            hash_hex: self.blake3.finalize().to_hex().to_string(),
+            sha256_hex: hex::encode(self.sha256.clone().finalize()),
             plain_len: self.plain_len,
+            segments: self.segments_written,
             bytes_on_disk,
         })
     }
 
-    /// 進度快照前呼叫：連湊不滿的那段也以「暫定段」寫到磁碟並 fsync，讓快照指到的每個 byte 都真的在檔裡
-    /// （`resume_pending` 解得到）。下次湊滿時暫定段會被截掉重封。
+    /// fsync（/docs/design/media/media-download.md §4.1：每 1.5 秒一次，限制斷電時最多丟多少）。只有完整段在檔裡：buffer 不寫。
     pub fn sync(&mut self) -> Result<(), SdkError> {
-        if !self.buffer.is_empty() {
-            self.drop_provisional()?;
-            // 暫定段用自己的 nonce（PROVISIONAL_BIT）：同段號之後正式重封是另一個 nonce，不是 nonce 重用。
-            let sealed = seal_segment(
-                &self.cipher,
-                &self.header,
-                self.segment_index,
-                true,
-                &self.buffer,
-            )?;
-            self.file.write_all(&sealed)?;
-            self.provisional_on_disk = true;
-        }
         self.file.sync_data()?;
         Ok(())
     }
@@ -397,9 +510,14 @@ impl PoolWriter {
 
 impl Write for PoolWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.holds_final_segment && !data.is_empty() {
+            return Err(std::io::Error::other(
+                "media pool: this file is already complete; nothing more can be written",
+            ));
+        }
         let mut remaining = data;
         while !remaining.is_empty() {
-            let room = self.header.segment_size as usize - self.buffer.len();
+            let room = (self.header.segment_size as usize).saturating_sub(self.buffer.len());
             let take = room.min(remaining.len());
             let Some((piece, rest)) = remaining.split_at_checked(take) else {
                 return Err(std::io::Error::other(
@@ -407,7 +525,8 @@ impl Write for PoolWriter {
                 ));
             };
             self.buffer.extend_from_slice(piece);
-            self.hasher.update(piece);
+            self.blake3.update(piece);
+            self.sha256.update(piece);
             self.plain_len += take as u64;
             remaining = rest;
             if self.buffer.len() == self.header.segment_size as usize {
@@ -429,9 +548,10 @@ pub struct PoolReader {
     cipher: XChaCha20Poly1305,
     header: Header,
     file: File,
+    segments: u64,
     plain_len: u64,
     position: u64,
-    loaded_segment: Option<(u64, Vec<u8>)>,
+    loaded_segment: Option<(u64, Zeroizing<Vec<u8>>)>,
 }
 
 impl PoolReader {
@@ -441,9 +561,16 @@ impl PoolReader {
 
     fn load_segment(&mut self, index: u64) -> std::io::Result<&[u8]> {
         if self.loaded_segment.as_ref().map(|(loaded, _)| *loaded) != Some(index) {
-            let plain = read_segment(&self.cipher, &self.header, &mut self.file, index)
+            let segment = open_segment(&self.cipher, &self.header, &mut self.file, index)
                 .map_err(io_error)?;
-            self.loaded_segment = Some((index, plain));
+            // 除了最後一段，每段都要是滿的：不然明文位置就對不上了。
+            if index + 1 < self.segments && segment.len != u64::from(self.header.segment_size) {
+                return Err(std::io::Error::other(format!(
+                    "media pool: segment {index} is short but is not the last"
+                )));
+            }
+            let data = Zeroizing::new(segment.data().map_err(io_error)?.to_vec());
+            self.loaded_segment = Some((index, data));
         }
         match &self.loaded_segment {
             Some((_, plain)) => Ok(plain),
@@ -510,12 +637,27 @@ impl Seek for PoolReader {
 
 // ---- 格式 ----
 
+/// 檔頭的 `owner`：mxc 的 BLAKE3 前 4 byte。只用來認「這個暫存名是不是還是同一個檔的」，🚫 不是安全邊界（池金鑰才是）。
+fn owner_of(mxc: &str) -> u32 {
+    let hash = blake3::hash(mxc.as_bytes());
+    let bytes = hash.as_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+pub(crate) fn random_nonce_base() -> Result<[u8; NONCE_BASE_LEN], SdkError> {
+    let mut nonce_base = [0u8; NONCE_BASE_LEN];
+    getrandom::getrandom(&mut nonce_base)
+        .map_err(|error| SdkError::Io(std::io::Error::other(format!("csprng: {error}"))))?;
+    Ok(nonce_base)
+}
+
 fn encode_header(header: &Header) -> [u8; HEADER_LEN as usize] {
     let mut bytes = [0u8; HEADER_LEN as usize];
     bytes[..4].copy_from_slice(MAGIC);
-    bytes[4] = VERSION;
+    bytes[4] = POOL_FORMAT_VERSION;
     bytes[8..12].copy_from_slice(&header.segment_size.to_le_bytes());
     bytes[12..12 + NONCE_BASE_LEN].copy_from_slice(&header.nonce_base);
+    bytes[28..32].copy_from_slice(&header.owner.to_le_bytes());
     bytes
 }
 
@@ -527,17 +669,13 @@ fn read_header(file: &mut File) -> Result<Header, SdkError> {
     if &bytes[..4] != MAGIC {
         return Err(pool_error("not a media pool file (bad magic)".into()));
     }
-    if bytes[4] != VERSION {
+    if bytes[4] != POOL_FORMAT_VERSION {
         return Err(pool_error(format!(
-            "media pool file version {} is not supported",
+            "media pool file version {} is not supported (this build reads {POOL_FORMAT_VERSION})",
             bytes[4]
         )));
     }
-    let segment_size = bytes
-        .get(8..12)
-        .and_then(|field| field.first_chunk::<4>())
-        .map(|field| u32::from_le_bytes(*field))
-        .ok_or_else(|| pool_error("pool header is shorter than its segment_size field".into()))?;
+    let segment_size = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
     if segment_size == 0 {
         return Err(pool_error("media pool file has segment_size 0".into()));
     }
@@ -546,31 +684,27 @@ fn read_header(file: &mut File) -> Result<Header, SdkError> {
     Ok(Header {
         segment_size,
         nonce_base,
+        owner: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
     })
 }
 
-fn segment_offset(header: &Header, index: u64) -> u64 {
-    HEADER_LEN + index * (u64::from(header.segment_size) + TAG_LEN)
+/// 每段在磁碟上的固定大小 R。
+fn record_len(header: &Header) -> u64 {
+    LEN_FIELD + u64::from(header.segment_size) + TAG_LEN
 }
 
-/// 暫定段（`sync()` 寫在檔尾、之後會被截掉重封的那段）用另一組 nonce：段號的最高位設 1。
-/// 同一個 (key, nonce) 封兩份不同的明文是 AEAD 的大忌（Poly1305 的金鑰會漏），而暫定段與它之後的正式段就是「同段號、不同明文」；
-/// 分開 nonce 之後兩者各自只封一次（PR #14 審查 rumia 🟡3）。段號只用 63 位，夠用（2^63 × 64 KiB）。
-const PROVISIONAL_BIT: u64 = 1 << 63;
+fn segment_offset(header: &Header, index: u64) -> u64 {
+    HEADER_LEN + index * record_len(header)
+}
 
-fn nonce_and_aad(header: &Header, index: u64, provisional: bool) -> ([u8; 24], Vec<u8>) {
-    let tagged_index = if provisional {
-        index | PROVISIONAL_BIT
-    } else {
-        index
-    };
+fn nonce_and_aad(header: &Header, index: u64) -> ([u8; 24], Vec<u8>) {
     let mut nonce = [0u8; 24];
     nonce[..NONCE_BASE_LEN].copy_from_slice(&header.nonce_base);
-    nonce[NONCE_BASE_LEN..].copy_from_slice(&tagged_index.to_le_bytes());
+    nonce[NONCE_BASE_LEN..].copy_from_slice(&index.to_le_bytes());
     let mut aad = Vec::with_capacity(AAD_PREFIX.len() + NONCE_BASE_LEN + 8);
     aad.extend_from_slice(AAD_PREFIX);
     aad.extend_from_slice(&header.nonce_base);
-    aad.extend_from_slice(&tagged_index.to_le_bytes());
+    aad.extend_from_slice(&index.to_le_bytes());
     (nonce, aad)
 }
 
@@ -578,80 +712,80 @@ fn seal_segment(
     cipher: &XChaCha20Poly1305,
     header: &Header,
     index: u64,
-    provisional: bool,
-    plain: &[u8],
+    data: &[u8],
 ) -> Result<Vec<u8>, SdkError> {
-    if index & PROVISIONAL_BIT != 0 {
-        return Err(pool_error(format!("segment index {index} is out of range")));
+    let segment_size = header.segment_size as usize;
+    if data.is_empty() || data.len() > segment_size {
+        return Err(pool_error(format!(
+            "segment {index} would hold {} bytes (1..={segment_size} allowed)",
+            data.len()
+        )));
     }
-    let (nonce, aad) = nonce_and_aad(header, index, provisional);
+    let mut plain = Zeroizing::new(Vec::with_capacity(LEN_FIELD as usize + segment_size));
+    plain.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    plain.extend_from_slice(data);
+    plain.resize(LEN_FIELD as usize + segment_size, 0);
+    let (nonce, aad) = nonce_and_aad(header, index);
     cipher
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
-                msg: plain,
+                msg: &plain,
                 aad: &aad,
             },
         )
         .map_err(|_| pool_error(format!("sealing segment {index} failed")))
 }
 
-/// 讀第 `index` 段並解開。最後一段可以短；超出檔尾回空。
-fn read_segment(
+/// 解開的一段：整段明文（含長度欄與補零）加上真實長度。
+struct OpenedSegment {
+    plain: Zeroizing<Vec<u8>>,
+    len: u64,
+}
+
+impl OpenedSegment {
+    fn data(&self) -> Result<&[u8], SdkError> {
+        let end = LEN_FIELD as usize + self.len as usize;
+        self.plain
+            .get(LEN_FIELD as usize..end)
+            .ok_or_else(|| pool_error("segment length runs past the segment".into()))
+    }
+}
+
+/// 讀第 `index` 段並解開，驗長度欄是 1..=segment_size。
+fn open_segment(
     cipher: &XChaCha20Poly1305,
     header: &Header,
     file: &mut File,
     index: u64,
-) -> Result<Vec<u8>, SdkError> {
-    read_segment_as(cipher, header, file, index, false)
-}
-
-/// `provisional` = true 用暫定段的 nonce 解（只有 `resume_pending` 讀暫存檔的尾巴會用）。
-fn read_segment_as(
-    cipher: &XChaCha20Poly1305,
-    header: &Header,
-    file: &mut File,
-    index: u64,
-    provisional: bool,
-) -> Result<Vec<u8>, SdkError> {
-    let start = segment_offset(header, index);
-    let total = file.metadata()?.len();
-    if start >= total {
-        return Ok(Vec::new());
+) -> Result<OpenedSegment, SdkError> {
+    let mut sealed = vec![0u8; record_len(header) as usize];
+    file.seek(SeekFrom::Start(segment_offset(header, index)))?;
+    file.read_exact(&mut sealed)
+        .map_err(|_| pool_error(format!("segment {index} is not complete on disk")))?;
+    let (nonce, aad) = nonce_and_aad(header, index);
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &sealed,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| pool_error(format!("segment {index} does not authenticate")))?,
+    );
+    let len = plain
+        .first_chunk::<4>()
+        .map(|field| u64::from(u32::from_le_bytes(*field)))
+        .ok_or_else(|| pool_error(format!("segment {index} has no length field")))?;
+    if len == 0 || len > u64::from(header.segment_size) {
+        return Err(pool_error(format!(
+            "segment {index} claims {len} bytes (1..={} allowed)",
+            header.segment_size
+        )));
     }
-    let sealed_len = (total - start).min(u64::from(header.segment_size) + TAG_LEN) as usize;
-    let mut sealed = vec![0u8; sealed_len];
-    file.seek(SeekFrom::Start(start))?;
-    file.read_exact(&mut sealed)?;
-    let (nonce, aad) = nonce_and_aad(header, index, provisional);
-    cipher
-        .decrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &sealed,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| pool_error(format!("segment {index} does not authenticate")))
-}
-
-/// 密文總長 → 明文總長（最後一段可短）。
-fn plain_len_from_cipher_len(header: &Header, cipher_len: u64) -> Result<u64, SdkError> {
-    if cipher_len < HEADER_LEN {
-        return Err(pool_error("file is shorter than the pool header".into()));
-    }
-    let body = cipher_len - HEADER_LEN;
-    let sealed_segment = u64::from(header.segment_size) + TAG_LEN;
-    let full = body / sealed_segment;
-    let rest = body % sealed_segment;
-    let tail = if rest == 0 {
-        0
-    } else if rest > TAG_LEN {
-        rest - TAG_LEN
-    } else {
-        return Err(pool_error("trailing bytes shorter than a tag".into()));
-    };
-    Ok(full * u64::from(header.segment_size) + tail)
+    Ok(OpenedSegment { plain, len })
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), SdkError> {
@@ -663,7 +797,7 @@ fn remove_if_exists(path: &Path) -> Result<(), SdkError> {
 }
 
 /// 池的錯誤一律當 Io（對呼叫者是「檔壞了、重拉」），字串裡沒有金鑰。
-fn pool_error(message: String) -> SdkError {
+pub(crate) fn pool_error(message: String) -> SdkError {
     SdkError::Io(std::io::Error::other(format!("media pool: {message}")))
 }
 
@@ -678,6 +812,9 @@ fn io_error(error: SdkError) -> std::io::Error {
 mod tests {
     use super::*;
 
+    const MXC: &str = "mxc://localhost/0001";
+    const R: u64 = LEN_FIELD + SEGMENT_SIZE as u64 + TAG_LEN;
+
     fn scratch_pool(name: &str) -> (MediaPool, PathBuf) {
         let dir = std::env::temp_dir().join(format!("wbf-pool-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -689,34 +826,59 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
-    #[test]
-    fn write_finish_adopt_read_back_and_dedup() {
-        let (pool, dir) = scratch_pool("roundtrip");
-        // 兩段半：跨段、最後一段短。
-        let plain = pattern(SEGMENT_SIZE as usize * 2 + 12345);
-        let mut writer = pool.create_pending("1").unwrap();
+    fn write_and_adopt(pool: &MediaPool, name: &str, plain: &[u8]) -> Finished {
+        let mut writer = pool.create_pending(name, MXC).unwrap();
         for piece in plain.chunks(7000) {
             writer.write_all(piece).unwrap();
         }
         let finished = writer.finish().unwrap();
-        assert_eq!(finished.plain_len, plain.len() as u64);
-        assert_eq!(finished.hash_hex, blake3::hash(&plain).to_hex().to_string());
-        assert_eq!(
-            finished.bytes_on_disk,
-            HEADER_LEN + 3 * TAG_LEN + plain.len() as u64
-        );
-        assert!(pool.adopt("1", &finished.hash_hex).unwrap());
+        pool.adopt(name, &finished.hash_hex).unwrap();
+        finished
+    }
+
+    fn read_all(pool: &MediaPool, hash: &str) -> Vec<u8> {
+        let mut back = Vec::new();
+        pool.open_read(hash)
+            .unwrap()
+            .read_to_end(&mut back)
+            .unwrap();
+        back
+    }
+
+    #[test]
+    fn every_segment_is_written_full_and_the_file_length_is_whole_records() {
+        let (pool, dir) = scratch_pool("full");
+        for len in [
+            1usize,
+            SEGMENT_SIZE as usize,
+            SEGMENT_SIZE as usize * 2 + 12345,
+        ] {
+            let plain = pattern(len);
+            let finished = write_and_adopt(&pool, "w", &plain);
+            let segments = (len as u64).div_ceil(u64::from(SEGMENT_SIZE));
+            assert_eq!(
+                finished.bytes_on_disk,
+                HEADER_LEN + segments * R,
+                "len {len}"
+            );
+            assert_eq!(finished.plain_len, len as u64);
+            assert_eq!(finished.hash_hex, blake3::hash(&plain).to_hex().to_string());
+            assert_eq!(finished.sha256_hex, hex::encode(Sha256::digest(&plain)));
+            assert_eq!(read_all(&pool, &finished.hash_hex), plain);
+            pool.remove(&finished.hash_hex).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reader_seeks_across_segments_and_dedup_keeps_the_first_copy() {
+        let (pool, dir) = scratch_pool("seek");
+        let plain = pattern(SEGMENT_SIZE as usize * 2 + 12345);
+        let finished = write_and_adopt(&pool, "1", &plain);
         assert!(!pool.pending_path("1").exists());
-        // 落地不是明文。
         let on_disk = std::fs::read(pool.path_of(&finished.hash_hex).unwrap()).unwrap();
         assert!(!on_disk.windows(64).any(|window| window == &plain[100..164]));
-
         let mut reader = pool.open_read(&finished.hash_hex).unwrap();
-        assert_eq!(reader.plain_len(), plain.len() as u64);
-        let mut back = Vec::new();
-        reader.read_to_end(&mut back).unwrap();
-        assert_eq!(back, plain);
-        // seek 到跨段的位置讀一小段。
         reader
             .seek(SeekFrom::Start(SEGMENT_SIZE as u64 - 10))
             .unwrap();
@@ -726,162 +888,191 @@ mod tests {
             &window[..],
             &plain[SEGMENT_SIZE as usize - 10..SEGMENT_SIZE as usize + 10]
         );
-
-        // 同內容第二次：adopt 回 false、暫存檔被丟。
-        let mut writer2 = pool.create_pending("2").unwrap();
-        writer2.write_all(&plain).unwrap();
-        let finished2 = writer2.finish().unwrap();
-        assert_eq!(finished2.hash_hex, finished.hash_hex);
-        assert!(!pool.adopt("2", &finished2.hash_hex).unwrap());
+        let mut writer = pool.create_pending("2", "mxc://localhost/other").unwrap();
+        writer.write_all(&plain).unwrap();
+        let second = writer.finish().unwrap();
+        assert!(!pool.adopt("2", &second.hash_hex).unwrap());
         assert!(!pool.pending_path("2").exists());
-        assert_eq!(
-            pool.bytes_on_disk(&finished.hash_hex).unwrap(),
-            finished.bytes_on_disk
-        );
-        pool.remove(&finished.hash_hex).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_keeps_whole_segments_and_drops_a_half_written_one() {
+        let (pool, dir) = scratch_pool("resume");
+        let plain = pattern(SEGMENT_SIZE as usize * 3 + 777);
+        let mut writer = pool.create_pending("r", MXC).unwrap();
+        writer
+            .write_all(&plain[..SEGMENT_SIZE as usize * 2 + 5])
+            .unwrap();
+        assert_eq!(writer.segments_written(), 2);
+        drop(writer);
+        // 第三段寫到一半就斷：檔尾多出半筆。
+        let path = pool.pending_path("r");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xAB; 1000]).unwrap();
+        drop(file);
+        let mut resumed = pool.resume_pending("r", MXC).unwrap();
+        assert_eq!(resumed.segments_written(), 2);
+        assert_eq!(resumed.plain_len(), SEGMENT_SIZE as u64 * 2);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), HEADER_LEN + 2 * R);
+        resumed
+            .write_all(&plain[SEGMENT_SIZE as usize * 2..])
+            .unwrap();
+        let finished = resumed.finish().unwrap();
+        assert_eq!(finished.hash_hex, blake3::hash(&plain).to_hex().to_string());
+        pool.adopt("r", &finished.hash_hex).unwrap();
+        assert_eq!(read_all(&pool, &finished.hash_hex), plain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_cuts_at_the_first_segment_that_does_not_open() {
+        let (pool, dir) = scratch_pool("cut");
+        let plain = pattern(SEGMENT_SIZE as usize * 3);
+        let mut writer = pool.create_pending("c", MXC).unwrap();
+        writer.write_all(&plain).unwrap();
+        drop(writer);
+        // 長度落地、內容沒落地：第二段變成零。
+        let path = pool.pending_path("c");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let second = (HEADER_LEN + R) as usize;
+        bytes[second..second + R as usize].fill(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let resumed = pool.resume_pending("c", MXC).unwrap();
+        assert_eq!(resumed.segments_written(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), HEADER_LEN + R);
+        drop(resumed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_but_not_adopted_file_resumes_to_its_full_length() {
+        let (pool, dir) = scratch_pool("done");
+        let plain = pattern(SEGMENT_SIZE as usize + 300);
+        let mut writer = pool.create_pending("d", MXC).unwrap();
+        writer.write_all(&plain).unwrap();
+        let first = writer.finish().unwrap();
+        let resumed = pool.resume_pending("d", MXC).unwrap();
+        assert_eq!(resumed.plain_len(), plain.len() as u64);
+        assert_eq!(resumed.segments_written(), 1);
+        let again = resumed.finish().unwrap();
+        assert_eq!(again, first);
+        // 完整的檔不准再接著寫。
+        let mut resumed = pool.resume_pending("d", MXC).unwrap();
+        assert!(resumed.write_all(&[1]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pending_file_of_another_media_or_version_is_not_resumed() {
+        let (pool, dir) = scratch_pool("owner");
+        let mut writer = pool.create_pending("o", MXC).unwrap();
+        writer.write_all(&pattern(SEGMENT_SIZE as usize)).unwrap();
+        drop(writer);
+        assert!(pool
+            .resume_pending("o", "mxc://localhost/someone-else")
+            .is_err());
+        assert!(pool.resume_pending("o", MXC).is_ok());
+        // 池格式 v1 一律不續（/docs/design/media/media-download.md §11 第 1 條）。
+        let path = pool.pending_path("o");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4] = 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(pool.resume_pending("o", MXC).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampering_moving_segments_and_a_wrong_key_are_rejected() {
+        let (pool, dir) = scratch_pool("tamper");
+        let plain = pattern(SEGMENT_SIZE as usize + 10);
+        let finished = write_and_adopt(&pool, "t", &plain);
+        let path = pool.path_of(&finished.hash_hex).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        // 翻第一段的一個 byte。
+        let mut bytes = original.clone();
+        bytes[HEADER_LEN as usize + 3] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reader = pool.open_read(&finished.hash_hex).unwrap();
+        assert!(reader.read_to_end(&mut Vec::new()).is_err());
+        // 把第 1 段搬到第 0 段：AAD／nonce 帶段號，解不開。
+        let mut bytes = original.clone();
+        let (head, body) = bytes.split_at_mut(HEADER_LEN as usize);
+        let _ = head;
+        let (first, second) = body.split_at_mut(R as usize);
+        first.swap_with_slice(&mut second[..R as usize]);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(pool.open_read(&finished.hash_hex).is_err());
+        // 別把金鑰。
+        std::fs::write(&path, &original).unwrap();
+        let other = MediaPool::open(&dir, Key32([8u8; 32])).unwrap();
+        assert!(other.open_read(&finished.hash_hex).is_err());
+        // 檔長不是整數筆：拒。
+        let mut bytes = original.clone();
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(&path, &bytes).unwrap();
         assert!(pool.open_read(&finished.hash_hex).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resume_mid_segment_reproduces_the_same_hash() {
-        let (pool, dir) = scratch_pool("resume");
-        let plain = pattern(SEGMENT_SIZE as usize * 3 + 777);
-        // 第一次：寫到 1.5 段加一點雜訊（模擬最後一次快照之後多寫的、不可信的部分），然後中斷。
-        let trusted = SEGMENT_SIZE as u64 + 30000;
-        let mut writer = pool.create_pending("r").unwrap();
-        writer.write_all(&plain[..trusted as usize]).unwrap();
-        writer.write_all(&[0xEE; 5000]).unwrap(); // 不可信的尾巴
-        writer.sync().unwrap();
-        drop(writer);
-        // 續：只信任到 trusted，之後的丟掉。
-        let mut resumed = pool.resume_pending("r", trusted).unwrap();
-        assert_eq!(resumed.plain_len(), trusted);
-        resumed.write_all(&plain[trusted as usize..]).unwrap();
-        let finished = resumed.finish().unwrap();
-        assert_eq!(finished.hash_hex, blake3::hash(&plain).to_hex().to_string());
-        pool.adopt("r", &finished.hash_hex).unwrap();
-        let mut back = Vec::new();
-        pool.open_read(&finished.hash_hex)
-            .unwrap()
-            .read_to_end(&mut back)
-            .unwrap();
-        assert_eq!(back, plain);
-        // 續傳點剛好在段邊界也行。
-        let mut writer = pool.create_pending("r2").unwrap();
-        writer
-            .write_all(&plain[..SEGMENT_SIZE as usize * 2])
-            .unwrap();
-        drop(writer);
-        let mut resumed = pool.resume_pending("r2", SEGMENT_SIZE as u64 * 2).unwrap();
-        resumed
-            .write_all(&plain[SEGMENT_SIZE as usize * 2..])
-            .unwrap();
-        assert_eq!(resumed.finish().unwrap().hash_hex, finished.hash_hex);
-        // 信任長度比檔裡有的還長：拒絕。
-        let mut writer = pool.create_pending("r3").unwrap();
-        writer.write_all(&plain[..1000]).unwrap();
-        drop(writer);
-        assert!(pool.resume_pending("r3", 5000).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tampering_and_wrong_key_are_rejected() {
-        let (pool, dir) = scratch_pool("tamper");
-        let plain = pattern(SEGMENT_SIZE as usize + 10);
-        let mut writer = pool.create_pending("t").unwrap();
-        writer.write_all(&plain).unwrap();
-        let finished = writer.finish().unwrap();
-        pool.adopt("t", &finished.hash_hex).unwrap();
-        let path = pool.path_of(&finished.hash_hex).unwrap();
-        // 翻第二段的一個 byte。
-        let mut bytes = std::fs::read(&path).unwrap();
-        let second = segment_offset(
-            &Header {
-                segment_size: SEGMENT_SIZE,
-                nonce_base: [0; NONCE_BASE_LEN],
-            },
-            1,
-        ) as usize;
-        bytes[second + 3] ^= 1;
-        std::fs::write(&path, &bytes).unwrap();
-        let mut reader = pool.open_read(&finished.hash_hex).unwrap();
-        let mut first = vec![0u8; SEGMENT_SIZE as usize];
-        reader.read_exact(&mut first).unwrap(); // 第一段還好
-        let mut rest = Vec::new();
-        assert!(reader.read_to_end(&mut rest).is_err()); // 第二段壞
-                                                         // 別把金鑰。
-        let other = MediaPool::open(&dir, Key32([8u8; 32])).unwrap();
-        let mut reader = other.open_read(&finished.hash_hex).unwrap();
-        assert!(reader.read_to_end(&mut Vec::new()).is_err());
-        // 把第 0 段搬到第 1 段：AAD／nonce 帶段號，解不開。
-        let mut bytes = std::fs::read(&path).unwrap();
-        let seg = SEGMENT_SIZE as usize + TAG_LEN as usize;
-        let first_segment: Vec<u8> = bytes[HEADER_LEN as usize..HEADER_LEN as usize + seg].to_vec();
-        bytes.truncate(HEADER_LEN as usize + seg);
-        bytes.extend_from_slice(&first_segment);
-        std::fs::write(&path, &bytes).unwrap();
-        let mut reader = pool.open_read(&finished.hash_hex).unwrap();
-        reader.seek(SeekFrom::Start(SEGMENT_SIZE as u64)).unwrap();
-        assert!(reader.read(&mut [0u8; 8]).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 暫定段與正式段是兩個 nonce：暫定段用正式 nonce 解不開（反之亦然），所以同段號重封不是 nonce 重用。
-    #[test]
-    fn provisional_segment_uses_its_own_nonce() {
-        let (pool, dir) = scratch_pool("provisional");
-        let plain = pattern(SEGMENT_SIZE as usize + 3000);
-        let mut writer = pool.create_pending("p").unwrap();
-        writer.write_all(&plain).unwrap();
-        writer.sync().unwrap(); // 段 1 是 3000 byte 的暫定段
-        let path = writer.path().to_path_buf();
-        drop(writer);
+    fn a_length_field_over_the_segment_size_is_rejected() {
+        let (_pool, dir) = scratch_pool("length");
         let cipher = XChaCha20Poly1305::new(Key32([9u8; 32]).as_bytes().into());
-        let mut file = File::open(&path).unwrap();
-        let header = read_header(&mut file).unwrap();
-        assert!(
-            read_segment(&cipher, &header, &mut file, 1).is_err(),
-            "final nonce must not open a provisional segment"
-        );
-        assert_eq!(
-            read_segment_as(&cipher, &header, &mut file, 1, true).unwrap(),
-            &plain[SEGMENT_SIZE as usize..]
-        );
-        assert!(
-            read_segment_as(&cipher, &header, &mut file, 0, true).is_err(),
-            "provisional nonce must not open a final segment"
-        );
-        // 續上去寫完：尾段被截掉、用正式 nonce 重封，完成檔裡沒有暫定段。
-        let mut resumed = pool.resume_pending("p", plain.len() as u64).unwrap();
-        resumed.write_all(&[7u8; 10]).unwrap();
-        let finished = resumed.finish().unwrap();
-        pool.adopt("p", &finished.hash_hex).unwrap();
-        let mut back = Vec::new();
-        pool.open_read(&finished.hash_hex)
-            .unwrap()
-            .read_to_end(&mut back)
+        let header = Header {
+            segment_size: SEGMENT_SIZE,
+            nonce_base: [3; NONCE_BASE_LEN],
+            owner: owner_of(MXC),
+        };
+        let mut plain = vec![0u8; R as usize - TAG_LEN as usize];
+        plain[..4].copy_from_slice(&(SEGMENT_SIZE + 1).to_le_bytes());
+        let (nonce, aad) = nonce_and_aad(&header, 0);
+        let sealed = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &aad,
+                },
+            )
             .unwrap();
-        assert_eq!(back.len(), plain.len() + 10);
-        assert_eq!(pool.list_files().unwrap(), vec![finished.hash_hex.clone()]);
+        let path = dir.join("forged");
+        let mut bytes = encode_header(&header).to_vec();
+        bytes.extend_from_slice(&sealed);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(open_segment(&cipher, &header, &mut file, 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn empty_file_and_bad_names() {
-        let (pool, dir) = scratch_pool("empty");
-        let writer = pool.create_pending("e").unwrap();
+    fn sealed_segments_read_back_while_writing() {
+        let (pool, dir) = scratch_pool("sealed");
+        let plain = pattern(SEGMENT_SIZE as usize * 2 + 50);
+        let mut writer = pool.create_pending("s", MXC).unwrap();
+        writer.write_all(&plain).unwrap();
+        assert_eq!(writer.sealed_plain_len(), SEGMENT_SIZE as u64 * 2);
+        let middle = writer.read_sealed(65000, 70000).unwrap();
+        assert_eq!(&middle[..], &plain[65000..70000]);
+        assert!(writer.read_sealed(0, SEGMENT_SIZE as u64 * 2 + 1).is_err());
+        // 讀過之後照樣接著寫到正確的位置。
+        writer.write_all(&[1, 2, 3]).unwrap();
         let finished = writer.finish().unwrap();
-        assert_eq!(finished.plain_len, 0);
-        assert_eq!(finished.hash_hex, blake3::hash(b"").to_hex().to_string());
-        pool.adopt("e", &finished.hash_hex).unwrap();
-        let mut reader = pool.open_read(&finished.hash_hex).unwrap();
-        assert_eq!(reader.plain_len(), 0);
-        assert_eq!(reader.read(&mut [0u8; 4]).unwrap(), 0);
+        pool.adopt("s", &finished.hash_hex).unwrap();
+        let mut expected = plain.clone();
+        expected.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(read_all(&pool, &finished.hash_hex), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_file_is_refused_and_bad_names_too() {
+        let (pool, dir) = scratch_pool("empty");
+        let writer = pool.create_pending("e", MXC).unwrap();
+        assert!(writer.finish().is_err());
         assert!(pool.path_of("../x").is_err());
         assert!(pool.path_of("zz").is_err());
-        assert_eq!(pool.list_pending().unwrap(), Vec::<String>::new());
+        assert_eq!(pool.list_pending().unwrap(), vec!["e".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

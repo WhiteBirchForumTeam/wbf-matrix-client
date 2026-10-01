@@ -105,6 +105,8 @@ struct Client {
     socket: Socket,
     keys: RpcKeys,
     next_id: u64,
+    /// 等回應時收到的推播（沒有 `id` 的），照順序。
+    pushes: Vec<Value>,
 }
 
 impl Client {
@@ -116,6 +118,7 @@ impl Client {
             socket,
             keys: RpcKeys::from_token(&TOKEN),
             next_id: 0,
+            pushes: Vec::new(),
         };
         let hello = client
             .call(
@@ -149,6 +152,9 @@ impl Client {
                     let reply: Value = serde_json::from_slice(&json).unwrap();
                     if reply["id"] == id {
                         return reply;
+                    }
+                    if reply["id"].is_null() {
+                        self.pushes.push(reply);
                     }
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
@@ -629,6 +635,72 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     }
     assert_eq!(found["manifest"]["mxc"], manifest["mxc"], "{found}");
 
+    // ── 讀（/docs/design/media/media-download.md §7）：池清掉 → media.open 排隊 → 從中間 seek → 等佇列拉完 → 整檔 ──
+    let subscribed = client
+        .call("subscribe", json!({ "events": ["media.download"] }))
+        .await;
+    assert_eq!(subscribed["code"], 0, "{subscribed}");
+    let gc = client
+        .call("media.gc", json!({ "quota_mib": 0, "protect_days": 0 }))
+        .await;
+    assert_eq!(gc["code"], 0, "media.gc: {gc}");
+    let by_event = json!({ "room": encrypted_room, "event_id": encrypted_event });
+    let opened = client.call("media.open", by_event.clone()).await;
+    assert_eq!(opened["code"], 0, "media.open: {opened}");
+    assert_eq!(opened["result"]["mxc"], manifest["mxc"]);
+    assert_eq!(opened["result"]["size"], body.len());
+    assert!(
+        matches!(
+            opened["result"]["state"].as_str(),
+            Some("queued" | "downloading")
+        ),
+        "池清掉了，打開就排進佇列：{opened}"
+    );
+    let url = opened["result"]["url"].as_str().unwrap().to_string();
+    assert!(url.contains("/media/mxc/e-") && url.len() < 160, "{url}");
+    let (status, head, window) = get(daemon.data_port, &url, Some("bytes=150000-150999")).await;
+    assert_eq!(status, 206, "{head}");
+    assert_eq!(
+        window,
+        body[150_000..151_000],
+        "seek 到中間，拿到的就是那一段"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains(&format!(
+            "content-range: bytes 150000-150999/{}",
+            body.len()
+        )),
+        "{head}"
+    );
+    let mut state = Value::Null;
+    for _ in 0..150 {
+        state = client.call("media.download", by_event.clone()).await;
+        assert_eq!(state["code"], 0, "media.download: {state}");
+        if state["result"]["state"] == "complete" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(state["result"]["state"], "complete", "佇列拉完了：{state}");
+    let (status, head, whole) = get(daemon.data_port, &url, None).await;
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(whole, body, "整檔跟送出去的一樣");
+    assert!(
+        client
+            .pushes
+            .iter()
+            .any(|push| push["method"] == "media.download"
+                && push["params"]["mxc"] == manifest["mxc"]
+                && push["params"]["state"] == "complete"),
+        "完成有推播：{:?}",
+        client.pushes
+    );
+    let stats = client.call("media.stats", json!({})).await;
+    assert_eq!(
+        stats["result"]["pending_on_disk"], 0,
+        "主檔進了池、seek 暫存檔刪了：{stats}"
+    );
+
     // ── 加密房：串流（沒給大小）──
     let created = client
         .call(
@@ -649,6 +721,35 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     assert_eq!(sent["code"], 0, "串流傳完就送得出去：{sent}");
 
     stop_daemon(daemon, client).await;
+}
+
+/// 裸 TCP 送一個 GET（`Connection: close`，讀到 EOF）。
+///
+/// Return:
+///     (u16, String, Vec<u8>)   (狀態碼, 標頭原文, body)
+async fn get(port: u16, url: &str, range: Option<&str>) -> (u16, String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = url
+        .strip_prefix(&format!("http://127.0.0.1:{port}"))
+        .unwrap_or_else(|| panic!("{url} is not on the data port {port}"));
+    let range = range
+        .map(|range| format!("Range: {range}\r\n"))
+        .unwrap_or_default();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let head =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{range}Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let head = String::from_utf8(response[..split].to_vec()).unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, head, response[split + 4..].to_vec())
 }
 
 /// 裸 TCP 送一個 PUT（`Connection: close`，讀到 EOF）：URL 與 header 照 `media.create` 回的。

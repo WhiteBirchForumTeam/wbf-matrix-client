@@ -206,6 +206,30 @@ pub fn push_of(event: &CoreEvent) -> Push {
                 job: None,
             }
         }
+        CoreEvent::MediaDownload {
+            user,
+            mxc,
+            state,
+            done,
+            total,
+            reason,
+        } => {
+            let mut params = json!({
+                "user": user,
+                "mxc": mxc,
+                "state": state,
+                "done": done,
+                "total": total,
+            });
+            if let Some(reason) = reason {
+                insert_field(&mut params, "reason", json!(reason));
+            }
+            Push {
+                request: Request::push("media.download", params),
+                user: Some(user.clone()),
+                job: None,
+            }
+        }
         CoreEvent::Received {
             user,
             role,
@@ -390,6 +414,34 @@ mod tests {
         assert_eq!(
             changed.request.params,
             json!({ "user": "@a:x", "changed_user": "@b:x", "device_version": "4-0a1b2c3d4e", "rooms": { "!r:x": 9 }, "gap": false })
+        );
+        // media.download（/docs/design/media/media-download.md §5.5）：理由只在 failed 帶。
+        let progress = push_of(&CoreEvent::MediaDownload {
+            user: "@a:x".into(),
+            mxc: "mxc://x/1".into(),
+            state: wbf_core::DownloadState::Downloading,
+            done: 3,
+            total: 10,
+            reason: None,
+        });
+        assert_eq!(progress.request.method, "media.download");
+        assert_eq!(progress.user.as_deref(), Some("@a:x"));
+        assert_eq!(
+            progress.request.params,
+            json!({ "user": "@a:x", "mxc": "mxc://x/1", "state": "downloading", "done": 3, "total": 10 })
+        );
+        let failed = push_of(&CoreEvent::MediaDownload {
+            user: "@a:x".into(),
+            mxc: "mxc://x/1".into(),
+            state: wbf_core::DownloadState::Failed,
+            done: 3,
+            total: 10,
+            reason: Some("chunk 3 does not authenticate".into()),
+        });
+        assert_eq!(failed.request.params["state"], json!("failed"));
+        assert_eq!(
+            failed.request.params["reason"],
+            json!("chunk 3 does not authenticate")
         );
     }
 

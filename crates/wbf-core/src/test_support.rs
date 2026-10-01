@@ -14,7 +14,7 @@ use wbf_sdk::protocol::{
 };
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
 use wbf_sdk::WsLink;
-use wbf_wire::pack::{control, device, event, flags, upload};
+use wbf_wire::pack::{control, device, download, event, flags, upload};
 use wbf_wire::{Kind, Pack};
 
 use crate::accounts::AccountDir;
@@ -219,9 +219,16 @@ pub(crate) struct FakeServer {
     pub(crate) sent_events: SentEvents,
     /// `Event/Send` 每則宣告的附件（跟 `sent_events` 同順序）。
     pub(crate) sent_attachments: Arc<Mutex<Vec<Vec<String>>>>,
-    /// `Upload/*` 建的上傳，key 是上傳 id（從 1 開始）。
+    /// `Upload/*` 建的上傳，key 是上傳 id（從 1 開始）。`Download/*` 也從這裡給（測試可以把上傳那台的複製過來）。
     pub(crate) uploads: FakeUploads,
+    /// 每次 `Download/Read` 要的塊號（照順序）。
+    pub(crate) download_reads: Arc<Mutex<Vec<u32>>>,
+    /// 每個 `Download/Read` 回答前先拿一個 permit：測試把 permit 收走就卡住下載、一次放一個（`add_permits(1)`）。預設多到用不完。
+    pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
 }
+
+/// `read_permits` 一開始有幾個（測試要卡住就 `acquire_many(READ_PERMITS)` 收走）。
+pub(crate) const READ_PERMITS: u32 = 1 << 20;
 
 /// 假 server 上的一個上傳：收到的密文塊照索引排、`Seal` 帶的描述。
 #[derive(Clone, Debug, Default)]
@@ -234,6 +241,11 @@ pub(crate) struct FakeUpload {
     pub(crate) sealed: bool,
     /// 測試設：server 說這個上傳**之前**被截斷過——只有 `Status` 的 Ack 帶（模擬截斷發生在被跳過的上一輪，這一輪的 `Chunk` Ack 不會再說）。
     pub(crate) truncated: bool,
+    pub(crate) chunk_size: u32,
+    /// 串流是 None。
+    pub(crate) file_size: Option<u64>,
+    /// 加密的描述：`Seal` 帶的，沒有就用 `Create` 帶的（`Download/Info` 回這個）。
+    pub(crate) description: Vec<u8>,
 }
 
 pub(crate) type FakeUploads = Arc<Mutex<std::collections::BTreeMap<u64, FakeUpload>>>;
@@ -274,6 +286,9 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let sent_attachments: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let uploads: FakeUploads = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
     let (attachments_t, uploads_t) = (sent_attachments.clone(), uploads.clone());
+    let download_reads: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let read_permits = Arc::new(tokio::sync::Semaphore::new(READ_PERMITS as usize));
+    let (reads_t, permits_t) = (download_reads.clone(), read_permits.clone());
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -355,6 +370,13 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     }
                 }
                 (Kind::Upload, _) => upload_reply(&pack, &uploads_t),
+                (Kind::Download, download::READ) => {
+                    if let Ok(permit) = permits_t.acquire().await {
+                        permit.forget();
+                    }
+                    download_reply(&pack, &uploads_t, &reads_t)
+                }
+                (Kind::Download, _) => download_reply(&pack, &uploads_t, &reads_t),
                 (Kind::Control, control::HELLO) => response(
                     Kind::Control,
                     control::ACK,
@@ -546,6 +568,56 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         sent_events,
         sent_attachments,
         uploads,
+        download_reads,
+        read_permits,
+    }
+}
+
+/// `Download/*` 的回答（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4）：從上傳收下的塊給。
+fn download_reply(pack: &Pack, uploads: &FakeUploads, reads: &Arc<Mutex<Vec<u32>>>) -> Pack {
+    let uploads = uploads.lock().unwrap();
+    let meta: Value = serde_json::from_slice(&pack.meta).unwrap();
+    let mxc = meta["mxc"].as_str().unwrap_or_default();
+    let Some(upload) = uploads
+        .values()
+        .find(|upload| upload.mxc == mxc && upload.sealed)
+    else {
+        return response(
+            Kind::Control,
+            control::ERROR,
+            pack.id,
+            pack.seq,
+            json!({ "code": "NotFound", "code_id": 1404, "message": "no such media" }),
+            Vec::new(),
+        );
+    };
+    let total_len: usize = upload.chunks.iter().map(Vec::len).sum();
+    match pack.subtype {
+        download::INFO => response(
+            Kind::Control,
+            control::ACK,
+            pack.id,
+            pack.seq,
+            json!({ "total_len": total_len, "file_size": upload.file_size, "chunk_size": upload.chunk_size,
+                    "chunk_count": upload.chunks.len(), "truncated": false, "content_type": null,
+                    "read_len": 65536, "chunk_size_large": 1048576 }),
+            upload.description.clone(),
+        ),
+        download::READ => {
+            let index = meta["chunk"].as_u64().unwrap() as usize;
+            reads.lock().unwrap().push(index as u32);
+            let data = upload.chunks[index].clone();
+            response(
+                Kind::Control,
+                control::ACK,
+                pack.id,
+                pack.seq,
+                json!({ "chunk": index, "pos": index as u64 * u64::from(upload.chunk_size), "len": data.len(),
+                        "chunk_size": upload.chunk_size, "chunk_count": upload.chunks.len(), "total_len": total_len }),
+                data,
+            )
+        }
+        other => panic!("fake server got Download subtype {other}"),
     }
 }
 
@@ -577,6 +649,9 @@ fn upload_reply(pack: &Pack, uploads: &FakeUploads) -> Pack {
                 FakeUpload {
                     mxc: mxc.clone(),
                     chunk_count: (info.file_size != 0).then_some(info.chunk_count),
+                    chunk_size: info.chunk_size,
+                    file_size: (info.file_size != 0).then_some(info.file_size),
+                    description: pack.data.to_vec(),
                     ..FakeUpload::default()
                 },
             );
@@ -616,6 +691,9 @@ fn upload_reply(pack: &Pack, uploads: &FakeUploads) -> Pack {
             let upload = uploads.get_mut(&pack.id).unwrap();
             assert!(upload.finished, "Seal before the last chunk");
             upload.sealed = true;
+            if !pack.data.is_empty() {
+                upload.description = pack.data.to_vec();
+            }
             ack(json!({ "mxc": upload.mxc }))
         }
         other => panic!("fake server got Upload subtype {other}"),

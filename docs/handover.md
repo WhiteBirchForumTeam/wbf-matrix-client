@@ -1,11 +1,11 @@
 # 交接：現在在哪、怎麼跑、下一步
 
-> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-09-30）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
+> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-10-01）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
 > 這裡只講**現況、怎麼跑、坑、下一步**。每一支 PR 做了什麼看 git 歷史與 Forgejo 上的 PR，這裡不重述。
 
 ## 1. 現況
 
-PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照層次：
+PR #1–#68 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照層次：
 
 - **線上協議與媒體**：`wbf-wire` 的 codec 對著 server 的黃金向量；`wbf-sdk` 的分塊上傳／下載／seek／續傳／串流、每塊 AEAD（`/docs/design/media/wbf-client-convention-for-chunk.md`）。
 - **本地資料**：vault 與子金鑰、資料目錄兩層路徑加密（`/docs/design/storage/vault-and-keys.md`）；`cache.db` 一個 server 一份、多帳號混存、單一寫入者（`/docs/design/storage/local-cache-db.md`、`/docs/design/daemon/daemon-runtime.md` §2）；
@@ -19,9 +19,11 @@ PR #1–#63 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照�
   訊息的 edit／redact 照 `/docs/design/messages/edits-and-redactions.md` 存。
 - **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
+- **資料平面**（`/docs/design/rpc-specs/data-plane.md`）：上傳是 UI 發動的兩步（`media.create` → `PUT /upload` 拿 manifest → `room.send_attachment`）；
+  讀是 `media.open` → `GET /media`（Range 就是 seek）。下載是每帳號一條佇列、一塊一步、池格式 v2、seek 暫存檔，進度是推播 `media.download`（`/docs/design/media/media-download.md`）。兩邊都對真 server 驗過。
 
-**還沒有**：UI；路徑版送檔進加密房（資料平面那條可以）；一般 Matrix 帳號的傳統上傳；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
-已讀（`/docs/design/messages/read-receipts.md` 是草案）；`cancel`；資料平面的讀（`media.open`／`GET /media`）；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
+**還沒有**：UI；路徑版送檔進加密房（資料平面那條可以）；一般 Matrix 帳號的傳統上傳與下載；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
+已讀（`/docs/design/messages/read-receipts.md` 是草案）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載佇列的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 ⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8；§7 第 1 項先照預設做）。
 
@@ -49,8 +51,9 @@ crates/wbf-sdk/src/
   account_dir.rs         資料目錄名的確定性加密（`<b58 nonce>_<b58 密文>`，/docs/design/storage/vault-and-keys.md §2）；沒有 IO
   room_keys.rs           本地金鑰快照放哪、用什麼 passphrase、權限（/docs/design/keys/room-key-backup.md §4）；不碰 matrix-sdk
   cache.rs               cache.db（feature `cache`，SQLCipher；/docs/design/storage/local-cache-db.md §5）：users／rooms／events／events_synced_log／room_list／sync_state／read_positions／media／event_media
-  media_pool.rs          媒體儲存池的落地格式（64 KiB 段各自 AEAD、暫定段、續傳、BLAKE3 檔名）；沒有 SQL、沒有網路
-  media.rs               fetch／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
+  media_pool.rs          媒體儲存池的落地格式（池格式 v2：64 KiB 段都寫滿、長度在密文裡、續傳從檔案本身、owner 認暫存名、BLAKE3 檔名；/docs/design/media/media-download.md §4.1）；沒有 SQL、沒有網路
+  seek_store.rs          seek 暫存檔（固定大小的格、O(1) 位置表、重開重建；/docs/design/media/media-download.md §4.2）
+  media.rs               `MediaDownload`（一個檔在主檔、暫存檔與網路之間怎麼拿塊）／collect_garbage／sweep：下載管線、池、cache.db 三者唯一的交會點（feature `cache`）
   event_json.rs          原始 Matrix 事件 JSON → Message；matrix backend 與 recent 共用，不掛 feature
   backend/matrix_sdk.rs  `use matrix_sdk` 的地方之一（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
   crypto_engine.rs       另一個碰上游的地方（feature `matrix`）：`OlmEngine` —— 同一個 sqlite crypto store（`m/`）上的 `OlmMachine` 只當狀態機用。
@@ -87,14 +90,17 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
                          `open_link_count`（`daemon.info` 的 `links`）。單元測試用記憶體對接的假 opener
   job.rs                 「現在跑的是哪個請求」：tokio task-local，讓事件說得出屬於誰。⚠️ 不跟著 `tokio::spawn`（有測試釘住）
   server_cache.rs        `cache.db` 的**單一寫入者**：一個 server dir 一條 OS 執行緒＋無上限 queue；`post`（commit 之後才發事件）／
-                         `run`（等它落地）＋一條重用的讀連線。⚠️ 媒體那幾條是刻意的例外（/docs/design/daemon/daemon-runtime.md §2.3.1）。
+                         `run`（等它落地）＋一條重用的讀連線。媒體也走它（/docs/design/daemon/daemon-runtime.md §2.3.1）；繞過它的 `cache_of` 只在測試建置。
                          🚨 刪 cache.db 之前要 `Core::close_server_cache`（等 queue 寫完、執行緒結束），不然 Windows 刪不掉、Linux 寫進已刪的檔
   backend_choice.rs      `transport` → backend：`ws`＝wbf-sdk、`http`＝matrix-sdk。探測 `get_backend_kind`（key 是**帳號**、
                          只記 server 回答過的）、規則 `get_backend_for`、閘門 `client_of`、`MethodHome` 暫時清單
   handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate。
                          `server_cache_of` 的註冊表鎖握滿「查、開、放」整段（#32：放掉會 `database is locked`）
   accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部
-  *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／media／backup／sync／misc
+  download_queue.rs      **每帳號的下載 worker**（/docs/design/media/media-download.md §5、§6）：佇列、`downloading` 表（取消旗標＋進度）、seek 收件匣先、一塊一步、
+                         每塊借一次 `Download` 線（只借開著的）、同 server 同 mxc 只有一個寫入者（`MediaClaims`）、推播節流。登出時 `close_links` 一併收
+  media_stream.rs        `GET /media` 的來源：本機原檔 → 完整池檔 →（worker）主檔已封的段 → 暫存檔 → 現拉；URL 不帶帳號，照已登入的帳號找
+  *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／attachment／media（排隊、另存、stats、gc）／backup／sync／misc
                          ⚠️ 公開介面不能假設同程序（/docs/design/overview/architecture-v2.md §6）：`&self`、可序列化的型別、事件走 channel、
                          🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
 crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底與全部有 core 對應的 method：
@@ -114,7 +120,7 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
   token.rs               token 檔的三遍覆蓋抹除（隨機 → 0xFF → 0x00 → 刪）與權限檢查；⚠️ daemon 預設不動 token，誰起的誰動
   main.rs                `-s` 常駐（先拿寫權、讀 token 與 conf、寫 daemon.json）。沒有 `-s` ＝單發，⚠️ **還沒實作**（會報錯講清楚）；
                          兩個都帶也報錯。控制平面與資料平面一起開、一起停
-  data_plane.rs          資料平面：URL 與 meta（共享 token 加密；URL 只帶「用途 ‖ mxc」、上傳狀態在 `Wbf-Upload-Meta` header）與 hyper 的 HTTP listener（`PUT /upload/mxc/…`、Host 檢查）
+  data_plane.rs          資料平面：URL 與 meta（共享 token 加密；URL 只帶「用途 ‖ mxc」、上傳狀態在 `Wbf-Upload-Meta` header）與 hyper 的 HTTP listener（`PUT /upload/mxc/…`、`GET`／`HEAD /media/mxc/…` 的 Range 與串流 body、Host 檢查）
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
   tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、
                          token 檔 daemon 不動、shutdown 之後程序結束並收走 daemon.json
@@ -235,15 +241,14 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
-1. **資料平面的讀與 E2EE 收尾**：下載佇列、`media.open`／`GET /media`、seek 暫存檔、池格式 v2（設計在 `/docs/design/media/media-download.md`）；
-   官方 Matrix 的傳統上傳（§7）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
+1. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
 2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
 之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
-資料平面的讀（`media.open`／`GET /media` 的 Range，`/docs/design/rpc-specs/data-plane.md` §8）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC；
-UI 框架比較；串流／seek 對著媒體池讀（`/docs/design/media/media-pool.md` §6）。
+下載佇列的暫停（只停佇列、🚫 不停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
+UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
 ⏳ 懸著等維護者：`media.db` 拆檔（維護者：「等要做的時候再討論」）。
 

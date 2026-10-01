@@ -186,7 +186,7 @@ mod tests {
             hash: None,
             file_size,
             chunk_size: 16,
-            chunks_written: 0,
+            segments_written: 0,
             complete: false,
             bytes_on_disk: 0,
             created_at: 0,

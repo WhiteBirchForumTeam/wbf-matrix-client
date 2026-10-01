@@ -446,6 +446,8 @@ impl crate::Core {
         account: &crate::accounts::AccountDir,
         reason: &str,
     ) -> usize {
+        // 下載 worker 借的就是這個池的線：先收它（開著的檔 fsync 留著），🚫 不讓它拿舊 session 的池一直空等。
+        self.stop_downloader_of(account);
         let pool = self
             .link_pools
             .lock()

@@ -87,6 +87,8 @@ impl Core {
     /// 解不開、舊 schema 就重建（/docs/design/storage/local-cache-db.md §1）；既有的庫照它自己記的 server 開，host 不同就拒絕、🚫 不重建
     /// （[`Core::find_recorded_cache_identity`]）。重建時發一個 `Progress` 事件說一聲——
     /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
+    /// 📌 只給測試：正式碼碰 `cache.db` 一律經 [`Core::server_cache_of`]（唯一寫入者）。
+    #[cfg(test)]
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
         #[cfg(test)]
         {

@@ -288,7 +288,7 @@ crates/wbf-wire     pack 的 codec
 crates/wbf-sdk      協議、chunk 加解密、cache.db、媒體池、vault、matrix backend、crypto 引擎（OlmEngine）
 crates/wbf-core     常駐狀態（多帳號 session、解鎖一次）、連線池、事件分發、命令本體。**沒有 RPC**
 crates/wbf-daemon   core ＋ RPC 服務。library ＋ binary（wbf-matrix-client-daemon）。**自己的命令列**也在這裡（§0.2）
-                    資料平面（`data_plane.rs`）：上傳做了，讀（`GET /media`）還沒。還沒做：單發命令
+                    資料平面（`data_plane.rs`）：上傳（`PUT /upload`）與讀（`GET /media`）。還沒做：單發命令
 apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）。
                     還沒做：改成 rpc-cli——只封裝 RPC 訊息、丟到本地 WS（§0.2），那時才改名
 ```

@@ -29,8 +29,8 @@ use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
 /// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改；
-/// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）。
-const SCHEMA_VERSION: i64 = 6;
+/// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）。
+const SCHEMA_VERSION: i64 = 7;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,7 +103,8 @@ pub struct MediaEntry {
     pub hash: Option<String>,
     pub file_size: u64,
     pub chunk_size: u32,
-    pub chunks_written: u64,
+    /// 主檔已經落地的完整段數（池格式 v2）。只給顯示用：🚫 不當續傳的依據，檔案本身才是進度（/docs/design/media/media-download.md §4.1）。
+    pub segments_written: u64,
     pub complete: bool,
     pub bytes_on_disk: u64,
     pub created_at: i64,
@@ -1012,7 +1013,7 @@ impl Cache {
     pub fn find_media(&self, mxc: &str) -> Result<Option<MediaEntry>, SdkError> {
         self.connection
             .query_row(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
                  FROM media WHERE mxc = ?1",
                 params![mxc],
                 media_entry_from_row,
@@ -1094,17 +1095,46 @@ impl Cache {
             .map(|id| id.map(|id| format!("m{id}")))
     }
 
-    /// 進度快照（/docs/design/media/media-pool.md §3：記憶體每 1–2 秒 flush 一次）。`chunk_size` 也一起寫：續傳截檔用的是下載時的塊大小。
+    /// 暫存名（`m<media.id>`）是哪一列的（掃描認領暫存檔用）。
+    ///
+    /// Args:
+    ///     pending_name: example: "m12"
+    /// Return:
+    ///     Ok(Some(MediaEntry))   有這一列
+    ///     Ok(None)               名字不是 `m<數字>`，或沒有這個 id 的列
+    pub fn find_media_by_pending_name(
+        &self,
+        pending_name: &str,
+    ) -> Result<Option<MediaEntry>, SdkError> {
+        let Some(id) = pending_name
+            .strip_prefix('m')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<i64>().ok())
+        else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
+                 FROM media WHERE id = ?1",
+                params![id],
+                media_entry_from_row,
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// 進度快照（/docs/design/media/media-download.md §4.4：每 1.5 秒一次）：主檔的完整段數，只給顯示用。
     pub fn media_progress(
         &mut self,
         mxc: &str,
-        chunks_written: u64,
+        segments_written: u64,
         chunk_size: u32,
     ) -> Result<(), SdkError> {
         self.connection
             .execute(
-                "UPDATE media SET chunks_written = ?2, chunk_size = ?3, complete = 0 WHERE mxc = ?1",
-                params![mxc, chunks_written as i64, chunk_size as i64],
+                "UPDATE media SET segments_written = ?2, chunk_size = ?3, complete = 0 WHERE mxc = ?1",
+                params![mxc, segments_written as i64, chunk_size as i64],
             )
             .map_err(db_error)?;
         Ok(())
@@ -1115,16 +1145,16 @@ impl Cache {
         &mut self,
         mxc: &str,
         pool_file: &str,
-        chunks_written: u64,
+        segments_written: u64,
         file_size: u64,
         bytes_on_disk: u64,
     ) -> Result<(), SdkError> {
         let now = now_millis();
         self.connection
             .execute(
-                "UPDATE media SET pool_file = ?2, complete = 1, chunks_written = ?3, file_size = ?4, bytes_on_disk = ?5, last_used_at = ?6,
+                "UPDATE media SET pool_file = ?2, complete = 1, segments_written = ?3, file_size = ?4, bytes_on_disk = ?5, last_used_at = ?6,
                    hash = COALESCE(hash, 'blake3:' || ?2) WHERE mxc = ?1",
-                params![mxc, pool_file, chunks_written as i64, file_size as i64, bytes_on_disk as i64, now],
+                params![mxc, pool_file, segments_written as i64, file_size as i64, bytes_on_disk as i64, now],
             )
             .map_err(db_error)?;
         Ok(())
@@ -1134,7 +1164,7 @@ impl Cache {
     pub fn media_reset(&mut self, mxc: &str) -> Result<(), SdkError> {
         self.connection
             .execute(
-                "UPDATE media SET pool_file = NULL, complete = 0, chunks_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
+                "UPDATE media SET pool_file = NULL, complete = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
                 params![mxc],
             )
             .map_err(db_error)?;
@@ -1170,7 +1200,7 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
                  FROM media WHERE complete = 1 ORDER BY last_used_at ASC, mxc",
             )
             .map_err(db_error)?;
@@ -1180,13 +1210,13 @@ impl Cache {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
-    /// 半成品（`complete = 0` 但 `chunks_written > 0`），啟動時掃孤兒用。
+    /// 半成品（`complete = 0` 但 `segments_written > 0`）：`media.stats` 計數、掃描判過期用。
     pub fn list_media_incomplete(&self) -> Result<Vec<MediaEntry>, SdkError> {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
-                 FROM media WHERE complete = 0 AND chunks_written > 0 ORDER BY mxc",
+                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
+                 FROM media WHERE complete = 0 AND segments_written > 0 ORDER BY mxc",
             )
             .map_err(db_error)?;
         let rows = statement
@@ -1205,6 +1235,90 @@ impl Cache {
             )
             .map_err(db_error)?;
         Ok(changed > 0)
+    }
+
+    /// 這個帳號看得到的事件裡，引用這個 mxc 的那一份區塊（含檔案金鑰，/docs/design/media/media-download.md §3.2 的「金鑰從哪來」）。
+    /// 🚫 不看別的帳號的：同一份 `cache.db` 裡有同 server 別人的事件，金鑰不跨帳號借。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     mxc: example: "mxc://localhost/000000000000004d"
+    /// Return:
+    ///     Ok(Some(ChunkedBlock))   找到一則解得開、附件就是這個 mxc 的事件（最早寫進來的那則）
+    ///     Ok(None)                 這個帳號沒有引用它的事件，或都解不出區塊
+    pub fn find_media_block_for(
+        &self,
+        user_id: &str,
+        mxc: &str,
+    ) -> Result<Option<crate::chunk_block::ChunkedBlock>, SdkError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT e.event_type, e.content_json FROM media m
+                   JOIN event_media em ON em.media = m.id
+                   JOIN events e ON e.id = em.event
+                   JOIN events_synced_log l ON l.event = e.id
+                   JOIN users reader ON reader.id = l.user
+                 WHERE m.mxc = ?1 AND reader.mxid = ?2
+                 ORDER BY e.id",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![mxc, user_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            let (event_type, content_json) = row.map_err(db_error)?;
+            if let Some(attachment) = attachment_of(event_type.as_deref(), content_json.as_deref())
+            {
+                if attachment.mxc == mxc {
+                    return Ok(Some(attachment.block));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 這個帳號看得到的某一則事件帶的附件（`media.download { room, event_id }`）。看的是這則自己的內容，🚫 不換成它目前的 edit。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     event_id: example: "$file"
+    /// Return:
+    ///     Ok(Some(Attachment))   這則在、這個帳號看得到、解得出區塊
+    ///     Ok(None)               沒有、看不到、不是檔案、還沒解開
+    pub fn find_event_attachment(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<crate::chat::Attachment>, SdkError> {
+        let found = self
+            .connection
+            .query_row(
+                "SELECT e.event_type, e.content_json FROM events e
+                   JOIN events_synced_log l ON l.event = e.id
+                   JOIN users reader ON reader.id = l.user
+                   JOIN rooms r ON r.id = e.room
+                 WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.event_id = ?3",
+                params![user_id, room_id, event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(found.and_then(|(event_type, content_json)| {
+            attachment_of(event_type.as_deref(), content_json.as_deref())
+        }))
     }
 
     // ---- forget ----
@@ -1348,7 +1462,7 @@ fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry>
         hash: row.get(4)?,
         file_size: row.get::<_, i64>(5)? as u64,
         chunk_size: row.get::<_, i64>(6)? as u32,
-        chunks_written: row.get::<_, i64>(7)? as u64,
+        segments_written: row.get::<_, i64>(7)? as u64,
         complete: row.get::<_, i64>(8)? == 1,
         bytes_on_disk: row.get::<_, i64>(9)? as u64,
         created_at: row.get(10)?,
@@ -1718,6 +1832,18 @@ fn apply_redaction(
     }
 }
 
+/// 一則事件帶的附件：解得開、是檔案（/docs/design/media/wbf-client-convention-for-chunk.md §5）才有。
+fn attachment_of(
+    event_type: Option<&str>,
+    content_json: Option<&str>,
+) -> Option<crate::chat::Attachment> {
+    let body = serde_json::from_str::<serde_json::Value>(content_json?).ok()?;
+    match kind_from_content(event_type?, &body, &serde_json::Value::Null) {
+        MessageKind::File { attachment, .. } => Some(attachment),
+        _ => None,
+    }
+}
+
 /// 內容是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔：建 `media`（已有就不動）與 `event_media`。
 fn link_media_of(
     transaction: &Transaction<'_>,
@@ -1725,15 +1851,7 @@ fn link_media_of(
     event_type: Option<&str>,
     content_json: Option<&str>,
 ) -> Result<(), SdkError> {
-    let (Some(event_type), Some(body)) = (
-        event_type,
-        content_json.and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok()),
-    ) else {
-        return Ok(());
-    };
-    let MessageKind::File { attachment, .. } =
-        kind_from_content(event_type, &body, &serde_json::Value::Null)
-    else {
+    let Some(attachment) = attachment_of(event_type, content_json) else {
         return Ok(());
     };
     let media = media_row_id(
@@ -1833,7 +1951,7 @@ fn media_row_id(
     let now = now_millis();
     transaction
         .execute(
-            "INSERT OR IGNORE INTO media (mxc, pool_file, name, mimetype, hash, file_size, chunk_size, chunks_written, complete, bytes_on_disk, created_at, last_used_at)
+            "INSERT OR IGNORE INTO media (mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at)
              VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?7)",
             params![mxc, name, mimetype, hash, file_size as i64, chunk_size as i64, now],
         )
@@ -2019,7 +2137,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                name TEXT, mimetype TEXT,
                hash TEXT,
                file_size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
-               chunks_written INTEGER NOT NULL, complete INTEGER NOT NULL, bytes_on_disk INTEGER NOT NULL,
+               segments_written INTEGER NOT NULL, complete INTEGER NOT NULL, bytes_on_disk INTEGER NOT NULL,
                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
                source_uri TEXT);
              CREATE INDEX media_lru ON media (last_used_at);

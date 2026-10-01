@@ -239,7 +239,7 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 
 ## 8 大資料走資料平面，不走 RPC
 
-怎麼用（路徑、token、狀態碼、上傳的兩步）的權威是 /docs/design/rpc-specs/data-plane.md；這一節只講**為什麼**。還沒做：`media.open` 與 `GET /media`。
+怎麼用（路徑、token、狀態碼、上傳的兩步、讀的 Range）的權威是 /docs/design/rpc-specs/data-plane.md；這一節只講**為什麼**。
 
 ⚠️ 下載一個 2 GB 的檔不可能塞進 JSON，改成 binary frame 串流也會逼**每個前端各自實作一次串流組裝**。
 
