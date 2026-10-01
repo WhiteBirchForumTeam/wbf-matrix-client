@@ -2578,6 +2578,62 @@ mod tests {
     }
 
     #[test]
+    fn the_key_of_a_file_comes_only_from_events_this_account_can_see() {
+        // 同一份 cache.db 裡有同 server 別的帳號的事件：下載要的區塊（含金鑰）🚫 不跨帳號借（/docs/design/media/media-download.md §7.1）。
+        let (mut cache, dir) = open("media-key");
+        let shared = file("!r", "$f1", 1, "mxc://localhost/aaaa");
+        let alice_only = file("!r", "$f2", 2, "mxc://localhost/bbbb");
+        put(&mut cache, ALICE, &[shared.clone(), alice_only.clone()]);
+        put(&mut cache, BOB, std::slice::from_ref(&shared));
+        let block = cache
+            .find_media_block_for(ALICE, "mxc://localhost/bbbb")
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.name.as_deref(), Some("a.txt"));
+        assert!(
+            cache
+                .find_media_block_for(BOB, "mxc://localhost/bbbb")
+                .unwrap()
+                .is_none(),
+            "bob never saw the event that carries this file"
+        );
+        assert!(cache
+            .find_media_block_for(BOB, "mxc://localhost/aaaa")
+            .unwrap()
+            .is_some());
+        assert!(cache
+            .find_media_block_for(ALICE, "mxc://localhost/none")
+            .unwrap()
+            .is_none());
+        let attachment = cache
+            .find_event_attachment(ALICE, "!r", "$f2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attachment.mxc, "mxc://localhost/bbbb");
+        assert!(cache.find_event_attachment(BOB, "!r", "$f2").unwrap().is_none());
+        assert!(cache
+            .find_event_attachment(ALICE, "!elsewhere", "$f2")
+            .unwrap()
+            .is_none());
+        // 暫存名 → 列（掃描認領暫存檔用）：只認 `m<數字>`。
+        let name = cache
+            .media_pending_name("mxc://localhost/aaaa")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cache.find_media_by_pending_name(&name).unwrap().unwrap().mxc,
+            "mxc://localhost/aaaa"
+        );
+        for junk in ["", "m", "1", "m-1", "mx1", "m1.seek", "m99999"] {
+            assert!(
+                cache.find_media_by_pending_name(junk).unwrap().is_none(),
+                "{junk}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn file_events_create_media_once_and_forget_walks_the_chain() {
         let (mut cache, dir) = open("media");
         let shared = file("!r", "$f1", 1, "mxc://localhost/aaaa");
