@@ -24,8 +24,10 @@
 | **主檔** | 池裡這個 mxc 的檔，從第 0 段開始順序 append。完成前叫 `m<media.id>`、在 `pending/`；完成後改名成明文的 BLAKE3 |
 | **seek 暫存檔** | 這個 mxc 被 seek 拉到的塊，照到達順序 append。一筆一個塊、每筆固定大小。主檔完成就刪 |
 | **位置表** | 塊號 → 它在 seek 暫存檔的第幾格。記憶體裡的陣列，O(1) |
-| **下載工作** | 一個 mxc 在 daemon 裡的狀態：manifest、驗過的參數、主檔寫到哪、暫存檔與位置表、正在拉哪幾塊。同一個 mxc 只有一個 |
-| **下載佇列** | 每個帳號一條，排著要順序拉完的檔，**一次一個** |
+| **mxc 的狀態** | 一個 mxc 在 daemon 裡的東西：manifest、驗過的參數、主檔寫到哪、暫存檔與位置表、正在拉哪幾塊。同一個 mxc 只有一份；job 與 seek 都用它 |
+| **job** | 「把這個 mxc 順序拉完」這件事：`{ mxc, next, total, … }`（§5.2）。一塊一步 |
+| **下載佇列** | 每個帳號一條，排著 job，**一次一個** |
+| **下載 worker** | 每個帳號一個 task，只有它用那個帳號的 `Download` 線拉檔；有 seek 與 job 兩個收件匣，seek 先（§5.1） |
 | **`Download` 線** | 連線池裡每個帳號五條 WS 線之一（/docs/design/daemon/link-pool.md），專跑 `Download/*`（kind `0x04`） |
 
 ## 2. 全景
@@ -61,7 +63,7 @@
 連線池裡一條線一次只跑一個命令（/docs/design/daemon/link-pool.md §5）。下載與 seek 都是**每塊借一次線**，借到就送一個 `Read`、等到它的回應就還，
 不是整個檔握著線（現在的 `media::fetch` 是整個檔握著，要改）。這樣 seek 才插得進來（§6.2）。
 
-### 3.2 開始一個檔：`Info`，一個下載工作只做一次
+### 3.2 開始一個檔：`Info`，一個 mxc 只做一次
 
 ```
 Download/Info { mxc } → Ack { file_size, chunk_size, chunk_count, ... }，data = Create 時那份加密描述
@@ -74,7 +76,7 @@ Download/Info { mxc } → Ack { file_size, chunk_size, chunk_count, ... }，data
 - 描述用檔案金鑰解得開，內容跟區塊對得上。
 
 任一條不過 → 這個 mxc 整個當壞檔（fail closed），佇列移除它、GET 回 502，🚫 不吐任何部分內容。結果（`VerifiedTarget`：檔案金鑰、`file_size`、`chunk_count`）
-存在下載工作裡，之後每一塊都用它，🚫 不重問。
+存在這個 mxc 的狀態裡，之後每一塊（job 與 seek 都是）都用它，🚫 不重問。
 
 **金鑰從哪來**：manifest（`media.open` 帶的，或 daemon 從 `cache.db` 找：`event_media` → 引用這個 mxc 的事件 → `content_json` 裡的區塊）。
 找不到任何區塊 → 沒有金鑰 → `media.open` 回 1100。
@@ -142,7 +144,7 @@ R = 4 + segment_size + 16                                    每段在磁碟上�
 
 **續傳（daemon 重開、或被取消後重新排進佇列）**：
 
-1. 開主檔，驗檔頭（magic、version、segment_size）。v1 的暫存檔：當壞的、刪掉重下（它是快取）。
+1. 開主檔，驗檔頭（magic、version、segment_size）。**v1 一律當壞檔、刪掉重下**（維護者 2026-10-01：它是快取），完成檔與暫存檔都一樣（§9）。
 2. 檔長驗算，不是整數倍就截掉最後那段不完整的。
 3. **從第 0 段起逐段解開**：餵回 BLAKE3／SHA-256，碰到第一個解不開的段（斷電時檔案長度先落地、內容沒落地）就截到它前面。
    全部重讀一遍本來就省不了（BLAKE3 要從頭算），所以順便把每一段都驗過，🚫 不靠 fsync 的時序猜哪幾段可信。
@@ -220,64 +222,114 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 
 | 時機 | 寫什麼 |
 |---|---|
-| 下載工作開始 | `media_begin`：沒有這個 mxc 的列就建（`complete = 0`）。已經 `complete = 1` 而且池檔在 → 不下載 |
+| job 建立 | `media_begin`：沒有這個 mxc 的列就建（`complete = 0`）。已經 `complete = 1` 而且池檔在 → 不下載 |
 | 每 1.5 秒（主檔） | `chunks_written` ＝ 完整段數（只給顯示用） |
 | 主檔完成 | `media_finish`：`pool_file`、`complete = 1`、`file_size`、`bytes_on_disk`；區塊沒帶 sha256 時 `hash = blake3:…` |
 | seek 暫存檔 | 🚫 不進 DB：暫存檔自己就是記錄（§4.2 的重建） |
 
 ⚠️ `chunks_written` 從「塊數」改記「段數」：欄位名字已經不對了。實作時改名（`segments_written`），`cache.db` 的 schema 版本跟著加一（舊庫整個重建，/docs/design/storage/local-cache-db.md §1）。
 
-## 5. 下載佇列
+## 5. 下載佇列：一塊一步的 job（維護者 2026-10-01 定）
 
-| 規則 | 內容 |
+### 5.1 誰在跑
+
+**每個帳號一個下載 worker**（一個 task），只有它用這個帳號的 `Download` 線拉檔。它有兩個收件匣：
+
+| 收件匣 | 放什麼 | 先後 |
+|---|---|---|
+| seek 請求 | 「第 `i` 塊，拉到交給我」（§6） | **先** |
+| 下載步驟 | 佇列頭那個 job 的下一步 | 沒有 seek 請求時才處理 |
+
+worker 每次只做**一塊**：做完一塊回頭看收件匣，所以 seek 最多等一塊的傳輸時間（§6.2）。
+
+### 5.2 job 長什麼樣
+
+```
+DownloadJob {
+    mxc,            要下載哪個檔                      example: "mxc://localhost/000000000000004d"
+    next,           下一塊要拉第幾塊（位置）           example: 123
+    total,          總塊數；不知道是 0                 example: 456
+    manifest,       區塊（檔案金鑰），驗過的參數（§3.2）
+    cancelled,      取消旗標
+}
+```
+
+### 5.3 建一個 job：先看 DB 與檔案
+
+收到要整檔的請求（`media.download`、`media.open`、`media.save_to`，§7.1），要哪個 mxc：
+
+| 本地狀況 | 做什麼 |
 |---|---|
-| 範圍 | **每個帳號一條**（跟 `Download` 線一樣） |
-| 一次幾個 | **一個**。一個檔完全下載完，才接著下一個；🚫 沒有平行下載（維護者 2026-10-01） |
-| 順序 | 先進先出 |
-| 怎麼進來 | `media.open` 要的檔不是完整的、也沒有本機原檔（/docs/design/rpc-specs/data-plane.md §8.1）→ 排進去；已經在佇列裡就不重複排 |
-| 取消 | `media.cancel { mxc }`：還沒開始 → 從佇列拿掉；下到一半 → 拉完當前這一塊就停、從佇列拿掉。主檔與暫存檔**留著**（下次排進來從斷點接）；太久沒人理由啟動掃描照 /docs/design/media/media-pool.md §5 的保護期清 |
-| 沒人看的時候 | **照樣拉完**（維護者 2026-10-01：Downloading 就是拉完） |
-| 暫停 | 現在沒有（之後可能加）。加的時候只停佇列，🚫 不停 seek |
-| 失敗 | 壞檔（§3.2、§3.3）→ 移除、`media` 列 reset；網路斷 → 這個檔停在佇列頭，線重開（/docs/design/daemon/link-pool.md §3.1）後接著拉 |
-| daemon 重開 | 佇列在記憶體裡，重開就沒了；主檔與暫存檔留著。UI 再 `media.open` 就重新排進來、從斷點接（§11 第 2 點） |
+| `media` 列 `complete = 1`、池檔在 | 🚫 不建 job：已經有了 |
+| 有本機原檔（/docs/design/rpc-specs/data-plane.md §8.1） | 🚫 不建 job（`media.save_to` 例外：它要的是池或原檔裡的 bytes，直接從原檔複製） |
+| 這個 mxc 已經在佇列裡 | 🚫 不重複建 |
+| 有 pending 主檔 | **從檔案確定進度**：驗檔長、逐段解（§4.1 續傳）→ 已寫 `k` 段 → `next = ⌊k × segment_size / chunk_size⌋`；DB 的 `segments_written` 只當提示，🚫 不當依據 |
+| 都沒有 | `next = 0` |
+| `total` | 區塊在手（有 `file_size`、`chunk_size`）就算 `ceil(file_size / chunk_size)`；不知道就填 **0**，第一步問 `Info` 再補 |
 
-`media.save_to`（另存新檔）也要整檔：改成**排進佇列、等它完成、再從池讀出來寫到使用者指定的位置**，🚫 不再自己握著 `Download` 線拉。
-它的 `no_cache`（不進池）版也一樣排隊。
+然後 job 排到佇列尾。daemon 重開時佇列不保存（維護者 2026-10-01）：之後再有人要這個檔，照上表從 DB 與檔案重建進度、接著拉。
+
+### 5.4 一步：拉一塊、落地、觸發下一步
+
+```
+worker 取佇列頭的 job：
+  0. total == 0 → Info（§3.2）驗過、填 total
+  1. 封一個「落地後續」：{ job, 落地後 next + 1, total }
+  2. 拿第 next 塊：
+       位置表有（§4.2）→ 從 seek 暫存檔讀那一格、用池金鑰解開   ← 不走網路
+       沒有             → Download/Read { mxc, chunk: next }，驗長度、用檔案金鑰解開（§3.3）
+  3. 明文餵進主檔（湊滿一段才封、才 append，§4.1）→ 這一塊落地結束
+  4. 觸發落地後續：
+       job.cancelled          → 停：主檔與暫存檔留著，從佇列移除        ← 取消插在這裡
+       next + 1 == total      → 收尾（§4.1）、刪暫存檔、推最後一則進度、拿下一個 job
+       否則                    → next += 1，回到 worker（先看有沒有 seek 請求）
+```
+
+- **取消**只在「一塊落地之後」生效：正在拉的那一塊會拉完、寫完，所以主檔永遠停在整塊（整段）的邊界上。
+- **壞檔**（§3.2、§3.3）→ job 移除、`media` 列 reset、推一則失敗。
+- **網路斷**：job 停在 `next`，線重開（/docs/design/daemon/link-pool.md §3.1）後從同一塊接著拉。
+- **沒人看的時候照樣拉完**（Downloading 就是拉完）。**暫停**之後才加，加的時候只停這個收件匣，🚫 不停 seek。
+
+### 5.5 進度：daemon 負責（維護者 2026-10-01）
+
+背景下載沒有 HTTP 連線可以看，所以進度由 daemon 管、由 daemon 報：
+
+- **狀態在 job 裡**（`next`／`total`）；DB 每 1.5 秒寫一次段數（顯示用，§4.4）。
+- **推播 `media.download`**（要先 `subscribe`，/docs/design/rpc-specs/rpc-spec.md §4）：
+  `{ mxc, state: "queued"|"downloading"|"complete"|"cancelled"|"failed", done: next, total, user }`。
+  每個 job **最多每秒一則**，加上每次狀態改變一則（排進、開始、完成、取消、失敗）——🚫 不是每塊一則（那會把 `room.message` 擠掉，/docs/design/daemon/daemon-runtime.md §5.4）。
+- **`media.queue`** 隨時可以問現在的樣子。
+- 播放中的進度照舊：就是那個 GET 收到多少 bytes。
+
+`media.save_to`（另存新檔）也排隊（維護者 2026-10-01）：建 job、等它完成、再從池讀出來寫到使用者指定的位置；`no_cache` 版也排隊。
 
 ## 6. Seek
 
 ### 6.1 什麼時候算 seek
 
 GET 要的那一段（§7.2），有任何一塊**不在**「本機原檔、完整主檔、主檔已寫的段、seek 暫存檔」之中 → 那幾塊要**現拉**，這就是 seek。
-seek 🚫 不算下載：不進佇列、不影響佇列的順序（維護者 2026-10-01）。
+seek 🚫 不算下載：不建 job、不進佇列、不影響佇列的順序（維護者 2026-10-01）。
 
 ### 6.2 在哪條線、怎麼插隊
 
-**同一條 `Download` 線，seek 優先**（維護者 2026-10-01）：
+**同一條 `Download` 線，seek 優先**（維護者 2026-10-01）：GET 把「第 `i` 塊」丟進那個帳號 worker 的 seek 收件匣（§5.1），
+worker 做完手上這一塊就先處理它。
 
-```
-seek：  seek_waiting += 1 → 借線 → Read{mxc, chunk: i} → 還線 → seek_waiting −= 1
-佇列：  每拉一塊之前：只要 seek_waiting > 0 就先等 → 借線 → Read → 還線
-```
-
-- 佇列每塊都會把線還回去，所以 seek 最多等**一塊**的傳輸時間。
+- 佇列一次只做一塊，所以 seek 最多等**一塊**的傳輸時間。
 - seek 跟佇列可能是不同的檔：線是帳號的，不是檔的。
-- seek 之後播放器通常順著往下讀，所以 seek 那邊也是一塊接一塊地拉；佇列在這段時間被讓到一邊，等播放器讀夠了（或主檔追上了）再回來。
+- seek 之後播放器通常順著往下讀，所以 seek 那邊也是一塊接一塊地要；這段時間佇列被讓到一邊，等播放器讀夠了（或主檔追上了）再回來。
 
 ### 6.3 一塊被 seek 拉到之後
 
 1. §3.3：驗長度、AEAD 解開 → 明文在記憶體。
 2. **append 進 seek 暫存檔**的下一格 → fsync → `slots[i] = s + 1`（§4.2）。
-3. 吐給要它的 GET。
+3. 交給要它的 GET。
 
-同一塊被好幾個 GET 同時要（播放器常同時開好幾條 Range）：下載工作記「正在拉的塊」，第二個請求等第一個拉完、讀暫存檔，🚫 不重拉。
+同一塊被好幾個 GET 同時要（播放器常同時開好幾條 Range）：worker 記「正在拉的塊」，第二個請求等第一個拉完、讀暫存檔，🚫 不重拉。
 
 ### 6.4 主檔追到 seek 拉過的塊
 
-佇列要拉第 `i` 塊之前，先查 `slots[i]`：
-
-- **有** → 從暫存檔讀那一格、解開（池金鑰）、照常寫進主檔。**不走網路**。
-- **沒有**（或那一格解不開）→ 照常向 server 拉。
+就是 §5.4 第 2 步：位置表有就從暫存檔搬、**不走網路**；沒有（或那一格解不開）照常向 server 拉。
 
 所以主檔永遠是「從第 0 段起連續」，不會有洞；暫存檔只是讓主檔追上來時快一點。最差狀況：同一塊在暫存檔與主檔各一份，**同時佔兩份空間**，主檔完成就刪掉暫存檔。暫存檔先不設上限（維護者 2026-10-01）。
 
@@ -287,11 +339,13 @@ seek：  seek_waiting += 1 → 借線 → Read{mxc, chunk: i} → 還線 → see
 
 | method | params | result | 說明 |
 |---|---|---|---|
-| `media.open` | `{ mxc } \| { room, event_id }`，`user?`、`server?` | `{ url, mimetype?, size, state }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`（原檔在）、`complete`（池裡完整）、`downloading`（佇列正在拉）、`queued`（排著）。不完整也沒原檔 → 排進佇列 |
-| `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, segments_written, file_size }] }` | 佇列現在的樣子，第一個是正在拉的 |
-| `media.cancel` | `{ mxc, user?, server? }` | `{ removed: bool }` | §5 的取消 |
+| `media.download` | `{ mxc } \| { room, event_id } \| { manifest }`，`user?`、`server?` | `{ state, done, total }` | 建 job（§5.3）。已經完整或有原檔就直接回 `complete`／`local_source` |
+| `media.open` | 同上 | `{ url, mimetype?, size, state }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`queued`。不完整也沒原檔 → 順便建 job |
+| `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 佇列現在的樣子，第一個是正在拉的 |
+| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 還沒開始 → 拿掉；下到一半 → 落地後停（§5.4） |
+| 推播 `media.download` | — | `{ mxc, state, done, total, user }` | §5.5 |
 
-進度：🚫 不推播（/docs/design/rpc-specs/rpc-spec.md §4：媒體的進度不走 RPC）。播放中的進度就是 GET 收到多少 bytes；背景下載的進度 UI 用 `media.queue` 自己問。
+`media.save_to` 的參數不變，行為改成排隊（§5.5 最後）。
 
 ### 7.2 GET 的路由
 
@@ -347,9 +401,10 @@ seek：  seek_waiting += 1 → 借線 → Read{mxc, chunk: i} → 還線 → see
 - 斷點表（§8）每一列一條。
 - 真 server：上傳一個檔 → `media.open` → 從中間 Range（seek）→ 拿到的 bytes 對 → 等佇列拉完 → 整檔對、暫存檔不見了。
 
-## 11. 要維護者決定的
+## 11. 維護者 2026-10-01 定的
 
-1. **v1 的池檔怎麼辦**：建議**讀的時候兩種都認、寫只寫 v2**（v1 的完成檔照用到被配額清掉）；v1 的下載中暫存檔直接刪掉重下。或者更簡單：v1 一律當壞檔重下（它是快取）。
-2. **佇列要不要跨 daemon 重開保存**：建議先不存（記憶體），UI 再 `media.open` 就從斷點接；要存的話就是 `cache.db` 多一張表。
-3. **`media.save_to` 也排隊**（§5）：會等前面的檔拉完，這是一次一個檔的直接後果。
-4. **背景下載的進度**：建議 UI 用 `media.queue` 自己問，不推播。
+1. **v1 的池檔一律當壞檔重下**（它是快取）：啟動掃描遇到 v1 的完成檔與暫存檔都刪，`media` 列 reset。
+2. **佇列不跨 daemon 重開保存**：進度照 DB 或直接讀檔案大小確定（§5.3），🚫 不另存佇列。
+3. **`media.save_to` 也排隊**（§5.5）。
+4. **背景下載的進度由 daemon 負責**（§5.5）：job 記著、推播 `media.download`（每個 job 最多每秒一則＋狀態改變）、`media.queue` 可以問。
+5. **佇列是一塊一步的 job**（§5.4）：「拉第 `next` 塊 → 落地 → 觸發後續（`next + 1`）」，取消插在落地之後。
