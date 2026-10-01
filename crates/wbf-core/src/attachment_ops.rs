@@ -238,14 +238,15 @@ impl Core {
         let total = chunk_count(size, chunk_size).ok_or_else(|| {
             CoreError::new(CoreErrorKind::Usage, "file too large for u32 chunk indices")
         })?;
-        // 續傳：問 server 收到第幾塊（新的上傳是 0）。
-        let mut next_wanted = self
+        // 續傳：問 server 收到第幾塊、之前有沒有截斷過（新的上傳是 0／沒有）。
+        let status = self
             .upload_link(account)
             .await?
             .upload_status(upload.upload_id)
-            .await?
-            .received;
-        let mut truncated = false;
+            .await?;
+        let mut next_wanted = status.received;
+        // 累加不覆寫：上一輪在被跳過的區段截斷過，這一輪的 Ack 不會再說一次（PR #67 審查 cirno 🟢5b）。
+        let mut truncated = status.truncated;
         let mut buffer = vec![0u8; chunk_size as usize];
         let mut read_so_far = 0u64;
         for index in 0..total {
@@ -283,7 +284,7 @@ impl Core {
                 .await;
             match sent {
                 Ok(ack) => {
-                    truncated = ack.truncated;
+                    truncated |= ack.truncated;
                     next_wanted = ack.received;
                 }
                 // server 已經有更後面的塊（上一次 PUT 的 Ack 沒收到）：往後讀就好。要的是前面的就沒救了——body 倒不回去。
@@ -897,6 +898,34 @@ mod tests {
         assert!(
             cache.find_media(&without.mxc).unwrap().is_none(),
             "沒給 source_uri 就不建列"
+        );
+    }
+
+    /// server 截斷過的上傳🚫 不記原檔——包括截斷發生在上一輪、這一輪續傳時被跳過的那段（Ack 不會再說一次，要從 `Status` 讀；PR #67 審查 cirno 🟢5b）。
+    #[tokio::test]
+    async fn a_truncated_upload_does_not_remember_its_source_even_after_a_resume() {
+        let dir = scratch("attach-truncated");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (_misc, upload) = misc_and_upload(&core, &account, false).await;
+        let target = Target::default();
+        let original = body(40);
+
+        let state = core
+            .create_upload(&new_upload(Some(ROOM), Some(40)), &target)
+            .await
+            .unwrap();
+        core.receive_upload(&state, &mut &original[..20], None, &target)
+            .await
+            .unwrap_err();
+        upload.uploads.lock().unwrap().get_mut(&1).unwrap().truncated = true;
+        let manifest = core
+            .receive_upload(&state, &mut &original[..], Some("file:///home/me/v.bin"), &target)
+            .await
+            .unwrap();
+        let (cache, _) = core.cache_and_me(&account).unwrap();
+        assert!(
+            cache.find_media(&manifest.mxc).unwrap().is_none(),
+            "截斷過就不記原檔"
         );
     }
 

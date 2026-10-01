@@ -232,6 +232,8 @@ pub(crate) struct FakeUpload {
     pub(crate) chunks: Vec<Vec<u8>>,
     pub(crate) finished: bool,
     pub(crate) sealed: bool,
+    /// 測試設：server 說這個上傳**之前**被截斷過——只有 `Status` 的 Ack 帶（模擬截斷發生在被跳過的上一輪，這一輪的 `Chunk` Ack 不會再說）。
+    pub(crate) truncated: bool,
 }
 
 pub(crate) type FakeUploads = Arc<Mutex<std::collections::BTreeMap<u64, FakeUpload>>>;
@@ -606,6 +608,7 @@ fn upload_reply(pack: &Pack, uploads: &FakeUploads) -> Pack {
             let upload = uploads.get(&pack.id).unwrap();
             let mut meta = chunk_ack(upload);
             meta["chunk_size"] = json!(16);
+            meta["truncated"] = json!(upload.truncated);
             meta["file_size"] = Value::Null;
             ack(meta)
         }

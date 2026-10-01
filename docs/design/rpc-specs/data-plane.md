@@ -101,6 +101,8 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 - 認不得的 URL 或 meta（別的 token 發的、被改過一個字、用途不對、meta 不是這個 URL 的、形狀不對）一律 **404**，🚫 不分辨原因。沒帶 meta 是 **400**（講清楚要帶什麼）。
 - **明文模式**：`daemon.set_encryption { enforced: false }`（除錯用，/docs/design/rpc-specs/rpc-spec.md §3.1）時，URL 是 `c-` ＋ B58(用途 ‖ mxc)、
   meta 是 `c-` ＋ B58(JSON)，都不加密。加密模式下拿 `c-` 來一律 404（fail closed）；加密的 `e-` 兩個模式都收。
+  ⚠️ `c-` **沒有任何認證**：本機任何程序都能自己組出一組合法的 URL＋meta。「daemon 解得開就是它發的」只對 `e-` 成立；
+  `c-` 擋得住的只剩 core 的「這個上傳是不是這個帳號的」核對——所以它只給除錯，🚫 不給正式環境。
 - **Host 檢查**：Host 標頭不是 `127.0.0.1`、`localhost`、`[::1]`（帶不帶 port 都可以）一律 **403**。擋的是 DNS rebinding：
   網頁把自己的網域指到 127.0.0.1 之後，瀏覽器送的 Host 是那個網域。
 - **未解鎖一律 503**：東西在，只是現在打不開（/docs/design/rpc-specs/local-interface.md §5）。
@@ -181,7 +183,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 | **409** | 這個上傳已經有一條 PUT 在收 | 106 |
 | **502** | homeserver 拒絕、連不上、逾時；包括「這個上傳 server 那邊已經沒有了」（例如傳完之後又 PUT） | 1400／1300／1600 |
 | **503** | vault 還沒解鎖 | 1001 |
-| **500** | 其他（本機 IO 等） | |
+| **500** | 帶了 `Content-Length` 卻在中途斷線（hyper 先回錯，core 收到的是 IO 錯）、其他本機 IO | 1200 |
 
 ### 4.3 同一個 URL 再 PUT 一次
 
@@ -331,6 +333,8 @@ media 列在，而且 source_uri 不是空的
 ```
 
 - **為什麼優先**：從池拿要先確認要的那一段下載了沒，很複雜；從原檔拿什麼都不用管——🚫 不觸發下載、🚫 不碰池、🚫 不動 DB（不 touch `last_used_at`、不發任何事件）。
+- **server 截斷過就不記**：`Seal` 時 server 說截斷了（含續傳之前那一輪截斷的，從 `Status` 讀），`source_uri` 不寫進列；
+  就算漏了，列的 `file_size` 跟原檔對不上，讀的時候大小比對也會自然退回池。
 - **大小相同就信**：這是猜，不是驗證（🚫 不算 hash，大檔太貴）。原檔被改過但大小沒變，讀到的就是改過的內容——接受，原檔是使用者自己的。
 - **`source_uri` 一律是 URI**，意義由 UI 決定，daemon 只有猜的權力。解的規則（`wbf_sdk::local_source`）：
 
