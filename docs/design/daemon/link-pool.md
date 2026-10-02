@@ -125,12 +125,14 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
   判斷在 daemon 的推播函數（§6），池只發。
 - 鉤子在讀取 task 上、表鎖之外（/docs/design/daemon/ws-receive-dispatch.md §4）；`EventSink` 是 broadcast 的 `try_send`，不會擋讀取 task。
 
-## 5. 一條線一次一個命令
+## 5. 一條線上的請求：送收分開、動作封在請求裡
 
-`PooledClient` 是那條線的 `WbfClient` 的 `tokio::Mutex` guard：同一條線上第二個命令等第一個做完。
-原因是 `WbfClient` 的方法都是 `&mut self`（請求號計數器、hello 的結果），而底下的 `WsLink` 本身允許並行——
-所以這是**上面那層**的限制，不是通道的。⭐ 有五條線之後，會排隊的只剩「同一類的兩個命令」（兩個下載、兩個 ping），可接受；
-之後要讓同一條線並行，改的是 `WbfClient`（計數器變 atomic、hello 結果變 `Arc`），🚫 不是池。
+**規則在 /docs/design/daemon/link-requests.md**（維護者 2026-10-02）：每條線一條發送 queue ＋ 一張在途表，請求送出去就不管，
+「拿到回覆之後做什麼」封在請求裡，回覆到了由那條線的處理端執行；預設無序，要守順序的例外由動作自己守。
+池的一格因此放的是「線」（發送 queue、在途表、處理端），活得比底下的 `WsLink` 久：線斷了 queue 不丟，重開之後接著送。
+
+**還沒搬過去的線**照舊的方式：`PooledClient` 是那條線的 `WbfClient` 的 `tokio::Mutex` guard，同一條線上第二個命令等第一個做完
+（`WbfClient` 的方法是 `&mut self`：請求號計數器、hello 的結果在它身上）。搬的順序在 /docs/design/daemon/link-requests.md §8，`Download` 第一個。
 
 ## 6. daemon 那半：訂閱、推播、desync（/docs/design/rpc-specs/rpc-spec.md §3.9、§4）
 

@@ -171,3 +171,4 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 ## 10. 之後
 
 這一層沒有待辦。推播封裝、`desync` 在 /docs/design/daemon/link-pool.md §6；`Event/Subscribe` 的訂閱在 /docs/design/rooms/room-sync.md。
+這一層之上、「請求送出後誰等回覆」的規則（送收分開、動作封在請求裡）在 /docs/design/daemon/link-requests.md。

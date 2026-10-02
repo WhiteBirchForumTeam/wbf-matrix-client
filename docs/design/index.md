@@ -28,6 +28,7 @@
 | [`/docs/design/daemon/account-session.md`](daemon/account-session.md) | 帳號的會話：探活、登入、登出、誰用 matrix-sdk 的 Client |
 | [`/docs/design/daemon/link-pool.md`](daemon/link-pool.md) | 連線池：一個帳號五條線、解鎖／登入後全開、背景看線重開 |
 | [`/docs/design/daemon/ws-receive-dispatch.md`](daemon/ws-receive-dispatch.md) | WS 收包分派：一條連線、任何順序、依會話表交付 |
+| [`/docs/design/daemon/link-requests.md`](daemon/link-requests.md) | 一條線上的請求：送收分開、動作封在請求裡、預設無序；五條線都照它 |
 
 ## `rooms/`：房間
 
