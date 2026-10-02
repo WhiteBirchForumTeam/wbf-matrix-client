@@ -37,8 +37,9 @@ const PUSH_EVERY: Duration = Duration::from_secs(1);
 const CLAIM_RETRY: Duration = Duration::from_secs(1);
 /// 沒事做時最久睡多久（收件、回覆、取消都會叫醒它）。
 const IDLE_WAKE: Duration = Duration::from_secs(60);
-/// 一個塊請求等回覆的上限；也是 GET 等一塊的上限（線沒開時請求排著不送，GET 🚫 永遠掛著）。
-const REPLY_TIMEOUT: Duration = wbf_sdk::channel::REQUEST_TIMEOUT;
+/// 有塊請求在等時，`Download` 線最久可以多久沒有任何回應（/docs/design/daemon/link-requests.md §4）。跟 server 的 `wbf_ws_idle_timeout` 一樣是 60 秒；
+/// 線真的死了，心跳 34 秒內就發現（`Network`），所以撞到這個的是「線活著、server 卻不回下載」。
+const LINE_SILENCE: Duration = Duration::from_secs(60);
 /// 同一個請求連續逾時幾次就當 server 那邊出事（/docs/design/daemon/link-requests.md §4）。
 const TIMEOUT_ATTEMPTS: u32 = 3;
 /// 只為 seek 開著、不是 job 的檔最多留幾個（每個握著兩個檔案把手）。
@@ -225,7 +226,7 @@ impl Downloader {
         });
         let (seeks, seek_inbox) = mpsc::unbounded_channel();
         let (replies_tx, replies) = mpsc::unbounded_channel();
-        let line = RequestLine::start(parts.links, LinkRole::Download, REPLY_TIMEOUT, replies_tx);
+        let line = RequestLine::start(parts.links, LinkRole::Download, LINE_SILENCE, replies_tx);
         let events = parts.events.clone();
         let handler = DownloadHandler {
             shared: shared.clone(),
@@ -370,10 +371,12 @@ impl Downloader {
     }
 
     /// GET 要第 `index` 塊（seek，/docs/design/media/media-download.md §6）：交一個 seek 的 job，它的請求插到發送 queue 最前面。
+    /// 🚫 自己限時：線斷了、線整段沒回應、這一塊驗不過，處理端都會回錯；線沒開時請求排著等線。播放器不要了（斷線）就丟掉這個 future。
     ///
     /// Return:
     ///     Ok(明文)
-    ///     Err(Network)     線斷了、或 `REPLY_TIMEOUT` 內沒拿到（線沒開時請求排著）
+    ///     Err(Network)     線斷了
+    ///     Err(Timeout)     線整段沒有回應（`LINE_SILENCE`）
     ///     Err(Integrity)   這一塊驗不過
     ///     Err(Io)          處理端已經收了
     pub(crate) async fn read_chunk(
@@ -381,7 +384,6 @@ impl Downloader {
         manifest: Arc<Manifest>,
         index: u32,
     ) -> Result<Zeroizing<Vec<u8>>, CoreError> {
-        let mxc = manifest.mxc.clone();
         let (reply, answer) = oneshot::channel();
         self.seeks
             .send(SeekJob {
@@ -390,16 +392,7 @@ impl Downloader {
                 reply,
             })
             .map_err(|_| downloader_gone())?;
-        match tokio::time::timeout(REPLY_TIMEOUT, answer).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_dropped)) => Err(downloader_gone()),
-            Err(_elapsed) => Err(CoreError::new(
-                CoreErrorKind::Network,
-                format!(
-                    "chunk {index} of {mxc} did not arrive within {REPLY_TIMEOUT:?} (is the download link open?)"
-                ),
-            )),
-        }
+        answer.await.map_err(|_| downloader_gone())?
     }
 
     /// 處理端現在開著的主檔暫存名（掃描用）。

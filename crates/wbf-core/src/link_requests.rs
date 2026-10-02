@@ -5,11 +5,12 @@
 //!
 //! - 線從連線池借**分身**（`LinkPool::find_ws_link`），🚫 不握池那格的鎖。沒開或死了就停一下再看，queue 留著（§2 最後一條）：開線是 `link_keeper` 的事。
 //! - 發送端一次只交一個給 `WsLink`、交完才取下一個，所以插到最前面的請求就是下一個送出去的（§2）。
+//! - 逾時看整條線：有請求在等、而一段時間內一個回應都沒收到才算（§4）；線還在回應，排得再後面也🚫 逾時。
 //! - 失敗怎麼處置🚫 不在這裡決定（§4）：擁有者收到 `Network`／`Timeout` 自己決定要不要 `push_front` 重送。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Notify};
 use tokio::task::{JoinHandle, JoinSet};
@@ -80,12 +81,12 @@ impl<A: LineRequest> RequestLine<A> {
     /// Args:
     ///     links: 這個帳號的連線池（只借開著的線）
     ///     role: example: LinkRole::Download
-    ///     reply_timeout: 一個請求等回覆的上限, example: Duration::from_secs(300)
+    ///     silence_timeout: 有請求在等時，這條線最久可以多久沒有任何回應, example: Duration::from_secs(60)
     ///     replies: 擁有者的收件匣；每個送出的請求恰好交回一個 `LineReply`（擁有者已經不在了就丟掉）
     pub(crate) fn start(
         links: Arc<LinkPool>,
         role: LinkRole,
-        reply_timeout: Duration,
+        silence_timeout: Duration,
         replies: mpsc::UnboundedSender<LineReply<A>>,
     ) -> RequestLine<A> {
         let queue = Arc::new(LineQueue {
@@ -96,7 +97,7 @@ impl<A: LineRequest> RequestLine<A> {
             queue.clone(),
             links,
             role,
-            reply_timeout,
+            silence_timeout,
             replies,
         ));
         RequestLine { queue, sender }
@@ -129,23 +130,51 @@ impl<A: LineRequest> RequestLine<A> {
     }
 }
 
+/// 送出去、還沒回的請求，鍵是 seq。等回覆的小 task 回來時從這裡拿走自己那一筆才交回去；線整段沒回應時發送端一次拿走全部——
+/// 誰先拿到誰交，所以每個請求恰好交回一次。
+struct OnWire<A> {
+    requests: HashMap<u32, Queued<A>>,
+    /// 上一次收到回應的時間；線從「沒有請求在等」變成「有」的那一刻也算（之前多久沒事都不算沉默）。
+    heard_at: Instant,
+}
+
+type SharedOnWire<A> = Arc<Mutex<OnWire<A>>>;
+
+fn lock<A>(on_wire: &SharedOnWire<A>) -> MutexGuard<'_, OnWire<A>> {
+    on_wire
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 發送端：取出 → 配 seq → 登記並送出（`WsLink::send_request`）→ 回覆交給一個小 task 等，🚫 這裡不等。
+/// 逾時看的是**整條線**（/docs/design/daemon/link-requests.md §4）：有請求在等、而 `silence_timeout` 內一個回應都沒收到，在途的全部交回 `Timeout`；
+/// 線還在回應，就🚫 有人逾時。
 async fn send_queued<A: LineRequest>(
     queue: Arc<LineQueue<A>>,
     links: Arc<LinkPool>,
     role: LinkRole,
-    reply_timeout: Duration,
+    silence_timeout: Duration,
     replies: mpsc::UnboundedSender<LineReply<A>>,
 ) {
     let mut link: Option<WsLink> = None;
     let mut next_seq = FIRST_SEQ;
+    let on_wire: SharedOnWire<A> = Arc::new(Mutex::new(OnWire {
+        requests: HashMap::new(),
+        heard_at: Instant::now(),
+    }));
+    let check_every =
+        (silence_timeout / 10).clamp(Duration::from_millis(10), Duration::from_secs(5));
     // 等回覆的小 task 都在這裡：發送端停了（擁有者丟掉 `RequestLine`），它們跟著停。
     let mut waiting = JoinSet::new();
     loop {
         while waiting.try_join_next().is_some() {}
+        time_out_if_silent(&on_wire, silence_timeout, &replies, &mut waiting);
         let next = queue.queued().pop_front();
         let Some(Queued { action, attempt }) = next else {
-            queue.wake.notified().await;
+            tokio::select! {
+                _ = queue.wake.notified() => {}
+                _ = tokio::time::sleep(check_every) => {}
+            }
             continue;
         };
         let current = match link.take() {
@@ -163,17 +192,31 @@ async fn send_queued<A: LineRequest>(
         let pack = action.to_pack(seq);
         match current.send_request(pack.clone()).await {
             Ok(pending) => {
-                let replies = replies.clone();
+                {
+                    let mut wire = lock(&on_wire);
+                    if wire.requests.is_empty() {
+                        wire.heard_at = Instant::now();
+                    }
+                    wire.requests.insert(seq, Queued { action, attempt });
+                }
+                let (on_wire, replies) = (on_wire.clone(), replies.clone());
                 waiting.spawn(async move {
                     let result = pending
-                        .wait(reply_timeout)
+                        .wait()
                         .await
                         .and_then(|response| protocol::expect_ack(&pack, response));
-                    let _ = replies.send(LineReply {
-                        action,
-                        attempt,
-                        result,
-                    });
+                    let answered = {
+                        let mut wire = lock(&on_wire);
+                        wire.heard_at = Instant::now();
+                        wire.requests.remove(&seq)
+                    };
+                    if let Some(Queued { action, attempt }) = answered {
+                        let _ = replies.send(LineReply {
+                            action,
+                            attempt,
+                            result,
+                        });
+                    }
                 });
             }
             // 這個號剛好有人在等（換一圈回來撞到還沒回的）：放回去，下一輪換下一個號。
@@ -187,6 +230,32 @@ async fn send_queued<A: LineRequest>(
             }
         }
         link = Some(current);
+    }
+}
+
+/// 有請求在等、而線 `silence_timeout` 內沒有任何回應：在途的全部交回 `Timeout`，等它們的小 task 停掉（晚到的回覆變無主）。
+fn time_out_if_silent<A>(
+    on_wire: &SharedOnWire<A>,
+    silence_timeout: Duration,
+    replies: &mpsc::UnboundedSender<LineReply<A>>,
+    waiting: &mut JoinSet<()>,
+) {
+    let silent: Vec<Queued<A>> = {
+        let mut wire = lock(on_wire);
+        if wire.requests.is_empty() || wire.heard_at.elapsed() < silence_timeout {
+            return;
+        }
+        wire.requests.drain().map(|(_, queued)| queued).collect()
+    };
+    waiting.abort_all();
+    for Queued { action, attempt } in silent {
+        let _ = replies.send(LineReply {
+            action,
+            attempt,
+            result: Err(SdkError::Timeout(format!(
+                "no response on this line for {silence_timeout:?}"
+            ))),
+        });
     }
 }
 
@@ -371,5 +440,76 @@ mod tests {
                 reply.result.err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_line_that_keeps_answering_times_out_nobody() {
+        let (pool, mut requests, answers) = pool_with_link().await;
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let line = RequestLine::start(
+            pool,
+            LinkRole::Download,
+            Duration::from_millis(300),
+            replies_tx,
+        );
+        line.push_back(Named("A"));
+        line.push_back(Named("B"));
+        line.push_back(Named("C"));
+        let sent = [
+            requests.recv().await.unwrap(),
+            requests.recv().await.unwrap(),
+            requests.recv().await.unwrap(),
+        ];
+        // 每 200 ms 回一個：C 從送出到回覆超過 600 ms，可是線一直在回應，誰都🚫 逾時。
+        for pack in &sent {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            answers.send(ack_for(pack)).unwrap();
+        }
+        for _ in 0..3 {
+            let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reply.result.is_ok(), "{:?}", reply.result.err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_that_answers_nothing_times_out_every_waiting_request_once() {
+        let (pool, mut requests, answers) = pool_with_link().await;
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let line = RequestLine::start(
+            pool,
+            LinkRole::Download,
+            Duration::from_millis(200),
+            replies_tx,
+        );
+        line.push_back(Named("A"));
+        line.push_back(Named("B"));
+        let first = requests.recv().await.unwrap();
+        requests.recv().await.unwrap();
+        let mut timed_out = Vec::new();
+        for _ in 0..2 {
+            let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(reply.result, Err(SdkError::Timeout(_))),
+                "{:?}",
+                reply.result.err()
+            );
+            timed_out.push(reply.action.0);
+        }
+        timed_out.sort();
+        assert_eq!(timed_out, vec!["A", "B"]);
+        // 晚到的回覆🚫 再交一次。
+        answers.send(ack_for(&first)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), replies.recv())
+                .await
+                .is_err(),
+            "each request comes back exactly once"
+        );
     }
 }

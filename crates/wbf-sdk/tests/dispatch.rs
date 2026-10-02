@@ -528,7 +528,6 @@ fn pong_for(ping: &Pack) -> Pack {
 async fn a_quiet_link_pings_and_stays_open_when_the_peer_answers() {
     let (link, mut peer) = connect_with_heartbeat(Heartbeat {
         interval: Duration::from_millis(100),
-        quiet: Duration::from_millis(50),
         reply_timeout: Duration::from_millis(500),
     });
     let first = peer.receive().await;
@@ -550,29 +549,33 @@ async fn a_quiet_link_pings_and_stays_open_when_the_peer_answers() {
     assert_eq!(link.unmatched(), 0, "Pong 都有人等");
 }
 
-/// 忙的線不跳：最近 `quiet` 之內有收到東西就跳過（這裡對面一直送無主的 pack）。
+/// 一直在收推播的線照樣按時跳（維護者 2026-10-02）：server 的 idle 只看 client 送了什麼，收東西不算。
 #[tokio::test]
-async fn a_busy_link_skips_its_heartbeat() {
+async fn a_link_that_keeps_receiving_still_pings_on_time() {
     let (link, mut peer) = connect_with_heartbeat(Heartbeat {
-        interval: Duration::from_millis(60),
-        quiet: Duration::from_millis(200),
+        interval: Duration::from_millis(100),
         reply_timeout: Duration::from_millis(500),
     });
-    // 600 ms 裡每 40 ms 送一個 pack 給 client：線一直是「最近有通訊」。
-    for _ in 0..15 {
+    // 對面每 20 ms 推一個 pack 給 client，同時看 client 送了什麼：450 ms 裡至少要收到 3 個 Ping。
+    let mut pings = 0;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_millis(450) {
         peer.send(device_push(0x0100_0000_0000_0009, 0)).await;
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        if let Ok(Ok(Some(bytes))) =
+            tokio::time::timeout(Duration::from_millis(20), peer.end.source.receive()).await
+        {
+            let ping = Pack::decode(&bytes).unwrap();
+            if ping.subtype == control::PING {
+                pings += 1;
+                peer.send(pong_for(&ping)).await;
+            }
+        }
     }
     assert!(
-        tokio::time::timeout(Duration::from_millis(50), peer.end.source.receive())
-            .await
-            .is_err(),
-        "整段時間對面沒收到任何 Ping"
+        pings >= 3,
+        "a ping every interval while pushes keep arriving, got {pings}"
     );
     assert!(!link.is_closed());
-    // 安靜下來之後才跳。
-    let ping = peer.receive().await;
-    assert_eq!(ping.subtype, control::PING);
 }
 
 /// Ping 沒人回：這條線死了（shut_down），在等的人立刻收到 Network、理由說是心跳。
@@ -580,7 +583,6 @@ async fn a_busy_link_skips_its_heartbeat() {
 async fn an_unanswered_heartbeat_closes_the_link_and_fails_the_waiters() {
     let (link, mut peer) = connect_with_heartbeat(Heartbeat {
         interval: Duration::from_millis(50),
-        quiet: Duration::from_millis(10),
         reply_timeout: Duration::from_millis(100),
     });
     let mut subscription = link
@@ -594,7 +596,7 @@ async fn an_unanswered_heartbeat_closes_the_link_and_fails_the_waiters() {
         .await
         .unwrap();
     assert_eq!(peer.receive().await.subtype, device::SUBSCRIBE);
-    // 訂閱那一送算通訊；等它安靜下來，Ping 來了、不回。
+    // 下一個間隔 Ping 來了、不回。
     let ping = peer.receive().await;
     assert_eq!(ping.subtype, control::PING);
     let outcome = subscription.next(Duration::from_secs(5)).await;

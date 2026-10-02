@@ -26,29 +26,25 @@ pub const CORRUPT_FRAME_BUDGET: u32 = 8;
 /// 送出（進佇列）最多等多久：送出 task 卡在死掉的 socket 上時，呼叫端不該永遠掛著。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1，維護者 2026-09-21：照 WireGuard 的 persistent keepalive 那個概念）：每條線自己一個，
-/// 每 `interval` 醒一次；最近 `quiet` 之內這條線有任何送或收就跳過這次，否則送一個 `Ping` 等 `Pong`；
-/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。
+/// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1）：每條線自己一個，**每 `interval` 一定送一個 `Ping`**、等 `Pong`；
+/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`
+/// 是 60 秒、只看 client 送了什麼——只收推播的線（`Rooms`／`Keys`）一直在收，可是 server 看到的是一條 60 秒沒請求的線，會把它關掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
     pub interval: Duration,
-    pub quiet: Duration,
     pub reply_timeout: Duration,
 }
 
 impl Heartbeat {
-    /// 預設：24 秒一次、最近 20 秒有通訊就跳過、Pong 等 10 秒。
-    /// 24 秒 ≪ server 的 `wbf_ws_idle_timeout`（300 秒），閘著的線不會被 server 當黑洞收掉；也能在半分鐘內發現對方已經不在。
+    /// 預設：24 秒一次、Pong 等 10 秒。24 秒在 server 的 60 秒 idle 之內還能錯過一次；對方悄悄不在了，34 秒內這條線就關了。
     pub const DEFAULT: Heartbeat = Heartbeat {
         interval: Duration::from_secs(24),
-        quiet: Duration::from_secs(20),
         reply_timeout: Duration::from_secs(10),
     };
 
     /// 不跳（只給測試別的事情時用）。
     pub const OFF: Heartbeat = Heartbeat {
         interval: Duration::MAX,
-        quiet: Duration::ZERO,
         reply_timeout: Duration::from_secs(10),
     };
 }
@@ -84,10 +80,6 @@ struct Shared {
     closed: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     hook: ReceivedHook,
-    /// 這條線起來的時間；`last_activity_ms` 從這裡算。
-    started: std::time::Instant,
-    /// 上次送或收（任何 frame）是起來之後第幾毫秒。心跳拿它決定要不要跳過。
-    last_activity_ms: AtomicU64,
 }
 
 impl Shared {
@@ -95,19 +87,6 @@ impl Shared {
         self.table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 送了或收了一個 frame。
-    fn touch(&self) {
-        let elapsed = self.started.elapsed().as_millis() as u64;
-        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
-    }
-
-    /// Return:
-    ///     Duration   距離上次送或收多久
-    fn idle_for(&self) -> Duration {
-        let now = self.started.elapsed().as_millis() as u64;
-        Duration::from_millis(now.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)))
     }
 
     fn is_closed(&self) -> bool {
@@ -160,8 +139,6 @@ impl WsLink {
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             hook,
-            started: std::time::Instant::now(),
-            last_activity_ms: AtomicU64::new(0),
         });
         let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
 
@@ -423,7 +400,6 @@ async fn write_queued<K: FrameSink>(
             shared.shut_down(&format!("send failed: {error}"));
             return;
         }
-        shared.touch();
     }
 }
 
@@ -437,10 +413,6 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
         tokio::time::sleep(heartbeat.interval).await;
         if link.shared.is_closed() {
             return;
-        }
-        // 最近有通訊：線是活的、server 那邊的 idle 也沒在走，這次不用跳。
-        if link.shared.idle_for() < heartbeat.quiet {
-            continue;
         }
         let ping = Pack {
             kind: wbf_wire::Kind::Control,
@@ -471,7 +443,6 @@ async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
         match source.receive().await {
             Ok(Some(bytes)) => match Pack::decode(&bytes) {
                 Ok(pack) => {
-                    shared.touch();
                     undecodable_in_a_row = 0;
                     let (session, route) = shared.table().classify(&pack);
                     (shared.hook)(&Received {
@@ -544,30 +515,19 @@ pub struct PendingReply {
 }
 
 impl PendingReply {
+    /// 等到回覆、或連線關了。🚫 自己限時：「多久算沒回應」看的是整條線多久沒收到回應，由用線的那一層決定（/docs/design/daemon/link-requests.md §4）；
+    /// 不要了就丟掉它。
+    ///
     /// Return:
     ///     Ok(Pack)        回來的那個（可能是 Error pack，這裡不解讀）
-    ///     Err(Timeout)    連線還活著、只是 `timeout` 內沒回
     ///     Err(Network)    連線沒了
-    pub async fn wait(mut self, timeout: Duration) -> Result<Pack, SdkError> {
-        match tokio::time::timeout(timeout, &mut self.receiver).await {
-            Ok(Ok(delivered)) => delivered,
-            Ok(Err(_dropped)) => Err(SdkError::Network(format!(
+    pub async fn wait(mut self) -> Result<Pack, SdkError> {
+        match (&mut self.receiver).await {
+            Ok(delivered) => delivered,
+            Err(_dropped) => Err(SdkError::Network(format!(
                 "connection {}: the reply slot for {:?} was dropped",
                 self.shared.connection_id, self.key
             ))),
-            Err(_elapsed) => {
-                let message = format!(
-                    "connection {}: no reply to {:?} within {timeout:?}",
-                    self.shared.connection_id, self.key
-                );
-                if self.shared.is_closed() {
-                    Err(SdkError::Network(format!(
-                        "{message}; the connection is closed"
-                    )))
-                } else {
-                    Err(SdkError::Timeout(message))
-                }
-            }
         }
     }
 }
