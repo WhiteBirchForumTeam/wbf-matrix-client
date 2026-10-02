@@ -1,7 +1,7 @@
 //! `GET /media/mxc/…` 的那一段明文從哪來（/docs/design/media/media-download.md §7.2、/docs/design/rpc-specs/data-plane.md §8）。
 //!
-//! 由上往下：本機原檔 → 完整的池檔 → （worker：主檔已封的段 → seek 暫存檔 → 現拉）。後三種都交給那個帳號的下載 worker，
-//! 一塊一塊地要：worker 是主檔與 seek 暫存檔唯一的寫入者，讀也經過它，🚫 不另開把手跟它搶。
+//! 由上往下：本機原檔 → 完整的池檔 → （下載處理端：主檔已封的段 → seek 暫存檔 → 現拉）。後三種都交給那個帳號的下載處理端，
+//! 一塊一塊地要（每一塊是一個 seek 的 job）：它是主檔與 seek 暫存檔唯一的寫入者，讀也經過它，🚫 不另開把手跟它搶。
 //!
 //! URL 不帶帳號（維護者 2026-10-01：「只要匹配 mxc 就能看」）：mxc 屬於哪份 `cache.db`，照本機已登入的帳號一份一份找，
 //! mxc 的 server_name 跟帳號網域一樣的先找。現拉要金鑰：從那個帳號看得到的事件裡拿，🚫 不跨帳號借。
@@ -36,7 +36,7 @@ enum Origin {
     Local(std::fs::File),
     /// 池裡完整的主檔。
     Pool(PoolReader),
-    /// 還不完整：一塊一塊跟 worker 要。
+    /// 還不完整：一塊一塊跟下載處理端要。
     Chunks {
         downloader: Arc<Downloader>,
         manifest: Arc<Manifest>,
@@ -238,7 +238,7 @@ impl Core {
         Ok(accounts)
     }
 
-    /// 這台 server 上如果別的帳號正在寫這個 mxc，seek 交給它的 worker（主檔與暫存檔只有一個寫入者）；沒有就用 `account`。
+    /// 這台 server 上如果別的帳號正在寫這個 mxc，seek 交給它的下載處理端（主檔與暫存檔只有一個寫入者）；沒有就用 `account`。
     fn find_writer_of(
         &self,
         account: &AccountDir,

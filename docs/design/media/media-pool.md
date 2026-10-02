@@ -64,7 +64,7 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
   只看這個程序就夠：資料目錄綁定 daemon（/docs/design/overview/architecture-v2.md §0.2）。
 - 事件快取不受這個配額（/docs/design/storage/local-cache-db.md §1）。
 
-**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now, in_use)` 掃孤兒：DB 說完整但檔打不開（不在、池格式 v1）→ reset；`pending/` 的規則在 /docs/design/media/media-download.md §4.3（沒列認領、列已完成、v1、過期 → 刪，`in_use` 裡的（下載 worker 正開著的）🚫 不碰）；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後、v1 被 reset 之後留下的）→ 刪。daemon 在這個程序第一次起某台 server 的下載 worker 時掃一次。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
+**實作（`wbf-sdk::media`）**：`collect_garbage(cache, pool, quota, protect, now)` 照上面的規則，先刪檔再 `media_reset` 列；`media_references` 大於 1（同 hash 去重過）的池檔不刪檔只清列。`sweep(cache, pool, protect, now, in_use)` 掃孤兒：DB 說完整但檔打不開（不在、池格式 v1）→ reset；`pending/` 的規則在 /docs/design/media/media-download.md §4.3（沒列認領、列已完成、v1、過期 → 刪，`in_use` 裡的（下載處理端正開著的）🚫 不碰）；`media/<hh>/` 裡沒有任何列指著的完成檔（`forget_account` 之後、DB 重建之後、v1 被 reset 之後留下的）→ 刪。daemon 在這個程序第一次起某台 server 的下載處理端時掃一次。CLI：`media-gc [--quota-mib] [--protect-days]` 先 sweep 再 gc、`media-stats`（/docs/design/rpc-specs/wbf-cli-spec.md §3.5）。UI 之後要的「手動清理」就是 quota 0 或直接刪 `media/`。
 
 ## 6 先不做的
 
@@ -75,7 +75,7 @@ s/<b58>_<b58>/media/<hash 前 2 hex>/<hash>     hash = 明文的 BLAKE3（32 byt
 ## 7 與下載管線的接法
 
 下載管線是「`Read` 一塊 → 驗長度 → 解密 → 交出去」；一個檔在主檔、seek 暫存檔與網路之間怎麼拿塊是 `wbf-sdk::media::MediaDownload`，
-誰、何時、做到哪是 core 的下載 worker（/docs/design/media/media-download.md §5）。讀的人只看到明文（`PoolReader` 或 GET 的 body），不知道底下是池還是 server。
+誰、何時、做到哪是 core 的下載處理端（/docs/design/media/media-download.md §5）。讀的人只看到明文（`PoolReader` 或 GET 的 body），不知道底下是池還是 server。
 
 三個模組的關係：`cache` 不知道池、`media_pool`／`seek_store` 不知道 DB、下載管線不知道兩者，只有 `media.rs` 同時碰三者。
 `WbfClient::download`（直接寫到 `Write`）留著給 CLI 的 `--no-cache` 與 `--token` 模式。

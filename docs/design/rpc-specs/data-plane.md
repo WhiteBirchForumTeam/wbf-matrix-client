@@ -300,8 +300,8 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 這跟媒體池原本的設計一致（/docs/design/media/media-pool.md §2）：池跟 `cache.db` 同層、同 server 的帳號共用、不分帳號、不要可見性——
 「拿得到 mxc 的人 server 就給他檔；可見性在事件那層擋過」。
 
-**下載怎麼做的權威是 /docs/design/media/media-download.md**（維護者 2026-10-01 定）：每帳號一條下載佇列、一次順序拉一個檔進池的**主檔**；
-播放器 seek 到還沒拉到的地方，在同一條 `Download` 線上插隊拉那幾塊、順序 append 進 **seek 暫存檔**，用 O(1) 的位置表記位置；
+**下載怎麼做的權威是 /docs/design/media/media-download.md**（維護者 2026-10-01 定）：每帳號一個下載處理端，要下載的檔一起跑、每個檔一塊在途，各自順序寫進池裡的**主檔**；
+播放器 seek 到還沒拉到的地方，那幾塊的請求插到 `Download` 線發送 queue 的最前面，拉到的順序 append 進 **seek 暫存檔**，用 O(1) 的位置表記位置；
 主檔追到時從暫存檔搬、不走網路；主檔完成就刪暫存檔。**每個檔都只被順序寫**。這裡只列 GET 由上往下找的來源（細節在 /docs/design/media/media-download.md §7.2）：
 
 | 先後 | 來源 | 要不要檔案金鑰 |
@@ -395,7 +395,7 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
 | 一般 Matrix 帳號的傳統上傳與下載（§7） | ❌ | |
-| `media.open`、`GET`／`HEAD /media`（Range、416、用途不對的 URL 不收）、下載佇列、seek 暫存檔（§8，/docs/design/media/media-download.md） | ✅ | daemon `data_plane::tests` 與 `tests/data_plane.rs`、core `download_queue::tests`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms`；清單在 /docs/design/media/media-download.md §10 |
+| `media.open`、`GET`／`HEAD /media`（Range、416、用途不對的 URL 不收）、下載處理端、seek 暫存檔（§8，/docs/design/media/media-download.md） | ✅ | daemon `data_plane::tests` 與 `tests/data_plane.rs`、core `download_queue::tests`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms`；清單在 /docs/design/media/media-download.md §10 |
 | `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對；讀的時候優先讀原檔（§8.1） | ✅ | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
 | UI 指定從第幾 byte 續傳 | ❌ | |
 | 機密模式（§9） | ❌ 伏筆 | |

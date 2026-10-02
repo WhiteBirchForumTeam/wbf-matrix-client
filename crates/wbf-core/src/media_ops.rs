@@ -5,7 +5,7 @@
 //! 而 core 先解密寫到某個路徑就是**明文落地**——整個加密池的意義就沒了（/docs/design/rpc-specs/local-interface.md §8）。
 //! 播放與顯示走資料平面的 URL（`media.open` → `GET /media`，`media_stream.rs`）；這裡唯一的明文落地是使用者明說要放到自己選的位置（[`Core::save_media_to`]）。
 //!
-//! 下載本身由每帳號一個的 worker 做（`download_queue.rs`）：這裡只負責「要哪個檔、本地已經有了沒、排進去、等它」。
+//! 下載本身由每帳號一個的下載處理端做（`download_queue.rs`）：這裡只負責「要哪個檔、本地已經有了沒、排進去、等它」。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,7 +20,7 @@ use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
-use crate::download_queue::{cancelled_error, Downloader, WorkerParts};
+use crate::download_queue::{cancelled_error, Downloader, DownloaderParts};
 use crate::error::{CoreError, CoreErrorKind};
 use crate::event::DownloadState;
 use crate::link_pool::LinkRole;
@@ -489,7 +489,7 @@ impl Core {
                 });
             }
         }
-        // 線先開好：worker 只借開著的線（`LinkPool::reuse`），開線是 core 入口與 `link_keeper` 的事。開不起來也照排，線回來就接著拉。
+        // 線先開好：下載處理端只借開著的線（`LinkPool::find_ws_link`），開線是 core 入口與 `link_keeper` 的事。開不起來也照排，線回來就接著拉。
         self.ensure_download_link(account).await;
         let downloader = self.downloader_of(account).await?;
         let status = downloader.enqueue(Arc::new(manifest), waiter);
@@ -501,7 +501,7 @@ impl Core {
         })
     }
 
-    /// 這個帳號的 `Download` 線開著嗎，沒開就開。開不起來只講一聲（佇列照排、worker 等線）。
+    /// 這個帳號的 `Download` 線開著嗎，沒開就開。開不起來只講一聲（job 照收、請求排著等線）。
     pub(crate) async fn ensure_download_link(&self, account: &AccountDir) {
         let opened = match self.pool_of_account(account) {
             Ok(links) => {
@@ -521,7 +521,7 @@ impl Core {
         }
     }
 
-    /// 這個帳號的下載 worker；沒有就起一個。這台 server 在這個程序裡第一次起 worker 時先掃一次孤兒（/docs/design/media/media-download.md §4.3、§11 第 1 條）。
+    /// 這個帳號的下載處理端；沒有就起一個。這台 server 在這個程序裡第一次起處理端時先掃一次孤兒（/docs/design/media/media-download.md §4.3、§11 第 1 條）。
     pub(crate) async fn downloader_of(
         &self,
         account: &AccountDir,
@@ -561,7 +561,7 @@ impl Core {
                 ));
             }
         }
-        let parts = WorkerParts {
+        let parts = DownloaderParts {
             user: me,
             server_dir,
             links: self.pool_of_account(account)?,
@@ -574,7 +574,7 @@ impl Core {
             .downloaders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // 起之前再看一次：兩個同時進來的，後到的用先到的那個（🚫 一個帳號兩個 worker）。
+        // 起之前再看一次：兩個同時進來的，後到的用先到的那個（🚫 一個帳號兩個處理端）。
         if let Some(existing) = downloaders.get(&account.dir) {
             return Ok(existing.clone());
         }
@@ -583,7 +583,7 @@ impl Core {
         Ok(downloader)
     }
 
-    /// 登出、換 session：收掉這個帳號的下載 worker（開著的檔 fsync 留著，下次接著拉）。
+    /// 登出、換 session：收掉這個帳號的下載處理端（開著的檔 fsync 留著，下次接著拉）。
     pub(crate) fn stop_downloader_of(&self, account: &AccountDir) {
         let removed = self
             .downloaders
@@ -593,7 +593,7 @@ impl Core {
         drop(removed);
     }
 
-    /// 這台 server 上所有 worker 正開著的暫存名（掃描不准碰）。
+    /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
     fn list_media_in_use(&self, server_dir: &Path) -> HashSet<String> {
         let downloaders: Vec<Arc<Downloader>> = self
             .downloaders

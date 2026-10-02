@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use support::fake_server::FakeServer;
 use wbf_sdk::cache::{Cache, CacheIdentity, MediaEntry};
+use wbf_sdk::channel::PackChannel;
 use wbf_sdk::media::{self, MediaDownload};
 use wbf_sdk::media_pool::{MediaPool, SEGMENT_SIZE};
 use wbf_sdk::{ChunkedBlock, Cipher, FileCipher, Key32, Manifest, SdkError, WbfClient};
@@ -112,7 +113,33 @@ fn open_download(cache: &mut Cache, pool: &MediaPool, manifest: &Manifest) -> Me
     MediaDownload::open(pool, &name, manifest).unwrap()
 }
 
-/// core 的下載 worker 做的那幾步（/docs/design/media/media-download.md §5.4），不含排隊與取消。
+/// 拿第 `index` 塊的明文：還沒驗過就先 `Info`。core 的下載處理端收到回覆時做的就是這兩步（/docs/design/media/media-download.md §3.2、§3.3），
+/// 只是它的請求走線的發送 queue、回覆另外交回來；這裡直接一問一答。
+async fn fetch_chunk<C: PackChannel>(
+    download: &mut MediaDownload,
+    client: &mut WbfClient<C>,
+    index: u32,
+) -> Result<Vec<u8>, SdkError> {
+    let mxc = download.manifest().mxc.clone();
+    if download.needs_info() {
+        let (info, description) = client.fetch_info(&mxc).await?;
+        download.accept_info(&info, &description)?;
+    }
+    let (_read, data) = client.read_chunk(&mxc, index).await?;
+    Ok(download.open_chunk(index, &data)?.to_vec())
+}
+
+/// 主檔往前一塊，從 server 拉。
+async fn advance_from_server<C: PackChannel>(
+    download: &mut MediaDownload,
+    client: &mut WbfClient<C>,
+) -> Result<(), SdkError> {
+    let index = download.next_chunk();
+    let plain = fetch_chunk(download, client, index).await?;
+    download.land_chunk(index, &plain)
+}
+
+/// core 的下載處理端做的那幾步（/docs/design/media/media-download.md §5.4），不含排隊與取消。
 async fn download_whole(
     server: &mut FakeServer,
     cache: &mut Cache,
@@ -124,10 +151,10 @@ async fn download_whole(
     while !download.is_written() {
         let landed = match download.advance_from_seek_store() {
             Ok(true) => Ok(()),
-            Ok(false) => download.advance_from_server(&mut client).await,
+            Ok(false) => advance_from_server(&mut download, &mut client).await,
             Err(error) => Err(error),
         };
-        // 壞檔：主檔與暫存檔都刪（core 的 worker 一樣做）。
+        // 壞檔：主檔與暫存檔都刪（core 的下載處理端一樣做）。
         if let Err(error) = landed {
             if matches!(error, SdkError::Integrity(_)) {
                 download.discard(pool);
@@ -212,7 +239,9 @@ async fn a_download_resumes_from_the_whole_segments_in_the_file() {
     {
         let mut client = WbfClient::new(&mut server);
         for _ in 0..5 {
-            download.advance_from_server(&mut client).await.unwrap();
+            advance_from_server(&mut download, &mut client)
+                .await
+                .unwrap();
         }
     }
     assert_eq!(download.segments_written(), 3);
@@ -243,10 +272,9 @@ async fn the_main_file_takes_a_seek_fetched_chunk_without_the_network() {
     let mut download = open_download(&mut cache, &pool, &manifest);
     let fetched = {
         let mut client = WbfClient::new(&mut server);
-        download
-            .fetch_into_seek_store(&mut client, &pool, 2)
-            .await
-            .unwrap()
+        let plain = fetch_chunk(&mut download, &mut client, 2).await.unwrap();
+        download.store_seek_chunk(&pool, 2, &plain).unwrap();
+        plain
     };
     assert_eq!(&fetched[..], &plain[CHUNK as usize * 2..CHUNK as usize * 3]);
     assert_eq!(reads_so_far(&server), 1);
@@ -264,7 +292,9 @@ async fn the_main_file_takes_a_seek_fetched_chunk_without_the_network() {
         let mut client = WbfClient::new(&mut server);
         while !download.is_written() {
             if !download.advance_from_seek_store().unwrap() {
-                download.advance_from_server(&mut client).await.unwrap();
+                advance_from_server(&mut download, &mut client)
+                    .await
+                    .unwrap();
             }
             // 主檔已封的段讀得回來。
             if download.segments_written() >= 1 {
@@ -471,13 +501,12 @@ async fn sweep_resets_missing_files_and_removes_what_nobody_claims() {
     orphan.write_all(b"nobody points at me").unwrap();
     let orphan_hash = orphan.finish().unwrap().hash_hex;
     pool.adopt("orphan", &orphan_hash).unwrap();
-    // 一個認領了、正在下載的主檔（下載 worker 握著）與一個認領了、但還是池格式 v1 的主檔。
+    // 一個認領了、正在下載的主檔（下載處理端握著）與一個認領了、但還是池格式 v1 的主檔。
     let busy = upload(&mut server, "busy.bin", &sample(CHUNK as usize * 2, 43)).await;
     let mut busy_download = open_download(&mut cache, &pool, &busy);
     {
         let mut client = WbfClient::new(&mut server);
-        busy_download
-            .advance_from_server(&mut client)
+        advance_from_server(&mut busy_download, &mut client)
             .await
             .unwrap();
     }
@@ -511,7 +540,7 @@ async fn sweep_resets_missing_files_and_removes_what_nobody_claims() {
     assert!(!cache.find_media(&manifest.mxc).unwrap().unwrap().complete);
     assert_eq!(pool.list_pending().unwrap(), vec![busy_name.clone()]);
 
-    // 過了保護期：還在下載的（worker 握著）照樣不碰——線斷了很久的下載，檔案很久沒動，但它還是活的。
+    // 過了保護期：還在下載的（下載處理端握著）照樣不碰——線斷了很久的下載，檔案很久沒動，但它還是活的。
     let later = SystemTime::now() + Duration::from_secs(8 * 24 * 3600);
     let swept = media::sweep(
         &mut cache,

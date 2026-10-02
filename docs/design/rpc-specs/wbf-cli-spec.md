@@ -142,7 +142,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 |
 |---|---|
 | `info <mxc> [--manifest <m.json>]` | 印 `Info` 的 Ack（server 知道的欄位）。有 manifest 就順便解描述印出來，並做 /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條的核對 |
-| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：本機有上傳時的原檔（大小對）就從它複製（stdout `source: local_source`）；池裡有完整檔就不連 server（`source: cache`、`hash` 是快取記的校驗碼）；沒有就排進下載佇列、進池、可續傳，再從池複製到 `-o`（`source: server`）。stdout 是 `{ out, bytes, source, hash? }`（/docs/design/media/media-download.md §7.1 的 `media.save_to`）。快取路徑上驗不過仍 exit 3：那是壞檔，池裡的半成品一起刪掉；網路斷了才留著給下次續（/docs/design/media/media-download.md §5.4）；`-o` 都不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
+| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：本機有上傳時的原檔（大小對）就從它複製（stdout `source: local_source`）；池裡有完整檔就不連 server（`source: cache`、`hash` 是快取記的校驗碼）；沒有就交給下載處理端、進池、可續傳，再從池複製到 `-o`（`source: server`）。stdout 是 `{ out, bytes, source, hash? }`（/docs/design/media/media-download.md §7.1 的 `media.save_to`）。快取路徑上驗不過仍 exit 3：那是壞檔，池裡的半成品一起刪掉；網路斷了才留著給下次續（/docs/design/media/media-download.md §5.4）；`-o` 都不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
 | `seek --manifest <m.json> --at <pos> [--len <n>]` | 只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。

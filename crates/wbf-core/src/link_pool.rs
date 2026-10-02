@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMappedMutexGuard, OwnedMutexGuard};
 use wbf_sdk::channel::Channel;
 use wbf_sdk::client::WbfClient;
+use wbf_sdk::link::WsLink;
 use wbf_sdk::sessions::Received;
 
 use crate::error::CoreError;
@@ -158,6 +159,22 @@ impl LinkPool {
         OwnedMutexGuard::try_map(guard, |slot| slot.as_mut())
             .ok()
             .map(PooledClient::Pooled)
+    }
+
+    /// 那條線底下的 `WsLink` 分身（/docs/design/daemon/link-requests.md §2）：開著、而且是 WebSocket 才有。同 `reuse`，🚫 不開、🚫 不發事件。
+    /// 拿到之後🚫 不握那格的鎖：送收都走分身；線被關了，分身上的請求一樣回 `Network`。
+    ///
+    /// Args:
+    ///     role: example: LinkRole::Download
+    /// Return:
+    ///     Some(WsLink)  開著的那條線的分身（丟掉🚫 不關線）
+    ///     None          那格沒開、線死了、或不是 WebSocket
+    pub async fn find_ws_link(&self, role: LinkRole) -> Option<WsLink> {
+        let client = self.reuse(role).await?;
+        match client.channel() {
+            Channel::WebSocket(channel) => Some(channel.link().share()),
+            Channel::Http(_) => None,
+        }
     }
 
     /// 確保那條線開著（`link_keeper.rs` 的鉤子用）：開著就不動、沒開或死了就開一條。
@@ -446,7 +463,7 @@ impl crate::Core {
         account: &crate::accounts::AccountDir,
         reason: &str,
     ) -> usize {
-        // 下載 worker 借的就是這個池的線：先收它（開著的檔 fsync 留著），🚫 不讓它拿舊 session 的池一直空等。
+        // 下載處理端借的就是這個池的線：先收它（開著的檔 fsync 留著），🚫 不讓它拿舊 session 的池一直空等。
         self.stop_downloader_of(account);
         let pool = self
             .link_pools

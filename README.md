@@ -148,7 +148,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 | [`crates/wbf-wire`](crates/wbf-wire) | 線上協議的 codec：pack、`EncryptedFileInfo`、CRC-32C。純函數、無 async | ✅ 完成 —— 對著 server 的黃金向量測 |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | 協議 client：每塊 AEAD、WebSocket 通道、分塊上傳／下載／seek／續傳／串流、加密 vault、`cache.db`、媒體池、matrix-sdk adapter | 🟢 可用 |
 | [`crates/wbf-core`](crates/wbf-core) | 每個命令「做什麼」：帳號、房間、訊息、媒體、backend 探測、`cache.db` 的單一寫入者。沒有命令列、沒有 RPC | 🟢 可用 |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE、資料平面的上傳（`PUT`，加密房的附件）與讀（`media.open` → `GET /media`、每帳號的下載佇列）。⏳ 還沒有：RPC 的 `cancel`；一般 Matrix server 的傳統 `/_matrix/media` |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE、資料平面的上傳（`PUT`，加密房的附件）與讀（`media.open` → `GET /media`、每帳號一個下載處理端，所有檔一起跑）。⏳ 還沒有：RPC 的 `cancel`；一般 Matrix server 的傳統 `/_matrix/media` |
 | [`apps/wbf-cli`](apps/wbf-cli) | 命令列前端 `wbf-cli`：登入、房間、送訊息、watch、上傳、下載、seek、多帳號、媒體快取 | 🟢 可用（目前直接叫 `wbf-core`） |
 | 桌面／Android／Python | 走 RPC 的前端 | ⏳ 還沒開始 |
 

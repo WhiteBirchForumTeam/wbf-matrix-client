@@ -47,16 +47,21 @@
 - **線斷了發送 queue 不丟**：queue 與在途表屬於「線」，不屬於某一條 `WsLink`。線死了（/docs/design/daemon/ws-receive-dispatch.md §7），在途的每個動作收到 `Network`；
   還沒送的留在 queue 裡，連線池重開（/docs/design/daemon/link-pool.md §3、§3.1）之後發送端接著送。
 
+**實作**（core 的 `link_requests.rs`，`RequestLine`）：發送端每送一個請求（`WsLink::send_request`），就交給一個小 task 等回覆（`PendingReply::wait`）；
+那個 task 手上拿著的就是這個請求的動作——在途表就是這些 task 加上 `WsLink` 的會話表。回覆過了 `expect_ack`，連同動作交回擁有者的收件匣（`LineReply`）。
+線從連線池借**分身**（`LinkPool::find_ws_link`，🚫 不握池那格的鎖），沒開就每秒再看一次。
+發送 queue 由**用這條線的那一方**擁有：`Download` 只有下載處理端一個用戶，`RequestLine` 就在它身上；`Misc` 這種很多命令共用的線搬過來時，`RequestLine` 放進池的那一格。
+
 ## 3. 動作是資料，🚫 不是閉包
 
 ```rust
-enum DownloadAction {                       // 例：Download 線的動作（/docs/design/media/media-download.md §5.4）
-    Verified { mxc },                       // Info 回來：區塊驗過了，送第一塊
-    MainChunk { mxc, index },               // 主檔要的第 index 塊回來：落地 → 看取消旗標 → 塞下一塊
-    SeekChunk { mxc, index },               // 播放器要的塊回來：存進 seek 暫存檔 → 交給在等的 GET
+enum DownloadRequest {                      // 例：Download 線（core 的 download_queue.rs，/docs/design/media/media-download.md §5.2）
+    Info { mxc },                           // Download/Info：回來之後驗區塊，主檔走「下一塊」、掛著的 seek 送它們的 Read
+    Chunk { mxc, index },                   // Download/Read：回來之後解開，主檔在等就落地、走「下一塊」；只有 seek 在等就存進暫存檔、交給 GET
 }
 ```
 
+- **請求本身就是動作**：它說得出「這是什麼、回來之後做什麼」；**誰在等它**（主檔、哪個 GET）記在處理端的在途表（§6），同一個請求只送一次。
 - 每條線一個 enum，處理端 `match` 它。**資料比閉包好**：測試能直接造一個動作餵處理端、能印出來（除錯時看得到在途表裡是什麼）、能比較（同一塊不重複要，§6）。
 - 動作🚫 不帶金鑰或明文：要的東西（manifest、池、暫存檔）在處理端自己的狀態裡，動作只帶「是誰的、第幾塊」。
 - 動作執行時一定拿到一個結果：`Ok(回覆)`、`Err(Timeout)`（線活著、server 沒聲）、`Err(Network)`（線斷了）、`Err(Server)`（server 拒絕）。**怎麼處置是動作的事**（§4）。
@@ -88,11 +93,14 @@ enum DownloadAction {                       // 例：Download 線的動作（/do
 ## 6. 同一件事🚫 不要兩次
 
 在途表的鍵是 (id, seq)，但同一件事可能被兩個人要（例：播放器 seek 要的那一塊，剛好就是主檔正在拉的那一塊）。
-處理端另外記「這件事正在途」（下載：`(mxc, 塊號)`），第二個要的人🚫 不再送，把自己掛到在途那一個的動作上（多一個要交付的人）。
+處理端另外記「這件事正在途」（下載：請求本身當鍵，`Chunk { mxc, index }` → 等它的人），第二個要的人🚫 不再送，把自己掛到在途那一個上（多一個要交付的人）。
+排著還沒送的同一個請求，被插隊的人要時一起提到最前面。
 
 ## 7. seq 與 id 由線發
 
-- 一問一答的 seq：線上一個 atomic 計數器，從 1 往上。心跳照舊從 `u32::MAX` 往下（/docs/design/daemon/ws-receive-dispatch.md §5.1）。
+- 一問一答的 seq：發送端一個計數器（只有發送端發號），**從 2³¹ 往上**（`link_requests::FIRST_SEQ`）。同一條 `WsLink` 上還有兩個發號的：
+  開線時的 `WbfClient`（`hello`，還沒搬過來的 CLI 路徑也是）從 1 往上、心跳從 `u32::MAX` 往下（/docs/design/daemon/ws-receive-dispatch.md §5.1），
+  三邊要撞到得先發二十億個請求；真撞到（`register` 回 `Usage`）就把請求放回 queue，下一輪換下一個號。
 - 具名會話的 id：線上一個 atomic 計數器（`id::SESSION` 型別）。
 - hello 的結果（feature、`recent_max_*`…）開線時拿到，放在線上，大家讀同一份。⚠️ 再 hello 會蓋掉宣告（/docs/design/daemon/link-pool.md §7），所以只有開線的人 hello。
 
@@ -100,7 +108,8 @@ enum DownloadAction {                       // 例：Download 線的動作（/do
 
 一條線一條線搬，搬完的線就沒有「借線」那條路：
 
-1. **`Download`**：跟下載的佇列一起做（/docs/design/media/media-download.md §5、§6），它是這個形狀的第一個用戶。
+1. **`Download`**：跟下載處理端一起做（/docs/design/media/media-download.md §5、§6），它是這個形狀的第一個用戶（2026-10-02 做完）。
+   CLI 的 `download --no-cache`／`seek` 還在這條線上用舊的借線方式（等 CLI 改走 RPC 一併收掉）；seq 錯開，見 §7。
 2. `Misc`：一問一答最多的線；呼叫點從 `client.call(…).await` 改成交請求，命令本身要等結果的（RPC 要回應）就把「回覆 RPC」封進動作。
 3. `Upload`：照 §5 的例外，一個上傳一塊在途。
 4. `Rooms`／`Keys`：訂閱本來就是收件匣（具名會話），改的是它們偶爾發的一問一答（`ItemsDestroy`、`Unsubscribe`）。

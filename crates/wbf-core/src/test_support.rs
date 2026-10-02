@@ -221,8 +221,8 @@ pub(crate) struct FakeServer {
     pub(crate) sent_attachments: Arc<Mutex<Vec<Vec<String>>>>,
     /// `Upload/*` 建的上傳，key 是上傳 id（從 1 開始）。`Download/*` 也從這裡給（測試可以把上傳那台的複製過來）。
     pub(crate) uploads: FakeUploads,
-    /// 每次 `Download/Read` 要的塊號（照順序）。
-    pub(crate) download_reads: Arc<Mutex<Vec<u32>>>,
+    /// 每次 `Download/Read` 要的 (mxc, 塊號)，照 server 處理的順序。
+    pub(crate) download_reads: Arc<Mutex<Vec<(String, u32)>>>,
     /// 每個 `Download/Read` 回答前先拿一個 permit：測試把 permit 收走就卡住下載、一次放一個（`add_permits(1)`）。預設多到用不完。
     pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -286,7 +286,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let sent_attachments: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let uploads: FakeUploads = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
     let (attachments_t, uploads_t) = (sent_attachments.clone(), uploads.clone());
-    let download_reads: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let download_reads: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(Vec::new()));
     let read_permits = Arc::new(tokio::sync::Semaphore::new(READ_PERMITS as usize));
     let (reads_t, permits_t) = (download_reads.clone(), read_permits.clone());
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
@@ -574,7 +574,11 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
 }
 
 /// `Download/*` 的回答（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4）：從上傳收下的塊給。
-fn download_reply(pack: &Pack, uploads: &FakeUploads, reads: &Arc<Mutex<Vec<u32>>>) -> Pack {
+fn download_reply(
+    pack: &Pack,
+    uploads: &FakeUploads,
+    reads: &Arc<Mutex<Vec<(String, u32)>>>,
+) -> Pack {
     let uploads = uploads.lock().unwrap();
     let meta: Value = serde_json::from_slice(&pack.meta).unwrap();
     let mxc = meta["mxc"].as_str().unwrap_or_default();
@@ -605,7 +609,7 @@ fn download_reply(pack: &Pack, uploads: &FakeUploads, reads: &Arc<Mutex<Vec<u32>
         ),
         download::READ => {
             let index = meta["chunk"].as_u64().unwrap() as usize;
-            reads.lock().unwrap().push(index as u32);
+            reads.lock().unwrap().push((mxc.to_string(), index as u32));
             let data = upload.chunks[index].clone();
             response(
                 Kind::Control,

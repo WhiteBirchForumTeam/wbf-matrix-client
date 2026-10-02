@@ -151,7 +151,7 @@ struct Work {
 ### 2.3.1 媒體也走寫入者：下載是一塊一步，DB 只在點上碰
 
 `media`、`event_media` 跟其他表一樣只由寫入者寫。能這樣做，是因為下載的形狀（/docs/design/media/media-download.md §5.4）：
-網路與寫池檔都在那個帳號的下載 worker 自己的 task 上，**DB 只在幾個點上碰一下**——
+寫池檔都在那個帳號的下載處理端自己的 task 上（網路是 `Download` 線的發送端，/docs/design/daemon/link-requests.md），**DB 只在幾個點上碰一下**——
 
 | 時機 | 入口 | 為什麼 |
 |---|---|---|
@@ -162,7 +162,7 @@ struct Work {
 | `media.gc`：`sweep` ＋ `collect_garbage` | `run`（一整件） | 掃描要的是一致的那一刻：列與池檔對照的中間不准有別人改列 |
 
 ⚠️ 代價說實話：`media.gc` 那一件會在寫入執行緒上跑完整個掃描（列與 `pending/`、`media/<hh>/` 的目錄、刪檔）；池很大的時候，這段時間同一台 server 的新訊息排在它後面。
-它是使用者按的（或一個程序裡每台 server 第一次起 worker 時一次），🚫 不在背景定時跑。哪天池大到這件事看得出來，再把「列出要刪的」與「刪檔」拆開。
+它是使用者按的（或一個程序裡每台 server 第一次起下載處理端時一次），🚫 不在背景定時跑。哪天池大到這件事看得出來，再把「列出要刪的」與「刪檔」拆開。
 
 讀（`find_media`、`find_media_block_for`、`find_event_attachment`）走讀連線，跟其他讀一樣。🚫 正式碼沒有繞過寫入者直接開 `cache.db` 的路（`Core::cache_of` 只在測試建置存在）。
 

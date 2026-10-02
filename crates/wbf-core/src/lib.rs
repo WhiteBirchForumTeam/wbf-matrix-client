@@ -68,6 +68,7 @@ mod key_sync;
 mod link_keeper;
 /// 連線池（/docs/design/daemon/link-pool.md）：一個帳號五條線。
 pub mod link_pool;
+mod link_requests;
 mod login_ops;
 mod media_ops;
 mod media_stream;
@@ -217,13 +218,13 @@ pub struct Core {
     pub(crate) crypto_engines: tokio::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<wbf_sdk::crypto_engine::OlmEngine>>,
     >,
-    /// 每個帳號一個下載 worker（`download_queue.rs`，/docs/design/media/media-download.md §5）：第一次要下載或 seek 才起，登出／換 session 收。key 是帳號目錄。
+    /// 每個帳號一個下載處理端（`download_queue.rs`，/docs/design/media/media-download.md §5）：第一次要下載或 seek 才起，登出／換 session 收。key 是帳號目錄。
     pub(crate) downloaders: std::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Arc<download_queue::Downloader>>,
     >,
-    /// 同一台 server 的同一個 mxc 現在由哪個帳號的 worker 在寫：主檔與 seek 暫存檔是同 server 的帳號共用的，一個檔只能有一個寫入者。
+    /// 同一台 server 的同一個 mxc 現在由哪個帳號的下載處理端在寫：主檔與 seek 暫存檔是同 server 的帳號共用的，一個檔只能有一個寫入者。
     pub(crate) media_claims: std::sync::Arc<download_queue::MediaClaims>,
-    /// 這個程序裡掃過池的 server dir（第一次起 worker 時掃一次，/docs/design/media/media-download.md §4.3）。
+    /// 這個程序裡掃過池的 server dir（第一次起下載處理端時掃一次，/docs/design/media/media-download.md §4.3）。
     pub(crate) media_swept: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// 「該開的線都開著嗎」的鉤子正在跑一輪（`link_keeper.rs`）：同時只跑一輪，後到的跳過（PR #61 審查 salvia／cirno 🟢）。
     pub(crate) ensuring_links: std::sync::atomic::AtomicBool,

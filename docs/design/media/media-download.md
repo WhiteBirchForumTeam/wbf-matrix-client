@@ -256,6 +256,8 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 - **處理一個「下載這個檔」的 job 很快**：建 downloading 項、開主檔、塞第一個塊請求，就換下一個 job。所以 jobA、jobB、jobC 進來就是三個檔一起跑，
   發送 queue 變成 `A0 B0 C0 → A1 B1 C1 → …`（維護者 2026-10-02：「處理全部」）。每個檔同時只有**一塊**在途：第 n 塊落地的動作才塞第 n+1 塊。
 - 🚫 不設同時幾個檔的上限（維護者 2026-10-02）。代價說清楚：頻寬由在跑的檔平分，排了 500 個檔，每個都要很久才完成；每個在跑的檔一個主檔把手加一個 64 KiB 的段緩衝。
+  而且在途的請求跟在跑的檔一樣多：server 對一條線照順序一個一個回（/docs/design/daemon/link-requests.md §9），排在後面的回覆要等前面的全部傳完，
+  等超過 300 秒（`channel::REQUEST_TIMEOUT`）就算逾時、重送（§5.4）——很多大檔一起跑時會發生，那一塊 server 會傳兩次。
 - **主檔與暫存檔只有一個寫入者**：落地都在處理端執行的動作裡做，處理端是一個 task；GET 要「還沒完成的主檔」與暫存檔也交給處理端讀（§7.2），🚫 不另開把手跟它搶。
 - **線斷了**：在途的塊請求的動作收到 `Network`，同一個請求排回發送 queue 最前面；線重開（/docs/design/daemon/link-pool.md §3.1）之後接著送，進度停在原地
   （/docs/design/daemon/link-requests.md §4）。
@@ -276,10 +278,11 @@ Downloading {                                       一個正在下載的檔，�
     total:     AtomicU32,                           總塊數（0 = 還不知道）
 }
 
-塊請求的動作（/docs/design/daemon/link-requests.md §3，資料不是閉包）
-    Verified  { mxc }                               Info 回來：驗區塊、填 total、走「下一塊」
-    MainChunk { mxc, index }                        主檔要的第 index 塊回來：落地 → 看旗標 → 走「下一塊」
-    SeekChunk { mxc, index }                        seek 要的第 index 塊回來：存進暫存檔 → 交給在等的 GET
+塊請求（/docs/design/daemon/link-requests.md §3，資料不是閉包；請求本身就是動作）
+    Info  { mxc }                                   Download/Info 回來：驗區塊 → 主檔走「下一塊」、掛著的 seek 送它們的 Read
+    Chunk { mxc, index }                            Download/Read 回來：解開 → 主檔在等就落地、走「下一塊」；只有 seek 在等就存進暫存檔 → 交給 GET
+
+在途表：塊請求 → 等它的人（Main ＝ 主檔、Seek ＝ 在等的 GET），同一個請求只送一次（§6.3）
 ```
 
 - **什麼時候放進表**：處理「下載這個檔」的 job 時（維護者 2026-10-02：解析 job 的時候就建表）。
@@ -297,9 +300,9 @@ Downloading {                                       一個正在下載的檔，�
 | 別的帳號正在寫它（認領不到） | 放進「等認領」（§5.1） |
 | 有 pending 主檔 | **從檔案確定進度**：驗檔長、逐段解（§4.1 續傳）→ 已寫 `k` 段 → `next = ⌊k × segment_size / chunk_size⌋`；DB 的 `segments_written` 只當提示，🚫 不當依據 |
 | 都沒有 | `next = 0` |
-| `total` | 區塊在手（有 `file_size`、`chunk_size`）就算 `ceil(file_size / chunk_size)`；不知道就填 **0**，`Verified` 回來再補 |
+| `total` | 區塊在手（有 `file_size`、`chunk_size`）就算 `ceil(file_size / chunk_size)`；不知道就填 **0**，`Info` 回來再補 |
 
-然後建 downloading 項、開主檔：還沒驗過就送 `Info`（動作 `Verified`），驗過了就走「下一塊」（§5.4）。
+然後建 downloading 項、開主檔：還沒驗過就送 `Info`（主檔掛在上面），驗過了就走「下一塊」（§5.4）。
 daemon 重開時 queue 不保存（維護者 2026-10-01）：之後再有人要這個檔，照上表從 DB 與檔案重建進度、接著拉。
 
 ### 5.4 動作：落地、看旗標、塞下一塊
@@ -308,9 +311,9 @@ daemon 重開時 queue 不保存（維護者 2026-10-01）：之後再有人要�
 「下一塊」（第 next 塊）：
     位置表有（§4.2）→ 從 seek 暫存檔讀那一格、用池金鑰解開、落地 → 再走「下一塊」      ← 不走網路
     在途表有（別人正在要這一塊，§6.3）→ 掛上去，那個回覆落地時一起處理
-    都沒有           → 塞 Read { mxc, chunk: next }，動作 MainChunk { mxc, next }
+    都沒有           → 塞 Chunk { mxc, next }（排在發送 queue 尾巴），主檔掛在上面
 
-MainChunk { mxc, next } 回來：
+Chunk { mxc, next } 回來、主檔在等：
     驗長度、用檔案金鑰解開（§3.3）→ 明文餵進主檔（湊滿一段才封、才 append，§4.1）→ done = next + 1
     cancelled == true      → 停：主檔與暫存檔留著；downloading.remove(mxc)            ← 取消在這裡生效
     next + 1 == total      → 收尾（§4.1）、刪暫存檔、推最後一則進度；downloading.remove(mxc)
@@ -319,7 +322,8 @@ MainChunk { mxc, next } 回來：
 
 - **取消**只在「一塊落地之後」生效：在途的那一塊會收完、寫完，所以主檔永遠停在整塊（整段）的邊界上。
 - **壞檔**（§3.2、§3.3）或 server 拒絕 → `downloading.remove(mxc)`、`media` 列 reset、主檔與暫存檔刪掉、推一則失敗。
-- **線斷、逾時**：照 /docs/design/daemon/link-requests.md §4，同一個請求排回去，進度停在 `next`。
+- **線斷、逾時**：照 /docs/design/daemon/link-requests.md §4，同一個請求排回最前面，進度停在 `next`。掛在上面的 GET 🚫 等線，直接收到錯（播放器會再要）；
+  同一個請求連續逾時 3 次就停下這個檔、推一則失敗，檔案留著（下次接著拉）。
 - **沒人看的時候照樣拉完**。**暫停**之後才加：加的時候是「走『下一塊』時先看暫停旗標」，只停主檔，🚫 不停 seek。
 
 **`media.cancel { mxc }`**：
@@ -356,8 +360,8 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 
 ```
 本地有（主檔已封的段、seek 暫存檔）→ 直接交給 GET
-在途表有（主檔正好在拉這一塊，或別的 GET 要過）→ 掛上去，那個回覆到了一起交（§6.3）
-都沒有 → 塞 Read { mxc, chunk: i } 到發送 queue 的**最前面**，動作 SeekChunk { mxc, i }
+在途表有（主檔正好在拉這一塊，或別的 GET 要過）→ 掛上去，那個回覆到了一起交（§6.3）；還排著沒送的，一起提到最前面
+都沒有 → 塞 Chunk { mxc, i } 到發送 queue 的**最前面**，這個 GET 掛在上面（區塊還沒驗過就先掛在 Info 上，Info 回來才送）
 ```
 
 - 發送 queue 平常幾乎是空的（每個在跑的檔最多一個請求在排），插到最前面就是下一個送出去的，🚫 不等在途的那幾塊回來。
@@ -367,7 +371,7 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 
 ### 6.3 一塊被 seek 拉到之後、同一塊被要兩次
 
-`SeekChunk { mxc, i }` 回來：
+`Chunk { mxc, i }` 回來、只有 GET 在等：
 
 1. §3.3：驗長度、AEAD 解開 → 明文在記憶體。
 2. **append 進 seek 暫存檔**的下一格 → fsync → `slots[i] = s + 1`（§4.2）。
@@ -453,6 +457,7 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 | 池格式 v2：1 byte、剛好整段、跨段；半段截掉、第一個解不開的段截掉；翻 bit／錯金鑰／段搬位置／檔長不是整數筆都拒；長度欄超過 segment_size 拒；收尾過、沒改名的檔續回整個、不准再寫；`owner` 對不上或 v1 不續；寫的中途讀回已封的段 | sdk `media_pool::tests` |
 | seek 暫存檔：照到達順序 append、最後一塊寫滿一格；重開截半格、重建位置表、重複留第一個、塊號超出就截；改塊號／翻 bit／別的 mxc／chunk_size 不同都不收；位置表太大不給 | sdk `seek_store::tests` |
 | `MediaDownload` 對假 server：下載進池、去重、從完整的段續傳（塊跟段不對齊）、seek 拉過的塊主檔不再上網、區塊對不上就刪掉暫存檔；配額清理；掃描（不碰正在下載的、刪 v1、刪過期的） | sdk `tests/media_cache.rs` |
+| 線的發送 queue：送出🚫 等回覆、回覆倒著回也找得回自己的動作、插到最前面的先送、還沒送的拿得回來、線斷了在途的都回 `Network` | core `link_requests::tests` |
 | 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、`save_to`（含 `no_cache`）、別的帳號在寫就等認領、處理端被收會放掉認領 | core `download_queue::tests` |
 | URL：讀與上傳的 URL 不能互換；Range 解析 | daemon `data_plane::tests` |
 | HTTP：未解鎖 503、別的 daemon 發的／用途不對／本機沒紀錄 404、方法不對 405 | daemon `tests/data_plane.rs` |

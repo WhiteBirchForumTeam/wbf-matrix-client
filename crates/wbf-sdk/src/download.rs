@@ -44,22 +44,8 @@ impl<C: PackChannel> WbfClient<C> {
     ///     Ok(VerifiedTarget)
     ///     Err(SdkError)     `Integrity`：區塊壞、與 `Info` 對不上、描述解不開或對不上；`Server`：NotFound 等
     pub async fn verify_target(&mut self, manifest: &Manifest) -> Result<VerifiedTarget, SdkError> {
-        let file_cipher = manifest.file_cipher()?;
-        let file_size = manifest.file_size();
-        let expected_count =
-            chunk_count(file_size, manifest.block.chunk_size).ok_or_else(|| {
-                SdkError::Integrity("file_size / chunk_size gives more chunks than u32".into())
-            })?;
-
         let (info, description_data) = self.fetch_info(&manifest.mxc).await?;
-        check_info_against_block(&info, &manifest.block, expected_count)?;
-        check_description(&file_cipher, &manifest.block, &description_data)?;
-
-        Ok(VerifiedTarget {
-            file_cipher,
-            file_size,
-            chunk_count: expected_count,
-        })
+        verify_info(manifest, &info, &description_data)
     }
 
     /// 整檔：逐塊 `Read` → 驗長度 → 解密 → 寫出；有 `sha256` 就整檔核對（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 3、4、5 條）。
@@ -174,11 +160,56 @@ impl<C: PackChannel> WbfClient<C> {
         target: &VerifiedTarget,
         index: u32,
     ) -> Result<Vec<u8>, SdkError> {
-        let expected = expected_plain_len(target.file_size, manifest.block.chunk_size, index)
-            .ok_or_else(|| SdkError::Integrity(format!("chunk {index} is beyond chunk_count")))?;
         let (_ack, data) = self.read_chunk(&manifest.mxc, index).await?;
-        Ok(target.file_cipher.open_chunk(index, &data, expected)?)
+        open_chunk_data(manifest, target, index, &data)
     }
+}
+
+/// `Info` 的回覆跟區塊對得上嗎（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 1、2 條、§4 的描述交叉核對）。
+///
+/// Args:
+///     manifest: 含區塊（檔案金鑰、`file_size`、`chunk_size`）
+///     info: `protocol::info_reply` 解出來的 meta
+///     description_data: 同一個回覆的 data（加密的描述）
+/// Return:
+///     Ok(VerifiedTarget)
+///     Err(Integrity)   區塊壞、與 `Info` 對不上、描述解不開或對不上
+pub fn verify_info(
+    manifest: &Manifest,
+    info: &InfoAck,
+    description_data: &[u8],
+) -> Result<VerifiedTarget, SdkError> {
+    let file_cipher = manifest.file_cipher()?;
+    let file_size = manifest.file_size();
+    let expected_count = chunk_count(file_size, manifest.block.chunk_size).ok_or_else(|| {
+        SdkError::Integrity("file_size / chunk_size gives more chunks than u32".into())
+    })?;
+    check_info_against_block(info, &manifest.block, expected_count)?;
+    check_description(&file_cipher, &manifest.block, description_data)?;
+    Ok(VerifiedTarget {
+        file_cipher,
+        file_size,
+        chunk_count: expected_count,
+    })
+}
+
+/// 一塊的密文 → 明文：驗長度、用檔案金鑰 AEAD 解開（/docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 3、4 條）。
+///
+/// Args:
+///     index: 第幾塊, example: 3
+///     data: `protocol::read_reply` 給的密文
+/// Return:
+///     Ok(明文)
+///     Err(Integrity)   塊號超出 chunk_count、長度不對、標籤不對
+pub fn open_chunk_data(
+    manifest: &Manifest,
+    target: &VerifiedTarget,
+    index: u32,
+    data: &[u8],
+) -> Result<Vec<u8>, SdkError> {
+    let expected = expected_plain_len(target.file_size, manifest.block.chunk_size, index)
+        .ok_or_else(|| SdkError::Integrity(format!("chunk {index} is beyond chunk_count")))?;
+    Ok(target.file_cipher.open_chunk(index, data, expected)?)
 }
 
 /// /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條：`chunk_size`、`chunk_count` 要與 `Info` 一致；`Info` 有 `file_size` 也要一致。

@@ -20,10 +20,11 @@ PR #1–#68 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照�
 - **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
 - **資料平面**（`/docs/design/rpc-specs/data-plane.md`）：上傳是 UI 發動的兩步（`media.create` → `PUT /upload` 拿 manifest → `room.send_attachment`）；
-  讀是 `media.open` → `GET /media`（Range 就是 seek）。下載是每帳號一條佇列、一塊一步、池格式 v2、seek 暫存檔，進度是推播 `media.download`（`/docs/design/media/media-download.md`）。兩邊都對真 server 驗過。
+  讀是 `media.open` → `GET /media`（Range 就是 seek）。下載是每帳號一個處理端、所有檔一起跑（每檔一塊在途）、`Download` 線送收分開（`/docs/design/daemon/link-requests.md`）、池格式 v2、seek 暫存檔，
+  進度是推播 `media.download`（`/docs/design/media/media-download.md`）。兩邊都對真 server 驗過。
 
 **還沒有**：UI；路徑版送檔進加密房（資料平面那條可以）；一般 Matrix 帳號的傳統上傳與下載；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；房間自設的換金鑰期限；交叉簽章；
-已讀（`/docs/design/messages/read-receipts.md` 是草案）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載佇列的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
+已讀（`/docs/design/messages/read-receipts.md` 是草案）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 ⏳ **等維護者**：補解寫失敗那批要不要加重試的觸發點、CLI 要不要能送加密房（`/docs/design/keys/e2ee-rpc.md` §8；§7 第 1 項先照預設做）。
 
@@ -97,9 +98,11 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   handles.rs             Session／Cache／Backend／池的取得，全 `pub(crate)`：🚫 `access_token` 一個欄位都不離開這個 crate。
                          `server_cache_of` 的註冊表鎖握滿「查、開、放」整段（#32：放掉會 `database is locked`）
   accounts.rs recovery.rs  資料目錄佈局（`DataDirMap`）、`r/` 的 recovery key；都是 crate 內部
-  download_queue.rs      **每帳號的下載 worker**（/docs/design/media/media-download.md §5、§6）：佇列、`downloading` 表（取消旗標＋進度）、seek 收件匣先、一塊一步、
-                         每塊借一次 `Download` 線（只借開著的）、同 server 同 mxc 只有一個寫入者（`MediaClaims`）、推播節流。登出時 `close_links` 一併收
-  media_stream.rs        `GET /media` 的來源：本機原檔 → 完整池檔 →（worker）主檔已封的段 → 暫存檔 → 現拉；URL 不帶帳號，照已登入的帳號找
+  download_queue.rs      **每帳號的下載處理端**（/docs/design/media/media-download.md §5、§6）：收件 queue（job 處理一次就消耗）、`downloading` 表（取消旗標＋進度）、
+                         在途表（同一個塊請求只送一次）、所有檔一起跑、每檔一塊在途、seek 的請求插最前面、
+                         同 server 同 mxc 只有一個寫入者（`MediaClaims`）、推播節流。登出時 `close_links` 一併收
+  link_requests.rs       一條線的發送 queue ＋ 發送端（/docs/design/daemon/link-requests.md）：送出🚫 等回覆、回覆連同動作交回擁有者；現在只有 `Download` 用
+  media_stream.rs        `GET /media` 的來源：本機原檔 → 完整池檔 →（下載處理端）主檔已封的段 → 暫存檔 → 現拉；URL 不帶帳號，照已登入的帳號找
   *_ops.rs               命令本體：login／account／session（logout/destroy）／rooms／upload／attachment／media（排隊、另存、stats、gc）／backup／sync／misc
                          ⚠️ 公開介面不能假設同程序（/docs/design/overview/architecture-v2.md §6）：`&self`、可序列化的型別、事件走 channel、
                          🚫 不問終端、🚫 沒有生命週期／trait object／`impl Trait`。**加新方法一樣要過這條**
@@ -241,13 +244,15 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
-1. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
-2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
-3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
+1. **其他四條線送收分開**（`/docs/design/daemon/link-requests.md` §8：`Misc` → `Upload` → `Rooms`／`Keys`）：現在除了 `Download`，
+   每條線一次只跑一個命令（借線的人握著那格的鎖、原地等回覆），例如一次送 10 則訊息就是「發收發收…」（維護者 2026-10-02：「先只改 download」，其他的另開）。
+2. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
+3. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
+4. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
 之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
-下載佇列的暫停（只停佇列、🚫 不停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
+下載的暫停（只停主檔、🚫 不停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
 UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
 ⏳ 懸著等維護者：`media.db` 拆檔（維護者：「等要做的時候再討論」）。

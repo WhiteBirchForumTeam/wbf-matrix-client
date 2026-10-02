@@ -1,9 +1,10 @@
-//! 媒體快取的接法：下載的一個檔（[`MediaDownload`]）怎麼在主檔、seek 暫存檔與網路之間拿塊，加上配額清理與啟動掃描。
+//! 媒體快取的接法：下載的一個檔（[`MediaDownload`]）的塊怎麼驗、怎麼落進主檔與 seek 暫存檔，加上配額清理與啟動掃描。
 //! 設計在 /docs/design/media/media-download.md（下載）與 /docs/design/media/media-pool.md §5（清理）。
 //!
 //! - [`MediaDownload`]：一個 mxc 的主檔（`PoolWriter`，池格式 v2）、seek 暫存檔（`SeekStore`）與 `Info` 驗過的參數。
-//!   主檔「往前一塊」先看 seek 暫存檔、沒有才上網拉；GET 要的塊先看本地（主檔已封的段、seek 暫存檔），沒有才現拉存進 seek 暫存檔。
-//!   **誰排隊、誰先、何時取消、DB 怎麼寫**不在這裡：那是 core 的下載 worker（`wbf_core::download_queue`）。
+//!   🚫 不碰網路：`Info`／`Read` 的回覆由 core 的下載處理端（`wbf_core::download_queue`）收到後交進來（`accept_info`、`open_chunk`），
+//!   這裡只管驗、解、落地（`land_chunk`、`store_seek_chunk`）與本地有沒有（`advance_from_seek_store`、`read_local_chunk`）。
+//!   **誰排隊、誰先、何時取消、DB 怎麼寫**也是那邊的事。
 //! - `collect_garbage`：配額 best effort、保護期內不刪、先刪檔再刪列、有人指著的池檔不刪（/docs/design/media/media-pool.md §5）。
 //! - `sweep`：掃孤兒（DB 說有檔但打不開 → reset；`pending/` 裡沒人認領、過期、不是池格式 v2 → 刪；沒人指著的完成檔 → 刪）。
 //!
@@ -15,13 +16,12 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use crate::cache::{Cache, MediaEntry};
-use crate::channel::PackChannel;
 use crate::chunk_crypto::{chunk_count, expected_plain_len};
-use crate::client::WbfClient;
-use crate::download::VerifiedTarget;
+use crate::download::{open_chunk_data, verify_info, VerifiedTarget};
 use crate::error::SdkError;
 use crate::manifest::Manifest;
 use crate::media_pool::{Finished, MediaPool, PoolReader, PoolWriter, SEEK_SUFFIX};
+use crate::protocol::InfoAck;
 use crate::seek_store::SeekStore;
 
 /// 進度快照的間隔（/docs/design/media/media-download.md §4.1：每 1.5 秒 fsync 一次並把段數寫回 DB）。
@@ -30,7 +30,7 @@ pub const PROGRESS_FLUSH: Duration = Duration::from_millis(1500);
 pub const DEFAULT_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_PROTECT: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// 一個正在下載（或正在被 seek）的 mxc。只有下載 worker 握著它：主檔與 seek 暫存檔都只有一個寫入者。
+/// 一個正在下載（或正在被 seek）的 mxc。只有下載處理端握著它：主檔與 seek 暫存檔都只有一個寫入者。
 pub struct MediaDownload {
     manifest: Manifest,
     pending_name: String,
@@ -131,31 +131,58 @@ impl MediaDownload {
         let Some(plain) = seek.read(index)? else {
             return Ok(false);
         };
-        self.land(index, &plain)?;
+        self.land_chunk(index, &plain)?;
         Ok(true)
     }
 
-    /// 主檔往前一塊，從 server 拉（`Download/Read`）。驗長度、用檔案金鑰解開；解不開重拉一次，還是不行就是壞檔。
+    /// Return:
+    ///     bool  true ＝ 還沒用 `Info` 驗過區塊：上網拉任何一塊之前，先送 `Info`、把回覆交給 [`MediaDownload::accept_info`]（/docs/design/media/media-download.md §3.2）
+    pub fn needs_info(&self) -> bool {
+        self.target.is_none()
+    }
+
+    /// `Info` 的回覆到了：跟區塊核對，對得上就記下來，之後每一塊都用它、🚫 不重問。
     ///
+    /// Args:
+    ///     info: `protocol::info_reply` 解出來的 meta
+    ///     description_data: 同一個回覆的 data
     /// Return:
     ///     Ok(())
-    ///     Err(Integrity)   `Info` 對不上區塊、或這一塊連兩次驗不過：整個檔當壞檔（fail closed）
-    ///     Err(Network)     線斷了：進度停在這裡，線回來之後從同一塊接著拉
-    ///     Err(Server)      server 拒絕（NotFound 等）
-    pub async fn advance_from_server<C: PackChannel>(
-        &mut self,
-        client: &mut WbfClient<C>,
-    ) -> Result<(), SdkError> {
-        let index = self.next_chunk();
-        let plain = self.read_from_server(client, index).await?;
-        self.land(index, &plain)
+    ///     Err(Integrity)   區塊對不上 `Info`、描述解不開：整個檔當壞檔（fail closed）
+    pub fn accept_info(&mut self, info: &InfoAck, description_data: &[u8]) -> Result<(), SdkError> {
+        self.target = Some(verify_info(&self.manifest, info, description_data)?);
+        Ok(())
+    }
+
+    /// 第 `index` 塊的密文 → 明文（/docs/design/media/media-download.md §3.3）。
+    ///
+    /// Args:
+    ///     index: example: 3
+    ///     data: `protocol::read_reply` 給的密文
+    /// Return:
+    ///     Ok(明文)
+    ///     Err(Integrity)   長度或標籤不對（呼叫者重拉一次，還是不行就是壞檔）
+    ///     Err(Usage)       還沒 `accept_info`
+    pub fn open_chunk(&self, index: u32, data: &[u8]) -> Result<Zeroizing<Vec<u8>>, SdkError> {
+        let Some(target) = self.target.as_ref() else {
+            return Err(SdkError::Usage(format!(
+                "chunk {index} of {} arrived before Info verified the block",
+                self.manifest.mxc
+            )));
+        };
+        Ok(Zeroizing::new(open_chunk_data(
+            &self.manifest,
+            target,
+            index,
+            data,
+        )?))
     }
 
     /// 第 `index` 塊，本地有就給：主檔已封的段、或 seek 暫存檔（/docs/design/media/media-download.md §7.2 第 3、4 列）。
     ///
     /// Return:
     ///     Ok(Some(明文))   本地有
-    ///     Ok(None)         本地沒有：呼叫者現拉（`fetch_into_seek_store`）
+    ///     Ok(None)         本地沒有：呼叫者現拉，拉到的交給 [`MediaDownload::store_seek_chunk`]
     ///     Err(Integrity)   塊號超出 chunk_count
     ///     Err(Io)          主檔的段解不開
     pub fn read_local_chunk(&mut self, index: u32) -> Result<Option<Zeroizing<Vec<u8>>>, SdkError> {
@@ -169,19 +196,18 @@ impl MediaDownload {
         }
     }
 
-    /// 現拉第 `index` 塊（seek）：驗過、append 進 seek 暫存檔、回明文（/docs/design/media/media-download.md §6.3）。
+    /// seek 拉到的一塊：append 進 seek 暫存檔（第一次才建檔，/docs/design/media/media-download.md §6.3）。
     ///
     /// Return:
-    ///     Ok(明文)
-    ///     Err(Integrity)／Err(Network)／Err(Server)   同 [`MediaDownload::advance_from_server`]
+    ///     Ok(())
     ///     Err(Usage)       chunk_count 太大、不給 seek 暫存檔（`seek_store::MAX_SEEK_CHUNKS`）
-    pub async fn fetch_into_seek_store<C: PackChannel>(
+    ///     Err(Io)          暫存檔寫不了
+    pub fn store_seek_chunk(
         &mut self,
-        client: &mut WbfClient<C>,
         pool: &MediaPool,
         index: u32,
-    ) -> Result<Zeroizing<Vec<u8>>, SdkError> {
-        let plain = self.read_from_server(client, index).await?;
+        plain: &[u8],
+    ) -> Result<(), SdkError> {
         if self.seek.is_none() {
             self.seek = Some(SeekStore::open(
                 pool,
@@ -191,10 +217,10 @@ impl MediaDownload {
                 self.chunk_count,
             )?);
         }
-        if let Some(seek) = self.seek.as_mut() {
-            seek.append(index, &plain)?;
+        match self.seek.as_mut() {
+            Some(seek) => seek.append(index, plain),
+            None => Ok(()),
         }
-        Ok(plain)
     }
 
     /// 收尾（/docs/design/media/media-download.md §4.1）：封最後一段、核對長度與區塊的 sha256、adopt 進池、刪 seek 暫存檔。
@@ -251,36 +277,17 @@ impl MediaDownload {
         Ok((start, start + len as u64))
     }
 
-    /// 拉一塊：第一次先 `Info` 驗區塊；驗長度、解開；解不開重拉一次（傳輸錯），還是不行就 Integrity。
-    async fn read_from_server<C: PackChannel>(
-        &mut self,
-        client: &mut WbfClient<C>,
-        index: u32,
-    ) -> Result<Zeroizing<Vec<u8>>, SdkError> {
-        if self.target.is_none() {
-            self.target = Some(client.verify_target(&self.manifest).await?);
-        }
-        let Some(target) = self.target.as_ref() else {
-            return Err(SdkError::Integrity(
-                "the download target was not verified".into(),
-            ));
-        };
-        match client
-            .read_and_open_chunk(&self.manifest, target, index)
-            .await
-        {
-            Ok(plain) => Ok(Zeroizing::new(plain)),
-            Err(SdkError::Integrity(_)) => Ok(Zeroizing::new(
-                client
-                    .read_and_open_chunk(&self.manifest, target, index)
-                    .await?,
-            )),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// 一塊落地：長度要對；這一塊在「已寫長度」之前的部分丟掉（續傳點可以在塊中間），其餘餵進主檔。
-    fn land(&mut self, index: u32, plain: &[u8]) -> Result<(), SdkError> {
+    /// 主檔往前一塊：長度要對；這一塊在「已寫長度」之前的部分丟掉（續傳點可以在塊中間），其餘餵進主檔。
+    ///
+    /// Args:
+    ///     index: 要是主檔的下一塊（`next_chunk()`）, example: 3
+    ///     plain: 那一塊的明文（`open_chunk` 給的、或暫存檔裡的）
+    /// Return:
+    ///     Ok(())
+    ///     Err(Integrity)   長度不對
+    ///     Err(Usage)       不是主檔的下一塊
+    ///     Err(Io)          主檔寫不了
+    pub fn land_chunk(&mut self, index: u32, plain: &[u8]) -> Result<(), SdkError> {
         let (start, end) = self.chunk_range(index)?;
         if plain.len() as u64 != end - start {
             return Err(SdkError::Integrity(format!(
@@ -405,7 +412,7 @@ pub struct SweepReport {
 /// Args:
 ///     protect: 暫存檔多久沒動過算過期, example: Duration::from_secs(7 * 24 * 3600)
 ///     now: 現在, example: SystemTime::now()
-///     in_use: 正在下載（下載 worker 握著）的暫存名，🚫 不碰, example: {"m12"}
+///     in_use: 正在下載（下載處理端握著）的暫存名，🚫 不碰, example: {"m12"}
 pub fn sweep(
     cache: &mut Cache,
     pool: &MediaPool,

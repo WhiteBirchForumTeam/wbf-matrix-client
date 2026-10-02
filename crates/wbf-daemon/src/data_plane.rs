@@ -333,7 +333,7 @@ impl DataServer {
     }
 }
 
-/// 回應的 body：小的一次給（`Full`），讀的是串流（`StreamBody`）。⚠️ 用 `Unsync`：串流裡等 worker 的 future 不一定是 `Sync`。
+/// 回應的 body：小的一次給（`Full`），讀的是串流（`StreamBody`）。⚠️ 用 `Unsync`：串流裡等下載處理端的 future 不一定是 `Sync`。
 type ReplyBody = UnsyncBoxBody<Bytes, std::io::Error>;
 type Reply = Response<ReplyBody>;
 

@@ -129,10 +129,11 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 
 **規則在 /docs/design/daemon/link-requests.md**（維護者 2026-10-02）：每條線一條發送 queue ＋ 一張在途表，請求送出去就不管，
 「拿到回覆之後做什麼」封在請求裡，回覆到了由那條線的處理端執行；預設無序，要守順序的例外由動作自己守。
-池的一格因此放的是「線」（發送 queue、在途表、處理端），活得比底下的 `WsLink` 久：線斷了 queue 不丟，重開之後接著送。
+發送 queue 與在途表活得比底下的 `WsLink` 久：線斷了 queue 不丟，重開之後接著送。
+`Download` 只有一個用戶，它的發送 queue 在下載處理端身上、線從池借分身（`LinkPool::find_ws_link`）；很多命令共用的線（`Misc`）搬過來時，發送 queue 放進池的這一格。
 
 **還沒搬過去的線**照舊的方式：`PooledClient` 是那條線的 `WbfClient` 的 `tokio::Mutex` guard，同一條線上第二個命令等第一個做完
-（`WbfClient` 的方法是 `&mut self`：請求號計數器、hello 的結果在它身上）。搬的順序在 /docs/design/daemon/link-requests.md §8，`Download` 第一個。
+（`WbfClient` 的方法是 `&mut self`：請求號計數器、hello 的結果在它身上）。搬的順序在 /docs/design/daemon/link-requests.md §8：`Download` 已經搬了，`Misc`、`Upload`、`Rooms`／`Keys` 還是這樣。
 
 ## 6. daemon 那半：訂閱、推播、desync（/docs/design/rpc-specs/rpc-spec.md §3.9、§4）
 

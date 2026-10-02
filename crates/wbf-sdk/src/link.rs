@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use wbf_wire::Pack;
 
@@ -305,6 +305,36 @@ impl WsLink {
         }
     }
 
+    /// 一問一答，但**送出就回來**：登記 `Reply { id, seq }` → 送 → 回一個之後再等的把手（/docs/design/daemon/link-requests.md §2：發送端🚫 不等回覆）。
+    ///
+    /// Return:
+    ///     Ok(PendingReply)  進佇列了；`wait` 拿回覆，丟掉就從表裡拿掉
+    ///     Err(Network)      連線已經關了、或送不出去
+    ///     Err(Usage)        同一個 (id, seq) 已經有人在等
+    pub async fn send_request(&self, pack: Pack) -> Result<PendingReply, SdkError> {
+        let key = SessionKey::Reply {
+            id: pack.id,
+            seq: pack.seq,
+        };
+        let (sink, receiver) = OneshotSink::new();
+        let generation = self.register_and_send(key, Box::new(sink), &pack).await?;
+        Ok(PendingReply {
+            key,
+            generation,
+            receiver,
+            shared: self.shared.clone(),
+        })
+    }
+
+    /// 同一條線的分身：送、收都一樣，但丟掉它🚫 不關線（只有原本那一份能關）。給「線在連線池裡、送請求的在別的 task」用（/docs/design/daemon/link-requests.md §2）。
+    pub fn share(&self) -> WsLink {
+        WsLink {
+            shared: self.shared.clone(),
+            outgoing: self.outgoing.clone(),
+            owner: false,
+        }
+    }
+
     /// 一問多答：登記 `Session(id)` → 送。回來的每一個抄這個 id 的 pack 都進 handle；handle 丟掉就從表裡拿掉。
     ///
     /// Return:
@@ -500,6 +530,49 @@ impl SessionInbox {
 }
 
 impl Drop for SessionInbox {
+    fn drop(&mut self) {
+        self.shared.table().remove_if(self.key, self.generation);
+    }
+}
+
+/// 送出去、還沒回的一個一問一答（`WsLink::send_request`）。丟掉就從表裡拿掉，晚到的回覆變無主。
+pub struct PendingReply {
+    key: SessionKey,
+    generation: SessionGeneration,
+    receiver: oneshot::Receiver<Result<Pack, SdkError>>,
+    shared: Arc<Shared>,
+}
+
+impl PendingReply {
+    /// Return:
+    ///     Ok(Pack)        回來的那個（可能是 Error pack，這裡不解讀）
+    ///     Err(Timeout)    連線還活著、只是 `timeout` 內沒回
+    ///     Err(Network)    連線沒了
+    pub async fn wait(mut self, timeout: Duration) -> Result<Pack, SdkError> {
+        match tokio::time::timeout(timeout, &mut self.receiver).await {
+            Ok(Ok(delivered)) => delivered,
+            Ok(Err(_dropped)) => Err(SdkError::Network(format!(
+                "connection {}: the reply slot for {:?} was dropped",
+                self.shared.connection_id, self.key
+            ))),
+            Err(_elapsed) => {
+                let message = format!(
+                    "connection {}: no reply to {:?} within {timeout:?}",
+                    self.shared.connection_id, self.key
+                );
+                if self.shared.is_closed() {
+                    Err(SdkError::Network(format!(
+                        "{message}; the connection is closed"
+                    )))
+                } else {
+                    Err(SdkError::Timeout(message))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PendingReply {
     fn drop(&mut self) {
         self.shared.table().remove_if(self.key, self.generation);
     }
