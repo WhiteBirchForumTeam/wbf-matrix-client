@@ -1773,6 +1773,138 @@ mod tests {
         server.read_permits.add_permits(READ_PERMITS as usize);
     }
 
+    /// 第 0 塊的 Read 已經送到 server（卡著）的時候，等 `downloading` 出現之後再等一下。
+    async fn wait_until_the_first_read_is_out(downloader: &Downloader) {
+        wait_for_async(
+            || async {
+                downloader
+                    .list_jobs()
+                    .first()
+                    .is_some_and(|(_, _, status)| status.state == DownloadState::Downloading)
+            },
+            "the job to start",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn a_seek_for_the_chunk_on_the_wire_rides_on_it() {
+        let (core, account, server, manifest) = uploaded("dq-ride").await;
+        let mut events = core.subscribe();
+        hold_reads(&server).await;
+        let downloader = core.downloader_of(&account).await.unwrap();
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&downloader).await;
+        // 主檔的第 0 塊在途，GET 也要第 0 塊：掛上去，🚫 再送一次（/docs/design/media/media-download.md §6.3）。
+        let seek = {
+            let downloader = downloader.clone();
+            let manifest = Arc::new(manifest.clone());
+            tokio::spawn(async move { downloader.read_chunk(manifest, 0).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        assert_eq!(&seek.await.unwrap().unwrap()[..], &body()[..16]);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        assert_eq!(reads(&server), (0..CHUNKS).collect::<Vec<_>>());
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_the_link_is_down_ends_at_once() {
+        let (core, account, server, manifest) = uploaded("dq-cancel-down").await;
+        let mut events = core.subscribe();
+        let links = core.pool_of_account(&account).unwrap();
+        assert!(links.close(LinkRole::Download, "test").await);
+        let downloader = core.downloader_of(&account).await.unwrap();
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_for_async(
+            || async {
+                downloader
+                    .list_jobs()
+                    .first()
+                    .is_some_and(|(_, _, status)| status.state == DownloadState::Downloading)
+            },
+            "the job to start",
+        )
+        .await;
+        // 它的請求還排在發送 queue 裡（沒有線）：取消就當場拿掉、當場停，🚫 等線回來。
+        assert!(downloader.cancel(&manifest.mxc));
+        wait_until(&mut events, &manifest.mxc, DownloadState::Cancelled).await;
+        assert!(downloader.list_jobs().is_empty());
+        assert!(reads(&server).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_seek_made_while_the_link_is_down_goes_out_first_when_it_is_back() {
+        let (core, account, server, manifest) = uploaded("dq-seek-relink").await;
+        let mut events = core.subscribe();
+        hold_reads(&server).await;
+        let downloader = core.downloader_of(&account).await.unwrap();
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&downloader).await;
+        // 線斷了：主檔的第 0 塊排回發送 queue。這時播放器 seek 到第 5 塊：它排在第 0 塊前面。
+        let links = core.pool_of_account(&account).unwrap();
+        assert!(links.close(LinkRole::Download, "test").await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seek = {
+            let downloader = downloader.clone();
+            let manifest = Arc::new(manifest.clone());
+            tokio::spawn(async move { downloader.read_chunk(manifest, 5).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (client, new_server) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        *new_server.uploads.lock().unwrap() = server.uploads.lock().unwrap().clone();
+        drop(
+            links
+                .acquire(LinkRole::Download, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        assert_eq!(&seek.await.unwrap().unwrap()[..], &body()[80..96]);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        let mut expected: Vec<u32> = vec![5];
+        expected.extend((0..CHUNKS).filter(|index| *index != 5));
+        assert_eq!(reads(&new_server), expected);
+        server.read_permits.add_permits(READ_PERMITS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_does_not_open_is_fetched_once_more() {
+        let (core, _account, server, manifest) = uploaded("dq-corrupt-once").await;
+        let mut events = core.subscribe();
+        server
+            .corrupt_reads
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        core.media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
+            .await
+            .unwrap();
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        let mut expected: Vec<u32> = vec![0];
+        expected.extend(0..CHUNKS);
+        assert_eq!(reads(&server), expected);
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_does_not_open_twice_makes_the_file_bad_and_leaves_nothing() {
+        let (core, account, server, manifest) = uploaded("dq-corrupt-twice").await;
+        let mut events = core.subscribe();
+        server
+            .corrupt_reads
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        core.media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
+            .await
+            .unwrap();
+        wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
+        assert_eq!(reads(&server), vec![0, 0]);
+        let pool = core.pool_of(&account).unwrap();
+        assert!(
+            pool.list_pending().unwrap().is_empty(),
+            "a bad file leaves no pending file behind"
+        );
+    }
+
     #[test]
     fn a_claim_belongs_to_one_account_until_it_lets_go() {
         let claims = MediaClaims::default();

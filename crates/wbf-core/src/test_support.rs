@@ -225,6 +225,8 @@ pub(crate) struct FakeServer {
     pub(crate) download_reads: Arc<Mutex<Vec<(String, u32)>>>,
     /// 每個 `Download/Read` 回答前先拿一個 permit：測試把 permit 收走就卡住下載、一次放一個（`add_permits(1)`）。預設多到用不完。
     pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
+    /// 接下來幾個 `Download/Read` 的回覆要弄壞（密文翻一個 bit）：測「一塊壞了重拉一次」。
+    pub(crate) corrupt_reads: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// `read_permits` 一開始有幾個（測試要卡住就 `acquire_many(READ_PERMITS)` 收走）。
@@ -289,6 +291,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let download_reads: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(Vec::new()));
     let read_permits = Arc::new(tokio::sync::Semaphore::new(READ_PERMITS as usize));
     let (reads_t, permits_t) = (download_reads.clone(), read_permits.clone());
+    let corrupt_reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let corrupt_t = corrupt_reads.clone();
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -374,7 +378,18 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     if let Ok(permit) = permits_t.acquire().await {
                         permit.forget();
                     }
-                    download_reply(&pack, &uploads_t, &reads_t)
+                    let mut reply = download_reply(&pack, &uploads_t, &reads_t);
+                    let corrupt = corrupt_t
+                        .fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |left| left.checked_sub(1),
+                        )
+                        .is_ok();
+                    if corrupt && !reply.data.is_empty() {
+                        reply.data[0] ^= 1;
+                    }
+                    reply
                 }
                 (Kind::Download, _) => download_reply(&pack, &uploads_t, &reads_t),
                 (Kind::Control, control::HELLO) => response(
@@ -570,6 +585,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         uploads,
         download_reads,
         read_permits,
+        corrupt_reads,
     }
 }
 
