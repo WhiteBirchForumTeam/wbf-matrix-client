@@ -11,7 +11,11 @@
 //! 這裡是池、seek 暫存檔、`cache.db` 與下載管線唯一的交會點：`cache` 不知道池，`media_pool` 不知道 DB，下載管線不知道兩者。
 
 use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::time::Duration;
+
+use sha2::{Digest, Sha256};
 
 use zeroize::Zeroizing;
 
@@ -327,6 +331,146 @@ pub fn open_complete(pool: &MediaPool, entry: &MediaEntry) -> Option<PoolReader>
     }
     let reader = pool.open_read(entry.pool_file.as_deref()?).ok()?;
     (reader.plain_len() == entry.file_size).then_some(reader)
+}
+
+/// 快取列跟這次的區塊說的是不是同一個檔（/docs/design/media/media-download.md §5.3，維護者 2026-10-02 照 PR #14 的規則）：
+/// 大小、塊大小要一樣；兩邊都帶 sha256 就要一樣。🚫 算 hash，只比記下來的字。
+///
+/// Return:
+///     bool  true ＝ 同一個檔，列可以照用；false ＝ 對不上，要丟掉重來（[`forget_for_new_description`]）
+pub fn is_same_file(entry: &MediaEntry, manifest: &Manifest) -> bool {
+    let same_size =
+        entry.file_size == manifest.file_size() && entry.chunk_size == manifest.block.chunk_size;
+    let recorded_sha256 = entry
+        .hash
+        .as_deref()
+        .and_then(|hash| hash.strip_prefix("sha256:"));
+    let same_sha256 = match (recorded_sha256, manifest.block.sha256.as_deref()) {
+        (Some(recorded), Some(claimed)) => recorded.eq_ignore_ascii_case(claimed),
+        _ => true,
+    };
+    same_size && same_sha256
+}
+
+/// 列說的跟這次的區塊不一樣（[`is_same_file`] 回 false）：丟掉這個 mxc 在本地的一切，列換成這次的描述、從頭來。
+/// 池檔還有別的 mxc 指著、或有人正在讀，就只清這一列不刪檔；主檔與 seek 暫存檔刪掉。⚠️ 呼叫者先確定沒人正在下載它。
+///
+/// Return:
+///     Ok(())
+///     Err(Io)   DB 或檔案動不了
+pub fn forget_for_new_description(
+    cache: &mut Cache,
+    pool: &MediaPool,
+    manifest: &Manifest,
+) -> Result<(), SdkError> {
+    let Some(entry) = cache.find_media(&manifest.mxc)? else {
+        return Ok(());
+    };
+    if let Some(pool_file) = entry.pool_file.as_deref() {
+        if cache.media_references(pool_file)? <= 1 && !pool.is_open(pool_file)? {
+            pool.remove(pool_file)?;
+        }
+    }
+    if let Some(pending_name) = cache.media_pending_name(&manifest.mxc)? {
+        discard(pool, &pending_name);
+    }
+    let block = &manifest.block;
+    cache.media_redescribe(
+        &manifest.mxc,
+        block.name.as_deref(),
+        block.mimetype.as_deref(),
+        block.sha256.as_deref(),
+        manifest.file_size(),
+        block.chunk_size,
+    )
+}
+
+/// 匯出時要對上的內容（/docs/design/media/media-download.md §7.1 的 `media.export_to`）。至少要有一個 hash：沒東西可比就🚫 匯出。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedContent {
+    pub file_size: u64,
+    /// 明文的 BLAKE3（池檔的檔名就是它）
+    pub blake3_hex: Option<String>,
+    /// 區塊帶的 sha256（上傳者算的）
+    pub sha256_hex: Option<String>,
+}
+
+/// 把明文整個寫到 `to`，邊寫邊算整檔的 BLAKE3／SHA-256（/docs/design/media/media-download.md §7.1）：先寫 `<to>.partial`、fsync，
+/// 大小與每個給了的 hash 都對上才改名成 `to`；對不上就刪掉暫存、`to` 🚫 被動過。
+///
+/// Args:
+///     source: 明文（池檔的 `PoolReader`，或本機原檔）
+///     to: 使用者指定的位置, example: "C:/Users/me/v.mp4"
+/// Return:
+///     Ok(u64)          寫了幾 byte
+///     Err(Integrity)   大小或 hash 對不上
+///     Err(Usage)       一個 hash 都沒給、`to` 沒有檔名
+///     Err(Io)          讀不了來源、寫不了、改不了名
+pub fn export_verified<R: Read>(
+    mut source: R,
+    to: &Path,
+    expected: &ExpectedContent,
+) -> Result<u64, SdkError> {
+    if expected.blake3_hex.is_none() && expected.sha256_hex.is_none() {
+        return Err(SdkError::Usage(
+            "nothing to verify the export against (no BLAKE3, no sha256)".into(),
+        ));
+    }
+    let mut partial_name = to
+        .file_name()
+        .ok_or_else(|| SdkError::Usage(format!("{} has no file name", to.display())))?
+        .to_os_string();
+    partial_name.push(".partial");
+    let partial = to.with_file_name(partial_name);
+    let written = (|| {
+        let mut file = std::fs::File::create(&partial)?;
+        let mut blake3 = blake3::Hasher::new();
+        let mut sha256 = Sha256::new();
+        let mut buffer = Zeroizing::new(vec![0u8; 1 << 16]);
+        let mut bytes = 0u64;
+        loop {
+            let read = source.read(&mut buffer)?;
+            let Some(piece) = buffer.get(..read).filter(|piece| !piece.is_empty()) else {
+                break;
+            };
+            blake3.update(piece);
+            sha256.update(piece);
+            file.write_all(piece)?;
+            bytes += piece.len() as u64;
+        }
+        file.sync_all()?;
+        if bytes != expected.file_size {
+            return Err(SdkError::Integrity(format!(
+                "exported {bytes} bytes, file_size says {}",
+                expected.file_size
+            )));
+        }
+        if let Some(wanted) = expected.blake3_hex.as_deref() {
+            let actual = blake3.finalize().to_hex().to_string();
+            if !wanted.eq_ignore_ascii_case(&actual) {
+                return Err(SdkError::Integrity(format!(
+                    "BLAKE3 mismatch: expected {wanted}, got {actual}"
+                )));
+            }
+        }
+        if let Some(wanted) = expected.sha256_hex.as_deref() {
+            let actual = hex::encode(sha256.finalize());
+            if !wanted.eq_ignore_ascii_case(&actual) {
+                return Err(SdkError::Integrity(format!(
+                    "sha256 mismatch: expected {wanted}, got {actual}"
+                )));
+            }
+        }
+        Ok(bytes)
+    })();
+    let renamed = written.and_then(|bytes| {
+        std::fs::rename(&partial, to)?;
+        Ok(bytes)
+    });
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    renamed
 }
 
 /// `collect_garbage` 的結果。

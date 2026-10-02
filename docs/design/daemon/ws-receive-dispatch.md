@@ -113,15 +113,15 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
   有序類（`Chunk`）由呼叫端按 `seq` 送，單一 task 寫 sink 所以順序不會亂。
 - 送出 task 寫 sink 失敗 → 直接走 §7 的 `shut_down`（🚫 不是只有自己停：讀取 task 那邊 socket 可能還活著，看不出異狀）；之後每個 `send` 立刻回 `Network`。
 
-### 5.1 心跳：每條線自己一個，每 24 秒一定跳（維護者 2026-09-21 定心跳、2026-10-02 定「一定跳」）
+### 5.1 心跳：每條線自己一個，每 24 秒一定跳（維護者 2026-10-02）
 
 `WsLink` 多一個心跳 task（`Heartbeat`）：
 
 - 每 `interval`（**24 秒**）**一定**送一個 `Control/Ping`（`WANT_ACK`，走一般的 `request`，所以 `Pong` 也經會話表、也過鉤子）。
-  🚫 因為「最近有通訊」就跳過（09-21 那一版會跳過，10-02 拿掉）：server 的 idle 只看 **client 送了什麼**，一條一直在收推播的訂閱線（`Rooms`、`Keys`）
+  🚫 因為「最近有通訊」就跳過：server 的 idle 只看 **client 送了什麼**，一條一直在收推播的訂閱線（`Rooms`、`Keys`）
   在 client 這邊看起來很忙，在 server 那邊卻是一條沒有請求的線。
 - `reply_timeout`（10 秒）內沒有 `Pong` → 這條線死了：走 §7 的 `shut_down("heartbeat: …")`。在等的人立刻收到 `Network`，連線池下一次取用會重開。
-- 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 **60 秒**（wbfuwunel PR #103 從 300 改成 60），沒請求就關線；而且沒有心跳，
+- 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 **60 秒**（wbfuwunel PR #103，2026-10-02），沒請求就關線；而且沒有心跳，
   對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒在 60 秒之內還能錯過一次，也讓「線死了」在 34 秒內可見。
 - 心跳的請求號從 `u32::MAX` 往下數（`WbfClient` 的從 1 往上），兩邊要碰到得幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。
 - `Heartbeat::OFF` 不跳（測試別的事情時用）；`start_with_heartbeat` 可以給短的間隔（測試用）。

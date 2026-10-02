@@ -27,7 +27,7 @@ pub const CORRUPT_FRAME_BUDGET: u32 = 8;
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1）：每條線自己一個，**每 `interval` 一定送一個 `Ping`**、等 `Pong`；
-/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`
+/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`（wbfuwunel #103，2026-10-02）
 /// 是 60 秒、只看 client 送了什麼——只收推播的線（`Rooms`／`Keys`）一直在收，可是 server 看到的是一條 60 秒沒請求的線，會把它關掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {

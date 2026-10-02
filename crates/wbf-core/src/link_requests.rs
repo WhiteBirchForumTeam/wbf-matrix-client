@@ -39,24 +39,17 @@ pub(crate) trait LineRequest: Clone + PartialEq + Send + 'static {
 /// 一個請求的結果，交回擁有者的收件匣。
 pub(crate) struct LineReply<A> {
     pub action: A,
-    /// 這是第幾次送（0 ＝ 第一次；`push_front` 重送時由擁有者給）
-    pub attempt: u32,
     /// `Ok`：`expect_ack` 驗過的 Ack。`Err`：`Network`（線斷了、送不出去）、`Timeout`（線活著、server 沒聲）、`Server`（server 拒絕）、`Protocol`
     pub result: Result<Pack, SdkError>,
 }
 
-struct Queued<A> {
-    action: A,
-    attempt: u32,
-}
-
 struct LineQueue<A> {
-    queued: Mutex<VecDeque<Queued<A>>>,
+    queued: Mutex<VecDeque<A>>,
     wake: Notify,
 }
 
 impl<A> LineQueue<A> {
-    fn queued(&self) -> MutexGuard<'_, VecDeque<Queued<A>>> {
+    fn queued(&self) -> MutexGuard<'_, VecDeque<A>> {
         self.queued
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -105,16 +98,14 @@ impl<A: LineRequest> RequestLine<A> {
 
     /// 排在尾巴（一般的請求）。
     pub(crate) fn push_back(&self, action: A) {
-        self.queue.queued().push_back(Queued { action, attempt: 0 });
+        self.queue.queued().push_back(action);
         self.queue.wake.notify_one();
     }
 
     /// 插到最前面：下一個送出去的就是它（seek，/docs/design/media/media-download.md §6.2；或重送，/docs/design/daemon/link-requests.md §4）。
-    ///
-    /// Args:
-    ///     attempt: 這是第幾次送, example: 1
-    pub(crate) fn push_front(&self, action: A, attempt: u32) {
-        self.queue.queued().push_front(Queued { action, attempt });
+    /// 送了第幾次🚫 記在這裡：那是擁有者的事（它決定要不要重送）。
+    pub(crate) fn push_front(&self, action: A) {
+        self.queue.queued().push_front(action);
         self.queue.wake.notify_one();
     }
 
@@ -125,7 +116,7 @@ impl<A: LineRequest> RequestLine<A> {
     pub(crate) fn withdraw(&self, action: &A) -> bool {
         let mut queued = self.queue.queued();
         let before = queued.len();
-        queued.retain(|item| item.action != *action);
+        queued.retain(|item| item != action);
         queued.len() != before
     }
 }
@@ -133,7 +124,7 @@ impl<A: LineRequest> RequestLine<A> {
 /// 送出去、還沒回的請求，鍵是 seq。等回覆的小 task 回來時從這裡拿走自己那一筆才交回去；線整段沒回應時發送端一次拿走全部——
 /// 誰先拿到誰交，所以每個請求恰好交回一次。
 struct OnWire<A> {
-    requests: HashMap<u32, Queued<A>>,
+    requests: HashMap<u32, A>,
     /// 上一次收到回應的時間；線從「沒有請求在等」變成「有」的那一刻也算（之前多久沒事都不算沉默）。
     heard_at: Instant,
 }
@@ -170,7 +161,7 @@ async fn send_queued<A: LineRequest>(
         while waiting.try_join_next().is_some() {}
         time_out_if_silent(&on_wire, silence_timeout, &replies, &mut waiting);
         let next = queue.queued().pop_front();
-        let Some(Queued { action, attempt }) = next else {
+        let Some(action) = next else {
             tokio::select! {
                 _ = queue.wake.notified() => {}
                 _ = tokio::time::sleep(check_every) => {}
@@ -183,7 +174,7 @@ async fn send_queued<A: LineRequest>(
         };
         let Some(current) = current else {
             // 線沒開：放回去，進度停在原地，等一下再看（/docs/design/daemon/link-requests.md §2）。
-            queue.queued().push_front(Queued { action, attempt });
+            queue.queued().push_front(action);
             tokio::time::sleep(LINK_RETRY).await;
             continue;
         };
@@ -197,7 +188,7 @@ async fn send_queued<A: LineRequest>(
                     if wire.requests.is_empty() {
                         wire.heard_at = Instant::now();
                     }
-                    wire.requests.insert(seq, Queued { action, attempt });
+                    wire.requests.insert(seq, action);
                 }
                 let (on_wire, replies) = (on_wire.clone(), replies.clone());
                 waiting.spawn(async move {
@@ -210,21 +201,16 @@ async fn send_queued<A: LineRequest>(
                         wire.heard_at = Instant::now();
                         wire.requests.remove(&seq)
                     };
-                    if let Some(Queued { action, attempt }) = answered {
-                        let _ = replies.send(LineReply {
-                            action,
-                            attempt,
-                            result,
-                        });
+                    if let Some(action) = answered {
+                        let _ = replies.send(LineReply { action, result });
                     }
                 });
             }
             // 這個號剛好有人在等（換一圈回來撞到還沒回的）：放回去，下一輪換下一個號。
-            Err(SdkError::Usage(_)) => queue.queued().push_front(Queued { action, attempt }),
+            Err(SdkError::Usage(_)) => queue.queued().push_front(action),
             Err(error) => {
                 let _ = replies.send(LineReply {
                     action,
-                    attempt,
                     result: Err(error),
                 });
             }
@@ -240,18 +226,17 @@ fn time_out_if_silent<A>(
     replies: &mpsc::UnboundedSender<LineReply<A>>,
     waiting: &mut JoinSet<()>,
 ) {
-    let silent: Vec<Queued<A>> = {
+    let silent: Vec<A> = {
         let mut wire = lock(on_wire);
         if wire.requests.is_empty() || wire.heard_at.elapsed() < silence_timeout {
             return;
         }
-        wire.requests.drain().map(|(_, queued)| queued).collect()
+        wire.requests.drain().map(|(_, action)| action).collect()
     };
     waiting.abort_all();
-    for Queued { action, attempt } in silent {
+    for action in silent {
         let _ = replies.send(LineReply {
             action,
-            attempt,
             result: Err(SdkError::Timeout(format!(
                 "no response on this line for {silence_timeout:?}"
             ))),
@@ -384,7 +369,7 @@ mod tests {
         // 單執行緒的 runtime：下一個 await 之前發送端跑不到，所以三個是一起排進去的。
         line.push_back(Named("A1"));
         line.push_back(Named("B1"));
-        line.push_front(Named("seek"), 0);
+        line.push_front(Named("seek"));
         let order: Vec<Vec<u8>> = [
             requests.recv().await.unwrap(),
             requests.recv().await.unwrap(),

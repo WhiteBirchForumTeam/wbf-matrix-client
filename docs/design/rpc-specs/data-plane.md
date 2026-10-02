@@ -277,7 +277,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 
 維護者 2026-09-30 定：homeserver 是官方 Matrix（不講 wbf）時，**用傳統方式上傳**，不是 wbf 的分塊。現在 `media.create` 對一般 Matrix 帳號回 1100。
 
-預定的形狀（UI 看到的 `media.create` → `PUT` → `room.send_attachment` 不變；下載一起做：`media.download`／`open`／`save_to` 對一般 Matrix 帳號現在也是 1100）：
+預定的形狀（UI 看到的 `media.create` → `PUT` → `room.send_attachment` 不變；下載一起做：`media.download`／`open`／`export_to` 對一般 Matrix 帳號現在也是 1100）：
 
 | 步驟 | 明文房 | 加密房 |
 |---|---|---|

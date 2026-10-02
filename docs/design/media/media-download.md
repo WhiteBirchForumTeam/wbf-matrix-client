@@ -191,7 +191,8 @@ C = 4 + 4 + chunk_size + 16                                  每格在磁碟上�
 - **塊號放在明文**（4 byte），但**綁在 AAD 裡**：改了它就解不開。洩漏的只有「這個檔哪幾塊被 seek 過」，可接受（池本來就不防檔案大小與數量，/docs/design/media/media-pool.md §8）。
 - **最後一塊也寫滿一格**，真實長度記在 `len`（維護者 2026-10-01：寫正好的尺寸，真實長度看長度欄）。
 - 🚫 不存解不開的東西：存進來的明文是 §3.3 驗過的。
-- 每格**只寫一次**：nonce 由格號決定，格號只增不減。
+- 每格**只寫一次**：nonce 由格號決定，格號只增不減。**格號先佔走才寫**：寫失敗（例：磁碟滿）、重開時寫到一半或塊號壞掉的格，號碼都跳過、🚫 再給別的塊——
+  同一把池金鑰、同一個 nonce 🚫 封第二份明文（2026-10-02，PR #69 審查）。所以重開🚫 截檔：殘留的半格留在檔裡，位置表永遠不指到它。
 - **mxc 在 AAD 裡**：跟主檔的 `owner` 同一個理由（§4.1），暫存名換了主人，舊格一律解不開。檔頭剛好 32 byte、沒有空位放標記，所以綁在每一格；暫存檔只屬於一個 mxc，綁了沒有代價。
 
 **位置表（O(1)）**：
@@ -250,7 +251,7 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 
 | queue | 放什麼 | 誰消耗 |
 |---|---|---|
-| **收件 queue** | job：「下載這個檔」（`media.download`／`media.open`／`media.save_to`，§5.3）、「seek 要這一塊」（GET，§6） | 處理端：一個 job **處理一次就消耗掉** |
+| **收件 queue** | job：「下載這個檔」（`media.download`／`media.open`／`media.export_to`，§5.3）、「seek 要這一塊」（GET，§6） | 處理端：一個 job **處理一次就消耗掉** |
 | **發送 queue**（線的） | 塊請求：`Read`（或第一次的 `Info`）＋ 回覆到了要做的動作（§5.2） | 線的發送端：取出就送，🚫 不等回覆；seek 的塊請求放**最前面** |
 
 - **處理一個「下載這個檔」的 job 很快**：建 downloading 項、開主檔、塞第一個塊請求，就換下一個 job。所以 jobA、jobB、jobC 進來就是三個檔一起跑，
@@ -294,15 +295,18 @@ Downloading {                                       一個正在下載的檔，�
 
 | 本地狀況 | 做什麼 |
 |---|---|
+| 列說的跟這次的區塊對不上（大小、塊大小；兩邊都帶 sha256 時 sha256） | **丟掉**：池檔（沒別人指著才刪）、主檔、暫存檔都刪，列換成這次的描述、從頭來（維護者 2026-10-02，照 PR #14 的規則）。那個檔正在用舊的描述下載就回錯、🚫 動它 |
 | `media` 列 `complete = 1`、池檔在 | 🚫 不下載：已經有了 |
-| 有本機原檔（/docs/design/rpc-specs/data-plane.md §8.1） | 🚫 不下載（`media.save_to` 例外：它要的是池或原檔裡的 bytes，直接從原檔複製） |
-| 這個 mxc 已經在 `downloading` 表、收件 queue 或「等認領」裡 | 🚫 不重複 |
+| 有本機原檔（/docs/design/rpc-specs/data-plane.md §8.1） | 🚫 不下載（`media.export_to` 例外，§7.3） |
+| 這個 mxc 已經在 `downloading` 表、正在準備、收件 queue 或「等認領」裡 | 🚫 不重複 |
 | 別的帳號正在寫它（認領不到） | 放進「等認領」（§5.1） |
 | 有 pending 主檔 | **從檔案確定進度**：驗檔長、逐段解（§4.1 續傳）→ 已寫 `k` 段 → `next = ⌊k × segment_size / chunk_size⌋`；DB 的 `segments_written` 只當提示，🚫 不當依據 |
 | 都沒有 | `next = 0` |
 | `total` | 區塊在手（有 `file_size`、`chunk_size`）就算 `ceil(file_size / chunk_size)`；不知道就填 **0**，`Info` 回來再補 |
 
 然後建 downloading 項、開主檔：還沒驗過就送 `Info`（主檔掛在上面），驗過了就走「下一塊」（§5.4）。
+從收件 queue 拿出來到進 downloading 表之間（建列、認領、開檔要等 DB）算「準備中」：取消、重複排入、`media.queue` 都認得它。
+📎 對比的只是記下來的字，🚫 算 hash：串流（`media.open`、GET）照用，每段讀出來時池的 AEAD 本來就驗過；整檔的 hash 留給匯出（§7.3）。
 daemon 重開時 queue 不保存（維護者 2026-10-01）：之後再有人要這個檔，照上表從 DB 與檔案重建進度、接著拉。
 
 ### 5.4 動作：落地、看旗標、塞下一塊
@@ -320,10 +324,11 @@ Chunk { mxc, next } 回來、主檔在等：
     否則                    → next += 1，走「下一塊」
 ```
 
-- **取消**只在「一塊落地之後」生效：在途的那一塊會收完、寫完，所以主檔永遠停在整塊（整段）的邊界上。
+- **取消**在「一塊落地之後」生效：在途的那一塊會收完、寫完，所以主檔永遠停在整塊（整段）的邊界上。主檔的請求還排著沒送（例：線斷了）就當場拿掉、當場停。
 - **壞檔**（§3.2、§3.3）或 server 拒絕 → `downloading.remove(mxc)`、`media` 列 reset、主檔與暫存檔刪掉、推一則失敗。
 - **線斷、逾時**：照 /docs/design/daemon/link-requests.md §4，同一個請求排回最前面，進度停在 `next`。掛在上面的 GET 🚫 等線，直接收到錯（播放器會再要）；
   線整段 60 秒沒回應就是逾時（/docs/design/daemon/link-requests.md §4），同一個請求連續逾時 3 次就停下這個檔、推一則失敗，檔案留著（下次接著拉）。
+  重送幾次記在處理端的在途表那一筆，重排、插隊、取消主檔時都沿用，🚫 歸零。
   GET 🚫 自己限時：處理端在線斷、逾時、驗不過時都會回它錯；播放器先放棄（斷線）就不等了。
 - **沒人看的時候照樣拉完**。**暫停**之後才加：加的時候是「走『下一塊』時先看暫停旗標」，只停主檔，🚫 不停 seek。
 
@@ -331,7 +336,8 @@ Chunk { mxc, next } 回來、主檔在等：
 
 | 這個 mxc 在哪 | 做什麼 |
 |---|---|
-| `downloading` 表裡（正在拉） | `cancelled = true`。在途的那一塊落地之後就停、處理端自己從表裡拿掉 |
+| `downloading` 表裡（正在拉） | `cancelled = true`。在途的那一塊落地之後就停；請求還排著沒送就當場停。處理端自己從表裡拿掉 |
+| 正在準備（還沒進表） | 記下來，處理端開始它之前看到就停 |
 | 收件 queue 或「等認領」裡（還沒開始） | 拿掉（它不在表裡） |
 | 都不在 | 回 `cancelled: false` |
 
@@ -346,7 +352,7 @@ Chunk { mxc, next } 回來、主檔在等：
 - **`media.queue`** 隨時可以問現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`）。
 - 播放中的進度照舊：就是那個 GET 收到多少 bytes。
 
-`media.save_to`（另存新檔）也排隊（維護者 2026-10-01）：交一個 job、等它完成、再從池讀出來寫到使用者指定的位置；`no_cache` 版也排隊。
+`media.export_to`（匯出）也排隊（維護者 2026-10-01）：交一個 job、等它完成、整檔驗過再寫到使用者指定的位置；`no_cache` 版也排隊（§7.3）。
 
 ## 6. Seek
 
@@ -396,11 +402,11 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 | `media.open` | 同上 | `{ url, mxc, mimetype?, size, state }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`queued`。不完整也沒原檔 → 順便建 job |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`） |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 正在拉 → 設 `downloading[mxc].cancelled`，在途的那一塊落地就停；還沒開始 → 拿掉（§5.4） |
-| `media.save_to` | 同 `media.download` 的三種說法，加 `out`、`no_cache?` | `{ out, bytes, source, hash? }`；`source` 是 `local_source`、`cache`、`server` | 排隊、等它完成、從池（或本機原檔）複製到 `out`（§5.5 最後）。`no_cache`：這次下載的複製完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI）、`no_cache?` | `{ to, bytes, source, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成、**整檔驗過**才寫到 `to`。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
 | 推播 `media.download` | — | `{ mxc, state, done, total, user, reason? }` | §5.5。`reason` 只在 `failed` 帶 |
 
 - 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。找不到是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
-- 一般 Matrix 帳號（走 matrix-sdk 的）的媒體沒有 `Download` 線，這四支加 `media.save_to` 都回 `1100`；傳統下載（`/_matrix/media`）跟傳統上傳一起做（/docs/design/rpc-specs/data-plane.md §7）。
+- 一般 Matrix 帳號（走 matrix-sdk 的）的媒體沒有 `Download` 線，這四支加 `media.export_to` 都回 `1100`；傳統下載（`/_matrix/media`）跟傳統上傳一起做（/docs/design/rpc-specs/data-plane.md §7）。
 - 下載一律走 WS 的 `Download` 線：`transport` 參數對這幾支沒有意義。CLI 的 `download --no-cache` 不走下載處理端（直接逐塊寫到檔案，不碰池），等 CLI 改走 RPC 時一併收掉。
 
 ### 7.2 GET 的路由
@@ -423,13 +429,25 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 - 吐出去的是**明文**；記憶體裡同時最多一塊（或一段）。HTTP 回應用串流 body，背壓同上傳：播放器讀得慢，daemon 就晚一點讀下一塊。
 - 上游慢就停著等、連線不斷；拿不到才斷（/docs/design/rpc-specs/data-plane.md §8）：body 已經開始吐就沒辦法改狀態碼，所以是讓 body 出錯、連線斷掉，播放器知道沒收完（🚫 不假裝結束）。
 
+### 7.3 匯出：`media.export_to`（維護者 2026-10-02）
+
+使用者明說要把明文放到自己選的位置（不是「存檔」：池本來就存著，只是在加密區裡）。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。
+
+- **`to` 是 URI**，跟 `media.create` 的 `source_uri` 同一套解法（/docs/design/rpc-specs/data-plane.md §8.1）。現在只收 `file://`（例 `file:///tmp/a.mp4`）；
+  `http://127.0.0.1:…/from_ui/mxc/…`（daemon 用 HTTP PUT 丟給 UI）之後才做，現在回參數錯。
+- **來源**：本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過（原檔上傳後被改過），就從池匯出——池裡沒有就排進下載、等它完成。
+- **整檔驗過才放上去**：先寫 `<to>.partial`、fsync，邊寫邊算；大小、整檔 BLAKE3（池檔名就是它，從池匯出時）、區塊有帶就再加 SHA-256，全對上才改名成 `to`。
+  對不上 → 刪掉暫存、`to` 🚫 被動過、回 `Integrity`；從池匯出時那份池檔也丟掉（下次重下）。一個 hash 都沒得比就🚫 匯出。
+- 跟串流分開驗（維護者 2026-10-02）：`media.open`／GET 是串流，🚫 算整檔 hash，每段讀出來時池的 AEAD 已經驗過；匯出才算整檔。
+- 🔜 之後的形狀：還沒下載完就先交 job，下載完成時**自動匯出**、RPC 不必等著；現在是等它完成才回。
+
 ## 8. 斷在哪裡、會留下什麼
 
 | 斷點 | 留下的 | 下次 |
 |---|---|---|
 | 主檔寫到一半（段沒寫完） | 檔長不是整數倍 | 截掉那一段，從涵蓋它的塊接著拉 |
 | 主檔的長度落地、內容沒落地 | 檔長是整數倍，但最後幾段解不開 | 逐段解，截到第一個解不開的段 |
-| 暫存檔寫到一半 | 檔長不是整數倍 | 截掉最後一格；那一塊之後再拉 |
+| 暫存檔寫到一半 | 檔長不是整數倍 | 半格留著、它的格號跳過（§4.2：🚫 同一個 nonce 封兩份明文）；那一塊之後再拉 |
 | 暫存檔某一格內容沒落地 | 那一格解不開 | 讀到時拿掉、重拉 |
 | 主檔完成、改名前 | pending 主檔完整 | 續傳時整檔驗完 → 直接收尾 |
 | 改名後、DB 記完成前 | 池檔在、列說沒完成 | 下次重下一次，收尾時 `adopt` 發現同 hash 的池檔 → 去重、記完成（在那之前掃描先跑到的話，沒人指著的池檔被刪，結果一樣） |
@@ -443,7 +461,7 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 |---|---|
 | 池格式 v1：沒有長度欄、最後一段可以短、有暫定段（每 1.5 秒截掉重寫） | v2：每段寫滿、長度在密文裡、沒有暫定段（§4.1） |
 | `media::fetch` 整個檔握著 `Download` 線 | 塊請求送收分開、動作封在請求裡（§3.1），seek 的請求插到發送 queue 最前面 |
-| 下載是 `media.save_to` 叫的時候當場拉 | 每帳號一個處理端，所有檔一起跑、每檔一塊在途（§5） |
+| 下載是 `media.save_to`（現在的 `media.export_to`）叫的時候當場拉 | 每帳號一個處理端，所有檔一起跑、每檔一塊在途（§5） |
 | 續傳信 DB 記的塊數 | 檔案本身就是進度（§4.1）；DB 的 `segments_written` 只給顯示 |
 | 媒體繞過唯一寫入者、自己開 `cache.db` | 一律經 `ServerCache`（/docs/design/daemon/daemon-runtime.md §2） |
 | 不做 seek（/docs/design/media/media-pool.md §6） | seek 暫存檔 ＋ 位置表（§4.2、§6） |
@@ -459,7 +477,7 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 | seek 暫存檔：照到達順序 append、最後一塊寫滿一格；重開截半格、重建位置表、重複留第一個、塊號超出就截；改塊號／翻 bit／別的 mxc／chunk_size 不同都不收；位置表太大不給 | sdk `seek_store::tests` |
 | `MediaDownload` 對假 server：下載進池、去重、從完整的段續傳（塊跟段不對齊）、seek 拉過的塊主檔不再上網、區塊對不上就刪掉暫存檔；配額清理；掃描（不碰正在下載的、刪 v1、刪過期的） | sdk `tests/media_cache.rs` |
 | 線的發送 queue：送出🚫 等回覆、回覆倒著回也找得回自己的動作、插到最前面的先送、還沒送的拿得回來、線斷了在途的都回 `Network` | core `link_requests::tests` |
-| 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、`save_to`（含 `no_cache`）、別的帳號在寫就等認領、處理端被收會放掉認領 | core `download_queue::tests` |
+| 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、準備中的 job 也取消得掉、`export_to`（含 `no_cache`、池檔對不上自己的名字就擋下並丟掉、原檔改過就改從池匯出）、同一個 mxc 帶了不同大小就丟掉快取重下、別的帳號在寫就等認領、處理端被收會放掉認領 | core `download_queue::tests` |
 | URL：讀與上傳的 URL 不能互換；Range 解析 | daemon `data_plane::tests` |
 | HTTP：未解鎖 503、別的 daemon 發的／用途不對／本機沒紀錄 404、方法不對 405 | daemon `tests/data_plane.rs` |
 | 推播 `media.download` 的欄位 | daemon `push::tests` |
@@ -471,7 +489,7 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 
 1. **v1 的池檔一律當壞檔重下**（它是快取）：啟動掃描遇到 v1 的完成檔與暫存檔都刪，`media` 列 reset。
 2. **queue 不跨 daemon 重開保存**：進度照 DB 或直接讀檔案大小確定（§5.3），🚫 不另存 queue。
-3. **`media.save_to` 也排隊**（§5.5）。
+3. **匯出也排隊**（§5.5；10-02 起叫 `media.export_to`，§7.3）。
 4. **背景下載的進度由 daemon 負責**（§5.5）：job 記著、推播 `media.download`（每個 job 最多每秒一則＋狀態改變）、`media.queue` 可以問。
 5. **一塊一步**（§5.4）：「拉第 `next` 塊 → 落地 → 觸發後續（`next + 1`）」，取消插在落地之後。
 6. **取消旗標放在 `downloading` 表**（§5.2）：key 是 mxc，所有塊共用同一份；設成 true 就只處理當下那一包；拉完或取消時自己從表裡拿掉。
@@ -483,3 +501,6 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 8. **job 處理一次就消耗掉，所有檔一起跑**（§5.1）：jobA、jobB、jobC 都處理掉，發送 queue 變成 `A B C、A B C`；每個檔同時一塊在途。🚫 不設同時幾個檔的上限。
 9. **seek 是一個事件一個 job**（§6.2）：它的塊請求放到發送 queue 最前面。
 10. **解析 job 的時候建 downloading 項**（§5.2）。
+11. **逾時看整條線**：有請求在等、而線整段沒有回應才算（/docs/design/daemon/link-requests.md §4）；心跳每 24 秒一定送（/docs/design/daemon/ws-receive-dispatch.md §5.1）。
+12. **快取命中要跟這次的描述對得上**（§5.3）：大小、塊大小（兩邊都有時 sha256）對不上就丟掉重來，照 PR #14 的規則。
+13. **`media.save_to` 改名 `media.export_to`、`to` 收 URI**（§7.3）：現在只做 `file://`；串流不算整檔 hash，匯出要整檔驗過。

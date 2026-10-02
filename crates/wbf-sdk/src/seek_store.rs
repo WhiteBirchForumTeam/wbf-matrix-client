@@ -12,7 +12,8 @@
 //! - 塊號放明文（重開不必解密就能重建位置表），但綁在 AAD 裡：改了就解不開。
 //! - mxc 也在 AAD 裡：同一個暫存名換了主人（`cache.db` 重建後 id 重新編號），舊格一律解不開；開檔時試解第一格，解不開就整個重建。
 //! - 寫入順序：整格寫完 → fsync → 才更新位置表。位置表永遠只指向已經落地的格。
-//! - 每格只寫一次：格號只增不減，nonce 由格號決定。
+//! - 每格只寫一次：格號只增不減，nonce 由格號決定。**格號先佔走才寫**：寫失敗（例：磁碟滿）、重開時寫到一半或塊號壞掉的格，號碼都跳過、🚫 再用——
+//!   同一把池金鑰、同一個 nonce 🚫 封第二份明文。所以重開🚫 截檔：殘留的半格留在檔裡，位置表永遠不指到它。
 //!
 //! 🚫 金鑰不進錯誤訊息。這裡沒有 SQL、沒有網路。
 
@@ -51,7 +52,7 @@ pub struct SeekStore {
 }
 
 impl SeekStore {
-    /// 開這個 mxc 的 seek 暫存檔：在就驗檔頭、截掉寫到一半的格、重建位置表；不在（或對不上）就建新的。
+    /// 開這個 mxc 的 seek 暫存檔：在就驗檔頭、重建位置表（寫到一半、塊號壞掉的格跳過）；不在（或對不上）就建新的。
     ///
     /// Args:
     ///     pool: 暫存檔放在池的 `pending/`，金鑰是池金鑰
@@ -104,12 +105,12 @@ impl SeekStore {
         })
     }
 
-    /// 既有的檔：驗檔頭、截半格、重建位置表、試解第一格。
+    /// 既有的檔：驗檔頭、重建位置表、試解第一格。下一格的格號接在**檔裡出現過的最後一格（含寫到一半的）之後**。
     ///
     /// Return:
     ///     Ok(Some(SeekStore))   可以接著用
     ///     Ok(None)              不是這個檔的（檔頭不對、chunk_size／chunk_count 不同、第一格解不開）：呼叫者建新的
-    ///     Err(Io)               截檔失敗
+    ///     Err(Io)               讀不了
     fn reopen(
         mut file: File,
         cipher: XChaCha20Poly1305,
@@ -140,25 +141,24 @@ impl SeekStore {
         let cell = store.cell_len();
         let body = store.file.metadata()?.len().saturating_sub(HEADER_LEN);
         let whole_cells = u32::try_from(body / cell).unwrap_or(u32::MAX);
-        let mut cells = 0u32;
+        // 寫到一半的那格也算用過：它的號碼🚫 再給別的塊（同 nonce 封兩份明文）。
+        let used_cells = u32::try_from(body.div_ceil(cell)).unwrap_or(u32::MAX);
         for slot in 0..whole_cells {
             let mut field = [0u8; INDEX_FIELD as usize];
             store.file.seek(SeekFrom::Start(store.cell_offset(slot)))?;
             store.file.read_exact(&mut field)?;
             let index = u32::from_le_bytes(field);
-            // 塊號超出範圍：檔壞了，從這格起截掉。
+            // 塊號超出範圍：這格壞了，跳過（號碼照樣算用過）。
             let Some(entry) = store.slots.get_mut(index as usize) else {
-                break;
+                continue;
             };
             // 同一塊出現兩次：留第一個。
             if *entry == 0 {
                 *entry = slot + 1;
             }
-            cells = slot + 1;
         }
-        store.cells = cells;
-        store.file.set_len(store.cell_offset(cells))?;
-        if cells > 0 && store.read_cell(0).is_err() {
+        store.cells = used_cells;
+        if whole_cells > 0 && store.read_cell(0).is_err() {
             return Ok(None);
         }
         Ok(Some(store))
@@ -194,7 +194,7 @@ impl SeekStore {
             .is_some_and(|slot| *slot != 0)
     }
 
-    /// 已經有幾格。
+    /// 用過幾個格號（下一格的格號；含寫失敗、寫到一半而跳過的）。
     pub fn cells(&self) -> u32 {
         self.cells
     }
@@ -206,8 +206,8 @@ impl SeekStore {
     ///     plain: 驗過的明文；最後一塊可以短, example: 65536 byte
     /// Return:
     ///     Ok(())
-    ///     Err(Usage)   塊號超出 chunk_count、明文是空的或比 chunk_size 長
-    ///     Err(Io)      寫不了（位置表沒動：寫失敗的格不會被指到）
+    ///     Err(Usage)   塊號超出 chunk_count、明文是空的或比 chunk_size 長、格號用完了
+    ///     Err(Io)      寫不了（位置表沒動：寫失敗的格不會被指到；它的格號已經佔走，🚫 再用）
     pub fn append(&mut self, index: u32, plain: &[u8]) -> Result<(), SdkError> {
         if self.slots.get(index as usize).is_none() {
             return Err(SdkError::Usage(format!(
@@ -226,6 +226,10 @@ impl SeekStore {
             )));
         }
         let slot = self.cells;
+        // 先佔走這個格號再寫：寫到一半失敗（磁碟滿）時檔裡可能已經有這格的部分密文，下一塊🚫 用同一個 nonce。
+        self.cells = slot
+            .checked_add(1)
+            .ok_or_else(|| SdkError::Usage("the seek file has no cell numbers left".into()))?;
         let mut padded = Zeroizing::new(Vec::with_capacity(
             LEN_FIELD as usize + self.chunk_size as usize,
         ));
@@ -250,7 +254,6 @@ impl SeekStore {
         self.file.write_all(&cell)?;
         self.file.sync_data()?;
         // 落地之後才指過去。
-        self.cells = slot + 1;
         if let Some(entry) = self.slots.get_mut(index as usize) {
             *entry = slot + 1;
         }
@@ -383,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_cuts_a_half_cell_rebuilds_the_table_and_keeps_the_first_duplicate() {
+    fn reopening_skips_a_half_cell_rebuilds_the_table_and_keeps_the_first_duplicate() {
         let (pool, dir) = scratch_pool("reopen");
         let mut store = SeekStore::open(&pool, "m1", MXC, CHUNK, 10).unwrap();
         store.append(4, &chunk(4, CHUNK as usize)).unwrap();
@@ -398,10 +401,11 @@ mod tests {
         bytes.extend_from_slice(&[0xCD; 100]);
         std::fs::write(&path, &bytes).unwrap();
         let mut store = SeekStore::open(&pool, "m1", MXC, CHUNK, 10).unwrap();
-        assert_eq!(store.cells(), 3);
+        // 半格的號碼算用過、🚫 截檔：下一格是第 4 格，第 3 格那個 nonce 🚫 再封別的明文。
+        assert_eq!(store.cells(), 4);
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            HEADER_LEN + 3 * cell as u64
+            HEADER_LEN + 3 * cell as u64 + 100
         );
         assert_eq!(
             &store.read(4).unwrap().unwrap()[..],
@@ -411,14 +415,42 @@ mod tests {
             &store.read(2).unwrap().unwrap()[..],
             &chunk(2, CHUNK as usize)[..]
         );
-        // 新的一格接在後面。
+        // 新的一格接在半格後面那個號碼。
         store.append(0, &chunk(0, 1)).unwrap();
-        assert_eq!(store.cells(), 4);
+        assert_eq!(store.cells(), 5);
+        assert_eq!(&store.read(0).unwrap().unwrap()[..], &chunk(0, 1)[..]);
+        drop(store);
+        // 再重開一次：半格那個號碼還是跳過，四塊都找得到。
+        let mut store = SeekStore::open(&pool, "m1", MXC, CHUNK, 10).unwrap();
+        assert_eq!(store.cells(), 5);
+        assert_eq!(&store.read(0).unwrap().unwrap()[..], &chunk(0, 1)[..]);
+        assert!(store.read(4).unwrap().is_some() && store.read(2).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_index_past_the_count_cuts_the_file_there() {
+    fn a_failed_write_burns_its_cell_number() {
+        let (pool, dir) = scratch_pool("burn");
+        let mut store = SeekStore::open(&pool, "m1", MXC, CHUNK, 10).unwrap();
+        store.append(1, &chunk(1, CHUNK as usize)).unwrap();
+        // 把手換成唯讀：下一格寫不進去（磁碟滿的替身）。
+        let path = pool.seek_path("m1");
+        let writable = std::mem::replace(&mut store.file, File::open(&path).unwrap());
+        assert!(store.append(2, &chunk(2, CHUNK as usize)).is_err());
+        assert!(!store.has(2));
+        assert_eq!(store.cells(), 2, "the failed cell's number is used up");
+        store.file = writable;
+        store.append(3, &chunk(3, CHUNK as usize)).unwrap();
+        assert_eq!(store.cells(), 3);
+        assert_eq!(
+            &store.read(3).unwrap().unwrap()[..],
+            &chunk(3, CHUNK as usize)[..]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_past_the_count_is_skipped_and_its_number_is_not_reused() {
         let (pool, dir) = scratch_pool("past");
         let mut store = SeekStore::open(&pool, "m1", MXC, CHUNK, 10).unwrap();
         store.append(1, &chunk(1, CHUNK as usize)).unwrap();
@@ -431,9 +463,15 @@ mod tests {
         bytes[second..second + 4].copy_from_slice(&99u32.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         let mut store = SeekStore::open(&pool, "m1", MXC, CHUNK, 10).unwrap();
-        assert_eq!(store.cells(), 1);
+        assert_eq!(store.cells(), 2, "the bad cell's number stays used");
         assert!(store.has(1) && !store.has(2));
         assert!(store.read(1).unwrap().is_some());
+        store.append(2, &chunk(2, CHUNK as usize)).unwrap();
+        assert_eq!(store.cells(), 3);
+        assert_eq!(
+            &store.read(2).unwrap().unwrap()[..],
+            &chunk(2, CHUNK as usize)[..]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

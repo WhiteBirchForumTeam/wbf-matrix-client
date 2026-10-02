@@ -244,7 +244,7 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一台 OlmMac
 | 收到新訊息 | —（推播 `room.message`） | ✅（背景，上游會話） |
 | 送一則訊息 | `room.send_text` | ✅ |
 | 標記已讀 | `room.read`（§6） | 🟡 看 `sync` |
-| 下載附件 | `media.save_to`／`media.open` | 🟡 命中媒體池就不用 |
+| 下載附件 | `media.export_to`／`media.open` | 🟡 命中媒體池就不用 |
 | 切換「現在看哪個帳號」 | **不用 RPC** | ❌ |
 
 🚨 最後一列是重點：**「UI 現在在看哪個帳號」是 UI 自己的狀態**，🚫 不是 daemon 的。
@@ -397,10 +397,11 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（/docs/design/overview/architecture-v2.md §5.1.1）。
 ⭐ 我們自己的推播是同一個問題，🚫 沒有理由用不同的答案。
 
-### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13）
+### 5.4 媒體的 bytes 不走 RPC，進度只有背景下載走推播（維護者 2026-09-13 定 bytes、2026-10-01 定背景下載的進度）
 
 **媒體的 bytes 從來不經過 RPC 通道**，所以「一個 2 GB 上傳發上萬則 `progress`、把 `room.message` 擠掉」這個情境不存在。
-上傳的 PUT 做了（/docs/design/rpc-specs/data-plane.md）；讀的 GET 還沒。
+上傳的 PUT 與讀的 GET 都做了（/docs/design/rpc-specs/data-plane.md）。**背景下載**沒有 HTTP 可看，進度走推播 `media.download`，
+每個檔最多每秒一則＋狀態改變（/docs/design/media/media-download.md §5.5）——低頻，擠不掉訊息。
 
 ```
 上傳：UI ──HTTP PUT bytes──> daemon ──切塊、加密──> homeserver
@@ -413,11 +414,11 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 - 🚨 **上游慢的時候，daemon 的 HTTP server 要「卡住」**：**停止送資料、但連線開著**，
   等拿到下一塊再繼續吐。🚫 **不要回一個空回應、也不要斷線** ——
   那會讓 UI 以為「傳完了」或「失敗了」，而事實是「還在等」。
-- 所以 **RPC 通道基本上永遠是暢通的**：它上面只有一問一答的控制訊息與低頻的推播，
+- 所以 **RPC 通道基本上永遠是暢通的**：它上面只有一問一答的控制訊息與低頻的推播（含節流過的 `media.download`），
   🚫 沒有 bytes、🚫 沒有每塊一則的進度。§5.3 的 `desync` 仍然要有（慢的訂閱者還是會落後），
   但「進度把訊息擠掉」這個情境**不存在**。
 
-⚠️ **例外：路徑版的 method**（`room.send_file`、`upload.file`、`media.save_to`）——
+⚠️ **例外：路徑版的 method**（`room.send_file`、`upload.file`）——
 那是 daemon **自己讀本機檔案**去傳，UI 沒有 HTTP 可看，所以它們的進度只能走 RPC 的 `progress`。
 📎 那是給 rpc-cli 與「Desktop 拖一個本機檔進來」用的路徑，頻率低、一次一個檔，
 ⭐ 所以**節流與分佇列先不做**（維護者 2026-09-13：「這個你可以先不做，先一步步來」）。
@@ -575,5 +576,5 @@ core 一旦認識「連線」與「請求 id」，/docs/design/overview/architec
 
 ### 12.5 這次檢視改掉的四件事
 
-結論已寫進各節：先寫庫、後發事件（§4.1）；`Lagged` 要送 `desync`（§5.3）；媒體的 bytes 與進度不走 RPC（§5.4）；HTTP 帳號也鏡射進 `cache.db`（§5.5）。
+結論已寫進各節：先寫庫、後發事件（§4.1）；`Lagged` 要送 `desync`（§5.3）；媒體的 bytes 不走 RPC、背景下載的進度是節流過的推播（§5.4）；HTTP 帳號也鏡射進 `cache.db`（§5.5）。
 📎 教訓：**把兩條規則寫在同一份文件的不同章節，不代表它們相容**。

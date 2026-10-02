@@ -498,7 +498,7 @@ async fn a_quiet_server_is_a_timeout_but_a_dead_connection_is_a_network_error() 
     ));
 }
 
-// ---- 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1；維護者 2026-09-21：照 WireGuard，安靜才跳、每條線自己一個）----
+// ---- 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1；維護者 2026-10-02：每條線自己一個，每個間隔一定跳）----
 
 use wbf_sdk::link::Heartbeat;
 

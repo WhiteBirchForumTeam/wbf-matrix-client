@@ -259,7 +259,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 為什麼不做一個 `vault.lock`：**它做不到它名字承諾的事。** 請求各自跑，`call()` 一進來就先拿一份
 `Arc<Core>`，所以「把 `Handle.core` 換成一個沒解鎖的」只換得掉**之後**進來的請求 —— 已經拿到舊那份的
-長工作（`sync.recent`、`upload.file`、`media.save_to`…）會繼續用解鎖狀態跑完，而金鑰要等**最後一個**
+長工作（`sync.recent`、`upload.file`、`media.export_to`…）會繼續用解鎖狀態跑完，而金鑰要等**最後一個**
 持有者放手才會被抹掉。那時回 `{ok: true}` 是在說謊，而一個回報成功、邊界卻沒成立的安全操作
 **比明確失敗危險得多**。⭐ 與其做一個「盡量鎖」，不如只留一條真的做得到的路（shutdown）。
 
@@ -361,7 +361,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }`，第一個是正在拉的 | `media_queue` |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, source_uri?, user?, server? }`（`source_uri` 是原檔的 URI，讀的時候優先讀它，/docs/design/rpc-specs/data-plane.md §8.1） | `{ upload_id, mxc, url, headers }`。`url` 是資料平面的 PUT URL（共享 token 加密的「用途 ‖ mxc」），`headers` 是 PUT 時要照抄的（`Wbf-Upload-Meta`：加密的上傳狀態）（/docs/design/rpc-specs/data-plane.md §4） | `create_upload`：有 `room` 就照房間決定加不加密；daemon 沒開資料平面回 100 |
-| `media.save_to` | 同 `media.download` 的三種說法，加 `out: path`、`no_cache?: bool` | `{ out, bytes, source: "local_source"\|"cache"\|"server", hash? }` | `save_media_to`：排隊、等它完成、從池（或本機原檔）複製。`no_cache`：這次下載的複製完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", hash? }` | `export_media_to`：沒有就排、等它完成、**整檔驗過**才寫到 `to`（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
 | `media.stats` | `{ user?, server? }` | `MediaStats` | `media_stats` |
 | `media.gc` | `{ quota_mib?: 2048, protect_days?: 7, user?, server? }` | `MediaGcReport` | `collect_media_garbage` |
 
@@ -396,7 +396,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 - 訂閱是**每條連線一份**，連線關了就沒了。`user` 是這條連線的一個設定：後一次 `subscribe` 帶了就蓋掉前一次的，沒帶就不動。
 - **什麼都沒訂的連線連 `desync` 也不收**：它本來就收不到任何推播，漏了沒有東西可漏。
-- `cancel` 只對長工作有意義（`room.send_file`、`upload.file`、`media.save_to`、`sync.recent`）；
+- `cancel` 只對長工作有意義（`room.send_file`、`upload.file`、`media.export_to`、`sync.recent`）；
   對已經回完的 `id` → `was_running: false`，不是錯誤。
 
 ## 4. 推播（沒有 `id` 的請求，daemon → 前端）
@@ -418,11 +418,10 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 - 推播**要先 `subscribe`**（/docs/design/rpc-specs/local-interface.md §6）。`progress`／`note` 例外：**發出長工作的那條連線自動收到自己請求的**，不必訂——不然每個前端都要多寫一步。
 - 推播是「不用輪詢」，🚫 不是「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
   🚨 **但掉了一定要發 `desync`**：不講的話 UI 永遠不會去重查（它以為自己收齊了）。
-- 🚨 **媒體的進度🚫 不走這裡**（維護者 2026-09-13）：UI 的上傳／下載是**資料平面的 HTTP**（§6），
-  進度就是那個 HTTP 傳輸自己的進度。⭐ 所以 RPC 通道上🚫 沒有 bytes、🚫 沒有每塊一則的進度，
-  它基本上永遠是暢通的。
-  📎 `progress` 只給**daemon 自己在跑的長工作**：路徑版的 `room.send_file`／`upload.file`／
-  `media.save_to`（daemon 讀本機檔，UI 沒有 HTTP 可看）、`sync.recent`、`backup.*`——都是低頻的。
+- 🚨 **媒體的 bytes 🚫 走這裡**（維護者 2026-09-13）：UI 的上傳與播放是**資料平面的 HTTP**（§6），進度就是那個 HTTP 傳輸自己的進度。
+  **背景下載**（2026-10-01）沒有 HTTP 可看，進度走推播 `media.download`：每個檔最多每秒一則＋狀態改變，🚫 每塊一則。
+  ⭐ 所以 RPC 通道上🚫 沒有 bytes、🚫 沒有每塊一則的進度，它基本上永遠是暢通的。
+  📎 `progress` 只給**daemon 自己在跑的長工作**：路徑版的 `room.send_file`／`upload.file`、`sync.recent`、`backup.*`——都是低頻的。
 
 ## 5. code 表（定了就不改）
 
@@ -488,7 +487,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 權威是 /docs/design/rpc-specs/data-plane.md：路徑、用共享 token 加密的 URL、狀態碼、上傳的兩步、續傳、附件宣告、一般 Matrix 的傳統上傳、`GET /media` 的 Range。
 🚨 **媒體本身的 bytes 只走那裡**（維護者 2026-09-30 再確認）：上傳是 UI HTTP `PUT` 給 daemon、下載是 `GET`；
-RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachment` 送事件），🚫 不傳 bytes，進度也不走 RPC（§4）。
+RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachment` 送事件、`media.open` 拿讀的 URL），🚫 不傳 bytes。
+播放中的進度就是那個 GET 收到多少 bytes；背景下載的進度是推播 `media.download`（§4）。
 
 ## 7. 一次完整的例子：Desktop 送一個 2 GB 的影片進 E2EE 房
 
@@ -512,7 +512,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 
 | 缺什麼 | 給誰用 |
 |---|---|
-| 一般 Matrix 帳號的傳統上傳與下載（`/_matrix/media`，/docs/design/rpc-specs/data-plane.md §7） | `media.create`、`media.download`、`media.open`、`media.save_to` |
+| 一般 Matrix 帳號的傳統上傳與下載（`/_matrix/media`，/docs/design/rpc-specs/data-plane.md §7） | `media.create`、`media.download`、`media.open`、`media.export_to` |
 
 ## 9. 明確不做的
 
@@ -557,7 +557,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（/docs/design/rooms/room-sync.md）；一般 Matrix matrix-sdk `/sync` | ✅ wbf：訂閱線由 daemon 自己開、看著、重開（/docs/design/daemon/link-pool.md §3.1），🚫 沒有開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`transport: "http"` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
-| `media.download`／`open`／`queue`／`cancel`、`media.save_to`、`GET /media`、`media.download` 推播 | ✅ `media_ops`／`download_queue`／`media_stream`（/docs/design/media/media-download.md） | **WS** `Download` 線的 `Info`／`Read`＋媒體池＋seek 暫存檔。一般 Matrix 帳號 1100 | ✅ wbf（真 server 驗過）／❌ 一般 server |
+| `media.download`／`open`／`queue`／`cancel`、`media.export_to`、`GET`／`HEAD /media`、`media.download` 推播 | ✅ `media_ops`／`download_queue`／`media_stream`（/docs/design/media/media-download.md） | **WS** `Download` 線的 `Info`／`Read`＋媒體池＋seek 暫存檔。一般 Matrix 帳號 1100 | ✅ wbf（真 server 驗過）／❌ 一般 server |
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，/docs/design/daemon/account-session.md §6） | 🔁 還沒做：搬到 crypto 層＋橋的 `/room_keys` |
 | `recovery.list`／`show` | ✅ | 本機（`<data dir>/r/`） | ✅ |

@@ -940,11 +940,13 @@ async fn download_command(
     // 登入中且沒說 `--no-cache`：走媒體快取（池裡有就不連 server；沒有就排進下載佇列、可續傳），
     // 再從池複製到 `--out`（/docs/design/media/media-download.md §5.5）。下載一律走 WS 的 `Download` 線，`--transport` 不影響這條。
     if !no_cache && context.token_override.is_none() {
-        let result = context
+        let exported = context
             .core()?
-            .save_media_to(&MediaRef::Manifest(manifest), &out, false, &target)
+            .export_media_to(&MediaRef::Manifest(manifest), &out, false, &target)
             .await?;
-        return print_value(&result);
+        let mut output = json_value_of(&exported)?;
+        set_field(&mut output, "out", json!(out.display().to_string()));
+        return print_json(&output);
     }
     if let Some(client) = token_client(context).await {
         return download_with_raw_client(context, client?, &manifest, &out).await;

@@ -3,7 +3,7 @@
 //!
 //! ⚠️ **池裡的東西是加密的**（/docs/design/media/media-pool.md §1）。所以「給前端一個路徑」是錯的：它讀到的是密文，
 //! 而 core 先解密寫到某個路徑就是**明文落地**——整個加密池的意義就沒了（/docs/design/rpc-specs/local-interface.md §8）。
-//! 播放與顯示走資料平面的 URL（`media.open` → `GET /media`，`media_stream.rs`）；這裡唯一的明文落地是使用者明說要放到自己選的位置（[`Core::save_media_to`]）。
+//! 播放與顯示走資料平面的 URL（`media.open` → `GET /media`，`media_stream.rs`）；這裡唯一的明文落地是使用者明說要匯出到自己選的位置（[`Core::export_media_to`]）。
 //!
 //! 下載本身由每帳號一個的下載處理端做（`download_queue.rs`）：這裡只負責「要哪個檔、本地已經有了沒、排進去、等它」。
 
@@ -20,7 +20,7 @@ use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
-use crate::download_queue::{cancelled_error, Downloader, DownloaderParts};
+use crate::download_queue::{Downloader, DownloaderParts};
 use crate::error::{CoreError, CoreErrorKind};
 use crate::event::DownloadState;
 use crate::link_pool::LinkRole;
@@ -106,10 +106,9 @@ pub struct QueuedMedia {
     pub total: u32,
 }
 
-/// `media.save_to` 的結果。
+/// `media.export_to` 的結果（寫到哪由呼叫者自己知道：RPC 回它收到的 URI、CLI 回 `-o`）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct SavedMedia {
-    pub out: String,
+pub struct ExportedMedia {
     pub bytes: u64,
     /// `"local_source"`（本機原檔）、`"cache"`（池裡本來就有）、`"server"`（這次排隊下載的）
     pub source: String,
@@ -199,7 +198,7 @@ impl Core {
     ) -> Result<MediaJob, CoreError> {
         let account = self.account_or_current(target)?;
         let manifest = self.resolve_media(&account, media).await?;
-        self.ensure_queued(&account, manifest, None).await
+        self.ensure_queued(&account, manifest, None, true).await
     }
 
     /// `media.open`：這個檔能不能開來讀、多大、什麼型別；不完整也沒原檔就順便排進佇列（/docs/design/media/media-download.md §7.1）。
@@ -219,7 +218,7 @@ impl Core {
             manifest.block.mimetype.clone(),
             manifest.file_size(),
         );
-        let job = self.ensure_queued(&account, manifest, None).await?;
+        let job = self.ensure_queued(&account, manifest, None, true).await?;
         Ok(OpenedMedia {
             mxc,
             mimetype,
@@ -256,86 +255,120 @@ impl Core {
         Ok(downloader.cancel(mxc))
     }
 
-    /// 另存新檔（`media.save_to`）：**解密寫到 `out`**。本機原檔在就從它複製；池裡沒有就排進佇列、等它完成（/docs/design/media/media-download.md §5.5 最後）。
+    /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.1）：**解密寫到 `to`，整檔驗過才放上去**。
+    /// 本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過，就從池匯出——池裡沒有就排進下載、等它完成。
+    /// 池那條驗大小、整檔 BLAKE3（池檔名就是它）、區塊有帶就再驗 sha256（維護者 2026-10-02：串流不算整檔 hash，匯出要仔細檢查）。
     ///
-    /// ⚠️ 這裡明文落地是**使用者要的**（他指定了 `out`），不是我們偷偷做的——這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
+    /// ⚠️ 這裡明文落地是**使用者要的**（他指定了 `to`），不是我們偷偷做的——這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
     ///
     /// Args:
-    ///     no_cache: true ＝ 這次下載的不留在池裡（池裡本來就有的不動）
+    ///     to: 本機路徑（RPC 那邊先從 `file://` URI 解出來）, example: "C:/Users/me/v.mp4"
+    ///     no_cache: true ＝ 這次為了匯出才下載的不留在池裡（池裡本來就有的不動）
     /// Return:
-    ///     Ok(SavedMedia)
+    ///     Ok(ExportedMedia)
     ///     Err(Usage)       同 [`Core::media_download`]；或下載被取消
-    ///     Err(Integrity)   檔壞了（驗不過）
-    ///     Err(Io)          寫不了 `out`
-    pub async fn save_media_to(
+    ///     Err(Integrity)   檔壞了（池裡那份大小或 hash 對不上：池檔一起丟掉，下次重下）；`to` 🚫 被動過
+    ///     Err(Io)          寫不了 `to`
+    pub async fn export_media_to(
         &self,
         media: &MediaRef,
-        out: &Path,
+        to: &Path,
         no_cache: bool,
         target: &Target,
-    ) -> Result<SavedMedia, CoreError> {
+    ) -> Result<ExportedMedia, CoreError> {
         let account = self.account_or_current(target)?;
         let manifest = self.resolve_media(&account, media).await?;
         let mxc = manifest.mxc.clone();
-        let (done, wait) = tokio::sync::oneshot::channel();
-        let job = self.ensure_queued(&account, manifest, Some(done)).await?;
+        let sha256_hex = manifest.block.sha256.clone();
         let (cache, _me) = self.server_cache_and_me(&account)?;
-        let pool = self.pool_of(&account)?;
+        if sha256_hex.is_some() {
+            let entry = cache.read().await.find_media(&mxc)?;
+            let original = entry
+                .filter(|entry| media::is_same_file(entry, &manifest))
+                .and_then(|entry| open_local_source(&entry).map(|(file, _)| (file, entry)));
+            if let Some((file, entry)) = original {
+                let expected = media::ExpectedContent {
+                    file_size: entry.file_size,
+                    blake3_hex: None,
+                    sha256_hex: sha256_hex.clone(),
+                };
+                match export_blocking(file, to, expected).await {
+                    Ok(bytes) => {
+                        return Ok(ExportedMedia {
+                            bytes,
+                            source: "local_source".to_string(),
+                            hash: entry.hash,
+                        })
+                    }
+                    // 原檔在上傳之後被改過（大小沒變）：改從池匯出。
+                    Err(error) if error.kind == CoreErrorKind::Integrity => {
+                        self.events.progress(format!(
+                            "export {mxc}: the local original no longer matches ({}); exporting from the pool",
+                            error.message
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let job = self
+            .ensure_queued(&account, manifest, Some(done), false)
+            .await?;
         let source = match job.state {
-            DownloadState::LocalSource => "local_source",
             DownloadState::Complete => "cache",
             _ => {
-                wait.await.map_err(|_| cancelled_error(&mxc))??;
+                wait.await.map_err(|_| {
+                    CoreError::new(
+                        CoreErrorKind::Io,
+                        format!("the downloader stopped before {mxc} was complete (logged out?)"),
+                    )
+                })??;
                 "server"
             }
         };
+        let pool = self.pool_of(&account)?;
         let entry = cache.read().await.find_media(&mxc)?.ok_or_else(|| {
             CoreError::new(
                 CoreErrorKind::Io,
                 format!("the media row of {mxc} vanished"),
             )
         })?;
-        let out_path = out.to_path_buf();
-        let bytes = match source {
-            "local_source" => {
-                let (file, _) = open_local_source(&entry).ok_or_else(|| {
-                    CoreError::new(
-                        CoreErrorKind::Io,
-                        "the local original went away while copying",
-                    )
-                })?;
-                copy_to(file, out_path).await?
-            }
-            _ => {
-                let reader = media::open_complete(&pool, &entry).ok_or_else(|| {
-                    CoreError::new(
-                        CoreErrorKind::Io,
-                        format!("{mxc} is not complete in the pool"),
-                    )
-                })?;
-                let mxc_here = mxc.clone();
-                cache.post(
-                    move |cache| cache.touch_media(&mxc_here).map(|_| ()),
-                    Vec::new(),
-                );
-                copy_to(reader, out_path).await?
-            }
+        let reader = media::open_complete(&pool, &entry).ok_or_else(|| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("{mxc} is not complete in the pool"),
+            )
+        })?;
+        let expected = media::ExpectedContent {
+            file_size: entry.file_size,
+            blake3_hex: entry.pool_file.clone(),
+            sha256_hex,
         };
+        let exported = export_blocking(reader, to, expected).await;
+        if let Err(error) = &exported {
+            if error.kind == CoreErrorKind::Integrity {
+                // 池裡那份對不上自己的名字或區塊：它是壞的，丟掉，下次重下。
+                self.drop_from_pool(&account, &mxc).await?;
+            }
+        }
+        let bytes = exported?;
+        let mxc_here = mxc.clone();
+        cache.post(
+            move |cache| cache.touch_media(&mxc_here).map(|_| ()),
+            Vec::new(),
+        );
         if no_cache && source == "server" {
             self.drop_from_pool(&account, &mxc).await?;
         }
-        Ok(SavedMedia {
-            out: out.display().to_string(),
+        Ok(ExportedMedia {
             bytes,
             source: source.to_string(),
-            hash: match source {
-                "local_source" => None,
-                _ => entry.hash,
-            },
+            hash: entry.hash,
         })
     }
 
-    /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.save_to` 走 [`Core::save_media_to`]）。
+    /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.export_to` 走 [`Core::export_media_to`]）。
     ///
     /// 🚫 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
     /// （/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
@@ -456,19 +489,32 @@ impl Core {
     }
 
     /// 本地已經有了就回那個狀態；沒有就排進佇列（/docs/design/media/media-download.md §5.3 的表）。
+    /// 列說的跟這次的區塊對不上（大小、塊大小、sha256，維護者 2026-10-02 照 PR #14）就丟掉重來，🚫 照用。
     ///
     /// Args:
     ///     waiter: 要等它結束的話給一個；`complete`／`local_source` 時直接丟掉（呼叫者看 `state` 就知道不用等）
+    ///     local_source_counts: false ＝ 本機原檔不算「已經有了」（匯出時原檔驗不過，要池裡那份）
+    /// Return:
+    ///     Ok(MediaJob)
+    ///     Err(Usage)   列對不上，而這個檔正在用舊的描述下載：等它停了再來
     pub(crate) async fn ensure_queued(
         &self,
         account: &AccountDir,
         manifest: Manifest,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), CoreError>>>,
+        local_source_counts: bool,
     ) -> Result<MediaJob, CoreError> {
         let (cache, _me) = self.server_cache_and_me(account)?;
         let pool = self.pool_of(account)?;
-        let entry = cache.read().await.find_media(&manifest.mxc)?;
+        let mut entry = cache.read().await.find_media(&manifest.mxc)?;
         let mxc = manifest.mxc.clone();
+        if entry
+            .as_ref()
+            .is_some_and(|entry| !media::is_same_file(entry, &manifest))
+        {
+            self.forget_old_description(account, &manifest).await?;
+            entry = None;
+        }
         if let Some(entry) = &entry {
             let total =
                 wbf_sdk::chunk_crypto::chunk_count(entry.file_size, entry.chunk_size).unwrap_or(0);
@@ -480,7 +526,7 @@ impl Core {
                     total,
                 });
             }
-            if open_local_source(entry).is_some() {
+            if local_source_counts && open_local_source(entry).is_some() {
                 return Ok(MediaJob {
                     mxc,
                     state: DownloadState::LocalSource,
@@ -609,7 +655,32 @@ impl Core {
             .collect()
     }
 
-    /// `no_cache`：這次為了另存才下載的，不留在池裡。還有別的 mxc 指著同一個池檔、或有人正在讀它，就只清這一列。
+    /// 列說的跟這次的區塊不一樣：丟掉本地的一切、列換成這次的描述（`media::forget_for_new_description`）。
+    /// 那個檔正開著（下載處理端正在用舊的描述寫）就🚫 動，回 Usage。
+    async fn forget_old_description(
+        &self,
+        account: &AccountDir,
+        manifest: &Manifest,
+    ) -> Result<(), CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let pool = self.pool_of(account)?;
+        let in_use = self.list_media_in_use(&account.server_dir());
+        let manifest_here = manifest.clone();
+        cache
+            .run(move |cache| {
+                let pending_name = cache.media_pending_name(&manifest_here.mxc)?;
+                if pending_name.is_some_and(|name| in_use.contains(&name)) {
+                    return Err(wbf_sdk::SdkError::Usage(format!(
+                        "{} is being downloaded under another description; try again when it stops",
+                        manifest_here.mxc
+                    )));
+                }
+                media::forget_for_new_description(cache, &pool, &manifest_here)
+            })
+            .await
+    }
+
+    /// `no_cache`：這次為了匯出才下載的，不留在池裡。還有別的 mxc 指著同一個池檔、或有人正在讀它，就只清這一列。
     async fn drop_from_pool(&self, account: &AccountDir, mxc: &str) -> Result<(), CoreError> {
         let (cache, _me) = self.server_cache_and_me(account)?;
         let pool = self.pool_of(account)?;
@@ -631,26 +702,19 @@ impl Core {
     }
 }
 
-/// 把一個 `Read` 整個複製到新檔 `out`（在 blocking 執行緒上做：大檔會讀很久）。失敗刪掉半成品。
-async fn copy_to<R: std::io::Read + Send + 'static>(
-    mut source: R,
-    out: std::path::PathBuf,
+/// `media::export_verified` 放到 blocking 執行緒上做（大檔會讀很久）。
+async fn export_blocking<R: std::io::Read + Send + 'static>(
+    source: R,
+    to: &Path,
+    expected: media::ExpectedContent,
 ) -> Result<u64, CoreError> {
-    tokio::task::spawn_blocking(move || {
-        let copied = (|| {
-            let mut file = std::fs::File::create(&out)?;
-            let bytes = std::io::copy(&mut source, &mut file)?;
-            std::io::Write::flush(&mut file)?;
-            file.sync_all()?;
-            Ok::<u64, std::io::Error>(bytes)
-        })();
-        if copied.is_err() {
-            let _ = std::fs::remove_file(&out);
-        }
-        copied.map_err(CoreError::from)
-    })
-    .await
-    .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("the copy task died: {error}")))?
+    let to = to.to_path_buf();
+    tokio::task::spawn_blocking(move || media::export_verified(source, &to, &expected))
+        .await
+        .map_err(|error| {
+            CoreError::new(CoreErrorKind::Io, format!("the export task died: {error}"))
+        })?
+        .map_err(CoreError::from)
 }
 
 fn now_millis() -> i64 {

@@ -75,8 +75,10 @@ enum DownloadRequest {                      // 例：Download 線（core 的 dow
 
 **逾時看的是整條線，🚫 不是單一個請求**（維護者 2026-10-02：「逾時應該是沒收到回應」）：有請求在等、而一段時間內這條線一個回應都沒收到，在途的才全部交回 `Timeout`；
 線還在回應（例：很多檔交替回塊），排得再後面的請求也🚫 逾時。計時從「上一次收到回應」算，線從「沒有請求在等」變成「有」的那一刻也算起點。
-多久算沒回應由擁有者給（`Download` 是 60 秒，跟 server 的 `wbf_ws_idle_timeout` 一樣）；線真的死了不用等它——心跳 34 秒內就關線、在途的收到 `Network`（/docs/design/daemon/ws-receive-dispatch.md §5.1）。
-等回應的那一方（例：GET 等一塊）🚫 另外自己限時。
+多久算沒回應由擁有者給（`Download` 是 60 秒，跟 server 的 `wbf_ws_idle_timeout` 一樣，wbfuwunel #103，2026-10-02）；線真的死了不用等它——心跳 34 秒內就關線、在途的收到 `Network`（/docs/design/daemon/ws-receive-dispatch.md §5.1）。
+等回應的那一方（例：GET 等一塊）🚫 另外自己限時。送了第幾次也🚫 記在線上：重不重送是擁有者的事，它自己記（下載記在在途表那一筆）。
+⚠️ 已知邊界（PR #69 審查，三位都判 🟢）：「上一次收到回應」是在等回覆的小 task 排到時才記，所以一個剛好在滿 60 秒那一瞬間到的回覆可能被判逾時——
+後果是那個請求多送一次、晚到的回覆變無主（每個請求仍然恰好交回一次）。
 | `Server`（拒絕、NotFound、Forbidden…） | 不重送。交給上層（下載：壞檔或沒權限，job 移除） |
 | 回覆的內容驗不過（AEAD、長度） | 重送一次；還是不行就交給上層（下載：壞檔，/docs/design/media/media-download.md §3.3） |
 

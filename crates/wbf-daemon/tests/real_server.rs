@@ -495,7 +495,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
 /// | 明文房：建檔 → PUT → 送附件（帶 manifest） | URL 是 `e-` 加密的、看不出 mxc；區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
 /// | 加密房：建檔 → PUT → 送附件（帶 `room_devices`） | 區塊有金鑰；送出去的是密文、附件在同一個請求宣告 |
 /// | 同一個 URL 傳完再 PUT 一次 | 🚫 不是 200：server 已經收掉這個上傳 |
-/// | `media.save_to` 那份 manifest | 從 server 拉回來、解開，跟 PUT 的 bytes 一樣 |
+/// | `media.export_to` 那份 manifest | 從 server 拉回來、解開、整檔驗過，跟 PUT 的 bytes 一樣 |
 /// | `room.files`（`both`） | 加密房那則解得開、認得出是檔案、mxc 對得上 |
 /// | 加密房串流（沒給大小） | 傳完拿到真的大小，送得出去 |
 #[tokio::test]
@@ -603,13 +603,21 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
 
     // 拉回來解開，跟送出去的一樣。
     let out = dir.path().join("secret.out");
+    let out_uri = format!(
+        "file:///{}",
+        out.display()
+            .to_string()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
     let saved = client
         .call(
-            "media.save_to",
-            json!({ "manifest": manifest, "out": out.display().to_string() }),
+            "media.export_to",
+            json!({ "manifest": manifest, "to": out_uri }),
         )
         .await;
-    assert_eq!(saved["code"], 0, "media.save_to: {saved}");
+    assert_eq!(saved["code"], 0, "media.export_to: {saved}");
+    assert_eq!(saved["result"]["to"], out_uri);
     assert_eq!(std::fs::read(&out).unwrap(), body, "解回來要一模一樣");
 
     // 加密房那則：解得開、認得出是檔案、指著同一個 mxc。

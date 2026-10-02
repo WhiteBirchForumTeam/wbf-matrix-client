@@ -1171,6 +1171,40 @@ impl Cache {
         Ok(())
     }
 
+    /// 這個 mxc 換一份描述、從頭來（`media::forget_for_new_description`，/docs/design/media/media-download.md §5.3）：
+    /// 檔名、型別、hash、大小、塊大小換成這次區塊的，下載進度清掉。`INSERT OR IGNORE` 不會蓋掉舊的描述，所以要這一支。
+    ///
+    /// Args:
+    ///     block_sha256_hex: 區塊帶的 sha256, example: Some("9f86d0…")
+    /// Return:
+    ///     Ok(())
+    ///     Err(Io)   DB 寫不了
+    pub fn media_redescribe(
+        &mut self,
+        mxc: &str,
+        name: Option<&str>,
+        mimetype: Option<&str>,
+        block_sha256_hex: Option<&str>,
+        file_size: u64,
+        chunk_size: u32,
+    ) -> Result<(), SdkError> {
+        self.connection
+            .execute(
+                "UPDATE media SET name = ?2, mimetype = ?3, hash = ?4, file_size = ?5, chunk_size = ?6,
+                     pool_file = NULL, complete = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
+                params![
+                    mxc,
+                    name,
+                    mimetype,
+                    block_hash(block_sha256_hex),
+                    file_size as i64,
+                    chunk_size as i64
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
     /// 還有幾個 `media` 列指著這個池檔（去重過的檔刪之前要問）。
     pub fn media_references(&self, pool_file: &str) -> Result<u64, SdkError> {
         self.connection
@@ -2610,7 +2644,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(attachment.mxc, "mxc://localhost/bbbb");
-        assert!(cache.find_event_attachment(BOB, "!r", "$f2").unwrap().is_none());
+        assert!(cache
+            .find_event_attachment(BOB, "!r", "$f2")
+            .unwrap()
+            .is_none());
         assert!(cache
             .find_event_attachment(ALICE, "!elsewhere", "$f2")
             .unwrap()
@@ -2621,7 +2658,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            cache.find_media_by_pending_name(&name).unwrap().unwrap().mxc,
+            cache
+                .find_media_by_pending_name(&name)
+                .unwrap()
+                .unwrap()
+                .mxc,
             "mxc://localhost/aaaa"
         );
         for junk in ["", "m", "1", "m-1", "mx1", "m1.seek", "m99999"] {

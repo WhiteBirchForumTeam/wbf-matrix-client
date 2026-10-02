@@ -1,14 +1,15 @@
 //! `upload.*`、`media.*`、`server.ping`（/docs/design/rpc-specs/rpc-spec.md §3.5、§3.6、§3.8）。
 //!
 //! `media.create` 只建檔、鑄 URL：bytes 走資料平面的 PUT（`data_plane.rs`，/docs/design/rpc-specs/data-plane.md）。
-//! 下載是每帳號一條佇列（/docs/design/media/media-download.md）：`media.download` 排、`media.open` 排並鑄讀的 URL（`GET /media`）、
-//! `media.queue` 問、`media.cancel` 停；`media.save_to` 也排隊。
+//! 下載是每帳號一個下載處理端（/docs/design/media/media-download.md）：`media.download` 排、`media.open` 排並鑄讀的 URL（`GET /media`）、
+//! `media.queue` 問、`media.cancel` 停；`media.export_to` 沒有就排、等完成、整檔驗過才寫到 UI 給的 URI。
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use wbf_core::{Core, MediaRef, NewUpload, SyncMode, UploadRequest};
+use wbf_core::{Core, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest};
+use wbf_sdk::local_source::local_path_of_file_uri;
 use wbf_sdk::Manifest;
 
 use super::{
@@ -281,30 +282,46 @@ pub(super) async fn media_cancel(handle: &Handle, core: &Core, params: Value) ->
     Ok(json!({ "cancelled": cancelled }))
 }
 
-/// 明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。排隊下載、等它完成、再從池（或本機原檔）複製；
-/// `no_cache` 也排隊，只是這次下載的不留在池裡（/docs/design/media/media-download.md §5.5）。
-pub(super) async fn media_save_to(handle: &Handle, core: &Core, params: Value) -> Outcome {
+/// 匯出（/docs/design/media/media-download.md §7.1）：明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。
+/// `to` 是 URI，意義跟 `media.create` 的 `source_uri` 同一套（/docs/design/rpc-specs/data-plane.md §8.1）：現在只收 `file://`；
+/// `http://`（daemon 用 PUT 丟給 UI，維護者 2026-10-02）之後才做。
+pub(super) async fn media_export_to(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
         #[serde(flatten)]
         media: MediaRefParams,
-        out: PathBuf,
+        to: String,
         #[serde(default)]
         no_cache: bool,
         #[serde(flatten)]
         target: TargetParams,
     }
+    #[derive(Serialize)]
+    struct Exported<'a> {
+        to: &'a str,
+        #[serde(flatten)]
+        media: ExportedMedia,
+    }
     let params: Params = parse_params(params)?;
+    let Some(path) = local_path_of_file_uri(&params.to) else {
+        return Err(invalid_params(format!(
+            "to must be a file:// URI (http:// is not supported yet): {}",
+            params.to
+        )));
+    };
     let media = media_ref_of(handle, core, params.media, &params.target).await?;
-    to_result(
-        core.save_media_to(
+    let exported = core
+        .export_media_to(
             &media,
-            &params.out,
+            &path,
             params.no_cache,
             &handle.target(&params.target),
         )
-        .await?,
-    )
+        .await?;
+    to_result(Exported {
+        to: &params.to,
+        media: exported,
+    })
 }
 
 pub(super) async fn server_ping(handle: &Handle, core: &Core, params: Value) -> Outcome {
