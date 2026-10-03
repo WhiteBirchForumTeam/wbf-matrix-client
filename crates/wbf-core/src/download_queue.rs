@@ -1925,7 +1925,9 @@ mod tests {
     async fn stopping_the_downloader_releases_what_it_was_writing() {
         let (core, account, server, manifest) = uploaded("dq-stop").await;
         hold_reads(&server).await;
-        // 讓唯一寫入者忙一下：處理端認領之後卡在建列那一步（還不在 `open` 裡），這時收掉它也要放掉認領。
+        // 處理端先起好（第一次起會用唯一寫入者掃一次池），再讓唯一寫入者忙一下：
+        // 處理端認領之後卡在建列那一步（還不在 `open` 裡），這時收掉它也要放掉認領。
+        core.downloader_of(&account).await.unwrap();
         let (cache, _) = core.server_cache_and_me(&account).unwrap();
         cache.post(
             |_| {
