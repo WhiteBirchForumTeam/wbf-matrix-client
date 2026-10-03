@@ -9,7 +9,6 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use wbf_sdk::chunk_crypto::expected_plain_len;
 use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media;
@@ -85,38 +84,31 @@ impl MediaStream {
                 downloader,
                 manifest,
             } => {
-                let chunk_size = u64::from(manifest.block.chunk_size);
-                let index = u32::try_from(self.position / chunk_size).map_err(|_| {
-                    CoreError::new(CoreErrorKind::Usage, "position is past the last chunk")
-                })?;
-                let plain = downloader.read_chunk(manifest.clone(), index).await?;
-                // 切片照這份描述的塊大小：拿回來的塊不是這個長度，就是照別的大小切的，切下去會是位置錯的明文。
-                // 處理端已經檢查過（`process_seek`），這裡是消費端自己再問一次。
-                let expected =
-                    expected_plain_len(manifest.file_size(), manifest.block.chunk_size, index);
-                if expected != Some(plain.len()) {
+                // 只交 byte 位置：是哪一塊、從哪裡開始，照處理端手上那個檔驗過的切法，🚫 照描述自己算。
+                let piece = downloader
+                    .read_piece_at(manifest.clone(), self.position)
+                    .await?;
+                // 消費端自己再核一次：回來的那一塊真的涵蓋這個位置。
+                let covers = self
+                    .position
+                    .checked_sub(piece.start)
+                    .filter(|from| *from < piece.plain.len() as u64);
+                let Some(from) = covers else {
                     return Err(CoreError::new(
                         CoreErrorKind::Integrity,
                         format!(
-                            "chunk {index} came back with {} bytes, this description cuts it to {expected:?}",
-                            plain.len()
+                            "the chunk at {} ({} bytes) does not cover position {}",
+                            piece.start,
+                            piece.plain.len(),
+                            self.position
                         ),
                     ));
-                }
-                let chunk_start = u64::from(index) * chunk_size;
-                let from = (self.position - chunk_start) as usize;
-                let to = ((self.end - chunk_start) as usize).min(plain.len());
-                plain
-                    .get(from..to)
-                    .ok_or_else(|| {
-                        CoreError::new(
-                            CoreErrorKind::Integrity,
-                            format!(
-                                "chunk {index} has {} bytes, wanted {from}..{to}",
-                                plain.len()
-                            ),
-                        )
-                    })?
+                };
+                let to = (self.end - piece.start).min(piece.plain.len() as u64);
+                piece
+                    .plain
+                    .get(from as usize..to as usize)
+                    .unwrap_or_default()
                     .to_vec()
             }
         };
@@ -220,7 +212,7 @@ impl Core {
             let downloader = self.downloader_of(&reader_account).await?;
             return Ok(Some(MediaSource {
                 mxc: mxc.to_string(),
-                size: manifest.file_size(),
+                size: entry.file_size,
                 mimetype: mimetype.or_else(|| manifest.block.mimetype.clone()),
                 origin: Origin::Chunks {
                     downloader,
