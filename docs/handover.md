@@ -1,11 +1,11 @@
 # 交接：現在在哪、怎麼跑、下一步
 
-> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-10-01）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
+> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-10-04）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
 > 這裡只講**現況、怎麼跑、坑、下一步**。每一支 PR 做了什麼看 git 歷史與 Forgejo 上的 PR，這裡不重述。
 
 ## 1. 現況
 
-PR #1–#68 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照層次：
+PR #1–#69 合併（main `199a88a`，2026-10-04）；#43（走橋的 GetEvent）是 2026-09-16 關掉、沒合——「跳到訊息」等 wbfuwunel #64 合了再開一支。已經能用的，照層次：
 
 - **線上協議與媒體**：`wbf-wire` 的 codec 對著 server 的黃金向量；`wbf-sdk` 的分塊上傳／下載／seek／續傳／串流、每塊 AEAD（`/docs/design/media/wbf-client-convention-for-chunk.md`）。
 - **本地資料**：vault 與子金鑰、資料目錄兩層路徑加密（`/docs/design/storage/vault-and-keys.md`）；`cache.db` 一個 server 一份、多帳號混存、單一寫入者（`/docs/design/storage/local-cache-db.md`、`/docs/design/daemon/daemon-runtime.md` §2）；
@@ -235,7 +235,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 | **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 排在 §7 第 1 項 | 加密房送檔（路徑版）仍拒，資料平面那條可以；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
 | 交叉簽章沒 bootstrap | client 還沒接；server 的橋都有了（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`／`0x25`，驗證訊息走 to-device） | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
-| PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（`Recent` 收 `before_event_id`） | 跳到訊息還是兩個來回 |
+| 跳到訊息的錨點（PR #43 走橋 GetEvent，2026-09-16 關掉、沒合） | 等 wbfuwunel #64（`Recent` 收 `before_event_id`），合了再開一支 | 跳到訊息還是兩個來回 |
 | server 批 3、批 4 的新 kind 沒接（0x12／0x15／0x1C／0x1D、0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加；沒有破壞性改動、向量檔沒變 | 推播規則、搜尋、目錄、TURN 都還沒有。做的時候先讀 #55 列的十個坑 |
 | 斷線後 `recent` 不自動續 | 命令 exit，下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪 |
 | core 層測「成功路徑」的假 wbf server 還不全 | core 的 `test_support` 會答訂閱、Device、橋的 Members／GetStateEvent／Keys*／SendToDevice、`Event/Send` | 探測成功、`watch`、`log_in` 的探測接點只有 `--ignored` 的真 server 測試走得到 |
@@ -244,6 +244,10 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
+0. **#69 審查延後的三件**（oliver #821／#822、rumia #823；維護者同意另開一支）：
+   - GET 用自己那份描述的 `chunk_size` 切片（`crates/wbf-core/src/media_stream.rs`），讀回來的塊是另一份描述的大小時會吐出位置錯的明文；`find_media_source` 要先過 `media::is_same_file`、對不上換下一個帳號；只為 seek 開的檔驗不過🚫 刪。
+   - 只為 seek 開著的檔一直握著認領（要超過 `SEEK_ONLY_OPEN` 才關），同 server 別的帳號下載同一個檔會一直等認領。
+   - 舊的下載處理端被串流中的 GET 留住，之後收掉時可能放掉同帳號新處理端的認領（認領的值只有 user）。
 1. **其他四條線送收分開**（`/docs/design/daemon/link-requests.md` §8：`Misc` → `Upload` → `Rooms`／`Keys`）：現在除了 `Download`，
    每條線一次只跑一個命令（借線的人握著那格的鎖、原地等回覆），例如一次送 10 則訊息就是「發收發收…」（維護者 2026-10-02：「先只改 download」，其他的另開）。
 2. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
@@ -251,7 +255,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 4. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
-之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
+之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；「跳到訊息」等 wbfuwunel #64（#43 已關）；server 批 3／4 的功能（#55）；
 下載的暫停（只停主檔、🚫 不停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
 UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
