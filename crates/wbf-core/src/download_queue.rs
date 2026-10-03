@@ -5,14 +5,14 @@
 //! - **動作封在請求裡**：塊請求（[`DownloadRequest`]）就是它的動作。回覆到了，處理端照它與在途表裡掛著的人（主檔、在等的 GET）決定落到哪；
 //!   主檔第 n 塊落地才塞第 n+1 塊。seek 的請求插到發送 queue 最前面（§6.2）。同一個請求🚫 送兩次：第二個要的人掛上去（§6.3）。
 //! - **`downloading` 表**放取消旗標與進度（§5.2）：處理 job 時放進去，最後一塊落地、失敗、或看到旗標時由處理端自己拿掉；`media.queue`／推播直接讀它。
-//! - **主檔與暫存檔只有一個寫入者**：落地都在這一個 task 裡做；同一台 server 的帳號共用池，所以開檔前先在 [`MediaClaims`] 認領，
-//!   別的帳號正在寫它，這個 job 放進「等認領」，每秒再試；seek 交給認領的那個帳號（`media_stream.rs` 的 `find_writer_of`）。
+//! - **主檔與暫存檔只有一個寫入者**：落地都在這一個 task 裡做；同一台 server 的帳號共用池，所以開檔前先在 [`MediaClaims`] 認領（認的是處理端，不只帳號），
+//!   別的處理端正在寫它，這個 job 放進「等認領」、留下記號，對方放掉時馬上再試（只為 seek 開著的會讓出來）；seek 交給認領的那個帳號（`media_stream.rs` 的 `find_writer_of`）。
 //!
 //! 塊怎麼驗、怎麼落地是 sdk 的 `MediaDownload`；這裡只管「誰、何時、做到哪」。DB 一律經 `ServerCache`（唯一寫入者）。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -123,44 +123,132 @@ impl Shared {
     }
 }
 
-/// 同一台 server（server dir）的同一個 mxc 現在由哪個帳號的處理端在寫。
+/// 認領的主人：哪個帳號（GET 照它找處理端，`find_writer_of`）、哪一個處理端。
+/// 同一個帳號重登之後新舊兩個處理端可能同時活著（舊的被串流中的 GET 留住）：只認帳號的話兩個都能寫同一個檔、也會互相放掉對方的認領。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimHolder {
+    pub user: String,
+    /// 每起一個處理端拿一個新號（[`MediaClaims::new_holder`]）
+    pub handler: u64,
+}
+
+/// 開檔是為了什麼（/docs/design/media/media-download.md §5.1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaimFor {
+    /// job：認領不到就留下「在等」的記號，只為 seek 開著它的處理端看到就讓出來
+    Download,
+    /// 只為 GET 要的塊開：別的處理端的 job 在等它，就🚫 搶回來（不然讓出來的馬上又被播放器拿回去）
+    Seek,
+}
+
+/// 「在等」的記號留多久：等的那個 job 每 `CLAIM_RETRY` 重試一次就延長；job 取消、帳號登出就不再延長，自己過期，🚫 要誰記得清。
+const CLAIM_WANTED_FOR: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct ClaimTable {
+    held: HashMap<(PathBuf, String), ClaimHolder>,
+    /// 認領不到、在等的 job：哪個處理端、記號到什麼時候
+    wanted: HashMap<(PathBuf, String), (u64, Instant)>,
+}
+
+/// 同一台 server（server dir）的同一個 mxc 現在由哪個處理端在寫。
 #[derive(Default)]
 pub(crate) struct MediaClaims {
-    held: Mutex<HashMap<(PathBuf, String), String>>,
+    table: Mutex<ClaimTable>,
+    next_handler: AtomicU64,
+    /// 有人放掉認領：等認領的 job 馬上重試。
+    released: Notify,
+    /// 有 job 認領不到、留了記號：只為 seek 開著那個檔的處理端看要不要讓。
+    /// 跟 `released` 分開：兩個處理端都在等別人的檔時，「我認領不到」去叫對方重試、對方又叫回來，會空轉。
+    asked_to_yield: Notify,
 }
 
 impl MediaClaims {
-    fn held(&self) -> MutexGuard<'_, HashMap<(PathBuf, String), String>> {
-        self.held
+    fn table(&self) -> MutexGuard<'_, ClaimTable> {
+        self.table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Return:
-    ///     bool  true ＝ 認領到了（本來沒人、或本來就是自己）；false ＝ 別的帳號正在寫
-    fn claim(&self, server_dir: &Path, mxc: &str, user: &str) -> bool {
-        let mut held = self.held();
-        let holder = held
-            .entry((server_dir.to_path_buf(), mxc.to_string()))
-            .or_insert_with(|| user.to_string());
-        holder == user
+    /// 起一個處理端時拿它的認領身分。
+    ///
+    /// Args:
+    ///     user: 這個處理端的帳號, example: "@alice:localhost"
+    pub(crate) fn new_holder(&self, user: &str) -> ClaimHolder {
+        ClaimHolder {
+            user: user.to_string(),
+            handler: self.next_handler.fetch_add(1, Ordering::SeqCst),
+        }
     }
 
-    fn release(&self, server_dir: &Path, mxc: &str, user: &str) {
-        let mut held = self.held();
+    /// Return:
+    ///     bool  true ＝ 認領到了（本來沒人、或本來就是這個處理端）；
+    ///           false ＝ 別的處理端正在寫（`Download` 就留下「在等」的記號），或（`Seek`）別的處理端的 job 在等它
+    fn claim(&self, server_dir: &Path, mxc: &str, holder: &ClaimHolder, purpose: ClaimFor) -> bool {
         let key = (server_dir.to_path_buf(), mxc.to_string());
-        if held.get(&key).is_some_and(|holder| holder == user) {
-            held.remove(&key);
+        let now = Instant::now();
+        let mut table = self.table();
+        if let Some(current) = table.held.get(&key) {
+            let mine = current.handler == holder.handler;
+            if !mine && purpose == ClaimFor::Download {
+                table
+                    .wanted
+                    .insert(key, (holder.handler, now + CLAIM_WANTED_FOR));
+                drop(table);
+                self.asked_to_yield.notify_waiters();
+            }
+            return mine;
         }
+        let wanted_by_another = table
+            .wanted
+            .get(&key)
+            .is_some_and(|(handler, until)| *handler != holder.handler && *until > now);
+        if purpose == ClaimFor::Seek && wanted_by_another {
+            return false;
+        }
+        if !wanted_by_another {
+            table.wanted.remove(&key);
+        }
+        table.held.insert(key, holder.clone());
+        true
+    }
+
+    /// 只有認領它的那個處理端放得掉。
+    fn release(&self, server_dir: &Path, mxc: &str, holder: &ClaimHolder) {
+        let key = (server_dir.to_path_buf(), mxc.to_string());
+        let released = {
+            let mut table = self.table();
+            let mine = table
+                .held
+                .get(&key)
+                .is_some_and(|current| current.handler == holder.handler);
+            if mine {
+                table.held.remove(&key);
+            }
+            mine
+        };
+        if released {
+            self.released.notify_waiters();
+        }
+    }
+
+    /// 別的處理端的 job 在等這個檔嗎（記號還沒過期）。
+    fn is_wanted_by_another(&self, server_dir: &Path, mxc: &str, holder: &ClaimHolder) -> bool {
+        let key = (server_dir.to_path_buf(), mxc.to_string());
+        self.table()
+            .wanted
+            .get(&key)
+            .is_some_and(|(handler, until)| *handler != holder.handler && *until > Instant::now())
     }
 
     /// Return:
     ///     Some(user)  正在寫它的帳號
     ///     None        沒人在寫
     pub(crate) fn find_holder(&self, server_dir: &Path, mxc: &str) -> Option<String> {
-        self.held()
+        self.table()
+            .held
             .get(&(server_dir.to_path_buf(), mxc.to_string()))
-            .cloned()
+            .map(|holder| holder.user.clone())
     }
 }
 
@@ -278,7 +366,7 @@ impl Downloader {
             seeks: seek_inbox,
             replies,
             line,
-            user: parts.user,
+            holder: parts.claims.new_holder(&parts.user),
             server_dir: parts.server_dir,
             media_pool: parts.media_pool,
             cache: parts.cache,
@@ -457,6 +545,12 @@ impl Downloader {
         answer.await.map_err(|_| downloader_gone())?
     }
 
+    /// 收掉處理端（登出、換 session）。從表裡拿掉還不夠：串流中的 GET 握著另一個 `Arc`，只等 drop 的話舊處理端會一直活著——
+    /// 它的線已經關了，GET 要的塊永遠等不到；它開著的檔也不在掃描的保護名單上。收掉之後 GET 立刻拿到錯、斷線，播放器重要時找到新的處理端。
+    pub(crate) fn stop(&self) {
+        self.task.abort();
+    }
+
     /// 處理端現在開著的主檔暫存名（掃描用）。
     pub(crate) fn list_open_names(&self) -> HashSet<String> {
         self.shared.state().open_names.clone()
@@ -501,6 +595,14 @@ fn downloader_gone() -> CoreError {
     )
 }
 
+/// GET 帶來的描述跟處理端手上那個檔的切法（大小、塊大小）不一樣。
+fn description_mismatch(mxc: &str) -> CoreError {
+    CoreError::new(
+        CoreErrorKind::Integrity,
+        format!("this description of {mxc} does not match the local copy (size or chunk size); the copy is kept"),
+    )
+}
+
 pub(crate) fn cancelled_error(mxc: &str) -> CoreError {
     CoreError::new(
         CoreErrorKind::Usage,
@@ -534,7 +636,8 @@ struct DownloadHandler {
     /// 線交回來的回覆（每個送出的塊請求恰好一個）。
     replies: mpsc::UnboundedReceiver<LineReply<DownloadRequest>>,
     line: RequestLine<DownloadRequest>,
-    user: String,
+    /// 這個處理端的認領身分（`user` 就是它的帳號）
+    holder: ClaimHolder,
     server_dir: PathBuf,
     media_pool: MediaPool,
     cache: Arc<ServerCache>,
@@ -561,6 +664,7 @@ impl DownloadHandler {
             {
                 self.retry_claims().await;
             }
+            self.yield_wanted_seek_only();
             let wait = self
                 .next_claim_retry
                 .map(|due| due.saturating_duration_since(Instant::now()))
@@ -576,6 +680,14 @@ impl DownloadHandler {
                     None => break,
                 },
                 _ = self.shared.wake.notified() => {}
+                // 有人放掉認領：在等認領的 job 馬上重試，🚫 等到下一秒。
+                _ = self.claims.released.notified() => {
+                    if self.next_claim_retry.is_some() {
+                        self.next_claim_retry = Some(Instant::now());
+                    }
+                }
+                // 有 job 在等某個檔：醒來走一輪，上面的 `yield_wanted_seek_only` 看要不要讓。
+                _ = self.claims.asked_to_yield.notified() => {}
                 _ = tokio::time::sleep(wait) => {}
             }
         }
@@ -649,8 +761,21 @@ impl DownloadHandler {
             self.end_job(&mxc, JobEnd::Complete);
             return;
         }
+        // 只為 seek 開著、用的是另一則事件的描述：關掉（留著、🚫 刪）再用這個 job 自己那份開。
+        // job 跑的檔一律用 job 的描述——驗不過才能確定是檔壞了（`is_job_running`）。
+        let opened_with_another = self
+            .open
+            .get(&mxc)
+            .is_some_and(|opened| opened.download.manifest() != job.manifest.as_ref());
+        if opened_with_another {
+            let error = CoreError::new(
+                CoreErrorKind::AccountBusy,
+                format!("{mxc} was reopened for a download; try again"),
+            );
+            self.fail_media(&mxc, error, false);
+        }
         if !self.open.contains_key(&mxc) {
-            match self.open_media(&job.manifest).await {
+            match self.open_media(&job.manifest, ClaimFor::Download).await {
                 Ok(true) => {}
                 Ok(false) if self.is_cancelled_while_preparing(&mxc) => {
                     self.end_job(&mxc, JobEnd::Cancelled);
@@ -879,11 +1004,12 @@ impl DownloadHandler {
                 self.resend(request, waiters, retries);
                 return;
             }
-            // 區塊跟 server 對不上、描述解不開：壞檔（§3.2）。
+            // 區塊跟 server 對不上、描述解不開：壞檔（§3.2）——但只為 seek 開的檔🚫 刪（下面 `is_job_running`）。
             Err(error) => {
                 let error = CoreError::from(error);
                 self.answer_seeks_only(waiters, &error);
-                self.fail_media(mxc, error, true);
+                let discard = self.is_job_running(mxc);
+                self.fail_media(mxc, error, discard);
                 return;
             }
         }
@@ -932,7 +1058,8 @@ impl DownloadHandler {
             Err(error) => {
                 let error = CoreError::from(error);
                 self.answer_seeks_only(waiters, &error);
-                self.fail_media(mxc, error, true);
+                let discard = self.is_job_running(mxc);
+                self.fail_media(mxc, error, discard);
                 return;
             }
         };
@@ -977,12 +1104,25 @@ impl DownloadHandler {
             reply,
         } = job;
         let mxc = manifest.mxc.clone();
-        if !self.open.contains_key(&mxc) {
-            if let Some(entry) = self.find_complete_entry(&mxc).await {
-                let _ = reply.send(read_complete_chunk(&self.media_pool, &entry, index));
+        // GET 照自己那份描述的塊大小切片：給它的塊一定要照同一個大小切，對不上就回錯，🚫 給位置錯的明文（/docs/design/media/media-download.md §7.2）。
+        if let Some(opened) = self.open.get(&mxc) {
+            let open_with = opened.download.manifest();
+            if open_with.file_size() != manifest.file_size()
+                || open_with.block.chunk_size != manifest.block.chunk_size
+            {
+                let _ = reply.send(Err(description_mismatch(&mxc)));
                 return;
             }
-            match self.open_media(&manifest).await {
+        } else {
+            if let Some(entry) = self.find_complete_entry(&mxc).await {
+                let answer = match media::is_same_file(&entry, &manifest) {
+                    true => read_complete_chunk(&self.media_pool, &entry, index),
+                    false => Err(description_mismatch(&mxc)),
+                };
+                let _ = reply.send(answer);
+                return;
+            }
+            match self.open_media(&manifest, ClaimFor::Seek).await {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = reply.send(Err(CoreError::new(
@@ -1107,6 +1247,12 @@ impl DownloadHandler {
         self.shared.state().downloading.get(mxc).cloned()
     }
 
+    /// 這個檔有 job 在跑嗎。有的話開著的檔用的就是 job 自己那份描述（`prepare_download` 保證），驗不過是檔壞了、刪；
+    /// 沒有的話它只為 seek 開著、用的是 GET 帶來的描述：驗不過可疑的是那份描述（寫錯或偽造的事件），🚫 刪別人拉到一半的主檔。
+    fn is_job_running(&self, mxc: &str) -> bool {
+        self.shared.state().downloading.contains_key(mxc)
+    }
+
     /// 主檔落了一塊：更新進度、到點就 fsync／寫 DB／推播。
     fn after_landing(&mut self, mxc: &str) {
         let (Some(downloading), Some(opened)) = (self.find_downloading(mxc), self.open.get(mxc))
@@ -1175,7 +1321,7 @@ impl DownloadHandler {
                 JobEnd::Failed(error.into())
             }
         };
-        self.claims.release(&self.server_dir, mxc, &self.user);
+        self.claims.release(&self.server_dir, mxc, &self.holder);
         self.answer_seeks_from_pool(mxc).await;
         self.end_job(mxc, end);
     }
@@ -1305,13 +1451,22 @@ impl DownloadHandler {
 
     /// 開（續）一個 mxc 的檔：先在同 server 認領，再建列、拿暫存名、開檔。
     ///
+    /// Args:
+    ///     purpose: job 要開的、還是只為 GET 要的塊開的（[`ClaimFor`]）
     /// Return:
     ///     Ok(true)    開好了
-    ///     Ok(false)   別的帳號正在寫它
+    ///     Ok(false)   別的處理端正在寫它（`Seek`：或別的處理端的 job 在等它）
     ///     Err(...)    列建不了、區塊算不出塊數、檔建不了
-    async fn open_media(&mut self, manifest: &Arc<Manifest>) -> Result<bool, CoreError> {
+    async fn open_media(
+        &mut self,
+        manifest: &Arc<Manifest>,
+        purpose: ClaimFor,
+    ) -> Result<bool, CoreError> {
         let mxc = manifest.mxc.clone();
-        if !self.claims.claim(&self.server_dir, &mxc, &self.user) {
+        if !self
+            .claims
+            .claim(&self.server_dir, &mxc, &self.holder, purpose)
+        {
             return Ok(false);
         }
         // 下面要等 DB：在等的時候被 abort，`Drop` 從這裡知道要放掉這個認領。
@@ -1336,7 +1491,7 @@ impl DownloadHandler {
                 Ok(true)
             }
             Err(error) => {
-                self.claims.release(&self.server_dir, &mxc, &self.user);
+                self.claims.release(&self.server_dir, &mxc, &self.holder);
                 Err(error)
             }
         }
@@ -1346,7 +1501,7 @@ impl DownloadHandler {
     fn take_open(&mut self, mxc: &str) -> Option<MediaDownload> {
         let opened = self.open.remove(mxc)?;
         self.shared.state().open_names.remove(&opened.pending_name);
-        self.claims.release(&self.server_dir, mxc, &self.user);
+        self.claims.release(&self.server_dir, mxc, &self.holder);
         Some(opened.download)
     }
 
@@ -1383,16 +1538,20 @@ impl DownloadHandler {
             .post(move |cache| cache.media_reset(&mxc_here), Vec::new());
     }
 
-    /// 只為 seek 開著的檔太多就關掉一些（在跑的、還有請求在途的不關）。
-    fn trim_seek_only(&mut self) {
+    /// 只為 seek 開著、現在沒事的檔（不是在跑的 job、沒有請求在途）：關掉它們🚫 影響任何人。
+    fn list_idle_seek_only(&self) -> Vec<String> {
         let running: HashSet<String> = self.shared.state().downloading.keys().cloned().collect();
         let busy: HashSet<&str> = self.in_flight.keys().map(DownloadRequest::mxc).collect();
-        let mut seek_only: Vec<String> = self
-            .open
+        self.open
             .keys()
             .filter(|mxc| !running.contains(*mxc) && !busy.contains(mxc.as_str()))
             .cloned()
-            .collect();
+            .collect()
+    }
+
+    /// 只為 seek 開著的檔太多就關掉一些。
+    fn trim_seek_only(&mut self) {
+        let mut seek_only = self.list_idle_seek_only();
         while seek_only.len() > SEEK_ONLY_OPEN {
             let Some(mxc) = seek_only.pop() else {
                 break;
@@ -1403,9 +1562,25 @@ impl DownloadHandler {
         }
     }
 
+    /// 別的處理端的 job 在等的檔，這裡只為 seek 開著：關掉、放掉認領讓它寫（/docs/design/media/media-download.md §5.1）。
+    /// 🚫 等它湊滿 `SEEK_ONLY_OPEN` 才關——只為 seek 開的檔永遠不會寫完，對方會一直等。
+    fn yield_wanted_seek_only(&mut self) {
+        for mxc in self.list_idle_seek_only() {
+            if !self
+                .claims
+                .is_wanted_by_another(&self.server_dir, &mxc, &self.holder)
+            {
+                continue;
+            }
+            if let Some(mut download) = self.take_open(&mxc) {
+                let _ = download.sync();
+            }
+        }
+    }
+
     fn push(&self, mxc: &str, state: DownloadState, done: u32, total: u32, reason: Option<String>) {
         self.events.emit(CoreEvent::MediaDownload {
-            user: self.user.clone(),
+            user: self.holder.user.clone(),
             mxc: mxc.to_string(),
             state,
             done,
@@ -1423,7 +1598,7 @@ impl DownloadHandler {
             }
         }
         for mxc in std::mem::take(&mut self.opening) {
-            self.claims.release(&self.server_dir, &mxc, &self.user);
+            self.claims.release(&self.server_dir, &mxc, &self.holder);
         }
     }
 }
@@ -2101,9 +2276,13 @@ mod tests {
         let (core, account, server, manifest) = uploaded("dq-claim").await;
         let mut events = core.subscribe();
         let server_dir = account.server_dir();
-        assert!(core
-            .media_claims
-            .claim(&server_dir, &manifest.mxc, "@someone-else:localhost"));
+        let someone_else = core.media_claims.new_holder("@someone-else:localhost");
+        assert!(core.media_claims.claim(
+            &server_dir,
+            &manifest.mxc,
+            &someone_else,
+            ClaimFor::Download
+        ));
         core.media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
             .await
             .unwrap();
@@ -2113,7 +2292,7 @@ mod tests {
             "the job waits while another account writes the file"
         );
         core.media_claims
-            .release(&server_dir, &manifest.mxc, "@someone-else:localhost");
+            .release(&server_dir, &manifest.mxc, &someone_else);
         wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
         assert_eq!(
             core.media_claims.find_holder(&server_dir, &manifest.mxc),
@@ -2397,27 +2576,342 @@ mod tests {
         assert!(reads(&server).is_empty());
     }
 
+    /// 同一台 server 上「另一個帳號」的處理端：自己的線（另一台假 server，資料抄同一份）、同一個池與 cache.db、同一張認領表。
+    async fn start_another_account(
+        core: &Core,
+        account: &AccountDir,
+        server: &FakeServer,
+        user: &str,
+    ) -> (Downloader, FakeServer) {
+        let links = Arc::new(LinkPool::new(user, core.events.clone()));
+        let (client, other_server) =
+            memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        *other_server.uploads.lock().unwrap() = server.uploads.lock().unwrap().clone();
+        drop(
+            links
+                .acquire(LinkRole::Download, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        let (cache, _) = core.server_cache_and_me(account).unwrap();
+        let downloader = Downloader::start(DownloaderParts {
+            user: user.to_string(),
+            server_dir: account.server_dir(),
+            links,
+            media_pool: core.pool_of(account).unwrap(),
+            cache,
+            events: core.events.clone(),
+            claims: core.media_claims.clone(),
+            line_silence: LINE_SILENCE,
+        });
+        (downloader, other_server)
+    }
+
+    /// 把一則帶附件的訊息當成 `user` 同步進來的存進快取（GET 從這裡拿描述）。
+    async fn store_file_event(
+        core: &Core,
+        account: &AccountDir,
+        user: &str,
+        event_id: &str,
+        mxc: &str,
+        block: &wbf_sdk::ChunkedBlock,
+    ) {
+        let (cache, _) = core.server_cache_and_me(account).unwrap();
+        let event = serde_json::json!({
+            "type": "m.room.message", "event_id": event_id, "room_id": "!r:localhost",
+            "sender": "@carol:localhost", "origin_server_ts": 1000,
+            "content": {
+                "msgtype": wbf_sdk::event_json::FILE_MSGTYPE, "body": "v.bin", "url": mxc,
+                wbf_sdk::event_json::CHUNKED_BLOCK_KEY: block,
+            },
+        });
+        let user = user.to_string();
+        cache
+            .run(move |cache| {
+                cache
+                    .upsert_events(
+                        &user,
+                        "!r:localhost",
+                        &[wbf_sdk::incoming::IncomingEvent::Plain { event }],
+                    )
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_get_uses_only_a_description_that_matches_the_local_record() {
+        let (core, account, _server, manifests, _upload_server) =
+            uploaded_many("dq-get-describe", 2).await;
+        let (_, me) = core.server_cache_and_me(&account).unwrap();
+        let (first, second) = (&manifests[0], &manifests[1]);
+        // 第一個檔：本地那一列由同 server 另一個帳號的事件建（塊 16 byte）；這個帳號看到的那則把塊大小寫成 32。
+        store_file_event(
+            &core,
+            &account,
+            "@bob:localhost",
+            "$right",
+            &first.mxc,
+            &first.block,
+        )
+        .await;
+        let mut cut_wrong = first.block.clone();
+        cut_wrong.chunk_size = CHUNK * 2;
+        store_file_event(&core, &account, &me, "$wrong", &first.mxc, &cut_wrong).await;
+        let error = core
+            .find_media_source(&first.mxc)
+            .await
+            .err()
+            .expect("a description that does not match the record is not used");
+        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        // 第二個檔：描述對得上，照常一塊一塊跟處理端拿。
+        store_file_event(&core, &account, &me, "$second", &second.mxc, &second.block).await;
+        assert_eq!(read_whole(&core, &second.mxc).await, body_of(1));
+    }
+
+    #[tokio::test]
+    async fn a_seek_with_a_description_cut_differently_gets_an_error_not_other_bytes() {
+        let (core, account, server, manifest) = uploaded("dq-seek-cut").await;
+        let mut events = core.subscribe();
+        let downloader = core.downloader_of(&account).await.unwrap();
+        let mut cut_wrong = manifest.clone();
+        cut_wrong.block.chunk_size = CHUNK * 2;
+        let cut_wrong = Arc::new(cut_wrong);
+        // 檔開著（下載中，第 0 塊卡在 server）：開著那份的切法跟 GET 那份不一樣，回錯，🚫 掛上去拿一塊別的大小的。
+        hold_reads(&server).await;
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&downloader).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            downloader.read_chunk(cut_wrong.clone(), 0),
+        )
+        .await
+        .expect("answered at once")
+        .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        // 檔完整了：從池檔給也一樣看切法。
+        let error = downloader.read_chunk(cut_wrong, 1).await.unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        let right = downloader
+            .read_chunk(Arc::new(manifest.clone()), 1)
+            .await
+            .unwrap();
+        assert_eq!(&right[..], &body()[16..32]);
+    }
+
+    #[tokio::test]
+    async fn a_seek_whose_description_fails_does_not_delete_the_unfinished_file() {
+        let (core, account, server, manifest) = uploaded("dq-seek-bad-key").await;
+        let mut events = core.subscribe();
+        // 先拉一塊就取消：主檔留著（再要一次從斷點接）。
+        hold_reads(&server).await;
+        let downloader = core.downloader_of(&account).await.unwrap();
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&downloader).await;
+        assert!(downloader.cancel(&manifest.mxc));
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Cancelled).await;
+        let pool = core.pool_of(&account).unwrap();
+        assert_eq!(pool.list_pending().unwrap().len(), 1);
+        // 一則金鑰寫錯（或偽造）的事件，播放器拿它 seek：`Info` 驗不過。可疑的是那份描述，🚫 刪別人拉到一半的主檔。
+        let mut wrong_key = manifest.clone();
+        wrong_key.block.key = Some([7u8; 32]);
+        let error = downloader
+            .read_chunk(Arc::new(wrong_key), 5)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        assert_eq!(
+            pool.list_pending().unwrap().len(),
+            1,
+            "the unfinished file is kept"
+        );
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+    }
+
+    #[tokio::test]
+    async fn a_job_reopens_a_file_opened_for_seek_with_another_description() {
+        let (core, account, server, manifest) = uploaded("dq-reopen").await;
+        let mut events = core.subscribe();
+        // 線斷著：seek 的 `Info` 排著送不出去。這個 seek 帶的是金鑰寫錯的描述，檔只為它開著。
+        let links = core.pool_of_account(&account).unwrap();
+        assert!(links.close(LinkRole::Download, "test").await);
+        let downloader = core.downloader_of(&account).await.unwrap();
+        let mut wrong_key = manifest.clone();
+        wrong_key.block.key = Some([7u8; 32]);
+        let seek = {
+            let downloader = downloader.clone();
+            tokio::spawn(async move { downloader.read_chunk(Arc::new(wrong_key), 5).await })
+        };
+        let server_dir = account.server_dir();
+        wait_for_async(
+            || async {
+                core.media_claims
+                    .find_holder(&server_dir, &manifest.mxc)
+                    .is_some()
+            },
+            "the seek to open the file",
+        )
+        .await;
+        // job 來了：用它自己那份描述重開，🚫 接著用那份寫錯的（不然 `Info` 驗不過時會被當成壞檔、整個刪掉）。
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        let answer = tokio::time::timeout(Duration::from_secs(5), seek)
+            .await
+            .expect("the seek is told the file was reopened")
+            .unwrap();
+        assert!(answer.is_err());
+        let (client, new_server) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        *new_server.uploads.lock().unwrap() = server.uploads.lock().unwrap().clone();
+        drop(
+            links
+                .acquire(LinkRole::Download, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+    }
+
+    #[tokio::test]
+    async fn a_file_open_only_for_seek_lets_go_when_another_account_downloads_it() {
+        let (core, account, server, manifest) = uploaded("dq-yield").await;
+        let mut events = core.subscribe();
+        let alice = core.downloader_of(&account).await.unwrap();
+        // 播放器 seek 了一塊：這個處理端只為 seek 開著這個檔、握著認領。
+        let chunk = alice
+            .read_chunk(Arc::new(manifest.clone()), 5)
+            .await
+            .unwrap();
+        assert_eq!(&chunk[..], &body()[80..96]);
+        let server_dir = account.server_dir();
+        assert!(core
+            .media_claims
+            .find_holder(&server_dir, &manifest.mxc)
+            .is_some());
+        // 同一台 server 的另一個帳號要整檔：它認領不到、留下記號，只為 seek 開著的那邊就讓出來——🚫 等它湊滿 `SEEK_ONLY_OPEN` 個才關。
+        let (bob, bob_server) =
+            start_another_account(&core, &account, &server, "@bob:localhost").await;
+        bob.enqueue(Arc::new(manifest.clone()), None);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        // 它接手同一個主檔與 seek 暫存檔：第 5 塊從暫存檔搬，🚫 再拉。
+        let bob_reads: Vec<u32> = bob_server
+            .download_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, index)| *index)
+            .collect();
+        assert_eq!(
+            bob_reads,
+            (0..CHUNKS).filter(|index| *index != 5).collect::<Vec<_>>()
+        );
+        // 讓出來之後 seek 照樣拿得到（現在從完整的池檔）。
+        let chunk = alice
+            .read_chunk(Arc::new(manifest.clone()), 6)
+            .await
+            .unwrap();
+        assert_eq!(&chunk[..], &body()[96..112]);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_downloader_ends_the_read_a_stream_was_waiting_for() {
+        let (core, account, server, manifest) = uploaded("dq-stop-stream").await;
+        hold_reads(&server).await;
+        let downloader = core.downloader_of(&account).await.unwrap();
+        // 串流中的 GET 握著處理端、等一塊（server 卡著）。登出時收掉處理端：GET 要馬上拿到錯，🚫 跟著舊處理端一直等。
+        let read = {
+            let downloader = downloader.clone();
+            let manifest = Arc::new(manifest.clone());
+            tokio::spawn(async move { downloader.read_chunk(manifest, 3).await })
+        };
+        let server_dir = account.server_dir();
+        wait_for_async(
+            || async {
+                core.media_claims
+                    .find_holder(&server_dir, &manifest.mxc)
+                    .is_some()
+            },
+            "the seek to open the file",
+        )
+        .await;
+        core.stop_downloader_of(&account);
+        let answer = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("the read ends when the downloader is stopped")
+            .unwrap();
+        assert!(answer.is_err());
+        wait_for_async(
+            || async {
+                core.media_claims
+                    .find_holder(&server_dir, &manifest.mxc)
+                    .is_none()
+            },
+            "the stopped downloader to let go of the file",
+        )
+        .await;
+        server.read_permits.add_permits(READ_PERMITS as usize);
+    }
+
     #[test]
-    fn a_claim_belongs_to_one_account_until_it_lets_go() {
+    fn a_claim_belongs_to_one_handler_until_it_lets_go() {
         let claims = MediaClaims::default();
         let dir = std::path::PathBuf::from("s1");
-        assert!(claims.claim(&dir, "mxc://a/1", "@a:x"));
+        let mxc = "mxc://a/1";
+        let alice = claims.new_holder("@a:x");
+        // 同一個帳號重登之後的新處理端（舊的還被串流中的 GET 留著）
+        let alice_again = claims.new_holder("@a:x");
+        let bob = claims.new_holder("@b:x");
+        assert!(claims.claim(&dir, mxc, &alice, ClaimFor::Seek));
         assert!(
-            claims.claim(&dir, "mxc://a/1", "@a:x"),
+            claims.claim(&dir, mxc, &alice, ClaimFor::Seek),
             "claiming again is fine"
         );
-        assert!(!claims.claim(&dir, "mxc://a/1", "@b:x"));
         assert!(
-            claims.claim(&std::path::PathBuf::from("s2"), "mxc://a/1", "@b:x"),
+            !claims.claim(&dir, mxc, &alice_again, ClaimFor::Download),
+            "the same account's other handler does not share it"
+        );
+        assert!(
+            claims.claim(
+                &std::path::PathBuf::from("s2"),
+                mxc,
+                &bob,
+                ClaimFor::Download
+            ),
             "another server dir is another file"
         );
-        claims.release(&dir, "mxc://a/1", "@b:x");
+        claims.release(&dir, mxc, &alice_again);
         assert_eq!(
-            claims.find_holder(&dir, "mxc://a/1").as_deref(),
+            claims.find_holder(&dir, mxc).as_deref(),
             Some("@a:x"),
-            "only the holder lets go"
+            "only the handler that holds it lets go"
         );
-        claims.release(&dir, "mxc://a/1", "@a:x");
-        assert!(claims.claim(&dir, "mxc://a/1", "@b:x"));
+        assert!(
+            claims.is_wanted_by_another(&dir, mxc, &alice),
+            "the job that could not claim it left a mark"
+        );
+        assert!(!claims.is_wanted_by_another(&dir, mxc, &alice_again));
+        claims.release(&dir, mxc, &alice);
+        assert!(
+            !claims.claim(&dir, mxc, &bob, ClaimFor::Seek),
+            "a seek does not take what a job is waiting for"
+        );
+        assert!(
+            claims.claim(&dir, mxc, &alice_again, ClaimFor::Download),
+            "the job that waited gets it"
+        );
+        assert!(
+            !claims.is_wanted_by_another(&dir, mxc, &bob),
+            "and its mark is gone"
+        );
+        claims.release(&dir, mxc, &alice);
+        assert!(
+            !claims.claim(&dir, mxc, &bob, ClaimFor::Seek),
+            "the old handler cannot let go of the new one's claim"
+        );
     }
 }

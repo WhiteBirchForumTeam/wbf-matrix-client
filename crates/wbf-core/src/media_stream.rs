@@ -9,6 +9,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+use wbf_sdk::chunk_crypto::expected_plain_len;
 use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media;
@@ -89,6 +90,19 @@ impl MediaStream {
                     CoreError::new(CoreErrorKind::Usage, "position is past the last chunk")
                 })?;
                 let plain = downloader.read_chunk(manifest.clone(), index).await?;
+                // 切片照這份描述的塊大小：拿回來的塊不是這個長度，就是照別的大小切的，切下去會是位置錯的明文。
+                // 處理端已經檢查過（`process_seek`），這裡是消費端自己再問一次。
+                let expected =
+                    expected_plain_len(manifest.file_size(), manifest.block.chunk_size, index);
+                if expected != Some(plain.len()) {
+                    return Err(CoreError::new(
+                        CoreErrorKind::Integrity,
+                        format!(
+                            "chunk {index} came back with {} bytes, this description cuts it to {expected:?}",
+                            plain.len()
+                        ),
+                    ));
+                }
                 let chunk_start = u64::from(index) * chunk_size;
                 let from = (self.position - chunk_start) as usize;
                 let to = ((self.end - chunk_start) as usize).min(plain.len());
@@ -148,10 +162,12 @@ impl Core {
     ///     Ok(Some(MediaSource))   讀得到（原檔、池、或可以現拉）
     ///     Ok(None)                本機沒有任何帳號有這個 mxc 的紀錄（404）
     ///     Err(Usage)              有紀錄，但沒有完整的檔、而且看得到它的帳號都沒有金鑰（502）
+    ///     Err(Integrity)          有紀錄、沒有完整的檔，帳號看得到的描述跟那一列都對不上（502）
     ///     Err(Locked)             還沒解鎖
     pub async fn find_media_source(&self, mxc: &str) -> Result<Option<MediaSource>, CoreError> {
         let accounts = self.list_accounts_for_media(mxc)?;
         let mut has_record = false;
+        let mut description_mismatched = false;
         for account in &accounts {
             let Ok((cache, me)) = self.server_cache_and_me(account) else {
                 continue;
@@ -194,6 +210,11 @@ impl Core {
                 mxc: mxc.to_string(),
                 block,
             });
+            // 這個帳號看到的描述跟本地那一列不是同一個檔（寫錯或偽造的事件）：🚫 拿它切片、🚫 拿它接手別人拉到一半的主檔，換下一個帳號。
+            if !media::is_same_file(&entry, &manifest) {
+                description_mismatched = true;
+                continue;
+            }
             let reader_account = self.find_writer_of(account, mxc, &accounts);
             self.ensure_download_link(&reader_account).await;
             let downloader = self.downloader_of(&reader_account).await?;
@@ -206,6 +227,12 @@ impl Core {
                     manifest,
                 },
             }));
+        }
+        if description_mismatched {
+            return Err(CoreError::new(
+                CoreErrorKind::Integrity,
+                format!("{mxc} is not complete here, and no account here has a description that matches the local record"),
+            ));
         }
         match has_record {
             true => Err(CoreError::new(
