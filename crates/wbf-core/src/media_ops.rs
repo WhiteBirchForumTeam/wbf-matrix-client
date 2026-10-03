@@ -1,23 +1,28 @@
-//! 媒體池：狀態、清理、下載到本機檔案。設計在 /docs/design/media/media-pool.md。
+//! 媒體池的對外操作：下載排隊（`media.download`／`media.open`／`media.queue`／`media.cancel`）、另存新檔、狀態、清理。
+//! 設計在 /docs/design/media/media-download.md（下載）與 /docs/design/media/media-pool.md（池）。
 //!
 //! ⚠️ **池裡的東西是加密的**（/docs/design/media/media-pool.md §1）。所以「給前端一個路徑」是錯的：它讀到的是密文，
-//! 而 core 先解密寫到某個路徑就是**明文落地**——整個加密池的意義就沒了
-//! （/docs/design/rpc-specs/local-interface.md §8 記了這是初稿的錯）。
+//! 而 core 先解密寫到某個路徑就是**明文落地**——整個加密池的意義就沒了（/docs/design/rpc-specs/local-interface.md §8）。
+//! 播放與顯示走資料平面的 URL（`media.open` → `GET /media`，`media_stream.rs`）；這裡唯一的明文落地是使用者明說要匯出到自己選的位置（[`Core::export_media_to`]）。
 //!
-//! 這一層現在只提供「**使用者明說要把明文放到自己選的位置**」那條路（[`Core::download_to`]）。
-//! 📎 daemon 落地時，播放與顯示會走資料平面的 URL（/docs/design/rpc-specs/local-interface.md §8），🚫 不是這裡。
+//! 下載本身由每帳號一個的下載處理端做（`download_queue.rs`）：這裡只負責「要哪個檔、本地已經有了沒、排進去、等它」。
 
-use std::io::Write;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Serialize;
 
+use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
-use wbf_sdk::media::{self, FetchOutcome};
+use wbf_sdk::media;
 use wbf_sdk::Transport;
 
+use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
+use crate::download_queue::{Downloader, DownloaderParts};
 use crate::error::{CoreError, CoreErrorKind};
+use crate::event::DownloadState;
 use crate::link_pool::LinkRole;
 use crate::{Core, Target};
 
@@ -48,7 +53,7 @@ pub struct MediaGcReport {
     pub swept_orphan_files: u64,
 }
 
-/// `--no-cache` 的下載結果（沒進池，所以沒有 `pool_file`／`source`）。
+/// `--no-cache` 的 CLI 下載結果（沒進池，所以沒有 `pool_file`／`source`）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DirectDownloadResult {
     pub out: String,
@@ -57,34 +62,73 @@ pub struct DirectDownloadResult {
     pub sha256_verified: bool,
 }
 
-/// `download` 的結果。
+/// 要哪個檔（/docs/design/media/media-download.md §7.1）：三種說法，金鑰從哪來不同（§3.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaRef {
+    /// 只給 mxc：金鑰從這個帳號看得到、引用它的事件裡找。
+    Mxc(String),
+    /// 某一則訊息的附件。
+    Event { room: String, event_id: String },
+    /// 直接給 manifest（含金鑰）。
+    Manifest(Manifest),
+}
+
+/// `media.download` 的回答：這個檔現在的樣子。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct DownloadResult {
-    pub out: String,
+pub struct MediaJob {
+    pub mxc: String,
+    pub state: DownloadState,
+    /// 已落地的塊數（`complete`／`local_source` 時等於 `total`）
+    pub done: u32,
+    /// 總塊數；還不知道是 0
+    pub total: u32,
+}
+
+/// `media.open` 的回答（URL 由 daemon 用共享 token 鑄，core 不知道）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OpenedMedia {
+    pub mxc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    /// 明文總長
+    pub size: u64,
+    pub state: DownloadState,
+}
+
+/// `media.queue` 的一項。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueuedMedia {
+    pub mxc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub state: DownloadState,
+    pub done: u32,
+    pub total: u32,
+}
+
+/// `media.export_to` 的結果（寫到哪由呼叫者自己知道：RPC 回它收到的 URI、CLI 回 `-o`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExportedMedia {
     pub bytes: u64,
-    pub chunks: u32,
-    /// `"cache"` 或 `"server"`。
+    /// `"local_source"`（本機原檔）、`"cache"`（池裡本來就有）、`"server"`（這次排隊下載的）
     pub source: String,
-    pub pool_file: String,
-    /// 快取列記的校驗碼。⚠️ 半成品還沒有（下載到一半就沒算完），所以是 `Option`。
+    /// 快取列記的校驗碼（`sha256:…` 或 `blake3:…`）；列上沒記就沒有
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    /// ⚠️ 只有這次**真的逐塊下載並整檔核對過**才是 `true`。命中快取沒有重算，
-    /// 報 `false`，而 `hash` 給的是快取列記的校驗碼（PR #14 審查 rumia🟡1）。
-    pub sha256_verified: bool,
 }
 
 impl Core {
     /// 媒體池現在多大、有幾個半成品。
-    pub fn media_stats(&self, target: &Target) -> Result<MediaStats, CoreError> {
+    pub async fn media_stats(&self, target: &Target) -> Result<MediaStats, CoreError> {
         let account = self.account_or_current(target)?;
-        let (cache, _me) = self.cache_and_me(&account)?;
+        let (cache, _me) = self.server_cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
-        let complete = cache.list_media_by_last_used()?;
-        let incomplete = cache.list_media_incomplete()?;
+        let reader = cache.read().await;
+        let complete = reader.list_media_by_last_used()?;
+        let incomplete = reader.list_media_incomplete()?;
         Ok(MediaStats {
             pool_dir: pool.dir().display().to_string(),
-            bytes_on_disk: cache.media_bytes_on_disk()?,
+            bytes_on_disk: reader.media_bytes_on_disk()?,
             complete_files: complete.len(),
             incomplete_files: incomplete.len(),
             pending_on_disk: pool.list_pending()?.len(),
@@ -97,20 +141,31 @@ impl Core {
     /// Args:
     ///     quota_mib: example: 2048
     ///     protect_days: 保護期，這幾天內用過的一律不刪, example: 7
-    pub fn collect_media_garbage(
+    pub async fn collect_media_garbage(
         &self,
         quota_mib: u64,
         protect_days: u64,
         target: &Target,
     ) -> Result<MediaGcReport, CoreError> {
         let account = self.account_or_current(target)?;
-        let (mut cache, _me) = self.cache_and_me(&account)?;
+        let (cache, _me) = self.server_cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
         let protect = std::time::Duration::from_secs(protect_days * 24 * 3600);
-        let now = now_millis();
-        let swept = media::sweep(&mut cache, &pool, protect, now)?;
-        let report =
-            media::collect_garbage(&mut cache, &pool, quota_mib * 1024 * 1024, protect, now)?;
+        let in_use = self.list_media_in_use(&account.server_dir());
+        let (swept, report) = cache
+            .run(move |cache| {
+                let swept =
+                    media::sweep(cache, &pool, protect, std::time::SystemTime::now(), &in_use)?;
+                let report = media::collect_garbage(
+                    cache,
+                    &pool,
+                    quota_mib * 1024 * 1024,
+                    protect,
+                    now_millis(),
+                )?;
+                Ok((swept, report))
+            })
+            .await?;
         if report.still_over_quota {
             self.events.progress(format!(
                 "media cache is still over quota ({} bytes > {quota_mib} MiB); everything left is inside the {protect_days}-day protection window",
@@ -129,76 +184,191 @@ impl Core {
         })
     }
 
-    /// 把一份 manifest 指的東西下載下來，**解密寫到 `out`**。
+    /// 排一個檔進這個帳號的下載佇列（/docs/design/media/media-download.md §5.3）。已經完整、或本機有原檔就不排。
     ///
-    /// ⚠️ 這裡明文落地是**使用者要的**（他指定了 `out`），不是我們偷偷做的——
-    /// 這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
-    ///
-    /// 途中發 `Progress` 事件回報塊數。
-    pub async fn download_to(
+    /// Args:
+    ///     media: example: &MediaRef::Mxc("mxc://localhost/000000000000004d".into())
+    /// Return:
+    ///     Ok(MediaJob)     `complete`／`local_source`（不排）、`queued`、`downloading`
+    ///     Err(Usage)       找不到金鑰（這個帳號看不到引用它的事件）、manifest 是別台 server 的、一般 Matrix 帳號（傳統下載還沒接）
+    pub async fn media_download(
         &self,
-        manifest: &Manifest,
-        out: &Path,
-        transport: Transport,
+        media: &MediaRef,
         target: &Target,
-    ) -> Result<DownloadResult, CoreError> {
+    ) -> Result<MediaJob, CoreError> {
         let account = self.account_or_current(target)?;
-        let (mut cache, _me) = self.cache_and_me(&account)?;
-        let pool = self.pool_of(&account)?;
-        let mut client = self
-            .client_of(
-                &account,
-                transport,
-                MethodHome::WbfSdkOnly,
-                LinkRole::Download,
-            )
-            .await?;
-        let fetched = media::fetch(
-            &mut client,
-            manifest,
-            &mut cache,
-            &pool,
-            &mut |done, total| {
-                self.events.progress_of(
-                    done as u64,
-                    Some(total as u64),
-                    format!("chunk {done}/{total}"),
-                )
-            },
-        )
-        .await?;
-        let pool_file =
-            fetched.entry.pool_file.as_deref().ok_or_else(|| {
-                CoreError::new(CoreErrorKind::Io, "fetched media has no pool file")
-            })?;
-        let mut reader = pool.open_read(pool_file)?;
-        let mut file = std::fs::File::create(out)
-            .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
-        let bytes = std::io::copy(&mut reader, &mut file)
-            .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
-        file.flush()
-            .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
-        let (source, chunks, sha256_verified) = match fetched.outcome {
-            FetchOutcome::CacheHit => ("cache", 0, false),
-            FetchOutcome::Downloaded { chunks, .. } => {
-                ("server", chunks, manifest.block.sha256.is_some())
-            }
-        };
-        Ok(DownloadResult {
-            out: out.display().to_string(),
-            bytes,
-            chunks,
-            source: source.to_string(),
-            pool_file: pool_file.to_string(),
-            hash: fetched.entry.hash,
-            sha256_verified,
+        let manifest = self.resolve_media(&account, media).await?;
+        self.ensure_queued(&account, manifest, None, true).await
+    }
+
+    /// `media.open`：這個檔能不能開來讀、多大、什麼型別；不完整也沒原檔就順便排進佇列（/docs/design/media/media-download.md §7.1）。
+    ///
+    /// Return:
+    ///     Ok(OpenedMedia)  `state` 是 `local_source`、`complete`、`downloading`、`queued`
+    ///     Err(Usage)       同 [`Core::media_download`]
+    pub async fn media_open(
+        &self,
+        media: &MediaRef,
+        target: &Target,
+    ) -> Result<OpenedMedia, CoreError> {
+        let account = self.account_or_current(target)?;
+        let manifest = self.resolve_media(&account, media).await?;
+        let (mxc, mimetype, size) = (
+            manifest.mxc.clone(),
+            manifest.block.mimetype.clone(),
+            manifest.file_size(),
+        );
+        let job = self.ensure_queued(&account, manifest, None, true).await?;
+        Ok(OpenedMedia {
+            mxc,
+            mimetype,
+            size,
+            state: job.state,
         })
     }
 
-    /// 直接逐塊下載到檔案，**繞過媒體池**（`--no-cache`）。
+    /// `media.queue`：這個帳號的佇列，第一個是正在拉的。
+    pub async fn media_queue(&self, target: &Target) -> Result<Vec<QueuedMedia>, CoreError> {
+        let account = self.account_or_current(target)?;
+        let downloader = self.downloader_of(&account).await?;
+        Ok(downloader
+            .list_jobs()
+            .into_iter()
+            .map(|(mxc, name, status)| QueuedMedia {
+                mxc,
+                name,
+                state: status.state,
+                done: status.done,
+                total: status.total,
+            })
+            .collect())
+    }
+
+    /// `media.cancel`：正在拉就設旗標（處理完手上那一包就停）、排著就從佇列拿掉（/docs/design/media/media-download.md §5.4）。
     ///
-    /// ⚠️ 「要不要走快取」是**使用者的選擇**，所以它是兩個方法而不是一個旗標：
-    /// 走快取那條（[`Core::download_to`]）會把東西留在池裡，這條不會。
+    /// Return:
+    ///     Ok(true)    在佇列或 `downloading` 表裡
+    ///     Ok(false)   都不在
+    pub async fn media_cancel(&self, mxc: &str, target: &Target) -> Result<bool, CoreError> {
+        let account = self.account_or_current(target)?;
+        let downloader = self.downloader_of(&account).await?;
+        Ok(downloader.cancel(mxc))
+    }
+
+    /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.3）：**解密寫到 `to`，整檔驗過才放上去**。
+    /// 本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過，就從池匯出——池裡沒有就排進下載、等它完成。
+    /// 池那條驗大小、整檔 BLAKE3（池檔名就是它）、區塊有帶就再驗 sha256（維護者 2026-10-02：串流不算整檔 hash，匯出要仔細檢查）。
+    ///
+    /// ⚠️ 這裡明文落地是**使用者要的**（他指定了 `to`），不是我們偷偷做的——這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
+    ///
+    /// Args:
+    ///     to: 本機路徑（RPC 那邊先從 `file://` URI 解出來）, example: "C:/Users/me/v.mp4"
+    ///     no_cache: true ＝ 這次為了匯出才下載的不留在池裡（池裡本來就有的不動）
+    /// Return:
+    ///     Ok(ExportedMedia)
+    ///     Err(Usage)       同 [`Core::media_download`]；或下載被取消
+    ///     Err(Integrity)   檔壞了（池裡那份大小或 hash 對不上：池檔一起丟掉，下次重下）；`to` 🚫 被動過
+    ///     Err(Io)          寫不了 `to`
+    pub async fn export_media_to(
+        &self,
+        media: &MediaRef,
+        to: &Path,
+        no_cache: bool,
+        target: &Target,
+    ) -> Result<ExportedMedia, CoreError> {
+        let account = self.account_or_current(target)?;
+        let manifest = self.resolve_media(&account, media).await?;
+        let mxc = manifest.mxc.clone();
+        let sha256_hex = manifest.block.sha256.clone();
+        let (cache, _me) = self.server_cache_and_me(&account)?;
+        if sha256_hex.is_some() {
+            let entry = cache.read().await.find_media(&mxc)?;
+            let original = entry
+                .filter(|entry| media::is_same_file(entry, &manifest))
+                .and_then(|entry| open_local_source(&entry).map(|(file, _)| (file, entry)));
+            if let Some((file, entry)) = original {
+                let expected = media::ExpectedContent {
+                    file_size: entry.file_size,
+                    blake3_hex: None,
+                    sha256_hex: sha256_hex.clone(),
+                };
+                match export_blocking(file, to, expected).await {
+                    Ok(bytes) => {
+                        return Ok(ExportedMedia {
+                            bytes,
+                            source: "local_source".to_string(),
+                            hash: entry.hash,
+                        })
+                    }
+                    // 原檔在上傳之後被改過（大小沒變）：改從池匯出。
+                    Err(error) if error.kind == CoreErrorKind::Integrity => {
+                        self.events.progress(format!(
+                            "export {mxc}: the local original no longer matches ({}); exporting from the pool",
+                            error.message
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let job = self
+            .ensure_queued(&account, manifest, Some(done), false)
+            .await?;
+        let source = match job.state {
+            DownloadState::Complete => "cache",
+            _ => {
+                wait.await.map_err(|_| {
+                    CoreError::new(
+                        CoreErrorKind::Io,
+                        format!("the downloader stopped before {mxc} was complete (logged out?)"),
+                    )
+                })??;
+                "server"
+            }
+        };
+        let pool = self.pool_of(&account)?;
+        let entry = cache.read().await.find_media(&mxc)?.ok_or_else(|| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("the media row of {mxc} vanished"),
+            )
+        })?;
+        let reader = media::open_complete(&pool, &entry).ok_or_else(|| {
+            CoreError::new(
+                CoreErrorKind::Io,
+                format!("{mxc} is not complete in the pool"),
+            )
+        })?;
+        let expected = media::ExpectedContent {
+            file_size: entry.file_size,
+            blake3_hex: entry.pool_file.clone(),
+            sha256_hex,
+        };
+        let exported = export_blocking(reader, to, expected).await;
+        if let Err(error) = &exported {
+            if error.kind == CoreErrorKind::Integrity {
+                // 池裡那份對不上自己的名字或區塊：它是壞的，丟掉，下次重下。
+                self.drop_from_pool(&account, &mxc).await?;
+            }
+        }
+        let bytes = exported?;
+        let mxc_here = mxc.clone();
+        cache.post(
+            move |cache| cache.touch_media(&mxc_here).map(|_| ()),
+            Vec::new(),
+        );
+        if no_cache && source == "server" {
+            self.drop_from_pool(&account, &mxc).await?;
+        }
+        Ok(ExportedMedia {
+            bytes,
+            source: source.to_string(),
+            hash: entry.hash,
+        })
+    }
+
+    /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.export_to` 走 [`Core::export_media_to`]）。
     ///
     /// 🚫 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
     /// （/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
@@ -236,7 +406,7 @@ impl Core {
                 return Err(error.into());
             }
         };
-        file.flush()?;
+        std::io::Write::flush(&mut file)?;
         Ok(DirectDownloadResult {
             out: out.display().to_string(),
             bytes: report.bytes,
@@ -244,6 +414,320 @@ impl Core {
             sha256_verified: report.sha256_verified,
         })
     }
+
+    /// 三種說法 → manifest（/docs/design/media/media-download.md §3.2「金鑰從哪來」）。
+    ///
+    /// Return:
+    ///     Ok(Manifest)   `server` 是這個帳號的 session 的 server
+    ///     Err(Usage)     一般 Matrix 帳號；manifest 是別台 server 的；這個帳號看不到帶金鑰的事件
+    pub(crate) async fn resolve_media(
+        &self,
+        account: &AccountDir,
+        media: &MediaRef,
+    ) -> Result<Manifest, CoreError> {
+        if !self.is_wbf_account(account)? {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                "this account is on a general Matrix server: its media is downloaded the traditional way (/_matrix/media), which is not wired yet",
+            ));
+        }
+        let session = self.session_of(account)?;
+        let (cache, me) = self.server_cache_and_me(account)?;
+        let manifest = match media {
+            MediaRef::Manifest(manifest) => {
+                // 消費端自己再問一次（A6）：daemon 也比過，但 manifest 是對方給的。
+                if crate::accounts::server_host_of(&manifest.server)
+                    != crate::accounts::server_host_of(&session.server)
+                {
+                    return Err(CoreError::new(
+                        CoreErrorKind::Usage,
+                        format!(
+                            "the manifest is for {}, but this account is on {}",
+                            manifest.server, session.server
+                        ),
+                    ));
+                }
+                manifest.clone()
+            }
+            MediaRef::Mxc(mxc) => {
+                let block = cache.read().await.find_media_block_for(&me, mxc)?;
+                let block = block.ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorKind::Usage,
+                        format!("no event {me} can see carries the key of {mxc}; pass the manifest, or the room and event_id"),
+                    )
+                })?;
+                Manifest {
+                    server: session.server.clone(),
+                    mxc: mxc.clone(),
+                    block,
+                }
+            }
+            MediaRef::Event { room, event_id } => {
+                let attachment = cache
+                    .read()
+                    .await
+                    .find_event_attachment(&me, room, event_id)?;
+                let attachment = attachment.ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorKind::Usage,
+                        format!("{event_id} in {room} is not a file {me} can see (or it is not decrypted yet)"),
+                    )
+                })?;
+                Manifest {
+                    server: session.server.clone(),
+                    mxc: attachment.mxc,
+                    block: attachment.block,
+                }
+            }
+        };
+        manifest
+            .block
+            .check_as_event_block()
+            .map_err(|error| CoreError::new(CoreErrorKind::Integrity, error.to_string()))?;
+        Ok(manifest)
+    }
+
+    /// 本地已經有了就回那個狀態；沒有就排進佇列（/docs/design/media/media-download.md §5.3 的表）。
+    /// 列說的跟這次的區塊對不上（大小、塊大小、sha256，維護者 2026-10-02 照 PR #14）就丟掉重來，🚫 照用。
+    ///
+    /// Args:
+    ///     waiter: 要等它結束的話給一個；`complete`／`local_source` 時直接丟掉（呼叫者看 `state` 就知道不用等）
+    ///     local_source_counts: false ＝ 本機原檔不算「已經有了」（匯出時原檔驗不過，要池裡那份）
+    /// Return:
+    ///     Ok(MediaJob)
+    ///     Err(Integrity)   列已經完整、池檔打得開，這次的描述對不上：快取留著，錯的是這次的描述
+    ///     Err(Usage)       列對不上，而這個檔正在用舊的描述下載：等它停了再來
+    pub(crate) async fn ensure_queued(
+        &self,
+        account: &AccountDir,
+        manifest: Manifest,
+        waiter: Option<tokio::sync::oneshot::Sender<Result<(), CoreError>>>,
+        local_source_counts: bool,
+    ) -> Result<MediaJob, CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let pool = self.pool_of(account)?;
+        let mut entry = cache.read().await.find_media(&manifest.mxc)?;
+        let mxc = manifest.mxc.clone();
+        if let Some(described) = entry
+            .clone()
+            .filter(|entry| !media::is_same_file(entry, &manifest))
+        {
+            // 已經完整、整檔驗過的快取是真的：對不上的是這次的描述（寫錯或偽造的事件），回錯給這次的請求、快取🚫 動（維護者 2026-10-03）。
+            if media::open_complete(&pool, &described).is_some() {
+                return Err(CoreError::new(
+                    CoreErrorKind::Integrity,
+                    format!(
+                        "this description of {mxc} does not match the file already downloaded and verified (size {}, chunk size {}); the cached copy is kept",
+                        described.file_size, described.chunk_size
+                    ),
+                ));
+            }
+            // 還沒下載完：兩份描述都還沒被整檔驗過，照 PR #14 的規則丟掉重來。
+            self.forget_old_description(account, &manifest).await?;
+            entry = None;
+        }
+        if let Some(entry) = &entry {
+            let total =
+                wbf_sdk::chunk_crypto::chunk_count(entry.file_size, entry.chunk_size).unwrap_or(0);
+            if media::open_complete(&pool, entry).is_some() {
+                return Ok(MediaJob {
+                    mxc,
+                    state: DownloadState::Complete,
+                    done: total,
+                    total,
+                });
+            }
+            if local_source_counts && open_local_source(entry).is_some() {
+                return Ok(MediaJob {
+                    mxc,
+                    state: DownloadState::LocalSource,
+                    done: total,
+                    total,
+                });
+            }
+        }
+        // 線先開好：下載處理端只借開著的線（`LinkPool::find_ws_link`），開線是 core 入口與 `link_keeper` 的事。開不起來也照排，線回來就接著拉。
+        self.ensure_download_link(account).await;
+        let downloader = self.downloader_of(account).await?;
+        let status = downloader.enqueue(Arc::new(manifest), waiter);
+        Ok(MediaJob {
+            mxc,
+            state: status.state,
+            done: status.done,
+            total: status.total,
+        })
+    }
+
+    /// 這個帳號的 `Download` 線開著嗎，沒開就開。開不起來只講一聲（job 照收、請求排著等線）。
+    pub(crate) async fn ensure_download_link(&self, account: &AccountDir) {
+        let opened = match self.pool_of_account(account) {
+            Ok(links) => {
+                links
+                    .ensure_open(LinkRole::Download, || {
+                        self.open_link(account, LinkRole::Download)
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = opened {
+            self.events.progress(format!(
+                "media: the download link of {} could not be opened yet ({error}); queued anyway",
+                account.label()
+            ));
+        }
+    }
+
+    /// 這個帳號的下載處理端；沒有就起一個。這台 server 在這個程序裡第一次起處理端時先掃一次孤兒（/docs/design/media/media-download.md §4.3、§11 第 1 條）。
+    pub(crate) async fn downloader_of(
+        &self,
+        account: &AccountDir,
+    ) -> Result<Arc<Downloader>, CoreError> {
+        if let Some(existing) = self
+            .downloaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account.dir)
+        {
+            return Ok(existing.clone());
+        }
+        let server_dir = account.server_dir();
+        let first_on_this_server = self
+            .media_swept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(server_dir.clone());
+        let (cache, me) = self.server_cache_and_me(account)?;
+        if first_on_this_server {
+            let pool = self.pool_of(account)?;
+            let in_use = self.list_media_in_use(&server_dir);
+            let swept = cache
+                .run(move |cache| {
+                    media::sweep(
+                        cache,
+                        &pool,
+                        media::DEFAULT_PROTECT,
+                        std::time::SystemTime::now(),
+                        &in_use,
+                    )
+                })
+                .await;
+            if let Err(error) = swept {
+                self.events.progress(format!(
+                    "media: sweeping the pool failed (ignored): {error}"
+                ));
+            }
+        }
+        let parts = DownloaderParts {
+            user: me,
+            server_dir,
+            links: self.pool_of_account(account)?,
+            media_pool: self.pool_of(account)?,
+            cache,
+            events: self.events.clone(),
+            claims: self.media_claims.clone(),
+            line_silence: crate::download_queue::LINE_SILENCE,
+        };
+        let mut downloaders = self
+            .downloaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 起之前再看一次：兩個同時進來的，後到的用先到的那個（🚫 一個帳號兩個處理端）。
+        if let Some(existing) = downloaders.get(&account.dir) {
+            return Ok(existing.clone());
+        }
+        let downloader = Arc::new(Downloader::start(parts));
+        downloaders.insert(account.dir.clone(), downloader.clone());
+        Ok(downloader)
+    }
+
+    /// 登出、換 session：收掉這個帳號的下載處理端（開著的檔 fsync 留著，下次接著拉）。
+    pub(crate) fn stop_downloader_of(&self, account: &AccountDir) {
+        let removed = self
+            .downloaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&account.dir);
+        drop(removed);
+    }
+
+    /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
+    fn list_media_in_use(&self, server_dir: &Path) -> HashSet<String> {
+        let downloaders: Vec<Arc<Downloader>> = self
+            .downloaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(account_dir, _)| account_dir.starts_with(server_dir))
+            .map(|(_, downloader)| downloader.clone())
+            .collect();
+        downloaders
+            .iter()
+            .flat_map(|downloader| downloader.list_open_names())
+            .collect()
+    }
+
+    /// 列說的跟這次的區塊不一樣：丟掉本地的一切、列換成這次的描述（`media::forget_for_new_description`）。
+    /// 那個檔正開著（下載處理端正在用舊的描述寫）就🚫 動，回 Usage。
+    async fn forget_old_description(
+        &self,
+        account: &AccountDir,
+        manifest: &Manifest,
+    ) -> Result<(), CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let pool = self.pool_of(account)?;
+        let in_use = self.list_media_in_use(&account.server_dir());
+        let manifest_here = manifest.clone();
+        cache
+            .run(move |cache| {
+                let pending_name = cache.media_pending_name(&manifest_here.mxc)?;
+                if pending_name.is_some_and(|name| in_use.contains(&name)) {
+                    return Err(wbf_sdk::SdkError::Usage(format!(
+                        "{} is being downloaded under another description; try again when it stops",
+                        manifest_here.mxc
+                    )));
+                }
+                media::forget_for_new_description(cache, &pool, &manifest_here)
+            })
+            .await
+    }
+
+    /// `no_cache`：這次為了匯出才下載的，不留在池裡。還有別的 mxc 指著同一個池檔、或有人正在讀它，就只清這一列。
+    async fn drop_from_pool(&self, account: &AccountDir, mxc: &str) -> Result<(), CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let pool = self.pool_of(account)?;
+        let mxc_here = mxc.to_string();
+        cache
+            .run(move |cache| {
+                let Some(pool_file) = cache
+                    .find_media(&mxc_here)?
+                    .and_then(|entry| entry.pool_file)
+                else {
+                    return Ok(());
+                };
+                if cache.media_references(&pool_file)? <= 1 && !pool.is_open(&pool_file)? {
+                    pool.remove(&pool_file)?;
+                }
+                cache.media_reset(&mxc_here)
+            })
+            .await
+    }
+}
+
+/// `media::export_verified` 放到 blocking 執行緒上做（大檔會讀很久）。
+async fn export_blocking<R: std::io::Read + Send + 'static>(
+    source: R,
+    to: &Path,
+    expected: media::ExpectedContent,
+) -> Result<u64, CoreError> {
+    let to = to.to_path_buf();
+    tokio::task::spawn_blocking(move || media::export_verified(source, &to, &expected))
+        .await
+        .map_err(|error| {
+            CoreError::new(CoreErrorKind::Io, format!("the export task died: {error}"))
+        })?
+        .map_err(CoreError::from)
 }
 
 fn now_millis() -> i64 {

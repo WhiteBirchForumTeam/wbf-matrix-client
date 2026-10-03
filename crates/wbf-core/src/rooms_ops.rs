@@ -544,6 +544,8 @@ impl Core {
         Ok((cache, session.user_id))
     }
 
+    /// 📌 只給測試（繞過唯一寫入者直接開 `cache.db`）：正式碼用 [`Core::server_cache_and_me`]。
+    #[cfg(test)]
     pub(crate) fn cache_and_me(
         &self,
         account: &AccountDir,

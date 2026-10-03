@@ -90,6 +90,20 @@ pub enum CoreEvent {
         /// 停的理由（`stopped` 才有）。
         reason: Option<String>,
     },
+    /// 一個下載 job 怎麼了（/docs/design/media/media-download.md §5.5）：狀態改變時一則，拉的途中每個 job 最多每秒一則。
+    /// 🚫 不是每塊一則：那會把 `room.message` 擠掉（廣播佇列深度只有 256）。
+    MediaDownload {
+        user: String,
+        /// example: "mxc://localhost/000000000000004d"
+        mxc: String,
+        state: DownloadState,
+        /// 已落地的塊數（主檔的 `next`）
+        done: u32,
+        /// 總塊數；還不知道是 0
+        total: u32,
+        /// `failed` 的理由（給人看的）；其他狀態是 `None`
+        reason: Option<String>,
+    },
     /// 這條線收到一個 pack（`ReceivedHook` 的那一頭）。**只有標頭**，🚫 不帶 meta／data：它是 broadcast、每條 RPC 連線一份，
     /// 而 data 可能是幾 MiB 的媒體塊或密文。要內容的由型別化的事件發（`Message` 那種）。
     Received {
@@ -111,6 +125,24 @@ pub enum CoreEvent {
 pub enum LinkState {
     Opened,
     Closed,
+}
+
+/// 一個下載 job 的狀態（`CoreEvent::MediaDownload`、`media.queue`，/docs/design/media/media-download.md §5.5）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadState {
+    /// 排在佇列裡，還沒開始。
+    Queued,
+    /// 正在拉（在 `downloading` 表裡）。
+    Downloading,
+    /// 主檔完成、進了池。
+    Complete,
+    /// 被 `media.cancel` 停了：主檔與暫存檔留著，再排一次從斷點接。
+    Cancelled,
+    /// 壞檔（驗不過）或帳號沒了：job 移除。
+    Failed,
+    /// 本機有原檔（/docs/design/rpc-specs/data-plane.md §8.1）：🚫 不下載。只在 RPC 的回應裡，推播不會有。
+    LocalSource,
 }
 
 /// 金鑰訂閱的狀態（`CoreEvent::Keys`，/docs/design/rpc-specs/rpc-spec.md §4 的 `keys.state`）。

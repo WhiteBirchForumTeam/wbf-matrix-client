@@ -148,43 +148,23 @@ struct Work {
 （後commit的那批帶著比較舊的 `cg_seq`）。要修就得在每個寫入點做 `max()` 防禦 ——
 ⭐ 那才是真的不乾淨：把一個順序問題散成 N 個地方的防禦。queue 是**一個地方**解決它。
 
-### 2.3.1 ⚠️ 寫入者管的是**哪些表**：媒體那幾條是例外
+### 2.3.1 媒體也走寫入者：下載是一塊一步，DB 只在點上碰
 
-「一個 server 一個寫入者」🚫 **不等於**「這個程序只有一條寫連線」。實際的邊界是：
+`media`、`event_media` 跟其他表一樣只由寫入者寫。能這樣做，是因為下載的形狀（/docs/design/media/media-download.md §5.4）：
+寫池檔都在那個帳號的下載處理端自己的 task 上（網路是 `Download` 線的發送端，/docs/design/daemon/link-requests.md），**DB 只在幾個點上碰一下**——
 
-| 表 | 誰寫 | 為什麼 |
+| 時機 | 入口 | 為什麼 |
 |---|---|---|
-| `events`、`events_synced_log`、`rooms`、`users`、`room_list`、`sync_state`（水位） | **寫入者，唯一** | 多方共寫（每個帳號的上游會話都寫同一批列），而且**水位有順序要求** |
-| `media`、`event_media` | 媒體那幾條**自己的連線** | 單一擁有者（一個 mxc 一列）、🚫 沒有順序要求 |
+| job 開檔：`media_begin` ＋ 拿暫存名 | `run` | 回答（暫存名）取決於這次寫入 |
+| 每 1.5 秒：`media_progress`（段數，只給顯示） | `post` | 丟了只是顯示慢一點 |
+| 收尾：`media_finish` | `run` | 之後才放掉認領、才叫醒等它的人（/docs/design/media/media-download.md §5.1 那條順序） |
+| 壞檔：`media_reset` | `post` | |
+| `media.gc`：`sweep` ＋ `collect_garbage` | `run`（一整件） | 掃描要的是一致的那一刻：列與池檔對照的中間不准有別人改列 |
 
-**為什麼媒體不能走寫入者**：`media::fetch` 的形狀是「**邊下載邊寫**」——
+⚠️ 代價說實話：`media.gc` 那一件會在寫入執行緒上跑完整個掃描（列與 `pending/`、`media/<hh>/` 的目錄、刪檔）；池很大的時候，這段時間同一台 server 的新訊息排在它後面。
+它是使用者按的（或一個程序裡每台 server 第一次起下載處理端時一次），🚫 不在背景定時跑。哪天池大到這件事看得出來，再把「列出要刪的」與「刪檔」拆開。
 
-```rust
-for index in resumed_from..chunk_count {
-    let plain = client.read_and_open_chunk(...).await?;  // 網路，每塊一次
-    writer.write_all(&plain)?;                           // 寫媒體池的檔
-    if progress.due() {                                  // 每 1–2 秒
-        cache.media_progress(&mxc, written_chunks, ...)?;// 才碰一次 DB
-    }
-}
-```
-
-它把 `&mut Cache` **借住整趟下載**（2 GB 就是好幾分鐘），中間夾著幾百個 `.await`。
-🚨 而寫入者的工作是**在寫入執行緒上跑完**的 —— 把這個函數丟進去，等於那條執行緒被一個下載
-佔住幾分鐘，**這台機器上每個帳號的新訊息都排在它後面**。
-
-⭐ 而「不走寫入者」是安全的，因為 **持有連線 ≠ 持有鎖**：SQLite 只在**交易期間**鎖，
-`media_progress` 是每 1–2 秒一次的短交易。兩條連線各自做短交易會排隊（`busy_timeout`，§2.1），
-🚫 不會互相卡死。
-
-⚠️ 代價要說實話，三條：
-
-1. 那些 DB 寫仍然是**在 async task 裡同步阻塞**（最壞等 5 秒鎖）→ 會卡住一條 tokio 工作執行緒。
-2. `daemon.info` 的 `cache_queue` **看不到**媒體那條路的寫（它們不排在 queue 上）。
-3. 兩個寫入者都在等同一把 SQLite 寫鎖 —— 正確，但會互相拖慢。
-
-👉 **什麼時候會消失**：還沒做：重寫下載路徑（`PoolReader`、邊拉邊吐給 HTTP）。⭐ 到那時候把 DB 觸點改成 `post`／`run` 是順路的，
-🚫 為了對稱先去改 `media::fetch` 的簽名只是製造一次沒有內容的大 diff。
+讀（`find_media`、`find_media_block_for`、`find_event_attachment`）走讀連線，跟其他讀一樣。🚫 正式碼沒有繞過寫入者直接開 `cache.db` 的路（`Core::cache_of` 只在測試建置存在）。
 
 ### 2.4 為什麼 `m/` 不需要這一套
 
@@ -264,7 +244,7 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一台 OlmMac
 | 收到新訊息 | —（推播 `room.message`） | ✅（背景，上游會話） |
 | 送一則訊息 | `room.send_text` | ✅ |
 | 標記已讀 | `room.read`（§6） | 🟡 看 `sync` |
-| 下載附件 | `media.save_to`／`media.open` | 🟡 命中媒體池就不用 |
+| 下載附件 | `media.export_to`／`media.open` | 🟡 命中媒體池就不用 |
 | 切換「現在看哪個帳號」 | **不用 RPC** | ❌ |
 
 🚨 最後一列是重點：**「UI 現在在看哪個帳號」是 UI 自己的狀態**，🚫 不是 daemon 的。
@@ -417,10 +397,11 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 📎 同一條原則在上游那一側已經有了：server 推送掉包會標 `gap`（/docs/design/overview/architecture-v2.md §5.1.1）。
 ⭐ 我們自己的推播是同一個問題，🚫 沒有理由用不同的答案。
 
-### 5.4 媒體的進度**不走 RPC**——它是資料平面的事（維護者 2026-09-13）
+### 5.4 媒體的 bytes 不走 RPC，進度只有背景下載走推播（維護者 2026-09-13 定 bytes、2026-10-01 定背景下載的進度）
 
 **媒體的 bytes 從來不經過 RPC 通道**，所以「一個 2 GB 上傳發上萬則 `progress`、把 `room.message` 擠掉」這個情境不存在。
-上傳的 PUT 做了（/docs/design/rpc-specs/data-plane.md）；讀的 GET 還沒。
+上傳的 PUT 與讀的 GET 都做了（/docs/design/rpc-specs/data-plane.md）。**背景下載**沒有 HTTP 可看，進度走推播 `media.download`，
+每個檔最多每秒一則＋狀態改變（/docs/design/media/media-download.md §5.5）——低頻，擠不掉訊息。
 
 ```
 上傳：UI ──HTTP PUT bytes──> daemon ──切塊、加密──> homeserver
@@ -433,11 +414,11 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 - 🚨 **上游慢的時候，daemon 的 HTTP server 要「卡住」**：**停止送資料、但連線開著**，
   等拿到下一塊再繼續吐。🚫 **不要回一個空回應、也不要斷線** ——
   那會讓 UI 以為「傳完了」或「失敗了」，而事實是「還在等」。
-- 所以 **RPC 通道基本上永遠是暢通的**：它上面只有一問一答的控制訊息與低頻的推播，
+- 所以 **RPC 通道基本上永遠是暢通的**：它上面只有一問一答的控制訊息與低頻的推播（含節流過的 `media.download`），
   🚫 沒有 bytes、🚫 沒有每塊一則的進度。§5.3 的 `desync` 仍然要有（慢的訂閱者還是會落後），
   但「進度把訊息擠掉」這個情境**不存在**。
 
-⚠️ **例外：路徑版的 method**（`room.send_file`、`upload.file`、`media.save_to`）——
+⚠️ **例外：路徑版的 method**（`room.send_file`、`upload.file`）——
 那是 daemon **自己讀本機檔案**去傳，UI 沒有 HTTP 可看，所以它們的進度只能走 RPC 的 `progress`。
 📎 那是給 rpc-cli 與「Desktop 拖一個本機檔進來」用的路徑，頻率低、一次一個檔，
 ⭐ 所以**節流與分佇列先不做**（維護者 2026-09-13：「這個你可以先不做，先一步步來」）。
@@ -527,7 +508,7 @@ let response = tokio::select! {
 | 階段 | 內容 | 狀態 |
 |---|---|---|
 | 1 | core 的事件形狀（`Note`／`Progress`／`Message`／`SyncState`）＋ `job` | ✅ |
-| 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 媒體那幾條是刻意的例外（§2.3.1） |
+| 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 媒體也走它（§2.3.1） |
 | 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info`，預設 `local`，**回應回報這次用了哪一種** | ✅ |
 | 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）；SDK 的收包分派（/docs/design/daemon/ws-receive-dispatch.md）；daemon 那半在 /docs/design/daemon/link-pool.md §6 | ✅ 還沒做：兩條佇列分開＋進度節流（§5.4 定了先不做） |
 | 5 | `cancel`（§8） | 還沒做 |
@@ -595,5 +576,5 @@ core 一旦認識「連線」與「請求 id」，/docs/design/overview/architec
 
 ### 12.5 這次檢視改掉的四件事
 
-結論已寫進各節：先寫庫、後發事件（§4.1）；`Lagged` 要送 `desync`（§5.3）；媒體的 bytes 與進度不走 RPC（§5.4）；HTTP 帳號也鏡射進 `cache.db`（§5.5）。
+結論已寫進各節：先寫庫、後發事件（§4.1）；`Lagged` 要送 `desync`（§5.3）；媒體的 bytes 不走 RPC、背景下載的進度是節流過的推播（§5.4）；HTTP 帳號也鏡射進 `cache.db`（§5.5）。
 📎 教訓：**把兩條規則寫在同一份文件的不同章節，不代表它們相容**。

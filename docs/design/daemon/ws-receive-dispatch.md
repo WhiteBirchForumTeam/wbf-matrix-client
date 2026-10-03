@@ -113,15 +113,17 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
   有序類（`Chunk`）由呼叫端按 `seq` 送，單一 task 寫 sink 所以順序不會亂。
 - 送出 task 寫 sink 失敗 → 直接走 §7 的 `shut_down`（🚫 不是只有自己停：讀取 task 那邊 socket 可能還活著，看不出異狀）；之後每個 `send` 立刻回 `Network`。
 
-### 5.1 心跳：每條線自己一個，安靜才跳（維護者 2026-09-21：照 WireGuard 的 persistent keepalive）
+### 5.1 心跳：每條線自己一個，每 24 秒一定跳（維護者 2026-10-02）
 
 `WsLink` 多一個心跳 task（`Heartbeat`）：
 
-- 每 `interval`（**24 秒**）醒一次。醒來先看**最近 `quiet`（20 秒）之內這條線有沒有任何送或收**（`Shared::last_activity_ms`，讀取 task 與送出 task 各自 `touch`）——
-  有就跳過這次；沒有才送一個 `Control/Ping`（`WANT_ACK`，走一般的 `request`，所以 `Pong` 也經會話表、也過鉤子）。
-- `reply_timeout`（10 秒）內沒有 `Pong` → 這條線死了：走 §7 的 `shut_down("heartbeat: …")`。在等的人立刻收到 `Network`，連線池下一次取用會重開。
-- 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 300 秒——一條閒著的訂閱線（keys、rooms）不跳的話會被 server 當黑洞收掉；而且沒有心跳，
-  對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒遠小於 300 秒，也讓「線死了」在半分鐘內可見。
+- 每 `interval`（**24 秒**）**一定**送一個 `Control/Ping`（`WANT_ACK`，走一般的 `request`，所以 `Pong` 也經會話表、也過鉤子）。
+  🚫 因為「最近有通訊」就跳過：server 的 idle 只看 **client 送了什麼**，一條一直在收推播的訂閱線（`Rooms`、`Keys`）
+  在 client 這邊看起來很忙，在 server 那邊卻是一條沒有請求的線。
+- 送出 `Ping` 之後 `reply_timeout`（10 秒）內**什麼都沒收到** → 這條線死了：走 §7 的 `shut_down("heartbeat: …")`。在等的人立刻收到 `Network`，連線池下一次取用會重開。
+  還在收別的東西就接著等（維護者 2026-10-02：逾時是沒收到回應）：server 照順序回，`Pong` 會排在已經在途的回覆後面——很多檔一起下載、網路又慢時，它可能晚於 10 秒才到。
+- 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 **60 秒**（wbfuwunel PR #103，2026-10-02），沒請求就關線；而且沒有心跳，
+  對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒在 60 秒之內還能錯過一次，也讓「線死了」在 34 秒內可見。
 - 心跳的請求號從 `u32::MAX` 往下數（`WbfClient` 的從 1 往上），兩邊要碰到得幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。
 - `Heartbeat::OFF` 不跳（測試別的事情時用）；`start_with_heartbeat` 可以給短的間隔（測試用）。
 - 📎 這不是監督者：它只**發現**線死了，不重連（重開見 /docs/design/daemon/link-pool.md §3、§3.1）。
@@ -140,7 +142,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 ## 7. 關線：表整張清空，每一項收到錯
 
 關線只有**一條路** `shut_down(reason)`：任何一個 task 死了如果只停自己、或 `close()` 不停送出 task，
-在等的人要等到各自的逾時（300 秒）才知道。三個入口都走它，第一個叫到的人做事、之後的都是 no-op：
+在等的人要等到各自的逾時才知道。三個入口都走它，第一個叫到的人做事、之後的都是 no-op：
 
 | 入口 | 什麼時候 |
 |---|---|
@@ -171,3 +173,4 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 ## 10. 之後
 
 這一層沒有待辦。推播封裝、`desync` 在 /docs/design/daemon/link-pool.md §6；`Event/Subscribe` 的訂閱在 /docs/design/rooms/room-sync.md。
+這一層之上、「請求送出後誰等回覆」的規則（送收分開、動作封在請求裡）在 /docs/design/daemon/link-requests.md。

@@ -239,7 +239,7 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 
 ## 8 大資料走資料平面，不走 RPC
 
-怎麼用（路徑、token、狀態碼、上傳的兩步）的權威是 /docs/design/rpc-specs/data-plane.md；這一節只講**為什麼**。還沒做：`media.open` 與 `GET /media`。
+怎麼用（路徑、token、狀態碼、上傳的兩步、讀的 Range）的權威是 /docs/design/rpc-specs/data-plane.md；這一節只講**為什麼**。
 
 ⚠️ 下載一個 2 GB 的檔不可能塞進 JSON，改成 binary frame 串流也會逼**每個前端各自實作一次串流組裝**。
 
@@ -277,8 +277,8 @@ http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 ```jsonc
 { "method": "media.open", "params": { "user": "…", "room": "…", "event_id": "$xyz" }, "id": 9 }
 { "code": 0, "msg": "ok", "id": 9, "result": {
-    "url": "http://127.0.0.1:51235/media/mxc/e-9f3aKq…_Lp7Wd…",
-    "mimetype": "video/x-matroska", "size": 1073741824 } }
+    "url": "http://127.0.0.1:51235/media/mxc/e-9f3aKq…_Lp7Wd…", "mxc": "mxc://example.org/abc",
+    "mimetype": "video/x-matroska", "size": 1073741824, "state": "downloading" } }
 ```
 
 前端把 `url` 直接交給播放器／圖片元件，它自己發 Range。daemon 邊解密邊吐，
@@ -290,10 +290,13 @@ http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 ⚠️ **Android 沒有別的選擇**：SAF 給的是 `content://` URI，**根本沒有檔案路徑可給**。
 所以 PUT 這條路在 Android 上不是「比較好」，是必要的。
 
-**另存新檔**（使用者明確要把明文放到自己選的位置）仍然走路徑：
+`state` 是 `local_source`、`complete`、`downloading`、`queued`：不完整也沒原檔時 `media.open` 順便排進下載，GET 會邊等邊吐。
+
+**匯出**（使用者明確要把明文放到自己選的位置）給一個 URI，現在只收 `file://`（/docs/design/media/media-download.md §7.3）。
+⚠️ **`to` 已經存在就覆蓋**（維護者 2026-10-03）：要不要覆蓋是 **UI 的事**，選位置的時候先問使用者，daemon 🚫 再擋。
 
 ```jsonc
-{ "method": "media.save_to", "params": { "user": "…", "manifest": { … }, "out": "/home/me/video.mkv" }, "id": 15 }
+{ "method": "media.export_to", "params": { "user": "…", "manifest": { … }, "to": "file:///home/me/video.mkv" }, "id": 15 }
 ```
 
 這裡明文落地是**使用者要的**，不是我們偷偷做的——這條界線要守住。rpc-cli 的 `download -o` 就是它。

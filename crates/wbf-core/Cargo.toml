@@ -15,7 +15,8 @@ tokio = { version = "1", features = ["sync", "io-util"] }
 # 資料平面上傳邊收邊算整檔 SHA-256（attachment_ops.rs）；跟 wbf-sdk 同一份。
 sha2 = "0.10"
 hex = "0.4"
+# 線的請求自己造 pack（link_requests.rs，/docs/design/daemon/link-requests.md §3）。本 repo 的 codec，不是上游依賴。
+wbf-wire = { path = "../wbf-wire" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt"] }
-wbf-wire = { path = "../wbf-wire" }

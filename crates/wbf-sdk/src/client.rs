@@ -802,8 +802,7 @@ impl<C: PackChannel> WbfClient<C> {
     ///     Ok((InfoAck, Vec<u8>))   meta 與 data（server 存的那份描述，原樣）
     pub async fn fetch_info(&mut self, mxc: &str) -> Result<(InfoAck, Vec<u8>), SdkError> {
         let ack = self.call(|seq| Ok(protocol::info(mxc, seq))).await?;
-        let info = protocol::parse_meta(&ack)?;
-        Ok((info, ack.data))
+        protocol::info_reply(ack)
     }
 
     /// wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.2：整整一塊，照上傳時的 bytes。這裡只驗 `len` 與 data 長度一致；解密與長度規則在下載端。
@@ -815,21 +814,7 @@ impl<C: PackChannel> WbfClient<C> {
         let ack = self
             .call(|seq| Ok(protocol::read_chunk(mxc, index, seq)))
             .await?;
-        let read: ReadAck = protocol::parse_meta(&ack)?;
-        if read.len != ack.data.len() as u64 {
-            return Err(SdkError::Protocol(format!(
-                "Read ack says len {} but data is {} bytes",
-                read.len,
-                ack.data.len()
-            )));
-        }
-        if read.chunk != index {
-            return Err(SdkError::Protocol(format!(
-                "asked for chunk {index}, got {}",
-                read.chunk
-            )));
-        }
-        Ok((read, ack.data))
+        protocol::read_reply(ack, index)
     }
 
     /// `Event/Recent` 的**一窗**（wbfuwunel 的 pack-pipeline.md §6）：送請求、收一串 `Event/Batch` 直到 `r = 0`。

@@ -57,8 +57,8 @@
   （server 允許未登入升級但 30 秒就關、而且我們沒有要在線上 `Session/Login`——那是另一支）。「未登入就閒置」＝池裡有這一格、沒有 socket。
 - **用**：`client_of` 回一個 `PooledClient`（一條線一次一個命令，§5）。呼叫端照舊 `client.xxx().await`。
 - **死**：`WsLink::is_closed()` 為 true（讀取或送出 task 走過 `shut_down`：對方關、寫失敗、**心跳沒回**）。池在**下一次**取用時看到就丟掉舊的、重開、再把命令做下去。
-  📎 **心跳**（/docs/design/daemon/ws-receive-dispatch.md §5.1，維護者 2026-09-21）：每條線自己一個，24 秒一次、最近 20 秒有通訊就跳過、10 秒沒 `Pong` 就當死。
-  所以閒著的線不會被 server 的 300 秒 idle 收掉，而對方悄悄不在了也會在半分鐘內變成 `is_closed()`——心跳本身不重連：重開的是下一次取用，或背景看線迴圈的下一輪（§3.1）。
+  📎 **心跳**（/docs/design/daemon/ws-receive-dispatch.md §5.1，維護者 2026-09-21）：每條線自己一個，**每 24 秒一定送一個 `Ping`**（維護者 2026-10-02：🚫 因為最近有收到東西就跳過）、送出 Ping 之後 10 秒什麼都沒收到才當死（`Pong` 排在別的回覆後面也不算死）。
+  所以不送請求的線（只收推播的訂閱線）不會被 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）收掉，而對方悄悄不在了也會在半分鐘內變成 `is_closed()`——心跳本身不重連：重開的是下一次取用，或背景看線迴圈的下一輪（§3.1）。
   🚨 **命令做到一半死了不重做**：錯誤原樣回呼叫端（`Network`），要不要重來是呼叫端的事（跟 1506 的原則一樣：重送是 UI 的）。
   ⭐ 這條跟維護者說的「萬一斷掉，就主動打開再執行 RPC 要的命令」一致：是**這次 RPC 開頭**發現死了就重開，不是替上一個死掉的 RPC 補做。
 - **訂閱線**（`Rooms`、`Keys`）：沒有命令會「用」它們，所以開它們的是 §3.1 的鉤子。訂閱的內容（`cd_seq` 在哪、收了什麼）🚫 不歸池管——池只管 socket。
@@ -125,12 +125,15 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
   判斷在 daemon 的推播函數（§6），池只發。
 - 鉤子在讀取 task 上、表鎖之外（/docs/design/daemon/ws-receive-dispatch.md §4）；`EventSink` 是 broadcast 的 `try_send`，不會擋讀取 task。
 
-## 5. 一條線一次一個命令
+## 5. 一條線上的請求：送收分開、動作封在請求裡
 
-`PooledClient` 是那條線的 `WbfClient` 的 `tokio::Mutex` guard：同一條線上第二個命令等第一個做完。
-原因是 `WbfClient` 的方法都是 `&mut self`（請求號計數器、hello 的結果），而底下的 `WsLink` 本身允許並行——
-所以這是**上面那層**的限制，不是通道的。⭐ 有五條線之後，會排隊的只剩「同一類的兩個命令」（兩個下載、兩個 ping），可接受；
-之後要讓同一條線並行，改的是 `WbfClient`（計數器變 atomic、hello 結果變 `Arc`），🚫 不是池。
+**規則在 /docs/design/daemon/link-requests.md**（維護者 2026-10-02）：每條線一條發送 queue ＋ 一張在途表，請求送出去就不管，
+「拿到回覆之後做什麼」封在請求裡，回覆到了由那條線的處理端執行；預設無序，要守順序的例外由動作自己守。
+發送 queue 與在途表活得比底下的 `WsLink` 久：線斷了 queue 不丟，重開之後接著送。
+`Download` 只有一個用戶，它的發送 queue 在下載處理端身上、線從池借分身（`LinkPool::find_ws_link`）；很多命令共用的線（`Misc`）搬過來時，發送 queue 放進池的這一格。
+
+**還沒搬過去的線**照舊的方式：`PooledClient` 是那條線的 `WbfClient` 的 `tokio::Mutex` guard，同一條線上第二個命令等第一個做完
+（`WbfClient` 的方法是 `&mut self`：請求號計數器、hello 的結果在它身上）。搬的順序在 /docs/design/daemon/link-requests.md §8：`Download` 已經搬了，`Misc`、`Upload`、`Rooms`／`Keys` 還是這樣。
 
 ## 6. daemon 那半：訂閱、推播、desync（/docs/design/rpc-specs/rpc-spec.md §3.9、§4）
 
@@ -141,7 +144,7 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 - 維護者 2026-09-29：「`sync.open`、`sync.close` 應該是指是否要推到 RPC UI 端的一個 flag。訂閱連線這件事總是由 daemon 搞定。」
   那個 flag 就是這裡的 `subscribe`／`unsubscribe`（例如 `subscribe { events: ["room.message", "keys.state"] }`），所以🚫 沒有另外的 `sync.open`／`sync.close`：
   UI 訂不訂只決定它收不收得到推播，daemon 對上游的訂閱照跑（§3.1）。
-- 新的推播名（加進 /docs/design/rpc-specs/rpc-spec.md §4）：`link.state`（＝`CoreEvent::Link`）、`pack.received`（＝`CoreEvent::Received`）。
+- 新的推播名（加進 /docs/design/rpc-specs/rpc-spec.md §4）：`link.state`（＝`CoreEvent::Link`）、`pack.received`（＝`CoreEvent::Received`）、`media.download`（＝`CoreEvent::MediaDownload`）。
   既有的 `room.message`／`sync.state`／`progress` 照 rpc-spec 對到 `CoreEvent::Message`／`SyncState`／`Progress`。
 
 ## 7. 開連線是一個接縫：`LinkOpener`

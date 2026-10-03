@@ -57,8 +57,8 @@ pub struct MediaInfo {
 pub struct CachedMedia {
     /// 整檔都在池裡了嗎。
     pub complete: bool,
-    /// 已經收下幾塊（續傳點）。
-    pub chunks_written: u64,
+    /// 主檔已經落地的完整段數（64 KiB 一段，池格式 v2）。只給顯示用：下載中的進度看 `media.queue`。
+    pub segments_written: u64,
     /// 池裡那份佔多少磁碟（**加密後**的大小，🚫 不等於 `file_size`）。
     pub bytes_on_disk: u64,
 }
@@ -212,18 +212,15 @@ impl Core {
             truncated: None,
             file_size: Some(entry.file_size),
             chunk_size: Some(entry.chunk_size),
-            // ⚠️ 沒下完時「一共幾塊」是不知道的：`chunks_written` 是進度，🚫 不是總數。
-            chunk_count: match entry.complete {
-                true => u32::try_from(entry.chunks_written).ok(),
-                false => None,
-            },
+            // 區塊的 file_size 與 chunk_size 都在列裡：一共幾塊算得出來（chunk_size 是 0 的列就不答）。
+            chunk_count: wbf_sdk::chunk_crypto::chunk_count(entry.file_size, entry.chunk_size),
             content_type: entry.mimetype.clone(),
             // 這兩個要 server 的描述才算得出來。
             description: None,
             verified: None,
             cached: Some(CachedMedia {
                 complete: entry.complete,
-                chunks_written: entry.chunks_written,
+                segments_written: entry.segments_written,
                 bytes_on_disk: entry.bytes_on_disk,
             }),
         })
@@ -239,7 +236,7 @@ impl Core {
         let found = cache.read().await.find_media(mxc)?;
         Ok(found.map(|entry| CachedMedia {
             complete: entry.complete,
-            chunks_written: entry.chunks_written,
+            segments_written: entry.segments_written,
             bytes_on_disk: entry.bytes_on_disk,
         }))
     }
@@ -374,7 +371,7 @@ mod tests {
             verified: None,
             cached: Some(CachedMedia {
                 complete: true,
-                chunks_written: 3,
+                segments_written: 1,
                 bytes_on_disk: 1234,
             }),
         };

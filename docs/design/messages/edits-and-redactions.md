@@ -1,6 +1,6 @@
 # 事件的處理：原始事件永遠不動，最終內容另存（維護者 2026-09-14 定）
 
-> 這份講 `cache.db` 的 `events` 表怎麼存一則事件，以及 edit、redact、reaction 這些關係事件怎麼折回目標（schema v5）。
+> 這份講 `cache.db` 的 `events` 表怎麼存一則事件，以及 edit、redact、reaction 這些關係事件怎麼折回目標（2026-10-02 是 schema v7；這份講的表從 v5 起沒變）。
 > 從 /docs/design/storage/local-cache-db.md 拆出來；整份 schema 在 /docs/design/storage/local-cache-db.md §5。
 
 ## 1 為什麼原始事件與顯示內容分開存

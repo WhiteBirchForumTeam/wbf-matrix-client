@@ -81,12 +81,12 @@ pub(super) fn account_switch(core: &Core, params: Value) -> Outcome {
     to_result(core.switch_current(&params.user, params.server.as_deref())?)
 }
 
-pub(super) fn media_stats(handle: &Handle, core: &Core, params: Value) -> Outcome {
+pub(super) async fn media_stats(handle: &Handle, core: &Core, params: Value) -> Outcome {
     let target: TargetParams = parse_params(params)?;
-    to_result(core.media_stats(&handle.target(&target))?)
+    to_result(core.media_stats(&handle.target(&target)).await?)
 }
 
-pub(super) fn media_gc(handle: &Handle, core: &Core, params: Value) -> Outcome {
+pub(super) async fn media_gc(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
         #[serde(default = "default_quota_mib")]
@@ -103,11 +103,14 @@ pub(super) fn media_gc(handle: &Handle, core: &Core, params: Value) -> Outcome {
         7
     }
     let params: Params = parse_params(params)?;
-    to_result(core.collect_media_garbage(
-        params.quota_mib,
-        params.protect_days,
-        &handle.target(&params.target),
-    )?)
+    to_result(
+        core.collect_media_garbage(
+            params.quota_mib,
+            params.protect_days,
+            &handle.target(&params.target),
+        )
+        .await?,
+    )
 }
 
 pub(super) fn recovery_list(core: &Core) -> Outcome {

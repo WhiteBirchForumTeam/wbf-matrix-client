@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use wbf_wire::Pack;
 
@@ -26,29 +26,26 @@ pub const CORRUPT_FRAME_BUDGET: u32 = 8;
 /// 送出（進佇列）最多等多久：送出 task 卡在死掉的 socket 上時，呼叫端不該永遠掛著。
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1，維護者 2026-09-21：照 WireGuard 的 persistent keepalive 那個概念）：每條線自己一個，
-/// 每 `interval` 醒一次；最近 `quiet` 之內這條線有任何送或收就跳過這次，否則送一個 `Ping` 等 `Pong`；
-/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。
+/// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1）：每條線自己一個，**每 `interval` 一定送一個 `Ping`**、等 `Pong`；
+/// 送出之後 `reply_timeout` 內**什麼都沒收到**才當這條線死了（`shut_down`）——server 照順序回，`Pong` 會排在已經在途的回覆後面，
+/// 回覆還在流進來就是活的（維護者 2026-10-02：逾時是沒收到回應）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`（wbfuwunel #103，2026-10-02）
+/// 是 60 秒、只看 client 送了什麼——只收推播的線（`Rooms`／`Keys`）一直在收，可是 server 看到的是一條 60 秒沒請求的線，會把它關掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
     pub interval: Duration,
-    pub quiet: Duration,
     pub reply_timeout: Duration,
 }
 
 impl Heartbeat {
-    /// 預設：24 秒一次、最近 20 秒有通訊就跳過、Pong 等 10 秒。
-    /// 24 秒 ≪ server 的 `wbf_ws_idle_timeout`（300 秒），閘著的線不會被 server 當黑洞收掉；也能在半分鐘內發現對方已經不在。
+    /// 預設：24 秒一次、Pong 等 10 秒。24 秒在 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）之內還能錯過一次；對方悄悄不在了，34 秒內這條線就關了。
     pub const DEFAULT: Heartbeat = Heartbeat {
         interval: Duration::from_secs(24),
-        quiet: Duration::from_secs(20),
         reply_timeout: Duration::from_secs(10),
     };
 
     /// 不跳（只給測試別的事情時用）。
     pub const OFF: Heartbeat = Heartbeat {
         interval: Duration::MAX,
-        quiet: Duration::ZERO,
         reply_timeout: Duration::from_secs(10),
     };
 }
@@ -84,10 +81,8 @@ struct Shared {
     closed: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     hook: ReceivedHook,
-    /// 這條線起來的時間；`last_activity_ms` 從這裡算。
-    started: std::time::Instant,
-    /// 上次送或收（任何 frame）是起來之後第幾毫秒。心跳拿它決定要不要跳過。
-    last_activity_ms: AtomicU64,
+    /// 讀取 task 至今解出幾個 pack：心跳拿它判斷「等 `Pong` 的這段時間有沒有收到任何東西」。
+    received: AtomicU64,
 }
 
 impl Shared {
@@ -95,19 +90,6 @@ impl Shared {
         self.table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 送了或收了一個 frame。
-    fn touch(&self) {
-        let elapsed = self.started.elapsed().as_millis() as u64;
-        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
-    }
-
-    /// Return:
-    ///     Duration   距離上次送或收多久
-    fn idle_for(&self) -> Duration {
-        let now = self.started.elapsed().as_millis() as u64;
-        Duration::from_millis(now.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)))
     }
 
     fn is_closed(&self) -> bool {
@@ -160,8 +142,7 @@ impl WsLink {
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             hook,
-            started: std::time::Instant::now(),
-            last_activity_ms: AtomicU64::new(0),
+            received: AtomicU64::new(0),
         });
         let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
 
@@ -305,6 +286,36 @@ impl WsLink {
         }
     }
 
+    /// 一問一答，但**送出就回來**：登記 `Reply { id, seq }` → 送 → 回一個之後再等的把手（/docs/design/daemon/link-requests.md §2：發送端🚫 不等回覆）。
+    ///
+    /// Return:
+    ///     Ok(PendingReply)  進佇列了；`wait` 拿回覆，丟掉就從表裡拿掉
+    ///     Err(Network)      連線已經關了、或送不出去
+    ///     Err(Usage)        同一個 (id, seq) 已經有人在等
+    pub async fn send_request(&self, pack: Pack) -> Result<PendingReply, SdkError> {
+        let key = SessionKey::Reply {
+            id: pack.id,
+            seq: pack.seq,
+        };
+        let (sink, receiver) = OneshotSink::new();
+        let generation = self.register_and_send(key, Box::new(sink), &pack).await?;
+        Ok(PendingReply {
+            key,
+            generation,
+            receiver,
+            shared: self.shared.clone(),
+        })
+    }
+
+    /// 同一條線的分身：送、收都一樣，但丟掉它🚫 不關線（只有原本那一份能關）。給「線在連線池裡、送請求的在別的 task」用（/docs/design/daemon/link-requests.md §2）。
+    pub fn share(&self) -> WsLink {
+        WsLink {
+            shared: self.shared.clone(),
+            outgoing: self.outgoing.clone(),
+            owner: false,
+        }
+    }
+
     /// 一問多答：登記 `Session(id)` → 送。回來的每一個抄這個 id 的 pack 都進 handle；handle 丟掉就從表裡拿掉。
     ///
     /// Return:
@@ -393,7 +404,6 @@ async fn write_queued<K: FrameSink>(
             shared.shut_down(&format!("send failed: {error}"));
             return;
         }
-        shared.touch();
     }
 }
 
@@ -408,10 +418,6 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
         if link.shared.is_closed() {
             return;
         }
-        // 最近有通訊：線是活的、server 那邊的 idle 也沒在走，這次不用跳。
-        if link.shared.idle_for() < heartbeat.quiet {
-            continue;
-        }
         let ping = Pack {
             kind: wbf_wire::Kind::Control,
             subtype: wbf_wire::pack::control::PING,
@@ -422,13 +428,33 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
             data: Vec::new(),
         };
         seq = seq.wrapping_sub(1);
-        match link.request(ping, heartbeat.reply_timeout).await {
-            Ok(_pong) => {}
+        let pending = match link.send_request(ping).await {
+            Ok(pending) => pending,
             // 這個號剛好有人在用：那條線顯然活著，下次再說。
-            Err(SdkError::Usage(_)) => {}
+            Err(SdkError::Usage(_)) => continue,
             Err(error) => {
                 link.shared.shut_down(&format!("heartbeat: {error}"));
                 return;
+            }
+        };
+        let mut pong = Box::pin(pending.wait());
+        loop {
+            let heard_before = link.shared.received.load(Ordering::Relaxed);
+            match tokio::time::timeout(heartbeat.reply_timeout, &mut pong).await {
+                Ok(Ok(_pong)) => break,
+                Ok(Err(error)) => {
+                    link.shared.shut_down(&format!("heartbeat: {error}"));
+                    return;
+                }
+                // 還在收別的回覆（`Pong` 排在它們後面）：線是活的，接著等。
+                Err(_elapsed) if link.shared.received.load(Ordering::Relaxed) != heard_before => {}
+                Err(_elapsed) => {
+                    link.shared.shut_down(&format!(
+                        "heartbeat: nothing received for {:?} after a ping",
+                        heartbeat.reply_timeout
+                    ));
+                    return;
+                }
             }
         }
     }
@@ -441,8 +467,8 @@ async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
         match source.receive().await {
             Ok(Some(bytes)) => match Pack::decode(&bytes) {
                 Ok(pack) => {
-                    shared.touch();
                     undecodable_in_a_row = 0;
+                    shared.received.fetch_add(1, Ordering::Relaxed);
                     let (session, route) = shared.table().classify(&pack);
                     (shared.hook)(&Received {
                         connection_id: shared.connection_id,
@@ -500,6 +526,38 @@ impl SessionInbox {
 }
 
 impl Drop for SessionInbox {
+    fn drop(&mut self) {
+        self.shared.table().remove_if(self.key, self.generation);
+    }
+}
+
+/// 送出去、還沒回的一個一問一答（`WsLink::send_request`）。丟掉就從表裡拿掉，晚到的回覆變無主。
+pub struct PendingReply {
+    key: SessionKey,
+    generation: SessionGeneration,
+    receiver: oneshot::Receiver<Result<Pack, SdkError>>,
+    shared: Arc<Shared>,
+}
+
+impl PendingReply {
+    /// 等到回覆、或連線關了。🚫 自己限時：「多久算沒回應」看的是整條線多久沒收到回應，由用線的那一層決定（/docs/design/daemon/link-requests.md §4）；
+    /// 不要了就丟掉它。
+    ///
+    /// Return:
+    ///     Ok(Pack)        回來的那個（可能是 Error pack，這裡不解讀）
+    ///     Err(Network)    連線沒了
+    pub async fn wait(mut self) -> Result<Pack, SdkError> {
+        match (&mut self.receiver).await {
+            Ok(delivered) => delivered,
+            Err(_dropped) => Err(SdkError::Network(format!(
+                "connection {}: the reply slot for {:?} was dropped",
+                self.shared.connection_id, self.key
+            ))),
+        }
+    }
+}
+
+impl Drop for PendingReply {
     fn drop(&mut self) {
         self.shared.table().remove_if(self.key, self.generation);
     }

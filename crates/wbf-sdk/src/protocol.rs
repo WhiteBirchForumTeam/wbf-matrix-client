@@ -499,6 +499,44 @@ pub struct ReadAck {
     pub total_len: u64,
 }
 
+/// `Download/Info` 的回覆（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.1）。
+///
+/// Args:
+///     ack: `expect_ack` 驗過的 Ack
+/// Return:
+///     Ok((InfoAck, Vec<u8>))   meta 與 data（server 存的那份加密描述，原樣）
+///     Err(Protocol)            meta 不是 `InfoAck` 的形狀
+pub fn info_reply(ack: Pack) -> Result<(InfoAck, Vec<u8>), SdkError> {
+    let info = parse_meta(&ack)?;
+    Ok((info, ack.data))
+}
+
+/// `Download/Read` 的回覆（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4.2）：只驗 `len` 與 data 長度一致、塊號是要的那一塊；解密與長度規則在下載端。
+///
+/// Args:
+///     ack: `expect_ack` 驗過的 Ack
+///     index: 要的是第幾塊, example: 3
+/// Return:
+///     Ok((ReadAck, Vec<u8>))   meta 與那一塊的密文
+///     Err(Protocol)            meta 形狀不對、`len` 對不上 data、或回的不是這一塊
+pub fn read_reply(ack: Pack, index: u32) -> Result<(ReadAck, Vec<u8>), SdkError> {
+    let read: ReadAck = parse_meta(&ack)?;
+    if read.len != ack.data.len() as u64 {
+        return Err(SdkError::Protocol(format!(
+            "Read ack says len {} but data is {} bytes",
+            read.len,
+            ack.data.len()
+        )));
+    }
+    if read.chunk != index {
+        return Err(SdkError::Protocol(format!(
+            "asked for chunk {index}, got {}",
+            read.chunk
+        )));
+    }
+    Ok((read, ack.data))
+}
+
 // ---- Event（kind 0x14）：wbfuwunel 的 /docs/design/room-seq-and-recent.md §2、wbfuwunel 的 /docs/design/media-attachments.md §3 ----
 
 /// `unsigned` 裡 server 加的每房連續序號（第一個事件是 1；聯邦補回的歷史 0、−1、…）。

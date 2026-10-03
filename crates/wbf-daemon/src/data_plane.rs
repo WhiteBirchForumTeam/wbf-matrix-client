@@ -2,8 +2,8 @@
 //!
 //! | 這裡 | 別處 |
 //! |---|---|
-//! | URL 與 meta（[`AccessKeys`]）：URL 裡那段是共享 token 加密的「用途 ‖ mxc」，上傳狀態在 `Wbf-Upload-Meta` header | `media.create` 鑄（`handle/media.rs`） |
-//! | HTTP listener（[`DataServer`]）：路徑、Host、狀態碼、把 body 交給 core | 怎麼切塊、加密、上傳（`Core::receive_upload`） |
+//! | URL 與 meta（[`AccessKeys`]）：URL 裡那段是共享 token 加密的「用途 ‖ mxc」，上傳狀態在 `Wbf-Upload-Meta` header | `media.create`／`media.open` 鑄（`handle/media.rs`） |
+//! | HTTP listener（[`DataServer`]）：路徑、Host、Range、狀態碼、把 body 交給 core、把 core 給的明文串流出去 | 怎麼切塊、加密、上傳（`Core::receive_upload`）；從哪讀（`Core::find_media_source`） |
 //!
 //! 🚫 沒有 token 表、沒有 TTL（維護者 2026-09-30）：URL 與 header 帶著上傳的一切，daemon 解得開就是它發的；
 //! 能活多久、要不要拒，是 server 的事。唯一的表是「正在收的上傳」，只活在那條連線的期間。🚫 這裡不印東西。
@@ -19,7 +19,9 @@ use bytes::Bytes;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use futures_util::TryStreamExt;
-use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -28,7 +30,7 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::StreamReader;
-use wbf_core::{Core, CoreError, CoreErrorKind, Target};
+use wbf_core::{Core, CoreError, CoreErrorKind, MediaStream, Target};
 use wbf_sdk::{Manifest, UploadState};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -37,6 +39,8 @@ use crate::message::code;
 
 /// 上傳的路徑前綴；後面接 URL key（/docs/design/rpc-specs/data-plane.md §3）。
 pub const UPLOAD_PATH: &str = "/upload/mxc/";
+/// 讀的路徑前綴；後面接 URL key（/docs/design/rpc-specs/data-plane.md §8）。
+pub const MEDIA_PATH: &str = "/media/mxc/";
 /// PUT 時帶上傳狀態的 header（`media.create` 給，/docs/design/rpc-specs/data-plane.md §2）。
 pub const UPLOAD_META_HEADER: &str = "Wbf-Upload-Meta";
 /// 資料平面從共享 token 導鑰的 context（跟 RPC 的兩把分開，/docs/design/rpc-specs/local-interface.md §4）。
@@ -51,8 +55,9 @@ const ENCRYPTED_PREFIX: &str = "e-";
 const PLAIN_PREFIX: &str = "c-";
 /// 加密模式裡分隔 nonce 與密文。Base58 的字母表沒有底線，所以它不會出現在兩段裡面。
 const SEPARATOR: char = '_';
-/// URL 明文的第一個 byte：這個 URL 是做什麼的。下載的 URL 拿來上傳要被拒。
+/// URL 明文的第一個 byte：這個 URL 是做什麼的。下載的 URL 拿來上傳要被拒，反之亦然。
 const PURPOSE_UPLOAD: u8 = 0x01;
+const PURPOSE_MEDIA: u8 = 0x02;
 
 /// `Wbf-Upload-Meta` 裡封的東西：上傳狀態，加上 UI 給的原檔位置（/docs/design/rpc-specs/data-plane.md §8.1）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,9 +92,48 @@ impl AccessKeys {
     ///     Ok(String)       example: "e-Hq3TbQ…_4kVn9s…"（約 100 個字元）
     ///     Err(CoreError)   OS 給不出亂數（`Io`）
     pub fn to_upload_url_key(&self, mxc: &str, encrypted: bool) -> Result<String, CoreError> {
-        let mut plain = vec![PURPOSE_UPLOAD];
+        self.to_url_key(PURPOSE_UPLOAD, mxc, encrypted)
+    }
+
+    /// 讀的 URL 裡 `/media/mxc/` 後面那段：用途 ‖ mxc，🚫 不帶帳號（/docs/design/rpc-specs/data-plane.md §8）。
+    ///
+    /// Args:
+    ///     mxc: example: "mxc://localhost/000000000000004d"
+    ///     encrypted: 同 [`AccessKeys::to_upload_url_key`]
+    /// Return:
+    ///     Ok(String)       example: "e-Hq3TbQ…_4kVn9s…"
+    ///     Err(CoreError)   OS 給不出亂數（`Io`）
+    pub fn to_media_url_key(&self, mxc: &str, encrypted: bool) -> Result<String, CoreError> {
+        self.to_url_key(PURPOSE_MEDIA, mxc, encrypted)
+    }
+
+    /// 開讀的 URL 那段。
+    ///
+    /// Return:
+    ///     Some(String)   mxc
+    ///     None           同 [`AccessKeys::open_upload_url_key`]（上傳的 URL 拿來讀也是 None）
+    pub fn open_media_url_key(&self, url_key: &str, encryption_enforced: bool) -> Option<String> {
+        self.open_url_key(PURPOSE_MEDIA, url_key, encryption_enforced)
+    }
+
+    fn to_url_key(&self, purpose: u8, mxc: &str, encrypted: bool) -> Result<String, CoreError> {
+        let mut plain = vec![purpose];
         plain.extend_from_slice(mxc.as_bytes());
         self.to_text(&plain, URL_AAD, encrypted)
+    }
+
+    fn open_url_key(
+        &self,
+        purpose: u8,
+        url_key: &str,
+        encryption_enforced: bool,
+    ) -> Option<String> {
+        let plain = self.open_text(url_key, URL_AAD, encryption_enforced)?;
+        let (found, mxc) = plain.split_first()?;
+        if *found != purpose {
+            return None;
+        }
+        String::from_utf8(mxc.to_vec()).ok()
     }
 
     /// 開上傳 URL 那段。
@@ -101,12 +145,7 @@ impl AccessKeys {
     ///     Some(String)   mxc
     ///     None           不是我們發的、被改過、別的 daemon（token 不同）發的、用途不對、形狀不對、加密模式下的 `c-`
     pub fn open_upload_url_key(&self, url_key: &str, encryption_enforced: bool) -> Option<String> {
-        let plain = self.open_text(url_key, URL_AAD, encryption_enforced)?;
-        let (purpose, mxc) = plain.split_first()?;
-        if *purpose != PURPOSE_UPLOAD {
-            return None;
-        }
-        String::from_utf8(mxc.to_vec()).ok()
+        self.open_url_key(PURPOSE_UPLOAD, url_key, encryption_enforced)
     }
 
     /// `Wbf-Upload-Meta` header 的值：整份上傳狀態（含檔案金鑰）與原檔位置，加密時綁定它的 mxc。
@@ -294,7 +333,9 @@ impl DataServer {
     }
 }
 
-type Reply = Response<Full<Bytes>>;
+/// 回應的 body：小的一次給（`Full`），讀的是串流（`StreamBody`）。⚠️ 用 `Unsync`：串流裡等下載處理端的 future 不一定是 `Sync`。
+type ReplyBody = UnsyncBoxBody<Bytes, std::io::Error>;
+type Reply = Response<ReplyBody>;
 
 async fn serve_connection(
     stream: TcpStream,
@@ -320,13 +361,30 @@ async fn route(
     if !is_loopback_host(&request) {
         return empty_reply(StatusCode::FORBIDDEN);
     }
-    let Some(access) = request.uri().path().strip_prefix(UPLOAD_PATH) else {
-        return not_found();
-    };
-    let access = access.to_string();
-    if request.method() != Method::PUT {
-        return method_not_allowed("PUT");
+    let path = request.uri().path().to_string();
+    if let Some(access) = path.strip_prefix(UPLOAD_PATH) {
+        if request.method() != Method::PUT {
+            return method_not_allowed("PUT");
+        }
+        return route_upload(handle, receiving, access, request).await;
     }
+    if let Some(access) = path.strip_prefix(MEDIA_PATH) {
+        let is_head = request.method() == Method::HEAD;
+        if request.method() != Method::GET && !is_head {
+            return method_not_allowed("GET, HEAD");
+        }
+        return get_media(&handle, access, &request, is_head).await;
+    }
+    not_found()
+}
+
+/// `PUT /upload/mxc/<URL key>`：開 URL 與 meta、同一個上傳只收一條 PUT。
+async fn route_upload(
+    handle: Arc<Handle>,
+    receiving: Arc<UploadsReceiving>,
+    access: &str,
+    request: Request<Incoming>,
+) -> Reply {
     let core = handle.core().await;
     // 未解鎖是 503 不是 404：東西在，只是現在打不開（/docs/design/rpc-specs/local-interface.md §5）。
     if !core.is_unlocked() {
@@ -340,7 +398,7 @@ async fn route(
         return not_found();
     };
     let enforced = handle.is_encryption_enforced();
-    let Some(mxc) = keys.open_upload_url_key(&access, enforced) else {
+    let Some(mxc) = keys.open_upload_url_key(access, enforced) else {
         return not_found();
     };
     let Some(meta) = request
@@ -368,6 +426,168 @@ async fn route(
         );
     };
     put_upload(&handle, &core, &meta, request).await
+}
+
+/// `GET`／`HEAD /media/mxc/<URL key>`（/docs/design/rpc-specs/data-plane.md §8）：開 URL → 找來源 → Range → 邊讀邊吐明文。
+async fn get_media(
+    handle: &Handle,
+    access: &str,
+    request: &Request<Incoming>,
+    is_head: bool,
+) -> Reply {
+    let core = handle.core().await;
+    if !core.is_unlocked() {
+        return error_reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            CoreErrorKind::Locked.rpc_code(),
+            "the vault is locked; call vault.unlock first",
+        );
+    }
+    let Some(keys) = handle.access_keys() else {
+        return not_found();
+    };
+    let Some(mxc) = keys.open_media_url_key(access, handle.is_encryption_enforced()) else {
+        return not_found();
+    };
+    let source = match core.find_media_source(&mxc).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return not_found(),
+        Err(error) if error.kind == CoreErrorKind::Locked => return core_error_reply(&error),
+        // 有紀錄但沒有完整的檔、也拿不到金鑰去拉：上游這一段走不通（§8 的 502）。
+        Err(error) => {
+            return error_reply(
+                StatusCode::BAD_GATEWAY,
+                error.kind.rpc_code(),
+                &error.message,
+            )
+        }
+    };
+    let size = source.size;
+    let range = request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let (status, start, end) = match parse_range(range, size) {
+        RangeAsked::Whole => (StatusCode::OK, 0, size),
+        RangeAsked::Part(start, end) => (StatusCode::PARTIAL_CONTENT, start, end),
+        RangeAsked::Unsatisfiable => {
+            let mut reply = empty_reply(StatusCode::RANGE_NOT_SATISFIABLE);
+            if let Ok(value) = header::HeaderValue::from_str(&format!("bytes */{size}")) {
+                reply.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            return reply;
+        }
+    };
+    let content_type = source
+        .mimetype
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let body = match is_head || start == end {
+        true => full_body(Bytes::new()),
+        false => stream_body(source.into_stream(start, end)),
+    };
+    let mut reply = Response::new(body);
+    *reply.status_mut() = status;
+    let headers = reply.headers_mut();
+    headers.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from(end - start),
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&content_type) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    // 型別是寄件者填的：前端可能是瀏覽器，`text/html`、`image/svg+xml` 的附件被當頁面打開時🚫 讓它跑腳本、🚫 猜型別。
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("sandbox"),
+    );
+    if status == StatusCode::PARTIAL_CONTENT {
+        let range = format!("bytes {start}-{}/{size}", end.saturating_sub(1));
+        if let Ok(value) = header::HeaderValue::from_str(&range) {
+            headers.insert(header::CONTENT_RANGE, value);
+        }
+    }
+    reply
+}
+
+/// `Range` 要的是哪一段。
+#[derive(Debug, PartialEq, Eq)]
+enum RangeAsked {
+    /// 沒帶、寫壞了、或不只一段：整檔（RFC 9110 §14.2：認不得的 Range 可以不理）
+    Whole,
+    /// `[start, end)`
+    Part(u64, u64),
+    /// 起點在檔尾或之後：416
+    Unsatisfiable,
+}
+
+/// Args:
+///     value: `Range` header, example: Some("bytes=100-199")
+///     size: 明文總長, example: 1000
+/// Return:
+///     RangeAsked   `bytes=a-b`、`bytes=a-`、`bytes=-n`（最後 n byte）三種寫法；終點超過檔尾就截到檔尾
+fn parse_range(value: Option<&str>, size: u64) -> RangeAsked {
+    let Some(spec) = value.and_then(|value| value.trim().strip_prefix("bytes=")) else {
+        return RangeAsked::Whole;
+    };
+    if spec.contains(',') {
+        return RangeAsked::Whole;
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return RangeAsked::Whole;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    if first.is_empty() {
+        // 最後 n byte。
+        let Ok(suffix) = last.parse::<u64>() else {
+            return RangeAsked::Whole;
+        };
+        if suffix == 0 || size == 0 {
+            return RangeAsked::Unsatisfiable;
+        }
+        return RangeAsked::Part(size.saturating_sub(suffix), size);
+    }
+    let Ok(start) = first.parse::<u64>() else {
+        return RangeAsked::Whole;
+    };
+    let end = match last {
+        "" => size,
+        text => match text.parse::<u64>() {
+            Ok(last) if last >= start => last.saturating_add(1).min(size),
+            _ => return RangeAsked::Whole,
+        },
+    };
+    if start >= size {
+        return RangeAsked::Unsatisfiable;
+    }
+    RangeAsked::Part(start, end)
+}
+
+/// 把 core 給的明文一段一段吐出去。拿不到下一段就讓 body 出錯：hyper 斷線，播放器知道沒收完（🚫 不假裝結束）。
+fn stream_body(stream: MediaStream) -> ReplyBody {
+    let frames = futures_util::stream::unfold(Some(stream), |state| async move {
+        let mut stream = state?;
+        match stream.next_piece().await {
+            Ok(Some(piece)) => Some((Ok(Frame::data(Bytes::from(piece))), Some(stream))),
+            Ok(None) => None,
+            Err(error) => Some((Err(std::io::Error::other(error.message)), None)),
+        }
+    });
+    StreamBody::new(frames).boxed_unsync()
+}
+
+fn full_body(bytes: Bytes) -> ReplyBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 /// 一個 PUT：body 是明文，一條連線送到底；回應在 `Seal` 之後才到，body 是 manifest（/docs/design/rpc-specs/data-plane.md §4）。
@@ -486,7 +706,7 @@ fn method_not_allowed(allowed: &'static str) -> Reply {
 }
 
 fn json_reply(status: StatusCode, json: Vec<u8>) -> Reply {
-    let mut reply = Response::new(Full::new(Bytes::from(json)));
+    let mut reply = Response::new(full_body(Bytes::from(json)));
     *reply.status_mut() = status;
     reply.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -496,7 +716,7 @@ fn json_reply(status: StatusCode, json: Vec<u8>) -> Reply {
 }
 
 fn empty_reply(status: StatusCode) -> Reply {
-    let mut reply = Response::new(Full::new(Bytes::new()));
+    let mut reply = Response::new(full_body(Bytes::new()));
     *reply.status_mut() = status;
     reply
 }
@@ -663,6 +883,79 @@ mod tests {
             keys.open_upload_url_key(&encrypted, false),
             Some(original.mxc)
         );
+    }
+
+    /// 讀的 URL 與上傳的 URL 只差用途那個 byte：拿來做另一件事一律不收。
+    #[test]
+    fn a_read_url_and_an_upload_url_are_not_interchangeable() {
+        let keys = AccessKeys::from_token(&[7u8; 256]);
+        let mxc = "mxc://localhost/0001";
+        for encrypted in [true, false] {
+            let read = keys.to_media_url_key(mxc, encrypted).unwrap();
+            let upload = keys.to_upload_url_key(mxc, encrypted).unwrap();
+            assert_eq!(keys.open_media_url_key(&read, false).as_deref(), Some(mxc));
+            assert_eq!(keys.open_upload_url_key(&read, false), None);
+            assert_eq!(keys.open_media_url_key(&upload, false), None);
+        }
+        // 加密模式下，明文的讀 URL 一律不收。
+        let plain = keys.to_media_url_key(mxc, false).unwrap();
+        assert_eq!(keys.open_media_url_key(&plain, true), None);
+    }
+
+    #[test]
+    fn a_range_is_one_span_clamped_to_the_file() {
+        assert_eq!(parse_range(None, 1000), RangeAsked::Whole);
+        assert_eq!(
+            parse_range(Some("bytes=100-199"), 1000),
+            RangeAsked::Part(100, 200)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=100-"), 1000),
+            RangeAsked::Part(100, 1000)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-10"), 1000),
+            RangeAsked::Part(990, 1000)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-5000"), 1000),
+            RangeAsked::Part(0, 1000)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=900-5000"), 1000),
+            RangeAsked::Part(900, 1000)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=999-999"), 1000),
+            RangeAsked::Part(999, 1000)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=1000-"), 1000),
+            RangeAsked::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range(Some("bytes=5000-6000"), 1000),
+            RangeAsked::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range(Some("bytes=-0"), 1000),
+            RangeAsked::Unsatisfiable
+        );
+        // 寫壞的、倒過來的、不只一段的、別的單位：不理，給整檔。
+        for ignored in [
+            "bytes=abc",
+            "bytes=200-100",
+            "bytes=0-1,5-6",
+            "items=0-1",
+            "bytes=",
+            "bytes=-",
+        ] {
+            assert_eq!(
+                parse_range(Some(ignored), 1000),
+                RangeAsked::Whole,
+                "{ignored}"
+            );
+        }
     }
 
     /// 同一個上傳同時只收一條 PUT；guard 丟掉（PUT 怎麼結束都一樣，含 future 被 hyper 丟掉）就解除。

@@ -30,7 +30,7 @@ pub fn open_local_source(entry: &MediaEntry) -> Option<(File, PathBuf)> {
 ///     uri: example: "file:///home/me/v.mkv"、"file:///C:/Users/me/v.mkv"
 /// Return:
 ///     Some(PathBuf)   解得出來的路徑
-///     None            不是 `file://`（`content://`、裸路徑 `/x`、相對路徑都算）、host 不是空的也不是 `localhost`、百分比編碼壞、不是 UTF-8、含 NUL
+///     None            不是 `file://`（`content://`、裸路徑 `/x`、相對路徑都算）、host 不是空的也不是 `localhost`、路徑本身是網路路徑（`//host/…`）、百分比編碼壞、不是 UTF-8、含 NUL
 pub fn local_path_of_file_uri(uri: &str) -> Option<PathBuf> {
     file_uri_to_path_text(uri, cfg!(windows)).map(PathBuf::from)
 }
@@ -67,6 +67,13 @@ fn file_uri_to_path_text(uri: &str, windows: bool) -> Option<String> {
     };
     let path = percent_decode(encoded_path)?;
     if path.contains('\0') {
+        return None;
+    }
+    // `file:////host/share`、`file:///%5C%5Chost` 解出來是網路路徑（Windows 的 UNC）：host 不是本機，一律不算（匯出也會往這裡寫）。
+    if path
+        .strip_prefix('/')
+        .is_some_and(|rest| rest.starts_with(['/', '\\']))
+    {
         return None;
     }
     if windows && is_slash_drive(&path) {
@@ -159,6 +166,8 @@ mod tests {
             "xfile:///home/me/v.mkv",
             "file:/home/me/v.mkv",
             "file://server/share/v.mkv",
+            "file:////server/share/v.mkv",
+            "file:///%5C%5Cserver/share/v.mkv",
             "file://C:/Users/me/v.mkv",
             "file://",
             "file:///home/me/v%2.mkv",
@@ -186,7 +195,7 @@ mod tests {
             hash: None,
             file_size,
             chunk_size: 16,
-            chunks_written: 0,
+            segments_written: 0,
             complete: false,
             bytes_on_disk: 0,
             created_at: 0,

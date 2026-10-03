@@ -9,11 +9,11 @@
 //! | `local` | `daemon.*`、`vault.*`、`account.list`／`switch`、`media.stats`／`gc`、`recovery.*` |
 //! | `accounts` | `account.add`／`whoami`／`del`／`destroy` |
 //! | `rooms` | `room.*`、`sync.recent` |
-//! | `media` | `upload.*`、`media.create`／`info`／`save_to`、`server.ping` |
+//! | `media` | `upload.*`、`media.create`／`info`／`download`／`open`／`queue`／`cancel`／`export_to`、`server.ping` |
 //! | `backup` | `backup.*` |
 //!
 //! 推播與 `subscribe` 在 `push.rs`／`server.rs`；資料平面的 HTTP 在 `data_plane.rs`，這裡只在 `media.create` 把上傳狀態封進它的 URL；`room.send_attachment` 收 UI 帶回來的 manifest。
-//! 還沒有：`cancel`、`media.open`（/docs/design/rpc-specs/rpc-spec.md §10）。
+//! 還沒有：通用的 `cancel`（/docs/design/rpc-specs/rpc-spec.md §10；下載有自己的 `media.cancel`）。
 
 mod accounts;
 mod backup;
@@ -344,8 +344,8 @@ impl Handle {
             "vault.remove_passphrase" => Box::pin(async { local::vault_remove_passphrase(core) }),
             "account.list" => Box::pin(async { local::account_list(core) }),
             "account.switch" => Box::pin(async { local::account_switch(core, params) }),
-            "media.stats" => Box::pin(async { local::media_stats(self, core, params) }),
-            "media.gc" => Box::pin(async { local::media_gc(self, core, params) }),
+            "media.stats" => Box::pin(local::media_stats(self, core, params)),
+            "media.gc" => Box::pin(local::media_gc(self, core, params)),
             "recovery.list" => Box::pin(async { local::recovery_list(core) }),
             "recovery.show" => Box::pin(async { local::recovery_show(core, params) }),
             "account.add" => Box::pin(async {
@@ -372,7 +372,11 @@ impl Handle {
             "upload.abort" => Box::pin(media::upload_abort(self, core, params)),
             "media.create" => Box::pin(media::media_create(self, core, params)),
             "media.info" => Box::pin(media::media_info(self, core, params)),
-            "media.save_to" => Box::pin(media::media_save_to(self, core, params)),
+            "media.export_to" => Box::pin(media::media_export_to(self, core, params)),
+            "media.download" => Box::pin(media::media_download(self, core, params)),
+            "media.open" => Box::pin(media::media_open(self, core, params)),
+            "media.queue" => Box::pin(media::media_queue(self, core, params)),
+            "media.cancel" => Box::pin(media::media_cancel(self, core, params)),
             "server.ping" => Box::pin(media::server_ping(self, core, params)),
             "backup.status" => Box::pin(backup::backup_status(self, core, params)),
             "backup.upload" => Box::pin(backup::backup_upload(self, core, params)),
@@ -830,8 +834,8 @@ mod tests {
             ("upload.abort", json!({ "upload_id": 1 })),
             ("media.info", json!({ "mxc": "mxc://x/y" })),
             (
-                "media.save_to",
-                json!({ "manifest": manifest, "out": dir.path().join("o").display().to_string() }),
+                "media.export_to",
+                json!({ "manifest": manifest, "to": format!("file:///{}", dir.path().join("o").display().to_string().replace('\\', "/").trim_start_matches('/')) }),
             ),
             ("server.ping", json!({})),
             ("backup.status", json!({})),
@@ -879,7 +883,11 @@ mod tests {
                 "room.send_attachment",
                 json!({ "room": "!r:localhost", "manifest": { "mxc": 7 } }),
             ),
-            ("media.save_to", json!({ "manifest": {}, "out": "x" })),
+            ("media.export_to", json!({ "manifest": {}, "to": "x" })),
+            (
+                "media.export_to",
+                json!({ "mxc": "mxc://x/y", "to": "http://127.0.0.1:1/from_ui/mxc/y" }),
+            ),
             ("vault.unlock", json!({ "passphrase_base64": "!!" })),
         ];
         for (method, params) in cases {

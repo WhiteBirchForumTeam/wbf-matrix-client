@@ -14,7 +14,7 @@ use crate::error::SdkError;
 use crate::link::{Heartbeat, Subscription, WsLink};
 use crate::sessions::ReceivedHook;
 
-/// 一個請求從送出到收到回應的上限。與 server 的 `wbf_ws_idle_timeout` 預設相同：對方黑洞了就回 `Network`，
+/// 還沒搬到送收分開（/docs/design/daemon/link-requests.md）的呼叫點，一個請求從送出到收到回應的上限：對方黑洞了就回錯，
 /// 不讓 client 永遠掛著。
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 

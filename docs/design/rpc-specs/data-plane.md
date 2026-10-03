@@ -5,11 +5,11 @@ http://127.0.0.1:<data port>
   PUT /upload/mxc/e-<B58 nonce>_<B58 密文>   UI → daemon：明文 bytes，daemon 邊收邊做 chunk 加密邊傳到 homeserver，傳完回 manifest
                                             ＋ header Wbf-Upload-Meta: e-<B58 nonce>_<B58 密文>（上傳狀態）
   PUT /upload/mxc/c-<B58 明文>               同上，明文模式（daemon.set_encryption 關掉時才收）
-  GET /media/mxc/e-<B58 nonce>_<B58 密文>    daemon → UI：從本地媒體池讀、支援 Range（還沒做，§8）
+  GET /media/mxc/e-<B58 nonce>_<B58 密文>    daemon → UI：明文 bytes，從本機原檔、媒體池或現拉，支援 Range（§8）；`HEAD` 一樣、沒有 body
 ```
 
 🚨 **媒體本身的 bytes 只走這裡**（維護者 2026-09-30 再確認）。RPC 只傳媒體**訊息**的 JSON：
-`media.create` 拿 URL、`room.send_attachment` 送事件。🚫 bytes 不進 RPC，進度也不走 RPC。
+`media.create`／`media.open` 拿 URL、`room.send_attachment` 送事件。🚫 bytes 不進 RPC。
 
 為什麼是另一個 port、為什麼是 HTTP、為什麼不能給檔案路徑，在 /docs/design/rpc-specs/local-interface.md §1、§8；這份只定**怎麼用**。
 method 的總表在 /docs/design/rpc-specs/rpc-spec.md §3.6、§3.3；這份是資料平面那幾支的權威，兩邊對不上時以這份為準。
@@ -103,6 +103,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
   meta 是 `c-` ＋ B58(JSON)，都不加密。加密模式下拿 `c-` 來一律 404（fail closed）；加密的 `e-` 兩個模式都收。
   ⚠️ `c-` **沒有任何認證**：本機任何程序都能自己組出一組合法的 URL＋meta。「daemon 解得開就是它發的」只對 `e-` 成立；
   `c-` 擋得住的只剩 core 的「這個上傳是不是這個帳號的」核對——所以它只給除錯，🚫 不給正式環境。
+  讀的那一面一樣：`c-` 模式下 `GET /media/mxc/c-…` 也沒有認證，知道 port 與 mxc 的本機程序（含瀏覽器裡的網頁）都讀得到解密後的媒體。
 - **Host 檢查**：Host 標頭不是 `127.0.0.1`、`localhost`、`[::1]`（帶不帶 port 都可以）一律 **403**。擋的是 DNS rebinding：
   網頁把自己的網域指到 127.0.0.1 之後，瀏覽器送的 Host 是那個網域。
 - **未解鎖一律 503**：東西在，只是現在打不開（/docs/design/rpc-specs/local-interface.md §5）。
@@ -118,7 +119,8 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 |---|---|---|
 | `PUT` | `/upload/mxc/<URL key>`，帶 `Wbf-Upload-Meta` | §4 |
 | 其他方法 | `/upload/mxc/<URL key>` | **405**，`Allow: PUT` |
-| `GET` | `/media/mxc/<URL key>` | 還沒做（§8），現在是 404 |
+| `GET`、`HEAD` | `/media/mxc/<URL key>` | §8 |
+| 其他方法 | `/media/mxc/<URL key>` | **405**，`Allow: GET, HEAD` |
 | 任何 | 其他路徑 | **404** |
 | 任何 | Host 不是 loopback | **403**（§2） |
 
@@ -276,7 +278,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 
 維護者 2026-09-30 定：homeserver 是官方 Matrix（不講 wbf）時，**用傳統方式上傳**，不是 wbf 的分塊。現在 `media.create` 對一般 Matrix 帳號回 1100。
 
-預定的形狀（下一支 PR；UI 看到的 `media.create` → `PUT` → `room.send_attachment` 不變）：
+預定的形狀（UI 看到的 `media.create` → `PUT` → `room.send_attachment` 不變；下載一起做：`media.download`／`open`／`export_to` 對一般 Matrix 帳號現在也是 1100）：
 
 | 步驟 | 明文房 | 加密房 |
 |---|---|---|
@@ -288,7 +290,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 - 🚫 不能整檔讀進記憶體：`/upload` 一個請求送完整個檔，所以是「PUT 進來的 body 直接串流成 `/upload` 的 body」，daemon 手上只有一小段。
 - 這條路的檔案用的是 Matrix 標準格式，別的 Matrix client 看得懂；wbf 的分塊檔只有 wbf client 看得懂（/docs/design/media/wbf-client-convention-for-chunk.md §5）。
 
-## 8. 讀：`GET /media/mxc/<URL key>`（下一支）
+## 8. 讀：`GET /media/mxc/<URL key>`
 
 下載🚫 不需要 header：播放器只吃 URL。URL 跟上傳同一套（§2），用途是 `0x02`，**不帶帳號**（維護者 2026-10-01：「只要匹配 mxc 就能看」）：
 
@@ -299,31 +301,32 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 這跟媒體池原本的設計一致（/docs/design/media/media-pool.md §2）：池跟 `cache.db` 同層、同 server 的帳號共用、不分帳號、不要可見性——
 「拿得到 mxc 的人 server 就給他檔；可見性在事件那層擋過」。
 
-**下載怎麼做的權威是 /docs/design/media/media-download.md**（維護者 2026-10-01 定）：每帳號一條下載佇列、一次順序拉一個檔進池的**主檔**；
-播放器 seek 到還沒拉到的地方，在同一條 `Download` 線上插隊拉那幾塊、順序 append 進 **seek 暫存檔**，用 O(1) 的位置表記位置；
+**下載怎麼做的權威是 /docs/design/media/media-download.md**（維護者 2026-10-01 定）：每帳號一個下載處理端，要下載的檔一起跑、每個檔一塊在途，各自順序寫進池裡的**主檔**；
+播放器 seek 到還沒拉到的地方，那幾塊的請求插到 `Download` 線發送 queue 的最前面，拉到的順序 append 進 **seek 暫存檔**，用 O(1) 的位置表記位置；
 主檔追到時從暫存檔搬、不走網路；主檔完成就刪暫存檔。**每個檔都只被順序寫**。這裡只列 GET 由上往下找的來源（細節在 /docs/design/media/media-download.md §7.2）：
 
 | 先後 | 來源 | 要不要檔案金鑰 |
 |---|---|---|
 | 1 | 本機原檔（§8.1） | 🚫 不要 |
-| 2 | 池裡完整的主檔（`wbf_sdk::media::open_cached` → `PoolReader`，明文位置的 `Read + Seek`） | 🚫 不要（池金鑰） |
+| 2 | 池裡完整的主檔（`wbf_sdk::media::open_complete` → `PoolReader`，明文位置的 `Read + Seek`） | 🚫 不要（池金鑰） |
 | 3 | 主檔已寫的段（下載中） | 🚫 不要（池金鑰） |
 | 4 | seek 暫存檔（位置表裡有） | 🚫 不要（池金鑰） |
 | 5 | 現拉（seek）：`Download` 線插隊 `Read`，解開後存進暫存檔再吐 | 要，從事件拿（`event_media` → `events.content_json` 的區塊） |
 
 - URL 可以重用，播放器 seek 沒問題；daemon 邊讀邊吐，🚫 不整檔進記憶體。
-- mxc 屬於哪一份 `cache.db`（一台 server 一份）：用 mxc 的 server_name 對上本機帳號的網域；對不到就把幾份都找一遍。
+- mxc 屬於哪一份 `cache.db`（一台 server 一份）：照本機已登入的帳號一個一個找，mxc 的 server_name 跟帳號網域一樣的先找。現拉的金鑰只從那個帳號看得到的事件拿，🚫 不跨帳號借。
 
 | | |
 |---|---|
-| 支援 | `Range: bytes=a-b`（單一 range）；沒 `Range` 就整檔 |
-| 回 | `200`（整檔）／`206 Partial Content`（有 Range）；`Content-Type` 是 `media` 列的 mimetype，沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length` |
-| `416` | Range 超出檔尾 |
-| `404` | 不是這個 daemon 發的 URL、或本機沒有這個 mxc 的任何紀錄 |
+| 支援 | `Range` 單一一段：`bytes=a-b`、`bytes=a-`、`bytes=-n`（最後 n byte），終點超過檔尾就截到檔尾；沒帶、寫壞了、不只一段 → 整檔（RFC 9110 §14.2：認不得的 Range 可以不理）。`HEAD` 回一樣的標頭、沒有 body |
+| 回 | `200`（整檔）／`206 Partial Content`（有 Range，帶 `Content-Range`）；`Content-Type` 是 `media` 列的 mimetype（沒有就用區塊的），都沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length`；`X-Content-Type-Options: nosniff` 與 `Content-Security-Policy: sandbox`（型別是寄件者填的，被瀏覽器當頁面打開時🚫 跑腳本） |
+| `416` | Range 的起點在檔尾或之後（帶 `Content-Range: bytes */<大小>`） |
+| `404` | 不是這個 daemon 發的 URL、用途不對（上傳的 URL）、或本機沒有任何帳號有這個 mxc 的紀錄 |
 | `503` | 未解鎖 |
-| `502` | 沒快取、從 server 拉失敗 |
+| `502` | 有紀錄，但沒有完整的檔、也沒有帳號拿得到金鑰去拉 |
 
-- 下載進度就是這個 GET 收到多少 bytes，🚫 不走 RPC。
+- body 開始吐了才拉不到（線斷了、一塊壞了）：狀態碼已經送出去了，所以是讓 body 出錯、連線斷掉，播放器知道沒收完（🚫 不假裝結束）。
+- 播放中的進度就是這個 GET 收到多少 bytes；背景下載的進度是推播 `media.download`（/docs/design/media/media-download.md §5.5）。
 
 ### 8.1 路由：本機原檔優先（維護者 2026-10-01 定）
 
@@ -392,8 +395,8 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | `media.create`、`PUT /upload/mxc/…`、`room.send_attachment`（wbf 帳號，明文房與加密房，固定大小與串流） | ✅ | core `attachment_ops::tests`、daemon `data_plane::tests` 與 `tests/data_plane.rs`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms` |
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
-| 一般 Matrix 帳號的傳統上傳（§7） | ❌ 下一支 | |
-| `media.open`、`GET /media`、下載佇列、seek 暫存檔（§8，設計在 /docs/design/media/media-download.md） | ❌ 下一支 | |
-| `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對（§8.1） | ✅（讀的那一端等 `GET /media`） | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
+| 一般 Matrix 帳號的傳統上傳與下載（§7） | ❌ | |
+| `media.open`、`GET`／`HEAD /media`（Range、416、用途不對的 URL 不收）、下載處理端、seek 暫存檔（§8，/docs/design/media/media-download.md） | ✅ | daemon `data_plane::tests` 與 `tests/data_plane.rs`、core `download_queue::tests`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms`；清單在 /docs/design/media/media-download.md §10 |
+| `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對；讀的時候優先讀原檔（§8.1） | ✅ | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
 | UI 指定從第幾 byte 續傳 | ❌ | |
 | 機密模式（§9） | ❌ 伏筆 | |

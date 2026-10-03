@@ -401,7 +401,7 @@ async fn bridge_members_and_send_to_device_against_real_server() {
 }
 
 /// 心跳對真 server（/docs/design/daemon/ws-receive-dispatch.md §5.1）：安靜的線每秒跳一次，Pong 經會話表回來、也過鉤子；三秒內至少兩個 Pong、線還開著、沒有無主。
-/// 📎 300 秒的 idle 不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
+/// 📎 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
 #[tokio::test]
 #[ignore = "needs a running wbfuwunel; see file header"]
 async fn the_heartbeat_keeps_a_quiet_line_alive_against_the_real_server() {
@@ -437,7 +437,6 @@ async fn the_heartbeat_keeps_a_quiet_line_alive_against_the_real_server() {
         hook,
         Heartbeat {
             interval: std::time::Duration::from_secs(1),
-            quiet: std::time::Duration::from_millis(500),
             reply_timeout: std::time::Duration::from_secs(5),
         },
     )
@@ -497,7 +496,10 @@ async fn the_matrix_sdk_client_keeps_only_state_and_crypto_on_disk() {
     stores.sort();
     assert_eq!(
         stores,
-        vec!["matrix-sdk-crypto.sqlite3".to_string(), "matrix-sdk-state.sqlite3".to_string()],
+        vec![
+            "matrix-sdk-crypto.sqlite3".to_string(),
+            "matrix-sdk-state.sqlite3".to_string()
+        ],
         "只有 state 與 crypto 落地"
     );
     drop(backend);

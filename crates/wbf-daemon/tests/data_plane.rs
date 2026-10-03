@@ -6,7 +6,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wbf_daemon::connection::EncryptionPolicy;
-use wbf_daemon::data_plane::{AccessKeys, DataServer, UploadMeta, UPLOAD_META_HEADER, UPLOAD_PATH};
+use wbf_daemon::data_plane::{
+    AccessKeys, DataServer, UploadMeta, MEDIA_PATH, UPLOAD_META_HEADER, UPLOAD_PATH,
+};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::settings::Settings;
 use wbf_sdk::{Cipher, FileCipher, UploadState};
@@ -137,12 +139,57 @@ async fn locked_is_503_and_foreign_urls_paths_and_methods_are_told_apart() {
         "/upload/",
         "/upload/mxc/",
         "/upload/mxc/e-abc_def",
-        "/media/mxc/e-abc_def",
         &path.replace("/mxc/", "/"),
     ] {
         let (status, _, _) = send(port, "PUT", path, &headers, b"").await;
         assert_eq!(status, 404, "{path}");
     }
+    let (status, head, _) = send(port, "PUT", "/media/mxc/e-abc_def", &headers, b"").await;
+    assert_eq!(status, 405, "讀的路徑只收 GET／HEAD");
+    assert!(
+        head.to_ascii_lowercase().contains("allow: get, head"),
+        "{head}"
+    );
+}
+
+/// 讀的 URL（/docs/design/rpc-specs/data-plane.md §8）：未解鎖 503；別的 daemon 發的、用途不對（上傳的 URL）、本機沒有這個 mxc 的任何紀錄都是 404。
+#[tokio::test]
+async fn a_media_url_is_locked_foreign_or_unknown_before_anything_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, port, _task) = start(dir.path()).await;
+    let mxc = "mxc://localhost/nobody-has-this";
+    let keys = AccessKeys::from_token(&TOKEN);
+    let media_path = format!("{MEDIA_PATH}{}", keys.to_media_url_key(mxc, true).unwrap());
+    let (status, _, body) = send(port, "GET", &media_path, "", b"").await;
+    assert_eq!(status, 503);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], 1001, "{body}");
+
+    handle.core().await.create_vault(None).unwrap();
+    let (status, _, _) = send(port, "GET", &media_path, "", b"").await;
+    assert_eq!(status, 404, "本機沒有任何帳號有這個 mxc 的紀錄");
+    let (status, _, _) = send(port, "HEAD", &media_path, "", b"").await;
+    assert_eq!(status, 404);
+    let other_daemon = AccessKeys::from_token(&[8u8; 256])
+        .to_media_url_key(mxc, true)
+        .unwrap();
+    let (status, _, _) = send(port, "GET", &format!("{MEDIA_PATH}{other_daemon}"), "", b"").await;
+    assert_eq!(status, 404, "別的 daemon（別的 token）發的");
+    let upload_key = keys.to_upload_url_key(mxc, true).unwrap();
+    let (status, _, _) = send(port, "GET", &format!("{MEDIA_PATH}{upload_key}"), "", b"").await;
+    assert_eq!(status, 404, "上傳的 URL 拿來讀：用途不對");
+    let media_key = keys.to_media_url_key(mxc, true).unwrap();
+    let (status, _, _) = send(
+        port,
+        "PUT",
+        &format!("{UPLOAD_PATH}{media_key}"),
+        &format!("{UPLOAD_META_HEADER}: x\r\nContent-Length: 0\r\n"),
+        b"",
+    )
+    .await;
+    assert_eq!(status, 404, "讀的 URL 拿來上傳：用途不對");
+    let (status, _, _) = send(port, "POST", &media_path, "Content-Length: 0\r\n", b"").await;
+    assert_eq!(status, 405);
 }
 
 /// URL 只帶 mxc，上傳狀態在 `Wbf-Upload-Meta`：沒帶是 400（講清楚要帶什麼）；帶了別的上傳的 meta 跟不認得一樣 404。
