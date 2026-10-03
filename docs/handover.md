@@ -1,6 +1,6 @@
 # 交接：現在在哪、怎麼跑、下一步
 
-> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-10-01）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
+> 給下一個接手的人（人或 agent）。每次交接更新（最近一次 2026-10-04）。設計理由不在這裡，在 `/docs/design/`（索引 `/docs/design/index.md`）；
 > 這裡只講**現況、怎麼跑、坑、下一步**。每一支 PR 做了什麼看 git 歷史與 Forgejo 上的 PR，這裡不重述。
 
 ## 1. 現況
@@ -235,7 +235,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 | **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 排在 §7 第 1 項 | 加密房送檔（路徑版）仍拒，資料平面那條可以；新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；房間自設的換金鑰期限沒讀（一律一週／100 則）；補解寫失敗那批不自動重試；CLI 給不了 `room_devices`（加密房送不了） |
 | 交叉簽章沒 bootstrap | client 還沒接；server 的橋都有了（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`／`0x25`，驗證訊息走 to-device） | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
-| PR #43（走橋 GetEvent 當歷史錨點）擱置 | 等 wbfuwunel #64（`Recent` 收 `before_event_id`） | 跳到訊息還是兩個來回 |
+| 跳到訊息的錨點（PR #43 走橋 GetEvent，2026-09-16 關掉、沒合） | 等 wbfuwunel #64（`Recent` 收 `before_event_id`），合了再開一支 | 跳到訊息還是兩個來回 |
 | server 批 3、批 4 的新 kind 沒接（0x12／0x15／0x1C／0x1D、0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加；沒有破壞性改動、向量檔沒變 | 推播規則、搜尋、目錄、TURN 都還沒有。做的時候先讀 #55 列的十個坑 |
 | 斷線後 `recent` 不自動續 | 命令 exit，下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪 |
 | core 層測「成功路徑」的假 wbf server 還不全 | core 的 `test_support` 會答訂閱、Device、橋的 Members／GetStateEvent／Keys*／SendToDevice、`Event/Send` | 探測成功、`watch`、`log_in` 的探測接點只有 `--ignored` 的真 server 測試走得到 |
