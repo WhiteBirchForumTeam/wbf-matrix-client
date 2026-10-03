@@ -5,7 +5,7 @@
 
 ## 1. 現況
 
-PR #1–#68 合併（#43 擱置，等 wbfuwunel #64）。已經能用的，照層次：
+PR #1–#69 合併（main `199a88a`，2026-10-04）；#43（走橋的 GetEvent）是 2026-09-16 關掉、沒合——「跳到訊息」等 wbfuwunel #64 合了再開一支。已經能用的，照層次：
 
 - **線上協議與媒體**：`wbf-wire` 的 codec 對著 server 的黃金向量；`wbf-sdk` 的分塊上傳／下載／seek／續傳／串流、每塊 AEAD（`/docs/design/media/wbf-client-convention-for-chunk.md`）。
 - **本地資料**：vault 與子金鑰、資料目錄兩層路徑加密（`/docs/design/storage/vault-and-keys.md`）；`cache.db` 一個 server 一份、多帳號混存、單一寫入者（`/docs/design/storage/local-cache-db.md`、`/docs/design/daemon/daemon-runtime.md` §2）；
@@ -244,6 +244,10 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
+0. **#69 審查延後的三件**（oliver #821／#822、rumia #823；維護者同意另開一支）：
+   - GET 用自己那份描述的 `chunk_size` 切片（`crates/wbf-core/src/media_stream.rs`），讀回來的塊是另一份描述的大小時會吐出位置錯的明文；`find_media_source` 要先過 `media::is_same_file`、對不上換下一個帳號；只為 seek 開的檔驗不過🚫 刪。
+   - 只為 seek 開著的檔一直握著認領（要超過 `SEEK_ONLY_OPEN` 才關），同 server 別的帳號下載同一個檔會一直等認領。
+   - 舊的下載處理端被串流中的 GET 留住，之後收掉時可能放掉同帳號新處理端的認領（認領的值只有 user）。
 1. **其他四條線送收分開**（`/docs/design/daemon/link-requests.md` §8：`Misc` → `Upload` → `Rooms`／`Keys`）：現在除了 `Download`，
    每條線一次只跑一個命令（借線的人握著那格的鎖、原地等回覆），例如一次送 10 則訊息就是「發收發收…」（維護者 2026-10-02：「先只改 download」，其他的另開）。
 2. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
@@ -251,7 +255,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 4. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
-之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；PR #43 等 wbfuwunel #64；server 批 3／4 的功能（#55）；
+之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；「跳到訊息」等 wbfuwunel #64（#43 已關）；server 批 3／4 的功能（#55）；
 下載的暫停（只停主檔、🚫 不停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
 UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
