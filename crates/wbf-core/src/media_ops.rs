@@ -496,7 +496,8 @@ impl Core {
     ///     local_source_counts: false ＝ 本機原檔不算「已經有了」（匯出時原檔驗不過，要池裡那份）
     /// Return:
     ///     Ok(MediaJob)
-    ///     Err(Usage)   列對不上，而這個檔正在用舊的描述下載：等它停了再來
+    ///     Err(Integrity)   列已經完整、池檔打得開，這次的描述對不上：快取留著，錯的是這次的描述
+    ///     Err(Usage)       列對不上，而這個檔正在用舊的描述下載：等它停了再來
     pub(crate) async fn ensure_queued(
         &self,
         account: &AccountDir,
@@ -508,10 +509,21 @@ impl Core {
         let pool = self.pool_of(account)?;
         let mut entry = cache.read().await.find_media(&manifest.mxc)?;
         let mxc = manifest.mxc.clone();
-        if entry
-            .as_ref()
-            .is_some_and(|entry| !media::is_same_file(entry, &manifest))
+        if let Some(described) = entry
+            .clone()
+            .filter(|entry| !media::is_same_file(entry, &manifest))
         {
+            // 已經完整、整檔驗過的快取是真的：對不上的是這次的描述（寫錯或偽造的事件），回錯給這次的請求、快取🚫 動（維護者 2026-10-03）。
+            if media::open_complete(&pool, &described).is_some() {
+                return Err(CoreError::new(
+                    CoreErrorKind::Integrity,
+                    format!(
+                        "this description of {mxc} does not match the file already downloaded and verified (size {}, chunk size {}); the cached copy is kept",
+                        described.file_size, described.chunk_size
+                    ),
+                ));
+            }
+            // 還沒下載完：兩份描述都還沒被整檔驗過，照 PR #14 的規則丟掉重來。
             self.forget_old_description(account, &manifest).await?;
             entry = None;
         }
@@ -615,6 +627,7 @@ impl Core {
             cache,
             events: self.events.clone(),
             claims: self.media_claims.clone(),
+            line_silence: crate::download_queue::LINE_SILENCE,
         };
         let mut downloaders = self
             .downloaders

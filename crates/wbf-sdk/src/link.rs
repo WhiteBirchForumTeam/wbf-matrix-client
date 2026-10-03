@@ -27,7 +27,8 @@ pub const CORRUPT_FRAME_BUDGET: u32 = 8;
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1）：每條線自己一個，**每 `interval` 一定送一個 `Ping`**、等 `Pong`；
-/// `reply_timeout` 內沒回就當這條線死了（`shut_down`）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`（wbfuwunel #103，2026-10-02）
+/// 送出之後 `reply_timeout` 內**什麼都沒收到**才當這條線死了（`shut_down`）——server 照順序回，`Pong` 會排在已經在途的回覆後面，
+/// 回覆還在流進來就是活的（維護者 2026-10-02：逾時是沒收到回應）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`（wbfuwunel #103，2026-10-02）
 /// 是 60 秒、只看 client 送了什麼——只收推播的線（`Rooms`／`Keys`）一直在收，可是 server 看到的是一條 60 秒沒請求的線，會把它關掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
@@ -80,6 +81,8 @@ struct Shared {
     closed: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     hook: ReceivedHook,
+    /// 讀取 task 至今解出幾個 pack：心跳拿它判斷「等 `Pong` 的這段時間有沒有收到任何東西」。
+    received: AtomicU64,
 }
 
 impl Shared {
@@ -139,6 +142,7 @@ impl WsLink {
             closed: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
             hook,
+            received: AtomicU64::new(0),
         });
         let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
 
@@ -424,13 +428,33 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
             data: Vec::new(),
         };
         seq = seq.wrapping_sub(1);
-        match link.request(ping, heartbeat.reply_timeout).await {
-            Ok(_pong) => {}
+        let pending = match link.send_request(ping).await {
+            Ok(pending) => pending,
             // 這個號剛好有人在用：那條線顯然活著，下次再說。
-            Err(SdkError::Usage(_)) => {}
+            Err(SdkError::Usage(_)) => continue,
             Err(error) => {
                 link.shared.shut_down(&format!("heartbeat: {error}"));
                 return;
+            }
+        };
+        let mut pong = Box::pin(pending.wait());
+        loop {
+            let heard_before = link.shared.received.load(Ordering::Relaxed);
+            match tokio::time::timeout(heartbeat.reply_timeout, &mut pong).await {
+                Ok(Ok(_pong)) => break,
+                Ok(Err(error)) => {
+                    link.shared.shut_down(&format!("heartbeat: {error}"));
+                    return;
+                }
+                // 還在收別的回覆（`Pong` 排在它們後面）：線是活的，接著等。
+                Err(_elapsed) if link.shared.received.load(Ordering::Relaxed) != heard_before => {}
+                Err(_elapsed) => {
+                    link.shared.shut_down(&format!(
+                        "heartbeat: nothing received for {:?} after a ping",
+                        heartbeat.reply_timeout
+                    ));
+                    return;
+                }
             }
         }
     }
@@ -444,6 +468,7 @@ async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
             Ok(Some(bytes)) => match Pack::decode(&bytes) {
                 Ok(pack) => {
                     undecodable_in_a_row = 0;
+                    shared.received.fetch_add(1, Ordering::Relaxed);
                     let (session, route) = shared.table().classify(&pack);
                     (shared.hook)(&Received {
                         connection_id: shared.connection_id,

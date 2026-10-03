@@ -292,7 +292,8 @@ http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 
 `state` 是 `local_source`、`complete`、`downloading`、`queued`：不完整也沒原檔時 `media.open` 順便排進下載，GET 會邊等邊吐。
 
-**匯出**（使用者明確要把明文放到自己選的位置）給一個 URI，現在只收 `file://`（/docs/design/media/media-download.md §7.3）：
+**匯出**（使用者明確要把明文放到自己選的位置）給一個 URI，現在只收 `file://`（/docs/design/media/media-download.md §7.3）。
+⚠️ **`to` 已經存在就覆蓋**（維護者 2026-10-03）：要不要覆蓋是 **UI 的事**，選位置的時候先問使用者，daemon 🚫 再擋。
 
 ```jsonc
 { "method": "media.export_to", "params": { "user": "…", "manifest": { … }, "to": "file:///home/me/video.mkv" }, "id": 15 }

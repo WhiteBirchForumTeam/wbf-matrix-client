@@ -6,7 +6,7 @@
 //!   主檔第 n 塊落地才塞第 n+1 塊。seek 的請求插到發送 queue 最前面（§6.2）。同一個請求🚫 送兩次：第二個要的人掛上去（§6.3）。
 //! - **`downloading` 表**放取消旗標與進度（§5.2）：處理 job 時放進去，最後一塊落地、失敗、或看到旗標時由處理端自己拿掉；`media.queue`／推播直接讀它。
 //! - **主檔與暫存檔只有一個寫入者**：落地都在這一個 task 裡做；同一台 server 的帳號共用池，所以開檔前先在 [`MediaClaims`] 認領，
-//!   別的帳號正在寫它，這個 job 放進「等認領」，每秒再試；seek 交給認領的那個帳號（`Core::downloader_for_seek`）。
+//!   別的帳號正在寫它，這個 job 放進「等認領」，每秒再試；seek 交給認領的那個帳號（`media_stream.rs` 的 `find_writer_of`）。
 //!
 //! 塊怎麼驗、怎麼落地是 sdk 的 `MediaDownload`；這裡只管「誰、何時、做到哪」。DB 一律經 `ServerCache`（唯一寫入者）。
 
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, Notify};
 use wbf_sdk::cache::MediaEntry;
+use wbf_sdk::error_code::WbfErrorCode;
 use wbf_sdk::media::{self, MediaDownload, PROGRESS_FLUSH};
 use wbf_sdk::media_pool::MediaPool;
 use wbf_sdk::{protocol, Manifest, SdkError};
@@ -39,7 +40,7 @@ const CLAIM_RETRY: Duration = Duration::from_secs(1);
 const IDLE_WAKE: Duration = Duration::from_secs(60);
 /// 有塊請求在等時，`Download` 線最久可以多久沒有任何回應（/docs/design/daemon/link-requests.md §4）。跟 server 的 `wbf_ws_idle_timeout` 一樣是 60 秒（wbfuwunel #103，2026-10-02）；
 /// 線真的死了，心跳 34 秒內就發現（`Network`），所以撞到這個的是「線活著、server 卻不回下載」。
-const LINE_SILENCE: Duration = Duration::from_secs(60);
+pub(crate) const LINE_SILENCE: Duration = Duration::from_secs(60);
 /// 同一個請求連續逾時幾次就當 server 那邊出事（/docs/design/daemon/link-requests.md §4）。
 const TIMEOUT_ATTEMPTS: u32 = 3;
 /// 只為 seek 開著、不是 job 的檔最多留幾個（每個握著兩個檔案把手）。
@@ -193,7 +194,30 @@ impl LineRequest for DownloadRequest {
 /// 在途表的一筆：等它的人，與它已經重送過幾次（只記在這裡：發送 queue 🚫 記，重排、插隊、取消主檔時都沿用這一份）。
 struct InFlight {
     waiters: Vec<Waiting>,
-    attempt: u32,
+    retries: Retries,
+}
+
+/// 一個請求重送過幾次。逾時與壞回覆**各算各的**（/docs/design/daemon/link-requests.md §4）：逾時過一次，壞回覆照樣還有一次重拉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Retries {
+    /// 線整段沒回應、重送過幾次（到 `TIMEOUT_ATTEMPTS` 就停下這個檔、檔案留著）
+    timeouts: u32,
+    /// 回覆壞了（塊驗不過、形狀不對、server 說解不開我們送的）重送過幾次（第二次就是壞檔）
+    bad_replies: u32,
+}
+
+/// server 正面說「這個檔不在／不給你」（`NotFound`、`Forbidden`）：主檔拿不到了，刪（/docs/design/media/media-download.md §5.4）。
+/// 其他的錯（token 過期、限流、server 內部錯、不認得的碼）🚫 刪：檔案留著，再要一次從斷點接著拉。
+fn is_permanent_refusal(error: &SdkError) -> bool {
+    matches!(
+        error.wbf_code(),
+        Some(WbfErrorCode::NotFound | WbfErrorCode::Forbidden)
+    )
+}
+
+/// 回覆壞了：形狀不對，或 server 說解不開我們送的（`Corrupt`）。跟驗不過的塊一樣重送一次。
+fn is_bad_reply(error: &SdkError) -> bool {
+    matches!(error, SdkError::Protocol(_)) || error.wbf_code() == Some(WbfErrorCode::Corrupt)
 }
 
 /// 掛在一個塊請求上、等它回來的人。
@@ -228,6 +252,8 @@ pub(crate) struct DownloaderParts {
     pub cache: Arc<ServerCache>,
     pub events: EventSink,
     pub claims: Arc<MediaClaims>,
+    /// 有塊請求在等時，`Download` 線最久可以多久沒有任何回應（正式是 `LINE_SILENCE`；測試給短的）
+    pub line_silence: Duration,
 }
 
 impl Downloader {
@@ -240,7 +266,12 @@ impl Downloader {
         });
         let (seeks, seek_inbox) = mpsc::unbounded_channel();
         let (replies_tx, replies) = mpsc::unbounded_channel();
-        let line = RequestLine::start(parts.links, LinkRole::Download, LINE_SILENCE, replies_tx);
+        let line = RequestLine::start(
+            parts.links,
+            LinkRole::Download,
+            parts.line_silence,
+            replies_tx,
+        );
         let events = parts.events.clone();
         let handler = DownloadHandler {
             shared: shared.clone(),
@@ -737,7 +768,7 @@ impl DownloadHandler {
             request.clone(),
             InFlight {
                 waiters: vec![waiting],
-                attempt: 0,
+                retries: Retries::default(),
             },
         );
         match at_front {
@@ -750,14 +781,16 @@ impl DownloadHandler {
     async fn handle_reply(&mut self, reply: LineReply<DownloadRequest>) {
         let LineReply { action, result } = reply;
         // 沒人等了（取消、失敗、收尾時拿掉的）：丟掉。
-        let Some(InFlight { waiters, attempt }) = self.in_flight.remove(&action) else {
+        let Some(InFlight { waiters, retries }) = self.in_flight.remove(&action) else {
             return;
         };
         match result {
             Ok(ack) => match action {
-                DownloadRequest::Info { mxc } => self.info_arrived(&mxc, ack, waiters).await,
+                DownloadRequest::Info { mxc } => {
+                    self.info_arrived(&mxc, ack, waiters, retries).await
+                }
                 DownloadRequest::Chunk { mxc, index } => {
-                    self.chunk_arrived(&mxc, index, ack, waiters, attempt).await
+                    self.chunk_arrived(&mxc, index, ack, waiters, retries).await
                 }
             },
             // 線斷了：主檔的請求排回最前面，線重開之後接著送，進度停在原地；GET 🚫 等線，直接斷（播放器會再要）。
@@ -765,32 +798,39 @@ impl DownloadHandler {
                 let error = CoreError::new(CoreErrorKind::Network, message);
                 let main = self.answer_seeks_only(waiters, &error);
                 if main {
-                    self.resend(action, vec![Waiting::Main], attempt);
+                    self.resend(action, vec![Waiting::Main], retries);
                 }
             }
-            Err(SdkError::Timeout(_)) if attempt + 1 < TIMEOUT_ATTEMPTS => {
-                self.resend(action, waiters, attempt + 1)
+            Err(SdkError::Timeout(_)) if retries.timeouts + 1 < TIMEOUT_ATTEMPTS => {
+                let retries = Retries {
+                    timeouts: retries.timeouts + 1,
+                    ..retries
+                };
+                self.resend(action, waiters, retries)
             }
-            // 回覆的形狀不對（id／seq、subtype、meta）：跟驗不過的塊一樣重送一次（/docs/design/daemon/link-requests.md §4）。
-            Err(SdkError::Protocol(_)) if attempt == 0 => self.resend(action, waiters, 1),
-            // 逾時太多次：這個檔停下，檔案留著（下次接著拉）。
-            Err(error @ SdkError::Timeout(_)) => {
-                let error = CoreError::from(error);
-                self.answer_seeks_only(waiters, &error);
-                self.fail_media(action.mxc(), error, false);
+            Err(error) if is_bad_reply(&error) && retries.bad_replies == 0 => {
+                let retries = Retries {
+                    bad_replies: 1,
+                    ..retries
+                };
+                self.resend(action, waiters, retries)
             }
-            // server 拒絕（NotFound、Forbidden…）：壞檔或沒權限，主檔與暫存檔都刪（§5.4）。
+            // 逾時太多次、server 拒絕、暫時性的錯：照錯誤碼決定刪不刪（§5.4）。只有 GET 在等的請求失敗，只回 GET，🚫 連坐停掉主檔——
+            // 除非 server 說這個檔不在／不給（主檔一樣拿不到）。
             Err(error) => {
+                let discard = is_permanent_refusal(&error);
                 let error = CoreError::from(error);
-                self.answer_seeks_only(waiters, &error);
-                self.fail_media(action.mxc(), error, true);
+                let main = self.answer_seeks_only(waiters, &error);
+                if main || discard {
+                    self.fail_media(action.mxc(), error, discard);
+                }
             }
         }
     }
 
-    fn resend(&mut self, request: DownloadRequest, waiters: Vec<Waiting>, attempt: u32) {
+    fn resend(&mut self, request: DownloadRequest, waiters: Vec<Waiting>, retries: Retries) {
         self.in_flight
-            .insert(request.clone(), InFlight { waiters, attempt });
+            .insert(request.clone(), InFlight { waiters, retries });
         self.line.push_front(request);
     }
 
@@ -812,17 +852,40 @@ impl DownloadHandler {
     }
 
     /// `Info` 回來（§3.2）：驗過就讓主檔走「下一塊」、掛著的 seek 送它們的 `Read`；驗不過就是壞檔。
-    async fn info_arrived(&mut self, mxc: &str, ack: Pack, waiters: Vec<Waiting>) {
-        let verified = match self.open.get_mut(mxc) {
-            Some(opened) => protocol::info_reply(ack)
-                .and_then(|(info, description)| opened.download.accept_info(&info, &description))
-                .map_err(CoreError::from),
-            None => Err(downloader_gone()),
-        };
-        if let Err(error) = verified {
-            self.answer_seeks_only(waiters, &error);
-            self.fail_media(mxc, error, true);
+    async fn info_arrived(
+        &mut self,
+        mxc: &str,
+        ack: Pack,
+        waiters: Vec<Waiting>,
+        retries: Retries,
+    ) {
+        let Some(opened) = self.open.get_mut(mxc) else {
+            self.answer_seeks_only(waiters, &downloader_gone());
             return;
+        };
+        let verified = protocol::info_reply(ack)
+            .and_then(|(info, description)| opened.download.accept_info(&info, &description));
+        match verified {
+            Ok(()) => {}
+            // 回覆的形狀不對：重送一次（續傳要先問 Info，一次怪回覆🚫 就刪掉之前的進度）。
+            Err(error) if is_bad_reply(&error) && retries.bad_replies == 0 => {
+                let request = DownloadRequest::Info {
+                    mxc: mxc.to_string(),
+                };
+                let retries = Retries {
+                    bad_replies: 1,
+                    ..retries
+                };
+                self.resend(request, waiters, retries);
+                return;
+            }
+            // 區塊跟 server 對不上、描述解不開：壞檔（§3.2）。
+            Err(error) => {
+                let error = CoreError::from(error);
+                self.answer_seeks_only(waiters, &error);
+                self.fail_media(mxc, error, true);
+                return;
+            }
         }
         let mut main = false;
         for waiting in waiters {
@@ -843,7 +906,7 @@ impl DownloadHandler {
         index: u32,
         ack: Pack,
         waiters: Vec<Waiting>,
-        attempt: u32,
+        retries: Retries,
     ) {
         let Some(opened) = self.open.get_mut(mxc) else {
             self.answer_seeks_only(waiters, &downloader_gone());
@@ -854,12 +917,16 @@ impl DownloadHandler {
         let plain = match opened_chunk {
             Ok(plain) => plain,
             // 一塊壞了：重拉一次（傳輸錯）；還是壞 → 整個檔當壞檔（§3.3）。
-            Err(SdkError::Integrity(_) | SdkError::Protocol(_)) if attempt == 0 => {
+            Err(SdkError::Integrity(_) | SdkError::Protocol(_)) if retries.bad_replies == 0 => {
                 let request = DownloadRequest::Chunk {
                     mxc: mxc.to_string(),
                     index,
                 };
-                self.resend(request, waiters, 1);
+                let retries = Retries {
+                    bad_replies: 1,
+                    ..retries
+                };
+                self.resend(request, waiters, retries);
                 return;
             }
             Err(error) => {
@@ -992,7 +1059,7 @@ impl DownloadHandler {
             if !self.line.withdraw(&request) {
                 continue;
             }
-            let Some(InFlight { waiters, attempt }) = self.in_flight.remove(&request) else {
+            let Some(InFlight { waiters, retries }) = self.in_flight.remove(&request) else {
                 self.end_job(&mxc, JobEnd::Cancelled);
                 continue;
             };
@@ -1002,7 +1069,7 @@ impl DownloadHandler {
                 .collect();
             // 同一個請求還有 GET 在等：放回去照送，重送次數沿用。
             if !others.is_empty() {
-                self.resend(request, others, attempt);
+                self.resend(request, others, retries);
             }
             self.end_job(&mxc, JobEnd::Cancelled);
         }
@@ -1502,6 +1569,26 @@ mod tests {
             .collect()
     }
 
+    /// `to` 旁邊沒有任何匯出暫存檔（`<to>.partial.<pid>-<n>`）。
+    fn no_partials_left(to: &std::path::Path) -> bool {
+        let Some(name) = to
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            return false;
+        };
+        let prefix = format!("{name}.partial");
+        std::fs::read_dir(to.parent().unwrap())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+    }
+
     /// 這個 mxc 的下一個「不是進度」的狀態。
     async fn next_state(events: &mut Receiver<CoreEvent>, mxc: &str) -> DownloadState {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1749,7 +1836,7 @@ mod tests {
         assert_eq!(exported.bytes, SIZE as u64);
         assert_eq!(std::fs::read(&out).unwrap(), body());
         assert!(
-            !out.with_file_name("v.bin.partial").exists(),
+            no_partials_left(&out),
             "the partial file is renamed into place"
         );
         let pool = core.pool_of(&account).unwrap();
@@ -1803,7 +1890,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
         assert!(!out.exists(), "nothing lands at the destination");
-        assert!(!out.with_file_name("v.bin.partial").exists());
+        assert!(no_partials_left(&out));
         let entry = cache.read().await.find_media(&first.mxc).unwrap().unwrap();
         assert!(!entry.complete, "the bad copy is dropped from the cache");
         // 下一次就重下，拿到對的。
@@ -1868,32 +1955,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_different_size_for_the_same_media_drops_the_cache_and_starts_over() {
-        let (core, _account, server, manifest) = uploaded("dq-redescribe").await;
+    async fn a_wrong_description_never_deletes_a_complete_verified_copy() {
+        let (core, account, server, manifest) = uploaded("dq-liar-complete").await;
         let mut events = core.subscribe();
         let target = Target::default();
         let media = MediaRef::Manifest(manifest.clone());
         core.media_download(&media, &target).await.unwrap();
         wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
-        // 另一則訊息引用同一個 mxc，卻說大小不一樣：快取對不上，丟掉、照這份描述從頭來（這份是假的，所以下載失敗）。
+        // 另一則訊息引用同一個 mxc，卻說大小不一樣（寫錯或偽造）：錯的是它，快取🚫 動（維護者 2026-10-03）。
+        let mut liar = manifest.clone();
+        liar.block.file_size = Some(SIZE as u64 + 16);
+        let liar = MediaRef::Manifest(liar);
+        for result in [
+            core.media_download(&liar, &target).await.map(|_| ()),
+            core.media_open(&liar, &target).await.map(|_| ()),
+            core.export_media_to(&liar, &scratch("dq-liar-out").join("x"), false, &target)
+                .await
+                .map(|_| ()),
+        ] {
+            assert_eq!(
+                result.unwrap_err().kind,
+                CoreErrorKind::Integrity,
+                "the wrong description is refused"
+            );
+        }
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        let entry = cache
+            .read()
+            .await
+            .find_media(&manifest.mxc)
+            .unwrap()
+            .unwrap();
+        assert!(
+            entry.complete && entry.file_size == SIZE as u64,
+            "{entry:?}"
+        );
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+        assert_eq!(
+            reads(&server).len(),
+            CHUNKS as usize,
+            "nothing was downloaded again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_different_size_drops_an_unfinished_copy_and_starts_over() {
+        let (core, account, server, manifest) = uploaded("dq-liar-unfinished").await;
+        let mut events = core.subscribe();
+        let target = Target::default();
+        let media = MediaRef::Manifest(manifest.clone());
+        // 下載到一半就取消：列還沒完成、主檔半成品留著。
+        hold_reads(&server).await;
+        let downloader = core.downloader_of(&account).await.unwrap();
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&downloader).await;
+        assert!(downloader.cancel(&manifest.mxc));
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Cancelled).await;
+        // 兩份描述都還沒被整檔驗過：照 PR #14 的規則丟掉、照這份從頭來（這份是假的，所以下載失敗）。
         let mut liar = manifest.clone();
         liar.block.file_size = Some(SIZE as u64 + 16);
         let job = core
             .media_download(&MediaRef::Manifest(liar), &target)
             .await
             .unwrap();
-        assert_ne!(job.state, DownloadState::Complete, "the cache is not used");
-        wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
-        // 原本那份描述再來一次：又對不上（列現在是假的那份），再丟一次、重下，拿到對的。
-        let job = core.media_download(&media, &target).await.unwrap();
         assert_ne!(job.state, DownloadState::Complete);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
+        // 原本那份再來一次：又對不上（列現在是假的那份）、也還沒完成，再丟一次、重下，拿到對的。
+        core.media_download(&media, &target).await.unwrap();
         wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
         assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+    }
+
+    #[tokio::test]
+    async fn a_server_error_that_is_not_a_refusal_keeps_the_unfinished_file() {
+        let (core, account, server, manifest) = uploaded("dq-server-internal").await;
+        let mut events = core.subscribe();
+        let target = Target::default();
+        let media = MediaRef::Manifest(manifest.clone());
+        // server 內部錯（1901）：這個檔停下、標失敗，但主檔半成品🚫 刪（§5.4）；再要一次就接著拉完。
+        *server.fail_next_read.lock().unwrap() = Some(("Internal", 1901));
+        core.media_download(&media, &target).await.unwrap();
+        wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
+        let pool = core.pool_of(&account).unwrap();
         assert_eq!(
-            reads(&server).len(),
-            2 * CHUNKS as usize,
-            "downloaded twice: once before the liar, once after"
+            pool.list_pending().unwrap().len(),
+            1,
+            "the unfinished file stays"
         );
+        core.media_download(&media, &target).await.unwrap();
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+    }
+
+    #[tokio::test]
+    async fn not_found_from_the_server_deletes_the_unfinished_file() {
+        let (core, account, server, manifest) = uploaded("dq-server-notfound").await;
+        let mut events = core.subscribe();
+        // server 說這個檔不在（1501）：主檔拿不到了，半成品刪掉、列 reset。
+        *server.fail_next_read.lock().unwrap() = Some(("NotFound", 1501));
+        core.media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
+            .await
+            .unwrap();
+        wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
+        let pool = core.pool_of(&account).unwrap();
+        wait_for_async(
+            || async { pool.list_pending().unwrap().is_empty() },
+            "the unfinished file to be deleted",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_does_not_use_up_the_retry_for_a_bad_chunk() {
+        let (core, account, server, manifest) = uploaded("dq-timeout-then-bad").await;
+        let mut events = core.subscribe();
+        hold_reads(&server).await;
+        // 自己起一個線上沉默時限很短的處理端（正式是 60 秒）。
+        let (cache, me) = core.server_cache_and_me(&account).unwrap();
+        let downloader = Downloader::start(DownloaderParts {
+            user: me,
+            server_dir: account.server_dir(),
+            links: core.pool_of_account(&account).unwrap(),
+            media_pool: core.pool_of(&account).unwrap(),
+            cache,
+            events: core.events.clone(),
+            claims: core.media_claims.clone(),
+            line_silence: Duration::from_millis(500),
+        });
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        // 第 0 塊卡在 server：線整段沒回應 → 逾時一次、重送。
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        // 放行：原本那份（已經沒人等）與重送那份的回覆都弄壞。重送那份是這一塊**第一次**壞：要再拉一次，🚫 當壞檔。
+        server
+            .corrupt_reads
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        assert_eq!(reads(&server)[..3], [0, 0, 0]);
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
     }
 
     #[tokio::test]

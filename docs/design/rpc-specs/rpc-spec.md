@@ -361,7 +361,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }`，第一個是正在拉的 | `media_queue` |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, source_uri?, user?, server? }`（`source_uri` 是原檔的 URI，讀的時候優先讀它，/docs/design/rpc-specs/data-plane.md §8.1） | `{ upload_id, mxc, url, headers }`。`url` 是資料平面的 PUT URL（共享 token 加密的「用途 ‖ mxc」），`headers` 是 PUT 時要照抄的（`Wbf-Upload-Meta`：加密的上傳狀態）（/docs/design/rpc-specs/data-plane.md §4） | `create_upload`：有 `room` 就照房間決定加不加密；daemon 沒開資料平面回 100 |
-| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", hash? }` | `export_media_to`：沒有就排、等它完成、**整檔驗過**才寫到 `to`（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`；已經存在就覆蓋，要不要覆蓋是 UI 先問）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", hash? }` | `export_media_to`：沒有就排、等它完成、**整檔驗過**才寫到 `to`（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
 | `media.stats` | `{ user?, server? }` | `MediaStats` | `media_stats` |
 | `media.gc` | `{ quota_mib?: 2048, protect_days?: 7, user?, server? }` | `MediaGcReport` | `collect_media_garbage` |
 

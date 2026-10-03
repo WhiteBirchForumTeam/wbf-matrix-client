@@ -168,9 +168,14 @@ impl LinkPool {
     ///     role: example: LinkRole::Download
     /// Return:
     ///     Some(WsLink)  開著的那條線的分身（丟掉🚫 不關線）
-    ///     None          那格沒開、線死了、或不是 WebSocket
+    ///     None          那格沒開、線死了、正被別人握著（等一下再要）、或不是 WebSocket
     pub async fn find_ws_link(&self, role: LinkRole) -> Option<WsLink> {
-        let client = self.reuse(role).await?;
+        // 那格正被別人握著（開線中、或還沒搬過來的路徑在用）就當這次沒有，🚫 排在它後面等：發送端一秒後再看。
+        let guard = self.slot(role).try_lock_owned().ok()?;
+        let client = guard.as_ref()?;
+        if client.channel().is_closed() {
+            return None;
+        }
         match client.channel() {
             Channel::WebSocket(channel) => Some(channel.link().share()),
             Channel::Http(_) => None,

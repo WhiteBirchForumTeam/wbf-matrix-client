@@ -103,6 +103,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
   meta 是 `c-` ＋ B58(JSON)，都不加密。加密模式下拿 `c-` 來一律 404（fail closed）；加密的 `e-` 兩個模式都收。
   ⚠️ `c-` **沒有任何認證**：本機任何程序都能自己組出一組合法的 URL＋meta。「daemon 解得開就是它發的」只對 `e-` 成立；
   `c-` 擋得住的只剩 core 的「這個上傳是不是這個帳號的」核對——所以它只給除錯，🚫 不給正式環境。
+  讀的那一面一樣：`c-` 模式下 `GET /media/mxc/c-…` 也沒有認證，知道 port 與 mxc 的本機程序（含瀏覽器裡的網頁）都讀得到解密後的媒體。
 - **Host 檢查**：Host 標頭不是 `127.0.0.1`、`localhost`、`[::1]`（帶不帶 port 都可以）一律 **403**。擋的是 DNS rebinding：
   網頁把自己的網域指到 127.0.0.1 之後，瀏覽器送的 Host 是那個網域。
 - **未解鎖一律 503**：東西在，只是現在打不開（/docs/design/rpc-specs/local-interface.md §5）。
@@ -318,7 +319,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 | | |
 |---|---|
 | 支援 | `Range` 單一一段：`bytes=a-b`、`bytes=a-`、`bytes=-n`（最後 n byte），終點超過檔尾就截到檔尾；沒帶、寫壞了、不只一段 → 整檔（RFC 9110 §14.2：認不得的 Range 可以不理）。`HEAD` 回一樣的標頭、沒有 body |
-| 回 | `200`（整檔）／`206 Partial Content`（有 Range，帶 `Content-Range`）；`Content-Type` 是 `media` 列的 mimetype（沒有就用區塊的），都沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length` |
+| 回 | `200`（整檔）／`206 Partial Content`（有 Range，帶 `Content-Range`）；`Content-Type` 是 `media` 列的 mimetype（沒有就用區塊的），都沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length`；`X-Content-Type-Options: nosniff` 與 `Content-Security-Policy: sandbox`（型別是寄件者填的，被瀏覽器當頁面打開時🚫 跑腳本） |
 | `416` | Range 的起點在檔尾或之後（帶 `Content-Range: bytes */<大小>`） |
 | `404` | 不是這個 daemon 發的 URL、用途不對（上傳的 URL）、或本機沒有任何帳號有這個 mxc 的紀錄 |
 | `503` | 未解鎖 |

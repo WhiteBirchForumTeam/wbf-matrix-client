@@ -227,6 +227,8 @@ pub(crate) struct FakeServer {
     pub(crate) read_permits: Arc<tokio::sync::Semaphore>,
     /// 接下來幾個 `Download/Read` 的回覆要弄壞（密文翻一個 bit）：測「一塊壞了重拉一次」。
     pub(crate) corrupt_reads: Arc<std::sync::atomic::AtomicU32>,
+    /// 下一個 `Download/Read` 改回這個錯誤（`(名字, code_id)`，例 `("Internal", 1901)`），回一次就清掉：測錯誤碼分流。
+    pub(crate) fail_next_read: Arc<Mutex<Option<(&'static str, u64)>>>,
 }
 
 /// `read_permits` 一開始有幾個（測試要卡住就 `acquire_many(READ_PERMITS)` 收走）。
@@ -293,6 +295,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let (reads_t, permits_t) = (download_reads.clone(), read_permits.clone());
     let corrupt_reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let corrupt_t = corrupt_reads.clone();
+    let fail_next_read: Arc<Mutex<Option<(&'static str, u64)>>> = Arc::new(Mutex::new(None));
+    let fail_read_t = fail_next_read.clone();
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -378,18 +382,33 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     if let Ok(permit) = permits_t.acquire().await {
                         permit.forget();
                     }
-                    let mut reply = download_reply(&pack, &uploads_t, &reads_t);
-                    let corrupt = corrupt_t
-                        .fetch_update(
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                            |left| left.checked_sub(1),
+                    if let Some((code, code_id)) = fail_read_t.lock().unwrap().take() {
+                        reads_t
+                            .lock()
+                            .unwrap()
+                            .push(("<failed>".to_string(), u32::MAX));
+                        response(
+                            Kind::Control,
+                            control::ERROR,
+                            pack.id,
+                            pack.seq,
+                            json!({ "code": code, "code_id": code_id, "message": "fake failure" }),
+                            Vec::new(),
                         )
-                        .is_ok();
-                    if corrupt && !reply.data.is_empty() {
-                        reply.data[0] ^= 1;
+                    } else {
+                        let mut reply = download_reply(&pack, &uploads_t, &reads_t);
+                        let corrupt = corrupt_t
+                            .fetch_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |left| left.checked_sub(1),
+                            )
+                            .is_ok();
+                        if corrupt && !reply.data.is_empty() {
+                            reply.data[0] ^= 1;
+                        }
+                        reply
                     }
-                    reply
                 }
                 (Kind::Download, _) => download_reply(&pack, &uploads_t, &reads_t),
                 (Kind::Control, control::HELLO) => response(
@@ -586,6 +605,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         download_reads,
         read_permits,
         corrupt_reads,
+        fail_next_read,
     }
 }
 

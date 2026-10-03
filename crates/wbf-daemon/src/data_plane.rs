@@ -500,6 +500,15 @@ async fn get_media(
     if let Ok(value) = header::HeaderValue::from_str(&content_type) {
         headers.insert(header::CONTENT_TYPE, value);
     }
+    // 型別是寄件者填的：前端可能是瀏覽器，`text/html`、`image/svg+xml` 的附件被當頁面打開時🚫 讓它跑腳本、🚫 猜型別。
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("sandbox"),
+    );
     if status == StatusCode::PARTIAL_CONTENT {
         let range = format!("bytes {start}-{}/{size}", end.saturating_sub(1));
         if let Ok(value) = header::HeaderValue::from_str(&range) {

@@ -578,6 +578,35 @@ async fn a_link_that_keeps_receiving_still_pings_on_time() {
     assert!(!link.is_closed());
 }
 
+/// Pong 排在一長串回覆後面也不算死：送出 Ping 之後還在收東西，線就是活的；什麼都不來了才關。
+#[tokio::test]
+async fn a_late_pong_behind_other_replies_does_not_kill_the_link() {
+    let (link, mut peer) = connect_with_heartbeat(Heartbeat {
+        interval: Duration::from_millis(100),
+        reply_timeout: Duration::from_millis(150),
+    });
+    let ping = peer.receive().await;
+    assert_eq!(ping.subtype, control::PING);
+    // 不回 Pong，但每 50 ms 推一個東西進來，持續 600 ms（遠超過 reply_timeout）。
+    for _ in 0..12 {
+        peer.send(device_push(0x0100_0000_0000_0009, 0)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!link.is_closed(), "still receiving: the link is alive");
+    // 終於回 Pong：照常。
+    peer.send(pong_for(&ping)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!link.is_closed());
+    // 之後完全安靜、Ping 也不回：關。
+    tokio::time::timeout(LONG, async {
+        while !link.is_closed() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the link closes once nothing arrives after a ping");
+}
+
 /// Ping 沒人回：這條線死了（shut_down），在等的人立刻收到 Network、理由說是心跳。
 #[tokio::test]
 async fn an_unanswered_heartbeat_closes_the_link_and_fails_the_waiters() {

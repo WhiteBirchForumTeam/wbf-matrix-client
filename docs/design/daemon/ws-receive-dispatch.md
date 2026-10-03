@@ -120,7 +120,8 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 - 每 `interval`（**24 秒**）**一定**送一個 `Control/Ping`（`WANT_ACK`，走一般的 `request`，所以 `Pong` 也經會話表、也過鉤子）。
   🚫 因為「最近有通訊」就跳過：server 的 idle 只看 **client 送了什麼**，一條一直在收推播的訂閱線（`Rooms`、`Keys`）
   在 client 這邊看起來很忙，在 server 那邊卻是一條沒有請求的線。
-- `reply_timeout`（10 秒）內沒有 `Pong` → 這條線死了：走 §7 的 `shut_down("heartbeat: …")`。在等的人立刻收到 `Network`，連線池下一次取用會重開。
+- 送出 `Ping` 之後 `reply_timeout`（10 秒）內**什麼都沒收到** → 這條線死了：走 §7 的 `shut_down("heartbeat: …")`。在等的人立刻收到 `Network`，連線池下一次取用會重開。
+  還在收別的東西就接著等（維護者 2026-10-02：逾時是沒收到回應）：server 照順序回，`Pong` 會排在已經在途的回覆後面——很多檔一起下載、網路又慢時，它可能晚於 10 秒才到。
 - 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 **60 秒**（wbfuwunel PR #103，2026-10-02），沒請求就關線；而且沒有心跳，
   對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒在 60 秒之內還能錯過一次，也讓「線死了」在 34 秒內可見。
 - 心跳的請求號從 `u32::MAX` 往下數（`WbfClient` 的從 1 往上），兩邊要碰到得幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。

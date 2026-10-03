@@ -79,8 +79,8 @@ enum DownloadRequest {                      // 例：Download 線（core 的 dow
 等回應的那一方（例：GET 等一塊）🚫 另外自己限時。送了第幾次也🚫 記在線上：重不重送是擁有者的事，它自己記（下載記在在途表那一筆）。
 ⚠️ 已知邊界（PR #69 審查，三位都判 🟢）：「上一次收到回應」是在等回覆的小 task 排到時才記，所以一個剛好在滿 60 秒那一瞬間到的回覆可能被判逾時——
 後果是那個請求多送一次、晚到的回覆變無主（每個請求仍然恰好交回一次）。
-| `Server`（拒絕、NotFound、Forbidden…） | 不重送。交給上層（下載：壞檔或沒權限，job 移除） |
-| 回覆的內容驗不過（AEAD、長度） | 重送一次；還是不行就交給上層（下載：壞檔，/docs/design/media/media-download.md §3.3） |
+| `Server`（server 回了錯誤碼） | **照 `code_id` 分流**，🚫 一律當拒絕（/docs/design/media/media-download.md §5.4）：正面拒絕（`NotFound`、`Forbidden`）不重送、交給上層（下載：刪檔）；`Corrupt` 跟壞回覆一樣重送一次；其他（token 過期、限流、server 內部錯、不認得的碼）不重送、交給上層，**🚫 刪任何東西** |
+| 回覆的內容驗不過（AEAD、長度、形狀） | 重送一次；還是不行就交給上層（下載：壞檔，/docs/design/media/media-download.md §3.3）。這一次跟逾時的次數**各算各的** |
 
 🚫 不能重送的請求（例：`Upload/Create` 重送會開出兩個上傳，/docs/design/daemon/ws-receive-dispatch.md §6）在動作裡就寫明不重送。
 
