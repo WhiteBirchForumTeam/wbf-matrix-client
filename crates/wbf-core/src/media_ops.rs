@@ -112,7 +112,7 @@ pub struct ExportedMedia {
     pub bytes: u64,
     /// `"local_source"`（本機原檔）、`"cache"`（池裡本來就有）、`"server"`（這次排隊下載的）
     pub source: String,
-    /// 快取列記的校驗碼（`sha256:…` 或 `blake3:…`）；本機原檔沒有
+    /// 快取列記的校驗碼（`sha256:…` 或 `blake3:…`）；列上沒記就沒有
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
 }
@@ -255,7 +255,7 @@ impl Core {
         Ok(downloader.cancel(mxc))
     }
 
-    /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.1）：**解密寫到 `to`，整檔驗過才放上去**。
+    /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.3）：**解密寫到 `to`，整檔驗過才放上去**。
     /// 本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過，就從池匯出——池裡沒有就排進下載、等它完成。
     /// 池那條驗大小、整檔 BLAKE3（池檔名就是它）、區塊有帶就再驗 sha256（維護者 2026-10-02：串流不算整檔 hash，匯出要仔細檢查）。
     ///

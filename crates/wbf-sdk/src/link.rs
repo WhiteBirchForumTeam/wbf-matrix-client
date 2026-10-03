@@ -36,7 +36,7 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    /// 預設：24 秒一次、Pong 等 10 秒。24 秒在 server 的 60 秒 idle 之內還能錯過一次；對方悄悄不在了，34 秒內這條線就關了。
+    /// 預設：24 秒一次、Pong 等 10 秒。24 秒在 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）之內還能錯過一次；對方悄悄不在了，34 秒內這條線就關了。
     pub const DEFAULT: Heartbeat = Heartbeat {
         interval: Duration::from_secs(24),
         reply_timeout: Duration::from_secs(10),

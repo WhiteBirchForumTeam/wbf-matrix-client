@@ -11,8 +11,10 @@
 //! 這裡是池、seek 暫存檔、`cache.db` 與下載管線唯一的交會點：`cache` 不知道池，`media_pool` 不知道 DB，下載管線不知道兩者。
 
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -339,8 +341,12 @@ pub fn open_complete(pool: &MediaPool, entry: &MediaEntry) -> Option<PoolReader>
 /// Return:
 ///     bool  true ＝ 同一個檔，列可以照用；false ＝ 對不上，要丟掉重來（[`forget_for_new_description`]）
 pub fn is_same_file(entry: &MediaEntry, manifest: &Manifest) -> bool {
-    let same_size =
-        entry.file_size == manifest.file_size() && entry.chunk_size == manifest.block.chunk_size;
+    // 區塊沒帶大小＝不知道，🚫 當成「不一樣」去丟快取（入口 `check_as_event_block` 已經拒過，這裡消費端自己再問一次）。
+    let same_file_size = match manifest.block.file_size {
+        Some(claimed) => claimed == entry.file_size,
+        None => true,
+    };
+    let same_size = same_file_size && entry.chunk_size == manifest.block.chunk_size;
     let recorded_sha256 = entry
         .hash
         .as_deref()
@@ -385,7 +391,7 @@ pub fn forget_for_new_description(
     )
 }
 
-/// 匯出時要對上的內容（/docs/design/media/media-download.md §7.1 的 `media.export_to`）。至少要有一個 hash：沒東西可比就🚫 匯出。
+/// 匯出時要對上的內容（/docs/design/media/media-download.md §7.3 的 `media.export_to`）。至少要有一個 hash：沒東西可比就🚫 匯出。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpectedContent {
     pub file_size: u64,
@@ -395,8 +401,9 @@ pub struct ExpectedContent {
     pub sha256_hex: Option<String>,
 }
 
-/// 把明文整個寫到 `to`，邊寫邊算整檔的 BLAKE3／SHA-256（/docs/design/media/media-download.md §7.1）：先寫 `<to>.partial`、fsync，
-/// 大小與每個給了的 hash 都對上才改名成 `to`；對不上就刪掉暫存、`to` 🚫 被動過。
+/// 把明文整個寫到 `to`，邊寫邊算整檔的 BLAKE3／SHA-256（/docs/design/media/media-download.md §7.3）：先寫一個**這次自己獨占建立**的暫存檔
+/// （`<to>.partial.<pid>-<n>`）、fsync，大小與每個給了的 hash 都對上才改名成 `to`；對不上就只刪那個暫存檔、`to` 🚫 被動過。
+/// 🚫 碰別人的檔：旁邊本來就有的 `<to>.partial` 之類一律不開、不刪。成功時 `to` 已經存在就**覆蓋**（要不要覆蓋是 UI 先問使用者，維護者 2026-10-03）。
 ///
 /// Args:
 ///     source: 明文（池檔的 `PoolReader`，或本機原檔）
@@ -416,14 +423,8 @@ pub fn export_verified<R: Read>(
             "nothing to verify the export against (no BLAKE3, no sha256)".into(),
         ));
     }
-    let mut partial_name = to
-        .file_name()
-        .ok_or_else(|| SdkError::Usage(format!("{} has no file name", to.display())))?
-        .to_os_string();
-    partial_name.push(".partial");
-    let partial = to.with_file_name(partial_name);
+    let (mut file, partial) = create_own_partial(to)?;
     let written = (|| {
-        let mut file = std::fs::File::create(&partial)?;
         let mut blake3 = blake3::Hasher::new();
         let mut sha256 = Sha256::new();
         let mut buffer = Zeroizing::new(vec![0u8; 1 << 16]);
@@ -463,14 +464,56 @@ pub fn export_verified<R: Read>(
         }
         Ok(bytes)
     })();
+    drop(file);
     let renamed = written.and_then(|bytes| {
         std::fs::rename(&partial, to)?;
         Ok(bytes)
     });
+    // 只刪自己建的那一個（`create_own_partial` 給的路徑），🚫 別人的。
     if renamed.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
     renamed
+}
+
+/// 這個程序裡第幾個匯出暫存檔（跟 pid 一起當名字，撞到別人的就換下一個）。
+static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
+
+/// 在 `to` 旁邊**獨占建立**一個新的暫存檔：名字已經有人用（不管是誰的）就換一個，🚫 開、🚫 截斷別人的檔。
+///
+/// Return:
+///     Ok((File, PathBuf))   新建的檔與它的路徑（只有這個路徑能刪）
+///     Err(Usage)            `to` 沒有檔名
+///     Err(Io)               建不了（目錄不能寫、試了 64 個名字都被占了）
+fn create_own_partial(to: &Path) -> Result<(File, PathBuf), SdkError> {
+    let file_name = to
+        .file_name()
+        .ok_or_else(|| SdkError::Usage(format!("{} has no file name", to.display())))?
+        .to_os_string();
+    let mut last_error = None;
+    for _ in 0..64 {
+        let mut partial_name = file_name.clone();
+        partial_name.push(format!(
+            ".partial.{}-{}",
+            std::process::id(),
+            NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let partial = to.with_file_name(partial_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+        {
+            Ok(file) => return Ok((file, partial)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error)
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::other("no free name for the export's partial file"))
+        .into())
 }
 
 /// `collect_garbage` 的結果。
@@ -603,4 +646,93 @@ pub fn sweep(
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wbf-export-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn expected_for(bytes: &[u8]) -> ExpectedContent {
+        ExpectedContent {
+            file_size: bytes.len() as u64,
+            blake3_hex: Some(blake3::hash(bytes).to_hex().to_string()),
+            sha256_hex: Some(hex::encode(Sha256::digest(bytes))),
+        }
+    }
+
+    /// 目錄裡除了 `keep` 之外還剩什麼（暫存檔不該留下）。
+    fn leftovers(dir: &Path, keep: &[&str]) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| !keep.contains(&name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn an_export_never_touches_a_partial_file_that_is_not_its_own() {
+        let dir = scratch("theirs");
+        let to = dir.join("movie.mp4");
+        let theirs = dir.join("movie.mp4.partial");
+        std::fs::write(&theirs, b"somebody else's download").unwrap();
+        let body = b"the exported movie".to_vec();
+        // 驗不過：那個 .partial 原封不動，`to` 沒出現。
+        let mut wrong = expected_for(&body);
+        wrong.sha256_hex = Some("00".repeat(32));
+        let error = export_verified(&body[..], &to, &wrong).unwrap_err();
+        assert!(matches!(error, SdkError::Integrity(_)), "{error:?}");
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"somebody else's download");
+        assert!(!to.exists());
+        assert!(leftovers(&dir, &["movie.mp4.partial"]).is_empty());
+        // 成功：一樣不碰它，`to` 寫好、沒有留下暫存檔。
+        assert_eq!(
+            export_verified(&body[..], &to, &expected_for(&body)).unwrap(),
+            body.len() as u64
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), body);
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"somebody else's download");
+        assert!(leftovers(&dir, &["movie.mp4", "movie.mp4.partial"]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_export_replaces_an_existing_destination() {
+        let dir = scratch("replace");
+        let to = dir.join("a.bin");
+        std::fs::write(&to, b"old").unwrap();
+        let body = b"new content".to_vec();
+        export_verified(&body[..], &to, &expected_for(&body)).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_exports_to_the_same_place_do_not_step_on_each_other() {
+        let dir = scratch("twice");
+        let to = dir.join("a.bin");
+        let good = vec![7u8; 1 << 20];
+        let bad = vec![9u8; 1 << 20];
+        let (to_good, to_bad, good_here) = (to.clone(), to.clone(), good.clone());
+        let succeeding = std::thread::spawn(move || {
+            export_verified(&good_here[..], &to_good, &expected_for(&good_here))
+        });
+        let failing = std::thread::spawn(move || {
+            let mut wrong = expected_for(&bad);
+            wrong.blake3_hex = Some("00".repeat(32));
+            export_verified(&bad[..], &to_bad, &wrong)
+        });
+        assert!(succeeding.join().unwrap().is_ok());
+        assert!(failing.join().unwrap().is_err());
+        // 失敗的那個只刪了自己的暫存檔：成功的那個照樣放上去。
+        assert_eq!(std::fs::read(&to).unwrap(), good);
+        assert!(leftovers(&dir, &["a.bin"]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

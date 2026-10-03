@@ -254,6 +254,7 @@ impl Downloader {
             events: parts.events,
             claims: parts.claims,
             open: HashMap::new(),
+            opening: HashSet::new(),
             in_flight: HashMap::new(),
             timers: HashMap::new(),
             next_claim_retry: None,
@@ -510,6 +511,8 @@ struct DownloadHandler {
     claims: Arc<MediaClaims>,
     /// 開著的檔（在跑的，與只為 seek 開的）。處理端是它們唯一的寫入者。
     open: HashMap<String, OpenMedia>,
+    /// 認領到了、還在開檔（等 DB 建列）的 mxc：還不在 `open` 裡，但處理端在這時被收掉也要放掉它的認領（`close_everything`）。
+    opening: HashSet<String>,
     /// 在途表：排著或送出去的塊請求 → 等它的人（/docs/design/media/media-download.md §6.3）。
     in_flight: HashMap<DownloadRequest, InFlight>,
     timers: HashMap<String, JobTimers>,
@@ -566,10 +569,33 @@ impl DownloadHandler {
     }
 
     /// 處理一個「下載這個檔」：它在處理的整段都算「準備中」（取消找得到），處理完拿掉。
+    ///
+    /// 處理端看過旗標之後、拿掉「準備中」之前來的取消（處理端與 `cancel` 在不同執行緒），旗標🚫 跟著條目一起丟：
+    /// 拿掉跟轉交在同一把鎖裡——job 已經開始了就設到 `downloading` 那一份（下一輪 `handle_cancellations` 停它），
+    /// 停在「等認領」就從那裡拿掉、發 `Cancelled`。
     async fn process_download_job(&mut self, job: DownloadJob) {
         let mxc = job.mxc.clone();
         self.prepare_download(job).await;
-        self.shared.state().preparing.remove(&mxc);
+        let parked_and_cancelled = {
+            let mut state = self.shared.state();
+            let cancelled = state
+                .preparing
+                .remove(&mxc)
+                .is_some_and(|preparing| preparing.cancelled);
+            if !cancelled {
+                false
+            } else if let Some(downloading) = state.downloading.get(&mxc) {
+                downloading.cancelled.store(true, Ordering::SeqCst);
+                false
+            } else {
+                let before = state.awaiting_claim.len();
+                state.awaiting_claim.retain(|parked| parked.mxc != mxc);
+                state.awaiting_claim.len() != before
+            }
+        };
+        if parked_and_cancelled {
+            self.end_job(&mxc, JobEnd::Cancelled);
+        }
     }
 
     /// 準備中被取消了嗎（`Downloader::cancel` 在它進 `downloading` 表之前來的）。
@@ -1221,6 +1247,8 @@ impl DownloadHandler {
         if !self.claims.claim(&self.server_dir, &mxc, &self.user) {
             return Ok(false);
         }
+        // 下面要等 DB：在等的時候被 abort，`Drop` 從這裡知道要放掉這個認領。
+        self.opening.insert(mxc.clone());
         let opened = async {
             let pending_name = self.begin_row(manifest).await?;
             let download = MediaDownload::open(&self.media_pool, &pending_name, manifest)?;
@@ -1230,6 +1258,7 @@ impl DownloadHandler {
             })
         }
         .await;
+        self.opening.remove(&mxc);
         match opened {
             Ok(opened) => {
                 self.shared
@@ -1325,6 +1354,9 @@ impl DownloadHandler {
             if let Some(mut download) = self.take_open(&mxc) {
                 let _ = download.sync();
             }
+        }
+        for mxc in std::mem::take(&mut self.opening) {
+            self.claims.release(&self.server_dir, &mxc, &self.user);
         }
     }
 }
@@ -1893,6 +1925,15 @@ mod tests {
     async fn stopping_the_downloader_releases_what_it_was_writing() {
         let (core, account, server, manifest) = uploaded("dq-stop").await;
         hold_reads(&server).await;
+        // 讓唯一寫入者忙一下：處理端認領之後卡在建列那一步（還不在 `open` 裡），這時收掉它也要放掉認領。
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        cache.post(
+            |_| {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            },
+            Vec::new(),
+        );
         core.media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
             .await
             .unwrap();

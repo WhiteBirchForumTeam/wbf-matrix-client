@@ -282,7 +282,7 @@ pub(super) async fn media_cancel(handle: &Handle, core: &Core, params: Value) ->
     Ok(json!({ "cancelled": cancelled }))
 }
 
-/// 匯出（/docs/design/media/media-download.md §7.1）：明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。
+/// 匯出（/docs/design/media/media-download.md §7.3）：明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。
 /// `to` 是 URI，意義跟 `media.create` 的 `source_uri` 同一套（/docs/design/rpc-specs/data-plane.md §8.1）：現在只收 `file://`；
 /// `http://`（daemon 用 PUT 丟給 UI，維護者 2026-10-02）之後才做。
 pub(super) async fn media_export_to(handle: &Handle, core: &Core, params: Value) -> Outcome {

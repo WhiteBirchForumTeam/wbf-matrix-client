@@ -401,7 +401,7 @@ async fn bridge_members_and_send_to_device_against_real_server() {
 }
 
 /// 心跳對真 server（/docs/design/daemon/ws-receive-dispatch.md §5.1）：安靜的線每秒跳一次，Pong 經會話表回來、也過鉤子；三秒內至少兩個 Pong、線還開著、沒有無主。
-/// 📎 server 的 60 秒 idle 不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
+/// 📎 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
 #[tokio::test]
 #[ignore = "needs a running wbfuwunel; see file header"]
 async fn the_heartbeat_keeps_a_quiet_line_alive_against_the_real_server() {

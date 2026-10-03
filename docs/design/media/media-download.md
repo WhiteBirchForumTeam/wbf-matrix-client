@@ -265,7 +265,7 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 - **第一次要用才起**，登出、換 session 時收（`Core::close_links` 一併收）：開著的主檔 fsync 留著，下次從檔案接著拉；收件與發送 queue 不保存（§11 第 2 條），等它的人收到錯誤。
 - **同一台 server 的帳號共用池**（`m<media.id>` 是 server 層級的名字），所以同一個 mxc 同時只准一個帳號的處理端寫：處理 job 時先在 `Core` 的認領表登記（server dir ＋ mxc → 帳號）。
   別的帳號正在寫它，這個 job 放進「等認領」清單；認領放掉時重新處理（對方寫完了，DB 會說完成）。seek 交給認領的那個帳號。
-  處理端被收時它的認領一定放掉（`Drop`，🚫 不靠 abort 剛好停在哪一行）；收尾時先寫 DB 記完成、**才**放掉認領——反過來的話，別的帳號會在 DB 記完成之前接手、把剛進池的檔重下一次。
+  處理端被收時它的認領一定放掉（`Drop`，🚫 不靠 abort 剛好停在哪一行），包括認領了、還在等 DB 建列、還沒開好的那幾個；收尾時先寫 DB 記完成、**才**放掉認領——反過來的話，別的帳號會在 DB 記完成之前接手、把剛進池的檔重下一次。
 
 ### 5.2 job、downloading 表、塊請求的動作
 
@@ -402,7 +402,7 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 | `media.open` | 同上 | `{ url, mxc, mimetype?, size, state }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`queued`。不完整也沒原檔 → 順便建 job |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`） |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 正在拉 → 設 `downloading[mxc].cancelled`，在途的那一塊落地就停；還沒開始 → 拿掉（§5.4） |
-| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI）、`no_cache?` | `{ to, bytes, source, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成、**整檔驗過**才寫到 `to`。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI；已經存在就覆蓋）、`no_cache?` | `{ to, bytes, source, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成、**整檔驗過**才寫到 `to`。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
 | 推播 `media.download` | — | `{ mxc, state, done, total, user, reason? }` | §5.5。`reason` 只在 `failed` 帶 |
 
 - 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。找不到是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
@@ -436,7 +436,9 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 - **`to` 是 URI**，跟 `media.create` 的 `source_uri` 同一套解法（/docs/design/rpc-specs/data-plane.md §8.1）。現在只收 `file://`（例 `file:///tmp/a.mp4`）；
   `http://127.0.0.1:…/from_ui/mxc/…`（daemon 用 HTTP PUT 丟給 UI）之後才做，現在回參數錯。
 - **來源**：本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過（原檔上傳後被改過），就從池匯出——池裡沒有就排進下載、等它完成。
-- **整檔驗過才放上去**：先寫 `<to>.partial`、fsync，邊寫邊算；大小、整檔 BLAKE3（池檔名就是它，從池匯出時）、區塊有帶就再加 SHA-256，全對上才改名成 `to`。
+- **整檔驗過才放上去**：先寫一個**這次自己獨占建立**的暫存檔（`<to>.partial.<pid>-<n>`，名字被占了就換一個）、fsync，邊寫邊算；大小、整檔 BLAKE3（池檔名就是它，從池匯出時）、
+  區塊有帶就再加 SHA-256，全對上才改名成 `to`。🚫 開、🚫 刪別人的檔（旁邊本來就有的 `<to>.partial` 之類），失敗只刪自己建的那一個；兩個匯出到同一個 `to` 互不踩。
+- **`to` 已經存在就覆蓋**（維護者 2026-10-03：要不要覆蓋是 UI 先問使用者，daemon 🚫 再擋）。
   對不上 → 刪掉暫存、`to` 🚫 被動過、回 `Integrity`；從池匯出時那份池檔也丟掉（下次重下）。一個 hash 都沒得比就🚫 匯出。
 - 跟串流分開驗（維護者 2026-10-02）：`media.open`／GET 是串流，🚫 算整檔 hash，每段讀出來時池的 AEAD 已經驗過；匯出才算整檔。
 - 🔜 之後的形狀：還沒下載完就先交 job，下載完成時**自動匯出**、RPC 不必等著；現在是等它完成才回。
@@ -474,8 +476,9 @@ GET 把「第 `i` 塊」當成一個 job 交給那個帳號的處理端（一個
 | 測什麼 | 在哪 |
 |---|---|
 | 池格式 v2：1 byte、剛好整段、跨段；半段截掉、第一個解不開的段截掉；翻 bit／錯金鑰／段搬位置／檔長不是整數筆都拒；長度欄超過 segment_size 拒；收尾過、沒改名的檔續回整個、不准再寫；`owner` 對不上或 v1 不續；寫的中途讀回已封的段 | sdk `media_pool::tests` |
-| seek 暫存檔：照到達順序 append、最後一塊寫滿一格；重開截半格、重建位置表、重複留第一個、塊號超出就截；改塊號／翻 bit／別的 mxc／chunk_size 不同都不收；位置表太大不給 | sdk `seek_store::tests` |
+| seek 暫存檔：照到達順序 append、最後一塊寫滿一格；寫失敗燒掉那個格號；重開🚫 截檔，半格與塊號超出的格跳過、號碼不再用，重建位置表、重複留第一個；改塊號／翻 bit／別的 mxc／chunk_size 不同都不收；位置表太大不給 | sdk `seek_store::tests` |
 | `MediaDownload` 對假 server：下載進池、去重、從完整的段續傳（塊跟段不對齊）、seek 拉過的塊主檔不再上網、區塊對不上就刪掉暫存檔；配額清理；掃描（不碰正在下載的、刪 v1、刪過期的） | sdk `tests/media_cache.rs` |
+| 匯出的暫存檔：旁邊本來就有的 `<to>.partial` 不論成敗都原封不動、成功時覆蓋既有的 `to`、兩個匯出到同一個 `to` 互不踩（失敗的只刪自己的）、不留暫存檔 | sdk `media::tests` |
 | 線的發送 queue：送出🚫 等回覆、回覆倒著回也找得回自己的動作、插到最前面的先送、還沒送的拿得回來、線斷了在途的都回 `Network` | core `link_requests::tests` |
 | 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、準備中的 job 也取消得掉、`export_to`（含 `no_cache`、池檔對不上自己的名字就擋下並丟掉、原檔改過就改從池匯出）、同一個 mxc 帶了不同大小就丟掉快取重下、別的帳號在寫就等認領、處理端被收會放掉認領 | core `download_queue::tests` |
 | URL：讀與上傳的 URL 不能互換；Range 解析 | daemon `data_plane::tests` |
