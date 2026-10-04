@@ -672,18 +672,19 @@ async fn pongs_alone_do_not_keep_a_request_waiting() {
         })
     };
     let _asked = peer.receive().await;
-    for _ in 0..12 {
-        if waiting.is_finished() {
-            break;
-        }
+    // `Pong` 一直流（最多 2 秒）；請求要在它們還在流的時候就逾時（沉默時限 200 ms），🚫 等到 `Pong` 停了才逾時。
+    let mut pongs_sent = 0;
+    while !waiting.is_finished() && pongs_sent < 40 {
         peer.send(pack(Kind::Control, control::PONG, flags::IS_RESPONSE, 0, 7))
             .await;
+        pongs_sent += 1;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let outcome = tokio::time::timeout(Duration::from_secs(2), waiting)
-        .await
-        .expect("it gives up")
-        .unwrap();
+    assert!(
+        pongs_sent < 20,
+        "the request gave up while pongs were still coming ({pongs_sent} sent)"
+    );
+    let outcome = waiting.await.unwrap();
     assert!(matches!(outcome, Err(SdkError::Timeout(_))), "{outcome:?}");
     assert!(!link.is_closed(), "the line itself is fine");
 }
