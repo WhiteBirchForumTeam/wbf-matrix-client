@@ -453,7 +453,7 @@ async fn get_media(
         Ok(Some(source)) => source,
         Ok(None) => return not_found(),
         Err(error) if error.kind == CoreErrorKind::Locked => return core_error_reply(&error),
-        // 有紀錄但沒有完整的檔、也拿不到金鑰去拉：上游這一段走不通（§8 的 502）。
+        // 有紀錄但沒有完整的檔、也拿不到（可信的）金鑰去拉——沒帳號看得到帶金鑰的事件，或看得到的描述都跟本地那一列對不上：上游這一段走不通（§8 的 502）。
         Err(error) => {
             return error_reply(
                 StatusCode::BAD_GATEWAY,

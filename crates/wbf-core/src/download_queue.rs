@@ -1162,6 +1162,7 @@ impl DownloadHandler {
         }
         // 只是 seek（別的處理端在下載、或沒人在下載）：🚫 開檔、🚫 寫、🚫 認領，拉到就交出去（§6.1）。
         // 塊大小先照 GET 帶來的描述算；`Info` 會核它跟 server 的一不一樣，不一樣就整個回錯，🚫 給錯位置的明文。
+        // 同一個 mxc 先到的描述贏：之後的 GET 沿用它驗過的 `Info`（金鑰、切法都以它為準）；它驗不過就丟掉，下一個 GET 帶自己的再來。
         let now = Instant::now();
         let seek = self
             .seek_only
@@ -1626,6 +1627,26 @@ impl DownloadHandler {
         }
         for mxc in std::mem::take(&mut self.opening) {
             self.claims.release(&self.server_dir, &mxc, &self.holder);
+        }
+        // 還沒處理的 job 與等的人（含別的處理端剛轉過來的，§5.1）：🚫 跟著收件 queue 一起悄悄消失，逐個回錯、推一則失敗。
+        let (unstarted, running, waiters) = {
+            let mut state = self.shared.state();
+            let unstarted: Vec<String> = state.inbox.drain(..).map(|job| job.mxc).collect();
+            let running: Vec<String> = state.downloading.drain().map(|(mxc, _)| mxc).collect();
+            (unstarted, running, std::mem::take(&mut state.waiters))
+        };
+        let error = downloader_gone();
+        for waiter in waiters.into_values().flatten() {
+            let _ = waiter.send(Err(error.clone()));
+        }
+        for mxc in unstarted.iter().chain(running.iter()) {
+            self.push(
+                mxc,
+                DownloadState::Failed,
+                0,
+                0,
+                Some(error.message.clone()),
+            );
         }
     }
 }
@@ -2829,6 +2850,30 @@ mod tests {
             before,
             "no network for a complete file"
         );
+    }
+
+    #[tokio::test]
+    async fn a_downloader_that_stops_after_taking_a_job_tells_whoever_waits() {
+        let (core, account, server, manifest) = uploaded("dq-hand-over-stop").await;
+        hold_reads(&server).await;
+        let alice = core.downloader_of(&account).await.unwrap();
+        alice.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&alice).await;
+        // Bob 的 job 與等的人轉給了 Alice，之後 Alice 登出：等的人要拿到錯，🚫 等到 Alice 的處理端整個被丟掉（測試自己還握著它）。
+        let (bob, _bob_server) =
+            start_another_account(&core, &account, &server, "@bob:localhost").await;
+        let (waiter, done) = oneshot::channel();
+        assert_eq!(
+            bob.enqueue(Arc::new(manifest.clone()), Some(waiter)).state,
+            DownloadState::Downloading
+        );
+        core.stop_downloader_of(&account);
+        let answer = tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("the waiter hears at once")
+            .expect("an answer, not a dropped sender");
+        assert!(answer.is_err());
+        server.read_permits.add_permits(READ_PERMITS as usize);
     }
 
     #[tokio::test]

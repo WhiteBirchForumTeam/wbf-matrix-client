@@ -202,7 +202,8 @@ impl Core {
                 mxc: mxc.to_string(),
                 block,
             });
-            // 這個帳號看到的描述跟本地那一列不是同一個檔（寫錯或偽造的事件）：🚫 拿它切片、🚫 拿它接手別人拉到一半的主檔，換下一個帳號。
+            // 現拉的金鑰只能從描述來：這個帳號看到的那則跟本地那一列不是同一個檔（寫錯或偽造的事件）就換下一個帳號。
+            // 切片🚫 用它（處理端照驗過的切法算），只是 seek 也🚫 寫檔，所以這裡擋的是「拿一把不可信的金鑰去拉」。
             if !media::is_same_file(&entry, &manifest) {
                 description_mismatched = true;
                 continue;
@@ -257,7 +258,7 @@ impl Core {
         Ok(accounts)
     }
 
-    /// 這台 server 上如果別的帳號正在寫這個 mxc，seek 交給它的下載處理端（主檔與暫存檔只有一個寫入者）；沒有就用 `account`。
+    /// 這台 server 上如果有處理端正在下載這個 mxc，seek 交給它（它有主檔與 `m<id>.seek` 可以讀，/docs/design/media/media-download.md §6.1）；沒有就用 `account`（只是 seek）。
     fn find_writer_of(
         &self,
         account: &AccountDir,
