@@ -323,7 +323,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 | `416` | Range 的起點在檔尾或之後（帶 `Content-Range: bytes */<大小>`） |
 | `404` | 不是這個 daemon 發的 URL、用途不對（上傳的 URL）、或本機沒有任何帳號有這個 mxc 的紀錄 |
 | `503` | 未解鎖 |
-| `502` | 有紀錄，但沒有完整的檔、也沒有帳號拿得到金鑰去拉 |
+| `502` | 有紀錄，但沒有完整的檔、也沒有帳號拿得到金鑰去拉；或看得到的描述都跟本地那一列對不上（`Integrity`，/docs/design/media/media-download.md §7.2） |
 
 - body 開始吐了才拉不到（線斷了、一塊壞了）：狀態碼已經送出去了，所以是讓 body 出錯、連線斷掉，播放器知道沒收完（🚫 不假裝結束）。
 - 播放中的進度就是這個 GET 收到多少 bytes；背景下載的進度是推播 `media.download`（/docs/design/media/media-download.md §5.5）。

@@ -84,25 +84,31 @@ impl MediaStream {
                 downloader,
                 manifest,
             } => {
-                let chunk_size = u64::from(manifest.block.chunk_size);
-                let index = u32::try_from(self.position / chunk_size).map_err(|_| {
-                    CoreError::new(CoreErrorKind::Usage, "position is past the last chunk")
-                })?;
-                let plain = downloader.read_chunk(manifest.clone(), index).await?;
-                let chunk_start = u64::from(index) * chunk_size;
-                let from = (self.position - chunk_start) as usize;
-                let to = ((self.end - chunk_start) as usize).min(plain.len());
-                plain
-                    .get(from..to)
-                    .ok_or_else(|| {
-                        CoreError::new(
-                            CoreErrorKind::Integrity,
-                            format!(
-                                "chunk {index} has {} bytes, wanted {from}..{to}",
-                                plain.len()
-                            ),
-                        )
-                    })?
+                // 只交 byte 位置：是哪一塊、從哪裡開始，照處理端手上那個檔驗過的切法，🚫 照描述自己算。
+                let piece = downloader
+                    .read_piece_at(manifest.clone(), self.position)
+                    .await?;
+                // 消費端自己再核一次：回來的那一塊真的涵蓋這個位置。
+                let covers = self
+                    .position
+                    .checked_sub(piece.start)
+                    .filter(|from| *from < piece.plain.len() as u64);
+                let Some(from) = covers else {
+                    return Err(CoreError::new(
+                        CoreErrorKind::Integrity,
+                        format!(
+                            "the chunk at {} ({} bytes) does not cover position {}",
+                            piece.start,
+                            piece.plain.len(),
+                            self.position
+                        ),
+                    ));
+                };
+                let to = (self.end - piece.start).min(piece.plain.len() as u64);
+                piece
+                    .plain
+                    .get(from as usize..to as usize)
+                    .unwrap_or_default()
                     .to_vec()
             }
         };
@@ -148,10 +154,12 @@ impl Core {
     ///     Ok(Some(MediaSource))   讀得到（原檔、池、或可以現拉）
     ///     Ok(None)                本機沒有任何帳號有這個 mxc 的紀錄（404）
     ///     Err(Usage)              有紀錄，但沒有完整的檔、而且看得到它的帳號都沒有金鑰（502）
+    ///     Err(Integrity)          有紀錄、沒有完整的檔，帳號看得到的描述跟那一列都對不上（502）
     ///     Err(Locked)             還沒解鎖
     pub async fn find_media_source(&self, mxc: &str) -> Result<Option<MediaSource>, CoreError> {
         let accounts = self.list_accounts_for_media(mxc)?;
         let mut has_record = false;
+        let mut description_mismatched = false;
         for account in &accounts {
             let Ok((cache, me)) = self.server_cache_and_me(account) else {
                 continue;
@@ -194,18 +202,30 @@ impl Core {
                 mxc: mxc.to_string(),
                 block,
             });
+            // 現拉的金鑰只能從描述來：這個帳號看到的那則跟本地那一列不是同一個檔（寫錯或偽造的事件）就換下一個帳號。
+            // 切片🚫 用它（處理端照驗過的切法算），只是 seek 也🚫 寫檔，所以這裡擋的是「拿一把不可信的金鑰去拉」。
+            if !media::is_same_file(&entry, &manifest) {
+                description_mismatched = true;
+                continue;
+            }
             let reader_account = self.find_writer_of(account, mxc, &accounts);
             self.ensure_download_link(&reader_account).await;
             let downloader = self.downloader_of(&reader_account).await?;
             return Ok(Some(MediaSource {
                 mxc: mxc.to_string(),
-                size: manifest.file_size(),
+                size: entry.file_size,
                 mimetype: mimetype.or_else(|| manifest.block.mimetype.clone()),
                 origin: Origin::Chunks {
                     downloader,
                     manifest,
                 },
             }));
+        }
+        if description_mismatched {
+            return Err(CoreError::new(
+                CoreErrorKind::Integrity,
+                format!("{mxc} is not complete here, and no account here has a description that matches the local record"),
+            ));
         }
         match has_record {
             true => Err(CoreError::new(
@@ -238,7 +258,7 @@ impl Core {
         Ok(accounts)
     }
 
-    /// 這台 server 上如果別的帳號正在寫這個 mxc，seek 交給它的下載處理端（主檔與暫存檔只有一個寫入者）；沒有就用 `account`。
+    /// 這台 server 上如果有處理端正在下載這個 mxc，seek 交給它（它有主檔與 `m<id>.seek` 可以讀，/docs/design/media/media-download.md §6.1）；沒有就用 `account`（只是 seek）。
     fn find_writer_of(
         &self,
         account: &AccountDir,

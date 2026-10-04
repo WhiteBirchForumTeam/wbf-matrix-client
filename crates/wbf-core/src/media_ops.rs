@@ -649,7 +649,9 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&account.dir);
-        drop(removed);
+        if let Some(downloader) = removed {
+            downloader.stop();
+        }
     }
 
     /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
