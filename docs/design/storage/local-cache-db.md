@@ -158,6 +158,8 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 --   不准把它蓋回明文 —— 蓋回去的下一步是送檔用 `cipher: none`，把區塊金鑰公開出去（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 --   ⭐ 放 rooms 不放 room_list：加不加密是房間的性質、對每個帳號都一樣；room_list 是「這個帳號看到的樣子」。
 --   讀的時候（list_conversations）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
+--   寫的地方兩個：拿房間清單（upsert_conversations），以及收到加密的證據（upsert_events 看到 m.room.encryption 或任何加密事件就設 1，2026-10-05）。
+--   送文字只看這一欄（find_room_encrypted；NULL 或沒有這列就報錯、請 UI 先拿房間，維護者 2026-10-05）；送附件照樣問 server 這一刻的狀態。
 CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
   encrypted INTEGER CHECK (encrypted IN (0, 1)));
 

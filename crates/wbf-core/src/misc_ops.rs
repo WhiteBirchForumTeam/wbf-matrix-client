@@ -148,7 +148,7 @@ impl Core {
             chunk_size: info.chunk_size,
             chunk_count: info.chunk_count,
             truncated: info.truncated,
-            content_type: info.content_type,
+            content_type: info.content_type.clone(),
             description: None,
             verified: None,
             cached: match sync {
@@ -166,7 +166,8 @@ impl Core {
                 format!("manifest is for {}, not {mxc}", manifest.mxc),
             ));
         }
-        let target = client.verify_target(manifest).await?;
+        // 用上面那次 `Info` 的回覆核對，🚫 再問一次。
+        let target = wbf_sdk::download::verify_info(manifest, &info, &description_data)?;
         let json = target
             .file_cipher
             .open_description(DescriptionSlot::Seal, &description_data)
@@ -336,6 +337,35 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
+    use std::sync::{Arc, Mutex};
+
+    /// `ping` 回的是開線那次 `Hello` 的答案，🚫 再 hello：同一條線再 hello 會蓋掉 server 記的宣告（/docs/design/daemon/link-requests.md §7）。
+    #[tokio::test]
+    async fn ping_answers_with_the_opening_hello_and_does_not_say_hello_again() {
+        let dir = scratch("ping-no-rehello");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        let pool = core.pool_of_account(&account).unwrap();
+        drop(
+            pool.acquire(LinkRole::Misc, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        let hellos_at_open = fake.hellos.load(std::sync::atomic::Ordering::SeqCst);
+        let hello = core
+            .ping(Transport::WebSocket, &Target::default())
+            .await
+            .unwrap();
+        assert_eq!(hello.server, "fake");
+        assert!(hello.features.iter().any(|feature| feature == "bridge"));
+        assert_eq!(
+            fake.hellos.load(std::sync::atomic::Ordering::SeqCst),
+            hellos_at_open,
+            "no second Hello on the same line"
+        );
+        fake.task.abort();
+    }
 
     #[test]
     fn not_verified_and_verified_false_are_different_things() {
@@ -410,21 +440,23 @@ pub struct UploadStatusReport {
 }
 
 impl Core {
-    /// `Hello` 加 `Ping`：server 講哪個協議版本、支援什麼、上限多少。
+    /// `Ping`，加上開線時 `Hello` 的答案：server 講哪個協議版本、支援什麼、上限多少。
+    /// 🚫 再 hello 一次：同一條線再 hello 會蓋掉 server 那邊記的宣告（/docs/design/daemon/link-requests.md §7）。
     pub async fn ping(
         &self,
         transport: Transport,
-        client_name: &str,
         target: &Target,
     ) -> Result<ServerHello, CoreError> {
         let account = self.account_or_current(target)?;
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
-        // 🚨 帶這條線自己的 features：server 把宣告記在連線上、下一個 Hello 覆蓋（沒帶就收回），空的會把 misc 的 `device_versions` 宣告收掉。
-        let hello = client
-            .hello(client_name, crate::link_pool::features_of(LinkRole::Misc))
-            .await?;
+        let hello = client.hello_ack().cloned().ok_or_else(|| {
+            CoreError::new(
+                crate::CoreErrorKind::Network,
+                "this link never got a Hello answer",
+            )
+        })?;
         client.ping().await?;
         Ok(ServerHello {
             protocol: hello.protocol,

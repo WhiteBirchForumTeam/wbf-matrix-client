@@ -391,7 +391,6 @@ mod tests {
                 Some(4801),
                 false,
                 Transport::WebSocket,
-                "ui refill",
                 &Target::default(),
             )
             .await
@@ -427,7 +426,6 @@ mod tests {
                 None,
                 false,
                 Transport::WebSocket,
-                "ui refill",
                 &Target::default(),
             )
             .await
@@ -668,6 +666,11 @@ mod tests {
         assert_eq!(ensured.opened.len(), 5, "五條都是這次開的：{ensured:?}");
         assert!(core_a.is_room_syncing(&account_a));
 
+        // 送文字只看本地記的加不加密（維護者 2026-10-05）：照 UI 的順序先拿房間。
+        core_b
+            .list_conversations(crate::SyncMode::Both, &Target::default())
+            .await
+            .expect("bob fetches his rooms");
         let body = format!("room sync e2e {}", std::process::id());
         let event_id = core_b
             .send_text(

@@ -17,6 +17,8 @@ sha2 = "0.10"
 hex = "0.4"
 # 線的請求自己造 pack（link_requests.rs，/docs/design/daemon/link-requests.md §3）。本 repo 的 codec，不是上游依賴。
 wbf-wire = { path = "../wbf-wire" }
+# 互不相干的查詢一起送、一起收（`try_join_all`，wbf_rooms.rs）；跟 wbf-sdk、wbf-daemon 同一份。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt"] }

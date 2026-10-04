@@ -166,7 +166,6 @@ impl Core {
         since: Option<i64>,
         from_scratch: bool,
         transport: Transport,
-        client_name: &str,
         target: &Target,
     ) -> Result<RecentSummary, CoreError> {
         let account = self.account_or_current(target)?;
@@ -175,10 +174,6 @@ impl Core {
         // 走 `http` 或對方不是 wbf 的話，這個功能就是**關的**，而閘門會說出是哪一個理由。
         let mut client = self
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
-            .await?;
-        // 帶這條線自己的 features（同 `ping`：空的會收回 misc 的 `device_versions` 宣告）。
-        client
-            .hello(client_name, crate::link_pool::features_of(LinkRole::Misc))
             .await?;
         let cg_seq = match (from_scratch, since) {
             (true, _) => None,

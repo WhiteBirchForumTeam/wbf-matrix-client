@@ -430,13 +430,6 @@ impl Core {
                 LinkRole::Misc,
             )
             .await?;
-        // 帶這條線自己的 features（同 `ping`：空的會收回 misc 的 `device_versions` 宣告）。
-        client
-            .hello(
-                HISTORY_CLIENT_NAME,
-                crate::link_pool::features_of(LinkRole::Misc),
-            )
-            .await?;
         let request = wbf_sdk::protocol::RecentRequest {
             rooms: Some(vec![room.to_string()]),
             // server 在上限以上會 clamp，client 先 clamp 才算得出「窗滿了沒」（protocol.rs）。
@@ -555,9 +548,6 @@ impl Core {
         Ok((cache, session.user_id))
     }
 }
-
-/// 跟 server 講房間歷史時報的 client 名字。⚠️ server 會 log 它。
-const HISTORY_CLIENT_NAME: &str = "wbf-client history";
 
 /// `before`（event_id）在 wbf 那條路上換不換得到 `g_seq`。
 enum Anchor {

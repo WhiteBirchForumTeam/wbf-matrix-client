@@ -4,7 +4,7 @@
 //! 兩個 task 哪一個死了、或呼叫端 `close()`，都走同一條路 `shut_down`：`closed` → `fail_all` → 兩個 task 都 abort。
 //! 這層🚫 不重連（第 8 階段監督者的事）：關了之後每個請求立刻回錯。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -50,8 +50,11 @@ impl Heartbeat {
     };
 }
 
-/// 心跳的 `Ping` 用的請求號從這裡往下數：`WbfClient` 的計數器從 1 往上，兩邊碰到要幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。
-const HEARTBEAT_FIRST_SEQ: u32 = u32::MAX;
+/// 線發的請求號從這裡起往上（/docs/design/daemon/link-requests.md §7）：底下那半留給上傳的塊號（`Chunk` 的 seq 就是塊索引，跟同一個上傳的 `Status` 同 id）。
+const FIRST_LINE_SEQ: u32 = 1 << 31;
+/// 有請求在等時，一條線最久可以多久沒有任何回應（/docs/design/daemon/link-requests.md §4）。跟 server 的 `wbf_ws_idle_timeout` 一樣是 60 秒（wbfuwunel #103）；
+/// 線真的死了，心跳 34 秒內就發現（`Network`），所以撞到這個的是「線活著、server 卻不回」。
+pub const LINE_SILENCE: Duration = Duration::from_secs(60);
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -83,6 +86,12 @@ struct Shared {
     hook: ReceivedHook,
     /// 讀取 task 至今解出幾個 pack：心跳拿它判斷「等 `Pong` 的這段時間有沒有收到任何東西」。
     received: AtomicU64,
+    /// 同上，但🚫 算 `Pong`：請求拿它判斷「整條線有沒有在回應」。算了 `Pong` 的話，server 只回心跳、不回請求，等的人就永遠不會逾時。
+    answered: AtomicU64,
+    /// 下一個請求號（`WsLink::next_seq`）
+    next_seq: AtomicU32,
+    /// 下一個具名會話的號（`WsLink::next_session_number`）
+    next_session: AtomicU64,
 }
 
 impl Shared {
@@ -143,6 +152,9 @@ impl WsLink {
             tasks: Mutex::new(Vec::new()),
             hook,
             received: AtomicU64::new(0),
+            answered: AtomicU64::new(0),
+            next_seq: AtomicU32::new(FIRST_LINE_SEQ),
+            next_session: AtomicU64::new(0),
         });
         let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
 
@@ -307,6 +319,61 @@ impl WsLink {
         })
     }
 
+    /// 這條線的下一個請求號（/docs/design/daemon/link-requests.md §7：seq 由線發）。同一條線上所有送請求的（共用的 client、`RequestLine`、心跳）都從這裡拿，
+    /// 🚫 自己數——兩個各自數的人同時用一條線就會撞號。從 2^31 起、繞回也留在上半：下半是上傳的塊號。
+    ///
+    /// Return:
+    ///     u32  example: 2147483648
+    pub fn next_seq(&self) -> u32 {
+        self.shared.next_seq.fetch_add(1, Ordering::Relaxed) | FIRST_LINE_SEQ
+    }
+
+    /// 這條線的下一個具名會話的號（`Recent`、`Device/*` 的會話 id 的值部分；型別 byte 是呼叫端加的）。同上，線發、🚫 自己數。
+    ///
+    /// Return:
+    ///     u64  從 1 起、永遠不是 0、不超過 `pack::id::MAX_VALUE`, example: 1
+    pub fn next_session_number(&self) -> u64 {
+        loop {
+            let number = self
+                .shared
+                .next_session
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+                & wbf_wire::pack::id::MAX_VALUE;
+            if number != 0 {
+                return number;
+            }
+        }
+    }
+
+    /// 一問一答，等到回覆為止；這個請求在等、而整條線 `silence` 內一個回應都沒收到（心跳的 `Pong` 🚫 算）才算逾時（/docs/design/daemon/link-requests.md §4）。
+    /// 線上別人的回覆還在流進來就是活的：🚫 每個請求從送出各自計時（線很忙時會誤判）。
+    ///
+    /// Return:
+    ///     Ok(Pack)        回來的那個（可能是 Error pack，這裡不解讀）
+    ///     Err(Timeout)    這條線還活著，可是 `silence` 內什麼都沒回
+    ///     Err(Network)    連線沒了
+    ///     Err(Usage)      同一個 (id, seq) 已經有人在等
+    pub async fn request_until_silent(
+        &self,
+        pack: Pack,
+        silence: Duration,
+    ) -> Result<Pack, SdkError> {
+        let key = SessionKey::Reply {
+            id: pack.id,
+            seq: pack.seq,
+        };
+        let mut reply = Box::pin(self.send_request(pack).await?.wait());
+        loop {
+            let heard_before = self.shared.answered.load(Ordering::Relaxed);
+            match tokio::time::timeout(silence, &mut reply).await {
+                Ok(outcome) => return outcome,
+                Err(_elapsed) if self.shared.answered.load(Ordering::Relaxed) != heard_before => {}
+                Err(_elapsed) => return Err(self.no_reply_error(key, 1, silence)),
+            }
+        }
+    }
+
     /// 同一條線的分身：送、收都一樣，但丟掉它🚫 不關線（只有原本那一份能關）。給「線在連線池裡、送請求的在別的 task」用（/docs/design/daemon/link-requests.md §2）。
     pub fn share(&self) -> WsLink {
         WsLink {
@@ -412,12 +479,12 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
     if heartbeat.interval == Duration::MAX {
         return;
     }
-    let mut seq = HEARTBEAT_FIRST_SEQ;
     loop {
         tokio::time::sleep(heartbeat.interval).await;
         if link.shared.is_closed() {
             return;
         }
+        let seq = link.next_seq();
         let ping = Pack {
             kind: wbf_wire::Kind::Control,
             subtype: wbf_wire::pack::control::PING,
@@ -427,7 +494,6 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
             meta: Vec::new(),
             data: Vec::new(),
         };
-        seq = seq.wrapping_sub(1);
         let pending = match link.send_request(ping).await {
             Ok(pending) => pending,
             // 這個號剛好有人在用：那條線顯然活著，下次再說。
@@ -469,6 +535,11 @@ async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
                 Ok(pack) => {
                     undecodable_in_a_row = 0;
                     shared.received.fetch_add(1, Ordering::Relaxed);
+                    let is_pong = pack.kind == wbf_wire::Kind::Control
+                        && pack.subtype == wbf_wire::pack::control::PONG;
+                    if !is_pong {
+                        shared.answered.fetch_add(1, Ordering::Relaxed);
+                    }
                     let (session, route) = shared.table().classify(&pack);
                     (shared.hook)(&Received {
                         connection_id: shared.connection_id,

@@ -23,7 +23,6 @@ pub async fn recent_command(
             None,
             from_scratch,
             context.transport,
-            crate::commands::CLIENT_NAME,
             &context.target(),
         )
         .await?;

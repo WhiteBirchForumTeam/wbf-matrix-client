@@ -240,6 +240,26 @@ impl Cache {
         transaction.commit().map_err(db_error)
     }
 
+    /// 本地記的「這間房加不加密」（`rooms.encrypted`）：拿房間時寫（`upsert_conversations`），收到加密的證據時往上升（`upsert_events`），只升不降。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    /// Return:
+    ///     Ok(Some(true))    加密
+    ///     Ok(Some(false))   明文
+    ///     Ok(None)          沒有這間房、或不知道（只因收到事件才建出來的房，NULL）——🚫 當成明文
+    pub fn find_room_encrypted(&self, room_id: &str) -> Result<Option<bool>, SdkError> {
+        self.connection
+            .query_row(
+                "SELECT encrypted FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .map_err(db_error)
+            .map(Option::flatten)
+    }
+
     /// Return:
     ///     Ok(Vec<Conversation>)   這個帳號的，照名稱排；解不開的列跳過（/docs/design/storage/local-cache-db.md §1：壞資料當沒有）
     pub fn list_conversations(&self, user_id: &str) -> Result<Vec<Conversation>, SdkError> {
@@ -411,6 +431,17 @@ impl Cache {
             }
             if is_new_to_process {
                 process_event(&transaction, room, event)?;
+            }
+            // 這間房加密了的證據（`m.room.encryption`，或任何加密事件）：本地的「加不加密」往上升，只升不降。
+            // 送文字只看它（維護者 2026-10-05）：拿完房間之後才開的加密，靠這裡補上。
+            let shows_encryption =
+                incoming.decrypted().is_some() || text("type") == Some("m.room.encryption");
+            if shows_encryption {
+                transaction
+                    .prepare_cached("UPDATE rooms SET encrypted = 1 WHERE id = ?1")
+                    .map_err(db_error)?
+                    .execute(params![room])
+                    .map_err(db_error)?;
             }
             transaction
                 .prepare_cached(
@@ -2468,6 +2499,64 @@ mod tests {
             "🚨 BOB 的 JSON 是舊的，但房間已知加密 —— 讀出來不准是明文"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拿過的房間：收到加密的證據就往上升，明文訊息不動它，只升不降；沒拿過的是「不知道」。
+    #[test]
+    fn an_encryption_event_or_a_ciphertext_marks_a_known_room_encrypted() {
+        let (mut cache, dir) = open("encrypted-by-events");
+        cache
+            .upsert_conversations(ALICE, &[room("!r", false), room("!s", false)])
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(false));
+        assert_eq!(
+            cache.find_room_encrypted("!never").unwrap(),
+            None,
+            "a room never fetched is unknown, not plaintext"
+        );
+        put(&mut cache, ALICE, &[text("!r", "$t", Some(1), 1)]);
+        assert_eq!(
+            cache.find_room_encrypted("!r").unwrap(),
+            Some(false),
+            "a plaintext message says nothing about encryption"
+        );
+        // 拿完房間之後才開的加密：`m.room.encryption` 進來就往上升（送文字只看本地，維護者 2026-10-05）。
+        let mut turned_on = event_json(
+            "!r",
+            "$enc",
+            CAROL,
+            Some(2),
+            2,
+            serde_json::json!({ "algorithm": "m.megolm.v1.aes-sha2" }),
+        );
+        turned_on["type"] = serde_json::json!("m.room.encryption");
+        turned_on["state_key"] = serde_json::json!("");
+        cache
+            .upsert_events(ALICE, "!r", &[IncomingEvent::Plain { event: turned_on }])
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(true));
+        // 收到一則密文也一樣。
+        let ciphertext = serde_json::json!({
+            "type": "m.room.encrypted", "event_id": "$c", "room_id": "!s", "sender": CAROL, "origin_server_ts": 3,
+            "content": { "algorithm": "m.megolm.v1.aes-sha2", "session_id": "S", "ciphertext": "AAA" },
+        });
+        cache
+            .upsert_events(
+                ALICE,
+                "!s",
+                &[IncomingEvent::Undecrypted {
+                    ciphertext,
+                    reason: "MissingRoomKey".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!s").unwrap(), Some(true));
+        // 只升不降：之後一份「沒加密」的房間清單蓋不回去。
+        cache
+            .upsert_conversations(ALICE, &[room("!r", false)])
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

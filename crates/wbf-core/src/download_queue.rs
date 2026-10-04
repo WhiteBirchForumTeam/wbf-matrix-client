@@ -38,9 +38,8 @@ use crate::CoreEvent;
 const PUSH_EVERY: Duration = Duration::from_secs(1);
 /// 沒事做時最久睡多久（收件、回覆、取消都會叫醒它）。
 const IDLE_WAKE: Duration = Duration::from_secs(60);
-/// 有塊請求在等時，`Download` 線最久可以多久沒有任何回應（/docs/design/daemon/link-requests.md §4）。跟 server 的 `wbf_ws_idle_timeout` 一樣是 60 秒（wbfuwunel #103，2026-10-02）；
-/// 線真的死了，心跳 34 秒內就發現（`Network`），所以撞到這個的是「線活著、server 卻不回下載」。
-pub(crate) const LINE_SILENCE: Duration = Duration::from_secs(60);
+/// 有塊請求在等時，`Download` 線最久可以多久沒有任何回應（/docs/design/daemon/link-requests.md §4）：跟其他線的一問一答同一個數（sdk 的 `link::LINE_SILENCE`，60 秒）。
+pub(crate) const LINE_SILENCE: Duration = wbf_sdk::link::LINE_SILENCE;
 /// 同一個請求連續逾時幾次就當 server 那邊出事（/docs/design/daemon/link-requests.md §4）。
 const TIMEOUT_ATTEMPTS: u32 = 3;
 /// 只是 seek 的檔（沒在下載）記著驗過的 `Info` 的最多幾個：播放器順著往下讀時下一塊🚫 再問一次 `Info`。只在記憶體。

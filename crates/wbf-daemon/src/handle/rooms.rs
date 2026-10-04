@@ -14,10 +14,7 @@ use wbf_core::{
 };
 use wbf_sdk::{Manifest, RecentPlan};
 
-use super::{
-    parse_params, to_result, Handle, Outcome, TargetParams, TransportParam, DAEMON_NAME,
-    DAEMON_VERSION,
-};
+use super::{parse_params, to_result, Handle, Outcome, TargetParams, TransportParam};
 
 #[derive(Deserialize)]
 struct RoomParams {
@@ -301,7 +298,6 @@ pub(super) async fn sync_recent(handle: &Handle, core: &Core, params: Value) -> 
             params.since,
             params.from_scratch,
             transport,
-            &format!("{DAEMON_NAME} {DAEMON_VERSION}"),
             &handle.target(&params.target),
         )
         .await?,

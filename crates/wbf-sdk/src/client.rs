@@ -181,6 +181,28 @@ impl<C: PackChannel> WbfClient<C> {
         }
     }
 
+    /// 開線時已經 hello 過的那條線上再發一個 client（/docs/design/daemon/link-pool.md §5：好幾個命令同時用一條線）：
+    /// 帶著開線那次的 `Hello` 結果，🚫 再 hello 一次——同一條線再 hello 會蓋掉 server 那邊記的宣告。
+    ///
+    /// Args:
+    ///     channel: 同一條線的通道（`WsChannel::from_link(link.share())`）
+    ///     hello: 開線時 `hello()` 回的那一份
+    pub fn with_hello(channel: C, hello: HelloAck) -> WbfClient<C> {
+        WbfClient {
+            channel,
+            next_seq: 1,
+            features: Some(hello.features.clone()),
+            hello: Some(hello),
+            next_stream_id: 0,
+        }
+    }
+
+    /// Return:
+    ///     Some(&HelloAck)  `hello()` 回的整份；None ＝ 還沒問過
+    pub fn hello_ack(&self) -> Option<&HelloAck> {
+        self.hello.as_ref()
+    }
+
     /// 底下的通道（診斷用：`Channel::unmatched`、`WsChannel::link`）。
     pub fn channel(&self) -> &C {
         &self.channel
@@ -197,8 +219,7 @@ impl<C: PackChannel> WbfClient<C> {
         &mut self,
         build: impl FnOnce(u32) -> Result<Pack, SdkError>,
     ) -> Result<Pack, SdkError> {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let request = build(seq)?;
         self.send_and_expect_ack(request).await
     }
@@ -271,8 +292,7 @@ impl<C: PackChannel> WbfClient<C> {
         body: Vec<u8>,
     ) -> Result<protocol::BridgeReply, SdkError> {
         self.require_feature(protocol::BRIDGE_FEATURE)?;
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let request = protocol::bridge_request(endpoint, variables, body, seq)?;
         let response = self.channel.request(request.clone()).await?;
         protocol::expect_bridge_reply(&request, response)
@@ -454,10 +474,27 @@ impl<C: PackChannel> WbfClient<C> {
 
     /// 一串回應的請求（`Recent`、`Device/Fetch`、`ItemsDestroy`）用的會話號：client 自己選，從 1 起、永遠不是 0。
     /// 型別 byte 是 SESSION（wbfuwunel 的 /docs/design/wbf-wire-format.md §2.2）：沒帶 server 回 InvalidRequest「carries none」（2026-09-13 對 wbfuwunel dc4e590f7 實跑踩到）。
+    /// 線發的（WebSocket：同一條線上的 client 共用，/docs/design/daemon/link-requests.md §7）；通道不共用就自己數。
     fn next_session_id(&mut self) -> u64 {
-        self.next_stream_id =
-            self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
-        wbf_wire::pack::id::compose_masked(wbf_wire::pack::id::SESSION, self.next_stream_id)
+        let number = match self.channel.line_session_number() {
+            Some(number) => number,
+            None => {
+                self.next_stream_id =
+                    self.next_stream_id.wrapping_add(1).max(1) & wbf_wire::pack::id::MAX_VALUE;
+                self.next_stream_id
+            }
+        };
+        wbf_wire::pack::id::compose_masked(wbf_wire::pack::id::SESSION, number)
+    }
+
+    /// 下一個請求號：線發的（WebSocket：同一條線上的 client 共用，🚫 各自數會撞號）；通道不共用（HTTP、測試的假通道）就自己數。
+    fn allocate_seq(&mut self) -> u32 {
+        if let Some(seq) = self.channel.line_seq() {
+            return seq;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        seq
     }
 
     /// `Device/Fetch` 一窗：從佇列最舊還沒銷毀的起拉 to-device，舊→新（/docs/design/keys/to-device-client.md §7）。回應是一串 `Device/Batch`。
@@ -477,8 +514,7 @@ impl<C: PackChannel> WbfClient<C> {
         per_pack_timeout: std::time::Duration,
     ) -> Result<DeviceWindow, SdkError> {
         self.require_feature(protocol::DEVICE_FEATURE)?;
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let pack = protocol::device_fetch(request, self.next_session_id(), seq)?;
         let mut window = DeviceWindow::default();
         let mut expected_seq = 0u32;
@@ -548,8 +584,7 @@ impl<C: PackChannel> WbfClient<C> {
         per_pack_timeout: std::time::Duration,
     ) -> Result<protocol::CryptoStateMeta, SdkError> {
         self.require_feature(protocol::DEVICE_FEATURE)?;
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let pack = protocol::device_subscribe(
             &protocol::DeviceSubscribeRequest {
                 device_id: device_id.to_string(),
@@ -598,8 +633,7 @@ impl<C: PackChannel> WbfClient<C> {
         per_pack_timeout: std::time::Duration,
     ) -> Result<DeviceSubscription, SdkError> {
         self.require_feature(protocol::DEVICE_FEATURE)?;
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let pack = protocol::device_subscribe(
             &protocol::DeviceSubscribeRequest {
                 device_id: device_id.to_string(),
@@ -653,8 +687,7 @@ impl<C: PackChannel> WbfClient<C> {
         rooms: Option<&[String]>,
         per_pack_timeout: std::time::Duration,
     ) -> Result<RoomSubscription, SdkError> {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let request = protocol::event_subscribe(
             &protocol::EventSubscribeRequest {
                 cg_seq: None,
@@ -704,8 +737,7 @@ impl<C: PackChannel> WbfClient<C> {
         mut subscription: RoomSubscription,
         per_pack_timeout: std::time::Duration,
     ) -> Result<(), SdkError> {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let pack = protocol::event_unsubscribe(None, subscription.request.id, seq)?;
         self.channel.send_only(pack).await?;
         loop {
@@ -758,8 +790,7 @@ impl<C: PackChannel> WbfClient<C> {
         if counts.is_empty() {
             return Ok(Vec::new());
         }
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let pack = protocol::device_items_destroy(counts, self.next_session_id(), seq);
         let mut destroyed: Option<Vec<u64>> = None;
         let mut on_pack = |response: Pack| -> Result<bool, SdkError> {
@@ -835,8 +866,7 @@ impl<C: PackChannel> WbfClient<C> {
         on_batch: OnBatch<'_>,
     ) -> Result<RecentWindow, SdkError> {
         self.require_feature("recent")?;
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.allocate_seq();
         let session_id = self.next_session_id();
         let pack = protocol::recent(request, session_id, seq)?;
         let mut window = RecentWindow::default();

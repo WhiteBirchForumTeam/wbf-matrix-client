@@ -351,8 +351,11 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
     assert_eq!(reply["code"], 0, "account.add: {reply}");
     // 訂閱線在背景開（/docs/design/daemon/link-pool.md §3.1）：等五條都開好再送，下面送的 7 則才一定會被推回來（訂閱不補訂閱之前的，那是 UI 叫 `sync.recent` 的事）。
     wait_for_links(&mut client, 5).await;
+    // 送文字只看本地記的加不加密（維護者 2026-10-05）：照 UI 的順序先拿房間。
+    let rooms = client.call("room.list", json!({ "sync": "both" })).await;
+    assert_eq!(rooms["code"], 0, "room.list: {rooms}");
 
-    // wbf 帳號的送訊息走 `Event/Send` 明文：加密房要被拒（1100），而且是送之前問這一刻的 `m.room.encryption`（/docs/design/daemon/account-session.md §6）。
+    // 加密房沒帶 `room_devices` 要被拒（1100）、🚫 送明文：加不加密看的是剛拿到的房間（/docs/design/keys/e2ee-rpc.md §7）。
     // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
     if let Ok(encrypted_room) = std::env::var("WBF_E2E_ENCRYPTED_ROOM") {
         let reply = client
@@ -362,6 +365,10 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
             )
             .await;
         assert_eq!(reply["code"], 1100, "加密房的明文送出要被拒：{reply}");
+        assert!(
+            reply.to_string().contains("room_devices"),
+            "refused because the room is encrypted, not because it is unknown: {reply}"
+        );
         // /docs/design/keys/e2ee-rpc.md 的 RPC 形狀：`room.refresh_devices` 回的整份原樣當 `room_devices` 帶回來，送出去的是密文、帶那個號碼。
         let refreshed = client
             .call("room.refresh_devices", json!({ "room": encrypted_room }))
