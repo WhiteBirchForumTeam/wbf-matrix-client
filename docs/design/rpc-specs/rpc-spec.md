@@ -113,7 +113,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - ⭐ **常態是 daemon 升級、前端沒升**：daemon 版本往上走的時候**維持能講舊協議**，舊前端照用。
   只有 **breaking**（舊協議真的沒辦法再服務）才把那個版本從表裡拿掉——那時候舊前端一連上來就被**明確拒絕**，
   🚫 不是連上了之後某個 method 突然壞掉。
-- 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2, 1]`）→ 談成 `2`，前端自己降級。
+- 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2]`）→ 談成 `2`，前端自己降級。
 - 現在 daemon 只有 `[2]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。
   **版本號只寫在一個地方**：同檔的 `CURRENT_PROTOCOL`，支援表與測試送的 `hello` 都從它拿；升版就改它（維護者 2026-10-05）。
   版本紀錄：**2**（2026-10-05，維護者定）`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房（§3.3，/docs/design/rooms/chat-model.md §2.1），
