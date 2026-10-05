@@ -41,6 +41,9 @@ enum KeyShareWork {
 pub(crate) struct KeyShareHandle {
     work: UnboundedSender<KeyShareWork>,
     task: tokio::task::JoinHandle<()>,
+    /// 試過幾次送一個房（只給測試：送成之後再試不會走橋，從假 server 看不出來有沒有停）。
+    #[cfg(test)]
+    attempts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Drop for KeyShareHandle {
@@ -54,6 +57,8 @@ struct KeyShareTask {
     engine: Arc<OlmEngine>,
     pool: Arc<LinkPool>,
     events: EventSink,
+    #[cfg(test)]
+    attempts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Core {
@@ -107,16 +112,22 @@ impl Core {
         let (sender, receiver) = unbounded_channel();
         // 收的那頭在這裡、還活著：送不出去是到不了的，但🚫 靠它，失敗就是這一件沒交上（下一次送會再交）。
         let _ = sender.send(work);
+        #[cfg(test)]
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let task = KeyShareTask {
             engine,
             pool,
             events: self.events.clone(),
+            #[cfg(test)]
+            attempts: attempts.clone(),
         };
         shares.insert(
             account.dir.clone(),
             KeyShareHandle {
                 work: sender,
                 task: tokio::spawn(task.run(receiver)),
+                #[cfg(test)]
+                attempts,
             },
         );
     }
@@ -168,6 +179,19 @@ impl Core {
             .get(&account.dir)
             .is_some_and(|handle| !handle.task.is_finished())
     }
+
+    /// Return:
+    ///     u32  這個帳號的後台試過幾次送一個房（只給測試斷言。還沒有後台是 0）
+    #[cfg(test)]
+    pub(crate) fn room_key_share_attempts(&self, account: &AccountDir) -> u32 {
+        self.key_shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account.dir)
+            .map_or(0, |handle| {
+                handle.attempts.load(std::sync::atomic::Ordering::SeqCst)
+            })
+    }
 }
 
 impl KeyShareTask {
@@ -209,6 +233,9 @@ impl KeyShareTask {
                 .map(|(room, members)| (room.clone(), members.clone()))
                 .collect();
             for (room, members) in pending {
+                #[cfg(test)]
+                self.attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 match self
                     .engine
                     .distribute_room_key(&mut line, &room, &members)
@@ -359,14 +386,25 @@ mod tests {
             "the first attempt failed and a retry followed",
         )
         .await;
-        // 重試成功之後就停：等過最長的間隔，走橋的呼叫數不再變。
+        // 重試成功之後就停：等過最長的間隔，走橋的呼叫數與「試過幾次」都不再變。
+        // 只看走橋的不夠：金鑰送出去之後再試一次什麼都不用送，一直重試也看不出來（變異驗證抓到）。
         tokio::time::sleep(RETRY_MAX).await;
         let settled = keys.bridge_calls.lock().unwrap().len();
+        let attempts = core.room_key_share_attempts(&account);
+        assert!(
+            attempts >= 2,
+            "one failed attempt and one retry: {attempts}"
+        );
         tokio::time::sleep(RETRY_MAX * 2).await;
         assert_eq!(
             keys.bridge_calls.lock().unwrap().len(),
             settled,
             "nothing is sent again once the room's key went out"
+        );
+        assert_eq!(
+            core.room_key_share_attempts(&account),
+            attempts,
+            "the room is not tried again once its key went out"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
