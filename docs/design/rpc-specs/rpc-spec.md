@@ -384,7 +384,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 | method | params | result | core |
 |---|---|---|---|
-| `server.ping` | `{ transport?, user?, server? }` | `ServerHello` | `ping(client_name = daemon 的名字與版本)` |
+| `server.ping` | `{ transport?, user?, server? }` | `ServerHello` | `ping(transport, target)`：送 `Ping`，回開線那次 `Hello` 的答案（🚫 再 hello，/docs/design/daemon/link-requests.md §7） |
 
 ### 3.9 訂閱、取消
 
@@ -561,7 +561,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，/docs/design/daemon/account-session.md §6） | 🔁 還沒做：搬到 crypto 層＋橋的 `/room_keys` |
 | `recovery.list`／`show` | ✅ | 本機（`<data dir>/r/`） | ✅ |
-| `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
+| `server.ping` | ✅ | **WS** `Ping`（`Hello` 是開線那次的） | ✅ |
 | `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發（/docs/design/rooms/room-sync.md §3：追平與否是 UI 自己叫 `sync.recent` 的結果，線的開關看 `link.state`）；`vault.state` ❌ | — | ❌ |
 | `progress`／`note` 推播 | ✅ daemon 層（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ |
 

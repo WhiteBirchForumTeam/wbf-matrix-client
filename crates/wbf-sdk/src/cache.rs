@@ -434,8 +434,12 @@ impl Cache {
             }
             // 這間房加密了的證據（`m.room.encryption`，或任何加密事件）：本地的「加不加密」往上升，只升不降。
             // 送文字只看它（維護者 2026-10-05）：拿完房間之後才開的加密，靠這裡補上。
-            let shows_encryption =
-                incoming.decrypted().is_some() || text("type") == Some("m.room.encryption");
+            // 認不認得 `m.room.encryption` 跟拿房間時同一個判斷（`is_encryption_content`），🚫 各寫一份。
+            let shows_encryption = incoming.decrypted().is_some()
+                || (text("type") == Some("m.room.encryption")
+                    && crate::room_state::is_encryption_content(
+                        envelope.get("content").unwrap_or(&serde_json::Value::Null),
+                    ));
             if shows_encryption {
                 transaction
                     .prepare_cached("UPDATE rooms SET encrypted = 1 WHERE id = ?1")
@@ -2521,6 +2525,27 @@ mod tests {
             Some(false),
             "a plaintext message says nothing about encryption"
         );
+        // 沒帶 `algorithm` 的 `m.room.encryption` 跟拿房間時一樣不算（`room_state::is_encryption_content`）。
+        let mut empty_algorithm = event_json(
+            "!r",
+            "$enc-empty",
+            CAROL,
+            Some(4),
+            4,
+            serde_json::json!({ "algorithm": "" }),
+        );
+        empty_algorithm["type"] = serde_json::json!("m.room.encryption");
+        empty_algorithm["state_key"] = serde_json::json!("");
+        cache
+            .upsert_events(
+                ALICE,
+                "!r",
+                &[IncomingEvent::Plain {
+                    event: empty_algorithm,
+                }],
+            )
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(false));
         // 拿完房間之後才開的加密：`m.room.encryption` 進來就往上升（送文字只看本地，維護者 2026-10-05）。
         let mut turned_on = event_json(
             "!r",

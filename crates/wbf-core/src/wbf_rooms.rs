@@ -5,6 +5,7 @@
 //! 路徑版的 `send_file` 還拒加密房（/docs/design/keys/e2ee-rpc.md §8）。
 //! 「加不加密」：送**文字**只看本地記的（`rooms.encrypted`，拿房間時寫、收到加密的證據時往上升；不知道就報錯，維護者 2026-10-05）；
 //! 送**附件**問這一刻的狀態（/docs/design/rpc-specs/data-plane.md §4.1：過期的「沒加密」會把檔案金鑰公開在事件裡）。
+//! ⚠️ 文字這側的代價：本地記著「沒加密」、房間卻在這台沒在聽的時候開了加密，就照送明文，直到下次拿房間或收到加密的證據（/docs/design/keys/e2ee-rpc.md §7）。
 
 use futures_util::future::try_join_all;
 use serde_json::Value;
@@ -134,7 +135,7 @@ impl Core {
     /// 附件在**同一個請求**裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2），加密房也一樣。
     ///
     /// Args:
-    ///     encrypted: 呼叫端剛問過的 [`Core::wbf_is_room_encrypted`]（送檔要先拿它核對區塊，所以由呼叫端問）
+    ///     encrypted: 這間房加不加密，由呼叫端決定怎麼問：文字看本地（[`Core::find_local_room_encryption`]）、附件問 server（[`Core::wbf_is_room_encrypted`]，送檔要先拿它核對區塊）
     ///     content: 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
     ///     attachments: 這則用到的 mxc, example: vec!["mxc://localhost/1122334455667788".into()]
     ///     options: 加密房要 `room_devices`；`txn_id` 重送用, example: &SendOptions::default()

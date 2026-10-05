@@ -134,9 +134,11 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 
 **RPC 來的命令**（`Misc`、`Upload`、`Rooms`／`Keys` 的一問一答，維護者 2026-10-05，/docs/design/daemon/link-requests.md §2.1）：沒有發送 queue，每個命令等自己的回條。
 
-- 一格是 `tokio::RwLock<Option<WbfClient>>`，裡面是**開線的那個 client**（線的擁有者，丟掉它就關線）。
+- 一格是 `tokio::RwLock<Option<WbfClient>>`（加一把「誰去開」的鎖，見下），裡面是**開線的那個 client**（線的擁有者，丟掉它就關線）。
 - **用**拿讀鎖：`PooledClient` 是同一條 `WsLink` 的分身、帶開線那次的 hello 的一個新 `WbfClient`，讀鎖跟著它。很多命令同時各拿一個，號由線發、🚫 撞（/docs/design/daemon/link-requests.md §7）。
-- **開、重開、關**拿寫鎖：同時進來的兩個命令一個開、另一個等它開好就用（🚫 各開一條）；關線等手上還在用它的命令做完（§3 的登出）。開好就降成讀鎖交出去。
+- **開、重開、關**拿寫鎖：關線等手上還在用它的命令做完（§3 的登出）。開好就降成讀鎖交出去。
+- **誰去開**：同時發現沒開（或死了）的命令先排一格自己的「開線」鎖，只有第一個去拿寫鎖開線；後面的等它**開好**、回頭拿讀鎖就用（🚫 各開一條）。
+  🚫 讓它們都去排寫鎖：寫鎖要等所有手上有這條線的命令都放掉，第二個會變成等第一個**做完**——解鎖後 UI 一次送 10 則（線剛開）正好排成一串（PR #72 審查 cirno／salvia）。
 - ⚠️ 一個命令🚫 握著一個 `PooledClient` 再要同一條線的第二個：中間如果有人在等寫鎖（登出），第二個讀鎖排在它後面、它又等第一個放——互等。要同時送就各拿各的（例：`wbf_rooms.rs` 的房間清單）。
 
 ## 6. daemon 那半：訂閱、推播、desync（/docs/design/rpc-specs/rpc-spec.md §3.9、§4）

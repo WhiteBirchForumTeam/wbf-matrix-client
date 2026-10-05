@@ -93,6 +93,8 @@ enum DownloadRequest {                      // 例：Download 線（core 的 dow
 
 ## 4. 失敗：每個動作都要說得出去處
 
+下表是有 `RequestLine` 的線（`Download`）的處置。RPC 來的命令（§2.1）沒有發送 queue：`Network`、`Timeout` 都直接交回 UI，🚫 排回去重送（/docs/design/daemon/link-pool.md §3：命令做到一半死了不重做）。
+
 | 收到 | 一般的處置 |
 |---|---|
 | `Network`（線斷了） | 同一個請求重新排回發送 queue（放最前面，順序不亂），等線重開再送。進度停在原地 |

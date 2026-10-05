@@ -57,16 +57,22 @@ impl LinkRole {
     }
 }
 
-/// 一格：開線的那個 client（線的擁有者，丟掉它就關線），`None` ＝ 沒開（Idle）。
-/// 讀寫鎖：**用**線拿讀鎖，很多命令同時用同一條線（/docs/design/daemon/link-pool.md §5）；**開、重開、關**拿寫鎖——
-/// 同一條線同時進來的兩個命令，一個開、另一個等它開好就用（🚫 不會各開一條）；關線等手上還在用它的命令都做完（維護者 2026-09-21）。
-type Slot = Arc<RwLock<Option<WbfClient<Channel>>>>;
+/// 一格（/docs/design/daemon/link-pool.md §5）。
+#[derive(Default)]
+struct Slot {
+    /// 開線的那個 client（線的擁有者，丟掉它就關線），`None` ＝ 沒開（Idle）。
+    /// **用**線拿讀鎖，很多命令同時用同一條線；**開、重開、關**拿寫鎖——關線等手上還在用它的命令都做完（維護者 2026-09-21）。
+    line: Arc<RwLock<Option<WbfClient<Channel>>>>,
+    /// 同時發現沒開的命令只有一個去開，其他的在這裡等它開好、再回頭拿讀鎖（🚫 各開一條）。
+    /// 🚫 讓它們排寫鎖：寫鎖要等所有手上有這條線的命令都做完，第二個就變成等第一個**做完**、不是等它**開好**。
+    opening: tokio::sync::Mutex<()>,
+}
 
 /// 一個帳號的五條線。
 pub struct LinkPool {
     user: String,
     events: EventSink,
-    slots: Mutex<HashMap<LinkRole, Slot>>,
+    slots: Mutex<HashMap<LinkRole, Arc<Slot>>>,
 }
 
 /// 開著的線上再發一個 client：同一條 `WsLink` 的分身、帶開線時 hello 的結果（🚫 再 hello，/docs/design/daemon/link-requests.md §7）。
@@ -102,7 +108,7 @@ impl LinkPool {
         &self.user
     }
 
-    fn slot(&self, role: LinkRole) -> Slot {
+    fn slot(&self, role: LinkRole) -> Arc<Slot> {
         self.slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -128,10 +134,15 @@ impl LinkPool {
         Fut: Future<Output = Result<WbfClient<Channel>, CoreError>>,
     {
         let slot = self.slot(role);
-        if let Some(pooled) = pooled_if_alive(slot.clone().read_owned().await) {
+        if let Some(pooled) = pooled_if_alive(slot.line.clone().read_owned().await) {
             return Ok(pooled);
         }
-        let mut writer = slot.write_owned().await;
+        let _opening = slot.opening.lock().await;
+        // 等的時候別人開好了：跟大家一樣拿讀鎖用。
+        if let Some(pooled) = pooled_if_alive(slot.line.clone().read_owned().await) {
+            return Ok(pooled);
+        }
+        let mut writer = slot.line.clone().write_owned().await;
         let found_dead = writer
             .as_ref()
             .is_some_and(|client| client.channel().is_closed());
@@ -147,7 +158,7 @@ impl LinkPool {
             *writer = Some(open().await?);
             self.emit_link(role, LinkState::Opened, None);
         }
-        // 剛開好（或等寫鎖時別人開好了）：降成讀鎖交出去，🚫 握著寫鎖擋住別的命令。
+        // 剛開好：降成讀鎖交出去，🚫 握著寫鎖擋住別的命令。
         pooled_if_alive(writer.downgrade()).ok_or_else(|| {
             CoreError::new(
                 crate::CoreErrorKind::Network,
@@ -165,7 +176,7 @@ impl LinkPool {
     ///     Some(PooledClient)  開著的線上的一個 client
     ///     None                那格沒開、或線已經死了（下次有人 `acquire` 會重開）
     pub async fn reuse(&self, role: LinkRole) -> Option<PooledClient> {
-        pooled_if_alive(self.slot(role).read_owned().await)
+        pooled_if_alive(self.slot(role).line.clone().read_owned().await)
     }
 
     /// 那條線底下的 `WsLink` 分身（/docs/design/daemon/link-requests.md §2）：開著、而且是 WebSocket 才有。同 `reuse`，🚫 不開、🚫 不發事件。
@@ -178,7 +189,7 @@ impl LinkPool {
     ///     None          那格沒開、線死了、正被別人握著（等一下再要）、或不是 WebSocket
     pub async fn find_ws_link(&self, role: LinkRole) -> Option<WsLink> {
         // 那格正在開或關（寫鎖在別人手上）就當這次沒有，🚫 排在它後面等：發送端一秒後再看。
-        let guard = self.slot(role).try_read_owned().ok()?;
+        let guard = self.slot(role).line.clone().try_read_owned().ok()?;
         let client = guard.as_ref()?;
         if client.channel().is_closed() {
             return None;
@@ -204,7 +215,7 @@ impl LinkPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<WbfClient<Channel>, CoreError>>,
     {
-        let is_open = match self.slot(role).try_read_owned() {
+        let is_open = match self.slot(role).line.clone().try_read_owned() {
             Ok(guard) => guard
                 .as_ref()
                 .is_some_and(|client| !client.channel().is_closed()),
@@ -225,7 +236,7 @@ impl LinkPool {
     /// Return:
     ///     usize   關掉了幾條開著的
     pub async fn close_all(&self, reason: &str) -> usize {
-        let slots: Vec<(LinkRole, Slot)> = self
+        let slots: Vec<(LinkRole, Arc<Slot>)> = self
             .slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -233,7 +244,7 @@ impl LinkPool {
             .collect();
         let mut closed = 0;
         for (role, slot) in slots {
-            let mut guard = slot.write().await;
+            let mut guard = slot.line.write().await;
             if let Some(client) = guard.take() {
                 drop(client);
                 closed += 1;
@@ -252,7 +263,7 @@ impl LinkPool {
     ///     bool  true ＝ 本來開著、關了；false ＝ 本來就沒開
     pub async fn close(&self, role: LinkRole, reason: &str) -> bool {
         let slot = self.slot(role);
-        let mut guard = slot.write().await;
+        let mut guard = slot.line.write().await;
         match guard.take() {
             Some(client) => {
                 drop(client);
@@ -266,7 +277,7 @@ impl LinkPool {
     /// Return:
     ///     usize   現在開著的線數（正在被用的也算開著）。給 `daemon.info`
     pub fn open_count(&self) -> usize {
-        let slots: Vec<Slot> = self
+        let slots: Vec<Arc<Slot>> = self
             .slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -275,7 +286,7 @@ impl LinkPool {
             .collect();
         slots
             .iter()
-            .filter(|slot| match slot.try_read() {
+            .filter(|slot| match slot.line.try_read() {
                 Ok(guard) => guard
                     .as_ref()
                     .is_some_and(|client| !client.channel().is_closed()),
@@ -945,6 +956,50 @@ mod tests {
             pings.iter().all(|ping| ping.seq >= 1 << 31),
             "numbers come from the line: {pings:?}"
         );
+    }
+
+    /// 線還沒開時同時到的兩個命令（UI 解鎖後一次送 10 則）：一個開，另一個等它**開好**就用，🚫 等它**做完**、🚫 各開一條。
+    /// 先握住寫鎖，讓兩個都在那格還空著時通過第一次檢查（PR #72 審查 cirno／salvia 指出的那個時刻）。
+    #[tokio::test]
+    async fn commands_arriving_together_on_an_unopened_line_wait_for_it_to_open_not_for_each_other()
+    {
+        let pool = Arc::new(LinkPool::new("@alice:localhost", EventSink::new()));
+        let (client, _peer) = memory_client(wbf_sdk::no_hook());
+        let held_shut = pool.slot(LinkRole::Misc).line.clone().write_owned().await;
+        let (finish_opening, opening_finished) = tokio::sync::oneshot::channel::<()>();
+        let opener = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.acquire(LinkRole::Misc, || async move {
+                    let _ = opening_finished.await;
+                    Ok(client)
+                })
+                .await
+            })
+        };
+        let latecomer = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.acquire(LinkRole::Misc, || async {
+                    Err(CoreError::new(
+                        crate::CoreErrorKind::Usage,
+                        "opened a second line",
+                    ))
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(held_shut);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = finish_opening.send(());
+        let first = opener.await.unwrap().unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), latecomer)
+            .await
+            .expect("the second command waits for the line to open, not for the first to finish")
+            .unwrap()
+            .expect("it uses the line the first one opened");
+        drop((first, second));
     }
 
     /// 關線（登出）等還在用這條線的命令做完才關（維護者 2026-09-21）：讀鎖在命令手上，寫鎖等它。

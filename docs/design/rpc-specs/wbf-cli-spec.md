@@ -184,10 +184,10 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 |
 |---|---|
 | `rooms` | 列出加入的房間：/docs/design/rooms/chat-model.md §2.1 的 `Conversation` 陣列（`id`、`kind`、`name`、`topic`、`encrypted`、`member_count`、`my_power_level`、`can_send_message`、`direct_peer`） |
-| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }`。📌 **wbf 帳號的加密房**：還沒做——CLI 不帶 `room_devices`，回 1100（RPC 那邊怎麼送見 /docs/design/rpc-specs/rpc-spec.md §3.3） |
+| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }`。送之前先拿一次這間房（`sync=both`）：wbf 帳號送文字只看本地記的加不加密（/docs/design/keys/e2ee-rpc.md §7），CLI 沒有常駐的快取。📌 **wbf 帳號的加密房**：還沒做——CLI 不帶 `room_devices`，回 1100（RPC 那邊怎麼送見 /docs/design/rpc-specs/rpc-spec.md §3.3） |
 | `send <room_id> --file <file> [--caption <c>] [--cipher …] [--chunk-size …] [--sha256] [--manifest <out>] [--yes]` | upload（含續傳）後把 /docs/design/media/wbf-client-convention-for-chunk.md §5 的事件送進房間；印 `{ "event_id", "mxc" }`。房間沒 E2EE：**送之前印警告並要求確認**（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）、強制 `cipher: none`（給別的 `--cipher` 就 exit 1：加密區塊的 key 會公開）；`--yes` 跳過確認給腳本用。⚠️ 一般 Matrix 帳號附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）帶不出去，stderr 會印警告；📌 **wbf 帳號**事件走 `Event/Send`、附件宣告成立（`attachment_declared: true`），加密房在上傳之前就拒（1100；/docs/design/daemon/account-session.md §6） |
 | `watch <room_id> tail \| wait <秒> \| once [--since <token>]` | 從 `/sync` 等**新**事件（現在起），來一個立刻印一個，一行一個 JSON。三種模式見 §3.4.2。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印。📌 **wbf 帳號拒絕**（1100）：沒有 `/sync` 的迴圈，新訊息走 daemon 的訂閱＋推播（/docs/design/daemon/account-session.md §6） |
-| `ping` | `Hello` 加 `Ping`，印 server 回的 features 與上限。除錯用 |
+| `ping` | `Ping`，印開線那次 `Hello` server 回的 features 與上限（🚫 再 hello，/docs/design/daemon/link-requests.md §7）。除錯用 |
 
 #### 3.4.1 讀房間
 

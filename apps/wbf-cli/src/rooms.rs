@@ -33,6 +33,9 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
     let core = context.core()?;
     let target = context.target();
     if let Some(text) = &args.text {
+        // 送文字只看本地的加密標記、本地不知道就回 Usage（/docs/design/keys/e2ee-rpc.md §7）；CLI 沒有常駐的快取，所以先拿一次房間。
+        core.conversation(&args.room, SyncMode::Both, &target)
+            .await?;
         let event_id = core
             .send_text(&args.room, text, &wbf_core::SendOptions::default(), &target)
             .await?;

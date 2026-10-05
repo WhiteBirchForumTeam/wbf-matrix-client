@@ -160,6 +160,8 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 --   讀的時候（list_conversations）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
 --   寫的地方兩個：拿房間清單（upsert_conversations），以及收到加密的證據（upsert_events 看到 m.room.encryption 或任何加密事件就設 1，2026-10-05）。
 --   送文字只看這一欄（find_room_encrypted；NULL 或沒有這列就報錯、請 UI 先拿房間，維護者 2026-10-05）；送附件照樣問 server 這一刻的狀態。
+--   ⚠️ 0 也可能是過期的：房間在這台沒在聽的時候開了加密，這一欄要到下次拿房間或收到加密的證據才升上去，中間送的文字是明文（/docs/design/keys/e2ee-rpc.md §7）。
+--   m.room.encryption 要帶非空的 algorithm 才算（room_state::is_encryption_content，跟拿房間同一個判斷）。
 CREATE TABLE rooms (id INTEGER PRIMARY KEY, room_id TEXT NOT NULL UNIQUE, first_seen_at INTEGER NOT NULL,
   encrypted INTEGER CHECK (encrypted IN (0, 1)));
 
