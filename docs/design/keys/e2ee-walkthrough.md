@@ -82,7 +82,8 @@ matrix-sdk 的 `room.send` 在裡面依序做：
 
 **我們**：
 - matrix-sdk 帳號：`MatrixBackend::send_text` → `room.send`，①–⑧ 全在 matrix-sdk 裡，送之前 `sync_once`。
-- wbf 帳號：sdk `encrypt_and_send`：②③⑤ 走橋、⑦ 是原生 `Event/Send`（`0x14/0x02`）帶 `room_version`；② 的「誰髒了」改成房間版本號（§16、/docs/design/keys/e2ee-rpc.md §3）。
+- wbf 帳號：sdk `encrypt_and_send` 只在本機做⑤的「建／換 session、排好要送的」、再加密、⑦ 是原生 `Event/Send`（`0x14/0x02`）帶 `room_version`；
+  ②③與⑤的「送出去」走橋、在後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1），送訊息🚫 等它（維護者 2026-10-05）；② 的「誰髒了」改成房間版本號（§16、/docs/design/keys/e2ee-rpc.md §3）。
   加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5、§6）：附件宣告跟密文同一個 `Event/Send`。還沒做：路徑版送檔進加密房（/docs/design/keys/e2ee-rpc.md §8）。
 
 ## 4. Bob 的 B1 收到並解開 Alice 的訊息
@@ -348,7 +349,7 @@ server 那邊的設計（wbfuwunel 的 /docs/design/wbf-room-device-version.md �
 | 3 | **只重查變了的人的裝置**；哪台裝置新了／沒了由狀態機自己比 | `OlmEngine::mark_users_changed(diff.changed)` → `send_outgoing_requests`（KeysQuery 走橋 `0x17 0x21`）。上游 `OlmMachine` 對每台裝置逐台追蹤，回應進來自己算差 |
 | 4 | **自己驗雜湊**：查回來的金鑰照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 重算 ＝ 清單上那個人的雜湊 → 看到的是同一組 | `OlmEngine::mismatched_device_hashes`（`refresh_room_devices` 裡：對不上再查一次，還不對就 `Protocol` 拒發；`unhashable` 與沒查過的不算） |
 | 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | `OlmEngine::share_room_key(room, users, settings)`（缺 Olm session 先 claim，全走橋）。分享策略明確選 `AllDevices`（`crypto_engine::room_key_share_settings`；交叉簽章做好後換 `IdentityBased`，那是唯一要改的地方） |
-| 6 | **帶房間版本號送出**；對不上 1506 → daemon 自動補齊金鑰、把新的房間狀態放進錯誤的 `data` 回給 UI；重送由 UI 決定（/docs/design/keys/e2ee-rpc.md §3） | `OlmEngine::encrypt_and_send` → `SendOutcome::{Sent, RoomDevicesChanged}`；補金鑰是 `refresh_room_devices(previous)`；重送是再叫一次（同 `txn_id`）。RPC 是 `room.send_text`＋1401 |
+| 6 | **帶房間版本號送出**；對不上 1506 → daemon 自動重拿房間狀態（金鑰交給後台補）、把新的房間狀態放進錯誤的 `data` 回給 UI；重送由 UI 決定（/docs/design/keys/e2ee-rpc.md §3） | `OlmEngine::encrypt_and_send` → `SendOutcome::{Sent, RoomDevicesChanged}`；補金鑰是 `refresh_room_devices(previous)`；重送是再叫一次（同 `txn_id`）。RPC 是 `room.send_text`＋1401 |
 | 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（/docs/design/keys/key-sync.md §1）；成員清單就是第 1 步，什麼時候叫由 UI 決定 |
 | 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta`；daemon 原樣轉成 `devices.changed`，**要不要叫 refresh 是 UI 的事**（/docs/design/keys/e2ee-rpc.md §4）。正確性仍由第 6 步的 1506 守 |
 | 9 | **下線就關掉訂閱**：說出口的退出；斷線 server 也自動退（兩條路都要有） | `WbfClient::device_unsubscribe()`（core `unsubscribe_keys_of`） |
