@@ -6,7 +6,7 @@
 //!   WBF_E2E_PASSWORD_FILE 整檔就是密碼（去掉結尾一個換行）
 //!
 //! 流程：vault.create（**passphrase 模式**）→ account.add（鉤子在背景開五條線）→ account.whoami → server.ping（WS）
-//! → room.list（local 與 both，後者走橋）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
+//! → room.list（local 與 both，後者走橋的 JoinedRooms）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
 //! → account.del。每一步看 code，🚫 不看 msg。
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
@@ -221,7 +221,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let reply = client.call("room.list", json!({})).await;
     assert_eq!(reply["code"], 0, "room.list: {reply}");
     assert!(reply["result"].is_array());
-    // wbf 帳號沒有 matrix-sdk 的 Client（/docs/design/daemon/account-session.md §2）：`sync=both` 走橋（JoinedRooms ＋ 每房 GetState ＋ m.direct）。
+    // wbf 帳號沒有 matrix-sdk 的 Client（/docs/design/daemon/account-session.md §2）：`sync=both` 走橋的 JoinedRooms（只有 id，維護者 2026-10-05）。
     let reply = client.call("room.list", json!({ "sync": "both" })).await;
     assert_eq!(reply["code"], 0, "room.list sync=both: {reply}");
     assert!(reply["result"].is_array());
@@ -351,13 +351,41 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
     assert_eq!(reply["code"], 0, "account.add: {reply}");
     // 訂閱線在背景開（/docs/design/daemon/link-pool.md §3.1）：等五條都開好再送，下面送的 7 則才一定會被推回來（訂閱不補訂閱之前的，那是 UI 叫 `sync.recent` 的事）。
     wait_for_links(&mut client, 5).await;
-    // 送文字只看本地記的加不加密（維護者 2026-10-05）：照 UI 的順序先拿房間。
+    // 照 UI 的順序（維護者 2026-10-05）：列表只有 id，看得到的那間再 `room.get` 拿樣子、寫進本地；送文字只看本地記的加不加密。
     let rooms = client.call("room.list", json!({ "sync": "both" })).await;
     assert_eq!(rooms["code"], 0, "room.list: {rooms}");
+    let listed = rooms["result"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["id"] == room.as_str()))
+        .unwrap_or_else(|| panic!("the joined list has {room}: {rooms}"));
+    assert!(
+        listed["refreshed_at"].is_null() && listed["name"].is_null(),
+        "a fresh data dir has only the id: {listed}"
+    );
+    let fetched = client
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    assert_eq!(fetched["code"], 0, "room.get: {fetched}");
+    let rooms = client.call("room.list", json!({})).await;
+    let listed = rooms["result"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["id"] == room.as_str()))
+        .unwrap_or_else(|| panic!("still listed: {rooms}"));
+    assert!(
+        listed["refreshed_at"].is_u64() && listed["encrypted"] == false,
+        "room.get wrote what it fetched: {listed}"
+    );
 
     // 加密房沒帶 `room_devices` 要被拒（1100）、🚫 送明文：加不加密看的是剛拿到的房間（/docs/design/keys/e2ee-rpc.md §7）。
     // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
     if let Ok(encrypted_room) = std::env::var("WBF_E2E_ENCRYPTED_ROOM") {
+        let fetched = client
+            .call(
+                "room.get",
+                json!({ "room": encrypted_room, "sync": "both" }),
+            )
+            .await;
+        assert_eq!(fetched["code"], 0, "room.get: {fetched}");
         let reply = client
             .call(
                 "room.send_text",

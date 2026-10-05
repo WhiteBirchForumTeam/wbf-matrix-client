@@ -768,11 +768,11 @@ mod tests {
         let target = Target::default();
         let (core_a, dir_a) = signed_in("real-e2ee-alice", alice.clone(), alice_password).await;
         let (core_b, dir_b) = signed_in("real-e2ee-bob", bob.clone(), bob_password.clone()).await;
-        // 送文字只看本地記的加不加密（維護者 2026-10-05）：照 UI 的順序先拿房間。
+        // 送文字只看本地記的加不加密（維護者 2026-10-05）：照 UI 的順序先拿那間房。
         core_a
-            .list_conversations(crate::SyncMode::Both, &target)
+            .conversation(&room, crate::SyncMode::Both, &target)
             .await
-            .expect("alice fetches her rooms");
+            .expect("alice fetches the room");
         let mut seen_b = core_b.subscribe();
 
         let first = core_a

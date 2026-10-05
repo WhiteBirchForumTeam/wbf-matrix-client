@@ -16,7 +16,7 @@ PR #1–#69 合併（main `199a88a`，2026-10-04）；#43（走橋的 GetEvent�
 - **連線**：一個帳號五條線（Misc、Upload、Download、Rooms、Keys），解鎖／登入後 daemon 全開、每 15 秒看一次、死了重開、各自心跳（`/docs/design/daemon/link-pool.md`）；
   很多命令同時用一條線、各等自己的回條、號由線發、逾時看整條線（`/docs/design/daemon/link-requests.md`）；
   收包依會話表交付、順序亂掉不出事（`/docs/design/daemon/ws-receive-dispatch.md`）。
-- **房間**：wbf 帳號的房間清單走橋、送訊息與送檔走 `Event/Send` 並宣告附件；訂閱線收推播寫快取、🚫 不碰水位，水位只由 UI 叫的 `sync.recent` 推（`/docs/design/rooms/room-sync.md`）。
+- **房間**：wbf 帳號的房間列表只問加入了哪些（`JoinedRooms`）、每一間的樣子是 UI 對看得到的房間叫 `room.get`（`/docs/design/rooms/chat-model.md` §2.1）、送訊息與送檔走 `Event/Send` 並宣告附件；訂閱線收推播寫快取、🚫 不碰水位，水位只由 UI 叫的 `sync.recent` 推（`/docs/design/rooms/room-sync.md`）。
   訊息的 edit／redact 照 `/docs/design/messages/edits-and-redactions.md` 存。
 - **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
@@ -87,7 +87,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
   room_sync.rs           **房間那條線的內容**（/docs/design/rooms/room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
   room_crypto.rs         **房間的加解密**（/docs/design/keys/e2ee-rpc.md）：`refresh_room_devices`、加密送出與 1506 之後自動重拿（`wbf_send_encrypted`）、收到時解（`to_incoming`）、補解（`decrypt_stored`）；`RoomDevices`／`SendOptions` 是 DTO
   link_keeper.rs         **「該開的線都開著嗎」的鉤子**（/docs/design/daemon/link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
-  wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：清單走橋（`JoinedRooms`，之後 `m.direct` 與每房 `GetState` 一起送）、`Event/Send` 送文字（加不加密只看本地 `rooms.encrypted`、不知道就報錯；明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
+  wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：列表只問橋的 `JoinedRooms`、單一房間 `GetState` 與 `m.direct` 一起送、`Event/Send` 送文字（加不加密只看本地 `rooms.encrypted`、不知道就報錯；明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（/docs/design/daemon/link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（同一條線上的一個 client；一格是讀寫鎖，很多命令同時用、開／關獨佔）、
                          `Core::client_of(…, role)` 是唯一閘門、`open_link`（session → Bearer 升級 → hello）、`close_links`（登出叫）、`received_hook`（pack → `CoreEvent::Received`）、
                          `open_link_count`（`daemon.info` 的 `links`）。單元測試用記憶體對接的假 opener

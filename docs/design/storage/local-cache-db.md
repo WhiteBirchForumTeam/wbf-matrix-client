@@ -157,8 +157,8 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 --   🚨 只准 0 → 1，不准 1 → 0：Matrix 房間一開加密就關不掉，所以一份過期的「沒加密」（別的帳號舊的、有 bug 的）
 --   不准把它蓋回明文 —— 蓋回去的下一步是送檔用 `cipher: none`，把區塊金鑰公開出去（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 --   ⭐ 放 rooms 不放 room_list：加不加密是房間的性質、對每個帳號都一樣；room_list 是「這個帳號看到的樣子」。
---   讀的時候（list_conversations）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
---   寫的地方兩個：拿房間清單（upsert_conversations），以及收到加密的證據（upsert_events 看到 m.room.encryption 或任何加密事件就設 1，2026-10-05）。
+--   讀的時候（list_room_entries、find_conversation）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
+--   寫的地方兩個：拿一間房的樣子（room.get → upsert_conversations；房間列表只記 id、🚫 寫這一欄），以及收到加密的證據（upsert_events 看到 m.room.encryption 或任何加密事件就設 1，2026-10-05）。
 --   送文字只看這一欄（find_room_encrypted；NULL 或沒有這列就報錯、請 UI 先拿房間，維護者 2026-10-05）；送附件照樣問 server 這一刻的狀態。
 --   ⚠️ 0 也可能是過期的：房間在這台沒在聽的時候開了加密，這一欄要到下次拿房間或收到加密的證據才升上去，中間送的文字是明文（/docs/design/keys/e2ee-rpc.md §7）。
 --   m.room.encryption 要帶非空的 algorithm 才算（room_state::is_encryption_content，跟拿房間同一個判斷）。
@@ -196,12 +196,18 @@ CREATE TABLE events_synced_log (
   PRIMARY KEY (event, user)) WITHOUT ROWID;
 CREATE INDEX events_synced_log_by_user ON events_synced_log (user, event);
 
--- 房間清單，一人一列。conversation_json 是這個 user 看到的 Conversation（power level、can_send 都是 per user）；
+-- 房間列表，一人一列。conversation_json 是這個 user 看到的 Conversation（power level、can_send 都是 per user）；
 -- 名稱、加密與否、人數都在 JSON 裡，不另開欄。
+-- 兩個寫入點（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1）：
+--   room.list（record_joined_rooms）：只拿「加入了哪些」。新的加一列（conversation_json／refreshed_at 是 NULL ＝ 還沒拿過）；
+--     已經有的🚫 覆寫它的樣子；名單裡沒有的標 joined = 0、🚫 刪列（回來了再標回 1）。
+--   room.get（upsert_conversations）：一間的樣子整份蓋上去、記 refreshed_at、joined = 1。
+-- room.list 讀 joined = 1 的，本地知道多少給多少（RoomListEntry，不知道的是 null）；room.get sync=local 退出的也給（最後看到的樣子）。
 CREATE TABLE room_list (
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
   user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  conversation_json TEXT NOT NULL, refreshed_at INTEGER NOT NULL,
+  conversation_json TEXT, refreshed_at INTEGER,
+  joined INTEGER NOT NULL DEFAULT 1 CHECK (joined IN (0, 1)),
   PRIMARY KEY (user, room)) WITHOUT ROWID;
 
 -- 每個帳號的 Recent 水位線（cg_seq 是 per user 的：server 依 user 的可見範圍算）。
@@ -264,7 +270,7 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - **威脅模型的邊界（維護者 2026-09-07 定）**：混存的前提是**同一台機器上的多個帳號屬於同一個人**（它們本來就共用一把 `local.key`）。帳號 A 解開的明文，帳號 B 只要 server 也給過他那則（有 synced_log 列），就讀得到明文，即使 B 的裝置沒有 Megolm 金鑰——這是刻意的（快、不重複存），🚫 不是給不同人共用一台機器的設計。要那種隔離，用不同的 `--data-dir`（不同的 `local.key`）。
 - **快取綁帳號的 home server**：`Cache` 的身份是 `session.sealed` 裡的 server，不吃 `--server` 覆蓋；`--server` 臨時指到別家時事件仍寫進原 server 的 `cache.db`。
 - **洞**：有 `r_seq` 的 room，「快取裡有哪些」就是 `r_seq` 的集合，缺的就是洞，不存 token。沒有 `r_seq` 的 room 只快取最新一段連續視窗。
-- **開 app 的同步**（UI 的順序，維護者定）：先刷房間清單（`room_list`）→ `Event/Recent` 帶這個帳號的 `cg_seq` 一窗一窗拉（每個 `Batch` 寫一次 DB：事件進 `events` 加 `events_synced_log`），Batch 說 `more: true` 就帶 `before = 最後的 ls` 再一窗；追平（`more: false`，或空窗）才把**第一窗第一個 Batch 的 `fs`** 寫回 `sync_state`。🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`，中途斷線不推水位（wbfuwunel 的 pack-pipeline.md §6.4）→ 點進房間才刷該房歷史（`/messages`）。
+- **開 app 的同步**（UI 的順序，維護者定）：先刷房間列表（`room_list`，只有加入了哪些；看得到的房間 UI 再一間一間 `room.get`）→ `Event/Recent` 帶這個帳號的 `cg_seq` 一窗一窗拉（每個 `Batch` 寫一次 DB：事件進 `events` 加 `events_synced_log`），Batch 說 `more: true` 就帶 `before = 最後的 ls` 再一窗；追平（`more: false`，或空窗）才把**第一窗第一個 Batch 的 `fs`** 寫回 `sync_state`。🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`，中途斷線不推水位（wbfuwunel 的 pack-pipeline.md §6.4）→ 點進房間才刷該房歷史（`/messages`）。
 
 ### 5.1 實作備註
 

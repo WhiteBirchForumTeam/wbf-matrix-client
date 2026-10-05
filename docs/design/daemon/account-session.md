@@ -78,7 +78,8 @@
 
 | 功能 | 一般 Matrix（走 Client） | wbf 帳號（不建 Client） |
 |---|---|---|
-| `room.list`／`room.get` 的 `server`／`both` | Client 的 /sync | 橋 `JoinedRooms`（0x13/0x28）＋`m.direct`（`GetAccountData` 0x11/0x25）＋每房 `GetState`（0x14/0x21）組 `Conversation`，`both` 寫進 `room_list`；`local` 不變。`JoinedRooms` 回來之後，`m.direct` 與每房的 `GetState` 一起送（同一條線、各等各的回條，/docs/design/daemon/link-requests.md §2.1），來回是兩輪；一次送出去的請求沒有上限；狀態超過 2 MiB 的房 server 回 `TooLarge`，整個呼叫失敗（講出來比少列一間好） |
+| `room.list` 的 `server`／`both` | Client 的 /sync | 只問橋 `JoinedRooms`（0x13/0x28），一個請求；`both` 把差異寫進 `room_list`（新的只有 id、拿過的🚫 覆寫、退出的標 `joined = 0`）；`local` 不變。每一間的樣子🚫 在這裡問，是 UI 對看得到的房間叫 `room.get`（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1） |
+| `room.get` 的 `server`／`both` | Client 的 /sync | 這一間的 `GetState`（0x14/0x21）＋`m.direct`（`GetAccountData` 0x11/0x25）一起送、組 `Conversation`，`both` 寫進 `room_list`。狀態超過 2 MiB 的房 server 回 `TooLarge`，原樣回給 UI |
 | `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機）；加密與否**只看本地的 `rooms.encrypted`**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §7）：本地不知道（沒拿過這間房）就是 1100、請 UI 先拿房間，🚫 當成明文、🚫 為它上網；**加密房**：先分金鑰、加密、帶 UI 給的 `room_devices.room_version` 送（/docs/design/keys/e2ee-rpc.md §3）；沒帶 `room_devices` 是 1100 |
 | `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（/docs/design/media/wbf-client-convention-for-chunk.md §5.2 的宣告，`attachment_declared: true`）；加密房在**上傳之前**就拒。兩邊的 content 同一份（`event_json::file_message_content`） |
 | `room.history` 錨點不在本地 | `/context` | 拒絕（1100）；`sync=both` 先把錨點寫進快取就翻得下去。還沒做：改用 wbfuwunel #64 的 `before_event_id` |
@@ -96,5 +97,5 @@
   路由（session 指向沒人聽的位址）：`room.list`／`get`／`send_text` 到開線才失敗（`Network`，🚫 不是「log in again」），`backup.status`／`watch`／錨點不在本地的 `history` 是 `Usage`、登出閘門是 `HistoryWouldBeLost`；
   `room_state.rs`：Group／Direct（要 m.direct 且兩人）／Channel（門檻 100）、v12 建房者無限、字串型 power level、沒有 algorithm 的 encryption 不算加密、名字的後備順序；`file_message_content` 的形狀；
   登入的 rollback：迷你 HTTP 回的 `user_id` 跟打的不同、而那個正規目錄已經存在 → 登入回 `Usage`，迷你 HTTP 要收到第二個請求 `POST /logout`（token 撤了），打字算出來的目錄沒有 session 也沒有 `m/`；
-  真 server（daemon `real_server`）：`room.list sync=both` 走橋、`room.send_text` 走 `Event/Send`（照 UI 的順序先 `room.list` 把房間記進本地）、加密房沒帶 `room_devices` 的 `send_text` 1100（核對錯誤裡有 `room_devices`、🚫 是「不知道這間房」；選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁走 wbf（錨點由推播寫進本地；錨點不在本地的拒答改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
+  真 server（daemon `real_server`）：`room.list sync=both` 走橋、列表只有 id、`room.get` 之後列表就帶著那間的樣子、`room.send_text` 走 `Event/Send`（照 UI 的順序先 `room.get` 把房間記進本地）、加密房沒帶 `room_devices` 的 `send_text` 1100（核對錯誤裡有 `room_devices`、🚫 是「不知道這間房」；選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁走 wbf（錨點由推播寫進本地；錨點不在本地的拒答改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
   ⚠️ 沒測的：`send_file` 走 `Event/Send`（沒有 daemon 的 e2e）、封 session 失敗那條 rollback（製造不出來：沒有可以讓 `seal_session` 失敗的接縫）、一般 Matrix 那條路的登入（沒有一台不講 wbf 的 server；它的程式沒動）。

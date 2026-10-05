@@ -9,7 +9,8 @@ use wbf_sdk::channel::{Channel, WsChannel};
 use wbf_sdk::client::WbfClient;
 use wbf_sdk::login::{Session, SessionBackend};
 use wbf_sdk::protocol::{
-    BridgedEndpoint, BRIDGE_KEYS_CLAIM, BRIDGE_KEYS_QUERY, BRIDGE_KEYS_UPLOAD, BRIDGE_MEMBERS,
+    BridgedEndpoint, BRIDGE_ACCOUNT_DATA, BRIDGE_JOINED_ROOMS, BRIDGE_KEYS_CLAIM,
+    BRIDGE_KEYS_QUERY, BRIDGE_KEYS_UPLOAD, BRIDGE_MEMBERS, BRIDGE_ROOM_STATE,
     BRIDGE_SEND_TO_DEVICE, BRIDGE_STATE_EVENT,
 };
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
@@ -21,7 +22,7 @@ use crate::accounts::AccountDir;
 use crate::link_pool::LinkRole;
 use crate::{Core, CoreEvent};
 
-/// 本地記住一間房（`room.list` 拿過的樣子）：送文字只看本地記的「加不加密」（wbf_rooms.rs），測試要先「拿過房間」。
+/// 本地記住一間房（`room.get` 拿過的樣子）：送文字只看本地記的「加不加密」（wbf_rooms.rs），測試要先「拿過房間」。
 pub(crate) async fn remember_room(core: &Core, account: &AccountDir, room: &str, encrypted: bool) {
     let (cache, me) = core.server_cache_and_me(account).unwrap();
     let conversation = wbf_sdk::chat::Conversation {
@@ -44,6 +45,10 @@ pub(crate) async fn remember_room(core: &Core, account: &AccountDir, room: &str,
 pub(crate) const DEAD: &str = "http://127.0.0.1:1";
 pub(crate) const ME: &str = "@a:localhost";
 pub(crate) const ROOM: &str = "!r:localhost";
+/// 假 server 的 `JoinedRooms` 回 `ROOM` 跟這一間。
+pub(crate) const OTHER_ROOM: &str = "!other:localhost";
+/// 假 server 的 `GetState` 給的房名。
+pub(crate) const FAKE_ROOM_NAME: &str = "fake room";
 
 pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("wbf-core-roomsync-{name}-{}", std::process::id()));
@@ -814,6 +819,23 @@ fn bridged_reply(
         } else {
             rejected("NotFound", 1501, 404, "M_NOT_FOUND")
         }
+    } else if is(BRIDGE_JOINED_ROOMS) {
+        ok(json!({ "joined_rooms": [ROOM, OTHER_ROOM] }))
+    } else if is(BRIDGE_ROOM_STATE) {
+        let mut state = vec![
+            json!({ "type": "m.room.create", "state_key": "", "sender": ME, "content": { "room_version": "10" } }),
+            json!({ "type": "m.room.member", "state_key": ME, "sender": ME, "content": { "membership": "join" } }),
+            json!({ "type": "m.room.name", "state_key": "", "sender": ME, "content": { "name": FAKE_ROOM_NAME } }),
+        ];
+        if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
+            state.push(
+                json!({ "type": "m.room.encryption", "state_key": "", "sender": ME,
+                               "content": { "algorithm": "m.megolm.v1.aes-sha2" } }),
+            );
+        }
+        ok(Value::Array(state))
+    } else if is(BRIDGE_ACCOUNT_DATA) {
+        rejected("NotFound", 1501, 404, "M_NOT_FOUND")
     } else if is(BRIDGE_KEYS_UPLOAD) {
         ok(json!({ "one_time_key_counts": { "signed_curve25519": 50 } }))
     } else if is(BRIDGE_KEYS_QUERY) {

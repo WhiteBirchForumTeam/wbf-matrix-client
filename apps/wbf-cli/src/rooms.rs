@@ -20,10 +20,10 @@ use crate::{SendArgs, WatchArgs};
 pub async fn rooms_command(context: &Context) -> Result<(), CoreError> {
     context.warn_if_backups_are_off();
     // CLI 沒有常駐的上游會話可以依賴，所以它一律 `Both`：打上游、寫快取、回本地讀的那份。
-    // ⭐ 這跟它以前的行為一模一樣（以前就是「打上游＋寫穿快取」），🚫 不是新行為。
+    // wbf 帳號的列表只問加入了哪些房，沒拿過的那幾間除了 id 都是 null（/docs/design/rooms/chat-model.md §2.1）。
     let conversations = context
         .core()?
-        .list_conversations(SyncMode::Both, &context.target())
+        .list_rooms(SyncMode::Both, &context.target())
         .await?;
     print_value(&conversations)
 }

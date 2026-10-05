@@ -70,8 +70,9 @@
 
 - **從池拿 client**（`LinkPool::acquire`／`reuse`）：那一格是讀寫鎖，用線拿讀鎖、開／重開／關拿寫鎖（/docs/design/daemon/link-pool.md §5）。拿到的是同一條 `WsLink` 的分身、帶開線那次的 hello，
   很多命令同時各拿一個。UI 一次送 10 則訊息，就是 10 個請求先後送出、10 個回條各自回來（發發發…收收收…）。
-- **一個命令裡的一串**（後一個要前一個的結果，例：先問加入了哪些房、再問每一房）還是一步等一步，但等的時候不擋別人；
-  互不相干的查詢一起送、一起收（`wbf_rooms.rs` 的房間清單：`m.direct` 與每一房的狀態）。
+- **一個命令裡的一串**（後一個要前一個的結果，例：`room.refresh_devices` 先拿成員、再查變了的人的金鑰）還是一步等一步，但等的時候不擋別人；
+  互不相干的查詢一起送、一起收（`wbf_rooms.rs` 的 `room.get`：那一間的狀態與 `m.direct`）。
+  ⚠️ 🚫 一個命令替 UI 做完一整串（例：列表順便拿每一間的樣子）：UI 要什麼叫什麼，daemon 照做（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1）。
 - **線斷了**：正在等的命令拿到 `Network`，原樣回給 UI；🚫 留在 queue 裡等線重開再續送（/docs/design/daemon/link-pool.md §3：命令做到一半死了不重做、要不要重來是呼叫端的事）。
   這是跟 2026-10-02 寫下的版本（`Misc` 也放一個 `RequestLine`、線斷了請求留在 queue）不一樣的地方，維護者 2026-10-05 定的。
 - **逾時**：`WsChannel` 的一問一答走 `WsLink::request_until_silent`，整條線 `LINE_SILENCE`（60 秒）沒有任何回應（心跳的 `Pong` 🚫 算）才回 `Timeout`（§4）。

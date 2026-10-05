@@ -36,7 +36,7 @@ pub(super) async fn room_list(handle: &Handle, core: &Core, params: Value) -> Ou
     }
     let params: Params = parse_params(params)?;
     to_result(
-        core.list_conversations(params.sync, &handle.target(&params.target))
+        core.list_rooms(params.sync, &handle.target(&params.target))
             .await?,
     )
 }

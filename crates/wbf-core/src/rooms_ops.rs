@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use wbf_sdk::chat::{ChatBackend, Conversation, Message, MessageKind};
+use wbf_sdk::chat::{ChatBackend, Conversation, Message, MessageKind, RoomListEntry};
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::{Cipher, EventPage, IncomingEvent};
 
@@ -86,46 +86,71 @@ pub enum SyncMode {
 }
 
 impl Core {
-    /// 加入的房間。`sync` 決定要本地的還是上游的（/docs/design/daemon/daemon-runtime.md §3.1）。
-    pub async fn list_conversations(
+    /// 房間列表：加入了哪些房，每一間本地知道多少給多少（/docs/design/rooms/chat-model.md §2.1 的 `RoomListEntry`）。
+    /// wbf 帳號上網只問 `JoinedRooms`（一個請求），每一間的樣子是 UI 對看得到的房間叫 [`Core::conversation`] 拿的（維護者 2026-10-05）。
+    ///
+    /// Return:
+    ///     Ok(Vec<RoomListEntry>)   `Local`／`Both`：本地讀的（`Both` 先把加入名單的差異寫進去）；
+    ///                              `Server`：上游說的、🚫 寫庫（wbf 帳號只有 id）
+    pub async fn list_rooms(
         &self,
         sync: SyncMode,
         target: &Target,
-    ) -> Result<Vec<Conversation>, CoreError> {
+    ) -> Result<Vec<RoomListEntry>, CoreError> {
         let account = self.account_or_current(target)?;
         if sync == SyncMode::Local {
             let (cache, me) = self.server_cache_and_me(&account)?;
-            let rows = cache.read().await.list_conversations(&me)?;
-            return Ok(rows);
+            let entries = cache.read().await.list_room_entries(&me)?;
+            return Ok(entries);
         }
-        // wbf 帳號沒有 Client：走橋（`wbf_rooms.rs`）。兩條路回的 `Conversation` 同一套規則（room_state.rs 的測試釘著）。
-        let conversations = if self.is_wbf_account(&account)? {
-            self.wbf_conversations(&account).await?
+        // wbf 帳號只拿名單；一般 Matrix 帳號的 Client 一次 /sync 就有每一間的樣子，拿到了就一起記。
+        let (joined, fetched) = if self.is_wbf_account(&account)? {
+            (self.wbf_joined_rooms(&account).await?, Vec::new())
         } else {
-            self.synced_backend_of(&account, target.server_backup)
+            let conversations = self
+                .synced_backend_of(&account, target.server_backup)
                 .await?
                 .conversations()
-                .await?
+                .await?;
+            let joined = conversations
+                .iter()
+                .map(|conversation| conversation.id.clone())
+                .collect();
+            (joined, conversations)
         };
         if sync == SyncMode::Server {
             // 🚫 看一眼不寫庫。
-            return Ok(conversations);
+            let mut entries: Vec<RoomListEntry> = joined
+                .iter()
+                .map(|room| RoomListEntry::unknown(room))
+                .collect();
+            for conversation in fetched {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == conversation.id) {
+                    *entry = RoomListEntry::from_conversation(conversation, None);
+                }
+            }
+            return Ok(entries);
         }
         // `Both`：寫進去**等它落地**，再從本地讀一次回傳 —— 這樣回的形狀跟 `Local` 一樣。
         let (cache, me) = self.server_cache_and_me(&account)?;
-        let rows = conversations;
         let me_here = me.clone();
         cache
-            .run(move |cache| cache.upsert_conversations(&me_here, &rows).map(|_| ()))
+            .run(move |cache| {
+                cache.upsert_conversations(&me_here, &fetched)?;
+                cache.record_joined_rooms(&me_here, &joined)
+            })
             .await?;
-        let rows = cache.read().await.list_conversations(&me)?;
-        Ok(rows)
+        let entries = cache.read().await.list_room_entries(&me)?;
+        Ok(entries)
     }
 
-    /// 一個房間本身（前端要問「加密了沒」就用它）。`sync` 同 [`Core::list_conversations`]。
+    /// 一個房間本身（UI 點進去、或列表上看得到卻沒名字的那幾間；前端要問「加密了沒」也用它）。`sync` 同 [`Core::list_rooms`]。
+    /// 上網只問**這一間**（🚫 為了一間把整份列表重拿）。
     ///
-    /// 📎 本地那條是從房間列表裡挑 —— `cache.db` 存的就是整個 `Conversation`（`room_list` 表），
-    /// 🚫 沒有另一張「單一房間」的表。
+    /// Return:
+    ///     Ok(Conversation)
+    ///     Err(NoSuchAccount)   `Local`：本地沒拿過這間；`Both`：拿回來了卻讀不到（寫庫失敗）
+    ///     Err(Server)          上游拒（不在房裡是 `Forbidden`）
     pub async fn conversation(
         &self,
         room: &str,
@@ -133,35 +158,34 @@ impl Core {
         target: &Target,
     ) -> Result<Conversation, CoreError> {
         let account = self.account_or_current(target)?;
-        if sync != SyncMode::Server {
-            if sync == SyncMode::Both {
-                // 先讓 `Both` 去上游更新一輪（它自己會寫進去）。
-                self.list_conversations(SyncMode::Both, target).await?;
+        if sync != SyncMode::Local {
+            let fetched = if self.is_wbf_account(&account)? {
+                self.wbf_conversation(&account, room).await?
+            } else {
+                self.synced_backend_of(&account, target.server_backup)
+                    .await?
+                    .conversation(room)
+                    .await?
+            };
+            if sync == SyncMode::Server {
+                return Ok(fetched);
             }
             let (cache, me) = self.server_cache_and_me(&account)?;
-            let found = cache
-                .read()
-                .await
-                .list_conversations(&me)?
-                .into_iter()
-                .find(|conversation| conversation.id == room);
-            return found.ok_or_else(|| {
-                // ⚠️ 兩種「找不到」講的不是同一件事，🚫 不要都叫人去 `sync=both`
-                //（`Both` 走到這裡，代表上游剛剛才問過）（PR #32 審查 salvia🟡1）。
-                let why = match sync {
-                    SyncMode::Both => "the homeserver does not list it either",
-                    _ => "it is not in the local cache; try sync=both",
-                };
-                CoreError::new(CoreErrorKind::NoSuchAccount, format!("{room}: {why}"))
-            });
+            cache
+                .run(move |cache| cache.upsert_conversations(&me, &[fetched]))
+                .await?;
         }
-        if self.is_wbf_account(&account)? {
-            return self.wbf_conversation(&account, room).await;
-        }
-        let backend = self
-            .synced_backend_of(&account, target.server_backup)
-            .await?;
-        Ok(backend.conversation(room).await?)
+        let (cache, me) = self.server_cache_and_me(&account)?;
+        let found = cache.read().await.find_conversation(&me, room)?;
+        found.ok_or_else(|| {
+            // ⚠️ 兩種「找不到」講的不是同一件事，🚫 不要都叫人去 `sync=both`
+            //（`Both` 走到這裡，代表上游剛剛才給過）（PR #32 審查 salvia🟡1）。
+            let why = match sync {
+                SyncMode::Both => "fetched it but could not read it back from the local cache",
+                _ => "it has not been fetched here yet; try sync=both",
+            };
+            CoreError::new(CoreErrorKind::NoSuchAccount, format!("{room}: {why}"))
+        })
     }
 
     /// 送一則文字。
