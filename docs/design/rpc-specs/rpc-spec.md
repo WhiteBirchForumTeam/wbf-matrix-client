@@ -115,6 +115,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
   🚫 不是連上了之後某個 method 突然壞掉。
 - 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2, 1]`）→ 談成 `2`，前端自己降級。
 - 現在 daemon 只有 `[2]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。
+  **版本號只寫在一個地方**：同檔的 `CURRENT_PROTOCOL`，支援表與測試送的 `hello` 都從它拿；升版就改它（維護者 2026-10-05）。
   版本紀錄：**2**（2026-10-05，維護者定）`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房（§3.3，/docs/design/rooms/chat-model.md §2.1），
   舊前端的 `room.list` 解不了、送文字一律 1100，所以 **1 從表裡拿掉**（只會講 1 的前端 `hello` 就拿到 `PROTOCOL_MISMATCH`）。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
 

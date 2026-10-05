@@ -22,6 +22,7 @@ use wbf_daemon::connection::EncryptionPolicy;
 use wbf_daemon::data_plane::{AccessKeys, DataServer};
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
+use wbf_daemon::protocol::CURRENT_PROTOCOL;
 use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
 
@@ -123,7 +124,7 @@ impl Client {
         let hello = client
             .call(
                 "hello",
-                json!({ "protocols": [2], "client": "wbf-matrix-rpc-cli e2e" }),
+                json!({ "protocols": [CURRENT_PROTOCOL], "client": "wbf-matrix-rpc-cli e2e" }),
             )
             .await;
         assert_eq!(hello["code"], 0, "{hello}");

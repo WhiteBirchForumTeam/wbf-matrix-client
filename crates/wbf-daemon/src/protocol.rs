@@ -1,9 +1,13 @@
 //! `hello` 的兩關（/docs/design/rpc-specs/rpc-spec.md §1.3）：client 名字、protocol 協商表。純函數。
 
+/// 本機 RPC 協議現在的版本。**升版只改這一個數**：支援表、測試送的 `hello` 都從這裡拿（維護者 2026-10-05）。
+/// 版本紀錄在 /docs/design/rpc-specs/rpc-spec.md §1.3。2：`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房。
+pub const CURRENT_PROTOCOL: u32 = 2;
+
 /// daemon 會講的 protocol 版本。**新的在前**。
 /// ⚠️ 從這裡拿掉一個版本＝breaking：舊前端一連上來就被拒絕。這是刻意的（/docs/design/rpc-specs/rpc-spec.md §1.3）。
-/// 2：`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房（維護者 2026-10-05）；1 拿掉了。
-pub const SUPPORTED_PROTOCOLS: &[u32] = &[2];
+/// 升版但舊版還服務得了（不是 breaking）就在這裡留著舊的（例：升到 3 而 2 還能用 → `&[CURRENT_PROTOCOL, 2]`）。
+pub const SUPPORTED_PROTOCOLS: &[u32] = &[CURRENT_PROTOCOL];
 
 /// client 正式名稱的前綴。不是這個開頭的一律拒絕。
 pub const CLIENT_NAME_PREFIX: &str = "wbf-matrix";
@@ -37,12 +41,16 @@ mod tests {
 
     #[test]
     fn negotiation_picks_the_largest_common_version_or_nothing() {
-        assert_eq!(negotiate(&[2]), Some(2));
+        let newer = CURRENT_PROTOCOL + 1;
+        assert_eq!(negotiate(&[CURRENT_PROTOCOL]), Some(CURRENT_PROTOCOL));
         // 前端比 daemon 新：談成 daemon 會的那個，前端自己降級。
-        assert_eq!(negotiate(&[3, 2, 1]), Some(2));
-        assert_eq!(negotiate(&[3]), None);
+        assert_eq!(
+            negotiate(&[newer, CURRENT_PROTOCOL]),
+            Some(CURRENT_PROTOCOL)
+        );
+        assert_eq!(negotiate(&[newer]), None);
         assert_eq!(negotiate(&[]), None);
-        // 1 拿掉了（`room.list` 的形狀換了）：只會講 1 的舊前端一連上來就被拒。
+        // 1 拿掉了（2026-10-05，`room.list` 的形狀換了）：只會講 1 的舊前端一連上來就被拒。
         assert_eq!(negotiate(&[1]), None);
     }
 
