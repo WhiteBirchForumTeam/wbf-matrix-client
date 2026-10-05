@@ -256,6 +256,8 @@ pub(crate) struct FakeServer {
     pub(crate) corrupt_reads: Arc<std::sync::atomic::AtomicU32>,
     /// 下一個 `Download/Read` 改回這個錯誤（`(名字, code_id)`，例 `("Internal", 1901)`），回一次就清掉：測錯誤碼分流。
     pub(crate) fail_next_read: Arc<Mutex<Option<(&'static str, u64)>>>,
+    /// 接下來幾個走橋的呼叫回 `Control/Error`（仍記在 `bridge_calls`）：測「後台送金鑰失敗就隔一段時間重試」。
+    pub(crate) fail_bridged: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// `read_permits` 一開始有幾個（測試要卡住就 `acquire_many(READ_PERMITS)` 收走）。
@@ -326,6 +328,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let corrupt_t = corrupt_reads.clone();
     let fail_next_read: Arc<Mutex<Option<(&'static str, u64)>>> = Arc::new(Mutex::new(None));
     let fail_read_t = fail_next_read.clone();
+    let fail_bridged = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let fail_bridged_t = fail_bridged.clone();
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -350,7 +354,20 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
             };
             if pack.flags & flags::IS_BRIDGED != 0 {
                 bridge_t.lock().unwrap().push((pack.kind, pack.subtype));
-                let reply = bridged_reply(&pack, &members_t, &encrypted_t);
+                let fail = fail_bridged_t
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_ok();
+                let reply = if fail {
+                    let mut error = injected_error(pack.id, pack.seq);
+                    error.flags |= flags::IS_BRIDGED;
+                    error
+                } else {
+                    bridged_reply(&pack, &members_t, &encrypted_t)
+                };
                 peer.sink.send(reply.encode().unwrap()).await.unwrap();
                 continue;
             }
@@ -639,6 +656,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         read_permits,
         corrupt_reads,
         fail_next_read,
+        fail_bridged,
     }
 }
 

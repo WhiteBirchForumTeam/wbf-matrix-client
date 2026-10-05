@@ -2,8 +2,9 @@
 //! 收到時解密、金鑰到了補解。
 //!
 //! - **狀態放 UI**：房間版本號與每個成員的裝置版本號（[`RoomDevices`]）由 UI 存，送出時帶回來；daemon 🚫 不存每房的快照。
-//! - **金鑰的分發由 daemon 自動做**：送出前一律先分（sdk `encrypt_and_send` 裡），第一次、該換、多了裝置三種都涵蓋。
-//! - **被 1506 擋**：daemon 自動 refresh（重拿成員、只重查變了的人、補金鑰），把新的 [`RoomDevices`] 放進錯誤的 `data` 一起回；
+//! - **送訊息🚫 綁發金鑰**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §3）：送出只在本機備好房間金鑰（sdk `encrypt_and_send` 裡），
+//!   送完、refresh 完把這個房交給後台（`key_share.rs`）送金鑰，🚫 等它。
+//! - **被 1506 擋**：daemon 自動 refresh（重拿成員、只重查變了的人、金鑰交給後台），把新的 [`RoomDevices`] 放進錯誤的 `data` 一起回；
 //!   🚫 不自動重送（重送是 UI 的事，用同一個 `txn_id`）。
 //! - **解密**：收到時有金鑰就解，密文明文一起存；沒金鑰只存密文。金鑰到了，找出那把 session 還沒解的立刻解、補存明文，
 //!   並照收訊息那條路發 `room.message`（同 `event_id`，UI 當更新）。
@@ -36,12 +37,12 @@ pub struct RoomDevices {
     pub members: BTreeMap<String, String>,
 }
 
-/// `room.refresh_devices` 的結果，也是 1506 那則錯誤的 `data`：這一刻的房間狀態、這輪補發了幾個 to-device。
+/// `room.refresh_devices` 的結果，也是 1506 那則錯誤的 `data`：這一刻的房間狀態、這輪排給後台送的 to-device 數。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RoomDevicesRefresh {
     #[serde(flatten)]
     pub devices: RoomDevices,
-    /// 這輪發了幾個 to-device（房間金鑰補給新裝置）；0 ＝ 每台裝置都已經有了
+    /// 這輪在本機排好、交給後台送的 to-device 數（維護者 2026-10-05：欄位名留著、意思改了，🚫 代表已經送到）
     pub shared: usize,
 }
 
@@ -102,13 +103,13 @@ impl RoomDevicesRefresh {
     fn from_refresh(refresh: &RoomRefresh) -> RoomDevicesRefresh {
         RoomDevicesRefresh {
             devices: RoomDevices::from_versions(&refresh.versions),
-            shared: refresh.shared_to_device_requests,
+            shared: refresh.queued_to_device_requests,
         }
     }
 }
 
 impl Core {
-    /// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。
+    /// 確認這個房現在的人與裝置、把房間金鑰交給後台補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）；🚫 等後台送完。
     ///
     /// Args:
     ///     room: example: "!r:localhost"
@@ -138,11 +139,19 @@ impl Core {
         let refresh = engine
             .refresh_room_devices(&mut client, room, previous.as_ref())
             .await?;
+        drop(client);
+        self.queue_room_key_share(
+            &account,
+            room,
+            refresh.versions.members.keys().cloned().collect(),
+        )
+        .await;
         Ok(RoomDevicesRefresh::from_refresh(&refresh))
     }
 
-    /// wbf 帳號在加密房送一則事件：先分金鑰、加密、帶 UI 給的房間版本號送（sdk `encrypt_and_send`）。
-    /// 被 1506 擋 → 自動 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人）→ 回 `RoomDevicesChanged`，`data` 是新狀態加 `txn_id`。
+    /// wbf 帳號在加密房送一則事件：在本機備好房間金鑰、加密、帶 UI 給的房間版本號送（sdk `encrypt_and_send`，🚫 上網分金鑰），
+    /// 送完把這個房交給後台送金鑰（/docs/design/keys/e2ee-rpc.md §3.1）。
+    /// 被 1506 擋 → 自動 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人）→ 金鑰交給後台 → 回 `RoomDevicesChanged`，`data` 是新狀態加 `txn_id`。
     ///
     /// Args:
     ///     message: 明文的事件；`attachments` 跟密文同一個 `Event/Send` 宣告, example: OutgoingRoomEvent { event_type: "m.room.message".into(), content: json!({"msgtype":"m.text","body":"hi"}), txn_id: "wbf-1727600000-3".into(), attachments: vec![] }
@@ -175,23 +184,34 @@ impl Core {
             .encrypt_and_send(&mut client, room, devices.room_version, &members, &message)
             .await?;
         let (current_room_version, blocked) = match outcome {
-            SendOutcome::Sent { event_id } => return Ok(event_id),
+            SendOutcome::Sent { event_id } => {
+                drop(client);
+                self.queue_room_key_share(account, room, members).await;
+                return Ok(event_id);
+            }
             SendOutcome::RoomDevicesChanged {
                 current_room_version,
                 error,
             } => (current_room_version, error),
         };
-        // 被擋了：daemon 自動做下一步（重拿房間狀態、補金鑰），連同錯誤一起回；🚫 不自動重送。
-        match engine
+        // 被擋了：daemon 自動做下一步（重拿房間狀態、金鑰交給後台），連同錯誤一起回；🚫 不自動重送。
+        let refreshed = engine
             .refresh_room_devices(&mut client, room, Some(&previous))
-            .await
-        {
+            .await;
+        drop(client);
+        match refreshed {
             Ok(refresh) => {
+                self.queue_room_key_share(
+                    account,
+                    room,
+                    refresh.versions.members.keys().cloned().collect(),
+                )
+                .await;
                 let fresh = RoomDevicesRefresh::from_refresh(&refresh);
                 Err(CoreError::new(
                     CoreErrorKind::RoomDevicesChanged,
                     format!(
-                        "{room}: {blocked}; the room was fetched again and its keys were shared (room_version {}): \
+                        "{room}: {blocked}; the room was fetched again and its keys were queued for the new devices (room_version {}): \
                          send again with the room_devices in data and the same txn_id",
                         fresh.devices.room_version
                     ),

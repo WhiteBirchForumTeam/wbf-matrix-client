@@ -1586,11 +1586,13 @@ mod with_crypto_engine {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 從沒在這個房分過金鑰（沒 refresh 過、daemon 剛重開、UI 手上已經有號碼）就直接送：`encrypt_and_send` 自己先分金鑰再加密，
-    /// 🚫 不會撞上游「沒有 outbound session」的 panic（維護者 2026-09-29：金鑰的分發由 daemon 自動做）。
+    /// 從沒在這個房分過金鑰（沒 refresh 過、daemon 剛重開、UI 手上已經有號碼）就直接送：`encrypt_and_send` 在本機建房間金鑰再加密，
+    /// 🚫 不會撞上游「沒有 outbound session」的 panic，而且**🚫 上網做任何金鑰的事**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §3）：
+    /// 假 server 只收到 `Event/Send`。金鑰的 `/keys/query` 等到 `distribute_room_key`（後台）才送。
     /// 送出去的是密文、帶 UI 給的號碼；自己解得開自己剛送的那則（`to_incoming` 走 Decrypted、密文照帶）。
     #[tokio::test]
-    async fn sending_without_a_prior_refresh_shares_the_room_key_first_instead_of_panicking() {
+    async fn sending_without_a_prior_refresh_creates_the_room_key_locally_and_asks_the_server_for_no_keys(
+    ) {
         use wbf_sdk::crypto_engine::{OutgoingRoomEvent, SendOutcome};
         use wbf_sdk::incoming::IncomingEvent;
         let members = serde_json::json!({
@@ -1618,7 +1620,35 @@ mod with_crypto_engine {
             .await
             .unwrap();
         assert!(matches!(sent, SendOutcome::Sent { .. }), "{sent:?}");
+        let key_requests = |server: &FakeServer| {
+            server
+                .requests
+                .iter()
+                .filter(|request| request.0 == wbf_wire::Kind::Keys)
+                .count()
+        };
         drop(client);
+        assert_eq!(
+            key_requests(&server),
+            0,
+            "the send path asks the server for no keys"
+        );
+        assert!(server.to_device_sent.is_empty());
+        let mut client = WbfClient::new(&mut server);
+        client.hello("test", &[]).await.unwrap();
+        engine
+            .distribute_room_key(
+                &mut client,
+                "!r:localhost",
+                &["@alice:localhost".to_string()],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        assert!(
+            key_requests(&server) >= 1,
+            "the background queries the members' devices"
+        );
         let (_, event_type, room_version) = server.sent_events.last().cloned().unwrap();
         let content = server.sent_contents.last().cloned().unwrap();
         assert_eq!(

@@ -189,6 +189,9 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
+        // 後台送房間金鑰的線就是這條（/docs/design/keys/e2ee-rpc.md §3.1）：線沒開時沒送成的房，現在再跑一輪。
+        // 它要等這格開好才拿得到線（`reuse` 排在開線的寫鎖後面），🚫 在這裡等它。
+        self.wake_room_key_share(account);
         Ok(())
     }
 
@@ -964,12 +967,7 @@ mod tests {
             .await
             .expect("A queries keys");
         let shared = engine_a
-            .share_room_key(
-                &mut ws_a,
-                &room,
-                std::slice::from_ref(&user),
-                wbf_sdk::crypto_engine::room_key_share_settings(),
-            )
+            .distribute_room_key(&mut ws_a, &room, std::slice::from_ref(&user))
             .await
             .expect("A shares the room key");
         assert!(shared >= 1, "A 至少要送給 B 一則 to-device");
