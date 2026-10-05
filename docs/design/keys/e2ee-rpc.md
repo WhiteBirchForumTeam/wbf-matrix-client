@@ -1,9 +1,9 @@
 # E2EE 的 RPC 面：狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再一起回
 
 > 維護者 2026-09-29 定的形狀（原話在 §0）。實作：
-> - sdk：`crypto_engine.rs` 的 `encrypt_and_send`（送出前先分金鑰）、`to_incoming`（收到時有金鑰就解），
+> - sdk：`crypto_engine.rs` 的 `encrypt_and_send`（只在本機備好房間金鑰、加密、送；🚫 上網分金鑰）、`distribute_room_key`（後台把金鑰送出去）、`to_incoming`（收到時有金鑰就解），
 >   `cache.rs` 的 `list_undecrypted_ciphertexts`（找還沒解的密文）。
-> - core：`room_crypto.rs`（refresh、加密送出、1506 之後自動重拿、補解）、`key_sync.rs`（上傳金鑰、補一次性金鑰、金鑰到了補解）、
+> - core：`room_crypto.rs`（refresh、加密送出、1506 之後自動重拿、補解）、`key_share.rs`（後台送房間金鑰，§3.1）、`key_sync.rs`（上傳金鑰、補一次性金鑰、金鑰到了補解）、
 >   `room_sync.rs`（推來的有金鑰就解、`DeviceChanged` 轉給 UI）、`sync_ops.rs`（`Recent` 拉完補解）、`link_pool.rs`（宣告 feature）。
 > - daemon：`room.refresh_devices`、`room.send_text` 多兩個參數、錯誤回應的 `data`、`devices.changed` 推播。
 >
@@ -26,6 +26,9 @@
 > 舊訊息補解開之後，要不要通知 UI？那當然要。走一樣的流程，訊息推送 RPC 鉤子。
 
 > 「上傳自己的一次性金鑰、不夠就補」這件事給 daemon 沒問題……而且盡量補多一點。
+
+> （2026-10-05）為什麼發訊息一定要綁定發金鑰？生成 session 時就該處理金鑰，後台需要生成金鑰時就散播，而不是累積到 send message。完全沒必要耦合。
+> 後台怎樣不管，後台有沒有送達金鑰也不管，在途也不管，已經生成了，那就用生成的 session 去加密，然後去送，散播金鑰的事，後台自己處理。
 
 > 1506 補 data 同意。
 
@@ -63,7 +66,9 @@
     🚫 再 hello，帶的是開線那次的結果（/docs/design/daemon/link-pool.md §5、2026-10-05）。
 - `room.refresh_devices { room, previous?, user?, server? }` → `{ room_version, members, shared }`：
   daemon 拿這一刻的成員清單與版本號（橋 `Members`）→ 跟 `previous` 比出誰的裝置版本號變了 → 只重查那些人（`/keys/query`）→ 雜湊對一次（不對再查一次，還不對就拒絕，fail closed）
-  → 把房間金鑰補給還沒有的裝置。`previous` 不帶就每個人都查（只是查得多，送金鑰照樣只送缺的）。
+  → 把這個房交給後台送金鑰（§3.1），🚫 等它送完。`previous` 不帶就每個人都查（只是查得多，送金鑰照樣只送缺的）。
+  查裝置、對雜湊留在這個命令裡：那是 UI 要的答案（新的 `RoomDevices`），🚫 是散播金鑰。
+  ⚠️ 回應的 `shared` 改成「這輪交給後台送的 to-device 數」（在本機排好的那幾個），🚫 代表已經送到。
 - UI 什麼時候叫：點進房間、收到 `devices.changed`、或自己覺得版本號可能舊了。**daemon 🚫 不自己叫**（除了 §3 的 1506）。
 
 ## 3. 送出
@@ -74,15 +79,22 @@
 |---|---|
 | 明文 | 跟以前一樣 `Event/Send` 明文，不看 `room_devices` |
 | 加密、沒帶 `room_devices` | 拒絕（`usage` 1100），🚫 不送明文 |
-| 加密、帶了 | sdk `encrypt_and_send`：**先分金鑰**（見下）→ 加密 → 帶 `room_devices.room_version` 送 |
+| 加密、帶了 | sdk `encrypt_and_send`：**在本機備好房間金鑰**（見下）→ 加密 → 帶 `room_devices.room_version` 送 → 把這個房交給後台送金鑰（§3.1） |
 
-**送出前一律先分金鑰**（維護者：金鑰的分發由 daemon 高度自動化）。`share_room_key` 由上游判斷三種情況：
-1. 在這個房第一次送（還沒有自己的房間金鑰）→ 建一把、分給每台裝置；
-2. 該換了（則數或時間到期、有人離開、有裝置被移除、可見性或演算法改了）→ 換一把新的、分給每台裝置；
-3. 多了還沒拿到的裝置 → 只補給它（上游記得「這把送過哪些裝置」）。
+**送訊息🚫 綁發金鑰**（維護者 2026-10-05，§0）：送的路上🚫 任何金鑰的網路動作（`Members`／`/keys/query`／`/keys/claim`／`sendToDevice`），
+🚫 等金鑰送到、🚫 管在途。先後順序不是問題：Matrix 🚫 要求金鑰先於訊息到，收的一方先留著解不開的、金鑰到了再補解（我們自己是 §6）。
 
-三種都沒有就什麼都不送。這一步也是防 panic 的：上游的加密在「沒有 outbound session」與「session 過期」時是 `expect`／`assert` 不是回錯，
-先分就把兩條都排除；分完到加密之間剛好跨過期限的那一瞬間，用 `catch_unwind` 接住轉成錯。
+「在本機備好房間金鑰」是上游 `OlmMachine::share_room_key`，它**只碰本機的 crypto store、不上網**：
+1. 這個房還沒有自己的房間金鑰 → 當場建一把；
+2. 該換了（則數或時間到期、跟 UI 帶來的成員比有人離開或裝置被移除、可見性或演算法改了）→ 當場換一把新的；
+3. 給「本機已知、還沒拿到」的裝置排好要送的 to-device（存在那把 session 上，🚫 在這裡送）。還沒有 Olm 通道的裝置上游排一則「暫不提供（`m.no_olm`）」，
+   但仍記成**還沒分到**：後台建好通道後再分一次，它就拿得到（上游 `ShareInfo::Withheld → ShareState::NotShared`）。
+
+這一步也是防 panic 的：上游的加密在「沒有 outbound session」與「session 過期」時是 `expect`／`assert` 不是回錯，
+加密只要 session 在、沒過期，🚫 管金鑰送到沒。先備好就把兩條都排除；備好到加密之間剛好跨過期限的那一瞬間，用 `catch_unwind` 接住轉成錯。
+
+代價（維護者選的取捨）：在這個房第一次送、或剛換金鑰時，對方可能先收到解不開的訊息，金鑰等後台送到才解得開；
+後台在 daemon 關掉前沒送完的，要等這個房下一次送或 refresh 才補（§8）。
 
 **被 1506 擋**（帶的號碼過期）：daemon 自動跑一次 §2 的 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人），然後回錯：
 
@@ -98,6 +110,23 @@
 - 🚫 **daemon 不自動重送**：使用者可能已經撤回或改了，重送的政策在 UI。
 
 加密房的**檔案**走資料平面：UI 先 `media.create` ＋ `PUT` 傳完，再 `room.send_attachment` 帶 PUT 回的 manifest 與同一份 `room_devices`，1506 的處理跟文字一樣（/docs/design/rpc-specs/data-plane.md §5）。路徑版的 `room.send_file` 在加密房仍拒（§8）。
+
+### 3.1 後台送房間金鑰（`key_share.rs`）
+
+每個帳號一個後台 task，只做一件事：**把排好的房間金鑰送到該拿的裝置**。誰都🚫 等它。
+
+- **交給它的時機**：加密送出之後（§3）、`room.refresh_devices` 與 1506 之後的 refresh 對完雜湊之後（§2）。
+  交的是「哪個房、哪些成員」（成員是 UI 帶來的那份）；同一個房還沒做完又交一次，就併成一件、成員取最新的。
+- **它做的事**，一個房一輪：
+  1. 追蹤這些人，該查的 `/keys/query`；
+  2. 缺 Olm 通道的裝置 `/keys/claim` 一次性金鑰、建通道；
+  3. 上游 `share_room_key`：會把剛建好通道的裝置（之前排成 `m.no_olm` 的）補進來，回這把 session 上**所有還沒送出的** to-device；
+  4. 一個一個 `sendToDevice`，成功的交回上游（`mark_request_as_sent`），上游就記得那台已經有了。
+- **走哪條線**：`Keys`（金鑰的線，`key_sync.rs` 也在上面上傳自己的金鑰）。用 `reuse`，🚫 自己開線：線沒開就等下次有人交、或線開好時再做（線開好時把手上還沒做完的房再跑一輪）。
+- **失敗**：那個房留著，隔一段時間（30 秒起、加倍到 5 分鐘）再試；發 `Note` 講一聲，🚫 回給誰（沒有人在等）。
+  裝置雜湊的比對（fail closed）只在 refresh 做（§2），跟以前送出時一樣；後台🚫 另外判斷要不要發。
+- **不存狀態**：要送的 to-device 本來就存在上游那把 session 上（crypto store），後台只在記憶體記「哪些房還有事」。
+  daemon 重開之後那張表是空的，要等那個房下一次送或 refresh 再交給它（§8）。
 
 ## 4. `devices.changed` 推播
 
@@ -127,7 +156,8 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 
 | 問題 | 在哪回答 | 只在那裡 |
 |---|---|---|
-| 送出前要不要分金鑰、分給誰、要不要換 | sdk `encrypt_and_send` → `share_room_key`（上游） | ✅ 呼叫端拿不到「不分就加密」的路 |
+| 加密前房間金鑰備好了沒、要不要換 | sdk `encrypt_and_send` → 上游 `share_room_key`（只碰本機） | ✅ 呼叫端拿不到「沒備好就加密」的路（上游會 panic） |
+| 房間金鑰送給誰、什麼時候送 | core `key_share.rs` → sdk `distribute_room_key` | 送出與 refresh 只「交給它」，🚫 自己送 |
 | 一則 WS 收到的事件要怎麼寫進 cache | `room_crypto::to_incoming`（→ sdk `OlmEngine::to_incoming`） | 三個入口都叫它 |
 | cache 裡還沒解的要怎麼補解、要不要通知 | `room_crypto::decrypt_stored` | 金鑰到了（`announce: true`）與 `Recent` 拉完（`false`）共用 |
 | 被 1506 擋之後做什麼 | `Core::wbf_send_encrypted` | 自動 refresh、組 `data` |
@@ -138,6 +168,9 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 ## 8. 不在這支（已知的缺口）
 
 - **路徑版送檔進加密房**：`room.send_file` 在加密房拒絕（資料平面那條可以，/docs/design/rpc-specs/data-plane.md）。
+- **後台沒送完就關了 daemon**：要送的 to-device 還在 crypto store 的那把 session 上，但後台「哪些房還有事」只在記憶體，
+  重開之後要等那個房下一次送或 refresh 才補。要不要在 `Keys` 線開好時掃一次所有加密房（要每房的成員，得上網拿）待維護者決定。
+- **`devices.changed` 🚫 觸發後台**：誰的裝置變了仍是 UI 決定要不要 refresh（§4，2026-09-29 定的）；refresh 之後才交給後台。
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
 - **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，/docs/design/keys/e2ee-walkthrough.md §16）。
@@ -146,11 +179,14 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 
 ## 9. 測試
 
-- sdk `tests/pipeline.rs`（會答橋的假 server）：沒 refresh 過就直接送——先分金鑰、不 panic、送的是密文帶 UI 的號碼、自己解得開（`to_incoming` 走 Decrypted、密文照帶）；
+- sdk `tests/pipeline.rs`（會答橋的假 server）：沒 refresh 過就直接送——**送之前假 server 🚫 收到任何金鑰的請求**、不 panic、送的是密文帶 UI 的號碼、自己解得開（`to_incoming` 走 Decrypted、密文照帶）；
+  `distribute_room_key` 之後才有 `/keys/query`／`/keys/claim`／`sendToDevice`；
   `to_incoming` 明文原樣、解不開的照存帶原因；refresh 與 1506 各一條。
 - sdk `cache.rs`：`list_undecrypted_ciphertexts` 只回這個讀者同步過、還沒解、那把 session（或那幾則）的，舊→新；解開之後就不再出現。
 - core `room_crypto.rs`（core 的假 server 多答橋的 `Members`／`GetStateEvent`／`KeysUpload`／`KeysQuery`／`KeysClaim`／`SendToDevice` 與 `Event/Send`，並學 server 的 1506）：
-  - 加密房沒帶 `room_devices` 拒、🚫 不送明文；refresh 回 UI 要存的；送出去是密文、帶那個號碼；號碼過期 → `RoomDevicesChanged`、`data` 帶新狀態與同一個 `txn_id`、訊息沒送；帶新狀態重送就過；
+  - 加密房沒帶 `room_devices` 拒、🚫 不送明文；refresh 回 UI 要存的；送出去是密文、帶那個號碼；
+  - **送的那一路假 server 🚫 收到 `Members`／`KeysQuery`／`KeysClaim`／`SendToDevice`**（`Event/Send` 之前一個都沒有）；後台之後把金鑰送出去；
+    `SendToDevice` 失敗一次，後台隔一段時間重送、送成就不再送；線沒開時後台🚫 開線；號碼過期 → `RoomDevicesChanged`、`data` 帶新狀態與同一個 `txn_id`、訊息沒送；帶新狀態重送就過；
   - 明文房照舊；`room_devices` 形狀不對是 `Usage`；
   - 補解：cache 裡那把 session 的密文解開、補存、發 `room.message`（同 `event_id`、明文），第二次什麼都不做；
   - 房間線推來的密文存成解開的、`room.message` 帶明文；`DeviceChanged` 原樣轉成 `CoreEvent::DeviceChanged`；

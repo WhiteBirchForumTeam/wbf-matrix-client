@@ -5,7 +5,7 @@
 
 ## 1. 現況
 
-PR #1–#69 合併（main `199a88a`，2026-10-04）；#43（走橋的 GetEvent）是 2026-09-16 關掉、沒合——「跳到訊息」等 wbfuwunel #64 合了再開一支。已經能用的，照層次：
+PR #1–#72 合併（main `144cb55`，2026-10-05）；#43（走橋的 GetEvent）是 2026-09-16 關掉、沒合——「跳到訊息」等 wbfuwunel #64 合了再開一支。已經能用的，照層次：
 
 - **線上協議與媒體**：`wbf-wire` 的 codec 對著 server 的黃金向量；`wbf-sdk` 的分塊上傳／下載／seek／續傳／串流、每塊 AEAD（`/docs/design/media/wbf-client-convention-for-chunk.md`）。
 - **本地資料**：vault 與子金鑰、資料目錄兩層路徑加密（`/docs/design/storage/vault-and-keys.md`）；`cache.db` 一個 server 一份、多帳號混存、單一寫入者（`/docs/design/storage/local-cache-db.md`、`/docs/design/daemon/daemon-runtime.md` §2）；
@@ -247,10 +247,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
-1. **送訊息不綁發金鑰**（維護者 2026-10-05）：加密房送訊息只拿本機現有的 session 加密、送 `Event/Send`；沒有或到期就本機當場建新的。
-   散播金鑰是後台自己的事（房間變加密、session 到期、成員或裝置變了、送失敗），送訊息🚫 等、🚫 管送到沒有。
-   先改 `/docs/design/keys/e2ee-rpc.md` 給維護者看再寫。半路知道的事實：規格沒有「金鑰先到」；`matrix-sdk-crypto` 加密只要本機有 session、沒過期（沒有會 panic）。
-   （其他四條線送收分開 2026-10-05 做完：`/docs/design/daemon/link-requests.md` §2.1。）
+1. **送訊息不綁發金鑰**（維護者 2026-10-05）：設計在 `/docs/design/keys/e2ee-rpc.md` §3、§3.1（先送設計 PR 給維護者看）——送出只在本機備好房間金鑰、加密、送；
+   散播金鑰交給每個帳號一個後台 task（`key_share.rs`，走 `Keys` 線、失敗退避重試），送訊息🚫 等、🚫 管送到沒有。設計合了再寫程式。
+   半路知道的事實：規格沒有「金鑰先到」；上游 `share_room_key` 只碰本機、加密只要 session 在且沒過期（沒有會 panic）；沒通道的裝置排成 `m.no_olm` 但仍算沒分到。
 2. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
 3. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
 4. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
