@@ -262,7 +262,7 @@ mod tests {
     }
 
     fn hello_json() -> &'static str {
-        r#"{"method":"hello","params":{"protocols":[1],"client":"wbf-matrix-rpc-cli 0.1.0"},"id":0}"#
+        r#"{"method":"hello","params":{"protocols":[2],"client":"wbf-matrix-rpc-cli 0.1.0"},"id":0}"#
     }
 
     fn close_code(inbound: &Inbound) -> Option<u32> {
@@ -281,10 +281,10 @@ mod tests {
             inbound,
             Inbound::HelloAccepted {
                 id: Some(0),
-                protocol: 1
+                protocol: 2
             }
         );
-        assert_eq!(connection.protocol(), Some(1));
+        assert_eq!(connection.protocol(), Some(2));
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
     fn bad_client_name_and_no_common_protocol_are_refused_with_the_hello_id() {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        let bad_name = r#"{"method":"hello","params":{"protocols":[1],"client":"rpc-cli"},"id":0}"#;
+        let bad_name = r#"{"method":"hello","params":{"protocols":[2],"client":"rpc-cli"},"id":0}"#;
         let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, bad_name));
         assert_eq!(close_code(&inbound), Some(9004));
         assert_eq!(connection.protocol(), None);
@@ -375,6 +375,13 @@ mod tests {
             unreachable!()
         };
         assert_eq!(notice.id, Some(2));
+
+        // 只會講 1 的舊前端：一連上來就被拒，🚫 連上了之後 `room.list` 才壞（/docs/design/rpc-specs/rpc-spec.md §1.3）。
+        let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
+        let old =
+            r#"{"method":"hello","params":{"protocols":[1],"client":"wbf-matrix-x 1"},"id":3}"#;
+        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, old));
+        assert_eq!(close_code(&inbound), Some(9005));
     }
 
     #[test]
@@ -434,7 +441,7 @@ mod tests {
             again,
             Inbound::HelloAccepted {
                 id: Some(0),
-                protocol: 1
+                protocol: 2
             }
         );
     }

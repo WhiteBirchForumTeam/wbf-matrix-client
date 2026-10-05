@@ -74,9 +74,9 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 ### 1.3 `hello`
 
 ```jsonc
-{ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli 0.1.0" }, "id": 0 }
+{ "method": "hello", "params": { "protocols": [2], "client": "wbf-matrix-rpc-cli 0.1.0" }, "id": 0 }
 { "code": 0, "msg": "ok", "id": 0, "result": {
-    "protocol": 1,                    // 談定的那一個
+    "protocol": 2,                    // 談定的那一個
     "daemon": "wbf-matrix-client-daemon 0.1.0",
     "instance": "3f2b1c4a-5d6e-4f80-9a1b-2c3d4e5f6071",  // 這次啟動的 UUID
     "pid": 4242,
@@ -114,7 +114,9 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
   只有 **breaking**（舊協議真的沒辦法再服務）才把那個版本從表裡拿掉——那時候舊前端一連上來就被**明確拒絕**，
   🚫 不是連上了之後某個 method 突然壞掉。
 - 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2, 1]`）→ 談成 `2`，前端自己降級。
-- 現在雙方都只有 `[1]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
+- 現在 daemon 只有 `[2]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。
+  版本紀錄：**2**（2026-10-05，維護者定）`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房（§3.3，/docs/design/rooms/chat-model.md §2.1），
+  舊前端的 `room.list` 解不了、送文字一律 1100，所以 **1 從表裡拿掉**（只會講 1 的前端 `hello` 就拿到 `PROTOCOL_MISMATCH`）。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
 
 📎 `msg` 一律英文（/docs/design/rpc-specs/wbf-cli-spec.md §4 同一條）。語言協商考慮過，維護者 2026-09-12 判定多餘：`msg` 是給人看的除錯字串，
 使用者看到的字由前端照 `code` 自己翻。

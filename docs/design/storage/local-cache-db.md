@@ -135,7 +135,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v7，就是 `wbf-sdk::cache` 建的）
+## 5. 快取的 schema（v8，就是 `wbf-sdk::cache` 建的）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
 
@@ -201,7 +201,7 @@ CREATE INDEX events_synced_log_by_user ON events_synced_log (user, event);
 -- 兩個寫入點（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1）：
 --   room.list（record_joined_rooms）：只拿「加入了哪些」。新的加一列（conversation_json／refreshed_at 是 NULL ＝ 還沒拿過）；
 --     已經有的🚫 覆寫它的樣子；名單裡沒有的標 joined = 0、🚫 刪列（回來了再標回 1）。
---   room.get（upsert_conversations）：一間的樣子整份蓋上去、記 refreshed_at、joined = 1。
+--   room.get（upsert_conversations）：一間的樣子整份蓋上去、記 refreshed_at；🚫 動 joined（加入了沒只由 room.list 寫，對退出的房叫 room.get 不會標回加入；新列預設 1）。
 -- room.list 讀 joined = 1 的，本地知道多少給多少（RoomListEntry，不知道的是 null）；room.get sync=local 退出的也給（最後看到的樣子）。
 CREATE TABLE room_list (
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,

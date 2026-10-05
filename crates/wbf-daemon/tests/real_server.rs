@@ -123,7 +123,7 @@ impl Client {
         let hello = client
             .call(
                 "hello",
-                json!({ "protocols": [1], "client": "wbf-matrix-rpc-cli e2e" }),
+                json!({ "protocols": [2], "client": "wbf-matrix-rpc-cli e2e" }),
             )
             .await;
         assert_eq!(hello["code"], 0, "{hello}");

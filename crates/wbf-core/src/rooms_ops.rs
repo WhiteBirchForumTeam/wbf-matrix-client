@@ -150,7 +150,8 @@ impl Core {
     /// Return:
     ///     Ok(Conversation)
     ///     Err(NoSuchAccount)   `Local`：本地沒拿過這間；`Both`：拿回來了卻讀不到（寫庫失敗）
-    ///     Err(Server)          上游拒（不在房裡是 `Forbidden`）
+    ///     Err(Server)          wbf 帳號：上游拒（不在房裡是 `Forbidden`）
+    ///     Err(Usage)           一般 Matrix 帳號：Client 的 store 裡沒有這間（不在房裡、或還沒同步到）
     pub async fn conversation(
         &self,
         room: &str,

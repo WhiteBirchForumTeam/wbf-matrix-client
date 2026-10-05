@@ -196,7 +196,8 @@ impl Cache {
 
     // ---- room_list ----
 
-    /// 拿回來的房間的樣子（一人一列；`Conversation` 是他看到的樣子）：整份蓋上去、記下什麼時候拿的、標成加入中。
+    /// 拿回來的房間的樣子（一人一列；`Conversation` 是他看到的樣子）：整份蓋上去、記下什麼時候拿的。
+    /// 🚫 動 `joined`：加入了沒只由 [`Cache::record_joined_rooms`]（`room.list`）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設加入。
     pub fn upsert_conversations(
         &mut self,
         user_id: &str,
@@ -210,7 +211,7 @@ impl Cache {
                 .prepare_cached(
                     "INSERT INTO room_list (room, user, conversation_json, refreshed_at, joined) VALUES (?1, ?2, ?3, ?4, 1)
                      ON CONFLICT(user, room) DO UPDATE SET conversation_json = excluded.conversation_json,
-                       refreshed_at = excluded.refreshed_at, joined = 1",
+                       refreshed_at = excluded.refreshed_at",
                 )
                 .map_err(db_error)?;
             // 🚨 **只准 0 → 1，🚫 不准 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
@@ -269,7 +270,8 @@ impl Cache {
                 joined_now.insert(room);
             }
         }
-        let joined_before: Vec<i64> = {
+        // 剛剛上面加的也在裡面，下面用 `joined_now` 濾掉。
+        let marked_joined: Vec<i64> = {
             let mut statement = transaction
                 .prepare_cached("SELECT room FROM room_list WHERE user = ?1 AND joined = 1")
                 .map_err(db_error)?;
@@ -282,7 +284,7 @@ impl Cache {
             let mut mark_left = transaction
                 .prepare_cached("UPDATE room_list SET joined = 0 WHERE user = ?1 AND room = ?2")
                 .map_err(db_error)?;
-            for room in joined_before
+            for room in marked_joined
                 .into_iter()
                 .filter(|room| !joined_now.contains(room))
             {
@@ -388,8 +390,8 @@ impl Cache {
         let Ok(mut conversation) = serde_json::from_str::<Conversation>(&json) else {
             return Ok(None);
         };
-        conversation.encrypted =
-            known_encryption(Some(conversation.encrypted), room_is_encrypted).unwrap_or(true);
+        // 房間說加密就是加密（`known_encryption` 同一條）。
+        conversation.encrypted |= room_is_encrypted == Some(true);
         Ok(Some(conversation))
     }
 
@@ -2683,6 +2685,18 @@ mod tests {
         assert!(
             cache.find_conversation(ALICE, "!b").unwrap().is_some(),
             "a left room still has its last view"
+        );
+        // 對退出的房叫 room.get：樣子更新，但🚫 標回加入（加入了沒只由 room.list 寫）。
+        cache
+            .upsert_conversations(ALICE, &[room("!b", true)])
+            .unwrap();
+        assert!(
+            cache
+                .list_room_entries(ALICE)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.id != "!b"),
+            "room.get does not mark a left room joined again"
         );
 
         cache

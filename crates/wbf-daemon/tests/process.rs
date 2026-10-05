@@ -160,7 +160,7 @@ async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up
         ready.rpc_port,
         &keys,
         &[
-            json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "hello", "params": { "protocols": [2], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
             json!({ "method": "daemon.info", "id": 1 }),
         ],
     )
@@ -181,7 +181,7 @@ async fn the_daemon_process_announces_ready_leaves_the_token_alone_and_cleans_up
         ready.rpc_port,
         &keys,
         &[
-            json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "hello", "params": { "protocols": [2], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
             json!({ "method": "daemon.shutdown", "id": 1 }),
         ],
     )
@@ -286,7 +286,7 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
         ready.rpc_port,
         &keys,
         &[
-            json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "hello", "params": { "protocols": [2], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
             json!({ "method": "daemon.info", "id": 1 }),
         ],
     )
@@ -298,7 +298,7 @@ async fn a_second_daemon_on_the_same_data_dir_refuses_to_start() {
         ready.rpc_port,
         &keys,
         &[
-            json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "hello", "params": { "protocols": [2], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
             json!({ "method": "daemon.shutdown", "id": 1 }),
         ],
     )
