@@ -20,10 +20,6 @@ use wbf_wire::Pack;
 
 use crate::link_pool::{LinkPool, LinkRole};
 
-/// 一問一答的 seq 從這裡往上數（/docs/design/daemon/link-requests.md §7）。同一條 `WsLink` 上還有兩個發號的：
-/// 開線時的 `WbfClient`（`hello`，還沒搬過來的 CLI 路徑也是）從 1 往上、心跳從 `u32::MAX` 往下，三邊要撞到都得先發二十億個請求。
-pub(crate) const FIRST_SEQ: u32 = 1 << 31;
-
 /// 線沒開或死了：等這麼久再向池要一次。
 const LINK_RETRY: Duration = Duration::from_secs(1);
 
@@ -148,7 +144,6 @@ async fn send_queued<A: LineRequest>(
     replies: mpsc::UnboundedSender<LineReply<A>>,
 ) {
     let mut link: Option<WsLink> = None;
-    let mut next_seq = FIRST_SEQ;
     let on_wire: SharedOnWire<A> = Arc::new(Mutex::new(OnWire {
         requests: HashMap::new(),
         heard_at: Instant::now(),
@@ -178,8 +173,8 @@ async fn send_queued<A: LineRequest>(
             tokio::time::sleep(LINK_RETRY).await;
             continue;
         };
-        let seq = next_seq;
-        next_seq = next_seq.wrapping_add(1).max(FIRST_SEQ);
+        // seq 由線發（/docs/design/daemon/link-requests.md §7）：同一條線上共用的 client、心跳都從同一個計數器拿，🚫 撞號。
+        let seq = current.next_seq();
         let pack = action.to_pack(seq);
         match current.send_request(pack.clone()).await {
             Ok(pending) => {
@@ -346,7 +341,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()]
         );
-        assert_eq!(sent[0].seq, FIRST_SEQ);
+        assert_eq!(
+            sent[0].seq,
+            1 << 31,
+            "seq comes from the line, from 2^31 up"
+        );
         // 倒著回：每個回覆照 (id, seq) 找回自己的動作。
         for pack in sent.iter().rev() {
             answers.send(ack_for(pack)).unwrap();

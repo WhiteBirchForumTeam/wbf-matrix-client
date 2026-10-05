@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use crate::chat::{Conversation, Message, MessageKind, Reaction};
+use crate::chat::{Conversation, Message, MessageKind, Reaction, RoomListEntry};
 use crate::error::SdkError;
 use crate::event_json::{kind_from_content, FILE_MSGTYPE};
 use crate::incoming::{
@@ -29,8 +29,9 @@ use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
 /// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改；
-/// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）。
-const SCHEMA_VERSION: i64 = 7;
+/// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）；
+/// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、🚫 刪列，維護者 2026-10-05）。
+const SCHEMA_VERSION: i64 = 8;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,7 +196,8 @@ impl Cache {
 
     // ---- room_list ----
 
-    /// 這個帳號的房間清單（一人一列；`Conversation` 是他看到的樣子）。
+    /// 拿回來的房間的樣子（一人一列；`Conversation` 是他看到的樣子）：整份蓋上去、記下什麼時候拿的。
+    /// 🚫 動 `joined`：加入了沒只由 [`Cache::record_joined_rooms`]（`room.list`）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設加入。
     pub fn upsert_conversations(
         &mut self,
         user_id: &str,
@@ -207,7 +209,7 @@ impl Cache {
         {
             let mut insert = transaction
                 .prepare_cached(
-                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at) VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, joined) VALUES (?1, ?2, ?3, ?4, 1)
                      ON CONFLICT(user, room) DO UPDATE SET conversation_json = excluded.conversation_json,
                        refreshed_at = excluded.refreshed_at",
                 )
@@ -240,37 +242,157 @@ impl Cache {
         transaction.commit().map_err(db_error)
     }
 
+    /// server 說這個帳號加入了哪些房（`room.list`，維護者 2026-10-05）：跟本地比對差異。
+    /// 新的加一列（樣子是 NULL，等 `room.get`）；已經有的🚫 覆寫它的樣子，退出過又回來的標回加入；
+    /// 本地標加入、名單裡卻沒有的標 `joined = 0`，🚫 刪列。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_ids: `JoinedRooms` 回的全部, example: &["!abc:localhost".to_string()]
+    pub fn record_joined_rooms(
+        &mut self,
+        user_id: &str,
+        room_ids: &[String],
+    ) -> Result<(), SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let user = user_row_id(&transaction, user_id)?;
+        let mut joined_now = std::collections::HashSet::new();
+        {
+            let mut insert = transaction
+                .prepare_cached(
+                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, joined) VALUES (?1, ?2, NULL, NULL, 1)
+                     ON CONFLICT(user, room) DO UPDATE SET joined = 1",
+                )
+                .map_err(db_error)?;
+            for room_id in room_ids {
+                let room = room_row_id(&transaction, room_id)?;
+                insert.execute(params![room, user]).map_err(db_error)?;
+                joined_now.insert(room);
+            }
+        }
+        // 剛剛上面加的也在裡面，下面用 `joined_now` 濾掉。
+        let marked_joined: Vec<i64> = {
+            let mut statement = transaction
+                .prepare_cached("SELECT room FROM room_list WHERE user = ?1 AND joined = 1")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![user], |row| row.get::<_, i64>(0))
+                .map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)?
+        };
+        {
+            let mut mark_left = transaction
+                .prepare_cached("UPDATE room_list SET joined = 0 WHERE user = ?1 AND room = ?2")
+                .map_err(db_error)?;
+            for room in marked_joined
+                .into_iter()
+                .filter(|room| !joined_now.contains(room))
+            {
+                mark_left.execute(params![user, room]).map_err(db_error)?;
+            }
+        }
+        transaction.commit().map_err(db_error)
+    }
+
+    /// 本地記的「這間房加不加密」（`rooms.encrypted`）：拿房間時寫（`upsert_conversations`），收到加密的證據時往上升（`upsert_events`），只升不降。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
     /// Return:
-    ///     Ok(Vec<Conversation>)   這個帳號的，照名稱排；解不開的列跳過（/docs/design/storage/local-cache-db.md §1：壞資料當沒有）
-    pub fn list_conversations(&self, user_id: &str) -> Result<Vec<Conversation>, SdkError> {
+    ///     Ok(Some(true))    加密
+    ///     Ok(Some(false))   明文
+    ///     Ok(None)          沒有這間房、或不知道（只因收到事件才建出來的房，NULL）——🚫 當成明文
+    pub fn find_room_encrypted(&self, room_id: &str) -> Result<Option<bool>, SdkError> {
+        self.connection
+            .query_row(
+                "SELECT encrypted FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .map_err(db_error)
+            .map(Option::flatten)
+    }
+
+    /// 這個帳號現在加入的房（`joined = 1`），本地知道多少給多少（`room.list`）。
+    ///
+    /// Return:
+    ///     Ok(Vec<RoomListEntry>)   照名稱排（還沒拿過的、沒名字的在前），同名照 id；
+    ///                              還沒拿過、或那份樣子解不開（/docs/design/storage/local-cache-db.md §1：壞資料當沒有）的，只有 id 與 `rooms.encrypted`
+    pub fn list_room_entries(&self, user_id: &str) -> Result<Vec<RoomListEntry>, SdkError> {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT l.conversation_json, r.encrypted FROM room_list l
+                "SELECT r.room_id, l.conversation_json, l.refreshed_at, r.encrypted FROM room_list l
                    JOIN users u ON u.id = l.user JOIN rooms r ON r.id = l.room
-                 WHERE u.mxid = ?1",
+                 WHERE u.mxid = ?1 AND l.joined = 1",
             )
             .map_err(db_error)?;
         let rows = statement
             .query_map(params![user_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<bool>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<bool>>(3)?,
+                ))
             })
             .map_err(db_error)?;
-        let mut conversations: Vec<Conversation> = Vec::new();
+        let mut entries: Vec<RoomListEntry> = Vec::new();
         for row in rows {
-            let (json, room_is_encrypted) = row.map_err(db_error)?;
-            if let Ok(mut conversation) = serde_json::from_str::<Conversation>(&json) {
-                // 🚨 `rooms.encrypted` 是**房間的**事實，`conversation_json` 只是**這個帳號上次看到的樣子**。
-                // 房間說加密就是加密 —— 🚫 不讓一份舊的「沒加密」從讀的這一側漏出去。
-                if room_is_encrypted == Some(true) {
-                    conversation.encrypted = true;
-                }
-                conversations.push(conversation);
-            }
+            let (room_id, json, refreshed_at, room_is_encrypted) = row.map_err(db_error)?;
+            let fetched = json.and_then(|json| serde_json::from_str::<Conversation>(&json).ok());
+            let mut entry = match fetched {
+                Some(conversation) => RoomListEntry::from_conversation(
+                    conversation,
+                    refreshed_at.and_then(|millis| u64::try_from(millis).ok()),
+                ),
+                None => RoomListEntry::unknown(&room_id),
+            };
+            entry.encrypted = known_encryption(entry.encrypted, room_is_encrypted);
+            entries.push(entry);
         }
-        conversations
-            .sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
-        Ok(conversations)
+        entries.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(entries)
+    }
+
+    /// 這個帳號拿過的一間房的樣子（`room.get sync=local`）。退出了的也給（那是它最後看到的樣子）。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    /// Return:
+    ///     Ok(Some(Conversation))   拿過
+    ///     Ok(None)                 沒這間、只知道加入了還沒拿過、或那份樣子解不開
+    pub fn find_conversation(
+        &self,
+        user_id: &str,
+        room_id: &str,
+    ) -> Result<Option<Conversation>, SdkError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT l.conversation_json, r.encrypted FROM room_list l
+                   JOIN users u ON u.id = l.user JOIN rooms r ON r.id = l.room
+                 WHERE u.mxid = ?1 AND r.room_id = ?2",
+                params![user_id, room_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<bool>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        let Some((Some(json), room_is_encrypted)) = row else {
+            return Ok(None);
+        };
+        let Ok(mut conversation) = serde_json::from_str::<Conversation>(&json) else {
+            return Ok(None);
+        };
+        // 房間說加密就是加密（`known_encryption` 同一條）。
+        conversation.encrypted |= room_is_encrypted == Some(true);
+        Ok(Some(conversation))
     }
 
     // ---- events ----
@@ -411,6 +533,21 @@ impl Cache {
             }
             if is_new_to_process {
                 process_event(&transaction, room, event)?;
+            }
+            // 這間房加密了的證據（`m.room.encryption`，或任何加密事件）：本地的「加不加密」往上升，只升不降。
+            // 送文字只看它（維護者 2026-10-05）：拿完房間之後才開的加密，靠這裡補上。
+            // 認不認得 `m.room.encryption` 跟拿房間時同一個判斷（`is_encryption_content`），🚫 各寫一份。
+            let shows_encryption = incoming.decrypted().is_some()
+                || (text("type") == Some("m.room.encryption")
+                    && crate::room_state::is_encryption_content(
+                        envelope.get("content").unwrap_or(&serde_json::Value::Null),
+                    ));
+            if shows_encryption {
+                transaction
+                    .prepare_cached("UPDATE rooms SET encrypted = 1 WHERE id = ?1")
+                    .map_err(db_error)?
+                    .execute(params![room])
+                    .map_err(db_error)?;
             }
             transaction
                 .prepare_cached(
@@ -2153,7 +2290,8 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
              CREATE TABLE room_list (
                room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-               conversation_json TEXT NOT NULL, refreshed_at INTEGER NOT NULL,
+               conversation_json TEXT, refreshed_at INTEGER,
+               joined INTEGER NOT NULL DEFAULT 1 CHECK (joined IN (0, 1)),
                PRIMARY KEY (user, room)) WITHOUT ROWID;
              CREATE TABLE sync_state (
                user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -2213,6 +2351,24 @@ fn remove_database_files(path: &Path) -> Result<(), SdkError> {
         let _ = std::fs::remove_file(path.with_file_name(format!("{CACHE_FILE_NAME}{suffix}")));
     }
     Ok(())
+}
+
+/// 「加不加密」的兩個來源合起來：`rooms.encrypted` 是**房間的**事實，`conversation_json` 只是**這個帳號上次看到的樣子**。
+/// 房間說加密就是加密——🚫 讓一份舊的「沒加密」從讀的這一側漏出去。
+///
+/// Args:
+///     seen: 這個帳號上次看到的（還沒拿過是 None）, example: Some(false)
+///     room: `rooms.encrypted`（NULL 是 None）, example: Some(true)
+/// Return:
+///     Some(true)    任一邊說加密
+///     Some(false)   有一邊說明文、沒有一邊說加密
+///     None          兩邊都不知道
+fn known_encryption(seen: Option<bool>, room: Option<bool>) -> Option<bool> {
+    match (seen, room) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (None, None) => None,
+    }
 }
 
 fn now_millis() -> i64 {
@@ -2432,9 +2588,18 @@ mod tests {
             Some(true),
             "🚫 不准降回明文"
         );
-        assert!(
-            cache.list_conversations(ALICE).unwrap()[0].encrypted,
+        assert_eq!(
+            cache.list_room_entries(ALICE).unwrap()[0].encrypted,
+            Some(true),
             "讀出來也要是加密"
+        );
+        assert!(
+            cache
+                .find_conversation(ALICE, "!r")
+                .unwrap()
+                .unwrap()
+                .encrypted,
+            "單一房間讀出來也是"
         );
 
         // 明文房間升級成加密：可以。
@@ -2462,12 +2627,170 @@ mod tests {
             .upsert_conversations(ALICE, &[room("!r", true)])
             .unwrap();
 
-        let bob_sees = cache.list_conversations(BOB).unwrap();
-        assert!(
+        let bob_sees = cache.list_room_entries(BOB).unwrap();
+        assert_eq!(
             bob_sees[0].encrypted,
+            Some(true),
             "🚨 BOB 的 JSON 是舊的，但房間已知加密 —— 讀出來不准是明文"
         );
+        assert!(
+            cache
+                .find_conversation(BOB, "!r")
+                .unwrap()
+                .unwrap()
+                .encrypted
+        );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 房間列表只記「加入了哪些」（維護者 2026-10-05）：新的只有 id、已經拿過的🚫 被蓋掉、退出的標起來🚫 刪列、回來了再標回去。
+    #[test]
+    fn the_joined_list_adds_new_rooms_keeps_what_was_fetched_and_marks_left_rooms_without_deleting()
+    {
+        let (mut cache, dir) = open("joined-list");
+        cache
+            .record_joined_rooms(ALICE, &["!a".to_string(), "!b".to_string()])
+            .unwrap();
+        assert_eq!(
+            cache.list_room_entries(ALICE).unwrap(),
+            vec![RoomListEntry::unknown("!a"), RoomListEntry::unknown("!b")],
+            "only ids until room.get fetches them"
+        );
+        assert_eq!(cache.find_conversation(ALICE, "!a").unwrap(), None);
+        assert_eq!(cache.find_room_encrypted("!a").unwrap(), None);
+
+        cache
+            .upsert_conversations(ALICE, &[room("!a", false), room("!b", true)])
+            .unwrap();
+        cache
+            .record_joined_rooms(ALICE, &["!a".to_string(), "!c".to_string()])
+            .unwrap();
+        let listed = cache.list_room_entries(ALICE).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["!c", "!a"],
+            "!b was left; unknown names sort first"
+        );
+        assert!(
+            listed[1].refreshed_at.is_some() && listed[1].encrypted == Some(false),
+            "what room.get fetched is not overwritten by the joined list: {listed:?}"
+        );
+        assert_eq!(
+            cache.count_rows("room_list").unwrap(),
+            3,
+            "a left room keeps its row"
+        );
+        assert!(
+            cache.find_conversation(ALICE, "!b").unwrap().is_some(),
+            "a left room still has its last view"
+        );
+        // 對退出的房叫 room.get：樣子更新，但🚫 標回加入（加入了沒只由 room.list 寫）。
+        cache
+            .upsert_conversations(ALICE, &[room("!b", true)])
+            .unwrap();
+        assert!(
+            cache
+                .list_room_entries(ALICE)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.id != "!b"),
+            "room.get does not mark a left room joined again"
+        );
+
+        cache
+            .record_joined_rooms(
+                ALICE,
+                &["!a".to_string(), "!b".to_string(), "!c".to_string()],
+            )
+            .unwrap();
+        let back = cache.list_room_entries(ALICE).unwrap();
+        assert!(
+            back.iter()
+                .any(|entry| entry.id == "!b" && entry.encrypted == Some(true)),
+            "rejoined, with what was known: {back:?}"
+        );
+        assert!(cache.list_room_entries(BOB).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拿過的房間：收到加密的證據就往上升，明文訊息不動它，只升不降；沒拿過的是「不知道」。
+    #[test]
+    fn an_encryption_event_or_a_ciphertext_marks_a_known_room_encrypted() {
+        let (mut cache, dir) = open("encrypted-by-events");
+        cache
+            .upsert_conversations(ALICE, &[room("!r", false), room("!s", false)])
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(false));
+        assert_eq!(
+            cache.find_room_encrypted("!never").unwrap(),
+            None,
+            "a room never fetched is unknown, not plaintext"
+        );
+        put(&mut cache, ALICE, &[text("!r", "$t", Some(1), 1)]);
+        assert_eq!(
+            cache.find_room_encrypted("!r").unwrap(),
+            Some(false),
+            "a plaintext message says nothing about encryption"
+        );
+        // 沒帶 `algorithm` 的 `m.room.encryption` 跟拿房間時一樣不算（`room_state::is_encryption_content`）。
+        let mut empty_algorithm = event_json(
+            "!r",
+            "$enc-empty",
+            CAROL,
+            Some(4),
+            4,
+            serde_json::json!({ "algorithm": "" }),
+        );
+        empty_algorithm["type"] = serde_json::json!("m.room.encryption");
+        empty_algorithm["state_key"] = serde_json::json!("");
+        cache
+            .upsert_events(
+                ALICE,
+                "!r",
+                &[IncomingEvent::Plain {
+                    event: empty_algorithm,
+                }],
+            )
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(false));
+        // 拿完房間之後才開的加密：`m.room.encryption` 進來就往上升（送文字只看本地，維護者 2026-10-05）。
+        let mut turned_on = event_json(
+            "!r",
+            "$enc",
+            CAROL,
+            Some(2),
+            2,
+            serde_json::json!({ "algorithm": "m.megolm.v1.aes-sha2" }),
+        );
+        turned_on["type"] = serde_json::json!("m.room.encryption");
+        turned_on["state_key"] = serde_json::json!("");
+        cache
+            .upsert_events(ALICE, "!r", &[IncomingEvent::Plain { event: turned_on }])
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(true));
+        // 收到一則密文也一樣。
+        let ciphertext = serde_json::json!({
+            "type": "m.room.encrypted", "event_id": "$c", "room_id": "!s", "sender": CAROL, "origin_server_ts": 3,
+            "content": { "algorithm": "m.megolm.v1.aes-sha2", "session_id": "S", "ciphertext": "AAA" },
+        });
+        cache
+            .upsert_events(
+                ALICE,
+                "!s",
+                &[IncomingEvent::Undecrypted {
+                    ciphertext,
+                    reason: "MissingRoomKey".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!s").unwrap(), Some(true));
+        // 只升不降：之後一份「沒加密」的房間清單蓋不回去。
+        cache
+            .upsert_conversations(ALICE, &[room("!r", false)])
+            .unwrap();
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2864,8 +3187,22 @@ mod tests {
         cache
             .upsert_conversations(ALICE, std::slice::from_ref(&conversation))
             .unwrap();
-        assert_eq!(cache.list_conversations(ALICE).unwrap(), vec![conversation]);
-        assert!(cache.list_conversations(BOB).unwrap().is_empty());
+        assert_eq!(
+            cache.find_conversation(ALICE, "!r").unwrap(),
+            Some(conversation.clone())
+        );
+        let listed = cache.list_room_entries(ALICE).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            RoomListEntry {
+                refreshed_at: None,
+                ..listed[0].clone()
+            },
+            RoomListEntry::from_conversation(conversation, None)
+        );
+        assert!(listed[0].refreshed_at.is_some());
+        assert!(cache.list_room_entries(BOB).unwrap().is_empty());
+        assert_eq!(cache.find_conversation(BOB, "!r").unwrap(), None);
         assert_eq!(cache.count_rows("room_list").unwrap(), 1);
 
         put(&mut cache, ALICE, &[text("!r", "$1", Some(1), 5)]);

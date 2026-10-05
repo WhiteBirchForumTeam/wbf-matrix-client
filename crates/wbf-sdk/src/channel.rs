@@ -11,11 +11,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use wbf_wire::Pack;
 
 use crate::error::SdkError;
-use crate::link::{Heartbeat, Subscription, WsLink};
+use crate::link::{Heartbeat, Subscription, WsLink, LINE_SILENCE};
 use crate::sessions::ReceivedHook;
 
-/// 還沒搬到送收分開（/docs/design/daemon/link-requests.md）的呼叫點，一個請求從送出到收到回應的上限：對方黑洞了就回錯，
-/// 不讓 client 永遠掛著。
+/// HTTP 通道（與 matrix-sdk 的 HTTP）一個請求從送出到收到回應的上限：對方黑洞了就回錯，不讓 client 永遠掛著。
+/// WebSocket 🚫 用這個：線在好幾個 client 之間共用，逾時看的是整條線多久沒回應（`link::LINE_SILENCE`）。
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// 通道的契約。實作只管 bytes 來回；回應是不是 Ack、id／seq 對不對，是 `protocol::expect_ack` 的事。
@@ -66,6 +66,20 @@ pub trait PackChannel {
             "this channel has no long-lived sessions to send into; use the WebSocket channel"
                 .into(),
         ))
+    }
+
+    /// 線發的請求號（/docs/design/daemon/link-requests.md §7）：WebSocket 的線在好幾個 client 之間共用，號要由線發、🚫 各自數。
+    ///
+    /// Return:
+    ///     Some(seq)   線發的
+    ///     None        這種通道不共用（HTTP 一請求一回應、測試的假通道）：client 自己數
+    fn line_seq(&self) -> Option<u32> {
+        None
+    }
+
+    /// 同上，具名會話的號（值的部分，從 1 起）。
+    fn line_session_number(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -184,6 +198,20 @@ impl PackChannel for Channel {
             Channel::Http(channel) => channel.send_only(pack).await,
         }
     }
+
+    fn line_seq(&self) -> Option<u32> {
+        match self {
+            Channel::WebSocket(channel) => channel.line_seq(),
+            Channel::Http(channel) => channel.line_seq(),
+        }
+    }
+
+    fn line_session_number(&self) -> Option<u64> {
+        match self {
+            Channel::WebSocket(channel) => channel.line_session_number(),
+            Channel::Http(channel) => channel.line_session_number(),
+        }
+    }
 }
 
 /// `GET /_wbf/v1/ws`：一條 `WsLink`（讀取 task ＋ 送出 task ＋ 會話表，/docs/design/daemon/ws-receive-dispatch.md）。
@@ -274,8 +302,17 @@ impl WsChannel {
 }
 
 impl PackChannel for WsChannel {
+    /// 等到回覆為止，整條線沉默（`LINE_SILENCE`）才算逾時：同一條線上別的 client 的回覆還在流進來，就🚫 算這個請求沒人理。
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
-        self.link.request(pack, REQUEST_TIMEOUT).await
+        self.link.request_until_silent(pack, LINE_SILENCE).await
+    }
+
+    fn line_seq(&self) -> Option<u32> {
+        Some(self.link.next_seq())
+    }
+
+    fn line_session_number(&self) -> Option<u64> {
+        Some(self.link.next_session_number())
     }
 
     async fn request_stream(

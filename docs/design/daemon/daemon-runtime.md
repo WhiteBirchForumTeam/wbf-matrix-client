@@ -238,8 +238,9 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一台 OlmMac
 |---|---|---|
 | 開 app、顯示帳號列表 | `account.list` | ❌ |
 | 顯示房間列表（全部帳號） | `room.list`（每個帳號一次） | ❌ `sync=local` |
+| 列表上看得到、還沒名字的房間（`refreshed_at` 是 `null`） | `room.get { sync: "both" }`（一間一次，/docs/design/rooms/chat-model.md §2.1） | ✅ 只問那一間，寫回庫 |
 | **點開一個房間** | `room.history { sync: "local" }` | ❌ |
-| 使用者按「重新整理」 | `room.list { sync: "both" }` | ✅ |
+| 使用者按「重新整理」 | `room.list { sync: "both" }` | ✅ 只問加入了哪些房 |
 | 房間內往上捲，捲到快取的盡頭 | `room.history { sync: "both", before }` | ✅ 逐房 backfill，寫回庫 |
 | 收到新訊息 | —（推播 `room.message`） | ✅（背景，上游會話） |
 | 送一則訊息 | `room.send_text` | ✅ |

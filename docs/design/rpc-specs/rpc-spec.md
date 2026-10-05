@@ -74,9 +74,9 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 ### 1.3 `hello`
 
 ```jsonc
-{ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli 0.1.0" }, "id": 0 }
+{ "method": "hello", "params": { "protocols": [2], "client": "wbf-matrix-rpc-cli 0.1.0" }, "id": 0 }
 { "code": 0, "msg": "ok", "id": 0, "result": {
-    "protocol": 1,                    // 談定的那一個
+    "protocol": 2,                    // 談定的那一個
     "daemon": "wbf-matrix-client-daemon 0.1.0",
     "instance": "3f2b1c4a-5d6e-4f80-9a1b-2c3d4e5f6071",  // 這次啟動的 UUID
     "pid": 4242,
@@ -113,8 +113,11 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - ⭐ **常態是 daemon 升級、前端沒升**：daemon 版本往上走的時候**維持能講舊協議**，舊前端照用。
   只有 **breaking**（舊協議真的沒辦法再服務）才把那個版本從表裡拿掉——那時候舊前端一連上來就被**明確拒絕**，
   🚫 不是連上了之後某個 method 突然壞掉。
-- 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2, 1]`）→ 談成 `2`，前端自己降級。
-- 現在雙方都只有 `[1]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
+- 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2]`）→ 談成 `2`，前端自己降級。
+- 現在 daemon 只有 `[2]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。
+  **版本號只寫在一個地方**：同檔的 `CURRENT_PROTOCOL`，支援表與測試送的 `hello` 都從它拿；升版就改它（維護者 2026-10-05）。
+  版本紀錄：**2**（2026-10-05，維護者定）`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房（§3.3，/docs/design/rooms/chat-model.md §2.1），
+  舊前端的 `room.list` 解不了、送文字一律 1100，所以 **1 從表裡拿掉**（只會講 1 的前端 `hello` 就拿到 `PROTOCOL_MISMATCH`）。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
 
 📎 `msg` 一律英文（/docs/design/rpc-specs/wbf-cli-spec.md §4 同一條）。語言協商考慮過，維護者 2026-09-12 判定多餘：`msg` 是給人看的除錯字串，
 使用者看到的字由前端照 `code` 自己翻。
@@ -293,9 +296,9 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 | method | params | result | core |
 |---|---|---|---|
-| `room.list` | `{ user?, server?, sync? }`。**有 `sync`**（§2） | `[Conversation]`（/docs/design/rooms/chat-model.md §2.1） | `list_conversations` |
-| `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation` | `conversation` |
-| `room.send_text` | `{ room, body, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（/docs/design/keys/e2ee-rpc.md §3） | `{ event_id }` | `send_text`。加密房：先分金鑰、加密、帶 `room_version` 送；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3），🚫 不自動重送 |
+| `room.list` | `{ user?, server?, sync? }`。**有 `sync`**（§2） | `[RoomListEntry]`（/docs/design/rooms/chat-model.md §2.1）：加入中的房，本地知道多少給多少、不知道的是 `null`；`refreshed_at` 是 `null` ＝ 這間還沒 `room.get` 過 | `list_rooms`。上網只問「加入了哪些房」（wbf 帳號一個 `JoinedRooms`），`both` 把差異寫進本地（新的加列、拿過的🚫 覆寫、退出的標 `joined = 0`、🚫 刪）再讀本地；`server` 🚫 寫庫，wbf 帳號只有 id（維護者 2026-10-05） |
+| `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation` | `conversation`。上網只問**這一間**（wbf 帳號是它的 `GetState` ＋ `m.direct`），`both` 寫進本地、下一次 `room.list` 就帶著。UI 對看得到、還沒名字的房間自己叫它 |
+| `room.send_text` | `{ room, body, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（/docs/design/keys/e2ee-rpc.md §3） | `{ event_id }` | `send_text`。加不加密看本地記的（`room.get sync=both` 拿過的房間；只在 `room.list` 上、還沒拿過的是不知道）：wbf 帳號沒拿過這間房、或本地不知道它加不加密 → **1100**，請先拿房間（維護者 2026-10-05：daemon 🚫 為了送一則字再問 server）。加密房：先分金鑰、加密、帶 `room_version` 送；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3），🚫 不自動重送 |
 | `room.refresh_devices` | `{ room, previous?, user?, server? }`。`previous` 是 UI 手上的上一份（`{ room_version, members }`）：帶了只重查裝置版本號變了的人 | `{ room_version, members: { mxid: "序號-雜湊" }, shared }`——**UI 存下來**，送出時整份當 `room_devices` 帶回來；`shared` 是這輪補發了幾個 to-device | `refresh_room_devices`：拿成員清單與版本號 → 只重查變了的人 → 雜湊對不上重查一次、還不對就拒（fail closed）→ 把房間金鑰補給還沒有的裝置（/docs/design/keys/e2ee-rpc.md §2）。wbf 帳號才有；一般 Matrix 1100 |
 | `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔） | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（/docs/design/rpc-specs/wbf-cli-spec.md §5），daemon 不落地 | `send_file`。長工作：推 `progress` |
 | `room.send_attachment` | `{ room, manifest, caption?, room_devices?, txn_id?, user?, server? }`。**資料平面版**的最後一步：UI 打 HTTP 傳完（`PUT` 回 manifest）之後，把那份 manifest 原樣帶回來（/docs/design/rpc-specs/data-plane.md §5）。加密房同 `room.send_text` 要 `room_devices` | `{ event_id, mxc, attachment_declared }` | `send_attachment`：核對 manifest 是這個帳號那台 server 的、區塊跟房間對得上；加密房被擋回 1401 |
@@ -384,7 +387,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 | method | params | result | core |
 |---|---|---|---|
-| `server.ping` | `{ transport?, user?, server? }` | `ServerHello` | `ping(client_name = daemon 的名字與版本)` |
+| `server.ping` | `{ transport?, user?, server? }` | `ServerHello` | `ping(transport, target)`：送 `Ping`，回開線那次 `Hello` 的答案（🚫 再 hello，/docs/design/daemon/link-requests.md §7） |
 
 ### 3.9 訂閱、取消
 
@@ -544,7 +547,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `account.list`／`switch` | ✅ | 本機 | ✅ |
 | `account.whoami` | ✅ | HTTP `/whoami`（維護者 2026-09-30：RPC 或 HTTP 都可以） | ✅ |
 | `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | ✅（維護者 2026-09-30 定：登出跟登入一樣走 HTTP） |
-| `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋 `JoinedRooms`＋`GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（/docs/design/daemon/account-session.md §6） |
+| `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋，列表 `JoinedRooms`、單一房間 `GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（/docs/design/daemon/account-session.md §6） |
 | `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房先分金鑰、加密、帶 `room_version`，/docs/design/keys/e2ee-rpc.md §3）；一般 Matrix：`Room::send` | ✅ wbf（含加密，真 server 驗過）／🔁 一般 server |
 | `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** 橋 `Members`＋`/keys/query`＋`/keys/claim`＋`sendToDevice` | ✅（真 server 驗過） |
 | `devices.changed` 推播 | ✅ `CoreEvent::DeviceChanged` | **WS** `Event/DeviceChanged`（`Rooms` 線宣告 `org.wbftw.device_versions`） | ✅ |
@@ -561,7 +564,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，/docs/design/daemon/account-session.md §6） | 🔁 還沒做：搬到 crypto 層＋橋的 `/room_keys` |
 | `recovery.list`／`show` | ✅ | 本機（`<data dir>/r/`） | ✅ |
-| `server.ping` | ✅ | **WS** `Hello`／`Ping` | ✅ |
+| `server.ping` | ✅ | **WS** `Ping`（`Hello` 是開線那次的） | ✅ |
 | `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發（/docs/design/rooms/room-sync.md §3：追平與否是 UI 自己叫 `sync.recent` 的結果，線的開關看 `link.state`）；`vault.state` ❌ | — | ❌ |
 | `progress`／`note` 推播 | ✅ daemon 層（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ |
 

@@ -261,8 +261,13 @@ mod tests {
         pack::seal(keys, Side::Client, pack_type, json.as_bytes()).expect("seal")
     }
 
-    fn hello_json() -> &'static str {
-        r#"{"method":"hello","params":{"protocols":[1],"client":"wbf-matrix-rpc-cli 0.1.0"},"id":0}"#
+    fn hello_json() -> String {
+        serde_json::json!({
+            "method": "hello",
+            "params": { "protocols": [protocol::CURRENT_PROTOCOL], "client": "wbf-matrix-rpc-cli 0.1.0" },
+            "id": 0,
+        })
+        .to_string()
     }
 
     fn close_code(inbound: &Inbound) -> Option<u32> {
@@ -276,15 +281,15 @@ mod tests {
     fn a_good_hello_is_accepted_and_the_protocol_is_agreed() {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
+        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, &hello_json()));
         assert_eq!(
             inbound,
             Inbound::HelloAccepted {
                 id: Some(0),
-                protocol: 1
+                protocol: protocol::CURRENT_PROTOCOL
             }
         );
-        assert_eq!(connection.protocol(), Some(1));
+        assert_eq!(connection.protocol(), Some(protocol::CURRENT_PROTOCOL));
     }
 
     #[test]
@@ -309,7 +314,7 @@ mod tests {
         let keys = keys();
         let other = RpcKeys::from_token(&[1u8; 256]);
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        let inbound = connection.receive(&client_frame(&other, PackType::Cipher, hello_json()));
+        let inbound = connection.receive(&client_frame(&other, PackType::Cipher, &hello_json()));
         assert_eq!(close_code(&inbound), Some(9001));
         let Inbound::Close(notice) = inbound else {
             unreachable!()
@@ -327,7 +332,7 @@ mod tests {
         let keys = keys();
         let policy = EncryptionPolicy::enforced();
         let mut connection = Connection::new(keys.clone(), policy.clone());
-        let plain_hello = client_frame(&keys, PackType::Plain, hello_json());
+        let plain_hello = client_frame(&keys, PackType::Plain, &hello_json());
         assert_eq!(close_code(&connection.receive(&plain_hello)), Some(9002));
 
         policy.set_enforced(false);
@@ -347,7 +352,7 @@ mod tests {
     fn responses_are_ciphertext_while_enforced_and_decrypt_on_the_client_side() {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
+        connection.receive(&client_frame(&keys, PackType::Cipher, &hello_json()));
         let bytes = connection
             .seal_response(&Response::ok(Some(0), serde_json::json!({ "x": 1 })))
             .unwrap();
@@ -361,8 +366,8 @@ mod tests {
     fn bad_client_name_and_no_common_protocol_are_refused_with_the_hello_id() {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        let bad_name = r#"{"method":"hello","params":{"protocols":[1],"client":"rpc-cli"},"id":0}"#;
-        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, bad_name));
+        let bad_name = hello_json().replace("wbf-matrix-rpc-cli 0.1.0", "rpc-cli");
+        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, &bad_name));
         assert_eq!(close_code(&inbound), Some(9004));
         assert_eq!(connection.protocol(), None);
 
@@ -375,6 +380,13 @@ mod tests {
             unreachable!()
         };
         assert_eq!(notice.id, Some(2));
+
+        // 只會講 1 的舊前端：一連上來就被拒，🚫 連上了之後 `room.list` 才壞（/docs/design/rpc-specs/rpc-spec.md §1.3）。
+        let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
+        let old =
+            r#"{"method":"hello","params":{"protocols":[1],"client":"wbf-matrix-x 1"},"id":3}"#;
+        let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, old));
+        assert_eq!(close_code(&inbound), Some(9005));
     }
 
     #[test]
@@ -392,7 +404,7 @@ mod tests {
 
         // hello 之後寫壞的請求：回 100，🚫 連線不關（/docs/design/rpc-specs/rpc-spec.md §5.1）。
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
+        connection.receive(&client_frame(&keys, PackType::Cipher, &hello_json()));
         let inbound = connection.receive(&client_frame(&keys, PackType::Cipher, "[1,2,3]"));
         // 🚫 不斷言 serde 的字（它會隨版本變）；斷言的是 code 與 id。
         match inbound {
@@ -428,13 +440,13 @@ mod tests {
     fn a_second_hello_does_not_renegotiate_the_protocol() {
         let keys = keys();
         let mut connection = Connection::new(keys.clone(), EncryptionPolicy::enforced());
-        connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
-        let again = connection.receive(&client_frame(&keys, PackType::Cipher, hello_json()));
+        connection.receive(&client_frame(&keys, PackType::Cipher, &hello_json()));
+        let again = connection.receive(&client_frame(&keys, PackType::Cipher, &hello_json()));
         assert_eq!(
             again,
             Inbound::HelloAccepted {
                 id: Some(0),
-                protocol: 1
+                protocol: protocol::CURRENT_PROTOCOL
             }
         );
     }

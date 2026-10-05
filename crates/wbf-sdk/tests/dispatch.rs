@@ -539,10 +539,11 @@ async fn a_quiet_link_pings_and_stays_open_when_the_peer_answers() {
     peer.send(pong_for(&first)).await;
     let second = peer.receive().await;
     assert_eq!(second.subtype, control::PING, "下一個間隔再跳一次");
-    assert_eq!(
-        second.seq,
-        first.seq.wrapping_sub(1),
-        "心跳的請求號從上往下數"
+    assert!(
+        first.seq >= 1 << 31 && second.seq == first.seq + 1,
+        "心跳的請求號跟其他請求一樣由線發（2^31 起往上）: {} then {}",
+        first.seq,
+        second.seq
     );
     peer.send(pong_for(&second)).await;
     assert!(!link.is_closed());
@@ -634,4 +635,56 @@ async fn an_unanswered_heartbeat_closes_the_link_and_fails_the_waiters() {
         "{outcome:?}"
     );
     assert!(link.is_closed());
+}
+
+/// 一問一答等到整條線沉默才逾時（/docs/design/daemon/link-requests.md §4）：線上別的回應還在流進來，這個請求🚫 逾時——
+/// 同一條線在好幾個 client 之間共用，別人的回覆排在前面很正常。
+#[tokio::test]
+async fn a_request_keeps_waiting_while_the_line_keeps_answering() {
+    let (link, mut peer) = connect();
+    let waiting = {
+        let link = link.share();
+        tokio::spawn(async move {
+            link.request_until_silent(ping(1 << 31), Duration::from_millis(200))
+                .await
+        })
+    };
+    let asked = peer.receive().await;
+    // 600 ms 裡每 50 ms 推一個別的 pack：線在回應。
+    for n in 0..12 {
+        peer.send(device_push(0x2000_0000_0000_0001, n)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!waiting.is_finished(), "the line kept answering");
+    peer.send(pong_for(&asked)).await;
+    waiting.await.unwrap().unwrap();
+}
+
+/// 只有心跳的 `Pong` 在流：🚫 算線在回應——不然 server 只回心跳、不回請求時，等的人永遠不逾時。
+#[tokio::test]
+async fn pongs_alone_do_not_keep_a_request_waiting() {
+    let (link, mut peer) = connect();
+    let waiting = {
+        let link = link.share();
+        tokio::spawn(async move {
+            link.request_until_silent(ping(1 << 31), Duration::from_millis(200))
+                .await
+        })
+    };
+    let _asked = peer.receive().await;
+    // `Pong` 一直流（最多 2 秒）；請求要在它們還在流的時候就逾時（沉默時限 200 ms），🚫 等到 `Pong` 停了才逾時。
+    let mut pongs_sent = 0;
+    while !waiting.is_finished() && pongs_sent < 40 {
+        peer.send(pack(Kind::Control, control::PONG, flags::IS_RESPONSE, 0, 7))
+            .await;
+        pongs_sent += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pongs_sent < 20,
+        "the request gave up while pongs were still coming ({pongs_sent} sent)"
+    );
+    let outcome = waiting.await.unwrap();
+    assert!(matches!(outcome, Err(SdkError::Timeout(_))), "{outcome:?}");
+    assert!(!link.is_closed(), "the line itself is fine");
 }

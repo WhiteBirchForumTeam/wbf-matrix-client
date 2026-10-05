@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::Message;
 use wbf_daemon::connection::EncryptionPolicy;
 use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
+use wbf_daemon::protocol::CURRENT_PROTOCOL;
 use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
 
@@ -84,7 +85,7 @@ async fn expect_close(socket: &mut Socket) -> u16 {
 }
 
 fn hello() -> Value {
-    json!({ "method": "hello", "params": { "protocols": [1], "client": "wbf-matrix-rpc-cli 0.0.0" }, "id": 0 })
+    json!({ "method": "hello", "params": { "protocols": [CURRENT_PROTOCOL], "client": "wbf-matrix-rpc-cli 0.0.0" }, "id": 0 })
 }
 
 #[tokio::test]
@@ -97,7 +98,7 @@ async fn hello_then_a_request_over_ciphertext() {
     assert_eq!(pack_type, PackType::Cipher);
     assert_eq!(reply["code"], 0, "{reply}");
     assert_eq!(reply["id"], 0);
-    assert_eq!(reply["result"]["protocol"], 1);
+    assert_eq!(reply["result"]["protocol"], CURRENT_PROTOCOL);
     assert_eq!(reply["result"]["unlocked"], false);
     assert_eq!(reply["result"]["encryption_enforced"], true);
 
@@ -112,7 +113,7 @@ async fn hello_then_a_request_over_ciphertext() {
     assert_eq!(reply["code"], 0, "{reply}");
     assert_eq!(reply["id"], 7);
     assert_eq!(reply["result"]["rpc_port"], daemon.port);
-    assert_eq!(reply["result"]["protocols"], json!([1]));
+    assert_eq!(reply["result"]["protocols"], json!([CURRENT_PROTOCOL]));
     assert_eq!(reply["result"]["connections"], 1);
     // 第二條連線進來，數字跟著變；它關掉之後回到 1。
     let mut other = connect(daemon.port).await;

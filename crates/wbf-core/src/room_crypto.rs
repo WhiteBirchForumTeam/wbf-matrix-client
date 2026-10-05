@@ -315,7 +315,8 @@ mod tests {
     use crate::test_support::*;
 
     /// 一條放進池裡的 `Misc`（記憶體對接的假 server）；這個房加密、成員只有自己、房間版本號 7。
-    async fn encrypted_room_on_misc(core: &Core, account: &AccountDir) -> FakeServer {
+    /// `Misc` 線接上假 server，房間（`ROOM`）在 server 那邊與本地都是 `encrypted` 那樣（送文字只看本地，wbf_rooms.rs）。
+    async fn room_on_misc(core: &Core, account: &AccountDir, encrypted: bool) -> FakeServer {
         let (client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
         let pool = core.pool_of_account(account).unwrap();
         drop(
@@ -324,7 +325,8 @@ mod tests {
                 .unwrap(),
         );
         fake.room_is_encrypted
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(encrypted, std::sync::atomic::Ordering::SeqCst);
+        remember_room(core, account, ROOM, encrypted).await;
         *fake.members.lock().unwrap() = Some(members_body(7));
         *fake.current_room_version.lock().unwrap() = Some(7);
         fake
@@ -345,7 +347,7 @@ mod tests {
     ) {
         let dir = scratch("crypto-send");
         let (core, account) = core_with_wbf_account(&dir).await;
-        let fake = encrypted_room_on_misc(&core, &account).await;
+        let fake = room_on_misc(&core, &account, true).await;
         let target = Target::default();
 
         let refused = core
@@ -434,9 +436,7 @@ mod tests {
     async fn a_plaintext_room_sends_plaintext_without_room_devices() {
         let dir = scratch("crypto-plain");
         let (core, account) = core_with_wbf_account(&dir).await;
-        let fake = encrypted_room_on_misc(&core, &account).await;
-        fake.room_is_encrypted
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let fake = room_on_misc(&core, &account, false).await;
         let event_id = core
             .send_text(ROOM, "hi", &SendOptions::default(), &Target::default())
             .await
@@ -453,6 +453,10 @@ mod tests {
             "hi"
         );
         drop(sent);
+        assert!(
+            fake.bridge_calls.lock().unwrap().is_empty(),
+            "送文字只看本地記的加不加密，🚫 為它問 server（維護者 2026-10-05）"
+        );
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -475,7 +479,7 @@ mod tests {
         account: &AccountDir,
         event_id: &str,
     ) -> (Value, String) {
-        let fake = encrypted_room_on_misc(core, account).await;
+        let fake = room_on_misc(core, account, true).await;
         let refreshed = core
             .refresh_room_devices(ROOM, None, &Target::default())
             .await
@@ -666,7 +670,6 @@ mod tests {
                 None,
                 true,
                 Transport::WebSocket,
-                "recent test",
                 &Target::default(),
             )
             .await
@@ -765,6 +768,11 @@ mod tests {
         let target = Target::default();
         let (core_a, dir_a) = signed_in("real-e2ee-alice", alice.clone(), alice_password).await;
         let (core_b, dir_b) = signed_in("real-e2ee-bob", bob.clone(), bob_password.clone()).await;
+        // 送文字只看本地記的加不加密（維護者 2026-10-05）：照 UI 的順序先拿那間房。
+        core_a
+            .conversation(&room, crate::SyncMode::Both, &target)
+            .await
+            .expect("alice fetches the room");
         let mut seen_b = core_b.subscribe();
 
         let first = core_a

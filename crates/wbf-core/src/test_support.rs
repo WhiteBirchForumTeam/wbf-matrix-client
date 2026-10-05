@@ -9,7 +9,8 @@ use wbf_sdk::channel::{Channel, WsChannel};
 use wbf_sdk::client::WbfClient;
 use wbf_sdk::login::{Session, SessionBackend};
 use wbf_sdk::protocol::{
-    BridgedEndpoint, BRIDGE_KEYS_CLAIM, BRIDGE_KEYS_QUERY, BRIDGE_KEYS_UPLOAD, BRIDGE_MEMBERS,
+    BridgedEndpoint, BRIDGE_ACCOUNT_DATA, BRIDGE_JOINED_ROOMS, BRIDGE_KEYS_CLAIM,
+    BRIDGE_KEYS_QUERY, BRIDGE_KEYS_UPLOAD, BRIDGE_MEMBERS, BRIDGE_ROOM_STATE,
     BRIDGE_SEND_TO_DEVICE, BRIDGE_STATE_EVENT,
 };
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
@@ -21,9 +22,33 @@ use crate::accounts::AccountDir;
 use crate::link_pool::LinkRole;
 use crate::{Core, CoreEvent};
 
+/// 本地記住一間房（`room.get` 拿過的樣子）：送文字只看本地記的「加不加密」（wbf_rooms.rs），測試要先「拿過房間」。
+pub(crate) async fn remember_room(core: &Core, account: &AccountDir, room: &str, encrypted: bool) {
+    let (cache, me) = core.server_cache_and_me(account).unwrap();
+    let conversation = wbf_sdk::chat::Conversation {
+        id: room.to_string(),
+        kind: wbf_sdk::chat::ConversationKind::Group,
+        name: None,
+        topic: None,
+        encrypted,
+        member_count: 2,
+        my_power_level: 0,
+        can_send_message: true,
+        direct_peer: None,
+    };
+    cache
+        .run(move |cache| cache.upsert_conversations(&me, &[conversation]))
+        .await
+        .unwrap();
+}
+
 pub(crate) const DEAD: &str = "http://127.0.0.1:1";
 pub(crate) const ME: &str = "@a:localhost";
 pub(crate) const ROOM: &str = "!r:localhost";
+/// 假 server 的 `JoinedRooms` 回 `ROOM` 跟這一間。
+pub(crate) const OTHER_ROOM: &str = "!other:localhost";
+/// 假 server 的 `GetState` 給的房名。
+pub(crate) const FAKE_ROOM_NAME: &str = "fake room";
 
 pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("wbf-core-roomsync-{name}-{}", std::process::id()));
@@ -209,6 +234,8 @@ pub(crate) struct FakeServer {
     pub(crate) fail_next_fetch: Arc<std::sync::atomic::AtomicBool>,
     /// 走橋的呼叫：(kind, subtype)，照收到的順序。
     pub(crate) bridge_calls: Arc<Mutex<Vec<(Kind, u8)>>>,
+    /// 收過幾個 `Hello`（同一條線只該在開線時 hello 一次，/docs/design/daemon/link-requests.md §7）。
+    pub(crate) hellos: Arc<std::sync::atomic::AtomicU32>,
     /// 橋 `Members`（`BRIDGE_MEMBERS`）回的 body；None → `Forbidden`。
     pub(crate) members: Arc<Mutex<Option<Value>>>,
     /// 橋 `GetStateEvent` 問 `m.room.encryption` 時：true 回 megolm 的 content，false 回 404（沒加密）。
@@ -283,6 +310,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         fail_next_fetch.clone(),
     );
     let bridge_calls: Arc<Mutex<Vec<(Kind, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+    let hellos = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let hellos_t = hellos.clone();
     let members: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let room_is_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let current_room_version: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
@@ -411,15 +440,18 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     }
                 }
                 (Kind::Download, _) => download_reply(&pack, &uploads_t, &reads_t),
-                (Kind::Control, control::HELLO) => response(
-                    Kind::Control,
-                    control::ACK,
-                    0,
-                    pack.seq,
-                    json!({ "protocol": wbf_sdk::protocol::PROTOCOL_VERSION, "server": "fake", "features": ["recent", "device", "bridge", "attachments"],
+                (Kind::Control, control::HELLO) => {
+                    hellos_t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    response(
+                        Kind::Control,
+                        control::ACK,
+                        0,
+                        pack.seq,
+                        json!({ "protocol": wbf_sdk::protocol::PROTOCOL_VERSION, "server": "fake", "features": ["recent", "device", "bridge", "attachments"],
                             "chunk_size_default": 16, "chunk_size_large": 16, "data_max_bytes": 1048576 }),
-                    Vec::new(),
-                ),
+                        Vec::new(),
+                    )
+                }
                 (Kind::Control, control::PING) => response(
                     Kind::Control,
                     control::PONG,
@@ -596,6 +628,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         device_early_push,
         fail_next_fetch,
         bridge_calls,
+        hellos,
         members,
         room_is_encrypted,
         current_room_version,
@@ -786,6 +819,23 @@ fn bridged_reply(
         } else {
             rejected("NotFound", 1501, 404, "M_NOT_FOUND")
         }
+    } else if is(BRIDGE_JOINED_ROOMS) {
+        ok(json!({ "joined_rooms": [ROOM, OTHER_ROOM] }))
+    } else if is(BRIDGE_ROOM_STATE) {
+        let mut state = vec![
+            json!({ "type": "m.room.create", "state_key": "", "sender": ME, "content": { "room_version": "10" } }),
+            json!({ "type": "m.room.member", "state_key": ME, "sender": ME, "content": { "membership": "join" } }),
+            json!({ "type": "m.room.name", "state_key": "", "sender": ME, "content": { "name": FAKE_ROOM_NAME } }),
+        ];
+        if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
+            state.push(
+                json!({ "type": "m.room.encryption", "state_key": "", "sender": ME,
+                               "content": { "algorithm": "m.megolm.v1.aes-sha2" } }),
+            );
+        }
+        ok(Value::Array(state))
+    } else if is(BRIDGE_ACCOUNT_DATA) {
+        rejected("NotFound", 1501, 404, "M_NOT_FOUND")
     } else if is(BRIDGE_KEYS_UPLOAD) {
         ok(json!({ "one_time_key_counts": { "signed_curve25519": 50 } }))
     } else if is(BRIDGE_KEYS_QUERY) {

@@ -42,6 +42,66 @@ pub struct Conversation {
     pub direct_peer: Option<String>,
 }
 
+/// 房間列表的一列（`room.list`，/docs/design/rooms/chat-model.md §2.1）：本地知道多少給多少，不知道的是 `null`。
+/// 列表只問 server「加入了哪些房」；每一間的樣子是 UI 對看得到的房間叫 `room.get` 拿回來、寫進本地的（維護者 2026-10-05）。
+/// 欄位跟 [`Conversation`] 同名；`refreshed_at` 是 `null` ＝ 這一間還沒拿過（`name` 的 `null` 這時是「不知道」，🚫 是「沒名字」）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomListEntry {
+    pub id: String,
+    pub kind: Option<ConversationKind>,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub encrypted: Option<bool>,
+    pub member_count: Option<u64>,
+    pub my_power_level: Option<i64>,
+    pub can_send_message: Option<bool>,
+    pub direct_peer: Option<String>,
+    /// 這一間的樣子是什麼時候拿的（Unix 毫秒）。
+    pub refreshed_at: Option<u64>,
+}
+
+impl RoomListEntry {
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    /// Return:
+    ///     RoomListEntry  只有 id，其他都是 null（加入了、還沒拿過）
+    pub fn unknown(room_id: &str) -> RoomListEntry {
+        RoomListEntry {
+            id: room_id.to_string(),
+            kind: None,
+            name: None,
+            topic: None,
+            encrypted: None,
+            member_count: None,
+            my_power_level: None,
+            can_send_message: None,
+            direct_peer: None,
+            refreshed_at: None,
+        }
+    }
+
+    /// Args:
+    ///     conversation: 拿回來的那一間
+    ///     refreshed_at: 什麼時候拿的；沒存進本地的（`sync=server`）給 None, example: Some(1_700_000_000_000)
+    pub fn from_conversation(
+        conversation: Conversation,
+        refreshed_at: Option<u64>,
+    ) -> RoomListEntry {
+        RoomListEntry {
+            id: conversation.id,
+            kind: Some(conversation.kind),
+            name: conversation.name,
+            topic: conversation.topic,
+            encrypted: Some(conversation.encrypted),
+            member_count: Some(conversation.member_count),
+            my_power_level: Some(conversation.my_power_level),
+            can_send_message: Some(conversation.can_send_message),
+            direct_peer: conversation.direct_peer,
+            refreshed_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub mxc: String,

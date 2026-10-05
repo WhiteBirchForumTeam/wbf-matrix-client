@@ -124,7 +124,9 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
   還在收別的東西就接著等（維護者 2026-10-02：逾時是沒收到回應）：server 照順序回，`Pong` 會排在已經在途的回覆後面——很多檔一起下載、網路又慢時，它可能晚於 10 秒才到。
 - 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 **60 秒**（wbfuwunel PR #103，2026-10-02），沒請求就關線；而且沒有心跳，
   對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒在 60 秒之內還能錯過一次，也讓「線死了」在 34 秒內可見。
-- 心跳的請求號從 `u32::MAX` 往下數（`WbfClient` 的從 1 往上），兩邊要碰到得幾十億個請求；真的撞到（`register` 回 Usage）就跳過這次。
+- 心跳的請求號跟這條線上其他請求一樣由線發（`WsLink::next_seq`，2³¹ 起往上，/docs/design/daemon/link-requests.md §7）；真的撞到（`register` 回 Usage）就跳過這次。
+- 請求等回覆也看「整條線有沒有在回應」（`WsLink::request_until_silent`，/docs/design/daemon/link-requests.md §4）：那個計數🚫 算 `Pong`——
+  不然 server 只回心跳、不回請求時，等的人永遠不逾時。心跳自己判死看的是收到任何東西（含別人的 `Pong`）。
 - `Heartbeat::OFF` 不跳（測試別的事情時用）；`start_with_heartbeat` 可以給短的間隔（測試用）。
 - 📎 這不是監督者：它只**發現**線死了，不重連（重開見 /docs/design/daemon/link-pool.md §3、§3.1）。
 

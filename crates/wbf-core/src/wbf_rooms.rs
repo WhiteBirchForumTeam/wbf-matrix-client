@@ -1,9 +1,11 @@
-//! wbf 帳號的房間（/docs/design/daemon/account-session.md §6）：沒有 matrix-sdk 的 Client，房間清單走橋（`JoinedRooms` ＋ 每房 `GetState` ＋ `m.direct`），
+//! wbf 帳號的房間（/docs/design/daemon/account-session.md §6）：沒有 matrix-sdk 的 Client，房間列表走橋的 `JoinedRooms`（只有 id）、單一房間走 `GetState` ＋ `m.direct`（UI 點到哪間問哪間，維護者 2026-10-05），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
 //!
 //! 加密房的訊息走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
 //! 路徑版的 `send_file` 還拒加密房（/docs/design/keys/e2ee-rpc.md §8）。
-//! ⚠️ 「加不加密」問的是**這一刻的狀態**（`GetState`），🚫 不用快取：過期的「沒加密」會把明文送進已經加密的房。
+//! 「加不加密」：送**文字**只看本地記的（`rooms.encrypted`，拿房間時寫、收到加密的證據時往上升；不知道就報錯，維護者 2026-10-05）；
+//! 送**附件**問這一刻的狀態（/docs/design/rpc-specs/data-plane.md §4.1：過期的「沒加密」會把檔案金鑰公開在事件裡）。
+//! ⚠️ 文字這側的代價：本地記著「沒加密」、房間卻在這台沒在聽的時候開了加密，就照送明文，直到下次拿房間或收到加密的證據（/docs/design/keys/e2ee-rpc.md §7）。
 
 use serde_json::Value;
 
@@ -16,38 +18,35 @@ use wbf_sdk::Transport;
 use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
-use crate::link_pool::LinkRole;
+use crate::link_pool::{LinkRole, PooledClient};
 use crate::room_crypto::SendOptions;
 use crate::Core;
 
 impl Core {
-    /// 加入的房間，每一間都問一次狀態。⚠️ N 間房就是 N＋2 次橋的往返（一次 `JoinedRooms`、一次 `m.direct`）；
-    /// 大房間的狀態超過 2 MiB 會被 server 以 `TooLarge` 拒，那一間就讓整個呼叫失敗——講出來比少列一間好。
-    pub(crate) async fn wbf_conversations(
-        &self,
-        account: &AccountDir,
-    ) -> Result<Vec<Conversation>, CoreError> {
-        let me = self.session_of(account)?.user_id;
-        let mut client = self
-            .client_of(
-                account,
-                Transport::WebSocket,
-                MethodHome::WbfSdkOnly,
-                LinkRole::Misc,
-            )
-            .await?;
-        let rooms = client.joined_rooms().await?;
-        let m_direct = client.account_data(&me, "m.direct").await?;
-        let mut conversations = Vec::with_capacity(rooms.len());
-        for room in rooms {
-            let state = client.room_state(&room).await?;
-            let peers = direct_peers_of_room(m_direct.as_ref(), &room);
-            conversations.push(conversation_from_state(&room, &me, &state, &peers)?);
-        }
-        Ok(conversations)
+    /// `Misc` 線上的一個 client（同一條線上很多命令可以同時各拿一個，/docs/design/daemon/link-pool.md §5）。
+    async fn misc_client(&self, account: &AccountDir) -> Result<PooledClient, CoreError> {
+        self.client_of(
+            account,
+            Transport::WebSocket,
+            MethodHome::WbfSdkOnly,
+            LinkRole::Misc,
+        )
+        .await
     }
 
-    /// 一個房間現在的樣子（走橋：`GetState` ＋ `m.direct`）。
+    /// 加入了哪些房（走橋的 `JoinedRooms`，一個請求）。每一間的樣子🚫 在這裡問：UI 對看得到的房間叫 `room.get`（維護者 2026-10-05）。
+    ///
+    /// Return:
+    ///     Ok(Vec<String>)   room id, example: vec!["!abc:localhost".to_string()]
+    pub(crate) async fn wbf_joined_rooms(
+        &self,
+        account: &AccountDir,
+    ) -> Result<Vec<String>, CoreError> {
+        Ok(self.misc_client(account).await?.joined_rooms().await?)
+    }
+
+    /// 一個房間現在的樣子（走橋：`GetState` ＋ `m.direct`，兩個一起送）。
+    /// 狀態超過 2 MiB 的大房間 server 回 `TooLarge`，原樣回給 UI。
     ///
     /// Return:
     ///     Ok(Conversation)
@@ -58,27 +57,27 @@ impl Core {
         room: &str,
     ) -> Result<Conversation, CoreError> {
         let me = self.session_of(account)?.user_id;
-        let mut client = self
-            .client_of(
-                account,
-                Transport::WebSocket,
-                MethodHome::WbfSdkOnly,
-                LinkRole::Misc,
-            )
-            .await?;
-        let state = client.room_state(room).await?;
-        let m_direct = client.account_data(&me, "m.direct").await?;
+        let state = async {
+            let mut client = self.misc_client(account).await?;
+            Ok::<_, CoreError>(client.room_state(room).await?)
+        };
+        let m_direct = async {
+            let mut client = self.misc_client(account).await?;
+            Ok::<_, CoreError>(client.account_data(&me, "m.direct").await?)
+        };
+        let (state, m_direct) = tokio::try_join!(state, m_direct)?;
         let peers = direct_peers_of_room(m_direct.as_ref(), room);
         Ok(conversation_from_state(room, &me, &state, &peers)?)
     }
 
     /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
+    /// 加不加密只看本地記的（[`Core::find_local_room_encryption`]），🚫 為了送一則字再問 server。
     ///
     /// Args:
     ///     options: 加密房要 `room_devices`；`txn_id` 重送用, example: &SendOptions::default()
     /// Return:
     ///     Ok(String)                 event_id
-    ///     Err(Usage)                 加密房但沒帶 `room_devices`
+    ///     Err(Usage)                 本地不知道這間房加不加密（UI 先拿房間）；或加密房但沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
     pub(crate) async fn wbf_send_text(
         &self,
@@ -88,16 +87,39 @@ impl Core {
         options: &SendOptions,
     ) -> Result<String, CoreError> {
         let content = serde_json::json!({ "msgtype": "m.text", "body": body });
-        let encrypted = self.wbf_is_room_encrypted(account, room).await?;
+        let encrypted = self.find_local_room_encryption(account, room).await?;
         self.wbf_send_message(account, room, encrypted, content, Vec::new(), options)
             .await
+    }
+
+    /// 本地記的「這間房加不加密」（`rooms.encrypted`）：拿單一房間（`room.get`）時寫，收到加密的證據（`m.room.encryption`、加密事件）時往上升，只升不降。
+    ///
+    /// Return:
+    ///     Ok(bool)     true ＝ 加密、false ＝ 明文
+    ///     Err(Usage)   本地沒有這間房、或不知道（只因收到事件才建出來的房）：UI 要先拿房間——🚫 當成明文
+    async fn find_local_room_encryption(
+        &self,
+        account: &AccountDir,
+        room: &str,
+    ) -> Result<bool, CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let encrypted = cache.read().await.find_room_encrypted(room)?;
+        encrypted.ok_or_else(|| {
+                CoreError::new(
+                    CoreErrorKind::Usage,
+                    format!(
+                        "{room} is not known here yet (or whether it is encrypted is not): fetch the room first \
+                         (room.get with sync=both), then send"
+                    ),
+                )
+            })
     }
 
     /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
     /// 附件在**同一個請求**裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2），加密房也一樣。
     ///
     /// Args:
-    ///     encrypted: 呼叫端剛問過的 [`Core::wbf_is_room_encrypted`]（送檔要先拿它核對區塊，所以由呼叫端問）
+    ///     encrypted: 這間房加不加密，由呼叫端決定怎麼問：文字看本地（[`Core::find_local_room_encryption`]）、附件問 server（[`Core::wbf_is_room_encrypted`]，送檔要先拿它核對區塊）
     ///     content: 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
     ///     attachments: 這則用到的 mxc, example: vec!["mxc://localhost/1122334455667788".into()]
     ///     options: 加密房要 `room_devices`；`txn_id` 重送用, example: &SendOptions::default()
@@ -296,26 +318,32 @@ mod tests {
         let (core, _account) = core_with_wbf_account(&dir);
         let target = Target::default();
 
-        // 走 WS 的：清單（server／both）、單一房間、送文字——到 `client_of` 開線那一步才失敗，而且是 Network。
+        // 走 WS 的：清單（server／both）、單一房間——到 `client_of` 開線那一步才失敗，而且是 Network。
         for outcome in [
-            core.list_conversations(SyncMode::Server, &target)
-                .await
-                .map(|_| ()),
+            core.list_rooms(SyncMode::Server, &target).await.map(|_| ()),
             core.conversation("!r:localhost", SyncMode::Server, &target)
                 .await
                 .map(|_| ()),
-            core.send_text(
+        ] {
+            let error = outcome.expect_err("nobody is listening");
+            assert_eq!(error.kind, CoreErrorKind::Network, "{error:?}");
+        }
+        // 送文字只看本地記的「加不加密」：沒拿過這間房就是不知道，🚫 當成明文，也🚫 為它上網（維護者 2026-10-05）。
+        let error = core
+            .send_text(
                 "!r:localhost",
                 "hi",
                 &crate::SendOptions::default(),
                 &target,
             )
             .await
-            .map(|_| ()),
-        ] {
-            let error = outcome.expect_err("nobody is listening");
-            assert_eq!(error.kind, CoreErrorKind::Network, "{error:?}");
-        }
+            .expect_err("the room was never fetched");
+        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
+        assert!(
+            error.message.contains("fetch the room first"),
+            "{}",
+            error.message
+        );
 
         // 還掛在 Client 上的：備份、watch——`Usage`，訊息講出是 wbf 帳號。
         let error = core.backup_status(&target).await.expect_err("refused");
@@ -357,6 +385,82 @@ mod tests {
         let error = core.log_out(ME, None, false, true).await.expect_err("gate");
         assert_eq!(error.kind, CoreErrorKind::HistoryWouldBeLost, "{error:?}");
         assert!(error.message.contains("wbf server"), "{}", error.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 房間列表只問 `JoinedRooms`，每一間的樣子是 `room.get` 一間一間拿的（維護者 2026-10-05）：
+    /// 列表回 id、其他是 null；`room.get` 只問那一間、寫進本地，下一次列表就帶名字；送文字看的就是它寫的那格。
+    #[tokio::test]
+    async fn the_room_list_asks_only_which_rooms_and_room_get_fetches_one_room_into_the_list() {
+        use std::sync::{Arc, Mutex};
+
+        use wbf_sdk::protocol::BRIDGE_JOINED_ROOMS;
+
+        use crate::link_pool::LinkRole;
+        use crate::test_support::{
+            core_with_wbf_account as open_account, memory_client_with_hello, FAKE_ROOM_NAME,
+            OTHER_ROOM, ROOM,
+        };
+
+        let dir = scratch("joined-list");
+        let (core, account) = open_account(&dir).await;
+        let (client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        drop(
+            core.pool_of_account(&account)
+                .unwrap()
+                .acquire(LinkRole::Misc, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        let target = Target::default();
+        let joined_rooms_call = (BRIDGE_JOINED_ROOMS.kind, BRIDGE_JOINED_ROOMS.subtype);
+
+        let listed = core.list_rooms(SyncMode::Both, &target).await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec![OTHER_ROOM, ROOM]);
+        assert!(
+            listed
+                .iter()
+                .all(|entry| entry.name.is_none() && entry.refreshed_at.is_none()),
+            "only ids until room.get: {listed:?}"
+        );
+        assert_eq!(
+            *fake.bridge_calls.lock().unwrap(),
+            vec![joined_rooms_call],
+            "the list asks only which rooms"
+        );
+
+        fake.bridge_calls.lock().unwrap().clear();
+        let room = core
+            .conversation(ROOM, SyncMode::Both, &target)
+            .await
+            .unwrap();
+        assert_eq!(room.name.as_deref(), Some(FAKE_ROOM_NAME));
+        let calls = fake.bridge_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "that room's state and m.direct, nothing else: {calls:?}"
+        );
+        assert!(!calls.contains(&joined_rooms_call), "{calls:?}");
+
+        let listed = core.list_rooms(SyncMode::Local, &target).await.unwrap();
+        let fetched = listed.iter().find(|entry| entry.id == ROOM).unwrap();
+        assert_eq!(fetched.name.as_deref(), Some(FAKE_ROOM_NAME));
+        assert_eq!(fetched.encrypted, Some(false));
+        assert!(fetched.refreshed_at.is_some());
+        let untouched = listed.iter().find(|entry| entry.id == OTHER_ROOM).unwrap();
+        assert!(untouched.name.is_none(), "{untouched:?}");
+
+        // 送文字看的就是 `room.get` 寫的那格：拿過的明文房送得出去，只在列表上的那間是「不知道」。
+        core.send_text(ROOM, "hi", &crate::SendOptions::default(), &target)
+            .await
+            .expect("a plaintext room fetched by room.get");
+        let error = core
+            .send_text(OTHER_ROOM, "hi", &crate::SendOptions::default(), &target)
+            .await
+            .expect_err("only listed, never fetched");
+        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

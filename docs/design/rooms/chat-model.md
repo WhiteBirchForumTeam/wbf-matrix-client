@@ -75,6 +75,29 @@ pub struct Conversation {
 }
 ```
 
+**房間列表與單一房間分開拿**（維護者 2026-10-05）：daemon 是中間層，照 UI 的指令做，🚫 一個命令替 UI 做完所有事。
+
+- `room.list` 只問 server「加入了哪些房」（wbf 帳號是一個 `JoinedRooms`），跟本地比對差異：新的加一列、樣子先空著；拿過的🚫 覆寫；
+  退出的標起來（`room_list.joined = 0`），🚫 刪列。回給 UI 的是本地知道多少給多少：
+
+  ```rust
+  pub struct RoomListEntry {          // 欄位跟 Conversation 同名，不知道的是 null
+      pub id: ConversationId,
+      pub kind: Option<ConversationKind>,
+      pub name: Option<String>,
+      pub topic: Option<String>,
+      pub encrypted: Option<bool>,    // rooms.encrypted 與這個帳號看到的合起來；說過加密就是加密
+      pub member_count: Option<u64>,
+      pub my_power_level: Option<i64>,
+      pub can_send_message: Option<bool>,
+      pub direct_peer: Option<PeerId>,
+      pub refreshed_at: Option<u64>,  // 這一間的樣子什麼時候拿的；null ＝ 還沒拿過（這時 name 的 null 是「不知道」）
+  }
+  ```
+- `room.get` 拿**一間**的樣子（wbf 帳號是那一間的 `GetState` ＋ `m.direct`）。UI 對看得到、還沒名字的房間自己叫它（一千間房、畫面上十間，就叫十次），
+  拿回來的寫進本地、轉給 UI，下一次 `room.list` 就帶著。點進房間也是叫它。
+- 送文字只看本地記的「加不加密」，所以要先 `room.get` 過那間房（/docs/design/keys/e2ee-rpc.md §7）。
+
 ### 2.2 人與裝置
 
 ```rust

@@ -59,8 +59,8 @@
 - `Misc` 與 `Rooms` 兩條線的 `Hello.features` 宣告 `org.wbftw.device_versions`（`link_pool::features_of`）：
   - `Misc`：加密訊息從這條 `Event/Send`。宣告了，server 對**加密**事件一律要 `room_version`（漏帶是 `InvalidRequest`），明文不受影響。
   - `Rooms`：宣告了 server 才推 `Event/DeviceChanged`。
-  - ⚠️ server 把宣告記在**連線**上、下一個 `Hello` 覆蓋（沒帶就收回）。所以在共用 `Misc` 上重 `hello` 的三處（`server.ping`、`room.history`、`sync.recent`）
-    也帶 `features_of(Misc)`；帶空的會把宣告收掉。
+  - ⚠️ server 把宣告記在**連線**上、下一個 `Hello` 覆蓋（沒帶就收回）。所以只有開線的人 hello，共用 `Misc` 上的命令（`server.ping`、`room.history`、`sync.recent`）
+    🚫 再 hello，帶的是開線那次的結果（/docs/design/daemon/link-pool.md §5、2026-10-05）。
 - `room.refresh_devices { room, previous?, user?, server? }` → `{ room_version, members, shared }`：
   daemon 拿這一刻的成員清單與版本號（橋 `Members`）→ 跟 `previous` 比出誰的裝置版本號變了 → 只重查那些人（`/keys/query`）→ 雜湊對一次（不對再查一次，還不對就拒絕，fail closed）
   → 把房間金鑰補給還沒有的裝置。`previous` 不帶就每個人都查（只是查得多，送金鑰照樣只送缺的）。
@@ -131,7 +131,8 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 | 一則 WS 收到的事件要怎麼寫進 cache | `room_crypto::to_incoming`（→ sdk `OlmEngine::to_incoming`） | 三個入口都叫它 |
 | cache 裡還沒解的要怎麼補解、要不要通知 | `room_crypto::decrypt_stored` | 金鑰到了（`announce: true`）與 `Recent` 拉完（`false`）共用 |
 | 被 1506 擋之後做什麼 | `Core::wbf_send_encrypted` | 自動 refresh、組 `data` |
-| 這個房加密了沒 | `Core::wbf_is_room_encrypted`（問 `m.room.encryption` 這一項，🚫 不用快取） | 問不到就是錯，🚫 不當成沒加密 |
+| 這個房加密了沒（送**文字**） | `Core::find_local_room_encryption`（只看本地 `rooms.encrypted`：拿房間時寫、收到加密的證據時往上升，維護者 2026-10-05） | 本地不知道就是錯（先拿房間），🚫 當成沒加密。⚠️ 代價：本地記著「沒加密」、房間卻在這台沒在聽的時候（離線、訂閱線沒開）開了加密，就照送明文，直到下次拿房間或收到加密的證據——維護者選的取捨（daemon 只管 RPC 來的命令、🚫 每次上網問） |
+| 這個房加密了沒（送**附件**） | `Core::wbf_is_room_encrypted`（問這一刻的 `m.room.encryption`，🚫 用快取：/docs/design/rpc-specs/data-plane.md §4.1） | 問不到就是錯，🚫 不當成沒加密 |
 | 走橋的每支端點是哪個 kind／subtype | sdk `protocol.rs` 的 `BRIDGE_*` 常數（對 wbfuwunel 的 `/docs/bridge-specs/`） | core 的假 server（`test_support::bridged_reply`）也吃這些常數，🚫 不手寫 hex |
 
 ## 8. 不在這支（已知的缺口）

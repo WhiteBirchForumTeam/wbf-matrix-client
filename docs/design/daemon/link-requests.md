@@ -12,14 +12,23 @@
 **預設無序、無狀態**（維護者 2026-10-02）：WebSocket 保證順序，我們🚫 不拿它的保證。收到什麼就看類型處理；
 真的要守順序的是例外，由動作自己守（例：上傳收到第 n 塊的 Ack 才送 n+1，§5）。
 
+**兩種形狀**（維護者 2026-10-05）：
+
+| 誰在送 | 動作是什麼 | 形狀 |
+|---|---|---|
+| **RPC 來的命令**（`Misc`、`Upload`、`Rooms`／`Keys` 的一問一答） | 「回給等的那個 RPC」 | 從池拿一個共用線上的 client，送出、**等自己那一個回條**；等的時候別人照送。🚫 發送 queue、🚫 處理端 task（§2.1） |
+| **自己往下推的狀態機**（`Download` 的下載處理端） | 「第 n 塊落地、要 n+1」 | 發送 queue ＋ 在途表 ＋ 處理端（§2、`RequestLine`） |
+
+兩種都🚫 握著線等回覆、都是號由線發（§7）、逾時都看整條線（§4）。
+
 ## 1. 跟之前的差別
 
 | 層 | 之前 | 現在 |
 |---|---|---|
 | 傳輸與會話表（`WsLink`，/docs/design/daemon/ws-receive-dispatch.md） | 送收分開、照 (id, seq) 交付、允許很多請求在途 | **不變** |
-| 線（連線池的一格） | 一條線一次一個命令：借線的人握著 `tokio::Mutex` 的 guard，送出後原地等（舊的 /docs/design/daemon/link-pool.md §5） | 一條線一條發送 queue ＋ 一張在途表；🚫 沒有獨佔的借用 |
-| `WbfClient` | 方法都是 `&mut self`：seq 計數器、hello 的結果在它身上，所以一次只能一個 | seq 由**線**發（atomic）、hello 的結果放在線上共用；送出不再需要 `&mut` |
-| 呼叫的人 | `let reply = client.call(…).await` | 交一個「請求 ＋ 動作」給線；回覆到了，動作在那條線的處理端執行 |
+| 線（連線池的一格） | 一條線一次一個命令：借線的人握著 `tokio::Mutex` 的 guard，送出後原地等（舊的 /docs/design/daemon/link-pool.md §5） | 很多命令同時用一條線（讀鎖），每個等自己的回條；下載處理端另有自己的發送 queue。🚫 沒有獨佔的借用 |
+| `WbfClient` | 方法都是 `&mut self`：seq 計數器、hello 的結果在它身上，所以一次只能一個 | seq 由**線**發（atomic）、hello 的結果是開線那次的、大家共用；每個命令拿自己的一個 `WbfClient`（同一條線的分身），`&mut` 只管它自己 |
+| 呼叫的人 | `let reply = client.call(…).await`，可是握著整條線 | RPC 命令：還是 `client.call(…).await`，但 client 是共用線上的分身、🚫 握線；下載處理端：交「請求 ＋ 動作」給它的線 |
 
 「送一個等一個沒錯，錯的是『下一個收到的就是我的回覆』」（/docs/design/daemon/ws-receive-dispatch.md 開頭）那一條，這裡往上推一層：
 **錯的也包括「送出的人得原地等它的回覆」**——那會讓同一條線上的第二件事排在第一件的網路來回後面。
@@ -50,7 +59,24 @@
 **實作**（core 的 `link_requests.rs`，`RequestLine`）：發送端每送一個請求（`WsLink::send_request`），就交給一個小 task 等回覆（`PendingReply::wait`）；
 那個 task 手上拿著的就是這個請求的動作——在途表就是這些 task 加上 `WsLink` 的會話表。回覆過了 `expect_ack`，連同動作交回擁有者的收件匣（`LineReply`）。
 線從連線池借**分身**（`LinkPool::find_ws_link`，🚫 不握池那格的鎖），沒開就每秒再看一次。
-發送 queue 由**用這條線的那一方**擁有：`Download` 只有下載處理端一個用戶，`RequestLine` 就在它身上；`Misc` 這種很多命令共用的線搬過來時，`RequestLine` 放進池的那一格。
+發送 queue 由**用這條線的那一方**擁有：`Download` 只有下載處理端一個用戶，`RequestLine` 就在它身上。
+
+### 2.1 RPC 來的命令：等自己的回條（維護者 2026-10-05）
+
+> 「就只管送訊息，daemon 更像是無狀態的東西，只管 RPC 來的命令。」
+
+`Misc`、`Upload`、`Rooms`／`Keys` 上的請求都是 RPC 來的命令送的，它們的動作只有一個：**把結果回給等的那個 RPC**。
+那個 RPC 的 task 等自己那一個回條（`WsLink` 會話表裡一個 `Reply { id, seq }` 的位子），就是「把『回覆 RPC』封進動作」——🚫 為每種請求寫一個狀態機。
+
+- **從池拿 client**（`LinkPool::acquire`／`reuse`）：那一格是讀寫鎖，用線拿讀鎖、開／重開／關拿寫鎖（/docs/design/daemon/link-pool.md §5）。拿到的是同一條 `WsLink` 的分身、帶開線那次的 hello，
+  很多命令同時各拿一個。UI 一次送 10 則訊息，就是 10 個請求先後送出、10 個回條各自回來（發發發…收收收…）。
+- **一個命令裡的一串**（後一個要前一個的結果，例：`room.refresh_devices` 先拿成員、再查變了的人的金鑰）還是一步等一步，但等的時候不擋別人；
+  互不相干的查詢一起送、一起收（`wbf_rooms.rs` 的 `room.get`：那一間的狀態與 `m.direct`）。
+  ⚠️ 🚫 一個命令替 UI 做完一整串（例：列表順便拿每一間的樣子）：UI 要什麼叫什麼，daemon 照做（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1）。
+- **線斷了**：正在等的命令拿到 `Network`，原樣回給 UI；🚫 留在 queue 裡等線重開再續送（/docs/design/daemon/link-pool.md §3：命令做到一半死了不重做、要不要重來是呼叫端的事）。
+  這是跟 2026-10-02 寫下的版本（`Misc` 也放一個 `RequestLine`、線斷了請求留在 queue）不一樣的地方，維護者 2026-10-05 定的。
+- **逾時**：`WsChannel` 的一問一答走 `WsLink::request_until_silent`，整條線 `LINE_SILENCE`（60 秒）沒有任何回應（心跳的 `Pong` 🚫 算）才回 `Timeout`（§4）。
+  一串回應的（`Recent` 的 `Batch`）還是每包自己的上限（第一窗 60 秒、之後 10 秒，維護者定）。
 
 ## 3. 動作是資料，🚫 不是閉包
 
@@ -67,6 +93,8 @@ enum DownloadRequest {                      // 例：Download 線（core 的 dow
 - 動作執行時一定拿到一個結果：`Ok(回覆)`、`Err(Timeout)`（有請求在等，線卻整段沒有回應）、`Err(Network)`（線斷了）、`Err(Server)`（server 拒絕）。**怎麼處置是動作的事**（§4）。
 
 ## 4. 失敗：每個動作都要說得出去處
+
+下表是有 `RequestLine` 的線（`Download`）的處置。RPC 來的命令（§2.1）沒有發送 queue：`Network`、`Timeout` 都直接交回 UI，🚫 排回去重送（/docs/design/daemon/link-pool.md §3：命令做到一半死了不重做）。
 
 | 收到 | 一般的處置 |
 |---|---|
@@ -105,23 +133,23 @@ enum DownloadRequest {                      // 例：Download 線（core 的 dow
 
 ## 7. seq 與 id 由線發
 
-- 一問一答的 seq：發送端一個計數器（只有發送端發號），**從 2³¹ 往上**（`link_requests::FIRST_SEQ`）。同一條 `WsLink` 上還有兩個發號的：
-  開線時的 `WbfClient`（`hello`，還沒搬過來的 CLI 路徑也是）從 1 往上、心跳從 `u32::MAX` 往下（/docs/design/daemon/ws-receive-dispatch.md §5.1），
-  三邊要撞到得先發二十億個請求；真撞到（`register` 回 `Usage`）就把請求放回 queue，下一輪換下一個號。
-- 具名會話的 id：線上一個 atomic 計數器（`id::SESSION` 型別）。
-- hello 的結果（feature、`recent_max_*`…）開線時拿到，放在線上，大家讀同一份。⚠️ 再 hello 會蓋掉宣告（/docs/design/daemon/link-pool.md §7），所以只有開線的人 hello。
+- 一問一答的 seq：**線上一個計數器**（`WsLink::next_seq`），**從 2³¹ 往上**、繞回也留在上半。同一條線上送請求的每一方——共用線上的 `WbfClient`、
+  下載處理端的 `RequestLine`、心跳——都從它拿，🚫 自己數（各自數的兩方同時用一條線就會撞號，`register` 回 `Usage`）。
+  下半留給上傳的塊號：`Upload/Chunk` 的 seq 就是塊索引，跟同一個上傳的 `Status` 同 id，所以線發的號🚫 落在那裡。
+- 具名會話的 id：線上一個 atomic 計數器（`WsLink::next_session_number`，加 `id::SESSION` 型別）。
+- 不共用的通道（HTTP、sdk 測試的假通道）沒有線，`WbfClient` 自己數（`PackChannel::line_seq` 回 `None`）。
+- hello 的結果（feature、`recent_max_*`…）開線時拿到，放在開線的那個 client 上；池發出去的每個 client 帶一份（`WbfClient::with_hello`）。
+  ⚠️ 再 hello 會蓋掉宣告（/docs/design/daemon/link-pool.md §7），所以只有開線的人 hello；`server.ping` 回的就是開線那次的答案。
 
 ## 8. 搬過來的順序
 
-一條線一條線搬，搬完的線就沒有「借線」那條路：
+都搬了，沒有「借線」那條路了：
 
-1. **`Download`**：跟下載處理端一起做（/docs/design/media/media-download.md §5、§6），它是這個形狀的第一個用戶（2026-10-02 做完）。
-   CLI 的 `download --no-cache`／`seek` 還在這條線上用舊的借線方式（等 CLI 改走 RPC 一併收掉）；seq 錯開，見 §7。
-2. `Misc`：一問一答最多的線；呼叫點從 `client.call(…).await` 改成交請求，命令本身要等結果的（RPC 要回應）就把「回覆 RPC」封進動作。
-3. `Upload`：照 §5 的例外，一個上傳一塊在途。
-4. `Rooms`／`Keys`：訂閱本來就是收件匣（具名會話），改的是它們偶爾發的一問一答（`ItemsDestroy`、`Unsubscribe`）。
-
-還沒搬的線維持舊的借線方式（/docs/design/daemon/link-pool.md §5）。
+1. **`Download`**：跟下載處理端一起做（/docs/design/media/media-download.md §5、§6），自己往下推的那種（`RequestLine`，2026-10-02）。
+   CLI 的 `download --no-cache`／`seek` 是 RPC 那種：拿共用線上的 client、等自己的回條。
+2. **`Misc`、`Upload`、`Rooms`／`Keys` 的一問一答**（2026-10-05）：§2.1 的形狀，一支一起搬。
+   - `Upload` 照 §5 的例外，一個上傳一塊在途：一個上傳命令一步等一步，別的命令照用這條線。
+   - `Rooms`／`Keys` 的訂閱本來就是收件匣（具名會話），沒變；它們偶爾發的一問一答（`ItemsDestroy`、`Unsubscribe`）跟別的命令一樣。
 
 ## 9. 跟 server 的關係（不靠，但要知道）
 

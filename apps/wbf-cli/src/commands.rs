@@ -19,8 +19,6 @@ use crate::unlock::{
 };
 use crate::{AccountAction, Cli, Command, KeyBackupAction, LoginArgs, RecoveryAction, UploadArgs};
 
-pub const CLIENT_NAME: &str = concat!("wbf-cli/", env!("CARGO_PKG_VERSION"));
-
 pub async fn run(cli: Cli) -> Result<(), CoreError> {
     let context = Context::from(&cli)?;
     let result = dispatch(&context, cli.command).await;
@@ -81,7 +79,7 @@ async fn dispatch(context: &Context, command: Command) -> Result<(), CoreError> 
         Command::Ping => {
             let hello = context
                 .core()?
-                .ping(context.transport, CLIENT_NAME, &context.target())
+                .ping(context.transport, &context.target())
                 .await?;
             print_value(&hello)
         }

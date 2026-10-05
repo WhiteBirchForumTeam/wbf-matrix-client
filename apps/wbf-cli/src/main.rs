@@ -172,7 +172,7 @@ pub enum Command {
     /// 拿掉 passphrase，local.key 回到明文（plain）模式
     RemovePassphrase,
     Whoami,
-    /// Hello 加 Ping，印 server 的 features 與上限
+    /// Ping，印開線那次 Hello 裡 server 的 features 與上限
     Ping,
     /// 固定大小上傳（可續傳），或 --stream 從 stdin 串流
     Upload(UploadArgs),

@@ -14,7 +14,6 @@ use wbf_sdk::Manifest;
 
 use super::{
     invalid_params, parse_params, to_result, Fail, Handle, Outcome, TargetParams, TransportParam,
-    DAEMON_NAME, DAEMON_VERSION,
 };
 use crate::data_plane::{UploadMeta, MEDIA_PATH, UPLOAD_META_HEADER, UPLOAD_PATH};
 use crate::message::code;
@@ -334,12 +333,5 @@ pub(super) async fn server_ping(handle: &Handle, core: &Core, params: Value) -> 
     }
     let params: Params = parse_params(params)?;
     let transport = handle.transport(&params.transport)?;
-    to_result(
-        core.ping(
-            transport,
-            &format!("{DAEMON_NAME} {DAEMON_VERSION}"),
-            &handle.target(&params.target),
-        )
-        .await?,
-    )
+    to_result(core.ping(transport, &handle.target(&params.target)).await?)
 }

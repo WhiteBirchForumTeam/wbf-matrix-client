@@ -55,7 +55,7 @@
 - **開**（`LinkOpener::open(account, role)`）：拿 vault 裡那個帳號的 session（`server`、`access_token`）→ `Channel::connect(WebSocket)`（Bearer 升級，**這就是登入**）
   → `hello(name, features_of(role))`。⚠️ 帳號**沒有 session**（沒登入過、或登出了）→ `Err(Usage("not logged in"))`，🚫 不開沒 token 的連線
   （server 允許未登入升級但 30 秒就關、而且我們沒有要在線上 `Session/Login`——那是另一支）。「未登入就閒置」＝池裡有這一格、沒有 socket。
-- **用**：`client_of` 回一個 `PooledClient`（一條線一次一個命令，§5）。呼叫端照舊 `client.xxx().await`。
+- **用**：`client_of` 回一個 `PooledClient`：同一條線上的一個 client，很多命令同時各拿一個（§5）。呼叫端照舊 `client.xxx().await`，等的是自己那一個回條。
 - **死**：`WsLink::is_closed()` 為 true（讀取或送出 task 走過 `shut_down`：對方關、寫失敗、**心跳沒回**）。池在**下一次**取用時看到就丟掉舊的、重開、再把命令做下去。
   📎 **心跳**（/docs/design/daemon/ws-receive-dispatch.md §5.1，維護者 2026-09-21）：每條線自己一個，**每 24 秒一定送一個 `Ping`**（維護者 2026-10-02：🚫 因為最近有收到東西就跳過）、送出 Ping 之後 10 秒什麼都沒收到才當死（`Pong` 排在別的回覆後面也不算死）。
   所以不送請求的線（只收推播的訂閱線）不會被 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）收掉，而對方悄悄不在了也會在半分鐘內變成 `is_closed()`——心跳本身不重連：重開的是下一次取用，或背景看線迴圈的下一輪（§3.1）。
@@ -69,7 +69,7 @@
 - **登出**（維護者 2026-09-21 定；完整順序在 /docs/design/daemon/account-session.md §4）：登出的 RPC 就是一次 HTTP `/logout`（一般 Matrix 帳號走 Client 的），**只有成與不成**。不成就到此為止，什麼都不動；
   成了就把這個帳號的池**直接關掉、釋放資源**（`close_all`），然後才刪本地的 `session.sealed`、`m/`…。池這邊看到的是：
   - `/logout` 成了：server 不再認這個 token。既有的線在下一個 message 被踢（server 每個 message 重驗），之後才開的線 hello 就被拒。
-  - `close_all`：等每一格的鎖、取出、關掉，池從註冊表拿掉。**還在處理的命令做完才被收**（它握著鎖）；正在開的那條也是。該落地的由 cache 寫入者照常落地。
+  - `close_all`：等每一格的寫鎖、取出、關掉，池從註冊表拿掉。**還在處理的命令做完才被收**（它們握著讀鎖，§5）；正在開的那條也是。等寫鎖的時候新來的命令排在它後面。該落地的由 cache 寫入者照常落地。
 
   🚫 **池裡不存「登出了沒」**：那件事的真相只有兩份——server 的 token 表與本地的 `session.sealed`——池再存一份就是第三份（維護者 2026-09-21：「這個改法有點髯」）。
   登出與一般命令的競賽因此由 server 裁決：`/logout` 之後任何新開的線都拿不到授權（hello 就是第一個 message），之前開的由 `close_all` 收。
@@ -92,7 +92,7 @@
 3. 一個一個帳號：沒登入的跳過；登出中的跳過（封池）；不是 wbf 的跳過——判準只看登入時記下的 `session.backend == Some(WbfSdk)`（跟 `init_keys`／`olm_engine_of` 同一條），
    🚫 不探 server（維護者 2026-09-29 選的：探測沒有逾時、失敗不記，每 15 秒一輪會對一般 Matrix 帳號一直敲門、server 黑洞時卡住整輪）。
    代價：沒記 backend 的 session（舊版封的、`--token` 接的，/docs/design/daemon/account-session.md §2）不會自動開線，重新登入一次就有。
-4. 五個角色照 `LinkRole::ALL` 的順序 `LinkPool::ensure_open`：開著的不動、**有命令正在用的算開著**（🚫 不排在一個長下載後面等）、沒開或死了的開一條（死的先發 `closed`）。
+4. 五個角色照 `LinkRole::ALL` 的順序 `LinkPool::ensure_open`：開著的不動、**正在開或正在關的算開著**（寫鎖在別人手上，🚫 排在它後面等；關掉的下一輪再開）、沒開或死了的開一條（死的先發 `closed`）。
    開不起來：發 `Note`、記進 `failed`、繼續下一條（一條不擋其他條、其他帳號）。
 
 **誰叫它**（daemon）：
@@ -127,13 +127,19 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 
 ## 5. 一條線上的請求：送收分開、動作封在請求裡
 
-**規則在 /docs/design/daemon/link-requests.md**（維護者 2026-10-02）：每條線一條發送 queue ＋ 一張在途表，請求送出去就不管，
-「拿到回覆之後做什麼」封在請求裡，回覆到了由那條線的處理端執行；預設無序，要守順序的例外由動作自己守。
-發送 queue 與在途表活得比底下的 `WsLink` 久：線斷了 queue 不丟，重開之後接著送。
-`Download` 只有一個用戶，它的發送 queue 在下載處理端身上、線從池借分身（`LinkPool::find_ws_link`）；很多命令共用的線（`Misc`）搬過來時，發送 queue 放進池的這一格。
+**規則在 /docs/design/daemon/link-requests.md**（維護者 2026-10-02、10-05）：🚫 握著線等回覆；預設無序，要守順序的例外由動作自己守。兩種形狀：
 
-**還沒搬過去的線**照舊的方式：`PooledClient` 是那條線的 `WbfClient` 的 `tokio::Mutex` guard，同一條線上第二個命令等第一個做完
-（`WbfClient` 的方法是 `&mut self`：請求號計數器、hello 的結果在它身上）。搬的順序在 /docs/design/daemon/link-requests.md §8：`Download` 已經搬了，`Misc`、`Upload`、`Rooms`／`Keys` 還是這樣。
+**自己往下推的狀態機**（`Download` 的下載處理端）：一條發送 queue ＋ 一張在途表，「拿到回覆之後做什麼」封在請求裡，回覆到了由處理端執行；
+發送 queue 與在途表活得比底下的 `WsLink` 久，線斷了 queue 不丟、重開之後接著送。它的 queue 在下載處理端身上、線從池借分身（`LinkPool::find_ws_link`）。
+
+**RPC 來的命令**（`Misc`、`Upload`、`Rooms`／`Keys` 的一問一答，維護者 2026-10-05，/docs/design/daemon/link-requests.md §2.1）：沒有發送 queue，每個命令等自己的回條。
+
+- 一格是 `tokio::RwLock<Option<WbfClient>>`（加一把「誰去開」的鎖，見下），裡面是**開線的那個 client**（線的擁有者，丟掉它就關線）。
+- **用**拿讀鎖：`PooledClient` 是同一條 `WsLink` 的分身、帶開線那次的 hello 的一個新 `WbfClient`，讀鎖跟著它。很多命令同時各拿一個，號由線發、🚫 撞（/docs/design/daemon/link-requests.md §7）。
+- **開、重開、關**拿寫鎖：關線等手上還在用它的命令做完（§3 的登出）。開好就降成讀鎖交出去。
+- **誰去開**：同時發現沒開（或死了）的命令先排一格自己的「開線」鎖，只有第一個去拿寫鎖開線；後面的等它**開好**、回頭拿讀鎖就用（🚫 各開一條）。
+  🚫 讓它們都去排寫鎖：寫鎖要等所有手上有這條線的命令都放掉，第二個會變成等第一個**做完**——解鎖後 UI 一次送 10 則（線剛開）正好排成一串（PR #72 審查 cirno／salvia）。
+- ⚠️ 一個命令🚫 握著一個 `PooledClient` 再要同一條線的第二個：中間如果有人在等寫鎖（登出），第二個讀鎖排在它後面、它又等第一個放——互等。要同時送就各拿各的（例：`wbf_rooms.rs` 的 `room.get`）。
 
 ## 6. daemon 那半：訂閱、推播、desync（/docs/design/rpc-specs/rpc-spec.md §3.9、§4）
 
@@ -159,13 +165,13 @@ pub trait LinkOpener: Send + Sync {
 
 - 正式的實作在 `Core`：session → `Channel::connect` → `hello(features_of(role))`。
 - 測試的實作用 `transport::memory_pair` 起 `WsLink`：池的生命週期（要用才開、死了重開、登出全關、事件有沒有發）不用真 server 就測得到。
-- `features_of(role)`：`Misc`（加密訊息從這條送）與 `Rooms`（收 `DeviceChanged`）宣告 `org.wbftw.device_versions`，其他三條空的（/docs/design/keys/e2ee-rpc.md §2）。⚠️ 同一條線重 `hello` 會蓋掉宣告，重 hello 的呼叫點要帶 `features_of` 回的那份。
+- `features_of(role)`：`Misc`（加密訊息從這條送）與 `Rooms`（收 `DeviceChanged`）宣告 `org.wbftw.device_versions`，其他三條空的（/docs/design/keys/e2ee-rpc.md §2）。⚠️ 同一條線重 `hello` 會蓋掉宣告，所以只有開線的人 hello；池發出去的 client 帶它的結果（§5），`server.ping`、`room.history`、`sync.recent` 🚫 再 hello。
 
 ## 8. 測試
 
 - `link_pool.rs` 單元（假 opener，記憶體對接）：同一角色第二次取用拿到同一條、不重開；不同角色是不同條；死了（對面丟掉 sink）下一次取用重開、`Link{Closed}` 再 `Link{Opened}`；
   沒 session 回 `Usage` 且不發事件；`close_all` 五條都關、發五則 `Closed`；**登出撞上正在 `open` 的 acquire**（oneshot 定順序）：`close_all` 等它開完、命令做完才收那條，事件是 Opened 再 Closed；
-  `Received` 事件帶對的 role 與標頭；`ensure_open`：沒開的開、開著的不動、有命令在用的算開著而且不等、死了的重開。`Transport::Http` 不進池這條沒有測試（core 從不開 Http）。
+  `Received` 事件帶對的 role 與標頭；`ensure_open`：沒開的開、開著的不動、有命令在用的算開著而且不等、死了的重開；**同一條線兩個命令同時用**（第二個🚫 等第一個、兩個請求都送出去了才回、號由線發🚫 撞）；**關線等還在用它的命令做完**。`Transport::Http` 不進池這條沒有測試（core 從不開 Http）。
 - `link_keeper.rs` 單元（server 是一個沒人聽的位址，所以「開」一定失敗——看的是**試了哪幾條**）：鎖著什麼都不做；登入的 wbf 帳號五條照順序都試、每條開不起來講一聲；
   已經有一輪在跑就跳過、跑完放旗子；生命週期鎖在別人手上整輪跳過、放手後照常；開著的 `Misc` 不動、死掉的 `Upload` 先發 `closed` 再重開；
   沒記 `backend: WbfSdk` 的 session 與沒登入的帳號一條都不開、而且🚫 沒探 server（探測註冊表是空的）。
@@ -179,4 +185,3 @@ pub trait LinkOpener: Send + Sync {
 
 - 第 8 階段監督者的其他部分：task panic 收攤、重連時重探 backend。背景看線（§3.1）是固定間隔＋失敗加倍，🚫 沒有更細的退避。
 - `Session/Login` 走 WS（另一支；現在的登入就是 Bearer 升級）。
-- 同一條線並行（§5）。
