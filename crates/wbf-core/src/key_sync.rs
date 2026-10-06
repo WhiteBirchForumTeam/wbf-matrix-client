@@ -61,7 +61,7 @@ struct KeySyncTask {
     pool: Arc<LinkPool>,
     /// 金鑰到了補解那些訊息用。
     cache: Arc<ServerCache>,
-    /// 補一次性金鑰失敗時交給金鑰線的 queue 重試（起不了就是 None）。
+    /// 補一次性金鑰失敗時交給金鑰線的後台重試（起不了就是 None）。
     key_share: Option<KeyShareInbox>,
 }
 
@@ -168,8 +168,8 @@ impl Core {
                 initial.otk_counts
             ));
         }
-        // 金鑰線的 queue（/docs/design/keys/e2ee-rpc.md §3.1）：這條線開好就起，上次 daemon 留在 `m/ks.sealed` 的房跟著讀回來。
-        // 起不了（沒解鎖）只講一聲：收金鑰照常，送金鑰等下一次送或 refresh 再起。
+        // 金鑰線的後台（/docs/design/keys/e2ee-rpc.md §3.1）：這條線開好就起。
+        // 起不了（沒解鎖）只講一聲：收金鑰照常，房間金鑰等下一次送或 refresh 再起。
         let key_share = match self.key_share_inbox(account).await {
             Ok(inbox) => Some(inbox),
             Err(error) => {
@@ -180,7 +180,7 @@ impl Core {
                 None
             }
         };
-        // 上傳自己的裝置金鑰、補一次性金鑰（第一次開線就是這一步讓別人查得到這台）。server 回 Ack 才算數：失敗就交給金鑰線的 queue 退避重試。
+        // 上傳自己的裝置金鑰、補一次性金鑰（第一次開線就是這一步讓別人查得到這台）。server 回 Ack 才算數：失敗就交給金鑰線的後台退避重試。
         if let Err(error) = engine.send_outgoing_requests(client).await {
             hand_own_key_upload_to_retry(
                 &self.events,
@@ -394,7 +394,7 @@ impl KeySyncTask {
     }
 
     /// `CryptoState` 說了自己在 server 上還剩幾把一次性金鑰：交給狀態機，它要補（不到 50 把、或 fallback key 用掉了）就上傳。
-    /// 上傳失敗交給金鑰線的 queue 退避重試到 server 回 Ack（/docs/design/keys/e2ee-rpc.md §3.1）；領光了還有 fallback key 撐著。
+    /// 上傳失敗交給金鑰線的後台退避重試到 server 回 Ack（/docs/design/keys/e2ee-rpc.md §3.1）；領光了還有 fallback key 撐著。
     async fn top_up_one_time_keys(&self, state: &CryptoStateMeta) {
         if let Err(error) = self
             .engine
@@ -482,7 +482,7 @@ async fn decrypt_what_the_keys_open(
     }
 }
 
-/// 自己的金鑰上傳失敗（server 沒回 Ack）：交給金鑰線的 queue 退避重試，並講一聲。
+/// 自己的金鑰上傳失敗（server 沒回 Ack）：交給金鑰線的後台退避重試，並講一聲。
 ///
 /// Args:
 ///     what: 哪一次上傳, example: "topping up one-time keys"

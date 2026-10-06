@@ -632,8 +632,7 @@ mod tests {
         let devices = core
             .refresh_room_devices(ROOM, None, &target)
             .await
-            .unwrap()
-            .devices;
+            .unwrap();
         let options = SendOptions {
             room_devices: Some(devices),
             txn_id: Some("t1".into()),

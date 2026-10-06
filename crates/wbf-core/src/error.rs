@@ -63,8 +63,12 @@ pub enum CoreErrorKind {
     /// server 拒絕或不講協議。
     Server,
     /// 加密訊息被 server 擋下：帶的房間版本號過期了（server 的 1506 `RoomDevicesChanged`）。訊息沒送。
-    /// daemon 已經自動重拿了房間狀態、把變了的裝置要的金鑰排好交給後台（還沒送到），新的狀態在 [`CoreError::data`]（/docs/design/keys/e2ee-rpc.md §3、§3.1）；重不重送是 UI 的事，🚫 等金鑰。
+    /// daemon 已經自動重拿了房間狀態、交給後台對新的狀態分好金鑰，新的狀態在 [`CoreError::data`]（/docs/design/keys/e2ee-rpc.md §3、§3.1）；
+    /// 重不重送是 UI 的事（帶新狀態、同一個 `txn_id`，送出時會等金鑰就緒）。
     RoomDevicesChanged,
+    /// 加密房的房間金鑰還沒準備好（後台在等待時間內沒分完，例：`Keys` 線不通）。訊息**沒加密、沒送**；後台照樣繼續分，
+    /// 用同一個 `txn_id` 重送就好（維護者 2026-10-06：送訊息只用已經分好的金鑰，/docs/design/keys/e2ee-rpc.md §3）。
+    RoomKeyNotReady,
     /// 完整性檢查不過（CRC、AEAD 標籤）。
     Integrity,
     Timeout,
@@ -96,6 +100,7 @@ impl CoreErrorKind {
             CoreErrorKind::Network => 1300,
             CoreErrorKind::Server => 1400,
             CoreErrorKind::RoomDevicesChanged => 1401,
+            CoreErrorKind::RoomKeyNotReady => 1402,
             CoreErrorKind::Integrity => 1500,
             CoreErrorKind::Timeout => 1600,
         }
@@ -208,6 +213,7 @@ mod tests {
             (CoreErrorKind::Network, 1300),
             (CoreErrorKind::Server, 1400),
             (CoreErrorKind::RoomDevicesChanged, 1401),
+            (CoreErrorKind::RoomKeyNotReady, 1402),
             (CoreErrorKind::Integrity, 1500),
             (CoreErrorKind::Timeout, 1600),
         ];

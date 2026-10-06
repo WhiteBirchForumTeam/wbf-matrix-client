@@ -541,7 +541,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
     .await;
     assert_eq!(joined["room_id"], room_id, "{joined}");
 
-    // 2. Alice 點進房間：refresh（第一次，每個人都查）→ 房間金鑰只在本機排好（送是後台的事，/docs/design/keys/e2ee-rpc.md §3.1）。
+    // 2. Alice 點進房間：refresh（第一次，每個人都查），🚫 碰房間金鑰（建、換、送都是後台的事，/docs/design/keys/e2ee-rpc.md §3.1）。
     let first = alice
         .engine
         .refresh_room_devices(&mut alice.ws, &room_id, None)
@@ -551,15 +551,24 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
     assert!(first.versions.members.contains_key(&bob1.session.user_id));
     assert!(first.rechecked.is_empty(), "雜湊第一次就對上：{first:?}");
 
-    // 3. Alice 帶這份快照的號碼送：接受——金鑰還沒送出去（送訊息🚫 綁發金鑰，維護者 2026-10-05）。
-    //    之後才由「後台」送金鑰（這裡直接叫 `distribute_room_key`）；Bob B1 拉 to-device 拿到房間金鑰、Recent 拉密文、解開。
+    // 3. 「後台」先把房間金鑰建好、送到 B1（這裡直接叫 `distribute_room_key`），送訊息只用分好的那把（維護者 2026-10-06）；
+    //    Alice 帶這份快照的號碼送：接受。Bob B1 拉 to-device 拿到房間金鑰、Recent 拉密文、解開。
+    let distributed = alice
+        .engine
+        .distribute_room_key(
+            &mut alice.ws,
+            &first.room_id,
+            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the background prepares the room key before the message");
+    assert!(distributed >= 1, "B1 must get the room key");
     let sent = alice
         .engine
         .encrypt_and_send(
             &mut alice.ws,
             &first.room_id,
             first.versions.room_version,
-            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi bob" }),
@@ -575,16 +584,6 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
     else {
         panic!("{sent:?}")
     };
-    let distributed = alice
-        .engine
-        .distribute_room_key(
-            &mut alice.ws,
-            &first.room_id,
-            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
-        )
-        .await
-        .expect("the background sends the room key after the message");
-    assert!(distributed >= 1, "B1 must get the room key");
     bob1.ws
         .device_subscribe(&bob1.session.device_id, Duration::from_secs(30))
         .await
@@ -630,7 +629,6 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
             &mut alice.ws,
             &first.room_id,
             first.versions.room_version,
-            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),
@@ -652,7 +650,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
     // server 原本的定義是只增不減的位置，外部審查 #5 之後可能改成成員集合的雜湊（wbfuwunel `docs/room-version-prev` 分支）——兩種定義下「變了」都成立。
     assert_ne!(current_room_version, first.versions.room_version);
 
-    // 6. 修：refresh（跟上一份比 → 只有 Bob 變了 → 只重查 Bob）。房間金鑰補給 B2 是後台的事（重送之後）。
+    // 6. 修：refresh（跟上一份比 → 只有 Bob 變了 → 只重查 Bob）。房間金鑰補給 B2 是後台的事（重送之前）。
     let second = alice
         .engine
         .refresh_room_devices(&mut alice.ws, &room_id, Some(&first.versions))
@@ -680,14 +678,23 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         .unwrap();
     assert!(known.contains(&bob2.session.device_id), "{known:?}");
 
-    // 7. 帶新號碼重送（同一個 txn_id）：接受。
+    // 7. 「後台」先把房間金鑰送到 B2，再帶新號碼重送（同一個 txn_id）：接受。
+    let distributed = alice
+        .engine
+        .distribute_room_key(
+            &mut alice.ws,
+            &second.room_id,
+            &second.versions.members.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the background prepares the room key for B2 before the resend");
+    assert!(distributed >= 1, "B2 must get the room key");
     let resent = alice
         .engine
         .encrypt_and_send(
             &mut alice.ws,
             &second.room_id,
             second.versions.room_version,
-            &second.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),
@@ -704,16 +711,6 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         panic!("{resent:?}")
     };
     assert_ne!(second_event_id, first_event_id);
-    let distributed = alice
-        .engine
-        .distribute_room_key(
-            &mut alice.ws,
-            &second.room_id,
-            &second.versions.members.keys().cloned().collect::<Vec<_>>(),
-        )
-        .await
-        .expect("the background sends the room key after the resend");
-    assert!(distributed >= 1, "B2 must get the room key");
 
     // 8. Bob 的新裝置 B2 收到那一輪的房間金鑰、解得開重送的那則；舊裝置 B1 也解得開。
     bob2.ws

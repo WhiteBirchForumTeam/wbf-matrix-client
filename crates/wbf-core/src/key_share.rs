@@ -1,31 +1,28 @@
-//! 金鑰線的 queue（/docs/design/keys/e2ee-rpc.md §3.1）：每個帳號一個後台 task，把「要上傳到 server 的金鑰」送到、**server 回 Ack 才算數**——
-//! 排在房間金鑰上的 to-device（送給該拿的裝置），以及這台裝置自己的金鑰（裝置金鑰、一次性金鑰）上傳失敗的那次。
+//! 金鑰線的後台（/docs/design/keys/e2ee-rpc.md §3、§3.1）：每個帳號一個 task，**房間金鑰只在這裡建、換、送**，server 回 Ack 才算數；
+//! 這台裝置自己的金鑰（裝置金鑰、一次性金鑰）上傳沒拿到 Ack 也在這裡重試。
 //!
-//! - 誰都🚫 等它（維護者 2026-10-05：送訊息🚫 綁發金鑰）。送出、refresh、1506 之後只「交給它」（[`Core::queue_room_key_share`]）就走。
-//! - 走 `Keys` 線、用 `reuse`，🚫 自己開線：線沒開就等，`init_keys` 開好線時叫醒它（[`Core::key_share_inbox`] ＋ [`KeyShareInbox::line_opened`]）。
-//! - 失敗的留著，隔一段時間再試（`RETRY_FIRST` 起加倍到 `RETRY_MAX`），講一聲（`Note`），🚫 回給誰（沒有人在等）。
-//! - **還有哪些房沒送完存在 `m/ks.sealed`**（維護者 2026-10-06，/docs/design/storage/local-storage.md）：daemon 重開、`Keys` 線一開就照著補。
-//!   要送的 to-device 本身存在上游那把 session 上（crypto store），這個檔只記「哪個房、送給哪些成員」，第三把子金鑰封著。
-//!   自己的金鑰沒存：上游自己記得還有沒上傳的，每次開線 `init_keys` 都會再上傳一次。
+//! - **送訊息只用已經分好的金鑰**（維護者 2026-10-06）：送出前問「房 R 的金鑰對房間版本號 V 就緒了沒」（[`Core::is_room_key_ready_within`]），
+//!   沒有就交給這裡準備（`Prepare`），最多等 `ROOM_KEY_WAIT`；等不到，那一則就不送。
+//! - 送出之後交 `AfterSend`：這把快到期就提早換、先分完，下一則拿到的就是就緒的。refresh、1506 之後交 `Prepare`：對新的 V 先分好。
+//! - 走 `Keys` 線、用 `reuse`，🚫 自己開線：線沒開就等，`init_keys` 開好線時叫醒它（[`KeyShareInbox::line_opened`]）。
+//! - 失敗的留著，隔一段時間再試（`RETRY_FIRST` 起加倍到 `RETRY_MAX`），講一聲（`Note`）。
+//! - 🚫 存檔：待送的那一份在上游 crypto store 的 session 上，而沒拿到 Ack 的金鑰從來沒被拿來加密過，daemon 重開丟了也沒有訊息解不開；
+//!   下一次 refresh 或送出會再交進來。自己的金鑰也一樣：上游記得還有沒上傳的，每次開線 `init_keys` 都會再傳。
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::time::Instant;
-use wbf_sdk::crypto_engine::OlmEngine;
-use wbf_sdk::vault::KeyShareQueueFile;
+use wbf_sdk::crypto_engine::{OlmEngine, RoomKeyState};
 
 use crate::accounts::AccountDir;
 use crate::error::CoreError;
 use crate::event::EventSink;
 use crate::link_pool::{LinkPool, LinkRole};
 use crate::Core;
-
-/// 金鑰線的 queue 存在帳號目錄的 `m/` 裡（跟 crypto store 同生共死：`m/` 被刪它就一起沒）。
-pub(crate) const KEY_SHARE_QUEUE_FILE_NAME: &str = "ks.sealed";
 
 /// 一件事送失敗之後，第一次隔多久再試；之後每次加倍，到 `RETRY_MAX` 為止（維護者 2026-10-05 照預設：30 秒到 5 分鐘）。
 #[cfg(not(test))]
@@ -39,29 +36,63 @@ const RETRY_FIRST: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_millis(800);
 /// 收 task 時等它結束最久多久（abort 之後通常下一次 poll 就放手）。
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// 送出等房間金鑰就緒最久多久（維護者 2026-10-06：2 秒），等不到那一則就回「金鑰還沒準備好」。
+#[cfg(not(test))]
+pub(crate) const ROOM_KEY_WAIT: Duration = Duration::from_secs(2);
+/// 測試裡縮短，等不到的那條才不用真的等 2 秒。
+#[cfg(test)]
+pub(crate) const ROOM_KEY_WAIT: Duration = Duration::from_millis(500);
 
-/// `m/ks.sealed` 解開之後的樣子（我們自己的格式，/docs/design/storage/local-storage.md）。
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct QueuedRoomKeys {
-    /// 格式版本；看不懂的版本🚫 猜。
-    v: u32,
-    /// 房間 id → 要拿這把房間金鑰的成員（UI 帶來的那份 join 成員，含自己）。
-    rooms: BTreeMap<String, Vec<String>>,
+/// 一個房要準備成什麼樣子：對這個房間版本號（UI 帶來的那份成員與裝置）分好金鑰。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RoomKeyWant {
+    /// example: 81234
+    room_version: u64,
+    /// 那一份的 join 成員（含自己）, example: vec!["@alice:localhost".to_string()]
+    members: Vec<String>,
+    /// 先丟掉現在那把再分（提早換）；丟過一次就清掉，重試🚫 再丟（不然剛分到一半的新金鑰又被丟掉）。
+    discard_first: bool,
 }
-
-const QUEUED_ROOM_KEYS_VERSION: u32 = 1;
 
 /// 交給後台的一件事。
 enum KeyShareWork {
-    /// 這個房的房間金鑰要送給這些人；同一個房還沒做完又來，成員取最新的。
-    Room { room: String, members: Vec<String> },
+    /// 這個房對這個房間版本號要有分好的金鑰（refresh、1506 之後、送出時發現還沒就緒）。
+    Prepare { room: String, want: RoomKeyWant },
+    /// 剛送出一則：看這把是不是快到期了，是就提早換。
+    AfterSend { room: String, want: RoomKeyWant },
     /// 這台裝置自己的金鑰上傳失敗了：之後重試到 server 回 Ack。
     UploadOwnKeys,
     /// `Keys` 線剛開好：手上還沒做完的再跑一輪。
     LineOpened,
 }
 
-/// 往這個帳號的後台交事情的那頭（`init_keys` 與收金鑰的 task 各握一份）。後台收掉了就交不上，回 false。
+/// 哪個房的金鑰對哪個房間版本號分好了（task 寫、送出那一路讀）。每次有房就緒，`changed` 的數字就 +1，等待的人醒來重看。
+struct RoomKeyReadiness {
+    /// 房間 id → 分好時依據的房間版本號
+    ready: Mutex<HashMap<String, u64>>,
+    changed: watch::Sender<u64>,
+}
+
+impl RoomKeyReadiness {
+    fn ready(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Return:
+    ///     bool  true ＝ 這個房的金鑰是對這個房間版本號分好的
+    fn is_ready_for(&self, room: &str, room_version: u64) -> bool {
+        self.ready().get(room) == Some(&room_version)
+    }
+
+    fn set_ready(&self, room: &str, room_version: u64) {
+        self.ready().insert(room.to_string(), room_version);
+        self.changed.send_modify(|generation| *generation += 1);
+    }
+}
+
+/// 往這個帳號的後台交事情的那頭（`init_keys` 與收金鑰的 task 各握一份）。
 #[derive(Clone)]
 pub(crate) struct KeyShareInbox(UnboundedSender<KeyShareWork>);
 
@@ -74,17 +105,18 @@ impl KeyShareInbox {
         self.0.send(KeyShareWork::UploadOwnKeys).is_ok()
     }
 
-    /// `Keys` 線開好了：手上還沒做完的（含上次 daemon 留在 `m/ks.sealed` 的）再跑一輪。
+    /// `Keys` 線開好了：手上還沒做完的再跑一輪。
     pub(crate) fn line_opened(&self) {
         let _ = self.0.send(KeyShareWork::LineOpened);
     }
 }
 
-/// 一個帳號的送金鑰 task。丟掉就 abort（登出、`Core` 丟掉）。
+/// 一個帳號的後台。丟掉就 abort（登出、`Core` 丟掉）。
 pub(crate) struct KeyShareHandle {
     inbox: KeyShareInbox,
+    readiness: Arc<RoomKeyReadiness>,
     task: tokio::task::JoinHandle<()>,
-    /// 試過幾次（送一個房、或重傳一次自己的金鑰；只給測試：送成之後再試不會走橋，從假 server 看不出來有沒有停）。
+    /// 試過幾次（分一個房、或重傳一次自己的金鑰；只給測試：做成之後再試不會走橋，從假 server 看不出來有沒有停）。
     #[cfg(test)]
     attempts: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -95,46 +127,125 @@ impl Drop for KeyShareHandle {
     }
 }
 
-/// task 自己握著的東西——🚫 不握 `Core`、不握線（線在池裡，要用時 `reuse` 那一格）、🚫 握主金鑰（queue 檔只帶第三把子金鑰）。
+/// task 自己握著的東西——🚫 不握 `Core`、不握線（線在池裡，要用時 `reuse` 那一格）。
 struct KeyShareTask {
     engine: Arc<OlmEngine>,
     pool: Arc<LinkPool>,
     events: EventSink,
-    queue_file: KeyShareQueueFile,
+    readiness: Arc<RoomKeyReadiness>,
     #[cfg(test)]
     attempts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Core {
-    /// 把這個房的房間金鑰交給後台送（/docs/design/keys/e2ee-rpc.md §3.1）；🚫 等它送。
-    /// 起不了後台（引擎開不起來、正在登出）只講一聲：金鑰還排在 session 上，下一次送或 refresh 會再交。
+    /// 讓後台對這個房間版本號分好這個房的金鑰（refresh、1506 之後叫）；🚫 等它。
+    /// 起不了後台（引擎開不起來、正在登出）只講一聲：送出時會再交一次，那時等不到就回「金鑰還沒準備好」。
     ///
     /// Args:
     ///     room: example: "!r:localhost"
-    ///     members: UI 帶來的那份 join 成員（含自己）, example: vec!["@alice:localhost".to_string(), "@bob:localhost".to_string()]
-    pub(crate) async fn queue_room_key_share(
+    ///     room_version: example: 81234
+    ///     members: 那一份的 join 成員（含自己）, example: vec!["@alice:localhost".to_string(), "@bob:localhost".to_string()]
+    pub(crate) async fn prepare_room_key(
         &self,
         account: &AccountDir,
         room: &str,
+        room_version: u64,
         members: Vec<String>,
     ) {
-        let work = KeyShareWork::Room {
-            room: room.to_string(),
+        let want = RoomKeyWant {
+            room_version,
             members,
+            discard_first: false,
         };
-        let handed = match self.key_share_inbox(account).await {
-            Ok(inbox) => inbox.0.send(work).is_ok(),
-            Err(_) => false,
+        self.hand_key_share_work(
+            account,
+            room,
+            KeyShareWork::Prepare {
+                room: room.to_string(),
+                want,
+            },
+        )
+        .await;
+    }
+
+    /// 剛送出一則加密訊息：交給後台看這把是不是快到期了，是就提早換、先分完；🚫 等它。
+    pub(crate) async fn room_key_used(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        room_version: u64,
+        members: Vec<String>,
+    ) {
+        let want = RoomKeyWant {
+            room_version,
+            members,
+            discard_first: false,
         };
-        if !handed {
-            self.events.progress(format!(
-                "room keys: the key of {room} stays queued in the crypto store; the background sender for {} is not running",
-                account.label()
-            ));
+        self.hand_key_share_work(
+            account,
+            room,
+            KeyShareWork::AfterSend {
+                room: room.to_string(),
+                want,
+            },
+        )
+        .await;
+    }
+
+    /// 送出前：這個房的金鑰對這個房間版本號分好了沒；還沒就交給後台準備，最多等 `wait`。
+    ///
+    /// Args:
+    ///     room: example: "!r:localhost"
+    ///     room_version: UI 帶來的那份, example: 81234
+    ///     members: 同一份的 join 成員（含自己）, example: vec!["@alice:localhost".to_string()]
+    ///     wait: example: ROOM_KEY_WAIT
+    /// Return:
+    ///     Ok(bool)    true ＝ 就緒（這一刻的金鑰排過的 to-device 都拿到 Ack、是對這個版本分的）；false ＝ 等到時間還沒好
+    ///     Err(...)    引擎開不起來、正在登出、沒解鎖、crypto store 讀不了
+    pub(crate) async fn is_room_key_ready_within(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        room_version: u64,
+        members: &[String],
+        wait: Duration,
+    ) -> Result<bool, CoreError> {
+        let engine = self.olm_engine_of(account).await?;
+        let (inbox, readiness) = self.key_share_parts(account).await?;
+        // 先訂閱再看：看完到開始等之間就緒的，也會讓下面的 `changed()` 醒來。
+        let mut changed = readiness.changed.subscribe();
+        let deadline = Instant::now() + wait;
+        let mut handed = false;
+        loop {
+            if readiness.is_ready_for(room, room_version)
+                && matches!(
+                    engine.room_key_state(room).await?,
+                    RoomKeyState::Ready { .. }
+                )
+            {
+                return Ok(true);
+            }
+            if !handed {
+                handed = true;
+                let want = RoomKeyWant {
+                    room_version,
+                    members: members.to_vec(),
+                    discard_first: false,
+                };
+                let _ = inbox.0.send(KeyShareWork::Prepare {
+                    room: room.to_string(),
+                    want,
+                });
+            }
+            match tokio::time::timeout_at(deadline, changed.changed()).await {
+                Ok(Ok(())) => continue,
+                // 時間到、或後台收掉了（它的 sender 丟了）：都是沒等到。
+                Ok(Err(_)) | Err(_) => return Ok(false),
+            }
         }
     }
 
-    /// 這個帳號的後台：在跑就給它的 inbox；沒有就起一個——起的時候讀回 `m/ks.sealed` 上次沒送完的房。
+    /// 這個帳號的後台的 inbox（`init_keys` 用）；沒在跑就起一個。
     ///
     /// Return:
     ///     Ok(KeyShareInbox)
@@ -143,51 +254,11 @@ impl Core {
         &self,
         account: &AccountDir,
     ) -> Result<KeyShareInbox, CoreError> {
-        if let Some(inbox) = self.running_key_share_inbox(account) {
-            return Ok(inbox);
-        }
-        // 開引擎是 async，鎖外做；起的時候再看一次（同時進來的另一個可能剛起好）。
-        let engine = self.olm_engine_of(account).await?;
-        let pool = self.pool_of_account(account)?;
-        let queue_file = self
-            .vault()?
-            .key_share_queue_file(&account.matrix_store_dir().join(KEY_SHARE_QUEUE_FILE_NAME));
-        let mut shares = self
-            .key_shares
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(handle) = shares.get(&account.dir) {
-            if !handle.task.is_finished() {
-                return Ok(handle.inbox.clone());
-            }
-        }
-        let (sender, receiver) = unbounded_channel();
-        let inbox = KeyShareInbox(sender);
-        #[cfg(test)]
-        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let task = KeyShareTask {
-            engine,
-            pool,
-            events: self.events.clone(),
-            queue_file,
-            #[cfg(test)]
-            attempts: attempts.clone(),
-        };
-        shares.insert(
-            account.dir.clone(),
-            KeyShareHandle {
-                inbox: inbox.clone(),
-                task: tokio::spawn(task.run(receiver)),
-                #[cfg(test)]
-                attempts,
-            },
-        );
-        Ok(inbox)
+        Ok(self.key_share_parts(account).await?.0)
     }
 
-    /// 收掉這個帳號的送金鑰 task（登出用），**等它真的結束**才回：task 握著引擎（`m/` 的 sqlite），
+    /// 收掉這個帳號的後台（登出用），**等它真的結束**才回：task 握著引擎（`m/` 的 sqlite），
     /// 只 abort 不等的話它要等下一次被 poll 才放手，而登出接著就要刪 `m/`（Windows 上開著刪不掉；單執行緒的 runtime 上刪檔的重試還會擋住它被 poll）。
-    /// 還沒送的仍在 crypto store 與 `m/ks.sealed`，但登出會刪整個 `m/`。
     pub(crate) async fn stop_room_key_share_of(&self, account: &AccountDir) {
         let handle = self
             .key_shares
@@ -210,27 +281,90 @@ impl Core {
         }
     }
 
+    /// 交一件房間金鑰的事給後台；起不了就講一聲。
+    async fn hand_key_share_work(&self, account: &AccountDir, room: &str, work: KeyShareWork) {
+        let handed = match self.key_share_parts(account).await {
+            Ok((inbox, _)) => inbox.0.send(work).is_ok(),
+            Err(_) => false,
+        };
+        if !handed {
+            self.events.progress(format!(
+                "room keys: the key of {room} cannot be prepared now; the background sender for {} is not running",
+                account.label()
+            ));
+        }
+    }
+
+    /// 這個帳號的後台：在跑就給它的 inbox 與就緒表；沒有就起一個。
+    ///
     /// Return:
-    ///     Some(KeyShareInbox)   這個帳號的後台正在跑
-    ///     None                  還沒起、或已經結束
-    fn running_key_share_inbox(&self, account: &AccountDir) -> Option<KeyShareInbox> {
+    ///     Ok((KeyShareInbox, Arc<RoomKeyReadiness>))
+    ///     Err(...)    引擎開不起來、正在登出、沒解鎖
+    async fn key_share_parts(
+        &self,
+        account: &AccountDir,
+    ) -> Result<(KeyShareInbox, Arc<RoomKeyReadiness>), CoreError> {
+        if let Some(parts) = self.running_key_share_parts(account) {
+            return Ok(parts);
+        }
+        // 開引擎是 async，鎖外做；起的時候再看一次（同時進來的另一個可能剛起好）。
+        let engine = self.olm_engine_of(account).await?;
+        let pool = self.pool_of_account(account)?;
+        let mut shares = self
+            .key_shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = shares.get(&account.dir) {
+            if !handle.task.is_finished() {
+                return Ok((handle.inbox.clone(), handle.readiness.clone()));
+            }
+        }
+        let (sender, receiver) = unbounded_channel();
+        let inbox = KeyShareInbox(sender);
+        let readiness = Arc::new(RoomKeyReadiness {
+            ready: Mutex::new(HashMap::new()),
+            changed: watch::channel(0).0,
+        });
+        #[cfg(test)]
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let task = KeyShareTask {
+            engine,
+            pool,
+            events: self.events.clone(),
+            readiness: readiness.clone(),
+            #[cfg(test)]
+            attempts: attempts.clone(),
+        };
+        shares.insert(
+            account.dir.clone(),
+            KeyShareHandle {
+                inbox: inbox.clone(),
+                readiness: readiness.clone(),
+                task: tokio::spawn(task.run(receiver)),
+                #[cfg(test)]
+                attempts,
+            },
+        );
+        Ok((inbox, readiness))
+    }
+
+    /// Return:
+    ///     Some((KeyShareInbox, Arc<RoomKeyReadiness>))   這個帳號的後台正在跑
+    ///     None                                           還沒起、或已經結束
+    fn running_key_share_parts(
+        &self,
+        account: &AccountDir,
+    ) -> Option<(KeyShareInbox, Arc<RoomKeyReadiness>)> {
         self.key_shares
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&account.dir)
             .filter(|handle| !handle.task.is_finished())
-            .map(|handle| handle.inbox.clone())
+            .map(|handle| (handle.inbox.clone(), handle.readiness.clone()))
     }
 
     /// Return:
-    ///     bool  true ＝ 這個帳號的送金鑰 task 還在（只給測試斷言用）
-    #[cfg(test)]
-    pub(crate) fn is_sharing_room_keys(&self, account: &AccountDir) -> bool {
-        self.running_key_share_inbox(account).is_some()
-    }
-
-    /// Return:
-    ///     u32  這個帳號的後台試過幾次（送一個房、或重傳一次自己的金鑰；只給測試斷言。還沒有後台是 0）
+    ///     u32  這個帳號的後台試過幾次（分一個房、或重傳一次自己的金鑰；只給測試斷言。還沒有後台是 0）
     #[cfg(test)]
     pub(crate) fn key_share_attempts(&self, account: &AccountDir) -> u32 {
         self.key_shares
@@ -245,7 +379,9 @@ impl Core {
 
 impl KeyShareTask {
     async fn run(self, mut work: UnboundedReceiver<KeyShareWork>) {
-        let mut rooms = self.load_rooms();
+        // 要分的房（同一個房只留一件，要的取最新）；剛送出、要看該不該提早換的房。
+        let mut rooms: BTreeMap<String, RoomKeyWant> = BTreeMap::new();
+        let mut used: BTreeMap<String, RoomKeyWant> = BTreeMap::new();
         let mut upload_own_keys = false;
         let mut retry_in = RETRY_FIRST;
         let mut retry_at: Option<Instant> = None;
@@ -264,12 +400,13 @@ impl KeyShareTask {
                     None => return,
                 },
             };
-            let mut changed = take_work(&mut rooms, &mut upload_own_keys, next);
+            take_work(&mut rooms, &mut used, &mut upload_own_keys, next);
             while let Ok(more) = work.try_recv() {
-                changed |= take_work(&mut rooms, &mut upload_own_keys, Some(more));
+                take_work(&mut rooms, &mut used, &mut upload_own_keys, Some(more));
             }
-            if changed {
-                self.save_rooms(&rooms);
+            // 剛送出的：只讀本機，快到期才交去換（🚫 每則都上網）。
+            for (room, want) in std::mem::take(&mut used) {
+                self.check_after_send(&mut rooms, room, want).await;
             }
             if rooms.is_empty() && !upload_own_keys {
                 retry_at = None;
@@ -296,37 +433,28 @@ impl KeyShareTask {
                     }
                 }
             }
-            let pending: Vec<(String, Vec<String>)> = rooms
-                .iter()
-                .map(|(room, members)| (room.clone(), members.clone()))
-                .collect();
-            let mut sent_any = false;
-            for (room, members) in pending {
+            let pending: Vec<String> = rooms.keys().cloned().collect();
+            for room in pending {
+                let Some(want) = rooms.get_mut(&room) else {
+                    continue;
+                };
                 #[cfg(test)]
                 self.attempts
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                match self
-                    .engine
-                    .distribute_room_key(&mut line, &room, &members)
-                    .await
-                {
-                    Ok(_) => {
+                match self.prepare(&mut line, &room, want).await {
+                    Ok(()) => {
                         rooms.remove(&room);
-                        sent_any = true;
                     }
                     Err(error) => {
                         failed = true;
                         self.events.progress(format!(
-                            "room keys: sending the key of {room} failed (retried in {}s): {error}",
+                            "room keys: preparing the key of {room} failed (retried in {}s): {error}",
                             retry_in.as_secs_f32()
                         ));
                     }
                 }
             }
             drop(line);
-            if sent_any {
-                self.save_rooms(&rooms);
-            }
             if failed {
                 retry_at = Some(Instant::now() + retry_in);
                 retry_in = (retry_in * 2).min(RETRY_MAX);
@@ -337,79 +465,91 @@ impl KeyShareTask {
         }
     }
 
-    /// 上次 daemon 沒送完的房（`m/ks.sealed`）。沒有檔就是沒有；檔壞了或看不懂就講一聲、從空的開始——
-    /// 🚫 刪它（下次寫的時候才蓋掉），那些房下一次送或 refresh 會再交進來。
-    fn load_rooms(&self) -> BTreeMap<String, Vec<String>> {
-        let plaintext = match self.queue_file.read() {
-            Ok(Some(plaintext)) => plaintext,
-            Ok(None) => return BTreeMap::new(),
-            Err(error) => {
-                self.events.progress(format!(
-                    "room keys: the key-share queue could not be opened ({error}); starting empty"
-                ));
-                return BTreeMap::new();
+    /// 剛送出一則之後：這把就緒而且快到期 → 交去提早換；已經不就緒（到期、作廢）→ 交去分一把新的；就緒也沒到期 → 什麼都不做。
+    async fn check_after_send(
+        &self,
+        rooms: &mut BTreeMap<String, RoomKeyWant>,
+        room: String,
+        mut want: RoomKeyWant,
+    ) {
+        match self.engine.room_key_state(&room).await {
+            Ok(RoomKeyState::Ready {
+                due_for_rotation: false,
+                ..
+            }) => {}
+            Ok(RoomKeyState::Ready {
+                due_for_rotation: true,
+                ..
+            }) => {
+                want.discard_first = true;
+                merge_want(rooms, room, want);
             }
-        };
-        match serde_json::from_slice::<QueuedRoomKeys>(&plaintext) {
-            Ok(queue) if queue.v == QUEUED_ROOM_KEYS_VERSION => queue.rooms,
-            Ok(queue) => {
-                self.events.progress(format!(
-                    "room keys: the key-share queue has version {}, this build understands {QUEUED_ROOM_KEYS_VERSION}; starting empty",
-                    queue.v
-                ));
-                BTreeMap::new()
-            }
-            Err(error) => {
-                self.events.progress(format!(
-                    "room keys: the key-share queue is not readable ({error}); starting empty"
-                ));
-                BTreeMap::new()
-            }
+            Ok(RoomKeyState::NotReady { .. }) => merge_want(rooms, room, want),
+            Err(error) => self.events.progress(format!(
+                "room keys: cannot read the key state of {room} after sending: {error}"
+            )),
         }
     }
 
-    /// 寫回 `m/ks.sealed`（空了就刪檔）。寫失敗只講一聲：記憶體裡的照送，只是重開之後不會接著送。
-    fn save_rooms(&self, rooms: &BTreeMap<String, Vec<String>>) {
-        let saved = if rooms.is_empty() {
-            self.queue_file.remove()
-        } else {
-            serde_json::to_vec(&QueuedRoomKeys {
-                v: QUEUED_ROOM_KEYS_VERSION,
-                rooms: rooms.clone(),
-            })
-            .map_err(|error| wbf_sdk::SdkError::Protocol(format!("key-share queue: {error}")))
-            .and_then(|plaintext| self.queue_file.write(&plaintext))
-        };
-        if let Err(error) = saved {
-            self.events.progress(format!(
-                "room keys: the key-share queue could not be saved ({error}); rooms still queued are lost if the daemon restarts"
-            ));
+    /// 分好一個房：要提早換就先丟掉現在那把（只丟一次）→ 建／換、送到每台裝置 → 確認就緒才記下這個房間版本號、叫醒等的人。
+    ///
+    /// Return:
+    ///     Ok(())       就緒了
+    ///     Err(...)     任何一步失敗、或送完了還不就緒（留著重試）
+    async fn prepare(
+        &self,
+        line: &mut wbf_sdk::WbfClient<wbf_sdk::Channel>,
+        room: &str,
+        want: &mut RoomKeyWant,
+    ) -> Result<(), wbf_sdk::SdkError> {
+        if want.discard_first {
+            self.engine.discard_room_key(room).await?;
+            want.discard_first = false;
+        }
+        self.engine
+            .distribute_room_key(line, room, &want.members)
+            .await?;
+        match self.engine.room_key_state(room).await? {
+            RoomKeyState::Ready { .. } => {
+                self.readiness.set_ready(room, want.room_version);
+                Ok(())
+            }
+            RoomKeyState::NotReady { reason } => Err(wbf_sdk::SdkError::Protocol(format!(
+                "the key is still not ready after distributing it: {reason}"
+            ))),
         }
     }
 }
 
-/// 一件事併進手上的事：同一個房只留一件、成員取最新的；自己的金鑰要重傳就記一筆；開線那一聲與重試到時不加新的。
-///
-/// Return:
-///     bool  true ＝ 房的清單變了（要寫回 `m/ks.sealed`）
+/// 同一個房只留一件：要的取最新的（房間版本號、成員），「先丟掉」只要有一件要就保留。
+fn merge_want(rooms: &mut BTreeMap<String, RoomKeyWant>, room: String, want: RoomKeyWant) {
+    let discard_first = want.discard_first
+        || rooms
+            .get(&room)
+            .is_some_and(|previous| previous.discard_first);
+    rooms.insert(
+        room,
+        RoomKeyWant {
+            discard_first,
+            ..want
+        },
+    );
+}
+
+/// 一件事併進手上的事。開線那一聲與重試到時不加新的。
 fn take_work(
-    rooms: &mut BTreeMap<String, Vec<String>>,
+    rooms: &mut BTreeMap<String, RoomKeyWant>,
+    used: &mut BTreeMap<String, RoomKeyWant>,
     upload_own_keys: &mut bool,
     work: Option<KeyShareWork>,
-) -> bool {
+) {
     match work {
-        Some(KeyShareWork::Room { room, members }) => {
-            if rooms.get(&room) == Some(&members) {
-                return false;
-            }
-            rooms.insert(room, members);
-            true
+        Some(KeyShareWork::Prepare { room, want }) => merge_want(rooms, room, want),
+        Some(KeyShareWork::AfterSend { room, want }) => {
+            used.insert(room, want);
         }
-        Some(KeyShareWork::UploadOwnKeys) => {
-            *upload_own_keys = true;
-            false
-        }
-        Some(KeyShareWork::LineOpened) | None => false,
+        Some(KeyShareWork::UploadOwnKeys) => *upload_own_keys = true,
+        Some(KeyShareWork::LineOpened) | None => {}
     }
 }
 
@@ -418,8 +558,11 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
-    use super::{RETRY_FIRST, RETRY_MAX};
+    use wbf_sdk::crypto_engine::RoomKeyState;
+
+    use super::RETRY_MAX;
     use crate::accounts::AccountDir;
+    use crate::error::CoreErrorKind;
     use crate::link_pool::LinkRole;
     use crate::room_crypto::{RoomDevices, SendOptions};
     use crate::test_support::*;
@@ -460,10 +603,20 @@ mod tests {
         }
     }
 
-    /// 送訊息🚫 綁發金鑰（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §3）：送的那一路假 server 一個走橋的請求都🚫 收到
-    /// （`Members`／`/keys/query`／`/keys/claim`／`sendToDevice` 全沒有），`Event/Send` 送的是密文；金鑰之後由後台走 `Keys` 線送（§3.1）。
+    /// 這個房現在那把房間金鑰的 session id 與狀態（測試用）。
+    async fn room_key_state(core: &Core, account: &AccountDir) -> RoomKeyState {
+        core.olm_engine_of(account)
+            .await
+            .unwrap()
+            .room_key_state(ROOM)
+            .await
+            .unwrap()
+    }
+
+    /// 送訊息只用已經分好的金鑰（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：送的那一路（`Misc`）一個走橋的請求都🚫 收到，
+    /// 金鑰是後台在 `Keys` 線上建、送完才拿來加密；送出去的是密文、帶那個號碼。
     #[tokio::test]
-    async fn an_encrypted_send_asks_for_no_keys_and_the_background_sends_them_on_the_keys_line() {
+    async fn an_encrypted_send_only_uses_a_key_the_background_prepared_on_the_keys_line() {
         let dir = scratch("key-share-send");
         let (core, account) = core_with_wbf_account(&dir).await;
         let misc = encrypted_room_on_misc(&core, &account).await;
@@ -471,11 +624,15 @@ mod tests {
 
         core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
             .await
-            .expect("sent without waiting for any key");
+            .expect("sent once the background prepared the key");
         assert_eq!(
             *misc.bridge_calls.lock().unwrap(),
             Vec::new(),
             "the send path asks the server for no keys"
+        );
+        assert!(
+            !keys.bridge_calls.lock().unwrap().is_empty(),
+            "the key was prepared on the Keys line before the send"
         );
         let sent = misc.sent_events.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -483,52 +640,80 @@ mod tests {
             (sent[0].1.as_str(), sent[0].2),
             ("m.room.encrypted", Some(7))
         );
-
-        wait_for_async(
-            || async { !keys.bridge_calls.lock().unwrap().is_empty() },
-            "the background works on the Keys line",
-        )
-        .await;
-        assert!(core.is_sharing_room_keys(&account));
-        assert_eq!(
-            *misc.bridge_calls.lock().unwrap(),
-            Vec::new(),
-            "the background does not use the line the command used"
-        );
+        assert!(matches!(
+            room_key_state(&core, &account).await,
+            RoomKeyState::Ready {
+                message_count: 1,
+                ..
+            }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 後台🚫 自己開線：`Keys` 線沒開就等，開好那一聲（`init_keys` 叫的 `line_opened`）來了才送。
-    /// 送失敗的房隔一段時間（`RETRY_FIRST`）再試；送成就停，🚫 一直重送。
+    /// `Keys` 線沒開：後台🚫 自己開線，送出最多等 `ROOM_KEY_WAIT`，等不到就 `RoomKeyNotReady`、訊息沒加密沒送、`data` 帶 `txn_id`。
+    /// 線開好那一聲（`init_keys` 叫的 `line_opened`）之後後台分好，同一個 `txn_id` 重送就過。
     #[tokio::test]
-    async fn the_background_waits_for_the_keys_line_and_retries_only_what_failed() {
-        let dir = scratch("key-share-retry");
+    async fn a_send_without_a_prepared_key_waits_then_fails_without_sending_and_goes_through_once_the_key_is_ready(
+    ) {
+        let dir = scratch("key-share-not-ready");
         let (core, account) = core_with_wbf_account(&dir).await;
-        let _misc = encrypted_room_on_misc(&core, &account).await;
+        let misc = encrypted_room_on_misc(&core, &account).await;
 
-        core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
+        let refused = core
+            .send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
             .await
-            .expect("sent while the Keys line is closed");
-        tokio::time::sleep(RETRY_FIRST * 3).await;
+            .unwrap_err();
+        assert_eq!(refused.kind, CoreErrorKind::RoomKeyNotReady, "{refused:?}");
+        assert_eq!(refused.data, Some(serde_json::json!({ "txn_id": "t-1" })));
+        assert!(
+            misc.sent_events.lock().unwrap().is_empty(),
+            "🚫 用沒分好的金鑰加密、🚫 送"
+        );
         let pool = core.pool_of_account(&account).unwrap();
         assert!(
             pool.reuse(LinkRole::Keys).await.is_none(),
             "the background does not open the Keys line"
         );
 
-        let keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
-        keys.fail_bridged.store(1, Ordering::SeqCst);
+        let _keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
         core.key_share_inbox(&account).await.unwrap().line_opened();
         wait_for_async(
             || async {
-                keys.fail_bridged.load(Ordering::SeqCst) == 0
-                    && keys.bridge_calls.lock().unwrap().len() >= 2
+                matches!(
+                    room_key_state(&core, &account).await,
+                    RoomKeyState::Ready { .. }
+                )
             },
-            "the first attempt failed and a retry followed",
+            "the background prepares the key once the line is open",
         )
         .await;
-        // 重試成功之後就停：等過最長的間隔，走橋的呼叫數與「試過幾次」都不再變。
-        // 只看走橋的不夠：金鑰送出去之後再試一次什麼都不用送，一直重試也看不出來（變異驗證抓到）。
+        core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
+            .await
+            .expect("the same txn_id goes through once the key is ready");
+        assert_eq!(misc.sent_events.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 準備失敗的房隔一段時間（`RETRY_FIRST`）再試，在送出的等待時間內分好就照送；分好之後就停，🚫 一直重試。
+    #[tokio::test]
+    async fn a_failed_prepare_is_retried_within_the_wait_and_stops_once_the_key_is_ready() {
+        let dir = scratch("key-share-retry");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let misc = encrypted_room_on_misc(&core, &account).await;
+        let keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
+        keys.fail_bridged.store(1, Ordering::SeqCst);
+
+        core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
+            .await
+            .expect("the retry finished within the wait");
+        assert_eq!(
+            keys.fail_bridged.load(Ordering::SeqCst),
+            0,
+            "the first call failed"
+        );
+        assert_eq!(misc.sent_events.lock().unwrap().len(), 1);
+        // 分好之後就停：等過最長的間隔，走橋的呼叫數與「試過幾次」都不再變。
+        // 只看走橋的不夠：分好之後再試一次什麼都不用送，一直重試也看不出來（變異驗證抓到）。
         tokio::time::sleep(RETRY_MAX).await;
         let settled = keys.bridge_calls.lock().unwrap().len();
         let attempts = core.key_share_attempts(&account);
@@ -537,127 +722,75 @@ mod tests {
             "one failed attempt and one retry: {attempts}"
         );
         tokio::time::sleep(RETRY_MAX * 2).await;
-        assert_eq!(
-            keys.bridge_calls.lock().unwrap().len(),
-            settled,
-            "nothing is sent again once the room's key went out"
-        );
+        assert_eq!(keys.bridge_calls.lock().unwrap().len(), settled);
         assert_eq!(
             core.key_share_attempts(&account),
             attempts,
-            "the room is not tried again once its key went out"
+            "the room is not prepared again once its key is ready"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 還沒送完的房存在 `m/ks.sealed`（維護者 2026-10-06）：後台收掉（＝daemon 重開）之後，新的後台一開線就照著補，
-    /// 沒有人再交一次；送完就刪檔。檔是封起來的：明文裡的房間 id 🚫 出現在檔裡。
+    /// 快到期的金鑰（剩不到 `PRE_ROTATE_MESSAGES` 則）在送出之後由後台提早換一把、先分完：下一則用的是新的、就緒的那把，
+    /// 🚫 等它到期才在送的路上卡住。
     #[tokio::test]
-    async fn rooms_still_queued_survive_a_restart_in_a_sealed_file_and_are_sent_when_the_keys_line_opens(
-    ) {
-        let dir = scratch("key-share-persist");
+    async fn a_key_close_to_expiry_is_replaced_after_a_send_before_the_next_one() {
+        let dir = scratch("key-share-rotate");
         let (core, account) = core_with_wbf_account(&dir).await;
-        let _misc = encrypted_room_on_misc(&core, &account).await;
-        let queue_path = account
-            .matrix_store_dir()
-            .join(super::KEY_SHARE_QUEUE_FILE_NAME);
-
-        core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
-            .await
-            .expect("sent while the Keys line is closed");
-        wait_for_async(
-            || async { queue_path.exists() },
-            "the queued room is written to m/ks.sealed",
-        )
-        .await;
-        let sealed = std::fs::read(&queue_path).unwrap();
-        assert!(
-            !sealed
-                .windows(ROOM.len())
-                .any(|window| window == ROOM.as_bytes()),
-            "the room id is not on disk in plain text"
-        );
-
-        core.stop_room_key_share_of(&account).await;
-        assert!(
-            queue_path.exists(),
-            "stopping the background keeps the file"
-        );
-        let keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
-        core.key_share_inbox(&account).await.unwrap().line_opened();
-        wait_for_async(
-            || async { core.key_share_attempts(&account) >= 1 && !queue_path.exists() },
-            "the new background sends the room read back from the file and removes it",
-        )
-        .await;
-        assert!(!keys.bridge_calls.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `m/ks.sealed` 壞了（不是我們封的、被截斷）：講一聲、從空的開始，後台照常活著、照常收新的事。
-    #[tokio::test]
-    async fn a_queue_file_that_cannot_be_opened_starts_the_background_empty_instead_of_stopping_it()
-    {
-        let dir = scratch("key-share-corrupt");
-        let (core, account) = core_with_wbf_account(&dir).await;
-        let _misc = encrypted_room_on_misc(&core, &account).await;
-        let queue_path = account
-            .matrix_store_dir()
-            .join(super::KEY_SHARE_QUEUE_FILE_NAME);
-        std::fs::create_dir_all(account.matrix_store_dir()).unwrap();
-        std::fs::write(
-            &queue_path,
-            b"{\"v\":1,\"nonce\":\"AAAA\",\"sealed\":\"AAAA\"}",
-        )
-        .unwrap();
+        let misc = encrypted_room_on_misc(&core, &account).await;
         let _keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
 
-        core.key_share_inbox(&account).await.unwrap().line_opened();
-        tokio::time::sleep(RETRY_FIRST * 2).await;
-        assert!(core.is_sharing_room_keys(&account));
-        assert_eq!(core.key_share_attempts(&account), 0, "nothing read back");
-
-        core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
+        core.send_text(ROOM, "0", &send_options("t-0"), &Target::default())
             .await
-            .expect("sent");
-        wait_for_async(
-            || async { core.key_share_attempts(&account) >= 1 && !queue_path.exists() },
-            "new work is still taken and sent",
-        )
-        .await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 解得開、但版本號看不懂的 `m/ks.sealed`（之後的版本寫的）：🚫 猜裡面的房，從空的開始、🚫 刪檔。
-    #[tokio::test]
-    async fn a_queue_file_from_a_version_this_build_does_not_know_is_not_read() {
-        let dir = scratch("key-share-version");
-        let (core, account) = core_with_wbf_account(&dir).await;
-        let _misc = encrypted_room_on_misc(&core, &account).await;
-        let queue_path = account
-            .matrix_store_dir()
-            .join(super::KEY_SHARE_QUEUE_FILE_NAME);
-        std::fs::create_dir_all(account.matrix_store_dir()).unwrap();
-        core.vault()
-            .unwrap()
-            .key_share_queue_file(&queue_path)
-            .write(format!(r#"{{"v":2,"rooms":{{"{ROOM}":["{ME}"]}}}}"#).as_bytes())
             .unwrap();
-        let _keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
-
-        core.key_share_inbox(&account).await.unwrap().line_opened();
-        tokio::time::sleep(RETRY_FIRST * 2).await;
-        assert!(core.is_sharing_room_keys(&account));
+        let RoomKeyState::Ready {
+            session_id: first, ..
+        } = room_key_state(&core, &account).await
+        else {
+            panic!("ready after the first send");
+        };
+        // 上游預設一把用 100 則；剩 5 則（第 95 則送完）就該換。
+        for position in 1..95 {
+            core.send_text(
+                ROOM,
+                &position.to_string(),
+                &send_options(&format!("t-{position}")),
+                &Target::default(),
+            )
+            .await
+            .unwrap();
+        }
+        wait_for_async(
+            || async {
+                matches!(
+                    room_key_state(&core, &account).await,
+                    RoomKeyState::Ready { ref session_id, .. } if *session_id != first
+                )
+            },
+            "the background replaced the key after the 95th message",
+        )
+        .await;
+        core.send_text(ROOM, "95", &send_options("t-95"), &Target::default())
+            .await
+            .unwrap();
+        let sent = misc.sent_events.lock().unwrap().clone();
+        assert_eq!(sent.len(), 96);
+        let session_of = |index: usize| {
+            serde_json::from_slice::<serde_json::Value>(&sent[index].4).unwrap()["session_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
         assert_eq!(
-            core.key_share_attempts(&account),
-            0,
-            "the room in a v2 file is not taken"
+            session_of(94),
+            first,
+            "the 95th message still used the first key"
         );
-        assert!(queue_path.exists(), "🚫 刪：下一次寫的時候才蓋掉");
+        assert_ne!(session_of(95), first, "the 96th used the replacement");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 自己的金鑰上傳 server 沒回 Ack（維護者 2026-10-05：要保證）：交給金鑰線的 queue，隔一段時間再上傳一次，傳成就停。
+    /// 自己的金鑰上傳 server 沒回 Ack（維護者 2026-10-05：要保證）：交給金鑰線的後台，隔一段時間再上傳一次，傳成就停。
     #[tokio::test]
     async fn an_own_key_upload_that_failed_is_retried_on_the_keys_line_until_the_server_acknowledges_it(
     ) {

@@ -18,7 +18,7 @@ PR #1–#72 合併（main `144cb55`，2026-10-05）；#43（走橋的 GetEvent�
   收包依會話表交付、順序亂掉不出事（`/docs/design/daemon/ws-receive-dispatch.md`）。
 - **房間**：wbf 帳號的房間列表只問加入了哪些（`JoinedRooms`）、每一間的樣子是 UI 對看得到的房間叫 `room.get`（`/docs/design/rooms/chat-model.md` §2.1）、送訊息與送檔走 `Event/Send` 並宣告附件；訂閱線收推播寫快取、🚫 不碰水位，水位只由 UI 叫的 `sync.recent` 推（`/docs/design/rooms/room-sync.md`）。
   訊息的 edit／redact 照 `/docs/design/messages/edits-and-redactions.md` 存。
-- **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動、1506 之後 daemon 補完再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
+- **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動（只在金鑰線的後台建、換、送；送訊息只用全部 Ack 的那把，等不到回 1402）、1506 之後 daemon 重拿再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
 - **資料平面**（`/docs/design/rpc-specs/data-plane.md`）：上傳是 UI 發動的兩步（`media.create` → `PUT /upload` 拿 manifest → `room.send_attachment`）；
   讀是 `media.open` → `GET /media`（Range 就是 seek）。下載是每帳號一個處理端、所有檔一起跑（每檔一塊在途）、`Download` 線送收分開（`/docs/design/daemon/link-requests.md`）、池格式 v2、seek 暫存檔，
@@ -60,8 +60,8 @@ crates/wbf-sdk/src/
   backend/matrix_sdk.rs  `use matrix_sdk` 的地方之一（feature `matrix`，預設關）；store 吃 vault 的第二把子金鑰
   crypto_engine.rs       另一個碰上游的地方（feature `matrix`）：`OlmEngine` —— 同一個 sqlite crypto store（`m/`）上的 `OlmMachine` 只當狀態機用。
                          `send_outgoing_requests`（KeysUpload／Query／Claim／Signatures／發 to-device 全走橋）、`refresh_room_devices`（一支例行程序：
-                         成員清單 → diff → 只重查變的人 → 雜湊對一次、不對再查、還不對就拒發 → 在本機排金鑰）、`encrypt_and_send`（只在本機備金鑰、加密、送，🚫 上網分金鑰）、
-                         `queue_room_key`（本機：建／換 session、排好 to-device）與 `distribute_room_key`（走橋送出去，後台叫）、`decrypt_room_event`、`import_items`／`pull_to_device`（匯入 → 落地 → 銷毀鎖死；推來的一包與 Fetch 的一窗同一支）。
+                         成員清單 → diff → 只重查變的人 → 雜湊對一次、不對再查、還不對就拒發；🚫 碰房間金鑰）、`encrypt_and_send`（只用已經分好的金鑰加密、送，沒就緒回 `RoomKeyNotReady`）、
+                         `room_key_state`（就緒了沒、快到期了沒；只讀本機）、`distribute_room_key`（建／換金鑰並走橋送出去，後台叫）、`discard_room_key`（提早換）、`decrypt_room_event`、`import_items`／`pull_to_device`（匯入 → 落地 → 銷毀鎖死；推來的一包與 Fetch 的一窗同一支）。
                          分享策略 `room_key_share_settings()` 明確選 AllDevices，交叉簽章做好後換 IdentityBased 只改那裡
   device_version.rs      裝置版本號（`序號-雜湊`）與房間版本號：成員清單怎麼讀（沒號碼是錯不是 0）、`diff_from`（誰要重查、誰離開）、
                          `compute_device_keys_hash`（照 server §3.4 重算，黃金向量 810b7c3be4；🚨 user_id 用 get 逐層查、不拼 JSON Pointer）。沒網路
@@ -86,7 +86,9 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
   room_sync.rs           **房間那條線的內容**（/docs/design/rooms/room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
   room_crypto.rs         **房間的加解密**（/docs/design/keys/e2ee-rpc.md）：`refresh_room_devices`、加密送出與 1506 之後自動重拿（`wbf_send_encrypted`）、收到時解（`to_incoming`）、補解（`decrypt_stored`）；`RoomDevices`／`SendOptions` 是 DTO
-  key_share.rs           **金鑰線的 queue**（/docs/design/keys/e2ee-rpc.md §3.1）：一帳號一 task，送房間金鑰、重傳自己沒拿到 Ack 的金鑰；送出（加密之前）／refresh／1506 之後 `queue_room_key_share` 交給它就走；走 `Keys` 線、`reuse` 🚫 開線（`init_keys` 開好線時起 task、`line_opened`）；還沒送完的房封在 `m/ks.sealed`，重開照著補（/docs/design/storage/local-storage.md §6.2.2）；失敗 30 秒起加倍到 5 分鐘；登出收
+  key_share.rs           **金鑰線的後台**（/docs/design/keys/e2ee-rpc.md §3.1）：一帳號一 task，**房間金鑰只在這裡建、換、送**、記「哪個房對哪個房間版本號就緒」；重傳自己沒拿到 Ack 的金鑰。
+                         refresh／1506 之後 `prepare_room_key`；送出前 `is_room_key_ready_within`（沒就緒就交它準備、最多等 `ROOM_KEY_WAIT` 2 秒）；送出後 `room_key_used`（快到期就提早換）。
+                         走 `Keys` 線、`reuse` 🚫 開線（`init_keys` 開好線時起 task、`line_opened`）；🚫 存檔；失敗 30 秒起加倍到 5 分鐘；登出收（等它真的結束才刪 `m/`）
   link_keeper.rs         **「該開的線都開著嗎」的鉤子**（/docs/design/daemon/link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
   wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：列表只問橋的 `JoinedRooms`、單一房間 `GetState` 與 `m.direct` 一起送、`Event/Send` 送文字（加不加密只看本地 `rooms.encrypted`、不知道就報錯；明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（/docs/design/daemon/link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（同一條線上的一個 client；一格是讀寫鎖，很多命令同時用、開／關獨佔）、
@@ -207,8 +209,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
   訂了之後 server 隨時推東西進來（別人 claim 你一把 OTK 就推 CryptoState），而通道現在只有「送一個等一個」——這就是第 4 階段要解的事。
 - **已追蹤的人只靠 `update_tracked_users` 不會再查**：要「這個人變了、重查」用 `OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口）。
 - **上游 `encrypt` 在房間沒有 outbound session、或 session 過期時是 panic 不是回錯**（`expect("Session wasn't created nor shared")`、`assert!(!session.expired())`）：
-  sdk 的 `encrypt_and_send` 自己先 `queue_room_key`（只碰本機：沒有就建、過期就換，維護者 2026-10-05 起🚫 上網），加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住，回 `Protocol`）。🚫 不要繞過它直接叫上游的 `encrypt_room_event_raw`。
-  上游 `share_room_key` 本身不上網（只排 to-device）；沒 Olm 通道的裝置排成 `m.no_olm` 但仍算沒分到，後台建好通道再分就補得到——但拿到的是那時候的位置，所以 refresh 先建通道（/docs/design/keys/e2ee-rpc.md §2）。
+  sdk 的 `encrypt_and_send` 先問 `room_key_state`（有、沒到期、沒作廢、排過的全拿到 Ack），不是 `Ready` 就不加密；加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住，回 `Protocol`）。🚫 不要繞過它直接叫上游的 `encrypt_room_event_raw`。
+  上游 `share_room_key` 本身不上網（只排 to-device），而且**換金鑰時會丟掉舊那把還沒送出的 to-device**（只回新那把的待送）：所以金鑰只在後台建、換、送，送出只用全部 Ack 的那把（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）。
+  沒 Olm 通道的裝置排成 `m.no_olm`，之後再補只拿得到之後的位置：所以 `distribute_room_key` 先 claim 建通道再排。
 - **`XNonce::from_slice` 長度不對會 panic**：檔案裡讀來的 nonce 一律先過 `vault::decode_nonce`（壞的 `local.key`／`session.sealed` 曾經能讓 daemon 死掉，2026-10-06 key_share 的壞檔測試抓到）。
 - **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
 - ruma 組請求對要 token 的端點一定要給 token：引擎給占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填。
@@ -251,7 +254,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 ## 7. 下一步（維護者 2026-09-30 定的切法：少而大的 PR）
 
 1. **官方 Matrix 的傳統上傳與下載、E2EE 收尾**：`/_matrix/media`（`/docs/design/rpc-specs/data-plane.md` §7；下載那半接在同一組 `media.*` 上）；讀 `m.room.encryption` 的換金鑰期限、補解寫失敗的重試觸發點（`room.history`／`sync.recent` 讀到未解的就再試）、CLI 能送加密房（CLI 自己就是前端：同一個命令裡先 refresh 再送）。
-   （送訊息不綁發金鑰 2026-10-06 做完：`/docs/design/keys/e2ee-rpc.md` §3、§3.1，core `key_share.rs`。）
+   （送訊息只用已經分好的金鑰 2026-10-06 做完：`/docs/design/keys/e2ee-rpc.md` §3、§3.1，core `key_share.rs`。之後可以補：UI 主動命令重發金鑰。）
 2. **訊息功能**：已讀三層（`/docs/design/messages/read-receipts.md`）；`/docs/design/rooms/chat-model.md` §6 剩的房間功能（建房、邀請、改權限、置頂、裝置驗證）。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。

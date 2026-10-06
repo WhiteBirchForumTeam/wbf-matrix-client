@@ -5,15 +5,16 @@
 //! 這是 wbf-sdk 裡**第二個**碰上游的地方（第一個是 `backend/matrix_sdk`）；兩者共用同一個 sqlite crypto store（`m/`），
 //! ⚠️ 同一時間只能有一個持有者（/docs/design/keys/e2ee-walkthrough.md §13 第 9 條）——過渡期由呼叫端保證不同時開。
 //!
-//! 涵蓋到哪：金鑰上傳／查詢／claim、收 to-device、把房間金鑰送給一群人（`distribute_room_key`，後台叫）、
-//! 在本機備好房間金鑰再加密帶房間版本號送出（`Event/Send`，🚫 上網分金鑰）、解密（WS 收到的密文 → 要寫進 cache 的樣子）。
-//! 1506 之後重拿房間狀態、什麼時候送金鑰是呼叫端的事（daemon 自動做，/docs/design/keys/e2ee-rpc.md §3、§3.1）。
+//! 涵蓋到哪：金鑰上傳／查詢／claim、收 to-device、建／換房間金鑰並送到每台裝置（`distribute_room_key`，後台叫）、
+//! 房間金鑰就緒了沒（`room_key_state`）、**只用已經分好的金鑰**加密帶房間版本號送出（`Event/Send`，🚫 產生金鑰、🚫 上網分金鑰）、
+//! 解密（WS 收到的密文 → 要寫進 cache 的樣子）。什麼時候準備金鑰、等它就緒、什麼時候換是呼叫端的事（daemon 的後台，/docs/design/keys/e2ee-rpc.md §3、§3.1）。
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt as _;
 
@@ -70,7 +71,11 @@ pub struct ImportReport {
 /// `pull_to_device` 最多拉幾窗：一窗 1000 則、六十四窗就是六萬多則 to-device，到這個數還沒追平是不對勁，停下來報錯。
 const PULL_WINDOWS_LIMIT: usize = 64;
 
-/// `refresh_room_devices` 一輪的結果：這一刻的房間快照（下次送帶它的 `room_version`）、跟上一份比出來的差、在本機排了幾個 to-device。
+/// 房間金鑰還剩幾則、多久就到期時，算「該提早換了」：送出之後後台先換一把、先分完，下一則拿到的就是就緒的（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3.1）。
+const PRE_ROTATE_MESSAGES: u64 = 5;
+const PRE_ROTATE_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// `refresh_room_devices` 一輪的結果：這一刻的房間快照（下次送帶它的 `room_version`）、跟上一份比出來的差。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomRefresh {
     /// 哪個房。
@@ -80,9 +85,6 @@ pub struct RoomRefresh {
     pub versions: RoomDeviceVersions,
     /// 誰要重查（新加入、裝置版本號變了）、誰離開了；`previous` 是 None 時全部算 changed。
     pub diff: MembersDiff,
-    /// 這輪在本機排好、等後台送的 to-device 數（房間金鑰要補給的裝置，含上一輪還沒送出的）；🚫 代表已經送到。
-    /// 只算本機已知、有 Olm 通道的；還沒通道的後台建好之後才排（/docs/design/keys/e2ee-rpc.md §3.1）。
-    pub queued_to_device_requests: usize,
     /// 雜湊第一次對不上、重查一次才對上的人（通常是空的；非空代表查詢與清單之間有人換了金鑰）。
     pub rechecked: Vec<String>,
 }
@@ -100,18 +102,43 @@ pub struct OutgoingRoomEvent {
     pub attachments: Vec<String>,
 }
 
-/// `encrypt_and_send` 的結果：送進去了，或被 1506 擋下來。
-/// 被擋不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 補金鑰、UI 決定重送，/docs/design/keys/e2ee-walkthrough.md §16.6）。
+/// `encrypt_and_send` 的結果：送進去了、金鑰還沒就緒沒送、或被 1506 擋下來。
+/// 後兩種不是 `Err`：那是這條路上**預期內**的結果（維護者定：daemon 準備金鑰、UI 決定重送，/docs/design/keys/e2ee-walkthrough.md §16.6）。
 #[derive(Debug)]
 pub enum SendOutcome {
     Sent {
         event_id: String,
     },
+    /// 這個房的房間金鑰還沒就緒（沒有、到期或作廢了、或還有 to-device 沒拿到 ACK），訊息沒加密、沒送。
+    /// 呼叫端要先讓後台 `distribute_room_key` 分完，再送。
+    RoomKeyNotReady {
+        /// 給人看的, example: "the room key expired"
+        reason: String,
+    },
     /// server 說帶的 `room_version` 過期，訊息沒送。拿 `current_room_version` 只能知道自己過期，🚫 不能直接拿它重送：
-    /// 先 `refresh_room_devices`（拿新的快照、金鑰交給後台補），再帶那份快照的 `room_version` 重送（同一個 `txn_id`）。
+    /// 先 `refresh_room_devices`（拿新的快照）、讓後台對它分好金鑰，再帶那份快照的 `room_version` 重送（同一個 `txn_id`）。
     RoomDevicesChanged {
         current_room_version: Option<u64>,
         error: SdkError,
+    },
+}
+
+/// 一個房的房間金鑰能不能拿來加密（`room_key_state`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoomKeyState {
+    /// 可以：排過的 to-device 全拿到 ACK、沒到期、沒作廢。
+    Ready {
+        /// example: "3OfEg1QBw1tyjrBe9SP+VTY/nAmXETEApGIUsrohAiI"
+        session_id: String,
+        /// 這把加密過幾則, example: 1
+        message_count: u64,
+        /// 快到期了（剩不到 `PRE_ROTATE_MESSAGES` 則或 `PRE_ROTATE_AGE`）：送完之後該提早換一把
+        due_for_rotation: bool,
+    },
+    /// 不行，例：還沒建過、到期或作廢了、還有 to-device 沒拿到 ACK。
+    NotReady {
+        /// 給人看的, example: "the room key expired"
+        reason: String,
     },
 }
 
@@ -169,13 +196,13 @@ impl OlmEngine {
     }
 
     /// UI 叫 `room.refresh_devices`（點進房間、收到 `devices.changed` 之後由 UI 決定）與被 1506 擋之後都叫這一支（/docs/design/keys/e2ee-rpc.md §2、§3）：
-    /// 拿這一刻的成員清單與版本號 → 跟上一份比出誰變了 → 只重查那些人 → 雜湊對一次（不對再查一次，還不對就拒絕）→
-    /// 在本機把房間金鑰排給還沒有的裝置（有人離開由上游決定輪換）。🚫 在這裡送：送是後台的事（呼叫端交給 `distribute_room_key`）。
+    /// 拿這一刻的成員清單與版本號 → 跟上一份比出誰變了 → 只重查那些人 → 雜湊對一次（不對再查一次，還不對就拒絕）。
+    /// 🚫 碰房間金鑰：建、換、送都是後台的事（呼叫端拿回來的 `versions` 交給 `distribute_room_key`）。
     ///
     /// Args:
     ///     client: 要能走橋的連線
     ///     room_id: example: "!r:localhost"
-    ///     previous: 上一次的 `RoomRefresh::versions`（發上一輪房間金鑰時依據的那份）；None ＝ 第一次進這個房，每個人都查
+    ///     previous: 上一次的 `RoomRefresh::versions`；None ＝ 第一次進這個房，每個人都查
     /// Return:
     ///     Ok(RoomRefresh)  下次送帶 `versions.room_version`
     ///     Err(Server)      不在房裡（`Forbidden`）等
@@ -212,53 +239,122 @@ impl OlmEngine {
                 )));
             }
         }
-        // 缺 Olm 通道的裝置在這裡建好（`/keys/claim`），🚫 留給後台：上游的房間金鑰是在排的那一刻、照 session 當下的位置匯出的，
-        // 沒通道的裝置只能排成 `m.no_olm`，等後台建好通道再分時 session 已經往前走了——之前加密的那幾則它解不開
-        // （真 server 實測：「unknown message index, first known index 1」，/docs/design/keys/e2ee-rpc.md §2）。送訊息一定帶 refresh 回的那份，所以送之前通道都在。
-        self.claim_missing_sessions(client, &parse_user_ids(&members)?)
-            .await?;
-        let queued_to_device_requests = self.queue_room_key(room_id, &members).await?;
         Ok(RoomRefresh {
             room_id: room_id.to_string(),
             versions,
             diff,
-            queued_to_device_requests,
             rechecked,
         })
     }
 
-    /// 在本機備好房間金鑰、加密、帶房間版本號送出（`Event/Send`）。
+    /// 這個房的房間金鑰能不能拿來加密：只讀本機的 crypto store，🚫 建、🚫 換、🚫 上網。
     ///
-    /// 🚨 **送的路上🚫 任何金鑰的網路動作**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §3）：只叫 [`OlmEngine::queue_room_key`]——
-    /// 沒有自己的房間金鑰就當場建、該換就當場換、要送的排在 session 上；送出去是呼叫端交給後台的事（`distribute_room_key`）。
-    /// 上游的加密在「沒有 outbound session」與「session 過期」時是 **panic** 不是回錯，先備好就是把那兩條排除掉；
-    /// 備好到加密之間剛好跨過期限的那一瞬間，用 `catch_unwind` 接住轉成錯（全域 P 條：失敗要有去處）。
-    /// 號碼與成員由呼叫端帶（UI 存著，/docs/design/keys/e2ee-rpc.md）：成員拿來決定要不要換、排給誰；號碼是 server 用來擋「送出方不知道最新裝置組合」的。
-    /// 被 1506 擋是 `Ok(RoomDevicesChanged)` 不是 `Err`：這條路預期內的結果，訊息沒送。
+    /// Args:
+    ///     room_id: example: "!r:localhost"
+    /// Return:
+    ///     Ok(RoomKeyState::Ready)      排過的 to-device 全拿到 ACK、沒到期、沒作廢；`due_for_rotation` 說要不要提早換
+    ///     Ok(RoomKeyState::NotReady)   還沒建過、到期或作廢了、或還有 to-device 沒拿到 ACK
+    ///     Err(Usage)                   房間 id 不合法
+    ///     Err(Protocol)                crypto store 讀不了
+    pub async fn room_key_state(&self, room_id: &str) -> Result<RoomKeyState, SdkError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id)
+            .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
+        let Some(session) = self
+            .machine
+            .store()
+            .get_outbound_group_session(&room_id)
+            .await
+            .map_err(crypto_store_error)?
+        else {
+            return Ok(RoomKeyState::NotReady {
+                reason: "this room has no room key yet".into(),
+            });
+        };
+        if session.invalidated() {
+            return Ok(RoomKeyState::NotReady {
+                reason: "the room key was discarded".into(),
+            });
+        }
+        if session.expired() {
+            return Ok(RoomKeyState::NotReady {
+                reason: "the room key expired".into(),
+            });
+        }
+        let pickle = session.pickle().await;
+        if !pickle.requests.is_empty() {
+            return Ok(RoomKeyState::NotReady {
+                reason: format!(
+                    "{} to-device message(s) of the room key are not acknowledged by the server yet",
+                    pickle.requests.len()
+                ),
+            });
+        }
+        let messages_left = pickle
+            .settings
+            .rotation_period_msgs
+            .clamp(1, 10_000)
+            .saturating_sub(pickle.message_count);
+        let created = Duration::from_secs(u64::from(pickle.creation_time.get()));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let time_left = (created + pickle.settings.rotation_period).saturating_sub(now);
+        Ok(RoomKeyState::Ready {
+            session_id: session.session_id().to_string(),
+            message_count: pickle.message_count,
+            due_for_rotation: messages_left <= PRE_ROTATE_MESSAGES || time_left <= PRE_ROTATE_AGE,
+        })
+    }
+
+    /// 丟掉這個房現在的房間金鑰（提早換用）：下一次 `distribute_room_key` 會建一把新的、分給每台裝置。只碰本機。
+    ///
+    /// Args:
+    ///     room_id: example: "!r:localhost"
+    /// Return:
+    ///     Ok(bool)        true ＝ 本來有一把、丟了；false ＝ 本來就沒有
+    ///     Err(Usage)      房間 id 不合法
+    ///     Err(Protocol)   crypto store 寫不了
+    pub async fn discard_room_key(&self, room_id: &str) -> Result<bool, SdkError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id)
+            .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
+        self.machine
+            .discard_room_key(&room_id)
+            .await
+            .map_err(crypto_store_error)
+    }
+
+    /// **只用已經分好的房間金鑰**加密、帶房間版本號送出（`Event/Send`，維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）。
+    ///
+    /// 🚨 這條路🚫 產生金鑰、🚫 換金鑰、🚫 任何金鑰的網路動作：先看 [`OlmEngine::room_key_state`]，不是 `Ready` 就不加密、回 `RoomKeyNotReady`，
+    /// 由呼叫端讓後台（`distribute_room_key`）分完再送。所以每一則用的金鑰，排過的 to-device 都已經拿到 server 的 ACK。
+    /// 上游的加密在「沒有 outbound session」與「session 過期」時是 **panic** 不是回錯：就緒檢查已經排除這兩條，
+    /// 檢查到加密之間剛好跨過期限的那一瞬間，用 `catch_unwind` 接住轉成錯（全域 P 條：失敗要有去處）。
+    /// 號碼由呼叫端帶（UI 存著）：server 用它擋「送出方不知道最新裝置組合」。被 1506 擋是 `Ok(RoomDevicesChanged)` 不是 `Err`。
     ///
     /// Args:
     ///     room_id: example: "!r:localhost"
     ///     room_version: 呼叫端手上那個房的房間版本號（`refresh_room_devices` 回的）, example: 81234
-    ///     members: 同一份的 `join` 成員（含自己）, example: &["@alice:localhost".to_string(), "@bob:localhost".to_string()]
     ///     message: example: &OutgoingRoomEvent { event_type: "m.room.message".into(), content: json!({"msgtype":"m.text","body":"hi"}), txn_id: "txn-1".into(), attachments: vec![] }
     /// Return:
     ///     Ok(SendOutcome::Sent)                 送進去了
+    ///     Ok(SendOutcome::RoomKeyNotReady)      金鑰還沒就緒，訊息沒加密、沒送
     ///     Ok(SendOutcome::RoomDevicesChanged)   1506：號碼過期，訊息沒送
-    ///     Err(Usage)                            房間 id、成員的 mxid 不合法
-    ///     Err(Protocol)                         備金鑰或加密失敗（含上游 panic 被接住的那種）
+    ///     Err(Usage)                            房間 id 不合法
+    ///     Err(Protocol)                         加密失敗（含上游 panic 被接住的那種）
     ///     Err(Server)                           其他拒絕（含宣告過 feature 卻漏帶號碼的 `InvalidRequest`）
     pub async fn encrypt_and_send<C: PackChannel>(
         &self,
         client: &mut WbfClient<C>,
         room_id: &str,
         room_version: u64,
-        members: &[String],
         message: &OutgoingRoomEvent,
     ) -> Result<SendOutcome, SdkError> {
         let owned_room_id: OwnedRoomId = RoomId::parse(room_id)
             .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
-        // 1. 在本機備好房間金鑰（🚫 上網）：沒有／該換的 session 建新的，要送的排好等後台。
-        self.queue_room_key(room_id, members).await?;
+        // 1. 金鑰一定是分好的那把；🚫 在這裡建或換。
+        if let RoomKeyState::NotReady { reason } = self.room_key_state(room_id).await? {
+            return Ok(SendOutcome::RoomKeyNotReady { reason });
+        }
         // 2. 加密。
         let raw_content: Raw<AnyMessageLikeEventContent> = Raw::from_json(
             serde_json::value::to_raw_value(&message.content)
@@ -273,7 +369,7 @@ impl OlmEngine {
         .await
         .map_err(|_| {
             SdkError::Protocol(
-                "encrypt: the room key had no session or expired right after it was shared; send again".into(),
+                "encrypt: the room key expired between the readiness check and encrypting; send again".into(),
             )
         })?
         .map_err(|error| SdkError::Protocol(format!("encrypt: {error}")))?;
@@ -608,37 +704,11 @@ impl OlmEngine {
         Ok(ids)
     }
 
-    /// 在本機備好 `room_id` 的房間金鑰，**🚫 上網**（/docs/design/keys/e2ee-rpc.md §3）：追蹤這些人、沒有／該換（到期、有人離開、裝置被移除）就當場建新的，
-    /// 給本機已知、還沒拿到的裝置排好 to-device（存在 session 上）。還沒 Olm 通道的裝置上游排一則 `m.no_olm`，但仍算沒分到，
-    /// 後台建好通道再分就拿得到。加密前一定要叫：上游的加密沒有或過期的 session 會 panic。
-    ///
-    /// Args:
-    ///     room_id: example: "!r:localhost"
-    ///     users: 房間裡要拿金鑰的人（含自己）, example: &["@alice:localhost".to_string()]
-    /// Return:
-    ///     Ok(usize)        這把 session 上還沒送出的 to-device 數（含之前排的）
-    ///     Err(Usage)       房間 id、成員的 mxid 不合法
-    ///     Err(Protocol)    crypto store 讀寫失敗
-    pub async fn queue_room_key(&self, room_id: &str, users: &[String]) -> Result<usize, SdkError> {
-        let room_id: OwnedRoomId = RoomId::parse(room_id)
-            .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
-        self.track_users(users).await?;
-        let users = parse_user_ids(users)?;
-        let requests = self
-            .machine
-            .share_room_key(
-                &room_id,
-                users.iter().map(OwnedUserId::as_ref),
-                room_key_share_settings(),
-            )
-            .await
-            .map_err(olm_error)?;
-        Ok(requests.len())
-    }
-
-    /// 把 `room_id` 的房間金鑰送到這些人的裝置（後台叫，/docs/design/keys/e2ee-rpc.md §3.1），全部走橋：
-    /// 追蹤中的該查的 `/keys/query` → 缺 Olm 通道的 `/keys/claim` → 上游 `share_room_key`（剛建好通道的補進來）→
+    /// 備好 `room_id` 的房間金鑰並送到這些人的每台裝置——**房間金鑰只在這裡建、換、送**（後台叫，/docs/design/keys/e2ee-rpc.md §3.1），全部走橋：
+    /// 追蹤中的該查的 `/keys/query` → 缺 Olm 通道的 `/keys/claim` → 上游 `share_room_key`（沒有、到期、作廢、有人離開就建新的）→
     /// 這把 session 上所有還沒送出的 to-device 一個一個送、交回上游。上游決定該不該輪換、發給哪些裝置（`room_key_share_settings`）。
+    /// 通道一定在排之前建好：上游的房間金鑰是在排的那一刻、照 session 當下的位置匯出的，沒通道的裝置只能排成 `m.no_olm`，
+    /// 之後再補只拿得到之後的位置（真 server 實測：「unknown message index, first known index 1」）。加密只用這裡分完的金鑰，所以加密之前通道都在。
     ///
     /// Args:
     ///     client: 走橋用的連線

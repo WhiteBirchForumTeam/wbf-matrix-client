@@ -24,7 +24,7 @@ local.key（0600）
   |---|---|---|
   | 1 | `wbf-matrix-client cache sqlcipher v1` | `cache.db` 的 SQLCipher raw key（/docs/design/storage/local-cache-db.md §3） |
   | 2 | `wbf-matrix-client matrix-sdk store v1` | matrix-sdk store 的 `open_with_key`（/docs/design/storage/local-cache-db.md §4.3） |
-  | 3 | `wbf-matrix-client session v1` | XChaCha20-Poly1305 封 `session.sealed`（server、user_id、device_id、access_token）、`r/` 裡的 recovery key、`m/ks.sealed`（金鑰線的 queue，/docs/design/storage/local-storage.md §6.2.2），三者靠 aad 分 |
+  | 3 | `wbf-matrix-client session v1` | XChaCha20-Poly1305 封 `session.sealed`（server、user_id、device_id、access_token）與 `r/` 裡的 recovery key，兩者靠 aad 分 |
   | 4 | `wbf-matrix-client media store v1` | 媒體池（/docs/design/media/media-pool.md §8） |
   | 5 | `wbf-matrix-client room key backup v1` | 本地房間金鑰快照 `k/snapshot` 的 passphrase（base64 後餵給上游的匯出，/docs/design/keys/room-key-backup.md §4） |
   | 6 | `wbf-matrix-client account directory v1` | 目錄名加密（§2），`s/`、`a/`、`r/` 共用這一把，靠 aad 分 |
@@ -52,7 +52,8 @@ local.key（0600）
 
 ### 1.1 實作細節
 
-- 包主金鑰、封 session、封 recovery key、封金鑰線的 queue 各帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`、`wbf-matrix-client recovery.sealed v1`、`wbf-matrix-client key-share queue v1`）：把 A 檔的密文搬到 B 檔解不開。三種封檔共用一個殼與一組讀寫函式（/docs/design/storage/local-storage.md §2.3）。
+- 包主金鑰、封 session、封 recovery key 各帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`、`wbf-matrix-client recovery.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。兩種封檔共用一個殼與一組讀寫函式（/docs/design/storage/local-storage.md §2.3）。
+  📌 `wbf-matrix-client key-share queue v1` 曾經用在 `m/ks.sealed`（2026-10-06 加、同一天拿掉，沒有發布過），🚫 再拿來用在別種檔。
 - `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問 passphrase，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
 - `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空的 passphrase 在這裡被拒。
 - `Vault::from_master(dir, master, mode)` 只給 `set_passphrase` 重包 `local.key` 用（同一個目錄、同一把主金鑰）；⚠️ 它不驗證那把金鑰是不是這個目錄的，所以🚫 除此之外不要拿它做別的事。

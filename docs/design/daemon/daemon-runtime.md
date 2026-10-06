@@ -37,7 +37,7 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 
 | 檔案 | 誰會同時碰 | 有沒有競爭 |
 |---|---|---|
-| `m/`（crypto store、`td.json`、`ks.sealed`） | **只有那一個帳號**：上游會話、收金鑰的 task、金鑰線的 queue | ❌ 沒有。一帳號一個 store；兩個 json 檔各只有一個 writer |
+| `m/`（crypto store、`td.json`） | **只有那一個帳號**：上游會話、收金鑰的 task、金鑰線的後台（共用同一個長活的引擎） | ❌ 沒有。一帳號一個 store、一個引擎；`td.json` 只有收金鑰那一支寫 |
 | `session.sealed`／`k/`／`r/` | 那一個帳號，而且只在登入／登出／備份時 | ❌ 沒有 |
 | **`cache.db`** | **同一個 server 上每一個登入中的帳號**，同時 | 🚨 **有**，見 §2 |
 | 媒體池 | 任何帳號的下載 | 🟡 有，但池的格式是「一檔一鎖、順序 append」（media-pool），本來就設計成多寫入者 |

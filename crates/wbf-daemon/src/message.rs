@@ -198,8 +198,7 @@ mod tests {
     /// 沒 `data` 的錯誤回應裡**沒有**這個欄位（🚫 不送 `null`）。
     #[test]
     fn core_error_data_rides_along_and_is_absent_when_there_is_none() {
-        let state =
-            serde_json::json!({ "room_version": 9, "members": {}, "shared": 0, "txn_id": "t2" });
+        let state = serde_json::json!({ "room_version": 9, "members": {}, "txn_id": "t2" });
         let error =
             CoreError::new(CoreErrorKind::RoomDevicesChanged, "stale").with_data(state.clone());
         let json = serde_json::to_value(Response::from_core_error(Some(5), &error)).unwrap();

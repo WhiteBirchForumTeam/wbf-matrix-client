@@ -318,8 +318,8 @@ impl Core {
         self.close_links(account, "logged out").await;
         // 長活的引擎握著 `m/` 的 sqlite：先丟掉才刪得掉（Windows）。
         self.forget_crypto_engine(account).await;
-        // 再收一次金鑰線的 queue：上面收過之後、引擎丟掉之前，進行中的送訊息可能又把它起了起來。
-        // 現在 session 與引擎都沒了，之後起不來；`m/ks.sealed` 也🚫 替自己建 `m/`（vault `KeyShareQueueFile::write`）。
+        // 再收一次金鑰線的後台：上面收過之後、引擎丟掉之前，進行中的送訊息可能又把它起了起來（它握著引擎，`m/` 就刪不掉）。
+        // 現在 session 與引擎都沒了，之後起不來。
         self.stop_room_key_share_of(account).await;
         account.delete_matrix_store()?;
         // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（/docs/design/keys/room-key-backup.md §7）。

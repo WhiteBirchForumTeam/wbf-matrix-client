@@ -110,7 +110,7 @@ pub use media_ops::{
 };
 pub use media_stream::{MediaSource, MediaStream};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
-pub use room_crypto::{RoomDevices, RoomDevicesRefresh, SendOptions};
+pub use room_crypto::{RoomDevices, SendOptions};
 pub use rooms_ops::{
     cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, MessagePage, SyncMode,
 };
@@ -214,7 +214,8 @@ pub struct Core {
     /// 正在收金鑰的帳號（`key_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Device/Push` 匯進 crypto store。收法跟 `room_syncs` 一樣。
     pub(crate) key_syncs:
         std::sync::Mutex<std::collections::HashMap<PathBuf, key_sync::KeySyncHandle>>,
-    /// 後台送房間金鑰的帳號（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1）：一個帳號一個 task，第一次有房交給它才起；登出收。
+    /// 金鑰線的後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1）：一個帳號一個 task，建、換、送房間金鑰、記哪個房對哪個房間版本號就緒；
+    /// `Keys` 線開好或第一次要用時起，登出收。
     pub(crate) key_shares:
         std::sync::Mutex<std::collections::HashMap<PathBuf, key_share::KeyShareHandle>>,
     /// wbf 帳號長活的 crypto 引擎（`m/` 的 OlmMachine）：第一次要用才開，之後共用；登出拿掉（store 跟著刪）。key 是帳號目錄。

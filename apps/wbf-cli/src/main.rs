@@ -407,6 +407,7 @@ fn exit_code(error: &CoreError) -> u8 {
         Server | RoomDevicesChanged => 2,
         Integrity => 3,
         Network => 4,
-        Timeout => 5,
+        // 房間金鑰在等待時間內沒分好：等過了、沒等到，跟逾時同一級（重送就好）。
+        Timeout | RoomKeyNotReady => 5,
     }
 }

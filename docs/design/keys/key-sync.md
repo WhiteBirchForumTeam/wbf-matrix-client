@@ -34,11 +34,11 @@
        Ack 之前推來的（early pushes）→ 不單獨匯：還沒銷、還在佇列裡，下面的追平會一起拉回
        pull_to_device：Fetch（🚫 不帶 cd_seq：server 從佇列最舊還沒銷毀的給）一窗一窗到 more=false，每窗 import_items   ← 同一支
        發 keys.state: caught_up（匯了幾則、幾把新房間金鑰）；這幾窗帶來的新房間金鑰 → 去 cache 補解（/docs/design/keys/e2ee-rpc.md §6）
-       起金鑰線的 queue（key_share.rs；讀回 m/ks.sealed 上次沒送完的房，/docs/design/keys/e2ee-rpc.md §3.1）
+       起金鑰線的後台（key_share.rs：建、換、送房間金鑰，/docs/design/keys/e2ee-rpc.md §3.1）
        訂閱時跟著來的 CryptoState 交給狀態機 → send_outgoing_requests：上傳裝置金鑰、一次性金鑰、fallback key
-         （/docs/design/keys/e2ee-rpc.md §5；沒拿到 Ack 就交給 queue 退避重試到 server 回 Ack，收金鑰照常）
+         （/docs/design/keys/e2ee-rpc.md §5；沒拿到 Ack 就交給後台退避重試到 server 回 Ack，收金鑰照常）
        起收金鑰的 task（握 Arc<OlmEngine>、Arc<LinkPool>、Arc<ServerCache>、EventSink、訂閱會話）
-       叫醒 queue：手上沒送完的現在跑一輪（它要等這格開好才拿得到線，🚫 在這裡等它）
+       叫醒後台：手上沒做完的現在跑一輪（它要等這格開好才拿得到線，🚫 在這裡等它）
        ⚠️ 這一段回錯（m/ 開不起來、Subscribe 被拒、追平壞包）＝這條線沒開成：fail loud，
           因為「金鑰沒在收」靠 UI 看不出來，線開不起來看得出來（接受的取捨）。
           沒進 store 的都還在佇列裡，下次開線的追平會拉回（恢復靠重開線：看線迴圈每 15 秒試一次）

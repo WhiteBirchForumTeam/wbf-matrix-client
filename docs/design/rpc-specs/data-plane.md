@@ -248,10 +248,11 @@ daemon 在上一塊的 Ack 回來之前不讀 body；hyper 只在被要求時才
 - core 核對 manifest 是**這個帳號那台 server** 的（不是就 1100）；「上傳者是不是 sender」由 server 驗（不是就整則拒，§6）。
 - 問這一刻的房間加不加密，**區塊跟房間對不上就拒（1100）**：加密房配 `none` 的檔（server 讀得到）、明文房配加密的檔（金鑰會公開）。
   建檔到送出之間房間可能變了，所以建檔與送出兩頭都擋。
-- 明文房：`Event/Send` 送明文事件。加密房：先分房間金鑰、Megolm 加密、帶 `room_version` 送（/docs/design/keys/e2ee-rpc.md §3）。
+- 明文房：`Event/Send` 送明文事件。加密房：只用後台已經分好的房間金鑰、Megolm 加密、帶 `room_version` 送（/docs/design/keys/e2ee-rpc.md §3）。
   事件 content 是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的形狀，**檔案金鑰在區塊裡、區塊在密文裡**——這正是 Matrix 把附件金鑰放事件裡的做法。
 - 被 1506 擋：回 **1401**，`data` 是 daemon 自動重拿的房間狀態（跟 `room.send_text` 一樣）。
   UI 用新的 `room_devices`、**同一份 manifest、同一個 `txn_id`** 重送；檔案🚫 不必重傳。
+- 房間金鑰在 2 秒內沒準備好：回 **1402**，訊息沒送，`data` 帶 `txn_id`；同一份 manifest 與 `txn_id` 重送，檔案🚫 必重傳（/docs/design/keys/e2ee-rpc.md §3）。
 - 同一份 manifest 可以送進好幾個房（轉傳）：每則各自宣告一次，server 的計數各自 +1（§6）。
 
 ## 6. ⚠️ 附件一定要宣告，不然媒體留不住

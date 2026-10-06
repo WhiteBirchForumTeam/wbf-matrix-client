@@ -1510,7 +1510,8 @@ mod with_crypto_engine {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 雜湊對得上：refresh 通過、`rechecked` 空；之後 `encrypt_and_send` 帶那份的號碼——對就 `Sent`，server 說變了就 `RoomDevicesChanged`。
+    /// 雜湊對得上：refresh 通過、`rechecked` 空、🚫 碰房間金鑰；後台 `distribute_room_key` 分好之後，`encrypt_and_send` 帶那份的號碼——
+    /// 對就 `Sent`，server 說變了就 `RoomDevicesChanged`。
     #[tokio::test]
     async fn refresh_then_send_reports_1506_as_an_outcome_not_an_error() {
         use wbf_sdk::crypto_engine::{OutgoingRoomEvent, SendOutcome};
@@ -1529,6 +1530,14 @@ mod with_crypto_engine {
         assert_eq!(refresh.versions.room_version, 7);
         assert!(refresh.rechecked.is_empty(), "{refresh:?}");
         assert_eq!(refresh.diff.changed, vec!["@alice:localhost".to_string()]);
+        engine
+            .distribute_room_key(
+                &mut client,
+                &refresh.room_id,
+                &refresh.versions.members.keys().cloned().collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
         let message = OutgoingRoomEvent {
             event_type: "m.room.message".into(),
             content: serde_json::json!({ "msgtype": "m.text", "body": "hi" }),
@@ -1540,7 +1549,6 @@ mod with_crypto_engine {
                 &mut client,
                 &refresh.room_id,
                 refresh.versions.room_version,
-                &refresh.versions.members.keys().cloned().collect::<Vec<_>>(),
                 &message,
             )
             .await
@@ -1564,7 +1572,6 @@ mod with_crypto_engine {
                 &mut client,
                 &refresh.room_id,
                 refresh.versions.room_version,
-                &refresh.versions.members.keys().cloned().collect::<Vec<_>>(),
                 &message,
             )
             .await
@@ -1586,14 +1593,13 @@ mod with_crypto_engine {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 從沒在這個房分過金鑰（沒 refresh 過、daemon 剛重開、UI 手上已經有號碼）就直接送：`encrypt_and_send` 在本機建房間金鑰再加密，
-    /// 🚫 不會撞上游「沒有 outbound session」的 panic，而且**🚫 上網做任何金鑰的事**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §3）：
-    /// 假 server 只收到 `Event/Send`。金鑰的 `/keys/query` 等到 `distribute_room_key`（後台）才送。
-    /// 送出去的是密文、帶 UI 給的號碼；自己解得開自己剛送的那則（`to_incoming` 走 Decrypted、密文照帶）。
+    /// 送訊息只用已經分好的金鑰（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：這個房還沒有分好的金鑰就送 →
+    /// `RoomKeyNotReady`，🚫 建金鑰、🚫 加密、🚫 送（假 server 一個請求都沒收到），也🚫 撞上游「沒有 outbound session」的 panic。
+    /// `distribute_room_key`（後台）建好、送完之後才 `Ready`，再送就過；送出去的是密文、帶 UI 給的號碼；
+    /// 自己解得開自己剛送的那則（`to_incoming` 走 Decrypted、密文照帶）。
     #[tokio::test]
-    async fn sending_without_a_prior_refresh_creates_the_room_key_locally_and_asks_the_server_for_no_keys(
-    ) {
-        use wbf_sdk::crypto_engine::{OutgoingRoomEvent, SendOutcome};
+    async fn sending_before_the_key_is_distributed_sends_nothing_and_goes_through_after_it_is() {
+        use wbf_sdk::crypto_engine::{OutgoingRoomEvent, RoomKeyState, SendOutcome};
         use wbf_sdk::incoming::IncomingEvent;
         let members = serde_json::json!({
             "chunk": [joined("@alice:localhost", &format!("1-{}", hash_of_no_keys("@alice:localhost")))],
@@ -1609,31 +1615,29 @@ mod with_crypto_engine {
             txn_id: "t-first".into(),
             attachments: Vec::new(),
         };
-        let sent = engine
-            .encrypt_and_send(
-                &mut client,
-                "!r:localhost",
-                7,
-                &["@alice:localhost".to_string()],
-                &message,
-            )
+        let refused = engine
+            .encrypt_and_send(&mut client, "!r:localhost", 7, &message)
             .await
             .unwrap();
-        assert!(matches!(sent, SendOutcome::Sent { .. }), "{sent:?}");
-        let key_requests = |server: &FakeServer| {
+        assert!(
+            matches!(&refused, SendOutcome::RoomKeyNotReady { reason } if reason.contains("no room key")),
+            "{refused:?}"
+        );
+        drop(client);
+        let requests_after_hello = server.requests.len();
+        assert!(server.sent_events.is_empty(), "🚫 送");
+        assert!(
             server
                 .requests
                 .iter()
-                .filter(|request| request.0 == wbf_wire::Kind::Keys)
-                .count()
-        };
-        drop(client);
-        assert_eq!(
-            key_requests(&server),
-            0,
+                .all(|request| request.0 != wbf_wire::Kind::Keys),
             "the send path asks the server for no keys"
         );
-        assert!(server.to_device_sent.is_empty());
+        assert!(matches!(
+            engine.room_key_state("!r:localhost").await.unwrap(),
+            RoomKeyState::NotReady { .. }
+        ));
+
         let mut client = WbfClient::new(&mut server);
         client.hello("test", &[]).await.unwrap();
         engine
@@ -1644,18 +1648,27 @@ mod with_crypto_engine {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            engine.room_key_state("!r:localhost").await.unwrap(),
+            RoomKeyState::Ready {
+                message_count: 0,
+                due_for_rotation: false,
+                ..
+            }
+        ));
+        let sent = engine
+            .encrypt_and_send(&mut client, "!r:localhost", 7, &message)
+            .await
+            .unwrap();
+        assert!(matches!(sent, SendOutcome::Sent { .. }), "{sent:?}");
         drop(client);
-        assert!(
-            key_requests(&server) >= 1,
-            "the background queries the members' devices"
-        );
+        assert!(server.requests.len() > requests_after_hello);
         let (_, event_type, room_version) = server.sent_events.last().cloned().unwrap();
         let content = server.sent_contents.last().cloned().unwrap();
         assert_eq!(
             (event_type.as_str(), room_version),
             ("m.room.encrypted", Some(7))
         );
-
         let echoed = serde_json::json!({
             "type": "m.room.encrypted", "event_id": "$mine", "room_id": "!r:localhost",
             "sender": "@alice:localhost", "origin_server_ts": 1,

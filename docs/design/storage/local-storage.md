@@ -11,7 +11,6 @@
 | 媒體池的檔案格式、清理 | `/docs/design/media/media-pool.md`、`/docs/design/media/media-download.md` §4 |
 | `k/snapshot`、`r/` 的 recovery key、登出的閘門 | `/docs/design/keys/room-key-backup.md` §4、§7、§8 |
 | `m/td.json`（to-device 的游標） | `/docs/design/keys/to-device-client.md` §2 |
-| `m/ks.sealed`（金鑰線的 queue） | `/docs/design/keys/e2ee-rpc.md` §3.1 |
 | `daemon.token`、`daemon.json` | `/docs/design/rpc-specs/local-interface.md` §3 |
 | `wbf.conf` | `/docs/design/rpc-specs/wbf-cli-spec.md` §10 |
 
@@ -49,14 +48,14 @@
 |---|---|---|
 | 1 | `cache sqlcipher` | `s/…/cache.db`（整檔 SQLCipher） |
 | 2 | `matrix-sdk store` | `s/…/a/…/m/*.sqlite3`（上游 StoreCipher 的外層） |
-| 3 | `session` | `session.sealed`、`r/*`、`m/ks.sealed`，**靠 aad 分**（§2.3） |
+| 3 | `session` | `session.sealed`、`r/*`，**靠 aad 分**（§2.3） |
 | 4 | `media store` | `s/…/media/` 底下每個池檔與 `.seek` 檔 |
 | 5 | `room key backup` | `k/snapshot`（base64 後當上游匯出的 passphrase） |
 | 6 | `account directory` | `s/`、`a/`、`r/` 底下每個名字 |
 
 ### 2.3 封檔（sealed file）的格式
 
-`session.sealed`、`r/*`、`m/ks.sealed` 都是同一個殼（`vault.rs` 的 `seal_file`／`open_sealed_file`），pretty JSON：
+`session.sealed`、`r/*` 都是同一個殼（`vault.rs` 的 `seal_file`／`open_sealed_file`），pretty JSON：
 
 ```json
 {
@@ -83,10 +82,9 @@
   |---|---|
   | `session.sealed` | `wbf-matrix-client session.sealed v1` |
   | `r/*` | `wbf-matrix-client recovery.sealed v1` |
-  | `m/ks.sealed` | `wbf-matrix-client key-share queue v1` |
   | （`local.key` 的 passphrase 模式包主金鑰） | `wbf-matrix-client local.key v1` |
 
-  例：把 `session.sealed` 複製成 `m/ks.sealed`，後台讀它會得到「cannot open …; it was sealed with another key file」，🚫 讀成一份 queue。
+  例：把 `session.sealed` 複製成 `r/` 裡的一個檔，讀 recovery key 會得到「cannot open …; it was sealed with another key file」，🚫 讀成一串 recovery key。
 - 讀的時候：`v` 不認得、nonce 不是 24 byte、解不開、aad 不對 → 都是 `Err`，🚫 panic、🚫 猜。
 
 ### 2.4 怎麼寫：`write_private`
@@ -101,7 +99,6 @@
 
 - 沒有 fsync 資料夾：斷電可能看到舊檔或新檔，不會是半個檔。
 - Windows 不設 ACL，靠使用者目錄本來的權限。
-- ⚠️ `m/ks.sealed` 例外地**🚫 建資料夾**：`m/` 不在就是 crypto store 不在（登出刪了），寫了只會留下孤兒檔（§6.3）。
 
 ### 2.5 目錄名
 
@@ -150,8 +147,7 @@
     │           │   ├── matrix-sdk-crypto.sqlite3-wal   （開著時才有）
     │           │   ├── matrix-sdk-crypto.sqlite3-shm   （開著時才有）
     │           │   ├── matrix-sdk-state.sqlite3        只有一般 Matrix 帳號
-    │           │   ├── td.json            to-device 的游標（§6.2.1）
-    │           │   └── ks.sealed          金鑰線的 queue（§6.2.2）
+    │           │   └── td.json            to-device 的游標（§6.2.1）
     │           └── k/
     │               └── snapshot           本地房間金鑰快照（§6.4；目前只有一般 Matrix 帳號會有）
     └── 🗑️<加密的 server host>/            destroy 時改名、刪到一半的 server 目錄（§5.4）
@@ -181,7 +177,7 @@ wbfdemo/
 ```
 
 - `-wal`／`-shm` 不在：CLI 結束時關乾淨了。daemon 開著的時候看得到。
-- `td.json`、`ks.sealed` 不在：CLI 沒開 `Keys` 線、沒有還沒送完的房間金鑰。daemon 收過 to-device 就有 `td.json`；`ks.sealed` 只在 queue 不是空的時候才在。
+- `td.json` 不在：CLI 沒開 `Keys` 線。daemon 收過 to-device 就有。
 - `daemon.json`、`daemon.token` 不在：還沒起過 daemon（起過的見 §4.5、§4.6）。
 - `*.<pid>.tmp`（§2.4）、`td.json.tmp`、`k/snapshot.tmp` 是寫到一半的暫存檔，正常結束時不會留著。
 
@@ -426,7 +422,6 @@ destroy 最後一個帳號時，整個 server 目錄先改名再刪。例：`s/q
 | `matrix-sdk-crypto.sqlite3`（＋ `-wal`、`-shm`） | 上游 `matrix-sdk-sqlite` | 見下 | 上游 StoreCipher：每個值 XChaCha20-Poly1305、鍵做雜湊；StoreCipher 自己被第二把子金鑰包住，存在 `kv` 表的 `cipher` 那一列。**檔案結構外露**（表名、列數），🚫 SQLCipher | wbf 帳號：`OlmEngine`；一般 Matrix 帳號：matrix-sdk `Client` |
 | `matrix-sdk-state.sqlite3`（＋ `-wal`、`-shm`） | 上游 | 一般 Matrix 帳號的房間狀態（Client 那條的 state store）。**wbf 帳號沒有這個檔** | 同上 | 只有 matrix-sdk `Client` |
 | `td.json` | 我們的 | §6.2.1 | 🚫 加密（只有數字，§9） | `OlmEngine::import_items` |
-| `ks.sealed` | 我們的 | §6.2.2 | 封檔，第三把子金鑰 | `key_share.rs` 的後台 |
 
 例：剛登入的 wbf 帳號，`m/` 裡只有一個 184320 byte 的 `matrix-sdk-crypto.sqlite3`。它的檔頭是明文的 SQLite 檔頭（對照 §5.1 的 `cache.db`）：
 
@@ -441,7 +436,7 @@ destroy 最後一個帳號時，整個 server 目錄先改名再刪。例：`s/q
 | `kv` | 這台裝置的帳號本身（身分金鑰、一次性金鑰的 pickle）、StoreCipher、其他零散的狀態 |
 | `session` | 跟別人每台裝置的 Olm 通道 |
 | `inbound_group_session` | 收到的房間金鑰（解訊息用） |
-| `outbound_group_session` | 自己在每個房的房間金鑰，**含排好、還沒送出去的 to-device**（後台要送的就是這些，§6.2.2） |
+| `outbound_group_session` | 自己在每個房的房間金鑰，**含排好、還沒送出去的 to-device**（後台全部送到、拿到 Ack 之前，這把金鑰🚫 拿來加密，/docs/design/keys/e2ee-rpc.md §3） |
 | `device`、`identity`、`tracked_user` | 別人的裝置金鑰、交叉簽章身分、追蹤哪些人的裝置清單 |
 | `olm_hash`、`key_requests`、`direct_withheld_info`、`secrets_inbox`、`room_settings`、`lease_locks`、`received_room_key_bundle`、`room_key_backups_fully_downloaded`、`rooms_pending_key_bundle` | 去重、金鑰請求、withheld、秘密、房間設定、跨 process 鎖、歷史金鑰包 |
 
@@ -458,27 +453,13 @@ destroy 最後一個帳號時，整個 server 目錄先改名再刪。例：`s/q
 - 寫法：`td.json.tmp` 再 rename，🚫 fsync、🚫 0600（只有數字）。
 - 跟 crypto store 同生共死：`m/` 沒了它也沒了，重新從佇列頭拉。
 
-#### 6.2.2 `m/ks.sealed`：金鑰線的 queue
+#### 6.2.2 金鑰線的後台🚫 存檔
 
-金鑰線（`Keys`）上「還沒送到的房間金鑰」記在這裡，daemon 重開之後 `Keys` 線一開就照著補（`/docs/design/keys/e2ee-rpc.md` §3.1，維護者 2026-10-06 選的做法）。
-磁碟上是封檔（§2.3 的形狀）；解開之後是一行 JSON，示意：
+`key_share.rs`（建、換、送房間金鑰）只有記憶體裡的「哪個房對哪個房間版本號就緒」，🚫 寫任何檔。
+理由在 `/docs/design/keys/e2ee-rpc.md` §3：送訊息只用排過的 to-device **全部拿到 Ack** 的金鑰，沒拿到 Ack 的那份從來沒被拿來加密過，daemon 重開丟了它也沒有訊息解不開；
+待送的 to-device 本身在上游 `outbound_group_session` 那一列上，重開之後下一次 refresh 或送出會再交給後台。
 
-```json
-{"v":1,"rooms":{"!VQOED7Ue4x3Uwh4ELt:localhost":["@alice:localhost","@bob:localhost"]}}
-```
-
-讀法：「`!VQOED7Ue4x3Uwh4ELt:localhost` 這個房的房間金鑰，還要送給 alice（自己的其他裝置）與 bob 的裝置」。
-
-- `rooms`：房間 id → 要拿這把房間金鑰的成員（UI 帶來的那份 join 成員，含自己）。**要送的 to-device 本身🚫 在這裡**，它們在上游 `outbound_group_session` 那一列上；這個檔只記「哪個房、送給誰」，後台照著叫上游重新算、送出去。
-- 一個房送成就從 `rooms` 拿掉、寫回檔；`rooms` 空了就刪檔——所以平常看不到這個檔，它在就表示有東西沒送到。
-- 同一個房還沒送完又交一次：成員換成最新的那份，🚫 合併兩份。
-- 為什麼加密：裡面是房間 id 與 mxid——目錄名特地加密就是為了藏這些（§2.1）。
-- 為什麼🚫 用上游 crypto store 的 `kv` 存（維護者 2026-10-06）：`m/` 裡除了上游的 store 都是我們自己的格式，這樣 store 換掉（只剩 `matrix-sdk-crypto` 的時候）它不受影響。
-- 格式：封檔（§2.3），aad `wbf-matrix-client key-share queue v1`。`v` 看不懂就從空的開始。
-- 寫失敗只講一聲，記憶體裡的照送，只是重開之後不會接著送。
-- 壞了（解不開、不是 JSON、版本不認得）：講一聲、從空的開始，🚫 刪它（下一次寫的時候才蓋掉）。那些房下一次送訊息或 refresh 會再交進來。
-- **🚫 替自己建 `m/`**（§2.4）。
-- 自己的金鑰（裝置金鑰、一次性金鑰）上傳失敗也進同一個 queue 重試，但**🚫 寫進檔**：上游自己記得還有沒上傳的，每次開 `Keys` 線 `init_keys` 都會再傳一次。
+📎 2026-10-06 加過一個 `m/ks.sealed`（記「哪些房還沒送完」）、同一天改了設計拿掉，沒有發布過。看到這個檔就是那天的開發版留下的，可以刪。
 
 ### 6.3 誰刪 `m/`
 
@@ -557,7 +538,7 @@ manifest 的例子（`wbf-cli upload photo.bin --manifest photo.manifest.json` �
 | | 登出（`logout`／`account del`） | destroy |
 |---|---|---|
 | `session.sealed` | 刪（server 那邊登出成功之後） | 刪 |
-| `m/`（含 `td.json`、`ks.sealed`） | 刪 | 刪 |
+| `m/`（含 `td.json`） | 刪 | 刪 |
 | `k/` | 刪（閘門過了之後） | 刪 |
 | 帳號目錄本身 | **留**（空的） | 刪 |
 | `r/<這個帳號>` | **留** | 刪 |
