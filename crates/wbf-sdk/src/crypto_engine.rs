@@ -201,6 +201,10 @@ pub struct OlmEngine {
     /// 最近一次 `/keys/query` 回答這個人的 body（整份）：拿來重算裝置雜湊跟成員清單上的比（wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4）。
     /// 只在記憶體：重開就重查。
     last_keys_query: Mutex<BTreeMap<String, serde_json::Value>>,
+    /// [`OlmEngine::send_outgoing_requests`] 一次只跑一個。同一台狀態機上兩個同時跑（開金鑰線時上傳自己的金鑰、refresh、後台分金鑰），
+    /// 各自拿到同一批「待查」的 `/keys/query` 去送、互相讓對方的回應過期，繞滿 `OUTGOING_ROUNDS_LIMIT` 圈就失敗
+    /// （2026-10-07 CLI 新裝置第一個命令送加密房實測：35 個 `/keys/query`）。
+    outgoing: tokio::sync::Mutex<()>,
 }
 
 impl OlmEngine {
@@ -244,6 +248,7 @@ impl OlmEngine {
             machine,
             store_dir: store_dir.to_path_buf(),
             last_keys_query: Mutex::new(BTreeMap::new()),
+            outgoing: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -690,6 +695,7 @@ impl OlmEngine {
         &self,
         client: &mut WbfClient<C>,
     ) -> Result<usize, SdkError> {
+        let _one_at_a_time = self.outgoing.lock().await;
         let mut sent = 0usize;
         for _ in 0..OUTGOING_ROUNDS_LIMIT {
             let requests = self

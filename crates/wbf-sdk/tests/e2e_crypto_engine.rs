@@ -839,3 +839,59 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         let _ = std::fs::remove_dir_all(&device.store_dir);
     }
 }
+
+/// 同一台狀態機上三個「送出所有待送請求」同時跑（新裝置開金鑰線時：上傳自己的金鑰、refresh 查成員、後台分金鑰）：三個都要成功。
+/// 沒有序列化時，它們各自拿到同一批 `/keys/query`、互相讓對方的回應過期，繞滿上限就失敗（2026-10-07 CLI 新裝置第一個命令實測）。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn concurrent_outgoing_request_loops_on_one_engine_all_finish() {
+    let (Some(target), Some(target_b)) = (target(), target_b()) else {
+        eprintln!(
+            "skipped: WBF_E2E_SERVER / USER / PASSWORD_FILE / USER_B / PASSWORD_B_FILE not set"
+        );
+        return;
+    };
+    let mut device = log_in_a_device(&target, &format!("concurrent-{}", std::process::id())).await;
+    let mut extra = Vec::new();
+    for _ in 0..2 {
+        let channel = Channel::connect(
+            &device.session.server,
+            &device.session.access_token,
+            Transport::WebSocket,
+        )
+        .await
+        .expect("ws");
+        let mut ws = WbfClient::new(channel);
+        ws.hello("concurrent", &[]).await.expect("hello");
+        extra.push(ws);
+    }
+    let bob = format!(
+        "@{}:{}",
+        target_b.user,
+        device
+            .session
+            .user_id
+            .split(':')
+            .nth(1)
+            .unwrap_or("localhost")
+    );
+    device
+        .engine
+        .track_users(&[device.session.user_id.clone(), bob])
+        .await
+        .unwrap();
+    let mut extra = extra.into_iter();
+    let (mut second, mut third) = (extra.next().unwrap(), extra.next().unwrap());
+    let engine = &device.engine;
+    let (one, two, three) = tokio::join!(
+        engine.send_outgoing_requests(&mut device.ws),
+        engine.send_outgoing_requests(&mut second),
+        engine.send_outgoing_requests(&mut third),
+    );
+    assert!(
+        one.is_ok() && two.is_ok() && three.is_ok(),
+        "{one:?} / {two:?} / {three:?}"
+    );
+    logout(&device.session).await.expect("logout");
+    let _ = std::fs::remove_dir_all(&device.store_dir);
+}
