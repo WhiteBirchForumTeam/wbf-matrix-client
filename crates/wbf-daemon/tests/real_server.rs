@@ -786,6 +786,288 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
     stop_daemon(daemon, client).await;
 }
 
+/// 別的 client（Element…）送來的標準附件（/docs/design/media/media-download.md §12）：
+///
+/// | 送的 | 要看到 |
+/// |---|---|
+/// | `m.file` 帶 `file`（上游 `AttachmentEncryptor` 加密、`/_matrix/media/v3/upload` 傳上去） | `kind` 2、下載完 `verified` 1、推播有 `verifying`、GET 200 整檔一樣 |
+/// | 同上，但上傳的密文翻一個 bit | `verified` 2、GET **412** 而 body 照給、匯出寫了檔而且回 **1501** |
+/// | `m.image` 只帶 `url` | `kind` 3、`verified` 0、GET 200 整檔一樣 |
+///
+/// 送的那一方用原生 HTTP（同一個 alice 另登一台裝置），🚫 經過我們的程式碼：它就是「別人的 client」。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_ROOM"]
+async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_data_plane() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let user = std::env::var("WBF_E2E_USER").expect("WBF_E2E_USER");
+    let room = std::env::var("WBF_E2E_ROOM").expect("WBF_E2E_ROOM");
+    let password_file = std::env::var("WBF_E2E_PASSWORD_FILE").expect("WBF_E2E_PASSWORD_FILE");
+    let password = std::fs::read_to_string(password_file).unwrap();
+    let password = password.strip_suffix('\n').unwrap_or(&password).to_string();
+
+    let dir = tempfile::Builder::new()
+        .prefix("wd")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
+    let reply = client.call("vault.create", json!({})).await;
+    assert_eq!(reply["code"], 0, "vault.create: {reply}");
+    let reply = client
+        .call(
+            "account.add",
+            json!({ "server": server, "user": user, "password": password, "device_name": "wbf-daemon standard media e2e" }),
+        )
+        .await;
+    assert_eq!(reply["code"], 0, "account.add: {reply}");
+    wait_for_links(&mut client, 5).await;
+    let subscribed = client
+        .call("subscribe", json!({ "events": ["media.download"] }))
+        .await;
+    assert_eq!(subscribed["code"], 0, "subscribe: {subscribed}");
+    let other = OtherClient::login(&server, &user, &password).await;
+    let body: Vec<u8> = (0..150_001u32)
+        .map(|position| (position % 253) as u8)
+        .collect();
+
+    // ── kind 2：對的檔 ──
+    let (cipher, mut file) = encrypt_like_element(&body);
+    let mxc = other.upload(cipher).await;
+    file["url"] = json!(mxc);
+    let event_id = other
+        .send(
+            &room,
+            json!({ "msgtype": "m.file", "body": "enc.bin", "info": { "size": body.len(), "mimetype": "application/octet-stream" }, "file": file }),
+        )
+        .await;
+    let by_event = json!({ "room": room, "event_id": event_id });
+    let opened = open_once_seen(&mut client, &by_event).await;
+    assert_eq!(opened["result"]["kind"], 2, "{opened}");
+    let url = opened["result"]["url"].as_str().unwrap().to_string();
+    let state = download_until_complete(&mut client, &by_event).await;
+    assert_eq!(
+        (&state["result"]["kind"], &state["result"]["verified"]),
+        (&json!(2), &json!(1)),
+        "{state}"
+    );
+    let (status, head, whole) = get(daemon.data_port, &url, None).await;
+    assert_eq!(status, 200, "{head}");
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.contains("wbf-media-kind: 2") && head.contains("wbf-media-verified: 1"),
+        "{head}"
+    );
+    assert_eq!(whole, body, "解開跟送的一樣");
+    let pushed: Vec<&Value> = client
+        .pushes
+        .iter()
+        .filter(|push| push["method"] == "media.download" && push["params"]["mxc"] == json!(mxc))
+        .collect();
+    assert!(
+        pushed
+            .iter()
+            .any(|push| push["params"]["state"] == "verifying")
+            && pushed.iter().any(
+                |push| push["params"]["state"] == "complete" && push["params"]["verified"] == 1
+            ),
+        "推播先 verifying、再 complete 帶 verified 1：{pushed:?}"
+    );
+
+    // ── kind 2：密文被改過一個 bit ──
+    let (mut cipher, mut file) = encrypt_like_element(&body);
+    cipher[1000] ^= 0x04;
+    let mxc = other.upload(cipher).await;
+    file["url"] = json!(mxc);
+    let event_id = other
+        .send(
+            &room,
+            json!({ "msgtype": "m.file", "body": "bad.bin", "info": { "size": body.len() }, "file": file }),
+        )
+        .await;
+    let by_event = json!({ "room": room, "event_id": event_id });
+    let opened = open_once_seen(&mut client, &by_event).await;
+    let url = opened["result"]["url"].as_str().unwrap().to_string();
+    let state = download_until_complete(&mut client, &by_event).await;
+    assert_eq!(
+        state["result"]["verified"], 2,
+        "驗不過也是完成、🚫 刪檔：{state}"
+    );
+    let (status, head, whole) = get(daemon.data_port, &url, None).await;
+    assert_eq!(status, 412, "沒驗過的傳統加密檔：412、body 照給：{head}");
+    assert_eq!(whole.len(), body.len());
+    assert_eq!(
+        whole[1000],
+        body[1000] ^ 0x04,
+        "AES-CTR 擋不住竄改：同一個 bit 跟著翻"
+    );
+    let out = dir.path().join("bad.out");
+    let out_uri = format!(
+        "file:///{}",
+        out.display()
+            .to_string()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let exported = client
+        .call(
+            "media.export_to",
+            json!({ "room": room, "event_id": event_id, "to": out_uri }),
+        )
+        .await;
+    assert_eq!(exported["code"], 1501, "照匯、回 unverified：{exported}");
+    assert_eq!(exported["data"]["verified"], 2, "{exported}");
+    assert_eq!(std::fs::read(&out).unwrap().len(), body.len(), "檔寫了");
+
+    // ── kind 3：只有 url ──
+    let mxc = other.upload(body.clone()).await;
+    let event_id = other
+        .send(
+            &room,
+            json!({ "msgtype": "m.image", "body": "p.png", "url": mxc, "info": { "size": body.len(), "mimetype": "image/png" } }),
+        )
+        .await;
+    let by_event = json!({ "room": room, "event_id": event_id });
+    let opened = open_once_seen(&mut client, &by_event).await;
+    assert_eq!(opened["result"]["kind"], 3, "{opened}");
+    let url = opened["result"]["url"].as_str().unwrap().to_string();
+    let state = download_until_complete(&mut client, &by_event).await;
+    assert_eq!(state["result"]["verified"], 0, "沒有 hash 可比：{state}");
+    let (status, head, whole) = get(daemon.data_port, &url, None).await;
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("wbf-media-kind: 3"),
+        "{head}"
+    );
+    assert_eq!(whole, body);
+
+    other.logout().await;
+    stop_daemon(daemon, client).await;
+}
+
+/// 上游的加密器（Element 這類 client 用的同一份）：回（密文、事件裡的 `file`，`url` 由呼叫者填）。
+fn encrypt_like_element(plain: &[u8]) -> (Vec<u8>, Value) {
+    use std::io::Read;
+    let mut source = plain;
+    let mut encryptor = matrix_sdk_crypto::AttachmentEncryptor::new(&mut source);
+    let mut cipher = Vec::new();
+    encryptor.read_to_end(&mut cipher).unwrap();
+    (cipher, serde_json::to_value(encryptor.finish()).unwrap())
+}
+
+/// 事件經訂閱線進了這個帳號的快取，`media.open` 才找得到金鑰：輪詢到成功為止。
+async fn open_once_seen(client: &mut Client, by_event: &Value) -> Value {
+    let mut opened = Value::Null;
+    for _ in 0..50 {
+        opened = client.call("media.open", by_event.clone()).await;
+        if opened["code"] == 0 {
+            return opened;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("media.open never found the event: {opened}");
+}
+
+async fn download_until_complete(client: &mut Client, by_event: &Value) -> Value {
+    let mut state = Value::Null;
+    for _ in 0..150 {
+        state = client.call("media.download", by_event.clone()).await;
+        assert_eq!(state["code"], 0, "media.download: {state}");
+        if state["result"]["state"] == "complete" {
+            return state;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("the download never completed: {state}");
+}
+
+/// 「別人的 client」：原生的 Matrix HTTP，🚫 經過我們的程式碼。
+struct OtherClient {
+    http: reqwest::Client,
+    server: String,
+    access_token: String,
+}
+
+impl OtherClient {
+    async fn login(server: &str, user: &str, password: &str) -> OtherClient {
+        let http = reqwest::Client::new();
+        let reply: Value = http
+            .post(format!("{server}/_matrix/client/v3/login"))
+            .json(&json!({ "type": "m.login.password", "identifier": { "type": "m.id.user", "user": user },
+                           "password": password, "initial_device_display_name": "e2e other client" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let access_token = reply["access_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("login: {reply}"))
+            .to_string();
+        OtherClient {
+            http,
+            server: server.to_string(),
+            access_token,
+        }
+    }
+
+    /// Return:
+    ///     String   `content_uri`, example: "mxc://localhost/AbCdEf"
+    async fn upload(&self, bytes: Vec<u8>) -> String {
+        let reply: Value = self
+            .http
+            .post(format!("{}/_matrix/media/v3/upload", self.server))
+            .bearer_auth(&self.access_token)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        reply["content_uri"]
+            .as_str()
+            .unwrap_or_else(|| panic!("upload: {reply}"))
+            .to_string()
+    }
+
+    /// Return:
+    ///     String   event_id
+    async fn send(&self, room: &str, content: Value) -> String {
+        let room = room.replace('!', "%21").replace(':', "%3A");
+        let txn = uuid::Uuid::new_v4();
+        let reply: Value = self
+            .http
+            .put(format!(
+                "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn}",
+                self.server
+            ))
+            .bearer_auth(&self.access_token)
+            .json(&content)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        reply["event_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("send: {reply}"))
+            .to_string()
+    }
+
+    async fn logout(&self) {
+        let _ = self
+            .http
+            .post(format!("{}/_matrix/client/v3/logout", self.server))
+            .bearer_auth(&self.access_token)
+            .json(&json!({}))
+            .send()
+            .await;
+    }
+}
+
 /// 裸 TCP 送一個 GET（`Connection: close`，讀到 EOF）。
 ///
 /// Return:
