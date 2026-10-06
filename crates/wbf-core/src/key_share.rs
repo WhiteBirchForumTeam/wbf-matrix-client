@@ -84,7 +84,7 @@ impl KeyShareInbox {
 pub(crate) struct KeyShareHandle {
     inbox: KeyShareInbox,
     task: tokio::task::JoinHandle<()>,
-    /// 試過幾次送一個房（只給測試：送成之後再試不會走橋，從假 server 看不出來有沒有停）。
+    /// 試過幾次（送一個房、或重傳一次自己的金鑰；只給測試：送成之後再試不會走橋，從假 server 看不出來有沒有停）。
     #[cfg(test)]
     attempts: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -230,9 +230,9 @@ impl Core {
     }
 
     /// Return:
-    ///     u32  這個帳號的後台試過幾次送一個房（只給測試斷言。還沒有後台是 0）
+    ///     u32  這個帳號的後台試過幾次（送一個房、或重傳一次自己的金鑰；只給測試斷言。還沒有後台是 0）
     #[cfg(test)]
-    pub(crate) fn room_key_share_attempts(&self, account: &AccountDir) -> u32 {
+    pub(crate) fn key_share_attempts(&self, account: &AccountDir) -> u32 {
         self.key_shares
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -282,6 +282,9 @@ impl KeyShareTask {
             };
             let mut failed = false;
             if upload_own_keys {
+                #[cfg(test)]
+                self.attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 match self.engine.send_outgoing_requests(&mut line).await {
                     Ok(_) => upload_own_keys = false,
                     Err(error) => {
@@ -528,7 +531,7 @@ mod tests {
         // 只看走橋的不夠：金鑰送出去之後再試一次什麼都不用送，一直重試也看不出來（變異驗證抓到）。
         tokio::time::sleep(RETRY_MAX).await;
         let settled = keys.bridge_calls.lock().unwrap().len();
-        let attempts = core.room_key_share_attempts(&account);
+        let attempts = core.key_share_attempts(&account);
         assert!(
             attempts >= 2,
             "one failed attempt and one retry: {attempts}"
@@ -540,7 +543,7 @@ mod tests {
             "nothing is sent again once the room's key went out"
         );
         assert_eq!(
-            core.room_key_share_attempts(&account),
+            core.key_share_attempts(&account),
             attempts,
             "the room is not tried again once its key went out"
         );
@@ -583,7 +586,7 @@ mod tests {
         let keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
         core.key_share_inbox(&account).await.unwrap().line_opened();
         wait_for_async(
-            || async { core.room_key_share_attempts(&account) >= 1 && !queue_path.exists() },
+            || async { core.key_share_attempts(&account) >= 1 && !queue_path.exists() },
             "the new background sends the room read back from the file and removes it",
         )
         .await;
@@ -612,17 +615,13 @@ mod tests {
         core.key_share_inbox(&account).await.unwrap().line_opened();
         tokio::time::sleep(RETRY_FIRST * 2).await;
         assert!(core.is_sharing_room_keys(&account));
-        assert_eq!(
-            core.room_key_share_attempts(&account),
-            0,
-            "nothing read back"
-        );
+        assert_eq!(core.key_share_attempts(&account), 0, "nothing read back");
 
         core.send_text(ROOM, "hi", &send_options("t-1"), &Target::default())
             .await
             .expect("sent");
         wait_for_async(
-            || async { core.room_key_share_attempts(&account) >= 1 && !queue_path.exists() },
+            || async { core.key_share_attempts(&account) >= 1 && !queue_path.exists() },
             "new work is still taken and sent",
         )
         .await;
@@ -659,11 +658,20 @@ mod tests {
             "the failed upload is tried again",
         )
         .await;
+        // 傳成之後就停。只數上傳不夠：傳成之後再試一次什麼都不用傳、不走橋，一直重試也看不出來（變異驗證抓到），所以也數「試過幾次」。
+        tokio::time::sleep(RETRY_MAX).await;
+        let attempts = core.key_share_attempts(&account);
         tokio::time::sleep(RETRY_MAX * 2).await;
         assert_eq!(
             uploads(),
             2,
             "uploaded once more after the failure, then stopped"
+        );
+        assert_eq!(attempts, 2, "one failed upload and one retry");
+        assert_eq!(
+            core.key_share_attempts(&account),
+            attempts,
+            "the upload is not tried again once the server acknowledged it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
