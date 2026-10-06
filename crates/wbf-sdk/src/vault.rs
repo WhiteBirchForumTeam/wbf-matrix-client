@@ -211,7 +211,7 @@ impl Vault {
                     )));
                 }
                 let kek = derive_kek(passphrase, &kdf)?;
-                let nonce = decode_base64(&nonce, "nonce")?;
+                let nonce = decode_nonce(&nonce)?;
                 let wrapped = decode_base64(&wrapped, "wrapped")?;
                 let master = XChaCha20Poly1305::new(kek.as_bytes().into())
                     .decrypt(
@@ -382,38 +382,10 @@ impl Vault {
     ///     Ok(None)           沒有這個檔（這個帳號還沒跑過 `key-backup recovery`）
     ///     Err(Usage)         檔案壞了、或不是這把主金鑰封的
     pub fn unseal_recovery_key(&self, path: &Path) -> Result<Option<Zeroizing<String>>, SdkError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(plaintext) = open_sealed_file(&self.session_key(), path, RECOVERY_AAD)? else {
+            return Ok(None);
         };
-        let file: SealedFile = serde_json::from_slice(&bytes).map_err(|error| {
-            SdkError::Usage(format!("{} is not readable: {error}", path.display()))
-        })?;
-        if file.v != SEALED_VERSION {
-            return Err(SdkError::Usage(format!(
-                "{} has version {}, this build understands {SEALED_VERSION}",
-                path.display(),
-                file.v
-            )));
-        }
-        let nonce = decode_base64(&file.nonce, "nonce")?;
-        let sealed = decode_base64(&file.sealed, "sealed")?;
-        let plaintext = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
-            .decrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &sealed,
-                    aad: RECOVERY_AAD,
-                },
-            )
-            .map_err(|_| {
-                SdkError::Usage(format!(
-                    "cannot open {}; it was sealed with another key file",
-                    path.display()
-                ))
-            })?;
-        let text = String::from_utf8(plaintext)
+        let text = String::from_utf8(plaintext.to_vec())
             .map_err(|_| SdkError::Usage(format!("{} does not hold text", path.display())))?;
         Ok(Some(Zeroizing::new(text)))
     }
@@ -421,41 +393,17 @@ impl Vault {
     /// Return:
     ///     Ok(Some(Session))  `path` 存在而且解得開
     ///     Ok(None)           沒有這個檔
-    ///     Err(Usage)         檔案壞了、或不是這把主金鑰封的
+    ///     Err(Usage)         檔案壞了、或不是這把主金鑰封的（訊息帶「重新 login」的提示）
     pub fn unseal_session(&self, path: &Path) -> Result<Option<Session>, SdkError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let plaintext = open_sealed_file(&self.session_key(), path, SESSION_AAD).map_err(
+            |error| match error {
+                SdkError::Usage(why) => SdkError::Usage(format!("{why}; run `login` again")),
+                other => other,
+            },
+        )?;
+        let Some(plaintext) = plaintext else {
+            return Ok(None);
         };
-        let file: SealedFile = serde_json::from_slice(&bytes).map_err(|error| {
-            SdkError::Usage(format!("{} is not recognised: {error}", path.display()))
-        })?;
-        if file.v != SEALED_VERSION {
-            return Err(SdkError::Usage(format!(
-                "{} version {} is not supported",
-                path.display(),
-                file.v
-            )));
-        }
-        let nonce = decode_base64(&file.nonce, "nonce")?;
-        let sealed = decode_base64(&file.sealed, "sealed")?;
-        let plaintext = Zeroizing::new(
-            XChaCha20Poly1305::new(self.session_key().as_bytes().into())
-                .decrypt(
-                    XNonce::from_slice(&nonce),
-                    Payload {
-                        msg: &sealed,
-                        aad: SESSION_AAD,
-                    },
-                )
-                .map_err(|_| {
-                    SdkError::Usage(format!(
-                        "{} was not sealed by this key file; run `login` again",
-                        path.display()
-                    ))
-                })?,
-        );
         let session = serde_json::from_slice(&plaintext).map_err(|error| {
             SdkError::Usage(format!("{} content is broken: {error}", path.display()))
         })?;
@@ -567,6 +515,20 @@ fn decode_base64(text: &str, field: &str) -> Result<Vec<u8>, SdkError> {
         .map_err(|error| SdkError::Usage(format!("key file field {field}: {error}")))
 }
 
+/// 檔案裡讀來的 nonce：長度不是 24 就是壞檔，回錯——🚫 交給 `XNonce::from_slice`（長度不對會 panic）。
+///
+/// Args:
+///     text: base64 的 nonce, example: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+/// Return:
+///     Ok([u8; 24])
+///     Err(Usage)   不是 base64、或不是 24 bytes
+fn decode_nonce(text: &str) -> Result<[u8; 24], SdkError> {
+    decode_base64(text, "nonce")?
+        .as_slice()
+        .try_into()
+        .map_err(|_| SdkError::Usage("key file field nonce: expected 24 bytes".into()))
+}
+
 fn decode_key32(text: &str, field: &str) -> Result<Key32, SdkError> {
     let bytes = Zeroizing::new(decode_base64(text, field)?);
     let array: [u8; 32] = bytes
@@ -593,10 +555,21 @@ impl KeyShareQueueFile {
     }
 
     /// 封進去：先寫暫存檔再 rename、0600。
+    /// 🚫 替它建資料夾：queue 跟 crypto store 同生共死，`m/` 不在（登出刪了）就是 store 不在，回錯——寫了只會在登出之後留下孤兒檔。
     ///
     /// Args:
     ///     plaintext: 呼叫端序列化好的 queue, example: br#"{"rooms":{}}"#
+    /// Return:
+    ///     Ok(())
+    ///     Err(Usage)   所在的資料夾不在
+    ///     Err(Io)      寫不進去
     pub fn write(&self, plaintext: &[u8]) -> Result<(), SdkError> {
+        if !self.path.parent().is_some_and(Path::is_dir) {
+            return Err(SdkError::Usage(format!(
+                "{} has no store directory to live in (logged out?)",
+                self.path.display()
+            )));
+        }
         seal_file(
             &self.key,
             &self.path,
@@ -670,7 +643,7 @@ fn open_sealed_file(
             file.v
         )));
     }
-    let nonce = decode_base64(&file.nonce, "nonce")?;
+    let nonce = decode_nonce(&file.nonce)?;
     let sealed = decode_base64(&file.sealed, "sealed")?;
     let plaintext = XChaCha20Poly1305::new(key.as_bytes().into())
         .decrypt(XNonce::from_slice(&nonce), Payload { msg: &sealed, aad })
@@ -718,11 +691,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    // Windows 的 rename 不覆蓋既有檔，先移走。
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    // `std::fs::rename` 在 Windows 也直接蓋掉既有檔（MoveFileExW ＋ MOVEFILE_REPLACE_EXISTING）。🚫 先刪舊檔：
+    // 刪了之後、rename 之前斷電，`local.key` 就沒了，整個 data dir 跟著解不開（/docs/design/storage/local-storage.md §2）。
+    if let Err(error) = std::fs::rename(&scratch_path, path) {
+        let _ = std::fs::remove_file(&scratch_path);
+        return Err(error.into());
     }
-    std::fs::rename(&scratch_path, path)?;
     Ok(())
 }
 
@@ -866,6 +840,12 @@ mod tests {
         let queue = vault.key_share_queue_file(&path);
         assert!(queue.read().unwrap().is_none());
         let plaintext = br#"{"rooms":{"!r:localhost":["@bob:localhost"]}}"#;
+        assert!(
+            queue.write(plaintext).is_err(),
+            "🚫 替它建 m/：store 不在（登出刪了）就不寫"
+        );
+        assert!(!dir.join("m").exists());
+        std::fs::create_dir_all(dir.join("m")).unwrap();
         queue.write(plaintext).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("@bob") && !raw.contains("!r:"), "{raw}");
@@ -879,6 +859,55 @@ mod tests {
         queue.remove().unwrap();
         assert!(queue.read().unwrap().is_none());
         queue.remove().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 蓋掉既有檔靠 rename 本身（Windows 也是），🚫 先刪舊檔：途中斷電時舊檔還在。蓋完不留暫存檔。
+    #[test]
+    fn write_private_replaces_an_existing_file_and_leaves_no_scratch_file() {
+        let dir = scratch_dir("write-private");
+        let path = dir.join("local.key");
+        write_private(&path, b"old").unwrap();
+        write_private(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["local.key".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 檔案裡的 nonce 長度不對（壞檔、被截斷）：四個讀檔的地方都回錯，🚫 panic（`XNonce::from_slice` 遇到長度不對會 panic，key_share 的測試抓到）。
+    #[test]
+    fn a_file_whose_nonce_has_the_wrong_length_is_an_error_not_a_panic() {
+        let dir = scratch_dir("short-nonce");
+        let passphrase = Unlock::Passphrase(b"pw".to_vec().into());
+        let vault = Vault::create(&dir, &passphrase).unwrap();
+        let shorten_nonce = |path: &Path| {
+            let mut file: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            file["nonce"] = serde_json::Value::String("AAAA".into());
+            std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+        };
+
+        shorten_nonce(&dir.join(KEY_FILE_NAME));
+        assert!(Vault::open(&dir, &passphrase).is_err());
+
+        let session = dir.join(SEALED_SESSION_FILE_NAME);
+        vault.seal_session(&session, &sample_session()).unwrap();
+        shorten_nonce(&session);
+        assert!(vault.unseal_session(&session).is_err());
+
+        let recovery = dir.join("recovery");
+        vault.seal_recovery_key(&recovery, "EsT1 abcd").unwrap();
+        shorten_nonce(&recovery);
+        assert!(vault.unseal_recovery_key(&recovery).is_err());
+
+        let queue = vault.key_share_queue_file(&dir.join("ks.sealed"));
+        queue.write(b"{}").unwrap();
+        shorten_nonce(&dir.join("ks.sealed"));
+        assert!(queue.read().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -103,6 +103,25 @@ pub(crate) fn members_body(room_version: u64) -> Value {
     })
 }
 
+/// 一條放進池裡的 `Keys` 線（記憶體對接的假 server）：refresh 走這條（/docs/design/keys/e2ee-rpc.md §3.1），
+/// 它的 `Members` 回房間版本號 `room_version`、成員只有自己。測試要讓房間「變了」就改回傳那個的 `members`。
+pub(crate) async fn keys_line_with_room(
+    core: &Core,
+    account: &AccountDir,
+    room_version: u64,
+) -> FakeServer {
+    let (client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+    drop(
+        core.pool_of_account(account)
+            .unwrap()
+            .acquire(LinkRole::Keys, || async move { Ok(client) })
+            .await
+            .unwrap(),
+    );
+    *fake.members.lock().unwrap() = Some(members_body(room_version));
+    fake
+}
+
 /// 一則 to-device（`m.dummy`：OlmMachine 認得、吃了不留痕），`count` 就是它在佇列裡的號。
 pub(crate) fn to_device_item(count: u64) -> (u64, Value) {
     (

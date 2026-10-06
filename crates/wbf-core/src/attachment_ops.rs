@@ -597,6 +597,8 @@ mod tests {
         let dir = scratch("attach-encrypted");
         let (core, account) = core_with_wbf_account(&dir).await;
         let (misc, upload) = misc_and_upload(&core, &account, true).await;
+        // refresh 走 `Keys` 線（/docs/design/keys/e2ee-rpc.md §3.1）；假 server 丟掉線就斷，留到測試結束。
+        let _keys = keys_line_with_room(&core, &account, 7).await;
         let target = Target::default();
         let original = body(40);
 
@@ -917,9 +919,20 @@ mod tests {
         core.receive_upload(&state, &mut &original[..20], None, &target)
             .await
             .unwrap_err();
-        upload.uploads.lock().unwrap().get_mut(&1).unwrap().truncated = true;
+        upload
+            .uploads
+            .lock()
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .truncated = true;
         let manifest = core
-            .receive_upload(&state, &mut &original[..], Some("file:///home/me/v.bin"), &target)
+            .receive_upload(
+                &state,
+                &mut &original[..],
+                Some("file:///home/me/v.bin"),
+                &target,
+            )
             .await
             .unwrap();
         let (cache, _) = core.cache_and_me(&account).unwrap();
