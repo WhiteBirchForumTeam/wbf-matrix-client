@@ -19,19 +19,22 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::chat::{Conversation, Message, MessageKind, Reaction, RoomListEntry};
+use crate::chunk_block::ChunkedBlock;
 use crate::error::SdkError;
 use crate::event_json::{kind_from_content, FILE_MSGTYPE};
 use crate::incoming::{
     check_replacement, classify, to_replaced_body, EventClass, IncomingEvent, ReplacementSide,
     NOT_DECRYPTED_HERE,
 };
+use crate::media_kind::{MediaKind, Verification};
 use crate::vault::Key32;
 
 pub const CACHE_FILE_NAME: &str = "cache.db";
 /// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改；
 /// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）；
 /// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、🚫 刪列，維護者 2026-10-05）。
-const SCHEMA_VERSION: i64 = 8;
+/// v9：`media.kind`、`media.verified`；`file_size`、`chunk_size` 只有 `kind` 1 一定有（維護者 2026-10-06，/docs/design/media/media-download.md §12）。
+const SCHEMA_VERSION: i64 = 9;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,10 +103,16 @@ pub struct MediaEntry {
     pub name: Option<String>,
     pub mimetype: Option<String>,
     /// 明文的校驗碼，`<algo>:<hex>`：事件區塊有帶就是 `sha256:…`（上傳者算的），沒帶就下載完填 `blake3:…`（我們算的，同 `pool_file`）。
-    /// 還沒下載完而區塊也沒帶時是 None。
+    /// 還沒下載完而區塊也沒帶時是 None。`kind` 2 是 `matrix-sha256:<base64>`（密文的，🚫 跟 `sha256:` 互比）。
     pub hash: Option<String>,
-    pub file_size: u64,
-    pub chunk_size: u32,
+    /// 哪一種格式（/docs/design/rpc-specs/data-plane.md §7.1）
+    pub kind: MediaKind,
+    /// 整檔 hash 比對的結果（/docs/design/media/media-download.md §12.3）
+    pub verified: Verification,
+    /// 明文總長：`kind` 1 一定有；`kind` 2、3 事件沒給就要下載完才知道
+    pub file_size: Option<u64>,
+    /// 塊大小：只有 `kind` 1 有
+    pub chunk_size: Option<u32>,
     /// 主檔已經落地的完整段數（池格式 v2）。只給顯示用：🚫 不當續傳的依據，檔案本身才是進度（/docs/design/media/media-download.md §4.1）。
     pub segments_written: u64,
     pub complete: bool,
@@ -113,6 +122,36 @@ pub struct MediaEntry {
     /// 這台機器上傳它時 UI 給的原檔位置（URI，例 `file:///home/me/v.mkv`）；None ＝ 不是從這裡傳的、或 UI 沒給。
     /// ⚠️ 意義由 UI 決定，daemon 只能猜：讀的時候照 /docs/design/rpc-specs/data-plane.md §8.1 的規則解，解不了或大小不對就當不存在。
     pub source_uri: Option<String>,
+}
+
+/// 建或換一列 `media` 的描述（從事件內容來，/docs/design/storage/local-cache-db.md §5）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaDescription {
+    pub kind: MediaKind,
+    pub name: Option<String>,
+    pub mimetype: Option<String>,
+    /// `media.hash` 的寫法（`sha256:<hex>`、`matrix-sha256:<base64>`）；None ＝ 事件沒給
+    pub hash: Option<String>,
+    pub file_size: Option<u64>,
+    pub chunk_size: Option<u32>,
+}
+
+impl MediaDescription {
+    /// wbf 分塊的事件區塊（/docs/design/media/wbf-client-convention-for-chunk.md §5）。
+    ///
+    /// Return:
+    ///     Some(MediaDescription)   `kind` 1
+    ///     None                     區塊沒帶 `file_size`：約定裡一定有，沒有就🚫 當成一個檔（`kind` 1 的列 CHECK 要它）
+    pub fn of_chunked_block(block: &ChunkedBlock) -> Option<MediaDescription> {
+        Some(MediaDescription {
+            kind: MediaKind::WbfChunked,
+            name: block.name.clone(),
+            mimetype: block.mimetype.clone(),
+            hash: block_hash(block.sha256.as_deref()),
+            file_size: Some(block.file_size?),
+            chunk_size: Some(block.chunk_size),
+        })
+    }
 }
 
 /// `forget_account` 的結果：清了什麼、哪些池檔已經沒人指、可以刪。
@@ -1150,8 +1189,7 @@ impl Cache {
     pub fn find_media(&self, mxc: &str) -> Result<Option<MediaEntry>, SdkError> {
         self.connection
             .query_row(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
-                 FROM media WHERE mxc = ?1",
+                &format!("SELECT {MEDIA_ROW_COLUMNS} FROM media WHERE mxc = ?1"),
                 params![mxc],
                 media_entry_from_row,
             )
@@ -1161,27 +1199,18 @@ impl Cache {
 
     /// 下載前叫：沒有這個 mxc 的列就建（`download --manifest` 可能沒有對應的事件），有就原樣回。
     ///
+    /// Args:
+    ///     description: 這次的描述（列已經在就只拿它補 hash）, example: &MediaDescription::of_chunked_block(&block)?
     /// Return:
     ///     Ok(MediaEntry)   `complete` 是 true 就不用下載了
+    ///     Err(Io)          DB 寫不了、或描述違反列的 CHECK（`kind` 1 少了大小）
     pub fn media_begin(
         &mut self,
         mxc: &str,
-        name: Option<&str>,
-        mimetype: Option<&str>,
-        block_sha256_hex: Option<&str>,
-        file_size: u64,
-        chunk_size: u32,
+        description: &MediaDescription,
     ) -> Result<MediaEntry, SdkError> {
         let transaction = self.connection.transaction().map_err(db_error)?;
-        media_row_id(
-            &transaction,
-            mxc,
-            name,
-            mimetype,
-            block_hash(block_sha256_hex).as_deref(),
-            file_size,
-            chunk_size,
-        )?;
+        media_row_id(&transaction, mxc, description)?;
         transaction.commit().map_err(db_error)?;
         self.find_media(mxc)?
             .ok_or_else(|| SdkError::Io(std::io::Error::other("media row vanished after insert")))
@@ -1201,17 +1230,11 @@ impl Cache {
         manifest: &crate::manifest::Manifest,
         source_uri: &str,
     ) -> Result<(), SdkError> {
-        let block = &manifest.block;
+        let description = MediaDescription::of_chunked_block(&manifest.block).ok_or_else(|| {
+            SdkError::Usage(format!("{}: the manifest has no file_size", manifest.mxc))
+        })?;
         let transaction = self.connection.transaction().map_err(db_error)?;
-        media_row_id(
-            &transaction,
-            &manifest.mxc,
-            block.name.as_deref(),
-            block.mimetype.as_deref(),
-            block_hash(block.sha256.as_deref()).as_deref(),
-            manifest.file_size(),
-            block.chunk_size,
-        )?;
+        media_row_id(&transaction, &manifest.mxc, &description)?;
         transaction
             .execute(
                 "UPDATE media SET source_uri = ?2 WHERE mxc = ?1",
@@ -1252,8 +1275,7 @@ impl Cache {
         };
         self.connection
             .query_row(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
-                 FROM media WHERE id = ?1",
+                &format!("SELECT {MEDIA_ROW_COLUMNS} FROM media WHERE id = ?1"),
                 params![id],
                 media_entry_from_row,
             )
@@ -1270,14 +1292,18 @@ impl Cache {
     ) -> Result<(), SdkError> {
         self.connection
             .execute(
-                "UPDATE media SET segments_written = ?2, chunk_size = ?3, complete = 0 WHERE mxc = ?1",
+                "UPDATE media SET segments_written = ?2, chunk_size = ?3, complete = 0, verified = 0 WHERE mxc = ?1",
                 params![mxc, segments_written as i64, chunk_size as i64],
             )
             .map_err(db_error)?;
         Ok(())
     }
 
-    /// 下載完、檔已 adopt 進池：寫齊 `pool_file`、`complete`、`file_size`（下載到的長度是事實，蓋掉區塊說的）、`bytes_on_disk`。
+    /// 下載完、檔已 adopt 進池：寫齊 `pool_file`、`complete`、`verified`、`file_size`（下載到的長度是事實，蓋掉區塊說的）、`bytes_on_disk`。
+    /// `complete` 與 `verified` 同一筆寫入：🚫 有「完成了卻還沒驗」落在 DB 裡（/docs/design/media/media-download.md §12.3）。
+    ///
+    /// Args:
+    ///     verified: 收尾時比對的結果, example: Verification::Matched
     pub fn media_finish(
         &mut self,
         mxc: &str,
@@ -1285,13 +1311,22 @@ impl Cache {
         segments_written: u64,
         file_size: u64,
         bytes_on_disk: u64,
+        verified: Verification,
     ) -> Result<(), SdkError> {
         let now = now_millis();
         self.connection
             .execute(
                 "UPDATE media SET pool_file = ?2, complete = 1, segments_written = ?3, file_size = ?4, bytes_on_disk = ?5, last_used_at = ?6,
-                   hash = COALESCE(hash, 'blake3:' || ?2) WHERE mxc = ?1",
-                params![mxc, pool_file, segments_written as i64, file_size as i64, bytes_on_disk as i64, now],
+                   verified = ?7, hash = COALESCE(hash, 'blake3:' || ?2) WHERE mxc = ?1",
+                params![
+                    mxc,
+                    pool_file,
+                    segments_written as i64,
+                    file_size as i64,
+                    bytes_on_disk as i64,
+                    now,
+                    verified.to_number()
+                ],
             )
             .map_err(db_error)?;
         Ok(())
@@ -1301,7 +1336,7 @@ impl Cache {
     pub fn media_reset(&mut self, mxc: &str) -> Result<(), SdkError> {
         self.connection
             .execute(
-                "UPDATE media SET pool_file = NULL, complete = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
+                "UPDATE media SET pool_file = NULL, complete = 0, verified = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
                 params![mxc],
             )
             .map_err(db_error)?;
@@ -1309,33 +1344,28 @@ impl Cache {
     }
 
     /// 這個 mxc 換一份描述、從頭來（`media::forget_for_new_description`，/docs/design/media/media-download.md §5.3）：
-    /// 檔名、型別、hash、大小、塊大小換成這次區塊的，下載進度清掉。`INSERT OR IGNORE` 不會蓋掉舊的描述，所以要這一支。
+    /// 格式、檔名、型別、hash、大小、塊大小換成這次的，下載進度與驗證結果清掉。`INSERT OR IGNORE` 不會蓋掉舊的描述，所以要這一支。
     ///
-    /// Args:
-    ///     block_sha256_hex: 區塊帶的 sha256, example: Some("9f86d0…")
     /// Return:
     ///     Ok(())
-    ///     Err(Io)   DB 寫不了
+    ///     Err(Io)   DB 寫不了、或描述違反列的 CHECK
     pub fn media_redescribe(
         &mut self,
         mxc: &str,
-        name: Option<&str>,
-        mimetype: Option<&str>,
-        block_sha256_hex: Option<&str>,
-        file_size: u64,
-        chunk_size: u32,
+        description: &MediaDescription,
     ) -> Result<(), SdkError> {
         self.connection
             .execute(
-                "UPDATE media SET name = ?2, mimetype = ?3, hash = ?4, file_size = ?5, chunk_size = ?6,
-                     pool_file = NULL, complete = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
+                "UPDATE media SET kind = ?2, name = ?3, mimetype = ?4, hash = ?5, file_size = ?6, chunk_size = ?7,
+                     pool_file = NULL, complete = 0, verified = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
                 params![
                     mxc,
-                    name,
-                    mimetype,
-                    block_hash(block_sha256_hex),
-                    file_size as i64,
-                    chunk_size as i64
+                    description.kind.to_number(),
+                    description.name,
+                    description.mimetype,
+                    description.hash,
+                    description.file_size.map(|size| size as i64),
+                    description.chunk_size.map(i64::from)
                 ],
             )
             .map_err(db_error)?;
@@ -1370,10 +1400,9 @@ impl Cache {
     pub fn list_media_by_last_used(&self) -> Result<Vec<MediaEntry>, SdkError> {
         let mut statement = self
             .connection
-            .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
-                 FROM media WHERE complete = 1 ORDER BY last_used_at ASC, mxc",
-            )
+            .prepare_cached(&format!(
+                "SELECT {MEDIA_ROW_COLUMNS} FROM media WHERE complete = 1 ORDER BY last_used_at ASC, mxc"
+            ))
             .map_err(db_error)?;
         let rows = statement
             .query_map([], media_entry_from_row)
@@ -1385,10 +1414,9 @@ impl Cache {
     pub fn list_media_incomplete(&self) -> Result<Vec<MediaEntry>, SdkError> {
         let mut statement = self
             .connection
-            .prepare_cached(
-                "SELECT mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri
-                 FROM media WHERE complete = 0 AND segments_written > 0 ORDER BY mxc",
-            )
+            .prepare_cached(&format!(
+                "SELECT {MEDIA_ROW_COLUMNS} FROM media WHERE complete = 0 AND segments_written > 0 ORDER BY mxc"
+            ))
             .map_err(db_error)?;
         let rows = statement
             .query_map([], media_entry_from_row)
@@ -1624,15 +1652,37 @@ impl Cache {
     }
 }
 
+/// `SELECT` 一列 `media` 時的欄位順序；跟 `media_entry_from_row` 一起改。
+const MEDIA_ROW_COLUMNS: &str = "mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri, kind, verified";
+
 fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry> {
+    // CHECK 擋著不認得的數字；真的讀到就是壞列，回錯、🚫 猜成哪一種。
+    let kind_number = row.get::<_, i64>(13)?;
+    let kind = MediaKind::from_number(kind_number).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            13,
+            rusqlite::types::Type::Integer,
+            format!("unknown media kind {kind_number}").into(),
+        )
+    })?;
+    let verified_number = row.get::<_, i64>(14)?;
+    let verified = Verification::from_number(verified_number).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            14,
+            rusqlite::types::Type::Integer,
+            format!("unknown verification {verified_number}").into(),
+        )
+    })?;
     Ok(MediaEntry {
         mxc: row.get(0)?,
         pool_file: row.get(1)?,
         name: row.get(2)?,
         mimetype: row.get(3)?,
         hash: row.get(4)?,
-        file_size: row.get::<_, i64>(5)? as u64,
-        chunk_size: row.get::<_, i64>(6)? as u32,
+        kind,
+        verified,
+        file_size: row.get::<_, Option<i64>>(5)?.map(|size| size as u64),
+        chunk_size: row.get::<_, Option<i64>>(6)?.map(|size| size as u32),
         segments_written: row.get::<_, i64>(7)? as u64,
         complete: row.get::<_, i64>(8)? == 1,
         bytes_on_disk: row.get::<_, i64>(9)? as u64,
@@ -2025,15 +2075,11 @@ fn link_media_of(
     let Some(attachment) = attachment_of(event_type, content_json) else {
         return Ok(());
     };
-    let media = media_row_id(
-        transaction,
-        &attachment.mxc,
-        attachment.block.name.as_deref(),
-        attachment.block.mimetype.as_deref(),
-        block_hash(attachment.block.sha256.as_deref()).as_deref(),
-        attachment.block.file_size.unwrap_or(0),
-        attachment.block.chunk_size,
-    )?;
+    // 區塊沒帶大小：約定裡一定有，沒有就🚫 建列（🚫 用 0 頂替，🚫 讓一則壞事件卡住整批寫入）。
+    let Some(description) = MediaDescription::of_chunked_block(&attachment.block) else {
+        return Ok(());
+    };
+    let media = media_row_id(transaction, &attachment.mxc, &description)?;
     transaction
         .prepare_cached("INSERT OR IGNORE INTO event_media (event, media) VALUES (?1, ?2)")
         .map_err(db_error)?
@@ -2113,22 +2159,27 @@ fn block_hash(sha256_hex: Option<&str>) -> Option<String> {
 fn media_row_id(
     transaction: &Transaction<'_>,
     mxc: &str,
-    name: Option<&str>,
-    mimetype: Option<&str>,
-    hash: Option<&str>,
-    file_size: u64,
-    chunk_size: u32,
+    description: &MediaDescription,
 ) -> Result<i64, SdkError> {
     let now = now_millis();
     transaction
         .execute(
-            "INSERT OR IGNORE INTO media (mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?7)",
-            params![mxc, name, mimetype, hash, file_size as i64, chunk_size as i64, now],
+            "INSERT OR IGNORE INTO media (mxc, pool_file, name, mimetype, hash, kind, verified, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, ?6, ?7, 0, 0, 0, ?8, ?8)",
+            params![
+                mxc,
+                description.name,
+                description.mimetype,
+                description.hash,
+                description.kind.to_number(),
+                description.file_size.map(|size| size as i64),
+                description.chunk_size.map(i64::from),
+                now
+            ],
         )
         .map_err(db_error)?;
     // 舊列沒有 hash、這次的區塊有帶：補上（同一個 mxc 的區塊 sha256 不會變，只會從沒有變成有）。
-    if let Some(hash) = hash {
+    if let Some(hash) = description.hash.as_deref() {
         transaction
             .execute(
                 "UPDATE media SET hash = ?2 WHERE mxc = ?1 AND hash IS NULL",
@@ -2307,11 +2358,15 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                mxc TEXT NOT NULL UNIQUE,
                pool_file TEXT,
                name TEXT, mimetype TEXT,
+               kind INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
+               verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1, 2)),
                hash TEXT,
-               file_size INTEGER NOT NULL, chunk_size INTEGER NOT NULL,
+               file_size INTEGER, chunk_size INTEGER,
                segments_written INTEGER NOT NULL, complete INTEGER NOT NULL, bytes_on_disk INTEGER NOT NULL,
                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
-               source_uri TEXT);
+               source_uri TEXT,
+               CHECK (kind <> 1 OR (file_size IS NOT NULL AND chunk_size IS NOT NULL)),
+               CHECK (verified = 0 OR complete = 1));
              CREATE INDEX media_lru ON media (last_used_at);
              CREATE INDEX media_by_pool_file ON media (pool_file) WHERE pool_file IS NOT NULL;
              CREATE TABLE event_media (
@@ -3008,7 +3063,7 @@ mod tests {
         assert_eq!(cache.count_rows("event_media").unwrap(), 2);
         let entry = cache.find_media("mxc://localhost/aaaa").unwrap().unwrap();
         assert_eq!(entry.name.as_deref(), Some("a.txt"));
-        assert_eq!(entry.file_size, 10);
+        assert_eq!(entry.file_size, Some(10));
         assert!(!entry.complete);
         assert!(cache.touch_media("mxc://localhost/aaaa").unwrap());
         assert!(!cache.touch_media("mxc://localhost/none").unwrap());
@@ -3116,7 +3171,14 @@ mod tests {
         );
         // 沒帶的下載完：用 blake3 補；之後 reset 也不清（校驗碼是內容的事實，不是本地副本的）。
         cache
-            .media_finish("mxc://localhost/nohash", "hash-n", 1, 10, 100)
+            .media_finish(
+                "mxc://localhost/nohash",
+                "hash-n",
+                1,
+                10,
+                100,
+                Verification::Unknown,
+            )
             .unwrap();
         cache.media_reset("mxc://localhost/nohash").unwrap();
         assert_eq!(
@@ -3130,7 +3192,14 @@ mod tests {
         );
         // 帶 sha256 的下載完：不被 blake3 蓋掉。
         cache
-            .media_finish("mxc://localhost/withhash", "hash-s", 1, 10, 100)
+            .media_finish(
+                "mxc://localhost/withhash",
+                "hash-s",
+                1,
+                10,
+                100,
+                Verification::Matched,
+            )
             .unwrap();
         assert_eq!(
             cache
@@ -3141,6 +3210,76 @@ mod tests {
                 .as_deref(),
             Some("sha256:abcdef")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v9 的 `kind`、`verified`（/docs/design/storage/local-cache-db.md §5）：事件進來的分塊檔是 `kind` 1、還沒驗；
+    /// 驗證結果跟完成同一筆寫、reset 清回 0；`kind` 1 少了大小、沒完成就說驗過，都被 CHECK 擋下。
+    #[test]
+    fn media_kind_and_verification_are_recorded_and_checked() {
+        let (mut cache, dir) = open("verified");
+        put(
+            &mut cache,
+            ALICE,
+            &[file("!v", "$v", 1, "mxc://localhost/v")],
+        );
+        let entry = cache.find_media("mxc://localhost/v").unwrap().unwrap();
+        assert_eq!(
+            (entry.kind, entry.verified, entry.chunk_size.is_some()),
+            (MediaKind::WbfChunked, Verification::Unknown, true)
+        );
+        cache
+            .media_finish(
+                "mxc://localhost/v",
+                "hash-v",
+                1,
+                10,
+                100,
+                Verification::Mismatched,
+            )
+            .unwrap();
+        let entry = cache.find_media("mxc://localhost/v").unwrap().unwrap();
+        assert_eq!(
+            (entry.complete, entry.verified),
+            (true, Verification::Mismatched)
+        );
+        cache.media_reset("mxc://localhost/v").unwrap();
+        let entry = cache.find_media("mxc://localhost/v").unwrap().unwrap();
+        assert_eq!(
+            (entry.complete, entry.verified),
+            (false, Verification::Unknown)
+        );
+
+        // `kind` 1 一定要有兩個大小。
+        let without_sizes = MediaDescription {
+            kind: MediaKind::WbfChunked,
+            name: None,
+            mimetype: None,
+            hash: None,
+            file_size: None,
+            chunk_size: None,
+        };
+        assert!(cache
+            .media_begin("mxc://localhost/nosize", &without_sizes)
+            .is_err());
+        // 其他格式可以沒有。
+        let plain = MediaDescription {
+            kind: MediaKind::MatrixPlain,
+            ..without_sizes
+        };
+        let entry = cache.media_begin("mxc://localhost/plain", &plain).unwrap();
+        assert_eq!(
+            (entry.kind, entry.file_size),
+            (MediaKind::MatrixPlain, None)
+        );
+        // 沒完成就說驗過：擋下。
+        assert!(cache
+            .connection
+            .execute(
+                "UPDATE media SET verified = 1 WHERE mxc = 'mxc://localhost/plain'",
+                [],
+            )
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

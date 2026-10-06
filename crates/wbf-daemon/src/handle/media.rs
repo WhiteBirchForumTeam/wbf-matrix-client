@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use wbf_core::{Core, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest};
+use wbf_core::{Core, CoreErrorKind, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest};
 use wbf_sdk::local_source::local_path_of_file_uri;
 use wbf_sdk::Manifest;
 
@@ -309,14 +309,25 @@ pub(super) async fn media_export_to(handle: &Handle, core: &Core, params: Value)
         )));
     };
     let media = media_ref_of(handle, core, params.media, &params.target).await?;
-    let exported = core
+    let exported = match core
         .export_media_to(
             &media,
             &path,
             params.no_cache,
             &handle.target(&params.target),
         )
-        .await?;
+        .await
+    {
+        Ok(exported) => exported,
+        // 匯了、但沒驗過或驗不過（1501）：`data` 要跟成功時的 `result` 一字不差，補上 `to`（/docs/design/rpc-specs/rpc-spec.md §5.3）。
+        Err(mut error) if error.kind == CoreErrorKind::Unverified => {
+            if let Some(Value::Object(fields)) = error.data.as_mut() {
+                fields.insert("to".to_string(), json!(params.to));
+            }
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     to_result(Exported {
         to: &params.to,
         media: exported,

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media;
+use wbf_sdk::media_kind::{MediaKind, Verification};
 use wbf_sdk::media_pool::PoolReader;
 
 use crate::accounts::AccountDir;
@@ -22,12 +23,15 @@ use crate::Core;
 /// 本機原檔與池檔一次讀這麼多。
 const PIECE: usize = 64 * 1024;
 
-/// 一個找得到的媒體：多大、什麼型別、從哪讀。
+/// 一個找得到的媒體：多大、什麼型別、從哪讀、可不可信。
 pub struct MediaSource {
     pub mxc: String,
     /// 明文總長
     pub size: u64,
     pub mimetype: Option<String>,
+    /// 格式與驗證結果（`media` 列的）：資料平面拿來決定狀態碼（/docs/design/rpc-specs/data-plane.md §8.2）
+    pub kind: MediaKind,
+    pub verified: Verification,
     origin: Origin,
 }
 
@@ -51,6 +55,17 @@ pub struct MediaStream {
 }
 
 impl MediaSource {
+    /// 這份資料可不可信（/docs/design/rpc-specs/data-plane.md §8.2）：本機原檔是這台機器自己傳的，可信；
+    /// 其他的只有「有 hash 可比、而加密本身擋不住竄改」的格式（`kind` 2）要驗過且正確。
+    ///
+    /// Return:
+    ///     bool   false ＝ GET 回 412、body 照給
+    pub fn is_trusted(&self) -> bool {
+        matches!(self.origin, Origin::Local(_))
+            || !self.kind.is_trust_gated_on_hash()
+            || self.verified == Verification::Matched
+    }
+
     /// Args:
     ///     start: 明文起點, example: 0
     ///     end: 明文終點（不含），呼叫者已經確定 `start < end <= size`, example: 1048576
@@ -169,11 +184,16 @@ impl Core {
             };
             has_record = true;
             let mimetype = entry.mimetype.clone();
-            if let Some((file, _)) = open_local_source(&entry) {
+            // 開得起來就是大小對得上列的 `file_size`（`open_local_source` 比過）。
+            if let Some((file, size)) = open_local_source(&entry)
+                .and_then(|(file, _)| entry.file_size.map(|size| (file, size)))
+            {
                 return Ok(Some(MediaSource {
                     mxc: mxc.to_string(),
-                    size: entry.file_size,
+                    size,
                     mimetype,
+                    kind: entry.kind,
+                    verified: entry.verified,
                     origin: Origin::Local(file),
                 }));
             }
@@ -186,8 +206,10 @@ impl Core {
                 );
                 return Ok(Some(MediaSource {
                     mxc: mxc.to_string(),
-                    size: entry.file_size,
+                    size: reader.plain_len(),
                     mimetype,
+                    kind: entry.kind,
+                    verified: entry.verified,
                     origin: Origin::Pool(reader),
                 }));
             }
@@ -211,10 +233,16 @@ impl Core {
             let reader_account = self.find_writer_of(account, mxc, &accounts);
             self.ensure_download_link(&reader_account).await;
             let downloader = self.downloader_of(&reader_account).await?;
+            // 分塊的列一定有大小（CHECK）；沒有就不是能一塊一塊拉的檔。
+            let Some(size) = entry.file_size else {
+                continue;
+            };
             return Ok(Some(MediaSource {
                 mxc: mxc.to_string(),
-                size: entry.file_size,
+                size,
                 mimetype: mimetype.or_else(|| manifest.block.mimetype.clone()),
+                kind: entry.kind,
+                verified: entry.verified,
                 origin: Origin::Chunks {
                     downloader,
                     manifest,

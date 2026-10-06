@@ -405,7 +405,8 @@ fn exit_code(error: &CoreError) -> u8 {
         | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | AccountBusy
         | ServerPendingRemoval | NoRecoveryKeyHere | HistoryWouldBeLost => 1,
         Server | RoomDevicesChanged => 2,
-        Integrity => 3,
+        // 匯出了、但它沒驗過或驗不過（/docs/design/rpc-specs/data-plane.md §8.2）：跟完整性同一級。
+        Integrity | Unverified => 3,
         Network => 4,
         // 房間金鑰在等待時間內沒分好：等過了、沒等到，跟逾時同一級（重送就好）。
         Timeout | RoomKeyNotReady => 5,

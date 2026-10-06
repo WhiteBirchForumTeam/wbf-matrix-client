@@ -16,6 +16,7 @@ use serde::Serialize;
 use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media;
+use wbf_sdk::media_kind::{MediaKind, Verification};
 use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
@@ -82,6 +83,11 @@ pub struct MediaJob {
     pub done: u32,
     /// 總塊數；還不知道是 0
     pub total: u32,
+    /// `media` 列的格式與驗證結果（/docs/design/media/media-download.md §12.3）；列還沒建（剛排進去）就不在
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MediaKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Verification>,
 }
 
 /// `media.open` 的回答（URL 由 daemon 用共享 token 鑄，core 不知道）。
@@ -93,6 +99,11 @@ pub struct OpenedMedia {
     /// 明文總長
     pub size: u64,
     pub state: DownloadState,
+    /// `kind` 2 而 `verified` 不是 1 時，讀 URL 會是 412、body 照給（/docs/design/rpc-specs/data-plane.md §8.2）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MediaKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Verification>,
 }
 
 /// `media.queue` 的一項。
@@ -112,6 +123,10 @@ pub struct ExportedMedia {
     pub bytes: u64,
     /// `"local_source"`（本機原檔）、`"cache"`（池裡本來就有）、`"server"`（這次排隊下載的）
     pub source: String,
+    /// 哪一種格式（/docs/design/rpc-specs/data-plane.md §7.1）
+    pub kind: MediaKind,
+    /// 整檔 hash 的比對結果（/docs/design/media/media-download.md §12.3）
+    pub verified: Verification,
     /// 快取列記的校驗碼（`sha256:…` 或 `blake3:…`）；列上沒記就沒有
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -224,6 +239,8 @@ impl Core {
             mimetype,
             size,
             state: job.state,
+            kind: job.kind,
+            verified: job.verified,
         })
     }
 
@@ -255,11 +272,12 @@ impl Core {
         Ok(downloader.cancel(mxc))
     }
 
-    /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.3）：**解密寫到 `to`，整檔驗過才放上去**。
-    /// 本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過，就從池匯出——池裡沒有就排進下載、等它完成。
-    /// 池那條驗大小、整檔 BLAKE3（池檔名就是它）、區塊有帶就再驗 sha256（維護者 2026-10-02：串流不算整檔 hash，匯出要仔細檢查）。
+    /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.3）：**解密寫到 `to`**。
+    /// 本機原檔能驗（區塊帶 sha256）就從它匯出、整檔比 sha256（原檔在池外、沒有保護）；不能驗、或驗不過，就從池匯出——池裡沒有就排進下載、等它完成。
+    /// 從池匯出🚫 再算 hash、只核大小（維護者 2026-10-06）：每段讀出時過了池的 AEAD，整檔 hash 下載完已經驗過、記在 `verified`。
+    /// 傳統加密的檔（`kind` 2）沒驗過或驗不過：**照匯**、回 `Unverified`（1501），`data` 是成功時會給的那份（/docs/design/rpc-specs/data-plane.md §8.2 的約定）。
     ///
-    /// ⚠️ 這裡明文落地是**使用者要的**（他指定了 `to`），不是我們偷偷做的——這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
+    /// ⚠️ 這裡明文落地是**使用者要的**（使用者指定了 `to`），不是我們偷偷做的——這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
     ///
     /// Args:
     ///     to: 本機路徑（RPC 那邊先從 `file://` URI 解出來）, example: "C:/Users/me/v.mp4"
@@ -267,7 +285,8 @@ impl Core {
     /// Return:
     ///     Ok(ExportedMedia)
     ///     Err(Usage)       同 [`Core::media_download`]；或下載被取消
-    ///     Err(Integrity)   檔壞了（池裡那份大小或 hash 對不上：池檔一起丟掉，下次重下）；`to` 🚫 被動過
+    ///     Err(Integrity)   檔壞了（池裡那份大小對不上：池檔一起丟掉，下次重下）；`to` 🚫 被動過
+    ///     Err(Unverified)  寫到 `to` 了，但它是沒驗過或驗不過的傳統加密檔；`data` 是 ExportedMedia
     ///     Err(Io)          寫不了 `to`
     pub async fn export_media_to(
         &self,
@@ -285,20 +304,25 @@ impl Core {
             let entry = cache.read().await.find_media(&mxc)?;
             let original = entry
                 .filter(|entry| media::is_same_file(entry, &manifest))
-                .and_then(|entry| open_local_source(&entry).map(|(file, _)| (file, entry)));
-            if let Some((file, entry)) = original {
+                .and_then(|entry| {
+                    let file_size = entry.file_size?;
+                    open_local_source(&entry).map(|(file, _)| (file, file_size, entry))
+                });
+            if let Some((file, file_size, entry)) = original {
                 let expected = media::ExpectedContent {
-                    file_size: entry.file_size,
-                    blake3_hex: None,
+                    file_size,
                     sha256_hex: sha256_hex.clone(),
                 };
                 match export_blocking(file, to, expected).await {
                     Ok(bytes) => {
+                        // 這台機器自己傳的原檔、剛剛整檔比過 sha256：可信，🚫 看 `verified`（/docs/design/rpc-specs/data-plane.md §8.2）。
                         return Ok(ExportedMedia {
                             bytes,
                             source: "local_source".to_string(),
+                            kind: entry.kind,
+                            verified: entry.verified,
                             hash: entry.hash,
-                        })
+                        });
                     }
                     // 原檔在上傳之後被改過（大小沒變）：改從池匯出。
                     Err(error) if error.kind == CoreErrorKind::Integrity => {
@@ -340,15 +364,15 @@ impl Core {
                 format!("{mxc} is not complete in the pool"),
             )
         })?;
+        // 🚫 再算 hash，只核大小（維護者 2026-10-06，/docs/design/media/media-download.md §7.3）。
         let expected = media::ExpectedContent {
-            file_size: entry.file_size,
-            blake3_hex: entry.pool_file.clone(),
-            sha256_hex,
+            file_size: reader.plain_len(),
+            sha256_hex: None,
         };
         let exported = export_blocking(reader, to, expected).await;
         if let Err(error) = &exported {
             if error.kind == CoreErrorKind::Integrity {
-                // 池裡那份對不上自己的名字或區塊：它是壞的，丟掉，下次重下。
+                // 池裡那份讀不滿自己的長度：它是壞的，丟掉，下次重下。
                 self.drop_from_pool(&account, &mxc).await?;
             }
         }
@@ -361,11 +385,30 @@ impl Core {
         if no_cache && source == "server" {
             self.drop_from_pool(&account, &mxc).await?;
         }
-        Ok(ExportedMedia {
+        let exported = ExportedMedia {
             bytes,
             source: source.to_string(),
+            kind: entry.kind,
+            verified: entry.verified,
             hash: entry.hash,
-        })
+        };
+        // 資料照給（已經在 `to`），錯誤碼說它不可信（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2）。
+        if exported.kind.is_trust_gated_on_hash() && exported.verified != Verification::Matched {
+            return Err(CoreError::new(
+                CoreErrorKind::Unverified,
+                format!(
+                    "{mxc} was exported, but its hash was {}: the content may not be what the sender sent",
+                    match exported.verified {
+                        Verification::Mismatched => "checked and does not match",
+                        _ => "not checked",
+                    }
+                ),
+            )
+            .with_data(serde_json::to_value(&exported).map_err(|error| {
+                CoreError::new(CoreErrorKind::Io, format!("export result: {error}"))
+            })?));
+        }
+        Ok(exported)
     }
 
     /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.export_to` 走 [`Core::export_media_to`]）。
@@ -518,7 +561,7 @@ impl Core {
                 return Err(CoreError::new(
                     CoreErrorKind::Integrity,
                     format!(
-                        "this description of {mxc} does not match the file already downloaded and verified (size {}, chunk size {}); the cached copy is kept",
+                        "this description of {mxc} does not match the file already downloaded and verified (size {:?}, chunk size {:?}); the cached copy is kept",
                         described.file_size, described.chunk_size
                     ),
                 ));
@@ -528,14 +571,21 @@ impl Core {
             entry = None;
         }
         if let Some(entry) = &entry {
-            let total =
-                wbf_sdk::chunk_crypto::chunk_count(entry.file_size, entry.chunk_size).unwrap_or(0);
+            // 總塊數還不知道是 0（`MediaJob::total` 的約定）：不是分塊的檔沒有塊。
+            let total = match (entry.file_size, entry.chunk_size) {
+                (Some(file_size), Some(chunk_size)) => {
+                    wbf_sdk::chunk_crypto::chunk_count(file_size, chunk_size).unwrap_or(0)
+                }
+                _ => 0,
+            };
             if media::open_complete(&pool, entry).is_some() {
                 return Ok(MediaJob {
                     mxc,
                     state: DownloadState::Complete,
                     done: total,
                     total,
+                    kind: Some(entry.kind),
+                    verified: Some(entry.verified),
                 });
             }
             if local_source_counts && open_local_source(entry).is_some() {
@@ -544,6 +594,8 @@ impl Core {
                     state: DownloadState::LocalSource,
                     done: total,
                     total,
+                    kind: Some(entry.kind),
+                    verified: Some(entry.verified),
                 });
             }
         }
@@ -556,6 +608,8 @@ impl Core {
             state: status.state,
             done: status.done,
             total: status.total,
+            kind: entry.as_ref().map(|entry| entry.kind),
+            verified: entry.as_ref().map(|entry| entry.verified),
         })
     }
 
@@ -717,14 +771,14 @@ impl Core {
     }
 }
 
-/// `media::export_verified` 放到 blocking 執行緒上做（大檔會讀很久）。
+/// `media::export_to_path` 放到 blocking 執行緒上做（大檔會讀很久）。
 async fn export_blocking<R: std::io::Read + Send + 'static>(
     source: R,
     to: &Path,
     expected: media::ExpectedContent,
 ) -> Result<u64, CoreError> {
     let to = to.to_path_buf();
-    tokio::task::spawn_blocking(move || media::export_verified(source, &to, &expected))
+    tokio::task::spawn_blocking(move || media::export_to_path(source, &to, &expected))
         .await
         .map_err(|error| {
             CoreError::new(CoreErrorKind::Io, format!("the export task died: {error}"))

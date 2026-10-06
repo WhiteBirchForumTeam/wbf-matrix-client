@@ -115,7 +115,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v9，就是 `wbf-sdk::cache` 建的；v9 還沒實作，現在的程式是 v8）
+## 5. 快取的 schema（v9，就是 `wbf-sdk::cache` 建的）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
 📎 v8 → v9（`media` 加 `kind`、`verified`）一樣整個重建：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
@@ -217,7 +217,7 @@ CREATE TABLE media (
   name TEXT, mimetype TEXT,
   -- 這個檔是哪種格式，建列時照事件內容判斷：1 = wbf 分塊（org.wbftw.wbfuwunel.chunked）、2 = Matrix 加密（file，EncryptedFile v2）、3 = Matrix 明文（只有 url）。
   --   程式裡是 enum MediaKind { WbfChunked = 1, MatrixEncrypted = 2, MatrixPlain = 3 }，DB 存整數（維護者 2026-10-06）。
-  --   🚫 0、🚫 DEFAULT：漏寫就被 NOT NULL 擋下，🚫 悄悄變成某一種。讀到不認得的數字就當這列壞了、重新照事件判斷。
+  --   🚫 0、🚫 DEFAULT：漏寫就被 NOT NULL 擋下，🚫 悄悄變成某一種。讀到不認得的數字就回錯（CHECK 擋著，不該發生）。
   kind INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
   -- 整檔跟發送者給的 hash 比對的結果（維護者 2026-10-06）：0 = 還沒驗、不知道；1 = 驗了、正確；2 = 驗了、不正確。
   --   程式裡是 enum Verification { Unknown = 0, Matched = 1, Mismatched = 2 }。驗過（1 或 2）就🚫 再驗。

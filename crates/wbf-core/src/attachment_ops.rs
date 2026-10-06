@@ -890,7 +890,7 @@ mod tests {
             .unwrap()
             .expect("傳完就有列");
         assert_eq!(entry.source_uri.as_deref(), Some("file:///home/me/v.bin"));
-        assert_eq!(entry.file_size, 40);
+        assert_eq!(entry.file_size, Some(40));
         assert_eq!(entry.name.as_deref(), Some("v.bin"));
         assert!(!entry.complete, "池裡還沒有：只是記下原檔在哪");
 

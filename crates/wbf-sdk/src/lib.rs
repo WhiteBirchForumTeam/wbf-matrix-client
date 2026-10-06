@@ -62,6 +62,7 @@ pub mod login;
 pub mod manifest;
 #[cfg(feature = "cache")]
 pub mod media;
+pub mod media_kind;
 pub mod media_pool;
 pub mod protocol;
 pub mod room_keys;

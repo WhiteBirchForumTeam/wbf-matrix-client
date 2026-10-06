@@ -18,10 +18,11 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, Notify};
-use wbf_sdk::cache::MediaEntry;
+use wbf_sdk::cache::{MediaDescription, MediaEntry};
 use wbf_sdk::download::{open_chunk_data, verify_info, VerifiedTarget};
 use wbf_sdk::error_code::WbfErrorCode;
 use wbf_sdk::media::{self, MediaDownload, PROGRESS_FLUSH};
+use wbf_sdk::media_kind::Verification;
 use wbf_sdk::media_pool::MediaPool;
 use wbf_sdk::{protocol, Manifest, SdkError};
 use wbf_wire::Pack;
@@ -177,6 +178,7 @@ fn enqueue_into(
             state: DownloadState::Queued,
             done: 0,
             total: 0,
+            verified: None,
             reason: None,
         });
     }
@@ -520,6 +522,7 @@ impl Downloader {
             state: DownloadState::Cancelled,
             done: 0,
             total: 0,
+            verified: None,
             reason: None,
         });
         true
@@ -635,7 +638,8 @@ pub(crate) fn cancelled_error(mxc: &str) -> CoreError {
 
 /// job 怎麼結束的。
 enum JobEnd {
-    Complete,
+    /// 完成，帶這個檔的驗證結果（剛驗完的、或快取那一列記的）
+    Complete(Verification),
     Cancelled,
     Failed(CoreError),
 }
@@ -759,9 +763,12 @@ impl DownloadHandler {
             return;
         }
         // 已經有完整的（別的帳號寫完了、或之前就有）：不下載。
-        if !self.open.contains_key(&mxc) && self.find_complete_entry(&mxc).await.is_some() {
-            self.end_job(&mxc, JobEnd::Complete);
-            return;
+        if !self.open.contains_key(&mxc) {
+            if let Some(entry) = self.find_complete_entry(&mxc).await {
+                // 驗過就🚫 再驗：照這一列記的結果回（/docs/design/media/media-download.md §12.3）。
+                self.end_job(&mxc, JobEnd::Complete(entry.verified));
+                return;
+            }
         }
         if !self.open.contains_key(&mxc) {
             match self.open_media(&job.manifest).await {
@@ -810,7 +817,7 @@ impl DownloadHandler {
         let waiters = self.shared.state().waiters.remove(&mxc).unwrap_or_default();
         // 這個帳號的 UI 收過一則 `queued`：補一則對方現在的樣子，🚫 讓它一直以為還在排。
         let status = enqueue_into(&queue, &self.events, job.manifest, waiters);
-        self.push(&mxc, status.state, status.done, status.total, None);
+        self.push(&mxc, status.state, status.done, status.total, None, None);
     }
 
     /// 主檔的「下一塊」（/docs/design/media/media-download.md §5.4）：暫存檔有就搬、不走網路；沒有就塞它的請求，等回覆。
@@ -1154,7 +1161,8 @@ impl DownloadHandler {
             return;
         }
         if let Some(entry) = self.find_complete_entry(&mxc).await {
-            let answer = chunk_index_at(position, entry.chunk_size, &mxc)
+            let answer = chunk_layout_of(&entry)
+                .and_then(|(chunk_size, _)| chunk_index_at(position, chunk_size, &mxc))
                 .and_then(|index| read_complete_chunk(&self.media_pool, &entry, index));
             let _ = reply.send(answer);
             return;
@@ -1286,7 +1294,7 @@ impl DownloadHandler {
                 last_push: now,
             },
         );
-        self.push(mxc, DownloadState::Downloading, done, total, None);
+        self.push(mxc, DownloadState::Downloading, done, total, None, None);
     }
 
     fn find_downloading(&self, mxc: &str) -> Option<Arc<Downloading>> {
@@ -1341,6 +1349,7 @@ impl DownloadHandler {
                 downloading.done.load(Ordering::SeqCst),
                 downloading.total.load(Ordering::SeqCst),
                 None,
+                None,
             );
         }
     }
@@ -1351,11 +1360,26 @@ impl DownloadHandler {
             return;
         };
         self.shared.state().open_names.remove(&opened.pending_name);
+        // 有 hash 可比就先報「驗證中」，收尾那則再報結果（維護者 2026-10-06，/docs/design/media/media-download.md §12.3）。
+        if opened.download.manifest().block.sha256.is_some() {
+            let (done, total) = self
+                .find_downloading(mxc)
+                .map(|downloading| {
+                    (
+                        downloading.done.load(Ordering::SeqCst),
+                        downloading.total.load(Ordering::SeqCst),
+                    )
+                })
+                .unwrap_or((0, 0));
+            self.push(mxc, DownloadState::Verifying, done, total, None, None);
+        }
         let end = match opened.download.finish(&self.media_pool) {
-            Ok(finished) => match self.record_finished(mxc, &finished).await {
-                Ok(()) => JobEnd::Complete,
-                Err(error) => JobEnd::Failed(error),
-            },
+            Ok((finished, verified)) => {
+                match self.record_finished(mxc, &finished, verified).await {
+                    Ok(()) => JobEnd::Complete(verified),
+                    Err(error) => JobEnd::Failed(error),
+                }
+            }
             Err(error) => {
                 self.cache_reset(mxc);
                 JobEnd::Failed(error.into())
@@ -1402,6 +1426,7 @@ impl DownloadHandler {
         &self,
         mxc: &str,
         finished: &wbf_sdk::media_pool::Finished,
+        verified: Verification,
     ) -> Result<(), CoreError> {
         let bytes_on_disk = self.media_pool.bytes_on_disk(&finished.hash_hex)?;
         let (mxc_here, hash, segments, plain_len) = (
@@ -1412,7 +1437,14 @@ impl DownloadHandler {
         );
         self.cache
             .run(move |cache| {
-                cache.media_finish(&mxc_here, &hash, segments, plain_len, bytes_on_disk)
+                cache.media_finish(
+                    &mxc_here,
+                    &hash,
+                    segments,
+                    plain_len,
+                    bytes_on_disk,
+                    verified,
+                )
             })
             .await
     }
@@ -1474,16 +1506,22 @@ impl DownloadHandler {
                 )
             })
             .unwrap_or((0, 0));
-        let (state, reason, outcome) = match end {
-            JobEnd::Complete => (DownloadState::Complete, None, Ok(())),
-            JobEnd::Cancelled => (DownloadState::Cancelled, None, Err(cancelled_error(mxc))),
+        let (state, verified, reason, outcome) = match end {
+            JobEnd::Complete(verified) => (DownloadState::Complete, Some(verified), None, Ok(())),
+            JobEnd::Cancelled => (
+                DownloadState::Cancelled,
+                None,
+                None,
+                Err(cancelled_error(mxc)),
+            ),
             JobEnd::Failed(error) => (
                 DownloadState::Failed,
+                None,
                 Some(error.message.clone()),
                 Err(error),
             ),
         };
-        self.push(mxc, state, done, total, reason);
+        self.push(mxc, state, done, total, verified, reason);
         for waiter in waiters {
             let _ = waiter.send(outcome.clone());
         }
@@ -1540,18 +1578,16 @@ impl DownloadHandler {
 
     /// `media_begin` ＋ 暫存名（/docs/design/media/media-download.md §4.4 的「job 建立」）。
     async fn begin_row(&self, manifest: &Manifest) -> Result<String, CoreError> {
-        let block = manifest.block.clone();
-        let (mxc, file_size) = (manifest.mxc.clone(), manifest.file_size());
+        let mxc = manifest.mxc.clone();
+        let description = MediaDescription::of_chunked_block(&manifest.block).ok_or_else(|| {
+            CoreError::new(
+                CoreErrorKind::Usage,
+                format!("{mxc}: the description has no file_size"),
+            )
+        })?;
         self.cache
             .run(move |cache| {
-                cache.media_begin(
-                    &mxc,
-                    block.name.as_deref(),
-                    block.mimetype.as_deref(),
-                    block.sha256.as_deref(),
-                    file_size,
-                    block.chunk_size,
-                )?;
+                cache.media_begin(&mxc, &description)?;
                 cache.media_pending_name(&mxc)?.ok_or_else(|| {
                     SdkError::Io(std::io::Error::other("the media row vanished after insert"))
                 })
@@ -1605,13 +1641,24 @@ impl DownloadHandler {
         }
     }
 
-    fn push(&self, mxc: &str, state: DownloadState, done: u32, total: u32, reason: Option<String>) {
+    /// Args:
+    ///     verified: `complete` 一律帶（/docs/design/media/media-download.md §12.3），其他狀態是 None, example: Some(Verification::Matched)
+    fn push(
+        &self,
+        mxc: &str,
+        state: DownloadState,
+        done: u32,
+        total: u32,
+        verified: Option<Verification>,
+        reason: Option<String>,
+    ) {
         self.events.emit(CoreEvent::MediaDownload {
             user: self.holder.user.clone(),
             mxc: mxc.to_string(),
             state,
             done,
             total,
+            verified,
             reason,
         });
     }
@@ -1644,6 +1691,7 @@ impl DownloadHandler {
                 DownloadState::Failed,
                 0,
                 0,
+                None,
                 Some(error.message.clone()),
             );
         }
@@ -1658,6 +1706,24 @@ impl Drop for DownloadHandler {
     }
 }
 
+/// 這一列的切法（塊大小、明文總長）。只有分塊的檔（`kind` 1）有；其他的沒有「第幾塊」可說。
+///
+/// Return:
+///     Ok((chunk_size, file_size))
+///     Err(Usage)   列沒有塊大小或總長（不是分塊的檔）
+fn chunk_layout_of(entry: &MediaEntry) -> Result<(u32, u64), CoreError> {
+    match (entry.chunk_size, entry.file_size) {
+        (Some(chunk_size), Some(file_size)) => Ok((chunk_size, file_size)),
+        _ => Err(CoreError::new(
+            CoreErrorKind::Usage,
+            format!(
+                "{} is not a chunked file: it has no chunk size or size",
+                entry.mxc
+            ),
+        )),
+    }
+}
+
 /// 從完整的池檔讀第 `index` 塊（seek 進來時檔剛好完成了）。塊大小照 DB 那一列（`media_begin` 從區塊抄的）。
 fn read_complete_chunk(
     pool: &MediaPool,
@@ -1665,9 +1731,10 @@ fn read_complete_chunk(
     index: u32,
 ) -> Result<SeekPiece, CoreError> {
     use std::io::{Read, Seek, SeekFrom};
-    let chunk_size = u64::from(entry.chunk_size);
+    let (chunk_size, file_size) = chunk_layout_of(entry)?;
+    let chunk_size = u64::from(chunk_size);
     let start = u64::from(index) * chunk_size;
-    let end = (start + chunk_size).min(entry.file_size);
+    let end = (start + chunk_size).min(file_size);
     if chunk_size == 0 || start >= end {
         return Err(CoreError::new(
             CoreErrorKind::Usage,
@@ -1692,6 +1759,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::sync::broadcast::Receiver;
+    use wbf_sdk::media_kind::MediaKind;
     use wbf_sdk::Manifest;
 
     use super::*;
@@ -1834,7 +1902,7 @@ mod tests {
         loop {
             match next_state(events, mxc).await {
                 state if state == wanted => return,
-                DownloadState::Queued => continue,
+                DownloadState::Queued | DownloadState::Verifying => continue,
                 other => panic!("expected {wanted:?}, the download ended as {other:?}"),
             }
         }
@@ -1865,7 +1933,33 @@ mod tests {
             next_state(&mut events, &manifest.mxc).await,
             DownloadState::Queued
         );
-        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        // 區塊帶 sha256：讀完先報「驗證中」，收尾那則帶結果（/docs/design/media/media-download.md §12.3）。
+        assert!(manifest.block.sha256.is_some());
+        assert_eq!(
+            next_state(&mut events, &manifest.mxc).await,
+            DownloadState::Verifying
+        );
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(CoreEvent::MediaDownload {
+                    mxc,
+                    state,
+                    verified,
+                    ..
+                }) = events.recv().await
+                {
+                    if mxc == manifest.mxc && state != DownloadState::Downloading {
+                        return (state, verified);
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            completed,
+            (DownloadState::Complete, Some(Verification::Matched))
+        );
         assert_eq!(reads(&server), (0..CHUNKS).collect::<Vec<_>>());
         // 再要一次：已經完整，不排、不碰網路。
         let again = core
@@ -1875,6 +1969,11 @@ mod tests {
         assert_eq!(
             (again.state, again.done, again.total),
             (DownloadState::Complete, CHUNKS, CHUNKS)
+        );
+        // 驗過就🚫 再驗：快取那一列記的結果。
+        assert_eq!(
+            (again.kind, again.verified),
+            (Some(MediaKind::WbfChunked), Some(Verification::Matched))
         );
         assert!(core
             .media_queue(&Target::default())
@@ -2078,19 +2177,21 @@ mod tests {
         assert_eq!(pool.list_files().unwrap().len(), 1);
     }
 
+    /// 從池匯出🚫 再算 hash（維護者 2026-10-06，/docs/design/media/media-download.md §7.3）：分塊的檔下載時每塊各自 AEAD 驗過、
+    /// 池每段讀出時又過池的 AEAD，整檔 hash 是多算一次。所以就算列被改指到另一個大小一樣的池檔，匯出也照給池裡那份、🚫 擋。
     #[tokio::test]
-    async fn an_export_checks_the_whole_file_and_drops_a_pool_copy_that_does_not_match() {
+    async fn an_export_from_the_pool_does_not_hash_a_chunked_file_again() {
         let (core, account, _server, manifests, _upload_server) =
-            uploaded_many("dq-export-bad", 2).await;
+            uploaded_many("dq-export-nohash", 2).await;
         let (first, second) = (manifests[0].clone(), manifests[1].clone());
         let target = Target::default();
-        let out = scratch("dq-export-bad-out").join("v.bin");
+        let out = scratch("dq-export-nohash-out").join("v.bin");
         for manifest in [&first, &second] {
             core.export_media_to(&MediaRef::Manifest(manifest.clone()), &out, false, &target)
                 .await
                 .unwrap();
         }
-        // 第一個檔的列改指第二個檔的池檔（同樣大小、能打開、內容不對）：串流照用，匯出要擋下。
+        // 第一個檔的列改指第二個檔的池檔（同樣大小、能打開、內容不同）。
         let (cache, _) = core.server_cache_and_me(&account).unwrap();
         let reader = cache.read().await;
         let second_entry = reader.find_media(&second.mxc).unwrap().unwrap();
@@ -2102,26 +2203,108 @@ mod tests {
             second_entry.bytes_on_disk,
         );
         cache
-            .run(move |cache| cache.media_finish(&mxc, &pool_file, segments, SIZE as u64, bytes))
+            .run(move |cache| {
+                cache.media_finish(
+                    &mxc,
+                    &pool_file,
+                    segments,
+                    SIZE as u64,
+                    bytes,
+                    Verification::Unknown,
+                )
+            })
             .await
             .unwrap();
         let _ = std::fs::remove_file(&out);
-        let error = core
-            .export_media_to(&MediaRef::Manifest(first.clone()), &out, false, &target)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
-        assert!(!out.exists(), "nothing lands at the destination");
-        assert!(no_partials_left(&out));
-        let entry = cache.read().await.find_media(&first.mxc).unwrap().unwrap();
-        assert!(!entry.complete, "the bad copy is dropped from the cache");
-        // 下一次就重下，拿到對的。
         let exported = core
             .export_media_to(&MediaRef::Manifest(first.clone()), &out, false, &target)
             .await
+            .expect("no hash is computed, so nothing notices");
+        assert_eq!(
+            (exported.source.as_str(), exported.kind),
+            ("cache", MediaKind::WbfChunked)
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), body_of(1));
+        assert!(no_partials_left(&out));
+    }
+
+    /// 讀的時候可不可信（維護者 2026-10-06，/docs/design/rpc-specs/data-plane.md §8.2）：資料一律照讀；傳統加密檔（`kind` 2）
+    /// 只有驗了、正確才可信（否則 GET 回 412），分塊的檔不看 `verified`。
+    #[tokio::test]
+    async fn a_traditional_encrypted_file_reads_but_is_trusted_only_once_it_matched() {
+        use std::io::Write;
+        let (core, account, _server, manifest) = uploaded("dq-trust").await;
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        let pool = core.pool_of(&account).unwrap();
+        let body = b"a traditional matrix attachment".to_vec();
+        for (mxc, verified, trusted) in [
+            ("mxc://localhost/t-matched", Verification::Matched, true),
+            (
+                "mxc://localhost/t-mismatched",
+                Verification::Mismatched,
+                false,
+            ),
+            ("mxc://localhost/t-unknown", Verification::Unknown, false),
+        ] {
+            let description = MediaDescription {
+                kind: MediaKind::MatrixEncrypted,
+                name: None,
+                mimetype: None,
+                hash: Some("matrix-sha256:abc".into()),
+                file_size: Some(body.len() as u64),
+                chunk_size: None,
+            };
+            let mxc_here = mxc.to_string();
+            let pending = cache
+                .run(move |cache| {
+                    cache.media_begin(&mxc_here, &description)?;
+                    cache.media_pending_name(&mxc_here)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let mut writer = pool.create_pending(&pending, mxc).unwrap();
+            writer.write_all(&body).unwrap();
+            let finished = writer.finish().unwrap();
+            pool.adopt(&pending, &finished.hash_hex).unwrap();
+            let (mxc_here, hash, segments, plain_len, bytes) = (
+                mxc.to_string(),
+                finished.hash_hex.clone(),
+                finished.segments,
+                finished.plain_len,
+                finished.bytes_on_disk,
+            );
+            cache
+                .run(move |cache| {
+                    cache.media_finish(&mxc_here, &hash, segments, plain_len, bytes, verified)
+                })
+                .await
+                .unwrap();
+            let source = core.find_media_source(mxc).await.unwrap().unwrap();
+            assert_eq!(
+                (source.kind, source.verified, source.is_trusted()),
+                (MediaKind::MatrixEncrypted, verified, trusted),
+                "{mxc}"
+            );
+            assert_eq!(
+                read_whole(&core, mxc).await,
+                body,
+                "the data is given either way"
+            );
+        }
+        // 分塊的檔：不看 `verified`，可信。
+        let mut events = core.subscribe();
+        core.media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
+            .await
             .unwrap();
-        assert_eq!(exported.source, "server");
-        assert_eq!(std::fs::read(&out).unwrap(), body_of(0));
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        let source = core
+            .find_media_source(&manifest.mxc)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.kind, MediaKind::WbfChunked);
+        assert!(source.is_trusted());
     }
 
     #[tokio::test]
@@ -2209,7 +2392,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            entry.complete && entry.file_size == SIZE as u64,
+            entry.complete && entry.file_size == Some(SIZE as u64),
             "{entry:?}"
         );
         assert_eq!(read_whole(&core, &manifest.mxc).await, body());

@@ -716,6 +716,15 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
         )),
         "{head}"
     );
+    // 分塊的檔不看 `verified`：還在下載也是 2xx；每個回應都說它是哪種、驗到哪（/docs/design/rpc-specs/data-plane.md §8.2）。
+    assert!(
+        head.to_ascii_lowercase().contains("wbf-media-kind: 1"),
+        "{head}"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("wbf-media-verified: "),
+        "{head}"
+    );
     let mut state = Value::Null;
     for _ in 0..150 {
         state = client.call("media.download", by_event.clone()).await;
@@ -726,8 +735,18 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     assert_eq!(state["result"]["state"], "complete", "佇列拉完了：{state}");
+    // 上傳時區塊帶 sha256：下載完自動驗過、正確（/docs/design/media/media-download.md §12.3）。
+    assert_eq!(
+        (&state["result"]["kind"], &state["result"]["verified"]),
+        (&json!(1), &json!(1)),
+        "{state}"
+    );
     let (status, head, whole) = get(daemon.data_port, &url, None).await;
     assert_eq!(status, 200, "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("wbf-media-verified: 1"),
+        "{head}"
+    );
     assert_eq!(whole, body, "整檔跟送出去的一樣");
     assert!(
         client

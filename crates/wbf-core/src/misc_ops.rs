@@ -5,8 +5,10 @@ use std::io::Read;
 
 use serde::Serialize;
 
+use wbf_sdk::cache::MediaDescription;
 use wbf_sdk::chunk_crypto::{choose_stream_chunk_size, DescriptionSlot, Link};
 use wbf_sdk::manifest::Manifest;
+use wbf_sdk::media_kind::MediaKind;
 use wbf_sdk::{ChunkedBlock, FileCipher, Transport};
 
 use crate::backend_choice::MethodHome;
@@ -124,22 +126,21 @@ impl Core {
             .client_of(&account, transport, MethodHome::WbfSdkOnly, LinkRole::Misc)
             .await?;
         let (info, description_data) = client.fetch_info(mxc).await?;
-        if sync == crate::SyncMode::Both {
-            // 把 server 說的寫進 `media` 表（下次 `Local` 就答得出來）。
-            // ⚠️ 只有兩邊都知道的欄位才寫進去 —— `media_begin` 要的正好就是那些。
+        // 把 server 說的寫進 `media` 表（下次 `Local` 就答得出來）。`Info` 是 wbf 分塊的（`kind` 1），塊大小沒給就🚫 寫（🚫 用 0 頂替）。
+        // ⚠️ 只有兩邊都知道的欄位才寫進去 —— `media_begin` 要的正好就是那些。
+        if let (crate::SyncMode::Both, Some(chunk_size)) = (sync, info.chunk_size) {
             let (cache, _me) = self.server_cache_and_me(&account)?;
-            let (mxc_here, size, chunk) = (
-                mxc.to_string(),
-                info.file_size.unwrap_or(info.total_len),
-                info.chunk_size.unwrap_or(0),
-            );
-            let content_type = info.content_type.clone();
+            let mxc_here = mxc.to_string();
+            let description = MediaDescription {
+                kind: MediaKind::WbfChunked,
+                name: None,
+                mimetype: info.content_type.clone(),
+                hash: None,
+                file_size: Some(info.file_size.unwrap_or(info.total_len)),
+                chunk_size: Some(chunk_size),
+            };
             cache
-                .run(move |cache| {
-                    cache
-                        .media_begin(&mxc_here, None, content_type.as_deref(), None, size, chunk)
-                        .map(|_| ())
-                })
+                .run(move |cache| cache.media_begin(&mxc_here, &description).map(|_| ()))
                 .await?;
         }
         let mut result = MediaInfo {
@@ -211,10 +212,12 @@ impl Core {
             // 🚫 本地不知道線上那份的總長與有沒有被截斷。
             total_len: None,
             truncated: None,
-            file_size: Some(entry.file_size),
-            chunk_size: Some(entry.chunk_size),
-            // 區塊的 file_size 與 chunk_size 都在列裡：一共幾塊算得出來（chunk_size 是 0 的列就不答）。
-            chunk_count: wbf_sdk::chunk_crypto::chunk_count(entry.file_size, entry.chunk_size),
+            file_size: entry.file_size,
+            chunk_size: entry.chunk_size,
+            // 分塊的檔兩個都在列裡：一共幾塊算得出來（不是分塊的檔、或 chunk_size 是 0 就不答）。
+            chunk_count: entry.file_size.zip(entry.chunk_size).and_then(
+                |(file_size, chunk_size)| wbf_sdk::chunk_crypto::chunk_count(file_size, chunk_size),
+            ),
             content_type: entry.mimetype.clone(),
             // 這兩個要 server 的描述才算得出來。
             description: None,

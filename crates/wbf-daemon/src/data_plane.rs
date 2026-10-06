@@ -43,6 +43,10 @@ pub const UPLOAD_PATH: &str = "/upload/mxc/";
 pub const MEDIA_PATH: &str = "/media/mxc/";
 /// PUT 時帶上傳狀態的 header（`media.create` 給，/docs/design/rpc-specs/data-plane.md §2）。
 pub const UPLOAD_META_HEADER: &str = "Wbf-Upload-Meta";
+/// 讀的每個回應都帶：這個檔的格式（`media.kind`）與驗證結果（`media.verified`），讓前端知道 412 是哪一種（/docs/design/rpc-specs/data-plane.md §8.2）。
+/// ⚠️ 要小寫：`HeaderMap::insert` 收 `&'static str` 時大寫的名字會 panic。
+pub const MEDIA_KIND_HEADER: &str = "wbf-media-kind";
+pub const MEDIA_VERIFIED_HEADER: &str = "wbf-media-verified";
 /// 資料平面從共享 token 導鑰的 context（跟 RPC 的兩把分開，/docs/design/rpc-specs/local-interface.md §4）。
 const ACCESS_CONTEXT: &str = "wbf-matrix-client data plane v1";
 const URL_AAD: &[u8] = b"wbf-data url v1";
@@ -482,13 +486,26 @@ async fn get_media(
         .mimetype
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
+    // 資料照給，狀態碼說它可不可信：沒驗過或驗不過的傳統加密檔是 412、body 跟 200／206 一模一樣（維護者 2026-10-06，/docs/design/rpc-specs/data-plane.md §8.2）。
+    let (trusted, kind, verified) = (source.is_trusted(), source.kind, source.verified);
     let body = match is_head || start == end {
         true => full_body(Bytes::new()),
         false => stream_body(source.into_stream(start, end)),
     };
     let mut reply = Response::new(body);
-    *reply.status_mut() = status;
+    *reply.status_mut() = match trusted {
+        true => status,
+        false => StatusCode::PRECONDITION_FAILED,
+    };
     let headers = reply.headers_mut();
+    headers.insert(
+        MEDIA_KIND_HEADER,
+        header::HeaderValue::from(u16::from(kind.to_number())),
+    );
+    headers.insert(
+        MEDIA_VERIFIED_HEADER,
+        header::HeaderValue::from(u16::from(verified.to_number())),
+    );
     headers.insert(
         header::ACCEPT_RANGES,
         header::HeaderValue::from_static("bytes"),

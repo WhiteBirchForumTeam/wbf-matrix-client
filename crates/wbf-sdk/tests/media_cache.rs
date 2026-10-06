@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use support::fake_server::FakeServer;
-use wbf_sdk::cache::{Cache, CacheIdentity, MediaEntry};
+use wbf_sdk::cache::{Cache, CacheIdentity, MediaDescription, MediaEntry};
 use wbf_sdk::channel::PackChannel;
 use wbf_sdk::media::{self, MediaDownload};
 use wbf_sdk::media_pool::{MediaPool, SEGMENT_SIZE};
@@ -98,17 +98,8 @@ fn reads_so_far(server: &FakeServer) -> usize {
 }
 
 fn open_download(cache: &mut Cache, pool: &MediaPool, manifest: &Manifest) -> MediaDownload {
-    let block = &manifest.block;
-    cache
-        .media_begin(
-            &manifest.mxc,
-            block.name.as_deref(),
-            block.mimetype.as_deref(),
-            block.sha256.as_deref(),
-            manifest.file_size(),
-            block.chunk_size,
-        )
-        .unwrap();
+    let description = MediaDescription::of_chunked_block(&manifest.block).unwrap();
+    cache.media_begin(&manifest.mxc, &description).unwrap();
     let name = cache.media_pending_name(&manifest.mxc).unwrap().unwrap();
     MediaDownload::open(pool, &name, manifest).unwrap()
 }
@@ -162,7 +153,7 @@ async fn download_whole(
             return Err(error);
         }
     }
-    let finished = download.finish(pool)?;
+    let (finished, verified) = download.finish(pool)?;
     let bytes_on_disk = pool.bytes_on_disk(&finished.hash_hex)?;
     cache.media_finish(
         &manifest.mxc,
@@ -170,6 +161,7 @@ async fn download_whole(
         finished.segments,
         finished.plain_len,
         bytes_on_disk,
+        verified,
     )?;
     Ok(cache.find_media(&manifest.mxc)?.unwrap())
 }
@@ -219,7 +211,7 @@ async fn a_download_lands_in_the_pool_and_the_same_content_dedups() {
     assert_eq!(cache.media_bytes_on_disk().unwrap(), entry.bytes_on_disk);
     // 列說的長度跟檔不一樣：不算完整。
     let mut wrong = entry.clone();
-    wrong.file_size = 1;
+    wrong.file_size = Some(1);
     assert!(media::open_complete(&pool, &wrong).is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -310,7 +302,12 @@ async fn the_main_file_takes_a_seek_fetched_chunk_without_the_network() {
         1 + 4,
         "chunk 2 came from the seek file"
     );
-    let finished = download.finish(&pool).unwrap();
+    let (finished, verified) = download.finish(&pool).unwrap();
+    assert_eq!(
+        verified,
+        wbf_sdk::media_kind::Verification::Matched,
+        "the block's sha256 matches the whole file"
+    );
     assert!(
         !pool.seek_path("m1").exists(),
         "the seek file goes when the main file is done"

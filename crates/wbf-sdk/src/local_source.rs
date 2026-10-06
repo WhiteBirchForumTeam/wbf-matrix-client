@@ -21,7 +21,7 @@ pub fn open_local_source(entry: &MediaEntry) -> Option<(File, PathBuf)> {
     let path = local_path_of_file_uri(entry.source_uri.as_deref()?)?;
     let file = File::open(&path).ok()?;
     let metadata = file.metadata().ok()?;
-    (metadata.is_file() && metadata.len() == entry.file_size).then_some((file, path))
+    (metadata.is_file() && Some(metadata.len()) == entry.file_size).then_some((file, path))
 }
 
 /// `file://` URI → 這台機器的路徑（/docs/design/rpc-specs/data-plane.md §8.1）。
@@ -193,8 +193,10 @@ mod tests {
             name: None,
             mimetype: None,
             hash: None,
-            file_size,
-            chunk_size: 16,
+            kind: crate::media_kind::MediaKind::WbfChunked,
+            verified: crate::media_kind::Verification::Unknown,
+            file_size: Some(file_size),
+            chunk_size: Some(16),
             segments_written: 0,
             complete: false,
             bytes_on_disk: 0,

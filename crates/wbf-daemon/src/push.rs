@@ -212,6 +212,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
             state,
             done,
             total,
+            verified,
             reason,
         } => {
             let mut params = json!({
@@ -221,6 +222,10 @@ pub fn push_of(event: &CoreEvent) -> Push {
                 "done": done,
                 "total": total,
             });
+            // `complete` 一律帶（/docs/design/media/media-download.md §12.3），其他狀態沒有就不在（🚫 送 null）。
+            if let Some(verified) = verified {
+                insert_field(&mut params, "verified", json!(verified));
+            }
             if let Some(reason) = reason {
                 insert_field(&mut params, "reason", json!(reason));
             }
@@ -422,6 +427,7 @@ mod tests {
             state: wbf_core::DownloadState::Downloading,
             done: 3,
             total: 10,
+            verified: None,
             reason: None,
         });
         assert_eq!(progress.request.method, "media.download");
@@ -436,12 +442,40 @@ mod tests {
             state: wbf_core::DownloadState::Failed,
             done: 3,
             total: 10,
+            verified: None,
             reason: Some("chunk 3 does not authenticate".into()),
         });
         assert_eq!(failed.request.params["state"], json!("failed"));
         assert_eq!(
             failed.request.params["reason"],
             json!("chunk 3 does not authenticate")
+        );
+        // 驗證中、驗完（/docs/design/media/media-download.md §12.3）：`complete` 帶 `verified` 的數字。
+        let verifying = push_of(&CoreEvent::MediaDownload {
+            user: "@a:x".into(),
+            mxc: "mxc://x/1".into(),
+            state: wbf_core::DownloadState::Verifying,
+            done: 10,
+            total: 10,
+            verified: None,
+            reason: None,
+        });
+        assert_eq!(
+            verifying.request.params,
+            json!({ "user": "@a:x", "mxc": "mxc://x/1", "state": "verifying", "done": 10, "total": 10 })
+        );
+        let mismatched = push_of(&CoreEvent::MediaDownload {
+            user: "@a:x".into(),
+            mxc: "mxc://x/1".into(),
+            state: wbf_core::DownloadState::Complete,
+            done: 10,
+            total: 10,
+            verified: Some(wbf_sdk::media_kind::Verification::Mismatched),
+            reason: None,
+        });
+        assert_eq!(
+            mismatched.request.params,
+            json!({ "user": "@a:x", "mxc": "mxc://x/1", "state": "complete", "done": 10, "total": 10, "verified": 2 })
         );
     }
 
