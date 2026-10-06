@@ -37,7 +37,7 @@ pub struct Cli {
     /// 直接給 access token，跳過 session 檔。不印、不寫進任何輸出
     #[arg(long, global = true, env = "WBF_ACCESS_TOKEN", hide_env_values = true)]
     pub token: Option<String>,
-    /// 資料目錄（local.key、current、s/<b58>/cache.db、s/<b58>/a/<b58>/…），預設見 /docs/design/rpc-specs/wbf-cli-spec.md §7
+    /// 資料目錄（local.key、current、s/<b58>/cache.db、s/<b58>/a/<b58>/…），預設見 /docs/design/storage/local-storage.md §1
     #[arg(long, global = true, env = "WBF_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// 用哪個帳號（mxid 或 localpart）；沒給就是最後一次 login 的那個。同名 localpart 在多個 server 時要配 --server
@@ -407,6 +407,7 @@ fn exit_code(error: &CoreError) -> u8 {
         Server | RoomDevicesChanged => 2,
         Integrity => 3,
         Network => 4,
-        Timeout => 5,
+        // 房間金鑰在等待時間內沒分好：等過了、沒等到，跟逾時同一級（重送就好）。
+        Timeout | RoomKeyNotReady => 5,
     }
 }

@@ -218,16 +218,18 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 ### 4.3 命名與目錄
 
 ```
-<data dir>/s/<B58 nonce>_<B58 密文>/                         這台 server（跟 cache.db 同層，同 server 的帳號共用）
-    cache.db
-    media/
-        pending/
-            m<media.id>                                       主檔，下載中（池格式 v2）
-            m<media.id>.seek                                  seek 暫存檔（§4.2）
-        <hash 前 2 hex>/<hash>                                完成的主檔（明文 BLAKE3，64 個小寫 hex）
+<data dir>/s/<B58 nonce>_<B58 密文>/    這台 server（跟 cache.db 同層，同 server 的帳號共用）
+├── cache.db
+└── media/
+    ├── pending/
+    │   ├── m<media.id>                  主檔，下載中（池格式 v2）；例 m7
+    │   └── m<media.id>.seek             seek 暫存檔（§4.2）；例 m7.seek
+    └── <hash 前 2 hex>/
+        └── <hash>                       完成的主檔（明文 BLAKE3，64 個小寫 hex）
+                                         例 e0/e050d82e36326f3fdf063dd38b034f2b43be659eba3d6488396db907d66e60d5
 ```
 
-- 檔名只有 `media.id` 與 hash：原檔名、mimetype、mxc 只在 `cache.db`（/docs/design/media/media-pool.md §2）。
+- 檔名只有 `media.id` 與 hash：原檔名、mimetype、mxc 只在 `cache.db`（/docs/design/media/media-pool.md §2）。整個資料目錄的樹與一個完整檔的實際檔頭在 `/docs/design/storage/local-storage.md` §3、§5.2。
 - 掃描（`media::sweep`：這個程序裡第一次起這台 server 的下載處理端時、`media.gc` 時）對 `pending/` 的規則：沒有對應的 `media` 列、列已經 `complete = 1`、
   主檔不是池格式 v2、或超過保護期沒動過（看檔案的修改時間）→ 刪；**處理端正開著的暫存名🚫 不碰**（正在下載的檔不能從底下抽掉）。
   `.seek` 跟它的主檔同一個主人。完成檔是 v1（打不開）→ 列 reset、沒人指著的檔刪。

@@ -2,8 +2,11 @@
 //! 收到時解密、金鑰到了補解。
 //!
 //! - **狀態放 UI**：房間版本號與每個成員的裝置版本號（[`RoomDevices`]）由 UI 存，送出時帶回來；daemon 🚫 不存每房的快照。
-//! - **金鑰的分發由 daemon 自動做**：送出前一律先分（sdk `encrypt_and_send` 裡），第一次、該換、多了裝置三種都涵蓋。
-//! - **被 1506 擋**：daemon 自動 refresh（重拿成員、只重查變了的人、補金鑰），把新的 [`RoomDevices`] 放進錯誤的 `data` 一起回；
+//! - **送訊息只用已經分好的金鑰**（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：金鑰只在後台（`key_share.rs`）建、換、送；
+//!   送出前等「這個房的金鑰對 UI 帶來的房間版本號就緒」最多 `ROOM_KEY_WAIT`，等到才加密送出，等不到回 `RoomKeyNotReady`（訊息沒送）。
+//!   送出之後交給後台看要不要提早換。refresh 完也交給後台對新的版本先分好。
+//! - **金鑰的網路動作都走 `Keys` 線**：refresh（查成員、查裝置）與後台建通道、送金鑰；`Misc` 上只有 `Event/Send`。
+//! - **被 1506 擋**：daemon 自動 refresh（重拿成員、只重查變了的人、交給後台），把新的 [`RoomDevices`] 放進錯誤的 `data` 一起回；
 //!   🚫 不自動重送（重送是 UI 的事，用同一個 `txn_id`）。
 //! - **解密**：收到時有金鑰就解，密文明文一起存；沒金鑰只存密文。金鑰到了，找出那把 session 還沒解的立刻解、補存明文，
 //!   並照收訊息那條路發 `room.message`（同 `event_id`，UI 當更新）。
@@ -14,7 +17,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use wbf_sdk::cache::UndecryptedFilter;
-use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, RoomRefresh, SendOutcome};
+use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, SendOutcome};
 use wbf_sdk::device_version::{DeviceVersion, RoomDeviceVersions};
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::{IncomingEvent, Transport};
@@ -34,15 +37,6 @@ pub struct RoomDevices {
     pub room_version: u64,
     /// 成員 → 裝置版本號, example: {"@bob:localhost": "3-810b7c3be4"}
     pub members: BTreeMap<String, String>,
-}
-
-/// `room.refresh_devices` 的結果，也是 1506 那則錯誤的 `data`：這一刻的房間狀態、這輪補發了幾個 to-device。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RoomDevicesRefresh {
-    #[serde(flatten)]
-    pub devices: RoomDevices,
-    /// 這輪發了幾個 to-device（房間金鑰補給新裝置）；0 ＝ 每台裝置都已經有了
-    pub shared: usize,
 }
 
 /// 送一則文字的選項（`room.send_text`）。
@@ -98,23 +92,15 @@ impl RoomDevices {
     }
 }
 
-impl RoomDevicesRefresh {
-    fn from_refresh(refresh: &RoomRefresh) -> RoomDevicesRefresh {
-        RoomDevicesRefresh {
-            devices: RoomDevices::from_versions(&refresh.versions),
-            shared: refresh.shared_to_device_requests,
-        }
-    }
-}
-
 impl Core {
-    /// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。
+    /// 確認這個房現在的人與裝置（UI 點進房、或自己發現版本號變了時叫），並交給後台對這一刻的狀態先分好房間金鑰；🚫 等後台分完。
+    /// 查成員、查裝置都走 `Keys` 線（金鑰的事都在那條，/docs/design/keys/e2ee-rpc.md §3.1）；沒開就開（這是 UI 下的命令）。
     ///
     /// Args:
     ///     room: example: "!r:localhost"
-    ///     previous: UI 手上的上一份；帶了只重查裝置版本號變了的人，None ＝ 每個人都查（只查得多，送金鑰照樣只送缺的）
+    ///     previous: UI 手上的上一份；帶了只重查裝置版本號變了的人，None ＝ 每個人都查
     /// Return:
-    ///     Ok(RoomDevicesRefresh)   UI 存下 `devices`，下次送出帶回來
+    ///     Ok(RoomDevices)          UI 存下來，下次送出帶回來
     ///     Err(Usage)               不是 wbf 帳號、或 `previous` 的裝置版本號形狀不對
     ///     Err(Server)              不在房裡（`Forbidden`）、server 沒給號碼、某人的裝置雜湊重查後仍對不上（fail closed，房間金鑰不發）
     ///     Err(Network)             線開不起來
@@ -123,33 +109,59 @@ impl Core {
         room: &str,
         previous: Option<&RoomDevices>,
         target: &Target,
-    ) -> Result<RoomDevicesRefresh, CoreError> {
+    ) -> Result<RoomDevices, CoreError> {
         let account = self.account_or_current(target)?;
-        let engine = self.olm_engine_of(&account).await?;
         let previous = previous.map(RoomDevices::to_versions).transpose()?;
+        self.refresh_on_keys_line(&account, room, previous.as_ref())
+            .await
+    }
+
+    /// refresh 的本體（UI 的 `room.refresh_devices` 與 1506 之後那次共用）：走 `Keys` 線重拿，交給後台對新的狀態分好金鑰。
+    ///
+    /// Return:
+    ///     Ok(RoomDevices)
+    ///     Err(...)   同 [`Core::refresh_room_devices`]
+    async fn refresh_on_keys_line(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        previous: Option<&RoomDeviceVersions>,
+    ) -> Result<RoomDevices, CoreError> {
+        let engine = self.olm_engine_of(account).await?;
         let mut client = self
             .client_of(
-                &account,
+                account,
                 Transport::WebSocket,
                 MethodHome::WbfSdkOnly,
-                LinkRole::Misc,
+                LinkRole::Keys,
             )
             .await?;
         let refresh = engine
-            .refresh_room_devices(&mut client, room, previous.as_ref())
+            .refresh_room_devices(&mut client, room, previous)
             .await?;
-        Ok(RoomDevicesRefresh::from_refresh(&refresh))
+        drop(client);
+        self.prepare_room_key(
+            account,
+            room,
+            refresh.versions.room_version,
+            refresh.versions.members.keys().cloned().collect(),
+        )
+        .await;
+        Ok(RoomDevices::from_versions(&refresh.versions))
     }
 
-    /// wbf 帳號在加密房送一則事件：先分金鑰、加密、帶 UI 給的房間版本號送（sdk `encrypt_and_send`）。
-    /// 被 1506 擋 → 自動 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人）→ 回 `RoomDevicesChanged`，`data` 是新狀態加 `txn_id`。
+    /// wbf 帳號在加密房送一則事件：**只用已經分好的金鑰**（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）——
+    /// 等這個房的金鑰對 UI 帶來的房間版本號就緒（還沒就交給後台準備，最多 `ROOM_KEY_WAIT`）→ 加密 → 帶號碼在 `Misc` 上送 → 交給後台看要不要提早換。
+    /// 🚫 在這裡建、換、送金鑰。等不到就回 `RoomKeyNotReady`，訊息沒加密、沒送。
+    /// 被 1506 擋 → 自動 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人）→ 交給後台 → 回 `RoomDevicesChanged`，`data` 是新狀態加 `txn_id`。
     ///
     /// Args:
     ///     message: 明文的事件；`attachments` 跟密文同一個 `Event/Send` 宣告, example: OutgoingRoomEvent { event_type: "m.room.message".into(), content: json!({"msgtype":"m.text","body":"hi"}), txn_id: "wbf-1727600000-3".into(), attachments: vec![] }
     ///     devices: UI 手上那份
     /// Return:
     ///     Ok(String)                 event_id
-    ///     Err(RoomDevicesChanged)    訊息沒送；`data`：`{room_version, members, shared, txn_id}`（重拿成功）或 `{txn_id, current_room_version}`（重拿也失敗，UI 自己叫 `room.refresh_devices`）
+    ///     Err(RoomKeyNotReady)       金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`，UI 用同一個 `txn_id` 重送
+    ///     Err(RoomDevicesChanged)    訊息沒送；`data`：`{room_version, members, txn_id}`（重拿成功）或 `{txn_id, current_room_version}`（重拿也失敗，UI 自己叫 `room.refresh_devices`）
     ///     Err(Usage)                 `devices` 的形狀不對
     ///     Err(Server)／Err(Network)  其他拒絕、線開不起來
     pub(crate) async fn wbf_send_encrypted(
@@ -162,6 +174,23 @@ impl Core {
         let engine = self.olm_engine_of(account).await?;
         let previous = devices.to_versions()?;
         let members: Vec<String> = devices.members.keys().cloned().collect();
+        let txn_id = message.txn_id.clone();
+        let is_ready = self
+            .is_room_key_ready_within(
+                account,
+                room,
+                devices.room_version,
+                &members,
+                crate::key_share::ROOM_KEY_WAIT,
+            )
+            .await?;
+        if !is_ready {
+            return Err(room_key_not_ready(
+                room,
+                "the background did not finish preparing it in time",
+                &txn_id,
+            ));
+        }
         let mut client = self
             .client_of(
                 account,
@@ -170,39 +199,42 @@ impl Core {
                 LinkRole::Misc,
             )
             .await?;
-        let txn_id = message.txn_id.clone();
         let outcome = engine
-            .encrypt_and_send(&mut client, room, devices.room_version, &members, &message)
+            .encrypt_and_send(&mut client, room, devices.room_version, &message)
             .await?;
+        drop(client);
         let (current_room_version, blocked) = match outcome {
-            SendOutcome::Sent { event_id } => return Ok(event_id),
+            SendOutcome::Sent { event_id } => {
+                self.room_key_used(account, room, devices.room_version, members)
+                    .await;
+                return Ok(event_id);
+            }
+            // 就緒檢查之後、加密之前剛好到期或被換掉：同樣不送，後台會分好下一把。
+            SendOutcome::RoomKeyNotReady { reason } => {
+                self.prepare_room_key(account, room, devices.room_version, members)
+                    .await;
+                return Err(room_key_not_ready(room, &reason, &txn_id));
+            }
             SendOutcome::RoomDevicesChanged {
                 current_room_version,
                 error,
             } => (current_room_version, error),
         };
-        // 被擋了：daemon 自動做下一步（重拿房間狀態、補金鑰），連同錯誤一起回；🚫 不自動重送。
-        match engine
-            .refresh_room_devices(&mut client, room, Some(&previous))
-            .await
-        {
-            Ok(refresh) => {
-                let fresh = RoomDevicesRefresh::from_refresh(&refresh);
-                Err(CoreError::new(
-                    CoreErrorKind::RoomDevicesChanged,
-                    format!(
-                        "{room}: {blocked}; the room was fetched again and its keys were shared (room_version {}): \
-                         send again with the room_devices in data and the same txn_id",
-                        fresh.devices.room_version
-                    ),
-                )
-                .with_data(json!({
-                    "room_version": fresh.devices.room_version,
-                    "members": fresh.devices.members,
-                    "shared": fresh.shared,
-                    "txn_id": txn_id,
-                })))
-            }
+        // 被擋了：daemon 自動做下一步（重拿房間狀態、交給後台），連同錯誤一起回；🚫 不自動重送。
+        match self.refresh_on_keys_line(account, room, Some(&previous)).await {
+            Ok(fresh) => Err(CoreError::new(
+                CoreErrorKind::RoomDevicesChanged,
+                format!(
+                    "{room}: {blocked}; the room was fetched again and its key is being prepared for it (room_version {}): \
+                     send again with the room_devices in data and the same txn_id",
+                    fresh.room_version
+                ),
+            )
+            .with_data(json!({
+                "room_version": fresh.room_version,
+                "members": fresh.members,
+                "txn_id": txn_id,
+            }))),
             Err(error) => Err(CoreError::new(
                 CoreErrorKind::RoomDevicesChanged,
                 format!(
@@ -215,6 +247,21 @@ impl Core {
             }))),
         }
     }
+}
+
+/// `RoomKeyNotReady` 那則錯誤：訊息沒送，`data` 帶這則的 `txn_id`（UI 沒給的話是 daemon 產的），重送用同一個。
+///
+/// Args:
+///     reason: example: "the room key expired"
+///     txn_id: example: "wbf-1727600000-3"
+fn room_key_not_ready(room: &str, reason: &str, txn_id: &str) -> CoreError {
+    CoreError::new(
+        CoreErrorKind::RoomKeyNotReady,
+        format!(
+            "{room}: the room key is not ready ({reason}); nothing was sent. The key keeps being prepared in the background: send again with the same txn_id"
+        ),
+    )
+    .with_data(json!({ "txn_id": txn_id }))
 }
 
 /// 一則 WS 收到的事件 → 要寫進 cache 的樣子：有引擎就讓它試著解（解得開密文明文一起存），沒有就原樣（密文標成沒解）。
@@ -314,9 +361,13 @@ mod tests {
     use super::*;
     use crate::test_support::*;
 
-    /// 一條放進池裡的 `Misc`（記憶體對接的假 server）；這個房加密、成員只有自己、房間版本號 7。
-    /// `Misc` 線接上假 server，房間（`ROOM`）在 server 那邊與本地都是 `encrypted` 那樣（送文字只看本地，wbf_rooms.rs）。
-    async fn room_on_misc(core: &Core, account: &AccountDir, encrypted: bool) -> FakeServer {
+    /// `Misc` 與 `Keys` 各一條放進池裡（記憶體對接的假 server）：房間（`ROOM`）在 server 那邊與本地都是 `encrypted` 那樣（送文字只看本地，wbf_rooms.rs）、
+    /// 成員只有自己、房間版本號 7。送訊息走 `Misc`，refresh 走 `Keys`（/docs/design/keys/e2ee-rpc.md §3.1）。
+    async fn room_on_misc(
+        core: &Core,
+        account: &AccountDir,
+        encrypted: bool,
+    ) -> (FakeServer, FakeServer) {
         let (client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
         let pool = core.pool_of_account(account).unwrap();
         drop(
@@ -329,7 +380,8 @@ mod tests {
         remember_room(core, account, ROOM, encrypted).await;
         *fake.members.lock().unwrap() = Some(members_body(7));
         *fake.current_room_version.lock().unwrap() = Some(7);
-        fake
+        let keys = keys_line_with_room(core, account, 7).await;
+        (fake, keys)
     }
 
     fn options(devices: &RoomDevices, txn_id: &str) -> SendOptions {
@@ -347,7 +399,7 @@ mod tests {
     ) {
         let dir = scratch("crypto-send");
         let (core, account) = core_with_wbf_account(&dir).await;
-        let fake = room_on_misc(&core, &account, true).await;
+        let (fake, keys) = room_on_misc(&core, &account, true).await;
         let target = Target::default();
 
         let refused = core
@@ -365,13 +417,15 @@ mod tests {
             .refresh_room_devices(ROOM, None, &target)
             .await
             .unwrap();
-        assert_eq!(refreshed.devices.room_version, 7);
-        assert_eq!(
-            refreshed.devices.members.keys().collect::<Vec<_>>(),
-            vec![ME]
+        assert_eq!(refreshed.room_version, 7);
+        assert!(
+            fake.bridge_calls.lock().unwrap().is_empty()
+                && !keys.bridge_calls.lock().unwrap().is_empty(),
+            "refresh 走 `Keys` 線、🚫 用 `Misc`"
         );
+        assert_eq!(refreshed.members.keys().collect::<Vec<_>>(), vec![ME]);
         let event_id = core
-            .send_text(ROOM, "hi", &options(&refreshed.devices, "t1"), &target)
+            .send_text(ROOM, "hi", &options(&refreshed, "t1"), &target)
             .await
             .unwrap();
         assert_eq!(event_id, "$sent-1");
@@ -397,9 +451,9 @@ mod tests {
 
         // 有人換了裝置：server 的號碼變 9。帶 7 送 → 被擋，daemon 自動重拿，新狀態跟錯誤一起回。
         *fake.current_room_version.lock().unwrap() = Some(9);
-        *fake.members.lock().unwrap() = Some(members_body(9));
+        *keys.members.lock().unwrap() = Some(members_body(9));
         let blocked = core
-            .send_text(ROOM, "again", &options(&refreshed.devices, "t2"), &target)
+            .send_text(ROOM, "again", &options(&refreshed, "t2"), &target)
             .await
             .unwrap_err();
         assert_eq!(
@@ -436,7 +490,7 @@ mod tests {
     async fn a_plaintext_room_sends_plaintext_without_room_devices() {
         let dir = scratch("crypto-plain");
         let (core, account) = core_with_wbf_account(&dir).await;
-        let fake = room_on_misc(&core, &account, false).await;
+        let (fake, _keys) = room_on_misc(&core, &account, false).await;
         let event_id = core
             .send_text(ROOM, "hi", &SendOptions::default(), &Target::default())
             .await
@@ -479,7 +533,7 @@ mod tests {
         account: &AccountDir,
         event_id: &str,
     ) -> (Value, String) {
-        let fake = room_on_misc(core, account, true).await;
+        let (fake, _keys) = room_on_misc(core, account, true).await;
         let refreshed = core
             .refresh_room_devices(ROOM, None, &Target::default())
             .await
@@ -487,7 +541,7 @@ mod tests {
         core.send_text(
             ROOM,
             "secret",
-            &options(&refreshed.devices, event_id),
+            &options(&refreshed, event_id),
             &Target::default(),
         )
         .await
@@ -727,7 +781,7 @@ mod tests {
     /// alice、bob 各一個 `Core`（各自的資料目錄）登入、鉤子開五條線（`Keys` 線上傳裝置金鑰）→ alice `refresh` 拿到 UI 要存的 `RoomDevices`
     /// → 帶著它送加密訊息 → bob 收到的 `room.message` 是解開的；
     /// bob 再登一台新裝置（第三個 `Core`）→ alice 帶**舊的** `RoomDevices` 送 → 被 server 擋（1506），`RoomDevicesChanged` 的 `data` 是 daemon 自動重拿的新狀態、訊息沒送
-    /// → alice 帶新狀態、同一個 `txn_id` 重送 → bob 的新裝置解得開（金鑰是 1506 之後那次 refresh 補給它的）。
+    /// → alice 帶新狀態、同一個 `txn_id` 重送 → bob 的新裝置解得開（1506 之後那次 refresh 交給後台、重送前等它分好的）。
     ///
     /// `--ignored`；環境變數：`WBF_E2E_SERVER`、`WBF_E2E_USER`（完整 mxid）、`WBF_E2E_PASSWORD_FILE`、`WBF_E2E_USER_B`、`WBF_E2E_PASSWORD_B_FILE`、
     /// `WBF_E2E_ENCRYPTED_ROOM`（兩人都在的加密房）。
@@ -779,16 +833,13 @@ mod tests {
             .refresh_room_devices(&room, None, &target)
             .await
             .unwrap();
-        assert!(
-            first.devices.members.contains_key(&bob),
-            "bob 在成員裡：{first:?}"
-        );
+        assert!(first.members.contains_key(&bob), "bob 在成員裡：{first:?}");
         let body_1 = format!("e2ee rpc 1 {}", std::process::id());
         let event_1 = core_a
             .send_text(
                 &room,
                 &body_1,
-                &options(&first.devices, &format!("t1-{}", std::process::id())),
+                &options(&first, &format!("t1-{}", std::process::id())),
                 &target,
             )
             .await
@@ -805,7 +856,7 @@ mod tests {
         let body_2 = format!("e2ee rpc 2 {}", std::process::id());
         let txn_2 = format!("t2-{}", std::process::id());
         let blocked = core_a
-            .send_text(&room, &body_2, &options(&first.devices, &txn_2), &target)
+            .send_text(&room, &body_2, &options(&first, &txn_2), &target)
             .await
             .expect_err("the stale room version is refused by the server");
         assert_eq!(
@@ -816,10 +867,10 @@ mod tests {
         let data = blocked.data.clone().expect("1506 帶新的房間狀態");
         assert_eq!(data["txn_id"], txn_2.as_str());
         let fresh: RoomDevices = serde_json::from_value(data).unwrap();
-        assert_ne!(fresh.room_version, first.devices.room_version, "號碼變了");
+        assert_ne!(fresh.room_version, first.room_version, "號碼變了");
         assert_ne!(
             fresh.members.get(&bob),
-            first.devices.members.get(&bob),
+            first.members.get(&bob),
             "bob 的裝置版本號變了"
         );
 

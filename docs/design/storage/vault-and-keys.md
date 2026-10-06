@@ -1,7 +1,7 @@
 # 本地的金鑰：主金鑰與子金鑰、路徑加密、passphrase
 
 > 這份講本機所有加密的根：`local.key` 裡的主金鑰與它導出的子金鑰（§1）、資料目錄裡 server 與帳號名字的加密（§2）、passphrase 怎麼讀（§3）。
-> 各檔放在哪見 /docs/design/storage/local-cache-db.md §4.6；`wbf-sdk::vault` 與 `wbf-sdk::account_dir` 就是照這裡寫的。
+> 各檔放在哪、裝什麼見 /docs/design/storage/local-storage.md；`wbf-sdk::vault` 與 `wbf-sdk::account_dir` 就是照這裡寫的。
 
 ## 1. 金鑰：一把主金鑰，兩種鎖法，型別化
 
@@ -52,11 +52,12 @@ local.key（0600）
 
 ### 1.1 實作細節
 
-- 包主金鑰、封 session、封 recovery key 各帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`、`wbf-matrix-client recovery.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。
+- 包主金鑰、封 session、封 recovery key 各帶固定的 AEAD 附加資料（`wbf-matrix-client local.key v1`、`wbf-matrix-client session.sealed v1`、`wbf-matrix-client recovery.sealed v1`）：把 A 檔的密文搬到 B 檔解不開。兩種封檔共用一個殼與一組讀寫函式（/docs/design/storage/local-storage.md §2.3）。
+  📌 `wbf-matrix-client key-share queue v1` 曾經用在 `m/ks.sealed`（2026-10-06 加、同一天拿掉，沒有發布過），🚫 再拿來用在別種檔。
 - `Vault::read_mode(dir)`：只看鎖法不解。CLI 用它決定要不要問 passphrase，🚫 不靠 `open` 失敗的錯誤字串判斷（那是 parse Display 的老毛病，matrix-sdk 那次踩過）。
 - `Vault::set_unlock(&Unlock)` 一個函數涵蓋設 passphrase、改 passphrase、拿掉 passphrase：只重寫 `local.key`，主金鑰不變，所以 `session.sealed` 與 SDK store 不動。空的 passphrase 在這裡被拒。
 - `Vault::from_master(dir, master, mode)` 只給 `set_passphrase` 重包 `local.key` 用（同一個目錄、同一把主金鑰）；⚠️ 它不驗證那把金鑰是不是這個目錄的，所以🚫 除此之外不要拿它做別的事。
-- 寫 `local.key`／`session.sealed` 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。
+- 寫 `local.key`／`session.sealed` 都先寫暫存檔再 rename（`vault::write_private`）：寫到一半斷電不留半個檔。🚫 先刪舊檔再 rename——中間斷電 `local.key` 就沒了（/docs/design/storage/local-storage.md §2.4）。
 - 既有的 matrix-sdk store 用別把金鑰開會失敗：訊息叫人刪那個 store 目錄（`m/`）重新 `login`，不遷移（/docs/design/storage/local-cache-db.md §1 的政策，維護者 2026-09-09 決定不改）。
   ⚠️ 這條站得住的前提是 /docs/design/keys/room-key-backup.md 的本地快照：`m/` 裡的 crypto store 裝著解開全部歷史的房間金鑰，手動刪 `m/` 時 `k/snapshot` 留著、`key-backup import` 讀得回來。
 

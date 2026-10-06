@@ -28,6 +28,7 @@ use wbf_sdk::protocol::{CryptoStateMeta, SubscribeReply};
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::event::{EventSink, KeysState};
+use crate::key_share::KeyShareInbox;
 use crate::link_pool::{LinkPool, LinkRole};
 use crate::room_crypto::{decrypt_stored, StoredToDecrypt};
 use crate::server_cache::ServerCache;
@@ -60,6 +61,8 @@ struct KeySyncTask {
     pool: Arc<LinkPool>,
     /// 金鑰到了補解那些訊息用。
     cache: Arc<ServerCache>,
+    /// 補一次性金鑰失敗時交給金鑰線的後台重試（起不了就是 None）。
+    key_share: Option<KeyShareInbox>,
 }
 
 impl Core {
@@ -165,11 +168,26 @@ impl Core {
                 initial.otk_counts
             ));
         }
-        // 上傳自己的裝置金鑰、補一次性金鑰（第一次開線就是這一步讓別人查得到這台）。失敗只講一聲：收金鑰照常，下一個 `CryptoState` 再補。
+        // 金鑰線的後台（/docs/design/keys/e2ee-rpc.md §3.1）：這條線開好就起。
+        // 起不了（沒解鎖）只講一聲：收金鑰照常，房間金鑰等下一次送或 refresh 再起。
+        let key_share = match self.key_share_inbox(account).await {
+            Ok(inbox) => Some(inbox),
+            Err(error) => {
+                self.events.progress(format!(
+                    "keys: the background key sender for {} could not start: {error}",
+                    account.label()
+                ));
+                None
+            }
+        };
+        // 上傳自己的裝置金鑰、補一次性金鑰（第一次開線就是這一步讓別人查得到這台）。server 回 Ack 才算數：失敗就交給金鑰線的後台退避重試。
         if let Err(error) = engine.send_outgoing_requests(client).await {
-            self.events.progress(format!(
-                "keys: uploading this device's keys failed (retried on the next key-stock update): {error}"
-            ));
+            hand_own_key_upload_to_retry(
+                &self.events,
+                key_share.as_ref(),
+                "uploading this device's keys",
+                &error,
+            );
         }
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = KeySyncTask {
@@ -178,6 +196,7 @@ impl Core {
             events: self.events.clone(),
             pool,
             cache,
+            key_share: key_share.clone(),
         };
         let handle = KeySyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
@@ -189,6 +208,11 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
+        // 線沒開時沒送成的（含上次 daemon 留下的），現在再跑一輪。
+        // 它要等這格開好才拿得到線（`reuse` 排在開線的寫鎖後面），🚫 在這裡等它。
+        if let Some(inbox) = &key_share {
+            inbox.line_opened();
+        }
         Ok(())
     }
 
@@ -370,7 +394,7 @@ impl KeySyncTask {
     }
 
     /// `CryptoState` 說了自己在 server 上還剩幾把一次性金鑰：交給狀態機，它要補（不到 50 把、或 fallback key 用掉了）就上傳。
-    /// 失敗只講一聲：下一個 `CryptoState`（有人再領一把、或下次開線）會再試；領光了還有 fallback key 撐著。
+    /// 上傳失敗交給金鑰線的後台退避重試到 server 回 Ack（/docs/design/keys/e2ee-rpc.md §3.1）；領光了還有 fallback key 撐著。
     async fn top_up_one_time_keys(&self, state: &CryptoStateMeta) {
         if let Err(error) = self
             .engine
@@ -394,9 +418,12 @@ impl KeySyncTask {
             return;
         };
         if let Err(error) = self.engine.send_outgoing_requests(&mut line).await {
-            self.events.progress(format!(
-                "keys: topping up one-time keys failed (retried on the next key-stock update): {error}"
-            ));
+            hand_own_key_upload_to_retry(
+                &self.events,
+                self.key_share.as_ref(),
+                "topping up one-time keys",
+                &error,
+            );
         }
     }
 
@@ -453,6 +480,25 @@ async fn decrypt_what_the_keys_open(
             ));
         }
     }
+}
+
+/// 自己的金鑰上傳失敗（server 沒回 Ack）：交給金鑰線的後台退避重試，並講一聲。
+///
+/// Args:
+///     what: 哪一次上傳, example: "topping up one-time keys"
+fn hand_own_key_upload_to_retry(
+    events: &EventSink,
+    key_share: Option<&KeyShareInbox>,
+    what: &str,
+    error: &wbf_sdk::SdkError,
+) {
+    let handed = key_share.is_some_and(KeyShareInbox::retry_own_key_upload);
+    let then = if handed {
+        "retried in the background until the server acknowledges it"
+    } else {
+        "retried when the keys line is reopened"
+    };
+    events.progress(format!("keys: {what} failed ({then}): {error}"));
 }
 
 /// 一輪（一包、或追平的幾窗）匯完：`keys.state: caught_up`，帶匯了幾則、幾把新房間金鑰。
@@ -964,12 +1010,7 @@ mod tests {
             .await
             .expect("A queries keys");
         let shared = engine_a
-            .share_room_key(
-                &mut ws_a,
-                &room,
-                std::slice::from_ref(&user),
-                wbf_sdk::crypto_engine::room_key_share_settings(),
-            )
+            .distribute_room_key(&mut ws_a, &room, std::slice::from_ref(&user))
             .await
             .expect("A shares the room key");
         assert!(shared >= 1, "A 至少要送給 B 一則 to-device");

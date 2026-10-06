@@ -1,4 +1,4 @@
-//! 每個帳號的資料放哪（/docs/design/rpc-specs/wbf-cli-spec.md §7；/docs/design/storage/local-cache-db.md §4.6、/docs/design/storage/vault-and-keys.md §2）：
+//! 每個帳號的資料放哪（/docs/design/storage/local-storage.md §3、/docs/design/storage/vault-and-keys.md §2）：
 //!
 //! ```text
 //! <data dir>/

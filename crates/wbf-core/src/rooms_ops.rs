@@ -205,7 +205,7 @@ impl Core {
     ) -> Result<String, CoreError> {
         let account = self.account_or_current(target)?;
         if self.is_wbf_account(&account)? {
-            // 明文走 `Event/Send`；加密房先分金鑰再加密（wbf_rooms.rs → room_crypto.rs）。
+            // 明文走 `Event/Send`；加密房等後台分好的房間金鑰就緒、再加密（wbf_rooms.rs → room_crypto.rs）。
             return self.wbf_send_text(&account, room, body, options).await;
         }
         let backend = self

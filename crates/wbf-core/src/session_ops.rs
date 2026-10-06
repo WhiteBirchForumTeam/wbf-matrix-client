@@ -298,6 +298,7 @@ impl Core {
                 // 成了：先收掉跟上游的 task（它握著訂閱線的 handle），再關線——順序反了 task 會看到 Network 才結束，一樣收得掉，但這樣乾淨。
                 self.stop_room_sync_of(account).await;
                 self.stop_key_sync_of(account).await;
+                self.stop_room_key_share_of(account).await;
                 // 說出口的退出（wbfuwunel 的 /docs/design/wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
                 self.unsubscribe_keys_of(account).await;
                 // token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（/docs/design/daemon/link-pool.md §3）。
@@ -317,6 +318,9 @@ impl Core {
         self.close_links(account, "logged out").await;
         // 長活的引擎握著 `m/` 的 sqlite：先丟掉才刪得掉（Windows）。
         self.forget_crypto_engine(account).await;
+        // 再收一次金鑰線的後台：上面收過之後、引擎丟掉之前，進行中的送訊息可能又把它起了起來（它握著引擎，`m/` 就刪不掉）。
+        // 現在 session 與引擎都沒了，之後起不來。
+        self.stop_room_key_share_of(account).await;
         account.delete_matrix_store()?;
         // 維護者 2026-09-09：離開這台機器就清乾淨——本地的房間金鑰備份跟著走（/docs/design/keys/room-key-backup.md §7）。
         // 上面的閘門已經確認過「server 那份救得回來」，或使用者明說接受失去它。
@@ -795,11 +799,19 @@ mod tests {
         core.close_server_cache(&server_dir).unwrap();
 
         let result = core
-            .destroy_account("@alice:localhost", Some("HTTP://LOCALHOST:6167/"), true, false)
+            .destroy_account(
+                "@alice:localhost",
+                Some("HTTP://LOCALHOST:6167/"),
+                true,
+                false,
+            )
             .await
             .expect("destroy 要成功");
 
-        assert_eq!(result.events_removed, 1, "alice 的那則要被忘掉（庫沒被重建成空的）");
+        assert_eq!(
+            result.events_removed, 1,
+            "alice 的那則要被忘掉（庫沒被重建成空的）"
+        );
         let bob_view = core
             .server_cache_of(&bob, SERVER)
             .unwrap()
@@ -825,7 +837,13 @@ mod tests {
         core.close_server_cache(&server_dir).unwrap();
 
         let raw = core.cache_of(&bob, "localhost:6167").unwrap();
-        assert_eq!(raw.history("@alice:localhost", "!r", None, 10).unwrap().len(), 1, "cache_of 不准重建");
+        assert_eq!(
+            raw.history("@alice:localhost", "!r", None, 10)
+                .unwrap()
+                .len(),
+            1,
+            "cache_of 不准重建"
+        );
         drop(raw);
         let alice_view = core
             .server_cache_of(&bob, "LOCALHOST:6167")
@@ -834,7 +852,11 @@ mod tests {
             .await
             .history("@alice:localhost", "!r", None, 10)
             .unwrap();
-        assert_eq!(alice_view.len(), 1, "🚨 唯一寫入者也不准重建：alice 的快取要留著");
+        assert_eq!(
+            alice_view.len(),
+            1,
+            "🚨 唯一寫入者也不准重建：alice 的快取要留著"
+        );
         drop(alice_view);
         core.close_server_cache(&server_dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

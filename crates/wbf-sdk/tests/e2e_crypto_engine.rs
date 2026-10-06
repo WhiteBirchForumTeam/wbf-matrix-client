@@ -15,8 +15,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use matrix_sdk_crypto::EncryptionSettings;
-use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, SendOutcome};
+use wbf_sdk::crypto_engine::{
+    room_key_share_settings, OlmEngine, OutgoingRoomEvent, RoomKeyState, SendOutcome,
+};
 use wbf_sdk::login::{login_with_password, logout, Session};
 use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_FEATURE};
 use wbf_sdk::to_device_state::ToDeviceState;
@@ -163,12 +164,7 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     let room_id = create_encrypted_room(&a.session).await;
     let to_device_requests = a
         .engine
-        .share_room_key(
-            &mut a.ws,
-            &room_id,
-            std::slice::from_ref(&user_id),
-            EncryptionSettings::default(),
-        )
+        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
         .await
         .expect("A shares the room key");
     assert!(to_device_requests >= 1, "{to_device_requests}");
@@ -242,15 +238,64 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     // 6. A 再分一次同一把：每台裝置都有了 → 沒有新的 to-device。
     let again_shared = a
         .engine
-        .share_room_key(
-            &mut a.ws,
-            &room_id,
-            std::slice::from_ref(&user_id),
-            EncryptionSettings::default(),
-        )
+        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
         .await
         .unwrap();
     assert_eq!(again_shared, 0);
+
+    // 6b. 送訊息只用排過的 to-device **全部拿到 Ack** 的金鑰（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：
+    //     另一個加密房，直接叫上游狀態機在本機排好給 B 的金鑰、先不送 → 還有待送，不算就緒、送不出去（🚫 加密、🚫 送）；
+    //     後台那支 `distribute_room_key` 把它送出去、拿到 Ack 之後才 `Ready`，送得出去。
+    let pending_room = create_encrypted_room(&a.session).await;
+    let parsed_room = matrix_sdk::ruma::RoomId::parse(&pending_room).unwrap();
+    let parsed_user = matrix_sdk::ruma::UserId::parse(&user_id).unwrap();
+    let queued = a
+        .engine
+        .machine()
+        .share_room_key(
+            &parsed_room,
+            std::iter::once(parsed_user.as_ref()),
+            room_key_share_settings(),
+        )
+        .await
+        .unwrap();
+    assert!(!queued.is_empty(), "a to-device for B is queued, not sent");
+    assert!(
+        matches!(
+            a.engine.room_key_state(&pending_room).await.unwrap(),
+            RoomKeyState::NotReady { ref reason } if reason.contains("not acknowledged")
+        ),
+        "a key with to-device still waiting for an Ack is not ready"
+    );
+    let refused = a
+        .engine
+        .encrypt_and_send(
+            &mut a.ws,
+            &pending_room,
+            0,
+            &OutgoingRoomEvent {
+                event_type: "m.room.message".into(),
+                content: serde_json::json!({ "msgtype": "m.text", "body": "too early" }),
+                txn_id: format!("pending-{}", std::process::id()),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(refused, SendOutcome::RoomKeyNotReady { .. }),
+        "{refused:?}"
+    );
+    let delivered = a
+        .engine
+        .distribute_room_key(&mut a.ws, &pending_room, std::slice::from_ref(&user_id))
+        .await
+        .unwrap();
+    assert!(delivered >= 1, "{delivered}");
+    assert!(matches!(
+        a.engine.room_key_state(&pending_room).await.unwrap(),
+        RoomKeyState::Ready { .. }
+    ));
 
     // 7. 下線：說出口的退出（不叫的話這條連線退了卻還佔著裝置）。
     b.ws.device_unsubscribe().await.expect("B unsubscribes");
@@ -315,12 +360,7 @@ async fn a_live_subscription_receives_the_push_for_a_room_key_shared_while_it_is
     let room_id = create_encrypted_room(&a.session).await;
     let shared = a
         .engine
-        .share_room_key(
-            &mut a.ws,
-            &room_id,
-            std::slice::from_ref(&user_id),
-            EncryptionSettings::default(),
-        )
+        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
         .await
         .expect("A shares the room key");
     assert!(shared >= 1);
@@ -557,7 +597,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
     .await;
     assert_eq!(joined["room_id"], room_id, "{joined}");
 
-    // 2. Alice 點進房間：refresh（第一次，每個人都查）→ 房間金鑰發給 Alice 與 Bob B1。
+    // 2. Alice 點進房間：refresh（第一次，每個人都查），🚫 碰房間金鑰（建、換、送都是後台的事，/docs/design/keys/e2ee-rpc.md §3.1）。
     let first = alice
         .engine
         .refresh_room_devices(&mut alice.ws, &room_id, None)
@@ -565,17 +605,26 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         .expect("alice refresh #1");
     assert_eq!(first.versions.members.len(), 2, "{first:?}");
     assert!(first.versions.members.contains_key(&bob1.session.user_id));
-    assert!(first.shared_to_device_requests >= 1, "{first:?}");
     assert!(first.rechecked.is_empty(), "雜湊第一次就對上：{first:?}");
 
-    // 3. Alice 帶這份快照的號碼送：接受。Bob B1 拉 to-device 拿到房間金鑰、Recent 拉密文、解開。
+    // 3. 「後台」先把房間金鑰建好、送到 B1（這裡直接叫 `distribute_room_key`），送訊息只用分好的那把（維護者 2026-10-06）；
+    //    Alice 帶這份快照的號碼送：接受。Bob B1 拉 to-device 拿到房間金鑰、Recent 拉密文、解開。
+    let distributed = alice
+        .engine
+        .distribute_room_key(
+            &mut alice.ws,
+            &first.room_id,
+            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the background prepares the room key before the message");
+    assert!(distributed >= 1, "B1 must get the room key");
     let sent = alice
         .engine
         .encrypt_and_send(
             &mut alice.ws,
             &first.room_id,
             first.versions.room_version,
-            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi bob" }),
@@ -636,7 +685,6 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
             &mut alice.ws,
             &first.room_id,
             first.versions.room_version,
-            &first.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),
@@ -658,7 +706,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
     // server 原本的定義是只增不減的位置，外部審查 #5 之後可能改成成員集合的雜湊（wbfuwunel `docs/room-version-prev` 分支）——兩種定義下「變了」都成立。
     assert_ne!(current_room_version, first.versions.room_version);
 
-    // 6. 修：refresh（跟上一份比 → 只有 Bob 變了 → 只重查 Bob → 房間金鑰補給 B2）。
+    // 6. 修：refresh（跟上一份比 → 只有 Bob 變了 → 只重查 Bob）。房間金鑰補給 B2 是後台的事（重送之前）。
     let second = alice
         .engine
         .refresh_room_devices(&mut alice.ws, &room_id, Some(&first.versions))
@@ -679,10 +727,6 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         second.versions.members[&bob1.session.user_id].seq
             > first.versions.members[&bob1.session.user_id].seq
     );
-    assert!(
-        second.shared_to_device_requests >= 1,
-        "B2 must get the room key: {second:?}"
-    );
     let known = alice
         .engine
         .known_devices_of(&bob1.session.user_id)
@@ -690,14 +734,23 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         .unwrap();
     assert!(known.contains(&bob2.session.device_id), "{known:?}");
 
-    // 7. 帶新號碼重送（同一個 txn_id）：接受。
+    // 7. 「後台」先把房間金鑰送到 B2，再帶新號碼重送（同一個 txn_id）：接受。
+    let distributed = alice
+        .engine
+        .distribute_room_key(
+            &mut alice.ws,
+            &second.room_id,
+            &second.versions.members.keys().cloned().collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the background prepares the room key for B2 before the resend");
+    assert!(distributed >= 1, "B2 must get the room key");
     let resent = alice
         .engine
         .encrypt_and_send(
             &mut alice.ws,
             &second.room_id,
             second.versions.room_version,
-            &second.versions.members.keys().cloned().collect::<Vec<_>>(),
             &OutgoingRoomEvent {
                 event_type: "m.room.message".into(),
                 content: serde_json::json!({ "msgtype": "m.text", "body": "hi again" }),

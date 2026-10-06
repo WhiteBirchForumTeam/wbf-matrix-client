@@ -58,6 +58,7 @@
 
 | 文件 | 講什麼 |
 |---|---|
+| [`/docs/design/storage/local-storage.md`](storage/local-storage.md) | **資料目錄裡每一個檔**：目錄樹、每檔的內容與格式、誰的格式、哪把鑰、怎麼寫、誰刪、哪些明文落地 |
 | [`/docs/design/storage/local-cache-db.md`](storage/local-cache-db.md) | `cache.db`：定位是快取、存什麼、SQLCipher、與 matrix-sdk store 的關係、schema |
 | [`/docs/design/storage/vault-and-keys.md`](storage/vault-and-keys.md) | 本地的金鑰：主金鑰與子金鑰、路徑兩層加密、passphrase |
 

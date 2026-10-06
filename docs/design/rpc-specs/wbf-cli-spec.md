@@ -347,7 +347,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 2 | server 回 `Error` pack 或 HTTP 非 2xx；stderr 印 `code`、wbf 的 `code_id`（有的話）與 `message`，例：`server OutOfOrder (1503): expected chunk 1` |
 | 3 | **完整性失敗**：CRC、AEAD 標籤、長度、sha256、事件與 `Info` 對不上。半成品已刪 |
 | 4 | 網路：連不上、斷線且續傳次數用完 |
-| 5 | 等逾時：`watch once --timeout` 到了還沒有事件 |
+| 5 | 等逾時：`watch once --timeout` 到了還沒有事件；加密房的房間金鑰在等待時間內沒準備好（core 的 `RoomKeyNotReady`，RPC 1402），訊息沒送、重送就好 |
 
 ⚠️ **SDK 認 wbf 的錯誤碼只看 `code_id`，🚫 不看 `code` 名字**（wbfuwunel 的 `/docs/design/wbf-wire-format.md` §3.4；issue #29 第 2 項）。
 `code` 那個字串同時裝著 Matrix 的 `errcode`（`M_FORBIDDEN`）與我們自己合成的（HTTP 401 的 `Unauthorized`），
@@ -399,27 +399,10 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 
 > 用字（維護者 2026-09-07 定）：**passphrase** 是解 `local.key` 的那句話，只存在這台機器；**password** 一律指 Matrix 帳號密碼，只有 `login` 用一次。旗標、命令、錯誤訊息、文件都照這個分。
 
-| 平台 | 位置 |
-|---|---|
-| Windows | `%APPDATA%\wbf-cli\` |
-| Linux | `$XDG_DATA_HOME/wbf-cli/`（沒設就 `~/.local/share/wbf-cli/`） |
-| macOS | `~/Library/Application Support/wbf-cli/` |
+預設位置（`--data-dir` → `WBF_DATA_DIR` → 平台預設）在 `/docs/design/storage/local-storage.md` §1。
 
-```
-<data dir>/
-  local.key                      32 byte 主金鑰，一台機器一把（/docs/design/storage/vault-and-keys.md §1）；所有帳號共用
-  wbf.conf                       設定檔（§10）；指定了 --data-dir 而這裡還沒有時自動生成一份
-  r/<b58>_<b58>                  recovery key（/docs/design/keys/room-key-backup.md §8）；🚫 logout 不碰它
-  current                        目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"；沒有這個檔 = 沒登入過。🚫 兩層都不寫明文（寫了等於把剛加密的名字再漏一次）
-  s/<b58>_<b58>/                 **server host 加密後的名字**（/docs/design/storage/vault-and-keys.md §2.2）：外面看不出這台機器連過哪家
-    cache.db                     這個 server 上所有帳號共用的快取（§3.5；/docs/design/storage/local-cache-db.md §5）
-    a/
-      <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（/docs/design/storage/vault-and-keys.md §2.2），第六把子金鑰
-        session.sealed           { "server", "user_id", "device_id", "access_token", "store_dir"?, "backend"? } 用第三把子金鑰封住（backend：/docs/design/daemon/account-session.md §2）
-        m/                       matrix-sdk 的 crypto 與 state store，綁 device；StoreCipher 用第二把子金鑰包住；logout 刪
-        k/snapshot               本地房間金鑰備份（/docs/design/keys/room-key-backup.md §4），全量快照一個檔；第五把子金鑰；`account del`／`destroy` 連它一起刪（/docs/design/keys/room-key-backup.md §7 的閘門）
-    media/                       媒體儲存池（/docs/design/media/media-pool.md）：<hash 前 2 hex>/<hash> 是完整檔、pending/m<id> 是下載中；第四把子金鑰
-```
+資料目錄裡每個檔（`local.key`、`current`、`wbf.conf`、`r/`、`s/<server>/cache.db`、`media/`、`a/<帳號>/session.sealed`、`m/`、`k/`）的
+內容、格式、加密、誰寫誰刪：**`/docs/design/storage/local-storage.md`**（目錄樹在 §3，只畫在那裡）。
 
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2）：`<base58 nonce>_<base58 密文>`，底線分隔（Base58 字母表沒有 `_`）。
   ⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母：兩段加密名字就吃掉 106 字元，

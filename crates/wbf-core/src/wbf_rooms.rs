@@ -1,7 +1,7 @@
 //! wbf 帳號的房間（/docs/design/daemon/account-session.md §6）：沒有 matrix-sdk 的 Client，房間列表走橋的 `JoinedRooms`（只有 id）、單一房間走 `GetState` ＋ `m.direct`（UI 點到哪間問哪間，維護者 2026-10-05），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
 //!
-//! 加密房的訊息走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
+//! 加密房的訊息走 `room_crypto.rs`（只用後台已經分好的房間金鑰：等它就緒、加密、帶 UI 給的房間版本號；送的路上🚫 建、換、分金鑰）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
 //! 路徑版的 `send_file` 還拒加密房（/docs/design/keys/e2ee-rpc.md §8）。
 //! 「加不加密」：送**文字**只看本地記的（`rooms.encrypted`，拿房間時寫、收到加密的證據時往上升；不知道就報錯，維護者 2026-10-05）；
 //! 送**附件**問這一刻的狀態（/docs/design/rpc-specs/data-plane.md §4.1：過期的「沒加密」會把檔案金鑰公開在事件裡）。
@@ -70,7 +70,7 @@ impl Core {
         Ok(conversation_from_state(room, &me, &state, &peers)?)
     }
 
-    /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
+    /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房等後台分好的房間金鑰就緒、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上🚫 建、換、分金鑰）。
     /// 加不加密只看本地記的（[`Core::find_local_room_encryption`]），🚫 為了送一則字再問 server。
     ///
     /// Args:
@@ -79,6 +79,7 @@ impl Core {
     ///     Ok(String)                 event_id
     ///     Err(Usage)                 本地不知道這間房加不加密（UI 先拿房間）；或加密房但沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
+    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`（room_crypto.rs）
     pub(crate) async fn wbf_send_text(
         &self,
         account: &AccountDir,
@@ -115,7 +116,7 @@ impl Core {
             })
     }
 
-    /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
+    /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房等後台分好的房間金鑰就緒、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上🚫 建、換、分金鑰）。
     /// 附件在**同一個請求**裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2），加密房也一樣。
     ///
     /// Args:
@@ -127,6 +128,7 @@ impl Core {
     ///     Ok(String)                 event_id
     ///     Err(Usage)                 加密房但沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
+    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`（room_crypto.rs）
     ///     Err(Server)                `Conflict`：某個附件 mxc 不是本站的、找不到、不是自己傳的、或有墓碑
     pub(crate) async fn wbf_send_message(
         &self,

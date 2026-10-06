@@ -64,6 +64,7 @@ pub mod event;
 mod handles;
 /// 「現在跑的是哪一個工作」——事件的歸屬（/docs/design/rpc-specs/rpc-spec.md §4）。
 pub mod job;
+mod key_share;
 mod key_sync;
 mod link_keeper;
 /// 連線池（/docs/design/daemon/link-pool.md）：一個帳號五條線。
@@ -109,7 +110,7 @@ pub use media_ops::{
 };
 pub use media_stream::{MediaSource, MediaStream};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
-pub use room_crypto::{RoomDevices, RoomDevicesRefresh, SendOptions};
+pub use room_crypto::{RoomDevices, SendOptions};
 pub use rooms_ops::{
     cipher_for_plaintext_room, FileEntry, FilePage, HistoryQuery, MessagePage, SyncMode,
 };
@@ -213,6 +214,10 @@ pub struct Core {
     /// 正在收金鑰的帳號（`key_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Device/Push` 匯進 crypto store。收法跟 `room_syncs` 一樣。
     pub(crate) key_syncs:
         std::sync::Mutex<std::collections::HashMap<PathBuf, key_sync::KeySyncHandle>>,
+    /// 金鑰線的後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1）：一個帳號一個 task，建、換、送房間金鑰、記哪個房對哪個房間版本號就緒；
+    /// `Keys` 線開好或第一次要用時起，登出收。
+    pub(crate) key_shares:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, key_share::KeyShareHandle>>,
     /// wbf 帳號長活的 crypto 引擎（`m/` 的 OlmMachine）：第一次要用才開，之後共用；登出拿掉（store 跟著刪）。key 是帳號目錄。
     /// ⚠️ tokio 的 Mutex：開 store 是 async，鎖要持的跨過那一段，兩個同時進來的才不會各開一次同一個 `m/`（PR #60 審查 cirno 🟢）。
     pub(crate) crypto_engines: tokio::sync::Mutex<
@@ -249,6 +254,7 @@ impl Core {
             logging_out: std::sync::Mutex::new(std::collections::HashSet::new()),
             room_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
             key_syncs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            key_shares: std::sync::Mutex::new(std::collections::HashMap::new()),
             crypto_engines: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             downloaders: std::sync::Mutex::new(std::collections::HashMap::new()),
             media_claims: std::sync::Arc::default(),
