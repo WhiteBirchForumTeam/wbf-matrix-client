@@ -37,6 +37,8 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 const RETRY_FIRST: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const RETRY_MAX: Duration = Duration::from_millis(800);
+/// 收 task 時等它結束最久多久（abort 之後通常下一次 poll 就放手）。
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `m/ks.sealed` 解開之後的樣子（我們自己的格式，/docs/design/storage/local-storage.md）。
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,13 +185,29 @@ impl Core {
         Ok(inbox)
     }
 
-    /// 收掉這個帳號的送金鑰 task（登出用）。還沒送的仍在 crypto store 與 `m/ks.sealed`，但登出會刪整個 `m/`。
-    pub(crate) fn stop_room_key_share_of(&self, account: &AccountDir) {
-        let _ = self
+    /// 收掉這個帳號的送金鑰 task（登出用），**等它真的結束**才回：task 握著引擎（`m/` 的 sqlite），
+    /// 只 abort 不等的話它要等下一次被 poll 才放手，而登出接著就要刪 `m/`（Windows 上開著刪不掉；單執行緒的 runtime 上刪檔的重試還會擋住它被 poll）。
+    /// 還沒送的仍在 crypto store 與 `m/ks.sealed`，但登出會刪整個 `m/`。
+    pub(crate) async fn stop_room_key_share_of(&self, account: &AccountDir) {
+        let handle = self
             .key_shares
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&account.dir);
+        let Some(mut handle) = handle else {
+            return;
+        };
+        handle.task.abort();
+        if tokio::time::timeout(STOP_TIMEOUT, &mut handle.task)
+            .await
+            .is_err()
+        {
+            self.events.progress(format!(
+                "room keys: the background key sender for {} did not stop within {}s",
+                account.label(),
+                STOP_TIMEOUT.as_secs()
+            ));
+        }
     }
 
     /// Return:
@@ -557,7 +575,7 @@ mod tests {
             "the room id is not on disk in plain text"
         );
 
-        core.stop_room_key_share_of(&account);
+        core.stop_room_key_share_of(&account).await;
         assert!(
             queue_path.exists(),
             "stopping the background keeps the file"
