@@ -147,21 +147,7 @@ impl Core {
             .synced_backend_of(&account, target.server_backup)
             .await?;
         let encrypted = backend.is_room_encrypted(room).await?;
-        let fits_the_room = match manifest.kind {
-            MediaKind::MatrixEncrypted => encrypted,
-            MediaKind::MatrixPlain => !encrypted,
-            MediaKind::WbfChunked => false,
-        };
-        if !fits_the_room {
-            let why = match encrypted {
-                true => "is encrypted but this upload is not",
-                false => "is not encrypted, so the file key in the event would be public",
-            };
-            return Err(CoreError::new(
-                CoreErrorKind::Usage,
-                format!("{room} {why}: create the upload again for this room"),
-            ));
-        }
+        refuse_kind_not_matching_room(room, encrypted, manifest.kind)?;
         let content = matrix_file_message_content(manifest, caption)?;
         Ok(backend.send_message_content(room, content).await?)
     }
@@ -180,6 +166,39 @@ impl Core {
     }
 }
 
+/// 送出前問這一刻的房間：傳統上傳的格式跟房間對得上嗎（建檔到送出之間房間可能變了）。
+///
+/// Args:
+///     room: 只拿來寫錯誤訊息, example: "!r:matrix.org"
+///     encrypted: 這一刻房間加密了嗎
+///     kind: manifest 說的格式, example: MediaKind::MatrixEncrypted
+/// Return:
+///     Ok(())       加密房配 `kind` 2、明文房配 `kind` 3
+///     Err(Usage)   其他（🚫 送：明文房的事件帶金鑰等於公開它、加密房會送一個 server 讀得到的檔；`kind` 1 不走這條路）
+fn refuse_kind_not_matching_room(
+    room: &str,
+    encrypted: bool,
+    kind: MediaKind,
+) -> Result<(), CoreError> {
+    let fits_the_room = match kind {
+        MediaKind::MatrixEncrypted => encrypted,
+        MediaKind::MatrixPlain => !encrypted,
+        MediaKind::WbfChunked => false,
+    };
+    if fits_the_room {
+        return Ok(());
+    }
+    let why = match (encrypted, kind) {
+        (_, MediaKind::WbfChunked) => "takes no wbf chunked manifest on this path",
+        (true, _) => "is encrypted but this upload is not",
+        (false, _) => "is not encrypted, so the file key in the event would be public",
+    };
+    Err(CoreError::new(
+        CoreErrorKind::Usage,
+        format!("{room} {why}: create the upload again for this room"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -194,6 +213,30 @@ mod tests {
     use crate::error::CoreErrorKind;
     use crate::test_support::*;
     use crate::{CreatedUpload, Target};
+
+    /// 加密房只收 `kind` 2、明文房只收 `kind` 3；`kind` 1 哪裡都不收（fail closed）。
+    #[test]
+    fn a_traditional_upload_is_sent_only_into_a_room_of_its_kind() {
+        use super::refuse_kind_not_matching_room;
+        for (encrypted, kind, fits) in [
+            (true, MediaKind::MatrixEncrypted, true),
+            (false, MediaKind::MatrixPlain, true),
+            (true, MediaKind::MatrixPlain, false),
+            (false, MediaKind::MatrixEncrypted, false),
+            (true, MediaKind::WbfChunked, false),
+            (false, MediaKind::WbfChunked, false),
+        ] {
+            let result = refuse_kind_not_matching_room("!r:localhost", encrypted, kind);
+            match fits {
+                true => assert!(result.is_ok(), "{encrypted} {kind:?}"),
+                false => assert_eq!(
+                    result.map_err(|error| error.kind),
+                    Err(CoreErrorKind::Usage),
+                    "{encrypted} {kind:?}"
+                ),
+            }
+        }
+    }
 
     /// 假 server 收到的（路徑、body），照順序。
     type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
