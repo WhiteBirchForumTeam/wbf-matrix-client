@@ -484,7 +484,12 @@ async fn compare_sending_over_wbf_and_over_the_matrix_sdk_client() {
     let started = Instant::now();
     let shared = alice
         .engine
-        .distribute_room_key(&mut alice.ws, &wbf_room, &members)
+        .distribute_room_key(
+            &mut alice.ws,
+            &wbf_room,
+            &members,
+            wbf_sdk::crypto_engine::RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .expect("distribute");
     let distribute_time = started.elapsed();
@@ -554,7 +559,12 @@ async fn compare_sending_over_wbf_and_over_the_matrix_sdk_client() {
             alice.engine.discard_room_key(&wbf_room).await.unwrap();
             alice
                 .engine
-                .distribute_room_key(&mut alice.ws, &wbf_room, &members)
+                .distribute_room_key(
+                    &mut alice.ws,
+                    &wbf_room,
+                    &members,
+                    wbf_sdk::crypto_engine::RoomKeyRotation::of_encryption_content(None),
+                )
                 .await
                 .expect("rotate");
             rotate_durations.push(started.elapsed());

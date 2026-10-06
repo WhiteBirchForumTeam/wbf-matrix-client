@@ -238,6 +238,13 @@ impl Core {
                 target.server_backup,
             )
             .await?;
+        // 讀本地的那兩種：之前沒解開的再試一次（`sync: server` 不寫庫，那條拿到的就是剛解的）。
+        let events = match query.sync {
+            SyncMode::Server => events,
+            SyncMode::Local | SyncMode::Both => {
+                self.retry_undecrypted_in_page(&account, room, events).await
+            }
+        };
         // 過濾在這一層（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1）：server 不知道我們的 kind 名字。
         let events = events
             .into_iter()

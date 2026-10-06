@@ -17,6 +17,7 @@ use wbf_sdk::{Cipher, Transport};
 use wbf_sdk::{FileCipher, UploadState};
 
 use crate::accounts::AccountDir;
+use crate::attachment_ops::refuse_block_not_matching_room;
 use crate::backend_choice::MethodHome;
 use crate::error::{CoreError, CoreErrorKind};
 use crate::link_pool::LinkRole;
@@ -73,36 +74,88 @@ impl Core {
     ///
     /// 🚫 **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（/docs/design/overview/architecture-v2.md §3）。前端要先問
     /// [`Core::conversation`]，再用 [`crate::cipher_for_plaintext_room`] 決定 `cipher`。
+    ///
+    /// Args:
+    ///     options: wbf 帳號的加密房要 `room_devices`（`room.refresh_devices` 回的那份）；`txn_id` 重送用。一般 Matrix 帳號不看它
+    /// Return:
+    ///     Ok(SendFileResult)
+    ///     Err(Usage)                 `cipher` 跟這一刻的房間對不上（明文房要 `none`、加密房不能 `none`）、加密房沒帶 `room_devices`——都在上傳**之前**
+    ///     Err(RoomDevicesChanged)    加密房被 1506 擋：檔案已經在 server 上，`data` 多帶 `manifest`；用 `data` 的新狀態與同一個 `txn_id` 改走 `room.send_attachment` 帶它重送
+    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好（同上，`data.manifest`，檔案🚫 必重傳）
     pub async fn send_file(
         &self,
         room: &str,
         request: &UploadRequest,
         caption: Option<&str>,
+        options: &crate::room_crypto::SendOptions,
         transport: Transport,
         target: &Target,
     ) -> Result<SendFileResult, CoreError> {
         let account = self.account_or_current(target)?;
         if self.is_wbf_account(&account)? {
-            // wbf 帳號：事件走 `Event/Send`，附件在 meta 裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2 終於成立）。加密房在**上傳之前**就拒，不白傳。
-            self.wbf_refuse_if_encrypted(&account, room).await?;
+            // wbf 帳號：事件走 `Event/Send`，附件在同一個請求裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）；加密房跟資料平面那條一樣先 Megolm。
+            // 這一刻房間加不加密問 server（送檔要核對區塊，同 `send_attachment`）；對不上、加密房沒帶 `room_devices`，都在**上傳之前**拒，不白傳。
+            let encrypted = self.wbf_is_room_encrypted(&account, room).await?;
+            refuse_block_not_matching_room(
+                room,
+                encrypted,
+                parse_cipher(request.cipher.as_deref())?,
+            )?;
+            if encrypted && options.room_devices.is_none() {
+                return Err(CoreError::new(
+                    CoreErrorKind::Usage,
+                    format!(
+                        "{room} is encrypted: pass room_devices (what room.refresh_devices returned for this room) before the file is uploaded"
+                    ),
+                ));
+            }
             let manifest = self
                 .upload_with_account(&account, request, transport)
                 .await?;
+            // 續傳時用的是狀態檔裡那份加密，不是這次的 `cipher`：拿真的區塊再對一次（消費端自己再問）。
+            refuse_block_not_matching_room(room, encrypted, manifest.block.cipher)?;
             let attachment = Attachment {
                 mxc: manifest.mxc.clone(),
                 block: manifest.block.clone(),
             };
             let content = wbf_sdk::event_json::file_message_content(&attachment, caption)?;
-            let event_id = self
-                .wbf_send_event(
+            let sent = self
+                .wbf_send_message(
                     &account,
                     room,
-                    "m.room.message",
+                    encrypted,
                     content,
                     vec![manifest.mxc.clone()],
-                    wbf_sdk::protocol::new_txn_id()?,
+                    options,
                 )
-                .await?;
+                .await;
+            let event_id = match sent {
+                Ok(event_id) => event_id,
+                // 加密房被擋（1401）、金鑰沒準備好（1402）：檔案已經在 server 上。manifest 跟錯誤一起回（`data.manifest`，含金鑰，
+                // 跟成功時的回應一樣敏感），UI 改走 `room.send_attachment` 重送、🚫 重傳檔案。
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        CoreErrorKind::RoomDevicesChanged | CoreErrorKind::RoomKeyNotReady
+                    ) =>
+                {
+                    let mut data = error.data.clone().unwrap_or_else(|| serde_json::json!({}));
+                    let manifest_json = serde_json::to_value(&manifest).map_err(|serde_error| {
+                        CoreError::new(
+                            CoreErrorKind::Io,
+                            format!(
+                                "{}: the manifest cannot be serialised: {serde_error}",
+                                manifest.mxc
+                            ),
+                        )
+                    })?;
+                    if let Some(fields) = data.as_object_mut() {
+                        fields.insert("manifest".into(), manifest_json);
+                    }
+                    return Err(error.with_data(data));
+                }
+                Err(error) => return Err(error),
+            };
             return Ok(SendFileResult {
                 event_id,
                 mxc: manifest.mxc.clone(),
@@ -272,6 +325,148 @@ fn remove_if_exists(path: &Path) -> Result<(), CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 路徑版送檔進加密房（原本是 /docs/design/keys/e2ee-rpc.md §8 的缺口）：沒帶 `room_devices`、加密房要 `none`、明文房要加密——
+    /// 都在**上傳之前**拒（Upload 那台一塊都沒收到）；帶了就加密送出（`m.room.encrypted`），附件跟密文同一個請求宣告。
+    #[tokio::test]
+    async fn the_path_version_sends_a_file_into_an_encrypted_room_and_refuses_before_uploading() {
+        use crate::room_crypto::SendOptions;
+        use crate::test_support::*;
+        let dir = scratch("send-file-encrypted");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (misc, upload) = misc_and_upload(&core, &account, true).await;
+        let keys = keys_line_with_room(&core, &account, 7).await;
+        let target = Target::default();
+        let file = dir.join("a.bin");
+        std::fs::write(&file, (0..40u8).collect::<Vec<_>>()).unwrap();
+        let request = |cipher: Option<&str>| UploadRequest {
+            file: file.clone(),
+            cipher: cipher.map(str::to_string),
+            chunk_size: None,
+            name: None,
+            mimetype: None,
+            sha256: true,
+        };
+        let refused = core
+            .send_file(
+                ROOM,
+                &request(None),
+                None,
+                &SendOptions::default(),
+                Transport::WebSocket,
+                &target,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.kind == CoreErrorKind::Usage && refused.message.contains("room_devices"),
+            "{refused:?}"
+        );
+        let devices = core
+            .refresh_room_devices(ROOM, None, &target)
+            .await
+            .unwrap();
+        let options = SendOptions {
+            room_devices: Some(devices),
+            txn_id: Some("f1".into()),
+        };
+        let refused = core
+            .send_file(
+                ROOM,
+                &request(Some("none")),
+                None,
+                &options,
+                Transport::WebSocket,
+                &target,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, CoreErrorKind::Usage, "{refused:?}");
+        assert!(
+            upload.uploads.lock().unwrap().is_empty(),
+            "refused before anything was uploaded"
+        );
+
+        let sent = core
+            .send_file(
+                ROOM,
+                &request(None),
+                Some("看這個"),
+                &options,
+                Transport::WebSocket,
+                &target,
+            )
+            .await
+            .unwrap();
+        assert!(sent.attachment_declared);
+        assert_eq!(
+            misc.sent_events.lock().unwrap()[0].1,
+            "m.room.encrypted",
+            "🚫 加密房不送明文事件"
+        );
+        assert_eq!(
+            *misc.sent_attachments.lock().unwrap(),
+            vec![vec![sent.mxc.clone()]],
+            "附件跟密文同一個請求宣告"
+        );
+
+        // 傳完才被擋（房間版本號變了，1401）：檔案已經在 server 上，manifest 跟錯誤一起回，改走 `send_attachment` 重送、🚫 重傳。
+        *misc.current_room_version.lock().unwrap() = Some(8);
+        *keys.members.lock().unwrap() = Some(members_body(8));
+        let blocked = core
+            .send_file(
+                ROOM,
+                &request(None),
+                None,
+                &options,
+                Transport::WebSocket,
+                &target,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            blocked.kind,
+            CoreErrorKind::RoomDevicesChanged,
+            "{blocked:?}"
+        );
+        let data = blocked.data.clone().unwrap();
+        let manifest: Manifest = serde_json::from_value(data["manifest"].clone()).unwrap();
+        let again = SendOptions {
+            room_devices: Some(serde_json::from_value(data.clone()).unwrap()),
+            txn_id: data["txn_id"].as_str().map(str::to_string),
+        };
+        let uploads_now = upload.uploads.lock().unwrap().len();
+        core.send_attachment(ROOM, &manifest, None, &again, &target)
+            .await
+            .unwrap();
+        assert_eq!(
+            upload.uploads.lock().unwrap().len(),
+            uploads_now,
+            "the file was not uploaded again"
+        );
+
+        misc.room_is_encrypted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let uploads_before = upload.uploads.lock().unwrap().len();
+        let refused = core
+            .send_file(
+                ROOM,
+                &request(Some("aes-256-gcm")),
+                None,
+                &SendOptions::default(),
+                Transport::WebSocket,
+                &target,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.kind,
+            CoreErrorKind::Usage,
+            "a key in a plain room would be public: {refused:?}"
+        );
+        assert_eq!(upload.uploads.lock().unwrap().len(), uploads_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_resume_state_sits_next_to_the_file_it_is_for() {

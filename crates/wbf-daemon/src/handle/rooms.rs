@@ -173,6 +173,11 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         mimetype: Option<String>,
         #[serde(default)]
         sha256: bool,
+        /// 加密房要（wbf 帳號）：同 `room.send_text`
+        #[serde(default)]
+        room_devices: Option<RoomDevices>,
+        #[serde(default)]
+        txn_id: Option<String>,
         #[serde(flatten)]
         transport: TransportParam,
         #[serde(flatten)]
@@ -204,11 +209,16 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         mimetype: params.mimetype,
         sha256: params.sha256,
     };
+    let options = SendOptions {
+        room_devices: params.room_devices,
+        txn_id: params.txn_id,
+    };
     let result = core
         .send_file(
             &params.room,
             &request,
             params.caption.as_deref(),
+            &options,
             transport,
             &target,
         )

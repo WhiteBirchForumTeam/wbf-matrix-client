@@ -520,7 +520,7 @@ fn cipher_for_room(encrypted: bool, requested: Option<&str>) -> Result<Cipher, C
 /// Return:
 ///     Ok(())       加密房配加密的區塊、明文房配 `none`
 ///     Err(Usage)   其他（🚫 不送：明文房會公開金鑰，加密房會送一個 server 讀得到的檔）
-fn refuse_block_not_matching_room(
+pub(crate) fn refuse_block_not_matching_room(
     room: &str,
     encrypted: bool,
     cipher: Cipher,
@@ -583,40 +583,10 @@ async fn read_chunk<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::test_support::*;
-
-    /// 兩條記憶體對接的線放進池裡：`Misc`（房間狀態、送事件）與 `Upload`（上傳）。各是一台假 server，狀態不共用——
-    /// 送事件那台不驗 mxc，所以附件宣告只看它帶了什麼。
-    async fn misc_and_upload(
-        core: &Core,
-        account: &AccountDir,
-        encrypted: bool,
-    ) -> (FakeServer, FakeServer) {
-        let (misc_client, misc) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
-        let (upload_client, upload) =
-            memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
-        let pool = core.pool_of_account(account).unwrap();
-        drop(
-            pool.acquire(LinkRole::Misc, || async move { Ok(misc_client) })
-                .await
-                .unwrap(),
-        );
-        drop(
-            pool.acquire(LinkRole::Upload, || async move { Ok(upload_client) })
-                .await
-                .unwrap(),
-        );
-        misc.room_is_encrypted
-            .store(encrypted, std::sync::atomic::Ordering::SeqCst);
-        *misc.members.lock().unwrap() = Some(members_body(7));
-        *misc.current_room_version.lock().unwrap() = Some(7);
-        (misc, upload)
-    }
 
     fn body(len: usize) -> Vec<u8> {
         (0..len).map(|position| (position % 251) as u8).collect()

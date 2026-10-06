@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use wbf_sdk::crypto_engine::{
-    room_key_share_settings, OlmEngine, OutgoingRoomEvent, RoomKeyState, SendOutcome,
+    room_key_share_settings, OlmEngine, OutgoingRoomEvent, RoomKeyRotation, RoomKeyState,
+    SendOutcome,
 };
 use wbf_sdk::login::{login_with_password, logout, Session};
 use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_FEATURE};
@@ -164,7 +165,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     let room_id = create_encrypted_room(&a.session).await;
     let to_device_requests = a
         .engine
-        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .expect("A shares the room key");
     assert!(to_device_requests >= 1, "{to_device_requests}");
@@ -238,7 +244,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     // 6. A 再分一次同一把：每台裝置都有了 → 沒有新的 to-device。
     let again_shared = a
         .engine
-        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .unwrap();
     assert_eq!(again_shared, 0);
@@ -255,7 +266,7 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .share_room_key(
             &parsed_room,
             std::iter::once(parsed_user.as_ref()),
-            room_key_share_settings(),
+            room_key_share_settings(RoomKeyRotation::of_encryption_content(None)),
         )
         .await
         .unwrap();
@@ -288,7 +299,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     );
     let delivered = a
         .engine
-        .distribute_room_key(&mut a.ws, &pending_room, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &pending_room,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .unwrap();
     assert!(delivered >= 1, "{delivered}");
@@ -360,7 +376,12 @@ async fn a_live_subscription_receives_the_push_for_a_room_key_shared_while_it_is
     let room_id = create_encrypted_room(&a.session).await;
     let shared = a
         .engine
-        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .expect("A shares the room key");
     assert!(shared >= 1);
@@ -615,6 +636,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
             &mut alice.ws,
             &first.room_id,
             &first.versions.members.keys().cloned().collect::<Vec<_>>(),
+            RoomKeyRotation::of_encryption_content(None),
         )
         .await
         .expect("the background prepares the room key before the message");
@@ -741,6 +763,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
             &mut alice.ws,
             &second.room_id,
             &second.versions.members.keys().cloned().collect::<Vec<_>>(),
+            RoomKeyRotation::of_encryption_content(None),
         )
         .await
         .expect("the background prepares the room key for B2 before the resend");

@@ -1010,7 +1010,12 @@ mod tests {
             .await
             .expect("A queries keys");
         let shared = engine_a
-            .distribute_room_key(&mut ws_a, &room, std::slice::from_ref(&user))
+            .distribute_room_key(
+                &mut ws_a,
+                &room,
+                std::slice::from_ref(&user),
+                wbf_sdk::crypto_engine::RoomKeyRotation::of_encryption_content(None),
+            )
             .await
             .expect("A shares the room key");
         assert!(shared >= 1, "A 至少要送給 B 一則 to-device");

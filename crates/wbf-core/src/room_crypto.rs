@@ -17,6 +17,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use wbf_sdk::cache::UndecryptedFilter;
+use wbf_sdk::chat::{Message, MessageKind};
 use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, SendOutcome};
 use wbf_sdk::device_version::{DeviceVersion, RoomDeviceVersions};
 use wbf_sdk::event_json::messages_from_incoming;
@@ -278,6 +279,69 @@ pub(crate) async fn to_incoming(
     match engine {
         Some(engine) => engine.to_incoming(room, raw).await,
         None => IncomingEvent::from_ws_json(raw),
+    }
+}
+
+impl Core {
+    /// `room.history` 讀本地（`local`／`both`）讀到還沒解開的：拿這幾則再試一次（/docs/design/keys/e2ee-rpc.md §6 的觸發點之三）。
+    /// 補的是「金鑰到了、解開了、但當時寫 cache 失敗」那幾則——那把金鑰已經匯入，不會再有「金鑰到了」叫它們。
+    /// 解開的補存、換掉這一頁裡的那幾則；🚫 發 `room.message`（UI 正在讀這一頁）。失敗只講一聲、照原樣回（🚫 讓讀歷史失敗）。
+    ///
+    /// Args:
+    ///     room: example: "!r:localhost"
+    ///     messages: 這一頁（照 UI 要的順序）
+    /// Return:
+    ///     Vec<Message>  同樣的順序；解開的那幾則換成明文。不是 wbf 帳號（matrix-sdk 自己解）、沒有沒解開的、引擎開不起來：原樣
+    pub(crate) async fn retry_undecrypted_in_page(
+        &self,
+        account: &AccountDir,
+        room: &str,
+        mut messages: Vec<Message>,
+    ) -> Vec<Message> {
+        let undecrypted: Vec<String> = messages
+            .iter()
+            .filter(|message| matches!(message.kind, MessageKind::Undecryptable))
+            .map(|message| message.id.clone())
+            .collect();
+        if undecrypted.is_empty() || !self.is_wbf_account(account).unwrap_or(false) {
+            return messages;
+        }
+        let retried = async {
+            let engine = self.olm_engine_of(account).await?;
+            let (cache, me) = self.server_cache_and_me(account)?;
+            let opened = decrypt_stored(
+                &engine,
+                &cache,
+                &self.events,
+                &me,
+                room,
+                StoredToDecrypt::EventIds(undecrypted.clone()),
+                false,
+            )
+            .await?;
+            if opened == 0 {
+                return Ok::<_, CoreError>(Vec::new());
+            }
+            let reread = cache
+                .read()
+                .await
+                .list_messages_by_event_ids(&me, room, &undecrypted)?;
+            Ok(reread)
+        };
+        match retried.await {
+            Ok(reread) => {
+                for fresh in reread {
+                    if let Some(slot) = messages.iter_mut().find(|message| message.id == fresh.id) {
+                        *slot = fresh;
+                    }
+                }
+            }
+            Err(error) => self.events.progress(format!(
+                "room.history: {} undecrypted message(s) in {room} could not be retried: {error}",
+                undecrypted.len()
+            )),
+        }
+        messages
     }
 }
 
@@ -561,6 +625,72 @@ mod tests {
             "unsigned": { wbf_sdk::protocol::R_SEQ_KEY: 5, wbf_sdk::protocol::G_SEQ_KEY: 5 },
         });
         (event, session_id)
+    }
+
+    /// 補解寫失敗留下的密文（/docs/design/keys/e2ee-rpc.md §6）：那把金鑰已經匯入、不會再有「金鑰到了」叫它，
+    /// `room.history`（本地）讀到它就再試一次——回的那頁是明文、cache 補存了；🚫 發 `room.message`（UI 正在讀這頁）。再讀一次什麼都不用做。
+    #[tokio::test]
+    async fn a_ciphertext_left_in_the_cache_is_retried_when_the_history_reads_it() {
+        let dir = scratch("crypto-history-retry");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (ciphertext, _session_id) = an_encrypted_message(&core, &account, "$left").await;
+        let (cache, me) = core.server_cache_and_me(&account).unwrap();
+        cache
+            .run(move |cache| {
+                cache.upsert_events(
+                    ME,
+                    ROOM,
+                    &[IncomingEvent::Undecrypted {
+                        ciphertext,
+                        reason: "the write of its decryption failed".into(),
+                    }],
+                )
+            })
+            .await
+            .unwrap();
+        let mut seen = core.subscribe();
+        let query = crate::HistoryQuery {
+            room: ROOM.into(),
+            limit: 10,
+            before: None,
+            sync: crate::SyncMode::Local,
+            types: Vec::new(),
+            sender: None,
+        };
+        let page = core.history(&query, &Target::default()).await.unwrap();
+        let read = page
+            .events
+            .iter()
+            .find(|message| message.id == "$left")
+            .expect("the message is in the page");
+        assert!(
+            matches!(&read.kind, MessageKind::Text { body, .. } if body == "secret"),
+            "{read:?}"
+        );
+        let stored = cache
+            .read()
+            .await
+            .list_messages_by_event_ids(&me, ROOM, &["$left".to_string()])
+            .unwrap();
+        assert!(
+            matches!(&stored[0].kind, MessageKind::Text { .. }),
+            "the plaintext was stored"
+        );
+        let announced = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                if let Ok(CoreEvent::Message { .. }) = seen.recv().await {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            announced.is_err(),
+            "no room.message: the UI is reading this page"
+        );
+        let again = core.history(&query, &Target::default()).await.unwrap();
+        assert_eq!(again.events, page.events);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 金鑰到了（這裡：引擎解得開了）→ 找出那把 session 還沒解的、解開、補存明文、照收訊息那條路發 `room.message`（同 `event_id`）；

@@ -112,6 +112,33 @@ pub(crate) fn members_body(room_version: u64) -> Value {
     })
 }
 
+/// 兩條記憶體對接的線放進池裡：`Misc`（房間狀態、送事件）與 `Upload`（上傳）。各是一台假 server，狀態不共用——
+/// 送事件那台不驗 mxc，所以附件宣告只看它帶了什麼。房間版本號 7、成員只有自己。
+pub(crate) async fn misc_and_upload(
+    core: &Core,
+    account: &AccountDir,
+    encrypted: bool,
+) -> (FakeServer, FakeServer) {
+    let (misc_client, misc) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+    let (upload_client, upload) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+    let pool = core.pool_of_account(account).unwrap();
+    drop(
+        pool.acquire(LinkRole::Misc, || async move { Ok(misc_client) })
+            .await
+            .unwrap(),
+    );
+    drop(
+        pool.acquire(LinkRole::Upload, || async move { Ok(upload_client) })
+            .await
+            .unwrap(),
+    );
+    misc.room_is_encrypted
+        .store(encrypted, std::sync::atomic::Ordering::SeqCst);
+    *misc.members.lock().unwrap() = Some(members_body(7));
+    *misc.current_room_version.lock().unwrap() = Some(7);
+    (misc, upload)
+}
+
 /// 一條放進池裡的 `Keys` 線（記憶體對接的假 server）：refresh 走這條（/docs/design/keys/e2ee-rpc.md §3.1），
 /// 它的 `Members` 回房間版本號 `room_version`、成員只有自己。測試要讓房間「變了」就改回傳那個的 `members`。
 pub(crate) async fn keys_line_with_room(
@@ -268,6 +295,8 @@ pub(crate) struct FakeServer {
     pub(crate) members: Arc<Mutex<Option<Value>>>,
     /// 橋 `GetStateEvent` 問 `m.room.encryption` 時：true 回 megolm 的 content，false 回 404（沒加密）。
     pub(crate) room_is_encrypted: Arc<std::sync::atomic::AtomicBool>,
+    /// 加密時 `m.room.encryption` 的 content（預設只有 megolm 的 `algorithm`；測換金鑰期限時加 `rotation_period_*`）。
+    pub(crate) encryption_content: Arc<Mutex<Value>>,
     /// `Event/Send`：學 server 的 F4——設了就是這個房目前的房間版本號，加密事件帶的號碼對不上就 1506（帶目前的號碼）。
     pub(crate) current_room_version: Arc<Mutex<Option<u64>>>,
     /// `Event/Send` 收下的：(room_id, type, room_version, txn_id, content)。
@@ -344,6 +373,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let hellos_t = hellos.clone();
     let members: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let room_is_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let encryption_content = Arc::new(Mutex::new(json!({ "algorithm": "m.megolm.v1.aes-sha2" })));
+    let encryption_content_t = encryption_content.clone();
     let current_room_version: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let sent_events: SentEvents = Arc::new(Mutex::new(Vec::new()));
     let sent_attachments: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -394,7 +425,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     error.flags |= flags::IS_BRIDGED;
                     error
                 } else {
-                    bridged_reply(&pack, &members_t, &encrypted_t)
+                    bridged_reply(&pack, &members_t, &encrypted_t, &encryption_content_t)
                 };
                 peer.sink.send(reply.encode().unwrap()).await.unwrap();
                 continue;
@@ -676,6 +707,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         hellos,
         members,
         room_is_encrypted,
+        encryption_content,
         current_room_version,
         sent_events,
         sent_attachments,
@@ -825,6 +857,7 @@ fn bridged_reply(
     pack: &Pack,
     members: &Arc<Mutex<Option<Value>>>,
     room_is_encrypted: &Arc<std::sync::atomic::AtomicBool>,
+    encryption_content: &Arc<Mutex<Value>>,
 ) -> Pack {
     let reply = |subtype: u8, meta: Value, data: Vec<u8>| Pack {
         kind: Kind::Control,
@@ -861,7 +894,7 @@ fn bridged_reply(
         }
     } else if is(BRIDGE_STATE_EVENT) {
         if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
-            ok(json!({ "algorithm": "m.megolm.v1.aes-sha2" }))
+            ok(encryption_content.lock().unwrap().clone())
         } else {
             rejected("NotFound", 1501, 404, "M_NOT_FOUND")
         }
@@ -876,7 +909,7 @@ fn bridged_reply(
         if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
             state.push(
                 json!({ "type": "m.room.encryption", "state_key": "", "sender": ME,
-                               "content": { "algorithm": "m.megolm.v1.aes-sha2" } }),
+                               "content": encryption_content.lock().unwrap().clone() }),
             );
         }
         ok(Value::Array(state))

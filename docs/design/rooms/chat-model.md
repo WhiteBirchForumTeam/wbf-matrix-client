@@ -251,7 +251,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | 我們 | Matrix 事件 |
 |---|---|
 | `Text` | `m.room.message`，`msgtype: m.text`，`body`；有 `formatted_body` 就進 `Formatted` |
-| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5），路徑版送檔進加密房還沒接（/docs/design/keys/e2ee-rpc.md §8）。別人的 `m.file`／`m.image`／`m.video`／`m.audio`（標準附件，AES-CTR 或明文）是 `MatrixFile`（§2.3），下載照 /docs/design/media/media-download.md §12 |
+| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5）或路徑版 `room.send_file`，兩條都帶 `room_devices`（/docs/design/keys/e2ee-rpc.md §3）。別人的 `m.file`／`m.image`／`m.video`／`m.audio`（標準附件，AES-CTR 或明文）是 `MatrixFile`（§2.3），下載照 /docs/design/media/media-download.md §12 |
 | `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（/docs/design/messages/edits-and-redactions.md §2、§6，維護者 2026-09-14） |

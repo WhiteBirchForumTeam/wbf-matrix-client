@@ -72,8 +72,60 @@ pub struct ImportReport {
 const PULL_WINDOWS_LIMIT: usize = 64;
 
 /// 房間金鑰還剩幾則、多久就到期時，算「該提早換了」：送出之後後台先換一把、先分完，下一則拿到的就是就緒的（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3.1）。
+/// 房間自己設的期限很短時，門檻跟著縮到期限的四分之一（[`pre_rotate_messages`]、[`pre_rotate_age`]）：不然「剩一小時」對一小時的期限永遠成立，每送一則就換一把。
 const PRE_ROTATE_MESSAGES: u64 = 5;
 const PRE_ROTATE_AGE: Duration = Duration::from_secs(60 * 60);
+/// 上游把 `rotation_period_ms` 夾在一小時以上才算到期（`OutboundGroupSession::safe_rotation_period`，防房主設太短）：我們算「快到期」用同一個下限。
+const UPSTREAM_MIN_ROTATION_AGE: Duration = Duration::from_secs(60 * 60);
+/// 上游把 `rotation_period_msgs` 夾在 1 到 10 000 之間（`OutboundGroupSession::expired`）。
+const UPSTREAM_MAX_ROTATION_MESSAGES: u64 = 10_000;
+
+/// 房間自己設的換金鑰期限（`m.room.encryption` 的 `rotation_period_ms`／`rotation_period_msgs`，/docs/design/keys/e2ee-rpc.md §3.1）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomKeyRotation {
+    /// 一把房間金鑰最多用多久, example: Duration::from_secs(7 * 24 * 3600)
+    pub max_age: Duration,
+    /// 一把房間金鑰最多加密幾則, example: 100
+    pub max_messages: u64,
+}
+
+impl RoomKeyRotation {
+    /// Args:
+    ///     content: 這個房 `m.room.encryption` 的 content；None 是沒有這個狀態事件, example: Some(&json!({"algorithm": "m.megolm.v1.aes-sha2", "rotation_period_msgs": 20}))
+    /// Return:
+    ///     RoomKeyRotation   沒設、或不是正整數的那一項用上游預設（一週／100 則）；太短的照寫，上游自己夾
+    pub fn of_encryption_content(content: Option<&serde_json::Value>) -> RoomKeyRotation {
+        let defaults = EncryptionSettings::default();
+        let positive = |field: &str| {
+            content
+                .and_then(|content| content.get(field))
+                .and_then(|value| value.as_u64())
+                .filter(|value| *value > 0)
+        };
+        RoomKeyRotation {
+            max_age: positive("rotation_period_ms")
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.rotation_period),
+            max_messages: positive("rotation_period_msgs").unwrap_or(defaults.rotation_period_msgs),
+        }
+    }
+}
+
+/// 剩幾則以內算「該提早換了」。
+///
+/// Return:
+///     u64  `PRE_ROTATE_MESSAGES` 與期限的四分之一取小的；期限 1 則時是 0（送完那一則就換）
+fn pre_rotate_messages(max_messages: u64) -> u64 {
+    PRE_ROTATE_MESSAGES.min(max_messages / 4)
+}
+
+/// 剩多久以內算「該提早換了」。
+///
+/// Return:
+///     Duration  `PRE_ROTATE_AGE` 與期限的四分之一取小的
+fn pre_rotate_age(max_age: Duration) -> Duration {
+    PRE_ROTATE_AGE.min(max_age / 4)
+}
 
 /// `refresh_room_devices` 一輪的結果：這一刻的房間快照（下次送帶它的 `room_version`）、跟上一份比出來的差。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,20 +341,26 @@ impl OlmEngine {
                 ),
             });
         }
-        let messages_left = pickle
+        // 跟上游判「到期」用同樣的夾法，門檻再跟著期限縮。
+        let max_messages = pickle
             .settings
             .rotation_period_msgs
-            .clamp(1, 10_000)
-            .saturating_sub(pickle.message_count);
+            .clamp(1, UPSTREAM_MAX_ROTATION_MESSAGES);
+        let messages_left = max_messages.saturating_sub(pickle.message_count);
+        let max_age = pickle
+            .settings
+            .rotation_period
+            .max(UPSTREAM_MIN_ROTATION_AGE);
         let created = Duration::from_secs(u64::from(pickle.creation_time.get()));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        let time_left = (created + pickle.settings.rotation_period).saturating_sub(now);
+        let time_left = (created + max_age).saturating_sub(now);
         Ok(RoomKeyState::Ready {
             session_id: session.session_id().to_string(),
             message_count: pickle.message_count,
-            due_for_rotation: messages_left <= PRE_ROTATE_MESSAGES || time_left <= PRE_ROTATE_AGE,
+            due_for_rotation: messages_left <= pre_rotate_messages(max_messages)
+                || time_left <= pre_rotate_age(max_age),
         })
     }
 
@@ -716,6 +774,7 @@ impl OlmEngine {
     ///     client: 走橋用的連線
     ///     room_id: example: "!r:localhost"
     ///     users: 房間裡要拿金鑰的人（含自己）, example: &["@alice:localhost".to_string()]
+    ///     rotation: 這個房自己設的期限；現在那把是照別的期限建的（房主改過）就先丟掉、照這個建新的（上游只在到期／作廢時換）
     /// Return:
     ///     Ok(usize)        送了幾個 to-device（0 ＝ 每台已知的裝置都已經有這把）
     ///     Err(Usage)       房間 id、成員的 mxid 不合法
@@ -725,9 +784,27 @@ impl OlmEngine {
         client: &mut WbfClient<C>,
         room_id: &str,
         users: &[String],
+        rotation: RoomKeyRotation,
     ) -> Result<usize, SdkError> {
         let room_id: OwnedRoomId = RoomId::parse(room_id)
             .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
+        if let Some(session) = self
+            .machine
+            .store()
+            .get_outbound_group_session(&room_id)
+            .await
+            .map_err(crypto_store_error)?
+        {
+            let settings = &session.pickle().await.settings;
+            if (settings.rotation_period, settings.rotation_period_msgs)
+                != (rotation.max_age, rotation.max_messages)
+            {
+                self.machine
+                    .discard_room_key(&room_id)
+                    .await
+                    .map_err(crypto_store_error)?;
+            }
+        }
         self.track_users(users).await?;
         let users = parse_user_ids(users)?;
         // 先把追蹤中的查詢送完，名單才是最新的。
@@ -738,7 +815,7 @@ impl OlmEngine {
             .share_room_key(
                 &room_id,
                 users.iter().map(OwnedUserId::as_ref),
-                room_key_share_settings(),
+                room_key_share_settings(rotation),
             )
             .await
             .map_err(olm_error)?;
@@ -895,9 +972,12 @@ impl OlmEngine {
 /// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。wbfuwunel 的 /docs/design/wbf-room-device-version.md §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
 /// 要每個帳號都 bootstrap 過交叉簽章才有意義——client 這邊還沒做（`SigningKeysUpload` 只有號碼），現在選它等於發給零台裝置。
 /// ✅ 交叉簽章做好之後要換成 `IdentityBasedStrategy`，這裡是唯一要改的地方。
-pub fn room_key_share_settings() -> EncryptionSettings {
+/// 期限照房間自己設的（[`RoomKeyRotation`]）。
+pub fn room_key_share_settings(rotation: RoomKeyRotation) -> EncryptionSettings {
     EncryptionSettings {
         sharing_strategy: CollectStrategy::AllDevices,
+        rotation_period: rotation.max_age,
+        rotation_period_msgs: rotation.max_messages,
         ..EncryptionSettings::default()
     }
 }
@@ -968,4 +1048,51 @@ fn crypto_store_error(error: matrix_sdk_crypto::store::CryptoStoreError) -> SdkE
 
 fn olm_error(error: matrix_sdk_crypto::OlmError) -> SdkError {
     SdkError::Protocol(format!("crypto: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `m.room.encryption` 的期限：有給正整數就照它，沒給、0、不是數字的那一項用上游預設；沒有這個狀態事件就全用預設。
+    #[test]
+    fn the_rotation_comes_from_the_rooms_encryption_content() {
+        let defaults = EncryptionSettings::default();
+        let default = RoomKeyRotation {
+            max_age: defaults.rotation_period,
+            max_messages: defaults.rotation_period_msgs,
+        };
+        assert_eq!(RoomKeyRotation::of_encryption_content(None), default);
+        let set = serde_json::json!({ "algorithm": "m.megolm.v1.aes-sha2", "rotation_period_ms": 7_200_000, "rotation_period_msgs": 20 });
+        assert_eq!(
+            RoomKeyRotation::of_encryption_content(Some(&set)),
+            RoomKeyRotation {
+                max_age: Duration::from_secs(7200),
+                max_messages: 20
+            }
+        );
+        let odd = serde_json::json!({ "rotation_period_ms": "soon", "rotation_period_msgs": 0 });
+        assert_eq!(RoomKeyRotation::of_encryption_content(Some(&odd)), default);
+    }
+
+    /// 提早換的門檻跟著期限縮：預設的期限照舊（5 則、1 小時），很短的期限 🚫 每送一則就換。
+    #[test]
+    fn the_early_rotation_margin_shrinks_with_a_short_period() {
+        assert_eq!(pre_rotate_messages(100), 5);
+        assert_eq!(pre_rotate_messages(8), 2);
+        assert_eq!(
+            pre_rotate_messages(1),
+            0,
+            "a one-message key is replaced right after its message"
+        );
+        assert_eq!(
+            pre_rotate_age(Duration::from_secs(7 * 24 * 3600)),
+            PRE_ROTATE_AGE
+        );
+        assert_eq!(
+            pre_rotate_age(UPSTREAM_MIN_ROTATION_AGE),
+            Duration::from_secs(15 * 60),
+            "the shortest period upstream allows leaves 45 minutes of use"
+        );
+    }
 }

@@ -1535,6 +1535,7 @@ mod with_crypto_engine {
                 &mut client,
                 &refresh.room_id,
                 &refresh.versions.members.keys().cloned().collect::<Vec<_>>(),
+                wbf_sdk::crypto_engine::RoomKeyRotation::of_encryption_content(None),
             )
             .await
             .unwrap();
@@ -1645,6 +1646,7 @@ mod with_crypto_engine {
                 &mut client,
                 "!r:localhost",
                 &["@alice:localhost".to_string()],
+                wbf_sdk::crypto_engine::RoomKeyRotation::of_encryption_content(None),
             )
             .await
             .unwrap();
