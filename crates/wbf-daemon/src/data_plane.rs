@@ -493,10 +493,7 @@ async fn get_media(
         false => stream_body(source.into_stream(start, end)),
     };
     let mut reply = Response::new(body);
-    *reply.status_mut() = match trusted {
-        true => status,
-        false => StatusCode::PRECONDITION_FAILED,
-    };
+    *reply.status_mut() = status_for_trust(status, trusted);
     let headers = reply.headers_mut();
     headers.insert(
         MEDIA_KIND_HEADER,
@@ -533,6 +530,20 @@ async fn get_media(
         }
     }
     reply
+}
+
+/// 讀的狀態碼（/docs/design/rpc-specs/data-plane.md §8.2 的約定）：可信就照 Range 給的（200／206）；不可信是 412，body 照給。
+///
+/// Args:
+///     status: 照 Range 決定的, example: StatusCode::PARTIAL_CONTENT
+///     trusted: `MediaSource::is_trusted`, example: false
+/// Return:
+///     StatusCode   `status` 或 412
+fn status_for_trust(status: StatusCode, trusted: bool) -> StatusCode {
+    match trusted {
+        true => status,
+        false => StatusCode::PRECONDITION_FAILED,
+    }
 }
 
 /// `Range` 要的是哪一段。
@@ -917,6 +928,18 @@ mod tests {
         // 加密模式下，明文的讀 URL 一律不收。
         let plain = keys.to_media_url_key(mxc, false).unwrap();
         assert_eq!(keys.open_media_url_key(&plain, true), None);
+    }
+
+    /// 資料照給，狀態碼說它可不可信（/docs/design/rpc-specs/data-plane.md §8.2）：可信照 Range 的 200／206，不可信一律 412。
+    #[test]
+    fn an_untrusted_read_is_412_whatever_the_range_asked() {
+        for status in [StatusCode::OK, StatusCode::PARTIAL_CONTENT] {
+            assert_eq!(status_for_trust(status, true), status);
+            assert_eq!(
+                status_for_trust(status, false),
+                StatusCode::PRECONDITION_FAILED
+            );
+        }
     }
 
     #[test]
