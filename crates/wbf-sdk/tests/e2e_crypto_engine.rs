@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, SendOutcome};
+use wbf_sdk::crypto_engine::{
+    room_key_share_settings, OlmEngine, OutgoingRoomEvent, RoomKeyState, SendOutcome,
+};
 use wbf_sdk::login::{login_with_password, logout, Session};
 use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_FEATURE};
 use wbf_sdk::to_device_state::ToDeviceState;
@@ -240,6 +242,60 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .await
         .unwrap();
     assert_eq!(again_shared, 0);
+
+    // 6b. 送訊息只用排過的 to-device **全部拿到 Ack** 的金鑰（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：
+    //     另一個加密房，直接叫上游狀態機在本機排好給 B 的金鑰、先不送 → 還有待送，不算就緒、送不出去（🚫 加密、🚫 送）；
+    //     後台那支 `distribute_room_key` 把它送出去、拿到 Ack 之後才 `Ready`，送得出去。
+    let pending_room = create_encrypted_room(&a.session).await;
+    let parsed_room = matrix_sdk::ruma::RoomId::parse(&pending_room).unwrap();
+    let parsed_user = matrix_sdk::ruma::UserId::parse(&user_id).unwrap();
+    let queued = a
+        .engine
+        .machine()
+        .share_room_key(
+            &parsed_room,
+            std::iter::once(parsed_user.as_ref()),
+            room_key_share_settings(),
+        )
+        .await
+        .unwrap();
+    assert!(!queued.is_empty(), "a to-device for B is queued, not sent");
+    assert!(
+        matches!(
+            a.engine.room_key_state(&pending_room).await.unwrap(),
+            RoomKeyState::NotReady { ref reason } if reason.contains("not acknowledged")
+        ),
+        "a key with to-device still waiting for an Ack is not ready"
+    );
+    let refused = a
+        .engine
+        .encrypt_and_send(
+            &mut a.ws,
+            &pending_room,
+            0,
+            &OutgoingRoomEvent {
+                event_type: "m.room.message".into(),
+                content: serde_json::json!({ "msgtype": "m.text", "body": "too early" }),
+                txn_id: format!("pending-{}", std::process::id()),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(refused, SendOutcome::RoomKeyNotReady { .. }),
+        "{refused:?}"
+    );
+    let delivered = a
+        .engine
+        .distribute_room_key(&mut a.ws, &pending_room, std::slice::from_ref(&user_id))
+        .await
+        .unwrap();
+    assert!(delivered >= 1, "{delivered}");
+    assert!(matches!(
+        a.engine.room_key_state(&pending_room).await.unwrap(),
+        RoomKeyState::Ready { .. }
+    ));
 
     // 7. 下線：說出口的退出（不叫的話這條連線退了卻還佔著裝置）。
     b.ws.device_unsubscribe().await.expect("B unsubscribes");
