@@ -875,23 +875,26 @@ async fn concurrent_outgoing_request_loops_on_one_engine_all_finish() {
             .nth(1)
             .unwrap_or("localhost")
     );
-    device
-        .engine
-        .track_users(&[device.session.user_id.clone(), bob])
-        .await
-        .unwrap();
+    let users = [device.session.user_id.clone(), bob];
+    device.engine.track_users(&users).await.unwrap();
     let mut extra = extra.into_iter();
     let (mut second, mut third) = (extra.next().unwrap(), extra.next().unwrap());
     let engine = &device.engine;
-    let (one, two, three) = tokio::join!(
-        engine.send_outgoing_requests(&mut device.ws),
-        engine.send_outgoing_requests(&mut second),
-        engine.send_outgoing_requests(&mut third),
-    );
-    assert!(
-        one.is_ok() && two.is_ok() && three.is_ok(),
-        "{one:?} / {two:?} / {three:?}"
-    );
+    // 競態：一輪不一定撞得到。每一輪先把兩個人標成「裝置變了」（又有一批 `/keys/query` 要送），三條線再同時送。
+    for round in 0..5 {
+        if round > 0 {
+            engine.mark_users_changed(&users).await.unwrap();
+        }
+        let (one, two, three) = tokio::join!(
+            engine.send_outgoing_requests(&mut device.ws),
+            engine.send_outgoing_requests(&mut second),
+            engine.send_outgoing_requests(&mut third),
+        );
+        assert!(
+            one.is_ok() && two.is_ok() && three.is_ok(),
+            "round {round}: {one:?} / {two:?} / {three:?}"
+        );
+    }
     logout(&device.session).await.expect("logout");
     let _ = std::fs::remove_dir_all(&device.store_dir);
 }
