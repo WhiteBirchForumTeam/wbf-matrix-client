@@ -359,12 +359,12 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | method | params | result | core |
 |---|---|---|---|
 | `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 答得出 `file_size`／`chunk_size`／`content_type`，加上上游答不出來的 `cached: { complete, segments_written, bytes_on_disk }`（`segments_written` 是池主檔的 64 KiB 段數，只給顯示；下載中的進度看 `media.queue`）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
-| `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id }`、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading` | `media_download`：交給這個帳號的下載處理端（/docs/design/media/media-download.md §5）。`mxc` 的金鑰從這個帳號看得到的事件裡找，找不到 1100；一般 Matrix 帳號 1100 |
-| `media.open` | 同 `media.download` | `{ url, mxc, mimetype?, size, state }`。`url` 是資料平面讀的 URL（/docs/design/rpc-specs/data-plane.md §8，不帶帳號、可以重用） | `media_open`；不完整也沒本機原檔就順便排進佇列。daemon 沒開資料平面回 100 |
+| `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id }`、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading`、`verifying`；`kind`、`verified` 是 `media` 列的（沒有列就不在，/docs/design/media/media-download.md §12.3） | `media_download`：交給這個帳號的下載處理端（/docs/design/media/media-download.md §5）。`mxc` 的金鑰從這個帳號看得到的事件裡找，找不到 1100；一般 Matrix 帳號 1100 |
+| `media.open` | 同 `media.download` | `{ url, mxc, mimetype?, size, state, kind?, verified? }`（`kind` 2 而 `verified` 不是 1 時，讀那個 `url` 會是 412、body 照給，/docs/design/rpc-specs/data-plane.md §8.2）。`url` 是資料平面讀的 URL（/docs/design/rpc-specs/data-plane.md §8，不帶帳號、可以重用） | `media_open`；不完整也沒本機原檔就順便排進佇列。daemon 沒開資料平面回 100 |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }`，第一個是正在拉的 | `media_queue` |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, source_uri?, user?, server? }`（`source_uri` 是原檔的 URI，讀的時候優先讀它，/docs/design/rpc-specs/data-plane.md §8.1） | `{ upload_id, mxc, url, headers }`。`url` 是資料平面的 PUT URL（共享 token 加密的「用途 ‖ mxc」），`headers` 是 PUT 時要照抄的（`Wbf-Upload-Meta`：加密的上傳狀態）（/docs/design/rpc-specs/data-plane.md §4） | `create_upload`：有 `room` 就照房間決定加不加密；daemon 沒開資料平面回 100 |
-| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`；已經存在就覆蓋，要不要覆蓋是 UI 先問）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", hash? }` | `export_media_to`：沒有就排、等它完成、**整檔驗過**才寫到 `to`（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`；已經存在就覆蓋，要不要覆蓋是 UI 先問）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", kind, verified, hash? }` | `export_media_to`：沒有就排、等它完成才寫到 `to`；從池匯出🚫 再算 hash，傳統加密的檔沒驗過或驗不過照匯、回 1501（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
 | `media.stats` | `{ user?, server? }` | `MediaStats` | `media_stats` |
 | `media.gc` | `{ quota_mib?: 2048, protect_days?: 7, user?, server? }` | `MediaGcReport` | `collect_media_garbage` |
 
@@ -414,7 +414,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
 | `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }` | 這個帳號對 homeserver 的某一條線開了或關了（/docs/design/daemon/link-pool.md §4）。五條線由 daemon 在 `vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（/docs/design/daemon/link-pool.md §3.1）。⚠️ 「關了」不是即時的：線死後大約一分鐘內才被看到 |
 | `devices.changed` | `{ user, changed_user, device_version, rooms: { room: room_version }, gap }`（/docs/design/keys/e2ee-rpc.md §4） | `Rooms` 線上 server 推來「某人的裝置變了」，原樣轉。daemon 自己🚫 不動作；要不要對開著的房 `room.refresh_devices` 是 UI 的事（`gap: true` ＝ 前面有推送被丟，開著的房都 refresh 一次） |
-| `media.download` | `{ user, mxc, state: "queued"\|"downloading"\|"complete"\|"cancelled"\|"failed", done, total, reason? }`（/docs/design/media/media-download.md §5.5） | 一個下載 job 的狀態改變時一則、拉的途中每個 job 最多每秒一則。`done`／`total` 是塊數（`total` 還不知道是 0）；`reason` 只在 `failed` 帶（給人看） |
+| `media.download` | `{ user, mxc, state: "queued"\|"downloading"\|"verifying"\|"complete"\|"cancelled"\|"failed", done, total, verified?, reason? }`（/docs/design/media/media-download.md §5.5、§12.3；`complete` 一律帶 `verified`：0 沒驗、1 正確、2 不正確） | 一個下載 job 的狀態改變時一則、拉的途中每個 job 最多每秒一則。`done`／`total` 是塊數（`total` 還不知道是 0）；`reason` 只在 `failed` 帶（給人看） |
 | `keys.state` | `{ user, state: "caught_up"\|"stopped", imported?, room_keys?, reason? }`（/docs/design/keys/key-sync.md §2） | 這個帳號的金鑰訂閱：`caught_up`＝一批 to-device 匯完、銷毀完（`imported` 則、`room_keys` 把新房間金鑰——UI 拿它決定要不要重解密文）；`stopped`＝這條訂閱結束了（被同一裝置後來的連線接手、線死了）：金鑰那條線跟著關，daemon 的看線迴圈下一輪（最多 15 秒）重開、重訂，重訂完會再來一則 `caught_up`。維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」 |
 | `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
@@ -468,6 +468,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | 1401 | `room_devices_changed` | 2 |
 | 1402 | `room_key_not_ready` | 5 |
 | 1500 | `integrity` | 3 |
+| 1501 | `unverified` | 3 |
 | 1600 | `timeout` | 5 |
 
 - `account_busy`（1013）：另一個 `account.add`／`account.del`／`account.destroy` 正握著 `<data dir>/account.lock`（`crates/wbf-core/src/account_lock.rs`），或這個帳號正在登出（/docs/design/daemon/account-session.md §4）。🚫 daemon 不排隊，前端決定要不要稍後再試。
@@ -479,6 +480,8 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 - 協議層（9xxx）的 exit code：`9001` token 錯 → **1**；其餘 → **4**（網路：連線建不起來）。
 - `room_devices_changed`（1401）：加密訊息被 server 擋（server 的 1506 `RoomDevicesChanged`：帶的房間版本號過期）。訊息**沒送**；daemon 已經自動重拿房間狀態、交給後台對新的狀態分金鑰（/docs/design/keys/e2ee-rpc.md §3.1），新的狀態在 `data`（§5.3）。用同一個 `txn_id` 帶 `data` 重送就過（送出時會等金鑰就緒，等不到回 1402）。
 - `room_key_not_ready`（1402）：加密房的房間金鑰在等待時間（2 秒）內沒準備好（例：`Keys` 線不通、這個房第一次送又剛好很慢）。訊息**沒加密、沒送**；後台照樣繼續分，用同一個 `txn_id` 重送就好（`data` 帶這則的 `txn_id`，§5.3；維護者 2026-10-06：送訊息只用已經分好的金鑰，/docs/design/keys/e2ee-rpc.md §3）。exit code 跟逾時同一級（5）。
+- `unverified`（1501）：**事情做了、資料照給，但它沒驗過或驗不過**（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2；跟 GET 的 412 是同一件事）。
+  現在只有 `media.export_to` 匯出傳統加密的檔（`kind` 2）而 `verified` 是 0 或 2 時回：檔**已經寫到 `to`**，`data` 是成功時會給的那份結果（§5.3），要不要留由 UI 決定、跟使用者講。不是「沒做」，所以🚫 重試。
 
 ### 5.3 錯誤回應的 `data`
 
@@ -488,6 +491,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 |---|---|
 | 1401 `room_devices_changed` | 重拿成功：`{ room_version: u64, members: { mxid: "序號-雜湊" }, txn_id: string }`——前兩個就是新的 `room_devices`（UI 存下、重送時帶回來），`txn_id` 是這則用的（UI 沒給的話是 daemon 產的，重送用同一個）。重拿也失敗：`{ txn_id: string, current_room_version: u64 或 null }`（server 沒給號碼時是 null），UI 自己叫 `room.refresh_devices` |
 | 1402 `room_key_not_ready` | `{ txn_id: string }`：這則用的（UI 沒給的話是 daemon 產的），重送用同一個。例：`{ "txn_id": "wbf-1791265069-3" }` |
+| 1501 `unverified` | 這個方法成功時的 `result`，一字不差。`media.export_to`：`{ to, bytes, source, kind, verified }`，例：`{ "to": "file:///tmp/a.mp4", "bytes": 52428800, "source": "cache", "kind": 2, "verified": 2 }`（示意） |
 
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）
 

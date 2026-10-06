@@ -3,6 +3,8 @@
 > 程式在哪：sdk 的 `media_pool.rs`（池格式 v2，§4.1）、`seek_store.rs`（§4.2）、`media.rs` 的 `MediaDownload`（一個檔在主檔、暫存檔與網路之間怎麼拿塊）；
 > core 的 `download_queue.rs`（每帳號的下載處理端，§5、§6；線的請求規則在 /docs/design/daemon/link-requests.md）、`media_ops.rs`（RPC 面，§7.1）、`media_stream.rs`（GET 的來源，§7.2）；daemon 的 `data_plane.rs`、`handle/media.rs`。
 >
+> 傳統格式的附件（Matrix 標準的 `file`／`url`，不是分塊）怎麼進同一個池在 §12。
+>
 > 相關：媒體池（本地加密的儲存）在 /docs/design/media/media-pool.md；資料平面的 URL、Host 檢查、狀態碼在 /docs/design/rpc-specs/data-plane.md；
 > 塊怎麼加密、下載端要做哪些檢查在 /docs/design/media/wbf-client-convention-for-chunk.md §3；server 的 `Download/*` 在 wbfuwunel 的 /docs/design/media/chunked-upload-spec.md §4。
 
@@ -148,7 +150,7 @@ R = 4 + segment_size + 16                                    每段在磁碟上�
 
 1. 明文丟進段大小的緩衝；**湊滿一段才封、才 append**（塊大小不必是 64 KiB 的倍數，塊的明文可以跨段）。
 2. 同時順序餵 BLAKE3（池檔的檔名）與 SHA-256（區塊有 `sha256` 時，§3.1 第 5 條的整檔核對）。
-3. 最後一塊寫完：封最後一段（補滿、記真實長度）、fsync、得出 BLAKE3；區塊帶 `sha256` 就跟整檔的 SHA-256 比，對不上是壞檔。
+3. 最後一塊寫完：封最後一段（補滿、記真實長度）、fsync、得出 BLAKE3；區塊帶 `sha256` 就跟整檔的 SHA-256 比，結果記進 `verified`（1 對上、2 對不上，§12.3），🚫 當壞檔（維護者 2026-10-06：每塊都過了 AEAD，要不要用由前端決定）。
 4. **進度**：**檔案本身就是進度**——完整的段數就是寫到哪。每 1.5 秒 fsync 一次（限制斷電時最多丟多少），並把段數寫回 `cache.db` 的 `media.segments_written`（給 `media.info` 顯示用；🚫 不當續傳的依據）。
 
 **續傳（daemon 重開、或被取消後再要一次）**：
@@ -240,7 +242,7 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
 |---|---|
 | job 建立 | `media_begin`：沒有這個 mxc 的列就建（`complete = 0`）。已經 `complete = 1` 而且池檔在 → 不下載 |
 | 每 1.5 秒（主檔） | `segments_written` ＝ 完整段數（只給顯示用） |
-| 主檔完成 | `media_finish`：`pool_file`、`complete = 1`、`file_size`、`bytes_on_disk`；區塊沒帶 sha256 時 `hash = blake3:…` |
+| 主檔完成 | `media_finish`：`pool_file`、`complete = 1`、`verified`（同一筆，§12.3）、`file_size`、`bytes_on_disk`；區塊沒帶 sha256 時 `hash = blake3:…` |
 | seek 暫存檔 | 🚫 不進 DB：暫存檔自己就是記錄（§4.2 的重建） |
 
 欄位記的是**段數**（池格式 v2 的 64 KiB 段），🚫 不是塊數：塊大小跟段大小無關。DB 一律經那台 server 的唯一寫入者（`ServerCache`，/docs/design/daemon/daemon-runtime.md §2）。
@@ -359,7 +361,7 @@ Chunk { mxc, next } 回來、主檔在等：
 
 - **狀態在 `downloading` 表裡**（`done`／`total`，§5.2）；DB 每 1.5 秒寫一次段數（顯示用，§4.4）。
 - **推播 `media.download`**（要先 `subscribe`，/docs/design/rpc-specs/rpc-spec.md §4）：
-  `{ mxc, state: "queued"|"downloading"|"complete"|"cancelled"|"failed", done: next, total, user, reason? }`。`queued` 是收到了、還沒處理。
+  `{ mxc, state: "queued"|"downloading"|"verifying"|"complete"|"cancelled"|"failed", done: next, total, user, verified?, reason? }`（`verifying` 與 `complete` 帶的 `verified` 在 §12.3）。`queued` 是收到了、還沒處理。
   每個檔**最多每秒一則**，加上每次狀態改變一則（收到、開始、完成、取消、失敗）——🚫 不是每塊一則（那會把 `room.message` 擠掉，/docs/design/daemon/daemon-runtime.md §5.4）。
 - **`media.queue`** 隨時可以問現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`）。
 - 播放中的進度照舊：就是那個 GET 收到多少 bytes。
@@ -464,11 +466,27 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 - **`to` 是 URI**，跟 `media.create` 的 `source_uri` 同一套解法（/docs/design/rpc-specs/data-plane.md §8.1）。現在只收 `file://`（例 `file:///tmp/a.mp4`）；
   `http://127.0.0.1:…/from_ui/mxc/…`（daemon 用 HTTP PUT 丟給 UI）之後才做，現在回參數錯。
 - **來源**：本機原檔能驗（區塊帶 sha256）就從它匯出；不能驗、或驗不過（原檔上傳後被改過），就從池匯出——池裡沒有就排進下載、等它完成。
-- **整檔驗過才放上去**：先寫一個**這次自己獨占建立**的暫存檔（`<to>.partial.<pid>-<n>`，名字被占了就換一個）、fsync，邊寫邊算；大小、整檔 BLAKE3（池檔名就是它，從池匯出時）、
-  區塊有帶就再加 SHA-256，全對上才改名成 `to`。🚫 開、🚫 刪別人的檔（旁邊本來就有的 `<to>.partial` 之類），失敗只刪自己建的那一個；兩個匯出到同一個 `to` 互不踩。
+  原檔在池外、沒有任何 AEAD 保護，所以**從原檔匯出一律整檔比 sha256**（照舊）。
+- **從池匯出🚫 再算 hash，照 `media.kind`／`verified` 決定回什麼**（維護者 2026-10-06，§12；跟 GET 同一個約定，/docs/design/rpc-specs/data-plane.md §8.2）：
+
+  | `kind` | `verified` | 從池匯出時 | 回 |
+  |---|---|---|---|
+  | 1 `WbfChunked` | 不看 | 照匯，只核大小 | 成功 |
+  | 2 `MatrixEncrypted` | 1 驗了、正確 | 照匯，只核大小 | 成功 |
+  | 2 `MatrixEncrypted` | 0 或 2 | **照匯**（資料照給） | **1501 `unverified`**，`data` 是成功時會給的那份結果（`to`、`bytes`、`source`、`kind`、`verified`）：檔已經在 `to`，要不要留由 UI 決定、跟使用者講 |
+  | 3 `MatrixPlain` | 不看（沒有 hash） | 照匯，只核大小 | 成功 |
+
+  - 為什麼🚫 再算：`kind` 1 每塊下載時各自 AEAD 驗過、池裡每段讀出時又過池的 AEAD，整檔 hash 是多算一次；`kind` 2 下載完已經自動驗過、結果記在 `verified`（§12.3），驗過就🚫 再驗。
+  - 匯出本來就等下載完成（還沒完成就排、等），所以到匯出那一刻 `kind` 2 的 `verified` 已經是 1 或 2；0 只會出現在「完成了卻沒驗」這種不該有的列，照 0 處理（1501）。
+  - 成功的結果也帶 `kind`、`verified`，前端不必另外問。
+
+- **暫存檔再改名照舊**：先寫一個**這次自己獨占建立**的暫存檔（`<to>.partial.<pid>-<n>`，名字被占了就換一個）、fsync，大小對上才改名成 `to`。
+  🚫 開、🚫 刪別人的檔（旁邊本來就有的 `<to>.partial` 之類），失敗只刪自己建的那一個；兩個匯出到同一個 `to` 互不踩。
+  這一步防的是「寫到一半」，不是竄改：池讀出來的每一段都過了池的 AEAD。
 - **`to` 已經存在就覆蓋**（維護者 2026-10-03：要不要覆蓋是 UI 先問使用者，daemon 🚫 再擋）。
-  對不上 → 刪掉暫存、`to` 🚫 被動過、回 `Integrity`；從池匯出時那份池檔也丟掉（下次重下）。一個 hash 都沒得比就🚫 匯出。
-- 跟串流分開驗（維護者 2026-10-02）：`media.open`／GET 是串流，🚫 算整檔 hash，每段讀出來時池的 AEAD 已經驗過；匯出才算整檔。
+  對不上 → 刪掉暫存、`to` 🚫 被動過、回 `Integrity`。
+- 跟串流分開（維護者 2026-10-02）：`media.open`／GET 是串流，🚫 算整檔 hash，每段讀出來時池的 AEAD 已經驗過。
+  📎 10-02 原本定「匯出要整檔驗（BLAKE3 ＋ 有就 SHA-256）」；10-06 改成上面那張表：`kind` 1 的整檔 hash 是重複的，`kind` 2 收尾時驗過、記在 `verified`。
 - 🔜 之後的形狀：還沒下載完就先交 job，下載完成時**自動匯出**、RPC 不必等著；現在是等它完成才回。
 
 ## 8. 斷在哪裡、會留下什麼
@@ -547,3 +565,106 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 16. **GET 只交 byte 位置**（§6.2）：HTTP Range 本來就是 byte。是哪一塊照處理端手上那個檔驗過的切法算，🚫 照 GET 帶來的描述。
 17. **一個 mxc 只有一個處理端碰**（§5.1、§6.1）：主檔與 `m<id>.seek` 都歸正在下載的那個處理端。別的處理端要下載 → 🚫 再下載，轉過去、回 `downloading`；
     只是 seek → 拉了就交出去，🚫 寫任何檔。認領記的是處理端（連線），🚫 只記帳號（重登前後的兩個處理端是兩個）。
+
+2026-10-06：
+
+18. **傳統格式的附件也進同一個池**（§12）：`kind` 2、3 照池格式 v2 寫主檔、收尾改名進池；完成之後跟 `kind` 1 分不出來。
+19. **`GET` 可以邊下載邊讀、驗證中也能讀，不論哪一種**（§12.2）：資料照給，**狀態碼說它可不可信**——`kind` 1 不檢查、一律 2xx；
+    `kind` 2 沒驗過或驗不過是 **412**、body 照給；前端看狀態碼決定，堅決要拿就照拿（/docs/design/rpc-specs/data-plane.md §8.2）。
+20. **`media` 表加 `kind` 與 `verified`，都用整數**（/docs/design/storage/local-cache-db.md §5）：程式裡是 enum，DB 存整數。
+    `verified`：0 還沒驗、不知道；1 驗了、正確；2 驗了、不正確。驗過就🚫 再驗。
+21. **下載完自動驗證**（§12.3）：推播 `media.download` 先報 `verifying`，驗完報 `complete` 帶 `verified`（成功 1、失敗 2）。驗不過🚫 刪檔。
+22. **從池匯出🚫 再算 hash，跟 GET 同一個約定**（§7.3）：`kind` 1 不檢查；`kind` 2 沒驗過或驗不過照匯、回 1501 `unverified`。
+
+## 12. 傳統格式的附件（`kind` 2、3）（維護者 2026-10-06）
+
+wbf 帳號與一般 Matrix 帳號都會收到標準 Matrix 附件（`m.file`／`m.image`… 帶 `file` 或 `url`），它們不是分塊的。
+哪一種看**事件內容**（/docs/design/rpc-specs/data-plane.md §7.1），🚫 看帳號：同一個 wbf 帳號的房裡可以同時有 `kind` 1 與 `kind` 2 的檔。
+
+### 12.1 從 homeserver 到池
+
+```
+GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 access token；一個請求從頭到尾）
+   │ 密文一段一段進來
+   ├─ kind 2：餵 SHA-256（算密文，最後跟 file.hashes.sha256 比）→ AES-256-CTR 解開
+   ├─ kind 3：原樣
+   ▼ 明文
+   湊滿 64 KiB 一段 → 池金鑰封起來 → append 到 pending/m<id>（池格式 v2，§4.1，跟 kind 1 同一個格式、同一支寫入）
+   同時餵 BLAKE3（池檔名）
+   ▼ 讀完 → 自動驗證（§12.3）：推播 state = verifying
+   kind 2：密文 SHA-256 對上   → 收尾（adopt、media_finish：complete = 1、verified = 1）→ 推播 complete、verified = 1
+           對不上             → 一樣收尾、🚫 刪檔（complete = 1、verified = 2）→ 推播 complete、verified = 2
+   kind 3：大小對得上事件的 info.size（有給的話）→ 收尾（complete = 1、verified = 0），🚫 verifying（沒有 hash 可比）
+```
+
+- **🚫 走 `Download` 線**：那條是 wbf 的 `Download/*`。傳統下載是一個普通的 HTTPS 請求，每個檔一個；**同一個下載處理端**照樣管它（§5.1）：
+  認領、downloading 表、取消旗標、進度推播 `media.download` 都一樣，只是「塊請求」換成「這條 HTTP 的下一段」。所有檔一起跑照舊。
+- **解密用上游的 `AttachmentDecryptor`**（`matrix-sdk-crypto`），🚫 自己刻 AES-CTR。它在讀到結尾時才比 hash、對不上回錯——正好是這裡要的時機。
+  它吃同步的 `Read`：跟上傳一樣在 `spawn_blocking` 裡跑，進出各一個有界 channel（/docs/design/rpc-specs/data-plane.md §7.2）。
+- **背壓**：池寫得慢就晚一點讀 HTTP 的下一段；記憶體裡同時只有幾段。🚫 整檔讀進記憶體（🚫 用 matrix-sdk 的 `get_media_content`，它回 `Vec<u8>`）。
+- **金鑰從哪來**：跟 §3.2 一樣從 `cache.db` 找引用這個 mxc 的事件，讀 `content_json` 的 `file`（`key`、`iv`、`hashes.sha256`、`v`）。
+  `v` 不是 `"v2"`、缺任何一個欄位 → 這個 mxc 當壞的（fail closed），🚫 試著解。
+- **快取命中**（§5.3）：`kind` 2 比 `media.hash`（記的是事件的 `file.hashes.sha256`，/docs/design/storage/local-cache-db.md §5）跟這次的描述，對不上就是那則描述錯（回錯，完成的快取🚫 刪）；
+  `kind` 3 只能比大小（有的話）。
+
+### 12.2 GET：邊下載邊讀、驗證中也能讀，狀態碼說可不可信
+
+- 路由照 §7.2，只有兩個差別：**沒有 seek 暫存檔、沒有現拉**（一個 HTTP 從頭讀到尾，拉不了第 n 塊）。GET 要的位置還沒寫到，就停著等主檔寫到那裡。
+- **資料照給，狀態碼說它可不可信**（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2）：
+  `kind` 2 的 `verified` 是 0（下載中、驗證中）或 2（驗不過）→ **412**、body 照給；是 1 → 200／206。`kind` 1、3 一律 200／206。
+  從驗證中變成驗完的那一刻，已經在吐的 GET 🚫 中斷：狀態碼在開始時就送了，前端想知道結果看推播（§12.3）或再問一次（`HEAD`）。
+- `kind` 2 在整檔 hash 比對之前交出去的位元組**還沒驗過**（AES-CTR 沒有防竄改，/docs/design/rpc-specs/data-plane.md §7.3）：這就是 412 的意思，要不要用由前端決定。
+
+### 12.3 驗證：下載完自動跑，`verified` 記結果、驗過就🚫 再驗（維護者 2026-10-06）
+
+`media.verified`（/docs/design/storage/local-cache-db.md §5）是整檔跟發送者給的 hash 比對的結果，程式裡是 enum、DB 存整數：
+
+| 值 | 程式裡的名字 | 意思 |
+|---|---|---|
+| 0 | `Unknown` | 還沒驗、不知道（下載中、驗證中，或根本沒有 hash 可比） |
+| 1 | `Matched` | 驗了，正確 |
+| 2 | `Mismatched` | 驗了，不正確 |
+
+**誰、什麼時候驗**：下載讀完那一刻**自動觸發**，🚫 等誰來叫。hash 是下載途中一段一段餵的，所以「驗證」就是收尾時把算好的值拿去比、寫結果：
+
+| `kind` | 比什麼 | 結果 |
+|---|---|---|
+| 1 `WbfChunked` | 區塊有帶 `sha256` 就比整檔明文的 SHA-256（§4.1 寫入第 3 步本來就在算） | 1 或 2；區塊沒帶 → 🚫 驗，留 0 |
+| 2 `MatrixEncrypted` | 密文的 SHA-256 跟事件的 `file.hashes.sha256` | 1 或 2 |
+| 3 `MatrixPlain` | 沒有 hash | 🚫 驗，留 0 |
+
+- **驗不過🚫 刪檔、🚫 當成下載失敗**：照樣收尾（`complete = 1`），記 `verified = 2`。資料留著，讀的時候用狀態碼講（GET 的 412、匯出的 1501，/docs/design/rpc-specs/data-plane.md §8.2）。
+  📎 這改掉了 §4.1 原本「`kind` 1 區塊 sha256 對不上是壞檔」：要不要用由前端決定，daemon 只把事實記下來。
+- **`complete` 與 `verified` 同一筆寫入**（`media_finish`）：🚫 有「完成了卻還沒驗」的中間狀態落在 DB 裡；驗證中當掉，下次照 §12.4 從頭重下。
+- **驗過（1 或 2）就🚫 再驗**：匯出、GET、快取命中都只看這一欄，🚫 重算。要重驗只有一條路：把這個檔從池拿掉、重下。
+- `adopt` 去重（同一個明文被兩個 mxc 指著）：`verified` 記在 `media` 列（每個 mxc 一列），🚫 記在池檔。另一個 mxc 指到同一個池檔，它自己的列照它自己的收尾寫。
+
+**進度推播**（`media.download`，§5.5）：要驗的檔（`kind` 2、帶 `sha256` 的 `kind` 1）在讀完時多一則、收尾時一則：
+
+```jsonc
+{ "user": "@alice:localhost", "mxc": "mxc://…", "state": "verifying", "done": 812, "total": 812 }       // 讀完了、正在比 hash
+{ "user": "@alice:localhost", "mxc": "mxc://…", "state": "complete", "done": 812, "total": 812, "verified": 1 }   // 驗證成功
+{ "user": "@alice:localhost", "mxc": "mxc://…", "state": "complete", "done": 812, "total": 812, "verified": 2 }   // 驗證失敗（資料仍在）
+```
+
+- `state` 多一個值 `verifying`；`complete` 一律帶 `verified`（0／1／2），🚫 只在要驗的檔帶——前端不必分辨「沒帶」與「0」。
+- `verifying` 很短（hash 是邊下載邊算的，收尾只是比一次），但照樣發：前端可以顯示「驗證中」，也讓「下載完」與「可以信」這兩件事在推播上分開。
+- 已經完成的檔再被要求下載（快取命中）：回 `complete` 時照樣帶這一列的 `verified`，🚫 再驗。
+
+### 12.4 🚫 續傳、🚫 seek（第一版）
+
+- daemon 重開、取消後再要：`kind` 2、3 的 pending 主檔**直接刪掉、從頭重下**（§4.1 的續傳只給 `kind` 1）。檔受 server 的上限（通常幾十 MB），而且是快取。
+- 要續傳得有兩樣：server 支援 HTTP Range（規格沒保證），以及「從任意位置開始的 CTR」與重算前面那段密文的 SHA-256（拿池裡的明文用同一組 key／IV 再加密一次就是原本的密文）。
+  上游的 `AttachmentDecryptor` 不支援從中間開始，要自己用 `ctr` 的 seek——之後真的需要再做。
+
+### 12.5 測試要釘的
+
+- 假 server，`kind` 2 對的檔：推播依序 `downloading` → `verifying` → `complete` 帶 `verified: 1`；列 `complete = 1`、`verified = 1`；完成後 GET 是 200／206。
+- 假 server，`kind` 2 翻一個密文 bit：下載中 GET 是 **412、body 照給**（跟 200 會給的 bytes 一樣）；收尾🚫 刪檔、推播 `complete` 帶 `verified: 2`、列 `verified = 2`；之後 GET 仍是 412、body 照給。
+- 每個 GET／HEAD 回應都帶 `Wbf-Media-Kind`、`Wbf-Media-Verified`；有 Range 時 412 一樣帶 `Content-Range`、只給那一段。
+- `kind` 1：下載中、完成後都是 200／206，不論 `verified`；區塊 sha256 對不上 → `verified = 2`、🚫 當壞檔、GET 照樣 2xx。
+- `kind` 3：🚫 `verifying`、完成時 `verified = 0`、GET 2xx；`info.size` 對不上 → `Integrity`。
+- 驗過的檔🚫 再驗：快取命中、匯出、GET 都🚫 再餵任何 hash 器。
+- 從池匯出：`kind` 1、3 照匯、成功；`kind` 2 `verified = 1` 成功、`verified = 2` **照匯**（`to` 有檔）而且回 1501、`data` 是那份結果。
+- 跟 `AttachmentEncryptor` 互通：我們上傳的（/docs/design/rpc-specs/data-plane.md §7.2）用上游的 `AttachmentDecryptor` 解得開，反過來也是。
+- 真 server：用 matrix-sdk 的 Client（等同 Element 的格式）在加密房送一個附件，wbf 帳號 `media.open` → GET 整檔對。

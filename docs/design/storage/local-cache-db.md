@@ -115,9 +115,10 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v8，就是 `wbf-sdk::cache` 建的）
+## 5. 快取的 schema（v9，就是 `wbf-sdk::cache` 建的；v9 還沒實作，現在的程式是 v8）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
+📎 v8 → v9（`media` 加 `kind`、`verified`）一樣整個重建：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
 
 三條原則：
 
@@ -208,20 +209,37 @@ CREATE TABLE read_positions (
 
 -- 媒體：mxc → 池裡的檔（/docs/design/media/media-pool.md）。不分帳號、不要可見性（維護者 2026-09-07 定）：拿得到 mxc 的人 server 就給他檔，可見性在事件那層已經擋過。
 -- pool_file 是明文的 BLAKE3 hex：同內容不同 mxc 只存一份；下載中先用暫存名，完成算完 hash 再 rename。
+-- v9（維護者 2026-10-06）：加 kind 與 verified；chunk_size、file_size 只有 kind 1 一定有（/docs/design/rpc-specs/data-plane.md §7.1、/docs/design/media/media-download.md §12）。
 CREATE TABLE media (
   id INTEGER PRIMARY KEY,
   mxc TEXT NOT NULL UNIQUE,
   pool_file TEXT,                       -- NULL = 還在下載
   name TEXT, mimetype TEXT,
-  hash TEXT,                            -- 明文校驗碼 "<algo>:<hex>"：事件區塊有 sha256 就是 "sha256:…"（上傳者算的）；沒帶就下載完填 "blake3:…"（我們算的，同 pool_file）
-  file_size INTEGER NOT NULL,           -- 明文總長，從事件區塊來
-  chunk_size INTEGER NOT NULL,          -- 事件區塊的塊大小
+  -- 這個檔是哪種格式，建列時照事件內容判斷：1 = wbf 分塊（org.wbftw.wbfuwunel.chunked）、2 = Matrix 加密（file，EncryptedFile v2）、3 = Matrix 明文（只有 url）。
+  --   程式裡是 enum MediaKind { WbfChunked = 1, MatrixEncrypted = 2, MatrixPlain = 3 }，DB 存整數（維護者 2026-10-06）。
+  --   🚫 0、🚫 DEFAULT：漏寫就被 NOT NULL 擋下，🚫 悄悄變成某一種。讀到不認得的數字就當這列壞了、重新照事件判斷。
+  kind INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
+  -- 整檔跟發送者給的 hash 比對的結果（維護者 2026-10-06）：0 = 還沒驗、不知道；1 = 驗了、正確；2 = 驗了、不正確。
+  --   程式裡是 enum Verification { Unknown = 0, Matched = 1, Mismatched = 2 }。驗過（1 或 2）就🚫 再驗。
+  --   下載完自動驗，結果跟 complete = 1 在同一筆寫入裡（/docs/design/media/media-download.md §12.3）；沒有 hash 可比的（kind 3、區塊沒帶 sha256 的 kind 1）永遠 0。
+  --   驗不過🚫 刪檔：資料留著、標 2，讀的時候用狀態碼講（傳統加密的 GET 是 412，/docs/design/rpc-specs/data-plane.md §8.2）。
+  verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1, 2)),
+  -- 校驗碼 "<algo>:<值>"：
+  --   kind 1：事件區塊有 sha256 就是 "sha256:…"（上傳者算的明文）；沒帶就下載完填 "blake3:…"（我們算的，同 pool_file）
+  --   kind 2："matrix-sha256:<事件裡的 unpadded base64>"——算的是**密文**，🚫 跟 kind 1 的 "sha256:" 混用（同一個字串前綴說的是兩件事會被拿來互比）
+  --   kind 3：下載完填 "blake3:…"
+  hash TEXT,
+  file_size INTEGER,                    -- 明文總長：kind 1 從事件區塊來（一定有）；kind 2、3 從 info.size（選填），沒給就下載完才填
+  chunk_size INTEGER,                   -- 事件區塊的塊大小；只有 kind 1 有
   segments_written INTEGER NOT NULL,    -- 池主檔已落地的完整段數（64 KiB 一段，每 1.5 秒寫一次）：只給顯示，🚫 不當續傳依據（/docs/design/media/media-download.md §4.1）
   complete INTEGER NOT NULL,            -- 1 = 整檔都在
   bytes_on_disk INTEGER NOT NULL,       -- 配額用
   created_at INTEGER NOT NULL,          -- 下載（建立）時間
   last_used_at INTEGER NOT NULL,        -- 最後一次看過
-  source_uri TEXT);                     -- 這台機器上傳它時 UI 給的原檔位置（URI）；讀的時候原檔在、大小對得上就讀它（/docs/design/rpc-specs/data-plane.md §8.1）
+  source_uri TEXT,                      -- 這台機器上傳它時 UI 給的原檔位置（URI）；讀的時候原檔在、大小對得上就讀它（/docs/design/rpc-specs/data-plane.md §8.1）
+  -- kind 1 的兩個大小一定有（v8 的 NOT NULL 搬到這裡）；驗過（1、2）一定已經 complete。
+  CHECK (kind <> 1 OR (file_size IS NOT NULL AND chunk_size IS NOT NULL)),
+  CHECK (verified = 0 OR complete = 1));
 CREATE INDEX media_lru ON media (last_used_at);
 CREATE INDEX media_by_pool_file ON media (pool_file) WHERE pool_file IS NOT NULL;   -- 同一個檔被幾個 mxc 指著，清檔前要問
 
@@ -257,7 +275,7 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - `Cache::open(dir, key, identity)` 回 `OpenOutcome`（Reused／Created／Rebuilt），呼叫者印出來，重建不是靜默的。錯金鑰在第一次讀頁就是「file is not a database」，走重建；「這個 build 沒有 SQLCipher」是另一種錯，往上丟（§3 的 fail closed）。
 - `read_positions.event` 指事件列：那則還沒進快取就拒絕標已讀（先同步再標）。
 - `hide_message` 只對這個帳號的 synced_log 列動手，沒同步過的東西沒有可藏的（回 false）。
-- `media` 列在 file 事件進來時 `INSERT OR IGNORE` 建（已有就不動）；下載進度與完成由 `media_begin`／`media_progress`／`media_finish` 寫（/docs/design/media/media-pool.md §3）。
+- `media` 列在 file 事件進來時 `INSERT OR IGNORE` 建（已有就不動），`kind` 照事件內容判斷（/docs/design/rpc-specs/data-plane.md §7.1；v9 起標準的 `m.file`／`m.image`… 也建）；下載進度與完成由 `media_begin`／`media_progress`／`media_finish` 寫（/docs/design/media/media-pool.md §3）。
 
 ## 6. 還開著的
 

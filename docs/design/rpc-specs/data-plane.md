@@ -158,7 +158,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 
 - 「房間加不加密」問的是**這一刻**的 `m.room.encryption`，🚫 不用快取（過期的「沒加密」會把金鑰公開出去）。
 - `size: 0` 是 1100：協議沒有零塊的上傳。
-- 一般 Matrix 帳號現在是 1100（§7）。
+- 一般 Matrix 帳號走傳統上傳（§7.2）：要 `size`、受 `m.upload.size` 限制、`cipher` 只認沒給與 `none`。（實作之前仍回 1100。）
 - `upload_id` 給 `upload.status`／`upload.abort` 用；UI 送訊息用的是 PUT 回的 manifest（§5）。
 - `source_uri` 跟上傳狀態一起封在 `Wbf-Upload-Meta` 裡（§2），PUT 傳完（`Seal` 成功、而且 server 沒截斷）才寫進 `media` 列；
   寫不進去只發一則提醒、PUT 照樣回 200（檔已經在 server 上了）。
@@ -275,21 +275,67 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
   那邊一般 Matrix 帳號是 `false`（/docs/design/rpc-specs/rpc-spec.md §3.3）。
 - ⚠️ 上傳完到送出之間，媒體靠保護期撐著；保護期是 server 的設定，client 🚫 不假設它多長。UI 拿到 manifest 就盡快送。
 
-## 7. 一般 Matrix 的 homeserver：傳統上傳（還沒做）
+## 7. 傳統格式：一般 Matrix 的 homeserver 上傳、任何帳號下載標準附件（維護者 2026-09-30、10-06 定；還沒做）
 
-維護者 2026-09-30 定：homeserver 是官方 Matrix（不講 wbf）時，**用傳統方式上傳**，不是 wbf 的分塊。現在 `media.create` 對一般 Matrix 帳號回 1100。
+homeserver 是官方 Matrix（不講 wbf）時，**用傳統方式上傳**，不是 wbf 的分塊（維護者 2026-09-30）。
+下載是另一件事：**wbf 帳號也會收到傳統格式的附件**（同一台 server 上用 Element 的人、別台 server 同步過來的），所以傳統下載兩種帳號都要有，
+看的是**檔案的格式**（事件內容），🚫 不是帳號的種類（/docs/design/media/media-download.md §12）。
 
-預定的形狀（UI 看到的 `media.create` → `PUT` → `room.send_attachment` 不變；下載一起做：`media.download`／`open`／`export_to` 對一般 Matrix 帳號現在也是 1100）：
+UI 看到的形狀不變：`media.create` → `PUT` → `room.send_attachment`；讀一律 `media.open` → `GET /media`。
+
+### 7.1 檔案有三種（`media.kind`）
+
+| `kind` | 程式裡的名字 | 事件 `content` 裡有 | 加密 | 完整性 |
+|---|---|---|---|---|
+| 1 | `WbfChunked` | `org.wbftw.wbfuwunel.chunked`（/docs/design/media/wbf-client-convention-for-chunk.md §5） | 每塊各自 AEAD | 每塊收到就驗得了 |
+| 2 | `MatrixEncrypted` | `file`（Matrix 的 `EncryptedFile`，`v: "v2"`） | 整檔一條 AES-256-CTR | 只有整檔讀完、比密文的 SHA-256（`file.hashes.sha256`）才知道 |
+| 3 | `MatrixPlain` | 只有 `url` | 沒有 | 沒有可比的（只能靠 TLS 信 server） |
+
+- 判斷順序照上表由上往下；三個都沒有就不是檔，不建 `media` 列。
+- 程式裡是 enum、DB 存整數（維護者 2026-10-06）：讀到不認得的整數就當這一列壞了（🚫 猜成哪一種），那個 mxc 重新照事件內容判斷。
+- `0` 🚫 是任何一種：漏寫或預設成 0 會被 CHECK 擋下來，而不是悄悄變成某一種。
+
+### 7.2 上傳（只有一般 Matrix 帳號）
+
+wbf 帳號一律走分塊（§4），🚫 走這條。
 
 | 步驟 | 明文房 | 加密房 |
 |---|---|---|
-| `media.create` | `POST /_matrix/media/v1/create` 預先拿 mxc | 同左，另外產一組 AES-256-CTR 的鑰與 IV |
-| `PUT` | 串流轉送到 `PUT /_matrix/media/v3/upload/{server}/{media_id}`（要 `Content-Length`，所以只收固定大小） | 邊收邊 AES-CTR 加密、邊算密文的 SHA-256，一樣串流轉送 |
-| `room.send_attachment` | 標準的 `m.file`／`m.image`…，`url` 就是 mxc | `m.file` 的 `file` 欄位（`EncryptedFile`：`key`、`iv`、`hashes.sha256`、`v: "v2"`），Megolm 加密送出 |
-| 附件宣告 | 沒有這個機制：媒體留多久照那台 server 自己的設定 | 同左 |
+| `media.create` | 先問 `GET /_matrix/client/v1/media/config` 的 `m.upload.size`，`size` 超過就 **1100**、🚫 讀任何 bytes；再 `POST /_matrix/media/v1/create` 預先拿 mxc | 同左 |
+| `PUT` | PUT 進來的 body 一段一段直接串流成 `PUT /_matrix/media/v3/upload/{server}/{media_id}` 的 body | 同左，中間邊收邊 AES-256-CTR 加密、邊算密文的 SHA-256 |
+| PUT 回的 manifest | `{ server, mxc, kind: 3, name, mimetype, size }` | `{ server, mxc, kind: 2, name, mimetype, size, file: EncryptedFile }`（含 `key`、`iv`、`hashes.sha256`） |
+| `room.send_attachment` | 標準的 `m.file`／`m.image`／`m.video`／`m.audio`，`url` 就是 mxc；`info.size`、`info.mimetype` 照 manifest | 同左，但 `url` 換成 `file`；Megolm 加密送出（matrix-sdk 的 `Room::send`） |
+| 附件宣告（§6） | 沒有這個機制：媒體留多久照那台 server 自己的設定；`attachment_declared` 是 `false` | 同左 |
 
-- 🚫 不能整檔讀進記憶體：`/upload` 一個請求送完整個檔，所以是「PUT 進來的 body 直接串流成 `/upload` 的 body」，daemon 手上只有一小段。
-- 這條路的檔案用的是 Matrix 標準格式，別的 Matrix client 看得懂；wbf 的分塊檔只有 wbf client 看得懂（/docs/design/media/wbf-client-convention-for-chunk.md §5）。
+- **只收固定大小**：`/upload` 一個請求送完整個檔，要先講 `Content-Length`。`media.create` 沒給 `size` 就 **1100**。CTR 不改長度，密文長度就是 `size`。
+- **加不加密照 §4.1 那張表**（問這一刻的房間）；`cipher` 只認「沒給」與 `none`，給了 wbf 的演算法名字是 1100（這條路只有 AES-256-CTR v2）；`chunk_size` 不適用，給了也忽略。
+- **🚫 整檔讀進記憶體**（維護者 2026-10-06）：AES-CTR 是串流加密，第 i 個 byte 的密文只看明文第 i 個 byte 與它的位置；SHA-256 也能一段一段餵，
+  而 hash 要到 `room.send_attachment` 才用得到，那時已經算完。所以 daemon 手上只有一小段，背壓同 §4.5（上游送不出去就不讀 PUT 的 body）。
+- **加密用上游的串流零件**：`matrix-sdk-crypto` 的 `AttachmentEncryptor`（包住一個 `Read`、讀完 `finish()` 拿 `key`／`iv`／`hashes`）。🚫 自己刻 AES-CTR。
+  它吃同步的 `Read`：在 `spawn_blocking` 裡跑，PUT 的 body 經一個有界 channel 餵它，加密後的段經另一個有界 channel 交給 HTTP 的串流 body；兩個 channel 都只放幾段，背壓不斷。
+  🚫 用 matrix-sdk 的 `Media::upload`／`upload_encrypted_file`：它們先 `read_to_end` 整檔進記憶體。
+- **金鑰與 IV 每次 PUT 現產**，🚫 在 `media.create` 產、🚫 放進 `Wbf-Upload-Meta`：同一組 key／IV 加密兩份不同的 body（UI 重送時改了檔）會洩漏兩份明文的 XOR。
+  金鑰只在 PUT 回的 manifest 裡（跟 §4.2 一樣，UI 要存就自己用私有權限存）。
+- **body 比 `size` 短或長**：中斷上游的請求（🚫 送出一個長度不對的檔），回 **400**。
+- **🚫 續傳**：傳統 `/upload` 沒有「收到第幾塊」。斷了 UI 用同一組 URL 再 PUT 一次**整個** body，daemon 用新的 key／IV 重送到同一個 mxc；
+  server 說那個 mxc 已經有內容（`M_CANNOT_OVERWRITE_MEDIA`）或預先拿的 mxc 過期了 → **502**，重新 `media.create`。
+- 這條路的檔案用 Matrix 標準格式，別的 Matrix client 看得懂；wbf 的分塊檔只有 wbf client 看得懂（/docs/design/media/wbf-client-convention-for-chunk.md §5）。
+- ⚠️ server 那邊收 `/upload` 是整檔進記憶體、可能沒有並行上限（wbfuwunel #110，server 怎麼做維護者還沒決定）；client 這邊🚫 為它做任何事，只照 `m.upload.size`。
+
+### 7.3 下載（兩種帳號都要）
+
+`kind` 2、3 的檔：`GET /_matrix/client/v1/media/download/{server}/{media_id}`（帶這個帳號的 access token；舊 server 回 `M_UNRECOGNIZED` 才退到 `/_matrix/media/v3/download/…`），
+一個請求從頭讀到尾，邊收邊（`kind` 2）解密、邊照池格式 v2 寫進主檔。細節在 /docs/design/media/media-download.md §12；這裡只講 UI 看得到的：
+
+- **`GET /media` 可以邊下載邊讀、驗證中也能讀**（維護者 2026-10-06）：已經寫進主檔的段照常交出去，跟 `kind` 1 一樣。
+  ⚠️ `kind` 2 在整檔 hash 比對之前，交出去的位元組**還沒驗過**：AES-CTR 沒有防竄改，server 翻一個密文 bit，明文同一個 bit 就翻了、解密照樣成功。
+  所以 `kind` 2 沒驗過、驗不過時狀態碼是 **412**、body 照給（§8.2 的約定）。
+- **下載完自動驗**：`kind` 2 比密文的 SHA-256 與事件的 `file.hashes.sha256`，推播 `media.download` 先報 `verifying`、再報結果
+  （`verified`：1 正確、2 不正確，/docs/design/media/media-download.md §12.3）。**驗不過🚫 刪檔**：資料留著、標 2，讀的時候是 412。
+  `kind` 3 沒有 hash：大小對得上事件的 `info.size`（有給的話）就完成，`verified = 0`。
+- **🚫 seek**：一個 HTTP 從頭讀到尾，沒有「先拉第 n 塊」。GET 要的位置還沒寫到就停著等主檔寫到那裡（同 §8「上游慢就停著等」）。
+- **🚫 續傳**：daemon 重開或取消之後再要，從頭重下（它受 server 的上限、是快取）。要續傳得有 HTTP Range ＋ 從任意位置開始的 CTR，之後真的需要再做。
+- `media.export_to` 跟 GET 同一個約定（/docs/design/media/media-download.md §7.3）。
 
 ## 8. 讀：`GET /media/mxc/<URL key>`
 
@@ -321,6 +367,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
 |---|---|
 | 支援 | `Range` 單一一段：`bytes=a-b`、`bytes=a-`、`bytes=-n`（最後 n byte），終點超過檔尾就截到檔尾；沒帶、寫壞了、不只一段 → 整檔（RFC 9110 §14.2：認不得的 Range 可以不理）。`HEAD` 回一樣的標頭、沒有 body |
 | 回 | `200`（整檔）／`206 Partial Content`（有 Range，帶 `Content-Range`）；`Content-Type` 是 `media` 列的 mimetype（沒有就用區塊的），都沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length`；`X-Content-Type-Options: nosniff` 與 `Content-Security-Policy: sandbox`（型別是寄件者填的，被瀏覽器當頁面打開時🚫 跑腳本） |
+| `412` | `kind` 2（傳統加密）的檔還沒驗、或驗不過：**body 照給**，跟 `200`／`206` 一樣（§8.2 的約定）。每個回應都帶 `Wbf-Media-Kind`、`Wbf-Media-Verified` |
 | `416` | Range 的起點在檔尾或之後（帶 `Content-Range: bytes */<大小>`） |
 | `404` | 不是這個 daemon 發的 URL、用途不對（上傳的 URL）、或本機沒有任何帳號有這個 mxc 的紀錄 |
 | `503` | 未解鎖 |
@@ -359,6 +406,27 @@ media 列在，而且 source_uri 不是空的
 - **約定**：UI 一律給 `file://` 開頭的 URI，🚫 不要直接給 `/絕對路徑`。daemon 🚫 不擋非法的值（`media.create` 照收、照記），只是讀的時候不走本機。
 - 只有**這台機器傳的**檔才有 `source_uri`；別人傳來的、或 UI 沒給的，一律走池。
 
+### 8.2 資料照給，狀態碼說它可不可信（維護者 2026-10-06 定的約定）
+
+**約定**：還沒驗、或驗不過的檔，daemon 🚫 擋、🚫 刪，**資料照給，用狀態碼（RPC 是錯誤碼）告訴前端它可不可信**。
+前端看狀態碼決定要不要用；堅決要拿就照拿——資料都在 body，該警告使用者的由 UI 警告。
+
+| 檔（`media.kind`，§7.1） | `media.verified` | `GET`／`HEAD` 的狀態碼 | body |
+|---|---|---|---|
+| 1 `WbfChunked` | 不看 | `200`／`206` | 照常 |
+| 2 `MatrixEncrypted` | 1 驗了、正確 | `200`／`206` | 照常 |
+| 2 `MatrixEncrypted` | 0 還沒驗（下載中、驗證中）或 2 驗了、不正確 | **`412 Precondition Failed`** | **照常**：跟 `200`／`206` 會給的一模一樣（有 Range 就帶 `Content-Range`、只給那一段） |
+| 3 `MatrixPlain` | 不看（沒有 hash 可比） | `200`／`206` | 照常 |
+| 任何一種，從本機原檔讀（§8.1） | 不看 | `200`／`206` | 照常（這台機器自己傳的） |
+
+- **為什麼只有 `kind` 2**：`kind` 1 每塊下載時各自 AEAD 驗過（不需要整檔 hash）；`kind` 3 沒有發送者給的 hash，驗不了也就沒有「沒驗過」可說；
+  只有 `kind` 2 是「有 hash 可比、而 AES-CTR 本身擋不住竄改」（§7.3）。
+- **每個回應都帶兩個標頭**，讓前端知道 412 是哪一種：`Wbf-Media-Kind: 1|2|3`、`Wbf-Media-Verified: 0|1|2`（`HEAD` 也有，前端可以先問再決定要不要拿）。
+- ⚠️ 412 對一般播放器就是錯誤：`<video src=…>` 這類直接吃 URL 的 🚫 會播還沒驗過的 `kind` 2。這是刻意的安全預設——
+  要在驗完之前就播，UI 得自己用 HTTP client 拿、看到 412 仍然收 body。
+- 412 是「條件不成立」：這裡的條件是「這個檔驗過、而且正確」，而前端🚫 必帶任何條件標頭——條件是這個約定本身。
+- 驗證本身與它的進度推播在 /docs/design/media/media-download.md §12.3；`media.export_to` 用同一個約定（/docs/design/media/media-download.md §7.3）。
+
 ## 9. 本機這一段的取捨：現在是明文（維護者 2026-09-30 定）
 
 UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 token 加密發的」。老實寫清楚這條線擋得住誰、擋不住誰：
@@ -396,7 +464,8 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | `media.create`、`PUT /upload/mxc/…`、`room.send_attachment`（wbf 帳號，明文房與加密房，固定大小與串流） | ✅ | core `attachment_ops::tests`、daemon `data_plane::tests` 與 `tests/data_plane.rs`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms` |
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
-| 一般 Matrix 帳號的傳統上傳與下載（§7） | ❌ | |
+| 一般 Matrix 帳號的傳統上傳（§7.2） | ❌（2026-10-06 定了形狀：串流 AES-CTR、只收固定大小、先問 `m.upload.size`） | |
+| 傳統格式附件的下載，兩種帳號（§7.3、/docs/design/media/media-download.md §12） | ❌（同上：`media.kind`／`verified`、邊下載邊讀、收尾才驗、🚫 seek、🚫 續傳） | |
 | `media.open`、`GET`／`HEAD /media`（Range、416、用途不對的 URL 不收）、下載處理端、seek 暫存檔（§8，/docs/design/media/media-download.md） | ✅ | daemon `data_plane::tests` 與 `tests/data_plane.rs`、core `download_queue::tests`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms`；清單在 /docs/design/media/media-download.md §10 |
 | `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對；讀的時候優先讀原檔（§8.1） | ✅ | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
 | UI 指定從第幾 byte 續傳 | ❌ | |
