@@ -335,91 +335,25 @@ impl Vault {
             serde_json::to_vec(session)
                 .map_err(|error| crate::error::cannot_serialize("Session", error))?,
         );
-        self.seal_file(path, &plaintext, SESSION_AAD, "seal session")
+        seal_file(
+            &self.session_key(),
+            path,
+            &plaintext,
+            SESSION_AAD,
+            "seal session",
+        )
     }
 
-    /// 把後台送房間金鑰的 queue 封進 `path`（/docs/design/storage/local-storage.md 的 `m/ks.sealed`）。
-    /// 內容是房間 id 與成員的 mxid：沒有金鑰，但會露出「誰在哪個房」，而目錄名加密就是為了不讓 mxid 出現在硬碟上，所以封起來。
-    /// 第三把子金鑰、自己的 aad；先寫暫存檔再 rename。
+    /// 後台送房間金鑰的 queue 檔（/docs/design/storage/local-storage.md 的 `m/ks.sealed`）：交給長活的 task，
+    /// 它只拿到第三把子金鑰與路徑，🚫 握主金鑰。
     ///
     /// Args:
     ///     path: example: "<account dir>/m/ks.sealed"
-    ///     plaintext: 呼叫端序列化好的 queue, example: br#"{"rooms":{}}"#
-    pub fn seal_key_share_queue(&self, path: &Path, plaintext: &[u8]) -> Result<(), SdkError> {
-        self.seal_file(path, plaintext, KEY_SHARE_QUEUE_AAD, "seal key-share queue")
-    }
-
-    /// Return:
-    ///     Ok(Some(bytes))   封著的 queue（呼叫端自己解析）
-    ///     Ok(None)          沒有這個檔（沒有沒送完的）
-    ///     Err(Usage)        檔案壞了、不是這把主金鑰封的、或版本不認得
-    pub fn unseal_key_share_queue(
-        &self,
-        path: &Path,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>, SdkError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let file: SealedFile = serde_json::from_slice(&bytes).map_err(|error| {
-            SdkError::Usage(format!("{} is not readable: {error}", path.display()))
-        })?;
-        if file.v != SEALED_VERSION {
-            return Err(SdkError::Usage(format!(
-                "{} has version {}, this build understands {SEALED_VERSION}",
-                path.display(),
-                file.v
-            )));
+    pub fn key_share_queue_file(&self, path: &Path) -> KeyShareQueueFile {
+        KeyShareQueueFile {
+            path: path.to_path_buf(),
+            key: self.session_key(),
         }
-        let nonce = decode_base64(&file.nonce, "nonce")?;
-        let sealed = decode_base64(&file.sealed, "sealed")?;
-        let plaintext = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
-            .decrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: &sealed,
-                    aad: KEY_SHARE_QUEUE_AAD,
-                },
-            )
-            .map_err(|_| {
-                SdkError::Usage(format!(
-                    "cannot open {}; it was sealed with another key file",
-                    path.display()
-                ))
-            })?;
-        Ok(Some(Zeroizing::new(plaintext)))
-    }
-
-    /// 用第三把子金鑰（XChaCha20-Poly1305）封一份東西進 `path`：`{ v, nonce, sealed }` 的 JSON，先寫暫存檔再 rename、0600。
-    /// 每種檔帶自己的 aad，密文搬到別種檔解不開。
-    fn seal_file(
-        &self,
-        path: &Path,
-        plaintext: &[u8],
-        aad: &[u8],
-        what: &str,
-    ) -> Result<(), SdkError> {
-        let nonce = random_nonce()?;
-        let sealed = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .map_err(|_| SdkError::Io(std::io::Error::other(what.to_string())))?;
-        let file = SealedFile {
-            v: SEALED_VERSION,
-            nonce: encode_base64(&nonce),
-            sealed: encode_base64(&sealed),
-        };
-        write_private(
-            path,
-            &serde_json::to_vec_pretty(&file)
-                .map_err(|error| crate::error::cannot_serialize("SealedFile", error))?,
-        )
     }
 
     /// 把 `key-backup recovery` 產生的那串 recovery key 封進 `path`（維護者 2026-09-09）。
@@ -434,7 +368,8 @@ impl Vault {
     ///     path: example: "<data dir>/r/<b58 nonce>_<b58 密文>"
     ///     recovery_key: 🚫 不印、不 log
     pub fn seal_recovery_key(&self, path: &Path, recovery_key: &str) -> Result<(), SdkError> {
-        self.seal_file(
+        seal_file(
+            &self.session_key(),
             path,
             recovery_key.as_bytes(),
             RECOVERY_AAD,
@@ -641,6 +576,113 @@ fn decode_key32(text: &str, field: &str) -> Result<Key32, SdkError> {
     Ok(Key32(array))
 }
 
+/// 後台送房間金鑰的 queue 檔（`m/ks.sealed`，/docs/design/storage/local-storage.md）：路徑加第三把子金鑰，drop 時歸零。
+/// 內容是房間 id 與成員的 mxid——沒有金鑰，但會露出「誰在哪個房」，而目錄名加密就是為了不讓 mxid 出現在硬碟上，所以封起來。
+pub struct KeyShareQueueFile {
+    path: PathBuf,
+    key: Key32,
+}
+
+impl KeyShareQueueFile {
+    /// Return:
+    ///     Ok(Some(bytes))   封著的 queue（呼叫端自己解析）
+    ///     Ok(None)          沒有這個檔（沒有沒送完的）
+    ///     Err(Usage)        檔案壞了、不是這把主金鑰封的、或版本不認得
+    pub fn read(&self) -> Result<Option<Zeroizing<Vec<u8>>>, SdkError> {
+        open_sealed_file(&self.key, &self.path, KEY_SHARE_QUEUE_AAD)
+    }
+
+    /// 封進去：先寫暫存檔再 rename、0600。
+    ///
+    /// Args:
+    ///     plaintext: 呼叫端序列化好的 queue, example: br#"{"rooms":{}}"#
+    pub fn write(&self, plaintext: &[u8]) -> Result<(), SdkError> {
+        seal_file(
+            &self.key,
+            &self.path,
+            plaintext,
+            KEY_SHARE_QUEUE_AAD,
+            "seal key-share queue",
+        )
+    }
+
+    /// 沒有要送的了：刪檔（本來就沒有也算成功）。
+    pub fn remove(&self) -> Result<(), SdkError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// 用一把子金鑰（XChaCha20-Poly1305）封一份東西進 `path`：`{ v, nonce, sealed }` 的 JSON，先寫暫存檔再 rename、0600。
+/// 每種檔帶自己的 aad，密文搬到別種檔解不開。
+fn seal_file(
+    key: &Key32,
+    path: &Path,
+    plaintext: &[u8],
+    aad: &[u8],
+    what: &str,
+) -> Result<(), SdkError> {
+    let nonce = random_nonce()?;
+    let sealed = XChaCha20Poly1305::new(key.as_bytes().into())
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| SdkError::Io(std::io::Error::other(what.to_string())))?;
+    let file = SealedFile {
+        v: SEALED_VERSION,
+        nonce: encode_base64(&nonce),
+        sealed: encode_base64(&sealed),
+    };
+    write_private(
+        path,
+        &serde_json::to_vec_pretty(&file)
+            .map_err(|error| crate::error::cannot_serialize("SealedFile", error))?,
+    )
+}
+
+/// Return:
+///     Ok(Some(bytes))   解開的內容
+///     Ok(None)          沒有這個檔
+///     Err(Usage)        檔案壞了、不是這把金鑰封的、aad 不對（別種檔）、或版本不認得
+fn open_sealed_file(
+    key: &Key32,
+    path: &Path,
+    aad: &[u8],
+) -> Result<Option<Zeroizing<Vec<u8>>>, SdkError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let file: SealedFile = serde_json::from_slice(&bytes)
+        .map_err(|error| SdkError::Usage(format!("{} is not readable: {error}", path.display())))?;
+    if file.v != SEALED_VERSION {
+        return Err(SdkError::Usage(format!(
+            "{} has version {}, this build understands {SEALED_VERSION}",
+            path.display(),
+            file.v
+        )));
+    }
+    let nonce = decode_base64(&file.nonce, "nonce")?;
+    let sealed = decode_base64(&file.sealed, "sealed")?;
+    let plaintext = XChaCha20Poly1305::new(key.as_bytes().into())
+        .decrypt(XNonce::from_slice(&nonce), Payload { msg: &sealed, aad })
+        .map_err(|_| {
+            SdkError::Usage(format!(
+                "cannot open {}; it was sealed with another key file",
+                path.display()
+            ))
+        })?;
+    Ok(Some(Zeroizing::new(plaintext)))
+}
+
 /// 含金鑰或 token 的檔：Unix 0600 建立；Windows 靠使用者目錄的 ACL（/docs/design/rpc-specs/wbf-cli-spec.md §5）。
 /// 先寫到同目錄的暫存檔再 rename：寫到一半斷電不會留下半個 `local.key`。
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
@@ -820,26 +862,23 @@ mod tests {
     fn the_key_share_queue_is_sealed_and_cannot_be_swapped_with_a_session_file() {
         let dir = scratch_dir("key-share-queue");
         let vault = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
-        let queue = dir.join("m").join("ks.sealed");
-        assert!(vault.unseal_key_share_queue(&queue).unwrap().is_none());
+        let path = dir.join("m").join("ks.sealed");
+        let queue = vault.key_share_queue_file(&path);
+        assert!(queue.read().unwrap().is_none());
         let plaintext = br#"{"rooms":{"!r:localhost":["@bob:localhost"]}}"#;
-        vault.seal_key_share_queue(&queue, plaintext).unwrap();
-        let raw = std::fs::read_to_string(&queue).unwrap();
+        queue.write(plaintext).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("@bob") && !raw.contains("!r:"), "{raw}");
-        assert_eq!(
-            vault
-                .unseal_key_share_queue(&queue)
-                .unwrap()
-                .unwrap()
-                .as_slice(),
-            plaintext
-        );
+        assert_eq!(queue.read().unwrap().unwrap().as_slice(), plaintext);
         let other = Vault::from_master(&dir, Key32([7u8; 32]), KeyMode::Plain);
-        assert!(other.unseal_key_share_queue(&queue).is_err());
+        assert!(other.key_share_queue_file(&path).read().is_err());
         let session = dir.join(SEALED_SESSION_FILE_NAME);
         vault.seal_session(&session, &sample_session()).unwrap();
-        assert!(vault.unseal_key_share_queue(&session).is_err());
-        assert!(vault.unseal_session(&queue).is_err());
+        assert!(vault.key_share_queue_file(&session).read().is_err());
+        assert!(vault.unseal_session(&path).is_err());
+        queue.remove().unwrap();
+        assert!(queue.read().unwrap().is_none());
+        queue.remove().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
