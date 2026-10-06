@@ -36,6 +36,9 @@ const SESSION_AAD: &[u8] = b"wbf-matrix-client session.sealed v1";
 const RECOVERY_AAD: &[u8] = b"wbf-matrix-client recovery.sealed v1";
 /// `local.key` 包主金鑰的 AEAD 附加資料。
 const WRAP_AAD: &[u8] = b"wbf-matrix-client local.key v1";
+/// 後台送房間金鑰的 queue（`m/ks.sealed`，/docs/design/storage/local-storage.md）的 AEAD 附加資料：跟 session、recovery key 同一把子金鑰，靠它分。
+/// 🚫 字串不要改：改了已經封好的 queue 就打不開。
+const KEY_SHARE_QUEUE_AAD: &[u8] = b"wbf-matrix-client key-share queue v1";
 
 const KEY_FILE_VERSION: u32 = 1;
 const SEALED_VERSION: u32 = 1;
@@ -332,16 +335,81 @@ impl Vault {
             serde_json::to_vec(session)
                 .map_err(|error| crate::error::cannot_serialize("Session", error))?,
         );
+        self.seal_file(path, &plaintext, SESSION_AAD, "seal session")
+    }
+
+    /// 把後台送房間金鑰的 queue 封進 `path`（/docs/design/storage/local-storage.md 的 `m/ks.sealed`）。
+    /// 內容是房間 id 與成員的 mxid：沒有金鑰，但會露出「誰在哪個房」，而目錄名加密就是為了不讓 mxid 出現在硬碟上，所以封起來。
+    /// 第三把子金鑰、自己的 aad；先寫暫存檔再 rename。
+    ///
+    /// Args:
+    ///     path: example: "<account dir>/m/ks.sealed"
+    ///     plaintext: 呼叫端序列化好的 queue, example: br#"{"rooms":{}}"#
+    pub fn seal_key_share_queue(&self, path: &Path, plaintext: &[u8]) -> Result<(), SdkError> {
+        self.seal_file(path, plaintext, KEY_SHARE_QUEUE_AAD, "seal key-share queue")
+    }
+
+    /// Return:
+    ///     Ok(Some(bytes))   封著的 queue（呼叫端自己解析）
+    ///     Ok(None)          沒有這個檔（沒有沒送完的）
+    ///     Err(Usage)        檔案壞了、不是這把主金鑰封的、或版本不認得
+    pub fn unseal_key_share_queue(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, SdkError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let file: SealedFile = serde_json::from_slice(&bytes).map_err(|error| {
+            SdkError::Usage(format!("{} is not readable: {error}", path.display()))
+        })?;
+        if file.v != SEALED_VERSION {
+            return Err(SdkError::Usage(format!(
+                "{} has version {}, this build understands {SEALED_VERSION}",
+                path.display(),
+                file.v
+            )));
+        }
+        let nonce = decode_base64(&file.nonce, "nonce")?;
+        let sealed = decode_base64(&file.sealed, "sealed")?;
+        let plaintext = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &sealed,
+                    aad: KEY_SHARE_QUEUE_AAD,
+                },
+            )
+            .map_err(|_| {
+                SdkError::Usage(format!(
+                    "cannot open {}; it was sealed with another key file",
+                    path.display()
+                ))
+            })?;
+        Ok(Some(Zeroizing::new(plaintext)))
+    }
+
+    /// 用第三把子金鑰（XChaCha20-Poly1305）封一份東西進 `path`：`{ v, nonce, sealed }` 的 JSON，先寫暫存檔再 rename、0600。
+    /// 每種檔帶自己的 aad，密文搬到別種檔解不開。
+    fn seal_file(
+        &self,
+        path: &Path,
+        plaintext: &[u8],
+        aad: &[u8],
+        what: &str,
+    ) -> Result<(), SdkError> {
         let nonce = random_nonce()?;
         let sealed = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
             .encrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: &plaintext,
-                    aad: SESSION_AAD,
+                    msg: plaintext,
+                    aad,
                 },
             )
-            .map_err(|_| SdkError::Io(std::io::Error::other("seal session")))?;
+            .map_err(|_| SdkError::Io(std::io::Error::other(what.to_string())))?;
         let file = SealedFile {
             v: SEALED_VERSION,
             nonce: encode_base64(&nonce),
@@ -366,25 +434,11 @@ impl Vault {
     ///     path: example: "<data dir>/r/<b58 nonce>_<b58 密文>"
     ///     recovery_key: 🚫 不印、不 log
     pub fn seal_recovery_key(&self, path: &Path, recovery_key: &str) -> Result<(), SdkError> {
-        let nonce = random_nonce()?;
-        let sealed = XChaCha20Poly1305::new(self.session_key().as_bytes().into())
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: recovery_key.as_bytes(),
-                    aad: RECOVERY_AAD,
-                },
-            )
-            .map_err(|_| SdkError::Io(std::io::Error::other("seal recovery key")))?;
-        let file = SealedFile {
-            v: SEALED_VERSION,
-            nonce: encode_base64(&nonce),
-            sealed: encode_base64(&sealed),
-        };
-        write_private(
+        self.seal_file(
             path,
-            &serde_json::to_vec_pretty(&file)
-                .map_err(|error| crate::error::cannot_serialize("SealedFile", error))?,
+            recovery_key.as_bytes(),
+            RECOVERY_AAD,
+            "seal recovery key",
         )
     }
 
@@ -761,6 +815,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `m/ks.sealed`：封得回來、磁碟上看不到 mxid；別把主金鑰解不開；`session.sealed` 拿來當 queue 也解不開（aad 不同）。
+    #[test]
+    fn the_key_share_queue_is_sealed_and_cannot_be_swapped_with_a_session_file() {
+        let dir = scratch_dir("key-share-queue");
+        let vault = Vault::create(&dir, &Unlock::NoPassphrase).unwrap();
+        let queue = dir.join("m").join("ks.sealed");
+        assert!(vault.unseal_key_share_queue(&queue).unwrap().is_none());
+        let plaintext = br#"{"rooms":{"!r:localhost":["@bob:localhost"]}}"#;
+        vault.seal_key_share_queue(&queue, plaintext).unwrap();
+        let raw = std::fs::read_to_string(&queue).unwrap();
+        assert!(!raw.contains("@bob") && !raw.contains("!r:"), "{raw}");
+        assert_eq!(
+            vault
+                .unseal_key_share_queue(&queue)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            plaintext
+        );
+        let other = Vault::from_master(&dir, Key32([7u8; 32]), KeyMode::Plain);
+        assert!(other.unseal_key_share_queue(&queue).is_err());
+        let session = dir.join(SEALED_SESSION_FILE_NAME);
+        vault.seal_session(&session, &sample_session()).unwrap();
+        assert!(vault.unseal_key_share_queue(&session).is_err());
+        assert!(vault.unseal_session(&queue).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 這些字串一旦進過任何一個已存在的 `local.key`／`session.sealed`，就是檔案格式的一部分：
     /// 改一個字，舊 vault 會靜默導出不同的子金鑰，資料等於鎖死（PR #11 審查 rumia 🟢2）。
     /// 這裡失敗＝有人改了格式，要換版本字串（v2）而不是改 v1。
@@ -783,6 +865,7 @@ mod tests {
         );
         assert_eq!(SESSION_AAD, b"wbf-matrix-client session.sealed v1");
         assert_eq!(WRAP_AAD, b"wbf-matrix-client local.key v1");
+        assert_eq!(KEY_SHARE_QUEUE_AAD, b"wbf-matrix-client key-share queue v1");
         // 導出的子金鑰也釘住：主金鑰全 7 時 cache key 的前 4 byte。改 BLAKE3 用法或 context 都會炸。
         let vault = Vault::from_master(Path::new("."), Key32([7u8; 32]), KeyMode::Plain);
         let cache = vault.cache_key();
