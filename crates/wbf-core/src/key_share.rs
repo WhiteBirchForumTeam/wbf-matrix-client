@@ -592,11 +592,16 @@ mod tests {
 
     /// UI 手上那份：房間版本號 7、成員只有自己（裝置版本號跟假 server 的 `Members` 同一個）。
     fn send_options(txn_id: &str) -> SendOptions {
+        send_options_at(7, txn_id)
+    }
+
+    /// 同上，房間版本號自己給。
+    fn send_options_at(room_version: u64, txn_id: &str) -> SendOptions {
         let hash =
             wbf_sdk::device_version::compute_device_keys_hash(ME, &serde_json::json!({})).unwrap();
         SendOptions {
             room_devices: Some(RoomDevices {
-                room_version: 7,
+                room_version,
                 members: [(ME.to_string(), format!("1-{hash}"))].into(),
             }),
             txn_id: Some(txn_id.to_string()),
@@ -691,6 +696,56 @@ mod tests {
             .await
             .expect("the same txn_id goes through once the key is ready");
         assert_eq!(misc.sent_events.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「就緒」以 UI 帶來的房間版本號為準：金鑰對 7 分好了，帶 8 送就要後台對 8 再跑一輪才送（成員或裝置可能變了，
+    /// 對 7 分好的那把未必送到了 8 的每一台），🚫 只看「有一把能用的金鑰」就送。
+    #[tokio::test]
+    async fn a_key_ready_for_an_older_room_version_is_prepared_again_for_the_new_one() {
+        let dir = scratch("key-share-version");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let misc = encrypted_room_on_misc(&core, &account).await;
+        let _keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
+
+        core.send_text(
+            ROOM,
+            "seven",
+            &send_options_at(7, "t-7"),
+            &Target::default(),
+        )
+        .await
+        .unwrap();
+        let after_seven = core.key_share_attempts(&account);
+        core.send_text(
+            ROOM,
+            "seven again",
+            &send_options_at(7, "t-7b"),
+            &Target::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            core.key_share_attempts(&account),
+            after_seven,
+            "same room version, key still ready: nothing to prepare"
+        );
+
+        *misc.current_room_version.lock().unwrap() = Some(8);
+        core.send_text(
+            ROOM,
+            "eight",
+            &send_options_at(8, "t-8"),
+            &Target::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            core.key_share_attempts(&account),
+            after_seven + 1,
+            "a new room version is prepared once before the send"
+        );
+        assert_eq!(misc.sent_events.lock().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
