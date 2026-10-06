@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use wbf_core::{Core, CoreErrorKind, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest};
+use wbf_core::{
+    Core, CoreErrorKind, CreatedUpload, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest,
+};
 use wbf_sdk::local_source::local_path_of_file_uri;
 use wbf_sdk::Manifest;
 
@@ -40,24 +42,34 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
             "this daemon has no data plane (it was not started with -s), so nothing could receive the bytes".into(),
         ));
     };
+    // wbf 帳號建分塊上傳、一般 Matrix 帳號建傳統上傳（/docs/design/rpc-specs/data-plane.md §7.2）：core 照帳號分。
     let upload = core
-        .create_upload(&params.upload, &handle.target(&params.target))
+        .create_media_upload(&params.upload, &handle.target(&params.target))
         .await?;
     let encrypted = handle.is_encryption_enforced();
-    let url_key = keys.to_upload_url_key(&upload.mxc, encrypted)?;
+    let url_key = keys.to_upload_url_key(upload.mxc(), encrypted)?;
+    let mxc = upload.mxc().to_string();
+    // 傳統上傳沒有上傳 id（server 那邊只有 mxc）。
+    let upload_id = match &upload {
+        CreatedUpload::Chunked(chunked) => Some(chunked.upload_id),
+        CreatedUpload::Matrix(_) => None,
+    };
     let meta = keys.to_upload_meta(
         &UploadMeta {
-            upload: upload.clone(),
+            upload,
             source_uri: params.source_uri,
         },
         encrypted,
     )?;
-    Ok(json!({
-        "upload_id": upload.upload_id,
-        "mxc": upload.mxc,
+    let mut reply = json!({
+        "mxc": mxc,
         "url": format!("http://127.0.0.1:{data_port}{UPLOAD_PATH}{url_key}"),
         "headers": { UPLOAD_META_HEADER: meta },
-    }))
+    });
+    if let (Some(upload_id), Some(fields)) = (upload_id, reply.as_object_mut()) {
+        fields.insert("upload_id".into(), json!(upload_id));
+    }
+    Ok(reply)
 }
 
 pub(super) async fn upload_file(handle: &Handle, core: &Core, params: Value) -> Outcome {

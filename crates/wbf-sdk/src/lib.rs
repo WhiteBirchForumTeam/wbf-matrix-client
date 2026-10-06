@@ -91,7 +91,7 @@ pub use error::SdkError;
 pub use incoming::{EventPage, IncomingEvent};
 pub use link::{AckPolicy, Heartbeat, StreamHandle, Subscription, WsLink};
 pub use login::Session;
-pub use manifest::{Manifest, UploadState};
+pub use manifest::{Manifest, MatrixManifest, MatrixUpload, UploadState};
 pub use room_keys::{get_snapshot_status, SnapshotStatus};
 pub use sessions::{no_hook, Received, ReceivedHook, Route, SessionKey};
 pub use upload::SentSummary;

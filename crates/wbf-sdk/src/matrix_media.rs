@@ -9,15 +9,19 @@ use std::io::Read;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use matrix_sdk_crypto::{AttachmentDecryptor, MediaEncryptionInfo};
+use matrix_sdk_crypto::{AttachmentDecryptor, AttachmentEncryptor, MediaEncryptionInfo};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 
 use crate::chat::MatrixAttachment;
 use crate::error::SdkError;
+use crate::manifest::{MatrixManifest, MatrixUpload};
 use crate::media_kind::{MediaKind, Verification};
 
-/// 解密一次交出去最多這麼多明文。
+/// 解密、加密一次處理最多這麼多。
 const PIECE: usize = 64 * 1024;
+/// 上傳時在路上（加密好、還沒送出去）最多幾段。
+const PIECES_IN_FLIGHT: usize = 4;
 /// 連線建不起來就放棄。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -49,12 +53,7 @@ pub async fn stream_matrix_media(
     sink: &mpsc::Sender<Vec<u8>>,
 ) -> Result<MatrixDownloadEnd, SdkError> {
     let (server_name, media_id) = split_mxc(&attachment.mxc)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        // 逾時看整條線多久沒回應（/docs/design/daemon/link-requests.md §4 同一個數），🚫 整個檔限時：大檔在慢網路上可以很久。
-        .read_timeout(crate::link::LINE_SILENCE)
-        .build()
-        .map_err(|error| SdkError::Network(format!("media client: {error}")))?;
+    let client = media_client()?;
     let base = server.trim_end_matches('/');
     let mut response = fetch(
         &client,
@@ -108,6 +107,274 @@ pub async fn stream_matrix_media(
         }
     }
     Ok(end)
+}
+
+/// 這個 server 願意收多大的檔（`m.upload.size`，/docs/design/rpc-specs/data-plane.md §7.2）。
+///
+/// Args:
+///     server: example: "https://matrix.org"
+/// Return:
+///     Ok(Some(u64))   上限（byte）
+///     Ok(None)        server 沒講（兩個端點都回了、但沒有這個欄位）
+///     Err(Server)     server 拒絕（meta 帶 `status`、`errcode`）
+///     Err(Network)
+pub async fn get_upload_size_limit(
+    server: &str,
+    access_token: &str,
+) -> Result<Option<u64>, SdkError> {
+    let client = media_client()?;
+    let base = server.trim_end_matches('/');
+    let mut response = fetch(
+        &client,
+        &format!("{base}/_matrix/client/v1/media/config"),
+        access_token,
+    )
+    .await?;
+    // 舊 server 沒有驗證過的端點：退到舊的那條（跟下載同一個規則）。
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let error = matrix_error_of(response).await;
+        if error.matrix_errcode() != Some("M_UNRECOGNIZED") {
+            return Err(error);
+        }
+        response = fetch(
+            &client,
+            &format!("{base}/_matrix/media/v3/config"),
+            access_token,
+        )
+        .await?;
+    }
+    if !response.status().is_success() {
+        return Err(matrix_error_of(response).await);
+    }
+    let config: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| SdkError::Network(format!("media config: {error}")))?;
+    Ok(config.get("m.upload.size").and_then(|size| size.as_u64()))
+}
+
+/// 先跟 server 拿一個 mxc（`POST /_matrix/media/v1/create`）：`media.create` 要回 mxc，bytes 之後才到。
+///
+/// Return:
+///     Ok(String)      example: "mxc://matrix.org/AbCdEf"
+///     Err(Server)     server 拒絕、或沒有這個端點（太舊的 server：🚫 退到「傳完才知道 mxc」的 `POST /upload`）
+///     Err(Integrity)  回的不是一個合法的 mxc
+///     Err(Network)
+pub async fn create_matrix_media(server: &str, access_token: &str) -> Result<String, SdkError> {
+    let client = media_client()?;
+    let response = client
+        .post(format!(
+            "{}/_matrix/media/v1/create",
+            server.trim_end_matches('/')
+        ))
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|error| SdkError::Network(format!("media create: {error}")))?;
+    if !response.status().is_success() {
+        return Err(matrix_error_of(response).await);
+    }
+    let created: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| SdkError::Network(format!("media create: {error}")))?;
+    let mxc = created
+        .get("content_uri")
+        .and_then(|uri| uri.as_str())
+        .unwrap_or("")
+        .to_string();
+    // 它要拼進 PUT 的路徑：消費端自己再問一次。
+    split_mxc(&mxc).map_err(|_| SdkError::Integrity(format!("media create returned {mxc:?}")))?;
+    Ok(mxc)
+}
+
+/// 把 PUT 進來的明文串流成 `PUT /_matrix/media/v3/upload/{server}/{media_id}` 的 body（/docs/design/rpc-specs/data-plane.md §7.2）：
+/// `encrypted` 就邊收邊用上游的 `AttachmentEncryptor` 加密（key／IV 這次現產）、邊算密文的 SHA-256。
+/// 記憶體裡只有幾段：上游送不出去就不讀 `body`。
+///
+/// Args:
+///     upload: `media.create` 建的（mxc、大小、加不加密）
+///     body: PUT 的 body
+/// Return:
+///     Ok(MatrixManifest)   `kind` 2 帶 `file`（含金鑰）、`kind` 3 沒有
+///     Err(Usage)           body 比 `size` 短或長（上游那個請求中斷了，🚫 送出一個長度不對的檔）、mxc 不合法
+///     Err(Io)              body 讀到一半斷了
+///     Err(Server)          server 拒絕（例 `M_CANNOT_OVERWRITE_MEDIA`：那個 mxc 已經有內容；`M_NOT_FOUND`：預先拿的 mxc 過期了）
+///     Err(Network)
+pub async fn upload_matrix_media<R: AsyncRead + Unpin>(
+    server: &str,
+    access_token: &str,
+    upload: &MatrixUpload,
+    body: &mut R,
+) -> Result<MatrixManifest, SdkError> {
+    let (server_name, media_id) = split_mxc(&upload.mxc)?;
+    let client = media_client()?;
+    // 加密的檔在 server 上是一坨不透明的 bytes：🚫 讓 server 看到它本來是什麼型別。
+    let content_type = match upload.encrypted {
+        true => "application/octet-stream",
+        false => upload
+            .mimetype
+            .as_deref()
+            .unwrap_or("application/octet-stream"),
+    };
+    let (sink, pieces) = mpsc::channel(PIECES_IN_FLIGHT);
+    let request = client
+        .put(format!(
+            "{}/_matrix/media/v3/upload/{server_name}/{media_id}",
+            server.trim_end_matches('/')
+        ))
+        .bearer_auth(access_token)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        // 串流的 body 預設是 chunked：規格要先講長度，而密文長度就是明文長度。
+        .header(reqwest::header::CONTENT_LENGTH, upload.size)
+        .body(reqwest::Body::wrap_stream(Pieces { receiver: pieces }))
+        .send();
+    let feeding = feed_upload_body(body, upload, sink);
+    let (fed, response) = tokio::join!(feeding, request);
+    // 先看是不是「body 長度不對」（是我們中斷了請求）、再看 server 說什麼、最後才是「上游不收了」。
+    let encryption = match (fed, response) {
+        (Err(error @ (SdkError::Usage(_) | SdkError::Io(_))), _) => return Err(error),
+        (_, Err(error)) => return Err(SdkError::Network(format!("media upload: {error}"))),
+        (_, Ok(response)) if !response.status().is_success() => {
+            return Err(matrix_error_of(response).await)
+        }
+        (Err(error), Ok(_)) => return Err(error),
+        (Ok(encryption), Ok(_)) => encryption,
+    };
+    let file = match encryption {
+        Some(info) => {
+            let mut file = serde_json::to_value(info).map_err(|error| {
+                SdkError::Integrity(format!("{}: the file description: {error}", upload.mxc))
+            })?;
+            if let Some(fields) = file.as_object_mut() {
+                fields.insert("url".into(), serde_json::Value::String(upload.mxc.clone()));
+            }
+            Some(file)
+        }
+        None => None,
+    };
+    Ok(MatrixManifest {
+        server: upload.server.clone(),
+        mxc: upload.mxc.clone(),
+        kind: match upload.encrypted {
+            true => MediaKind::MatrixEncrypted,
+            false => MediaKind::MatrixPlain,
+        },
+        name: upload.name.clone(),
+        mimetype: upload.mimetype.clone(),
+        size: upload.size,
+        file,
+    })
+}
+
+/// 讀 PUT 的 body、（加密的話）加密、一段一段送進 `sink`。長度不對就送一個錯進去：reqwest 中斷那個請求（🚫 讓 server 收下一個長度不對的檔）。
+///
+/// Return:
+///     Ok(Some(info))   加密的：`key`、`iv`、密文的 `hashes.sha256`
+///     Ok(None)         明文
+///     Err(Usage)       body 比 `size` 短或長
+///     Err(Io)          body 讀到一半斷了
+///     Err(Network)     上游不收了（那個請求已經結束，原因在它的回應裡）
+async fn feed_upload_body<R: AsyncRead + Unpin>(
+    body: &mut R,
+    upload: &MatrixUpload,
+    sink: mpsc::Sender<std::io::Result<Vec<u8>>>,
+) -> Result<Option<MediaEncryptionInfo>, SdkError> {
+    let queue = Mutex::new(VecDeque::new());
+    let mut source = Queued { bytes: &queue };
+    // 佇列空著叫它只回 0、不收尾（跟解密器不同）：只在佇列有東西時叫。key／IV 在這裡現產。
+    let mut encryptor = upload
+        .encrypted
+        .then(|| AttachmentEncryptor::new(&mut source));
+    let mut buffer = vec![0u8; PIECE];
+    let mut sent = 0u64;
+    let refuse = |message: String| SdkError::Usage(message);
+    loop {
+        let read = match body.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = sink
+                    .send(Err(std::io::Error::other("the body broke")))
+                    .await;
+                return Err(SdkError::Io(error));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        sent += read as u64;
+        if sent > upload.size {
+            let _ = sink
+                .send(Err(std::io::Error::other("the body is too long")))
+                .await;
+            return Err(refuse(format!(
+                "the body is longer than the size {} the upload was created with",
+                upload.size
+            )));
+        }
+        let plain = buffer.get(..read).unwrap_or_default();
+        let piece = match encryptor.as_mut() {
+            Some(encryptor) => {
+                queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend(plain.iter());
+                let mut cipher = vec![0u8; read];
+                let mut filled = 0;
+                while let Some(space) = cipher.get_mut(filled..).filter(|space| !space.is_empty()) {
+                    let got = encryptor.read(space).map_err(SdkError::Io)?;
+                    if got == 0 {
+                        break;
+                    }
+                    filled += got;
+                }
+                cipher.truncate(filled);
+                cipher
+            }
+            None => plain.to_vec(),
+        };
+        if sink.send(Ok(piece)).await.is_err() {
+            return Err(SdkError::Network(
+                "the server stopped reading the upload".into(),
+            ));
+        }
+    }
+    if sent < upload.size {
+        let _ = sink
+            .send(Err(std::io::Error::other("the body is too short")))
+            .await;
+        return Err(refuse(format!(
+            "the body ended after {sent} bytes but the upload was created with size {}",
+            upload.size
+        )));
+    }
+    Ok(encryptor.map(AttachmentEncryptor::finish))
+}
+
+/// 上傳的 body：從有界 channel 拿下一段（channel 滿了、讀 PUT 那邊就停著等 —— 背壓）。
+struct Pieces {
+    receiver: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+}
+
+impl futures_core::Stream for Pieces {
+    type Item = std::io::Result<Vec<u8>>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(context)
+    }
+}
+
+fn media_client() -> Result<reqwest::Client, SdkError> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        // 逾時看整條線多久沒回應（/docs/design/daemon/link-requests.md §4 同一個數），🚫 整個檔限時：大檔在慢網路上可以很久。
+        .read_timeout(crate::link::LINE_SILENCE)
+        .build()
+        .map_err(|error| SdkError::Network(format!("media client: {error}")))
 }
 
 /// `mxc://<server_name>/<media_id>` → 兩段。只收規格允許的字元（server_name 是主機名＋埠、media_id 是 `[A-Za-z0-9_-]`）：

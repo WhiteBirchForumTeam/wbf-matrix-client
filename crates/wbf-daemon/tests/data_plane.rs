@@ -93,7 +93,7 @@ fn put_of(upload: &UploadState, encrypted: bool) -> (String, String) {
     let meta = keys
         .to_upload_meta(
             &UploadMeta {
-                upload: upload.clone(),
+                upload: wbf_core::CreatedUpload::Chunked(upload.clone()),
                 source_uri: None,
             },
             encrypted,

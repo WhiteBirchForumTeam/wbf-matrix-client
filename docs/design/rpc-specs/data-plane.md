@@ -275,7 +275,7 @@ server 在加密房讀不到訊息內容，不知道哪則訊息用了哪個 mxc
   那邊一般 Matrix 帳號是 `false`（/docs/design/rpc-specs/rpc-spec.md §3.3）。
 - ⚠️ 上傳完到送出之間，媒體靠保護期撐著；保護期是 server 的設定，client 🚫 不假設它多長。UI 拿到 manifest 就盡快送。
 
-## 7. 傳統格式：一般 Matrix 的 homeserver 上傳、任何帳號下載標準附件（維護者 2026-09-30、10-06 定；還沒做）
+## 7. 傳統格式：一般 Matrix 的 homeserver 上傳、任何帳號下載標準附件（維護者 2026-09-30、10-06 定；已實作，現況在 §11）
 
 homeserver 是官方 Matrix（不講 wbf）時，**用傳統方式上傳**，不是 wbf 的分塊（維護者 2026-09-30）。
 下載是另一件事：**wbf 帳號也會收到傳統格式的附件**（同一台 server 上用 Element 的人、別台 server 同步過來的），所以傳統下載兩種帳號都要有，
@@ -312,15 +312,52 @@ wbf 帳號一律走分塊（§4），🚫 走這條。
 - **🚫 整檔讀進記憶體**（維護者 2026-10-06）：AES-CTR 是串流加密，第 i 個 byte 的密文只看明文第 i 個 byte 與它的位置；SHA-256 也能一段一段餵，
   而 hash 要到 `room.send_attachment` 才用得到，那時已經算完。所以 daemon 手上只有一小段，背壓同 §4.5（上游送不出去就不讀 PUT 的 body）。
 - **加密用上游的串流零件**：`matrix-sdk-crypto` 的 `AttachmentEncryptor`（包住一個 `Read`、讀完 `finish()` 拿 `key`／`iv`／`hashes`）。🚫 自己刻 AES-CTR。
-  它吃同步的 `Read`：在 `spawn_blocking` 裡跑，PUT 的 body 經一個有界 channel 餵它，加密後的段經另一個有界 channel 交給 HTTP 的串流 body；兩個 channel 都只放幾段，背壓不斷。
+  它吃同步的 `Read`：餵它的是一個記憶體佇列，PUT 的 body 讀一段（最多 64 KiB）放進去、叫它加密到佇列空（佇列空著它只回 0、不收尾），
+  加密後的段經一個有界 channel（4 段）交給 HTTP 的串流 body；channel 滿了就停著不讀 PUT，背壓不斷。加密一段只是幾十 KiB 的 XOR，🚫 `spawn_blocking`。
+  實作：`crates/wbf-sdk/src/matrix_media.rs` 的 `upload_matrix_media`；帳號與房間那半在 `crates/wbf-core/src/matrix_upload.rs`。
   🚫 用 matrix-sdk 的 `Media::upload`／`upload_encrypted_file`：它們先 `read_to_end` 整檔進記憶體。
+- **`Content-Length` 先講**：串流的 body 預設是 chunked，這裡明寫 `Content-Length: size`（密文長度就是明文長度）。加密的檔 `Content-Type` 一律 `application/octet-stream`（🚫 讓 server 看到它本來是什麼），明文的照 `mimetype`。
+- **沒給 `room`**：不知道要送去哪，金鑰沒有地方安全地放，一律明文（`kind` 3）。要加密就給 `room`。房間加不加密問 matrix-sdk（`latest_encryption_state`：本地不知道就問 server，問不到是錯、🚫 猜成明文房）。
 - **金鑰與 IV 每次 PUT 現產**，🚫 在 `media.create` 產、🚫 放進 `Wbf-Upload-Meta`：同一組 key／IV 加密兩份不同的 body（UI 重送時改了檔）會洩漏兩份明文的 XOR。
   金鑰只在 PUT 回的 manifest 裡（跟 §4.2 一樣，UI 要存就自己用私有權限存）。
 - **body 比 `size` 短或長**：中斷上游的請求（🚫 送出一個長度不對的檔），回 **400**。
 - **🚫 續傳**：傳統 `/upload` 沒有「收到第幾塊」。斷了 UI 用同一組 URL 再 PUT 一次**整個** body，daemon 用新的 key／IV 重送到同一個 mxc；
   server 說那個 mxc 已經有內容（`M_CANNOT_OVERWRITE_MEDIA`）或預先拿的 mxc 過期了 → **502**，重新 `media.create`。
+- **太舊的 server 沒有 `/create`**：回錯（🚫 退到「傳完才知道 mxc」的 `POST /upload`：`media.create` 要回 mxc）。`/config` 的 v1 回 `M_UNRECOGNIZED` 才退到 v3。
+- **`media.create` 的回應沒有 `upload_id`**（server 那邊只有 mxc）；`room.send_attachment` 回 `attachment_declared: false`。
+- **`source_uri` 這條路還不記**（§8.1）：讀自己傳的檔從 server 拿。
 - 這條路的檔案用 Matrix 標準格式，別的 Matrix client 看得懂；wbf 的分塊檔只有 wbf client 看得懂（/docs/design/media/wbf-client-convention-for-chunk.md §5）。
 - ⚠️ server 那邊收 `/upload` 是整檔進記憶體、可能沒有並行上限（wbfuwunel #110，server 怎麼做維護者還沒決定）；client 這邊🚫 為它做任何事，只照 `m.upload.size`。
+
+PUT 回的 manifest（加密房，實際跑 `upload_matrix_media` 的結果印出的形狀，金鑰與 hash 換成 `<…>`）：
+
+```json
+{
+  "server": "https://matrix.org",
+  "mxc": "mxc://matrix.org/AbCdEf",
+  "kind": 2,
+  "name": "cat.png",
+  "mimetype": "image/png",
+  "size": 81234,
+  "file": {
+    "hashes": { "sha256": "<密文的 SHA-256，base64>" },
+    "iv": "<iv>",
+    "key": { "alg": "A256CTR", "ext": true, "k": "<key>", "key_ops": ["decrypt", "encrypt"], "kty": "oct" },
+    "url": "mxc://matrix.org/AbCdEf",
+    "v": "v2"
+  }
+}
+```
+
+`room.send_attachment` 帶它、`caption: "look"` 送出去的事件內容（`event_json::matrix_file_message_content`，組完拿收的那邊同一支解析再驗一次）：
+
+```json
+{ "msgtype": "m.image", "body": "look", "filename": "cat.png",
+  "info": { "mimetype": "image/png", "size": 81234 },
+  "file": { "…同上…": "" } }
+```
+
+明文房的 manifest 沒有 `file`、`kind` 是 3，事件裡是 `"url": "<mxc>"`。沒給 `caption` 時 `body` 是檔名、沒有 `filename`。
 
 ### 7.3 下載（兩種帳號都要）
 
@@ -464,7 +501,7 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | `media.create`、`PUT /upload/mxc/…`、`room.send_attachment`（wbf 帳號，明文房與加密房，固定大小與串流） | ✅ | core `attachment_ops::tests`、daemon `data_plane::tests` 與 `tests/data_plane.rs`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms` |
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
-| 一般 Matrix 帳號的傳統上傳（§7.2） | ❌（2026-10-06 定了形狀：串流 AES-CTR、只收固定大小、先問 `m.upload.size`） | |
+| 一般 Matrix 帳號的傳統上傳（§7.2）：先問 `m.upload.size`、`/create`、串流 `/upload`（加密房邊收邊 `AttachmentEncryptor`、`Content-Length` 先講）、只收固定大小、key／IV 每次 PUT 現產；送成標準附件 | ✅ | 真 server `crates/wbf-sdk/tests/e2e_local_server.rs` 的 `a_traditional_upload_goes_into_plain_and_encrypted_rooms_and_downloads_back`（matrix-sdk 的 Client、明文房與加密房、讀回歷史、下載比對）；sdk `tests/matrix_media.rs`（上游解密器解得開、每次 PUT 新 key／IV、長度不對中斷上游、`M_CANNOT_OVERWRITE_MEDIA`）、`tests/chat_mapping.rs`；core `matrix_upload::tests`；daemon `data_plane::tests`。⚠️ core 帶 `room` 的那一段（問房間加密、送出）只有真 server 那條在 sdk 層驗過 |
 | `media.kind`／`verified`（cache.db v9）、下載完自動驗、GET 的 412、匯出的 1501（§8.2、/docs/design/media/media-download.md §12.3） | ✅ | sdk `media_kind::tests`、`cache::tests::media_kind_and_verification_are_recorded_and_checked`；core `download_queue::tests::a_traditional_encrypted_file_reads_but_is_trusted_only_once_it_matched`；daemon `data_plane::tests`（`status_for_trust`）、真 server `tests/real_server.rs` |
 | 傳統格式附件的下載，兩種帳號（§7.3、/docs/design/media/media-download.md §12）：HTTP 串流、`AttachmentDecryptor` 邊收邊解、進同一個池、邊下載邊讀、🚫 seek、🚫 續傳；同一個 mxc 兩份描述照 §12.1 | ✅ | 真 server `tests/real_server.rs` 的 `a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_data_plane`（`kind` 2 對的與被改過一個 bit 的、`kind` 3）；sdk `tests/matrix_media.rs`、`tests/chat_mapping.rs` 的 `standard_attachments_are_recognised_and_a_broken_encrypted_one_is_not_taken_as_plain`、`media::tests::two_matrix_descriptions_are_the_same_file_only_with_the_same_kind_hash_and_size`；core `matrix_download::tests` |
 | `media.open`、`GET`／`HEAD /media`（Range、416、用途不對的 URL 不收）、下載處理端、seek 暫存檔（§8，/docs/design/media/media-download.md） | ✅ | daemon `data_plane::tests` 與 `tests/data_plane.rs`、core `download_queue::tests`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms`；清單在 /docs/design/media/media-download.md §10 |

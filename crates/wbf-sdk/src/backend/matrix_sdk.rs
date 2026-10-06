@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::authentication::SessionTokens;
 use matrix_sdk::config::{RequestConfig, SyncSettings};
+use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
 use matrix_sdk::encryption::recovery::RecoveryState;
 use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
@@ -24,10 +25,9 @@ use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
 use matrix_sdk::ruma::events::MessageLikeEventType;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
-use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk::store::StoreConfig;
-use matrix_sdk::{SqliteCryptoStore, SqliteStateStore, SqliteStoreConfig};
 use matrix_sdk::{Client, Room, SessionMeta};
+use matrix_sdk::{SqliteCryptoStore, SqliteStateStore, SqliteStoreConfig};
 
 use crate::chat::{
     Attachment, ChatBackend, Conversation, ConversationKind, Update, WatchControl, WatchEnd,
@@ -138,6 +138,39 @@ impl MatrixBackend {
         self.client
             .get_room(&room_id)
             .ok_or_else(|| SdkError::Usage(format!("not in room {id} (or not synced yet)")))
+    }
+
+    /// 這個房**現在**加密了嗎（傳統上傳要不要加密、送出前再對一次，/docs/design/rpc-specs/data-plane.md §7.2）。
+    /// 本地還不知道就問 server（matrix-sdk 的 `latest_encryption_state`）。
+    ///
+    /// Return:
+    ///     Ok(bool)     true ＝ 加密房
+    ///     Err(Usage)   不在這個房（或還沒同步到）
+    ///     Err(...)     問 server 失敗：🚫 猜成明文房
+    pub async fn is_room_encrypted(&self, id: &str) -> Result<bool, SdkError> {
+        let state = self
+            .room(id)?
+            .latest_encryption_state()
+            .await
+            .map_err(matrix_error)?;
+        Ok(state.is_encrypted())
+    }
+
+    /// 送一則 `m.room.message`（加密房由 matrix-sdk 用 Megolm 加密）。內容由呼叫者組好、驗過（例 `event_json::matrix_file_message_content`）。
+    ///
+    /// Return:
+    ///     Ok(String)   event_id
+    ///     Err(Usage)   內容不是 `m.room.message` 認得的形狀、不在這個房
+    pub async fn send_message_content(
+        &self,
+        id: &str,
+        content: serde_json::Value,
+    ) -> Result<String, SdkError> {
+        let room = self.room(id)?;
+        let content: RoomMessageEventContent = serde_json::from_value(content)
+            .map_err(|error| SdkError::Usage(format!("message content: {error}")))?;
+        let response = room.send(content).await.map_err(matrix_error)?;
+        Ok(response.response.event_id.to_string())
     }
 
     async fn describe(&self, room: &Room) -> Result<Conversation, SdkError> {

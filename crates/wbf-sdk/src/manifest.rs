@@ -46,6 +46,50 @@ impl Manifest {
     }
 }
 
+/// 一般 Matrix 帳號的傳統上傳，`media.create` 建好、PUT 時交回來（/docs/design/rpc-specs/data-plane.md §7.2）。
+/// 🚫 有金鑰：key／IV 每次 PUT 現產（同一組加密兩份不同的 body 會洩漏兩份明文的 XOR）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatrixUpload {
+    /// example: "https://matrix.org"
+    pub server: String,
+    /// example: "@alice:matrix.org"
+    pub user_id: String,
+    /// `/_matrix/media/v1/create` 預先拿的, example: "mxc://matrix.org/AbCdEf"
+    pub mxc: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    /// 明文總長：`/upload` 要先講 `Content-Length`，所以一定有；CTR 不改長度
+    pub size: u64,
+    /// 建檔那一刻房間加密了嗎：true ＝ 邊收邊 AES-256-CTR（`kind` 2）、false ＝ 原樣（`kind` 3）
+    pub encrypted: bool,
+}
+
+impl MatrixUpload {
+    /// Return:
+    ///     bool  true ＝ 這個上傳是這台 server、這個人建的
+    pub fn is_for(&self, server: &str, user_id: &str) -> bool {
+        self.server.trim_end_matches('/') == server.trim_end_matches('/') && self.user_id == user_id
+    }
+}
+
+/// 傳統上傳傳完、PUT 回給 UI 的那份；`room.send_attachment` 帶回來組事件（/docs/design/rpc-specs/data-plane.md §7.2）。
+/// `file` 含檔案金鑰：UI 要存就自己用私有權限存。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatrixManifest {
+    pub server: String,
+    pub mxc: String,
+    /// `MatrixEncrypted`（有 `file`）或 `MatrixPlain`
+    pub kind: crate::media_kind::MediaKind,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    pub size: u64,
+    /// `kind` 2：Matrix 的 `EncryptedFile`（`v`、`key`、`iv`、`hashes`、`url`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<serde_json::Value>,
+}
+
 /// 上傳中的一切，`Create` 之後就該落地（/docs/design/rpc-specs/wbf-cli-spec.md §6），續傳時讀回來。
 /// `block.file_size` 在串流模式是 None；串流沒有續傳，狀態只活在記憶體。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

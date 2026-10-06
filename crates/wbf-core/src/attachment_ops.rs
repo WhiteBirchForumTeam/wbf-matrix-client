@@ -4,9 +4,10 @@
 //! core 不知道 HTTP：bytes 從一個 `AsyncRead` 進來；建好的上傳（[`UploadState`]）由呼叫端帶著（daemon 把它加密進 PUT 的 URL），
 //! 每一步再交回來。每一步都自己核對「這個上傳是不是這個帳號的」，🚫 不靠呼叫端記得查。
 //!
-//! 只有 wbf 帳號：一般 Matrix 帳號要走傳統上傳（`/_matrix/media`），還沒接。
+//! 這裡是 wbf 帳號的分塊上傳；一般 Matrix 帳號走傳統上傳（`/_matrix/media`，`matrix_upload.rs`）。`media.create` 用的
+//! [`Core::create_media_upload`] 照帳號的種類分流、回 [`CreatedUpload`]，PUT 時原樣交回來。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -16,7 +17,7 @@ use wbf_sdk::chunk_crypto::{
 };
 use wbf_sdk::error_code::WbfErrorCode;
 use wbf_sdk::manifest::Manifest;
-use wbf_sdk::{Cipher, FileCipher, SdkError, Transport, UploadState};
+use wbf_sdk::{Cipher, FileCipher, MatrixUpload, SdkError, Transport, UploadState};
 
 use crate::accounts::AccountDir;
 use crate::backend_choice::MethodHome;
@@ -47,7 +48,81 @@ pub struct NewUpload {
     pub chunk_size: Option<u32>,
 }
 
+/// `media.create` 建好的上傳，照帳號的種類（/docs/design/rpc-specs/data-plane.md §4、§7.2）。PUT 時原樣交回來；daemon 把它封進 `Wbf-Upload-Meta`。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "format", rename_all = "snake_case")]
+pub enum CreatedUpload {
+    /// wbf 帳號：分塊（含檔案金鑰）
+    Chunked(UploadState),
+    /// 一般 Matrix 帳號：傳統 `/upload`（🚫 金鑰：PUT 時現產）
+    Matrix(MatrixUpload),
+}
+
+impl CreatedUpload {
+    /// Return:
+    ///     &str  這個上傳的 mxc, example: "mxc://localhost/000000000000004d"
+    pub fn mxc(&self) -> &str {
+        match self {
+            CreatedUpload::Chunked(upload) => &upload.mxc,
+            CreatedUpload::Matrix(upload) => &upload.mxc,
+        }
+    }
+
+    /// Return:
+    ///     &str  建它的帳號在哪台 server, example: "https://matrix.org"
+    pub fn server(&self) -> &str {
+        match self {
+            CreatedUpload::Chunked(upload) => &upload.server,
+            CreatedUpload::Matrix(upload) => &upload.server,
+        }
+    }
+
+    /// Return:
+    ///     &str  建它的帳號, example: "@alice:matrix.org"
+    pub fn user_id(&self) -> &str {
+        match self {
+            CreatedUpload::Chunked(upload) => &upload.user_id,
+            CreatedUpload::Matrix(upload) => &upload.user_id,
+        }
+    }
+
+    /// Return:
+    ///     Some(u64)  明文總長（傳統上傳一定有）
+    ///     None       分塊的串流上傳（事先不知道多長）
+    pub fn size(&self) -> Option<u64> {
+        match self {
+            CreatedUpload::Chunked(upload) => upload.block.file_size,
+            CreatedUpload::Matrix(upload) => Some(upload.size),
+        }
+    }
+}
+
 impl Core {
+    /// `media.create`：wbf 帳號建分塊上傳（[`Core::create_upload`]）、一般 Matrix 帳號建傳統上傳（`matrix_upload.rs`）。
+    ///
+    /// Args:
+    ///     request: example: &NewUpload { room: Some("!r:localhost".into()), name: "v.mkv".into(), size: Some(2147483648), ..Default::default() }
+    /// Return:
+    ///     Ok(CreatedUpload)   `Chunked` 含檔案金鑰：🚫 不落地、不給前端
+    ///     Err(...)            同 [`Core::create_upload`]；傳統上傳另見 `Core::create_matrix_upload`
+    pub async fn create_media_upload(
+        &self,
+        request: &NewUpload,
+        target: &Target,
+    ) -> Result<CreatedUpload, CoreError> {
+        let account = self.account_or_current(target)?;
+        match self.is_wbf_account(&account)? {
+            true => self
+                .create_upload(request, target)
+                .await
+                .map(CreatedUpload::Chunked),
+            false => self
+                .create_matrix_upload(&account, request, target)
+                .await
+                .map(CreatedUpload::Matrix),
+        }
+    }
+
     /// 去 server 建一個上傳（`Upload/Create`），回的 [`UploadState`] 由呼叫端記著，PUT 進來時交回 [`Core::receive_upload`]。
     ///
     /// Args:
@@ -375,7 +450,7 @@ impl Core {
 
     /// Return:
     ///     Ok(())       wbf 帳號
-    ///     Err(Usage)   一般 Matrix 帳號（傳統上傳還沒接）
+    ///     Err(Usage)   一般 Matrix 帳號（它走傳統上傳，`matrix_upload.rs`）
     ///     Err(NotLoggedIn)
     fn refuse_unless_wbf_upload(&self, account: &AccountDir) -> Result<(), CoreError> {
         if self.is_wbf_account(account)? {
@@ -383,7 +458,7 @@ impl Core {
         }
         Err(CoreError::new(
             CoreErrorKind::Usage,
-            "this account is on a general Matrix server: its uploads go the traditional way (/_matrix/media), which is not wired yet",
+            "this account is on a general Matrix server: its uploads go the traditional way (/_matrix/media), not in wbf chunks",
         ))
     }
 

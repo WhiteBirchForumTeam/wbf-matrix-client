@@ -52,6 +52,80 @@ pub fn file_message_content(
     Ok(content)
 }
 
+/// 傳統上傳的檔當成標準 Matrix 附件送（/docs/design/rpc-specs/data-plane.md §7.2）：`msgtype` 看 `mimetype`（`image/*` → `m.image`、
+/// `video/*` → `m.video`、`audio/*` → `m.audio`，其他 `m.file`）；有說明時 `body` 是說明、檔名放 `filename`（Matrix 規格 v1.10）。
+///
+/// Args:
+///     manifest: PUT 回、UI 帶回來的那份
+///     caption: example: Some("看這個")
+/// Return:
+///     Ok(Value)    `kind` 2：`{"msgtype", "body", "info": {"size", "mimetype"?}, "file", "filename"?}`；`kind` 3：`file` 換成 `"url": mxc`
+///     Err(Usage)   `kind` 1；`kind` 2 沒有 `file`、`kind` 3 帶了 `file`；組出來的收的那邊認不得（`file` 不齊、`url` 跟 mxc 不一樣）
+pub fn matrix_file_message_content(
+    manifest: &crate::manifest::MatrixManifest,
+    caption: Option<&str>,
+) -> Result<serde_json::Value, crate::error::SdkError> {
+    let usage = |message: String| crate::error::SdkError::Usage(message);
+    let mimetype = manifest.mimetype.as_deref().unwrap_or("");
+    let msgtype = match mimetype.split('/').next() {
+        Some("image") => "m.image",
+        Some("video") => "m.video",
+        Some("audio") => "m.audio",
+        _ => "m.file",
+    };
+    let mut info = serde_json::json!({ "size": manifest.size });
+    if let (Some(mimetype), Some(fields)) = (&manifest.mimetype, info.as_object_mut()) {
+        fields.insert(
+            "mimetype".into(),
+            serde_json::Value::String(mimetype.clone()),
+        );
+    }
+    let mut content = serde_json::json!({
+        "msgtype": msgtype,
+        "body": caption.unwrap_or(&manifest.name),
+        "info": info,
+    });
+    let Some(fields) = content.as_object_mut() else {
+        return Err(usage("the event content is not an object".into()));
+    };
+    if caption.is_some() {
+        fields.insert(
+            "filename".into(),
+            serde_json::Value::String(manifest.name.clone()),
+        );
+    }
+    match (manifest.kind, &manifest.file) {
+        (MediaKind::MatrixEncrypted, Some(file)) => {
+            fields.insert("file".into(), file.clone());
+        }
+        (MediaKind::MatrixPlain, None) => {
+            fields.insert(
+                "url".into(),
+                serde_json::Value::String(manifest.mxc.clone()),
+            );
+        }
+        (kind, file) => return Err(usage(format!(
+            "{}: a {kind:?} manifest {} file description cannot be sent as a standard attachment",
+            manifest.mxc,
+            if file.is_some() {
+                "with a"
+            } else {
+                "without a"
+            }
+        ))),
+    }
+    // 消費端自己再問一次：組出來的要是收的那邊（同一支解析）認得的、指著同一個 mxc、同一種格式。
+    let parsed = matrix_attachment_of_content(msgtype, &content)
+        .map_err(|why| usage(format!("{}: {why}", manifest.mxc)))?;
+    if parsed.mxc != manifest.mxc || parsed.kind != manifest.kind {
+        return Err(usage(format!(
+            "{}: the file description points at {} ({:?})",
+            manifest.mxc, parsed.mxc, parsed.kind
+        )));
+    }
+    Ok(content)
+}
+
 /// 一頁事件 JSON → `Message` 陣列，關係事件折進目標（`aggregate`）。給沒有 `TimelineEvent` 的呼叫者與測試用；
 /// `decrypted` 一律 None（解密狀態只有 matrix-sdk 的 `TimelineEvent` 知道）。
 ///

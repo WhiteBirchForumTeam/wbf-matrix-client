@@ -30,8 +30,8 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::io::StreamReader;
-use wbf_core::{Core, CoreError, CoreErrorKind, MediaStream, Target};
-use wbf_sdk::{Manifest, UploadState};
+use wbf_core::{Core, CoreError, CoreErrorKind, CreatedUpload, MediaStream, Target};
+use wbf_sdk::{Manifest, MatrixManifest};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::handle::Handle;
@@ -66,7 +66,8 @@ const PURPOSE_MEDIA: u8 = 0x02;
 /// `Wbf-Upload-Meta` 裡封的東西：上傳狀態，加上 UI 給的原檔位置（/docs/design/rpc-specs/data-plane.md §8.1）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadMeta {
-    pub upload: UploadState,
+    /// `Core::create_media_upload` 回的：wbf 分塊（含檔案金鑰）或傳統上傳（🚫 金鑰）
+    pub upload: CreatedUpload,
     /// `media.create` 的 `source_uri`，原樣；daemon 不解它，傳完記進 `media` 列。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
@@ -155,7 +156,7 @@ impl AccessKeys {
     /// `Wbf-Upload-Meta` header 的值：整份上傳狀態（含檔案金鑰）與原檔位置，加密時綁定它的 mxc。
     ///
     /// Args:
-    ///     meta: 上傳狀態是 `Core::create_upload` 回的；`source_uri` 是 UI 給的
+    ///     meta: 上傳狀態是 `Core::create_media_upload` 回的；`source_uri` 是 UI 給的
     ///     encrypted: 同 [`AccessKeys::to_upload_url_key`]
     /// Return:
     ///     Ok(String)       example: "e-Hq3TbQ…_8Pz2Lw…"（約 520 個字元）
@@ -167,7 +168,7 @@ impl AccessKeys {
                 format!("cannot serialise the upload: {error}"),
             )
         })?);
-        self.to_text(&json, &meta_aad(&meta.upload.mxc), encrypted)
+        self.to_text(&json, &meta_aad(meta.upload.mxc()), encrypted)
     }
 
     /// 開 `Wbf-Upload-Meta`，而且它要是**這個 URL 的** meta。
@@ -188,7 +189,7 @@ impl AccessKeys {
         let json = self.open_text(meta, &meta_aad(mxc), encryption_enforced)?;
         let meta: UploadMeta = serde_json::from_slice(&json).ok()?;
         // 加密的已經被 AAD 綁住；明文的沒有，所以兩種都再對一次（A6：不靠上游記得綁）。
-        (meta.upload.mxc == mxc).then_some(meta)
+        (meta.upload.mxc() == mxc).then_some(meta)
     }
 
     /// Return:
@@ -253,14 +254,15 @@ fn meta_aad(mxc: &str) -> Vec<u8> {
     aad
 }
 
-/// 正在收的上傳（server、上傳 id）：同一個上傳同時只收一條 PUT（兩條交錯送，串流的塊會亂）。只活在連線期間。
+/// 正在收的上傳（server、mxc）：同一個上傳同時只收一條 PUT（兩條交錯送，串流的塊會亂）。只活在連線期間。
 #[derive(Default)]
 struct UploadsReceiving {
-    uploads: Mutex<HashSet<(String, u64)>>,
+    /// (server, mxc)
+    uploads: Mutex<HashSet<(String, String)>>,
 }
 
 impl UploadsReceiving {
-    fn uploads(&self) -> MutexGuard<'_, HashSet<(String, u64)>> {
+    fn uploads(&self) -> MutexGuard<'_, HashSet<(String, String)>> {
         self.uploads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -269,8 +271,9 @@ impl UploadsReceiving {
     /// Return:
     ///     Some(ReceivingGuard)   登記好了；丟掉 guard 就解除
     ///     None                   這個上傳已經有一條 PUT 在收
-    fn begin(self: &Arc<Self>, upload: &UploadState) -> Option<ReceivingGuard> {
-        let key = (upload.server.clone(), upload.upload_id);
+    fn begin(self: &Arc<Self>, upload: &CreatedUpload) -> Option<ReceivingGuard> {
+        // mxc 是 server 發的、每個上傳一個：兩種上傳都用它當鍵。
+        let key = (upload.server().to_string(), upload.mxc().to_string());
         if !self.uploads().insert(key.clone()) {
             return None;
         }
@@ -284,7 +287,7 @@ impl UploadsReceiving {
 /// 🚨 丟掉就解除登記——PUT 怎麼結束都一樣（回了、失敗、連線斷了、future 被 hyper 丟掉），🚫 不留一個永遠 409 的上傳。
 struct ReceivingGuard {
     receiving: Arc<UploadsReceiving>,
-    key: (String, u64),
+    key: (String, String),
 }
 
 impl Drop for ReceivingGuard {
@@ -626,13 +629,13 @@ async fn put_upload(
     request: Request<Incoming>,
 ) -> Reply {
     let upload = &meta.upload;
-    if let Err(message) = check_content_length(&request, upload.block.file_size) {
+    if let Err(message) = check_content_length(&request, upload.size()) {
         return error_reply(StatusCode::BAD_REQUEST, code::INVALID_PARAMS, message);
     }
     // 上傳綁的是建它的那個帳號；core 會再核對一次（/docs/design/rpc-specs/data-plane.md §1）。
     let target = Target {
-        user: Some(upload.user_id.clone()),
-        server: Some(upload.server.clone()),
+        user: Some(upload.user_id().to_string()),
+        server: Some(upload.server().to_string()),
         server_backup: handle.settings().server_backup,
     };
     let frames = request
@@ -641,11 +644,37 @@ async fn put_upload(
         .map_err(std::io::Error::other);
     let mut body = StreamReader::new(frames);
     // ⚠️ 裝箱：matrix-sdk 的 future 很深，讓編譯器一路推 `Send` 會撞 E0275（遞迴上限）；handle 的 dispatch 也是這樣切的。
-    let receiving: Pin<Box<dyn Future<Output = Result<Manifest, CoreError>> + Send + '_>> =
-        Box::pin(core.receive_upload(upload, &mut body, meta.source_uri.as_deref(), &target));
-    match receiving.await {
-        Ok(manifest) => manifest_reply(&manifest),
-        Err(error) => core_error_reply(&error),
+    match upload {
+        CreatedUpload::Chunked(upload) => {
+            let receiving: Pin<Box<dyn Future<Output = Result<Manifest, CoreError>> + Send + '_>> =
+                Box::pin(core.receive_upload(
+                    upload,
+                    &mut body,
+                    meta.source_uri.as_deref(),
+                    &target,
+                ));
+            match receiving.await {
+                Ok(manifest) => manifest_reply(&manifest),
+                Err(error) => core_error_reply(&error),
+            }
+        }
+        // 傳統上傳（/docs/design/rpc-specs/data-plane.md §7.2）：`source_uri` 這條路還不記（讀的時候從 server 拿）。
+        CreatedUpload::Matrix(upload) => {
+            let receiving: Pin<
+                Box<dyn Future<Output = Result<MatrixManifest, CoreError>> + Send + '_>,
+            > = Box::pin(core.receive_matrix_upload(upload, &mut body, &target));
+            match receiving.await {
+                Ok(manifest) => match serde_json::to_vec_pretty(&manifest) {
+                    Ok(json) => json_reply(StatusCode::OK, json),
+                    Err(error) => error_reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        code::INTERNAL,
+                        format!("{error}"),
+                    ),
+                },
+                Err(error) => core_error_reply(&error),
+            }
+        }
     }
 }
 
@@ -752,6 +781,7 @@ fn empty_reply(status: StatusCode) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wbf_sdk::UploadState;
 
     const SERVER: &str = "http://127.0.0.1:6167";
     const ALICE: &str = "@alice:localhost";
@@ -773,7 +803,7 @@ mod tests {
 
     fn meta_of(upload: &UploadState) -> UploadMeta {
         UploadMeta {
-            upload: upload.clone(),
+            upload: CreatedUpload::Chunked(upload.clone()),
             source_uri: Some("file:///home/me/v.bin".into()),
         }
     }
@@ -1002,14 +1032,26 @@ mod tests {
     #[test]
     fn one_put_per_upload_at_a_time_and_dropping_the_guard_releases_it() {
         let receiving = Arc::new(UploadsReceiving::default());
-        let first = receiving.begin(&upload(1, Some(40))).unwrap();
-        assert!(receiving.begin(&upload(1, Some(40))).is_none(), "409");
-        let other = receiving.begin(&upload(2, Some(40)));
+        let chunked = |upload_id| CreatedUpload::Chunked(upload(upload_id, Some(40)));
+        let first = receiving.begin(&chunked(1)).unwrap();
+        assert!(receiving.begin(&chunked(1)).is_none(), "409");
+        let other = receiving.begin(&chunked(2));
         assert!(other.is_some(), "別的上傳不受影響");
         drop(first);
-        assert!(
-            receiving.begin(&upload(1, Some(40))).is_some(),
-            "丟掉之後可以再 PUT"
-        );
+        assert!(receiving.begin(&chunked(1)).is_some(), "丟掉之後可以再 PUT");
+        // 傳統上傳也一樣（鍵是 server ＋ mxc）。
+        let traditional = CreatedUpload::Matrix(wbf_sdk::MatrixUpload {
+            server: SERVER.into(),
+            user_id: ALICE.into(),
+            mxc: "mxc://localhost/NewMedia".into(),
+            name: "a.png".into(),
+            mimetype: None,
+            size: 40,
+            encrypted: true,
+        });
+        let busy = receiving.begin(&traditional).unwrap();
+        assert!(receiving.begin(&traditional).is_none(), "409");
+        drop(busy);
+        assert!(receiving.begin(&traditional).is_some());
     }
 }
