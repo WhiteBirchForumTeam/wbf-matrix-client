@@ -288,24 +288,26 @@ server 不再推「誰的裝置清單變了」那份清單，改成一個**可�
 |---|---|---|
 | 1 | `Hello.features` 帶 `"org.wbftw.device_versions"` 才推 `DeviceChanged`；**宣告後加密訊息漏帶 `room_version` 會被 `InvalidRequest` 拒** | `protocol::DEVICE_VERSIONS_FEATURE`；`WbfClient::hello(name, features)`。`Misc`／`Rooms` 兩條線宣告（`link_pool::features_of`，/docs/design/keys/e2ee-rpc.md §2）：加密房每則都走 `encrypt_and_send`、帶 `room_version` |
 | 2 | 成員清單（`0x13 0x29`／HTTP `/members`）最外層 `org.wbftw.room_version`，每個 `join` 成員 `unsigned["org.wbftw.device_version"]`；橋不再收 `at` | `device_version::RoomDeviceVersions::from_members_body`（沒有號碼就是錯，不是 0）、`diff_from`（誰要重查、誰離開）；`WbfClient::room_device_versions(room_id)`（走橋的 Members，`membership=join`） |
-| 3 | `Event/Send` meta 多 `room_version`；只查 `m.room.encrypted`；對不上回 1506，meta 帶目前的號碼 | `SendRequest::room_version`、`WbfErrorCode::RoomDevicesChanged`、`SdkError::current_room_version`；`encrypt_and_send` 帶 `room_version`，1506 回 `SendOutcome::RoomDevicesChanged`；重查→補發是 `refresh_room_devices`，重送是再叫一次（同 `txn_id`） |
+| 3 | `Event/Send` meta 多 `room_version`；只查 `m.room.encrypted`；對不上回 1506，meta 帶目前的號碼 | `SendRequest::room_version`、`WbfErrorCode::RoomDevicesChanged`、`SdkError::current_room_version`；`encrypt_and_send` 帶 `room_version`，1506 回 `SendOutcome::RoomDevicesChanged`；重查、建通道、在本機排好是 `refresh_room_devices`，送出去是後台的 `distribute_room_key`（/docs/design/keys/e2ee-rpc.md §3.1），重送是再叫一次（同 `txn_id`） |
 | 4 | `Event/DeviceChanged`（`0x14 0x07`）：`{user_id, device_version, rooms, gap}`，跟 `Push` 共用 `id`／`seq`／`gap` | `pack::event::DEVICE_CHANGED`、`protocol::DeviceChangedMeta`（缺 `gap` 當 true）；`Rooms` 線的收包迴圈原樣轉成 `devices.changed`（`room_sync.rs`，/docs/design/keys/e2ee-rpc.md §4） |
 
 順手一起的：`Device/CryptoState`（`0x16 0x08`）→ `pack::device::CRYPTO_STATE`、`protocol::CryptoStateMeta`（`unused_fallback_key_types` 缺欄位是錯，🚫 不補成空：
 `[]` 對 OlmMachine 是「都用掉了，該換」，「沒給」是「server 不支援」）。五條向量（`send_encrypted_with_room_version`、
 `error_room_devices_changed`、`event_device_changed`、`device_crypto_state`、`device_crypto_state_empty`）都有測試比對。
 
-### 16.2 收到 1506 之後（wbfuwunel 的 /docs/design/wbf-room-device-version.md §7.2 的迴圈；daemon 做到補發為止，重送是 UI 的事）
+### 16.2 收到 1506 之後（wbfuwunel 的 /docs/design/wbf-room-device-version.md §7.2 的迴圈；daemon 做到「排好、交給後台」為止，送到是後台的事，重送是 UI 的事）
 
 ```
 送 Event/Send{ type: m.room.encrypted, room_version: V }  ──→  Error 1506 { room_version: V' }
-  ↓ 訊息沒送出；V' 只用來知道自己過期，🚫 不拿它直接重送（金鑰還沒補發）
+  ↓ 訊息沒送出；V' 只用來知道自己過期，🚫 不拿它直接重送（變了的裝置還沒有金鑰）
 重拿 Members  → RoomDeviceVersions { room_version: V'', members }      ← 名單與號碼是同一刻的
   ↓ diff_from(上一份)
 changed（新加入、版本號變了的）→ 只對他們 /keys/query → 餵 OlmMachine（update_tracked_users／mark_user_as_changed）
 left（不在了的）              → 換一把新的房間金鑰（OlmMachine 的 share 策略本來就會做，見 §9）
-  ↓ get_missing_sessions → /keys/claim；share_room_key → /sendToDevice（都走橋）
-（UI）帶 V'' 重送（同一個 txn_id）。同一個 txn_id 已經送成功過的，server 回原本的 event_id，不會再被擋。
+  ↓ get_missing_sessions → /keys/claim 建好 Olm 通道（走 Keys 線的橋）；share_room_key 在本機排好 to-device；交給後台 → 回 1401 給 UI
+（後台）distribute_room_key → /sendToDevice（Keys 線，失敗退避重試）      ┐ 兩件事各走各的，
+（UI）帶 V'' 重送（同一個 txn_id，Misc 線）                                 ┘ 🚫 互等
+同一個 txn_id 已經送成功過的，server 回原本的 event_id，不會再被擋。重送比金鑰先到的話，對方先存著解不開的、金鑰到了補解。
 ```
 
 📎 雜湊可以自己驗：`device_version::compute_device_keys_hash(user_id, /keys/query 的回應)` 照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 重算（黃金向量 `810b7c3be4` 有測試釘住），
@@ -348,7 +350,7 @@ server 那邊的設計（wbfuwunel 的 /docs/design/wbf-room-device-version.md �
 | 2 | **跟上次那份比**：誰新加入、誰的裝置版本號變了（要重查）、誰不在了（要換房間金鑰） | `RoomDeviceVersions::diff_from(&previous)` → `MembersDiff { changed, left }`。「上次那份」存在 UI（/docs/design/keys/e2ee-rpc.md §1），refresh 與送出時帶回來 |
 | 3 | **只重查變了的人的裝置**；哪台裝置新了／沒了由狀態機自己比 | `OlmEngine::mark_users_changed(diff.changed)` → `send_outgoing_requests`（KeysQuery 走橋 `0x17 0x21`）。上游 `OlmMachine` 對每台裝置逐台追蹤，回應進來自己算差 |
 | 4 | **自己驗雜湊**：查回來的金鑰照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 重算 ＝ 清單上那個人的雜湊 → 看到的是同一組 | `OlmEngine::mismatched_device_hashes`（`refresh_room_devices` 裡：對不上再查一次，還不對就 `Protocol` 拒發；`unhashable` 與沒查過的不算） |
-| 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | `OlmEngine::share_room_key(room, users, settings)`（缺 Olm session 先 claim，全走橋）。分享策略明確選 `AllDevices`（`crypto_engine::room_key_share_settings`；交叉簽章做好後換 `IdentityBased`，那是唯一要改的地方） |
+| 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | 兩步：`OlmEngine::queue_room_key(room, users)` 在本機建／換、排好 to-device（🚫 上網）；後台的 `OlmEngine::distribute_room_key(client, room, users)` 缺 Olm session 先 claim、再逐一 `sendToDevice`（`Keys` 線的橋，/docs/design/keys/e2ee-rpc.md §3.1）。分享策略明確選 `AllDevices`（`crypto_engine::room_key_share_settings`；交叉簽章做好後換 `IdentityBased`，那是唯一要改的地方） |
 | 6 | **帶房間版本號送出**；對不上 1506 → daemon 自動重拿房間狀態（金鑰交給後台補）、把新的房間狀態放進錯誤的 `data` 回給 UI；重送由 UI 決定（/docs/design/keys/e2ee-rpc.md §3） | `OlmEngine::encrypt_and_send` → `SendOutcome::{Sent, RoomDevicesChanged}`；補金鑰是 `refresh_room_devices(previous)`；重送是再叫一次（同 `txn_id`）。RPC 是 `room.send_text`＋1401 |
 | 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（/docs/design/keys/key-sync.md §1）；成員清單就是第 1 步，什麼時候叫由 UI 決定 |
 | 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta`；daemon 原樣轉成 `devices.changed`，**要不要叫 refresh 是 UI 的事**（/docs/design/keys/e2ee-rpc.md §4）。正確性仍由第 6 步的 1506 守 |
@@ -370,8 +372,8 @@ wbf-sdk 只提供方法，不在這兩者之間選邊。
 
 1506 其實是兩件事疊在一起，分開給：
 
-- **金鑰面**（daemon）：房間版本號過期 ＝ 現在的裝置集合裡有人沒拿到房間金鑰。修法是成員清單 → 比出誰變了 → 重查那個人 → 補發或輪換，
-  然後把新的房間狀態放進錯誤的 `data` 交回 UI。只有 daemon 做得到（OlmMachine 與 crypto store 在它手上），而且不管 UI 之後重不重送都該做——這是金鑰衛生，不是那則訊息的事。
+- **金鑰面**（daemon）：房間版本號過期 ＝ 現在的裝置集合裡有人沒拿到房間金鑰。修法是成員清單 → 比出誰變了 → 重查那個人 → 建好通道、在本機排好補發或輪換 → 交給後台送，
+  然後把新的房間狀態放進錯誤的 `data` 交回 UI（🚫 等後台送到）。只有 daemon 做得到（OlmMachine 與 crypto store 在它手上），而且不管 UI 之後重不重送都該做——這是金鑰衛生，不是那則訊息的事。
 - **訊息面**（UI）：這則要不要再送、送幾次、畫面顯示傳送中還是失敗。daemon 🚫 不自動重送：使用者可能已經撤回或改了，daemon 不會知道；重試次數是每則訊息的政策，放 UI 才自然。
 
 ⭐ **一支例行程序、兩種觸發**：`refresh_room_devices` 由 UI 叫（點進房間、收到 `devices.changed`、自己覺得號碼舊了），或由 daemon 在被 1506 擋時自動叫。內容一樣，只有「誰按下去」不同。

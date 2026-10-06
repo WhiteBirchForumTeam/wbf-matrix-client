@@ -763,7 +763,7 @@ mod tests {
     /// alice、bob 各一個 `Core`（各自的資料目錄）登入、鉤子開五條線（`Keys` 線上傳裝置金鑰）→ alice `refresh` 拿到 UI 要存的 `RoomDevices`
     /// → 帶著它送加密訊息 → bob 收到的 `room.message` 是解開的；
     /// bob 再登一台新裝置（第三個 `Core`）→ alice 帶**舊的** `RoomDevices` 送 → 被 server 擋（1506），`RoomDevicesChanged` 的 `data` 是 daemon 自動重拿的新狀態、訊息沒送
-    /// → alice 帶新狀態、同一個 `txn_id` 重送 → bob 的新裝置解得開（金鑰是 1506 之後那次 refresh 補給它的）。
+    /// → alice 帶新狀態、同一個 `txn_id` 重送 → bob 的新裝置解得開（1506 之後那次 refresh 排好、後台送給它的）。
     ///
     /// `--ignored`；環境變數：`WBF_E2E_SERVER`、`WBF_E2E_USER`（完整 mxid）、`WBF_E2E_PASSWORD_FILE`、`WBF_E2E_USER_B`、`WBF_E2E_PASSWORD_B_FILE`、
     /// `WBF_E2E_ENCRYPTED_ROOM`（兩人都在的加密房）。

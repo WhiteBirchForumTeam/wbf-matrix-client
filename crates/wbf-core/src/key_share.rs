@@ -41,7 +41,7 @@ const RETRY_MAX: Duration = Duration::from_millis(800);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `m/ks.sealed` 解開之後的樣子（我們自己的格式，/docs/design/storage/local-storage.md）。
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct QueuedRoomKeys {
     /// 格式版本；看不懂的版本🚫 猜。
     v: u32,
@@ -340,22 +340,18 @@ impl KeyShareTask {
     /// 上次 daemon 沒送完的房（`m/ks.sealed`）。沒有檔就是沒有；檔壞了或看不懂就講一聲、從空的開始——
     /// 🚫 刪它（下次寫的時候才蓋掉），那些房下一次送或 refresh 會再交進來。
     fn load_rooms(&self) -> BTreeMap<String, Vec<String>> {
-        let parsed =
-            self.queue_file
-                .read()
-                .and_then(|plaintext| match plaintext {
-                    None => Ok(QueuedRoomKeys::default()),
-                    Some(plaintext) => serde_json::from_slice::<QueuedRoomKeys>(&plaintext)
-                        .map_err(|error| {
-                            wbf_sdk::SdkError::Protocol(format!(
-                                "the key-share queue is not readable: {error}"
-                            ))
-                        }),
-                });
-        match parsed {
-            Ok(queue) if queue.v == QUEUED_ROOM_KEYS_VERSION || queue.rooms.is_empty() => {
-                queue.rooms
+        let plaintext = match self.queue_file.read() {
+            Ok(Some(plaintext)) => plaintext,
+            Ok(None) => return BTreeMap::new(),
+            Err(error) => {
+                self.events.progress(format!(
+                    "room keys: the key-share queue could not be opened ({error}); starting empty"
+                ));
+                return BTreeMap::new();
             }
+        };
+        match serde_json::from_slice::<QueuedRoomKeys>(&plaintext) {
+            Ok(queue) if queue.v == QUEUED_ROOM_KEYS_VERSION => queue.rooms,
             Ok(queue) => {
                 self.events.progress(format!(
                     "room keys: the key-share queue has version {}, this build understands {QUEUED_ROOM_KEYS_VERSION}; starting empty",
@@ -365,7 +361,7 @@ impl KeyShareTask {
             }
             Err(error) => {
                 self.events.progress(format!(
-                    "room keys: the key-share queue could not be read ({error}); starting empty"
+                    "room keys: the key-share queue is not readable ({error}); starting empty"
                 ));
                 BTreeMap::new()
             }
@@ -403,7 +399,11 @@ fn take_work(
 ) -> bool {
     match work {
         Some(KeyShareWork::Room { room, members }) => {
-            rooms.insert(room, members.clone()) != Some(members)
+            if rooms.get(&room) == Some(&members) {
+                return false;
+            }
+            rooms.insert(room, members);
+            true
         }
         Some(KeyShareWork::UploadOwnKeys) => {
             *upload_own_keys = true;
@@ -625,6 +625,35 @@ mod tests {
             "new work is still taken and sent",
         )
         .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 解得開、但版本號看不懂的 `m/ks.sealed`（之後的版本寫的）：🚫 猜裡面的房，從空的開始、🚫 刪檔。
+    #[tokio::test]
+    async fn a_queue_file_from_a_version_this_build_does_not_know_is_not_read() {
+        let dir = scratch("key-share-version");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let _misc = encrypted_room_on_misc(&core, &account).await;
+        let queue_path = account
+            .matrix_store_dir()
+            .join(super::KEY_SHARE_QUEUE_FILE_NAME);
+        std::fs::create_dir_all(account.matrix_store_dir()).unwrap();
+        core.vault()
+            .unwrap()
+            .key_share_queue_file(&queue_path)
+            .write(format!(r#"{{"v":2,"rooms":{{"{ROOM}":["{ME}"]}}}}"#).as_bytes())
+            .unwrap();
+        let _keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
+
+        core.key_share_inbox(&account).await.unwrap().line_opened();
+        tokio::time::sleep(RETRY_FIRST * 2).await;
+        assert!(core.is_sharing_room_keys(&account));
+        assert_eq!(
+            core.key_share_attempts(&account),
+            0,
+            "the room in a v2 file is not taken"
+        );
+        assert!(queue_path.exists(), "🚫 刪：下一次寫的時候才蓋掉");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

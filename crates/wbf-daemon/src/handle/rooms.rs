@@ -111,7 +111,7 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
     Ok(json!({ "event_id": event_id, "mxc": params.manifest.mxc, "attachment_declared": true }))
 }
 
-/// 確認這個房現在的人與裝置、把房間金鑰補給還沒有的裝置（UI 點進房、或自己發現版本號變了時叫）。
+/// 確認這個房現在的人與裝置、把房間金鑰排給還沒有的裝置、交給後台送（UI 點進房、或自己發現版本號變了時叫；🚫 等送到）。
 /// 回的 `{room_version, members, shared}` UI 存下來，送出時整份當 `room_devices` 帶回來（/docs/design/keys/e2ee-rpc.md §2）。
 pub(super) async fn room_refresh_devices(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]

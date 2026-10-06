@@ -63,7 +63,7 @@ pub enum CoreErrorKind {
     /// server 拒絕或不講協議。
     Server,
     /// 加密訊息被 server 擋下：帶的房間版本號過期了（server 的 1506 `RoomDevicesChanged`）。訊息沒送。
-    /// daemon 已經自動重拿了房間狀態、補了金鑰，新的狀態在 [`CoreError::data`]（/docs/design/keys/e2ee-rpc.md §3）；重不重送是 UI 的事。
+    /// daemon 已經自動重拿了房間狀態、把變了的裝置要的金鑰排好交給後台（還沒送到），新的狀態在 [`CoreError::data`]（/docs/design/keys/e2ee-rpc.md §3、§3.1）；重不重送是 UI 的事，🚫 等金鑰。
     RoomDevicesChanged,
     /// 完整性檢查不過（CRC、AEAD 標籤）。
     Integrity,

@@ -1,7 +1,7 @@
 //! wbf 帳號的房間（/docs/design/daemon/account-session.md §6）：沒有 matrix-sdk 的 Client，房間列表走橋的 `JoinedRooms`（只有 id）、單一房間走 `GetState` ＋ `m.direct`（UI 點到哪間問哪間，維護者 2026-10-05），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
 //!
-//! 加密房的訊息走 `room_crypto.rs`（先分金鑰、加密、帶 UI 給的房間版本號）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
+//! 加密房的訊息走 `room_crypto.rs`（本機備好房間金鑰、交給後台送、加密、帶 UI 給的房間版本號；送的路上🚫 分金鑰）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
 //! 路徑版的 `send_file` 還拒加密房（/docs/design/keys/e2ee-rpc.md §8）。
 //! 「加不加密」：送**文字**只看本地記的（`rooms.encrypted`，拿房間時寫、收到加密的證據時往上升；不知道就報錯，維護者 2026-10-05）；
 //! 送**附件**問這一刻的狀態（/docs/design/rpc-specs/data-plane.md §4.1：過期的「沒加密」會把檔案金鑰公開在事件裡）。
@@ -70,7 +70,7 @@ impl Core {
         Ok(conversation_from_state(room, &me, &state, &peers)?)
     }
 
-    /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
+    /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房在本機備好房間金鑰、交給後台送、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上🚫 分金鑰）。
     /// 加不加密只看本地記的（[`Core::find_local_room_encryption`]），🚫 為了送一則字再問 server。
     ///
     /// Args:
@@ -115,7 +115,7 @@ impl Core {
             })
     }
 
-    /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房先分金鑰、加密、帶 UI 給的房間版本號送（room_crypto.rs）。
+    /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房在本機備好房間金鑰、交給後台送、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上🚫 分金鑰）。
     /// 附件在**同一個請求**裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2），加密房也一樣。
     ///
     /// Args:
