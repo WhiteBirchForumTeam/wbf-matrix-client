@@ -941,6 +941,10 @@ mod tests {
         let plain = sample(200_000);
         let (cipher, real_file) = encrypt(&plain, mxc);
         let (_, other_file) = encrypt(&plain, mxc);
+        let real_hash = format!(
+            "matrix-sha256:{}",
+            real_file["hashes"]["sha256"].as_str().unwrap()
+        );
         let release = Arc::new(Notify::new());
         let base = media_server(cipher, Some((100_000, release.clone()))).await;
         let (core, account) = on_server("mx-busy", &base, SessionBackend::WbfSdk).await;
@@ -982,7 +986,13 @@ mod tests {
             Some((DownloadState::Complete, Some(Verification::Matched)))
         );
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
-        let _ = account;
+        // 結果記在真的那份描述上：被拒的那份🚫 換掉列的描述。
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        let entry = cache.read().await.find_media(mxc).unwrap().unwrap();
+        assert_eq!(
+            (entry.hash, entry.verified),
+            (Some(real_hash), Verification::Matched)
+        );
     }
 
     /// 取消（/docs/design/media/media-download.md §12.4）：🚫 續傳，半成品刪掉、列回到沒下載、推播 cancelled；再要一次從頭來。
