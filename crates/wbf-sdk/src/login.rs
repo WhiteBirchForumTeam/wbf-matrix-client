@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SdkError;
 
-/// /docs/design/rpc-specs/wbf-cli-spec.md §7 的 session 檔內容。🚫 `access_token` 不印、不 log、不進錯誤訊息。
+/// /docs/design/storage/local-storage.md §6.1 的 session 檔內容。🚫 `access_token` 不印、不 log、不進錯誤訊息。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub server: String,

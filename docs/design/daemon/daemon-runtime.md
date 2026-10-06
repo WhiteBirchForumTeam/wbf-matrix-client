@@ -27,24 +27,17 @@ homeserver ──上游同步──> cache.db ──本地讀──> UI
 
 ## 1. 資料在哪：每帳號一份 vs 每 server 一份
 
-```
-<data dir>/
-  local.key                    一台機器一把主金鑰
-  daemon.lock  daemon.json     獨佔與 ready（/docs/design/overview/architecture-v2.md §0.2、/docs/design/rpc-specs/local-interface.md §3）
-  s/<加密的 server 名>/
-    cache.db                   🚨 **一個 server 一份，這台機器上所有這個 server 的帳號共用**
-    media/                     媒體池：一個加密池、一把鑰，不分帳號
-    a/<加密的帳號名>/
-      session.sealed           access_token（每帳號）
-      m/                       matrix-sdk 的 crypto store（每帳號；wbf 帳號由 OlmEngine 開、只有 crypto store，一般 Matrix 帳號還有 Client 的 state store）
-      k/  r/                   本地房間金鑰快照、recovery key（每帳號）
-```
+完整的目錄樹與每個檔在 `/docs/design/storage/local-storage.md` §3。跟併發有關的只有這幾層：
+
+- `s/<加密的 server 名>/cache.db`、`media/`：🚨 **一個 server 一份，這台機器上所有這個 server 的帳號共用**。
+- `s/…/a/<加密的帳號名>/session.sealed`、`m/`、`k/`：每帳號一份（`m/` 是這台裝置的 crypto store，wbf 帳號由 `OlmEngine` 開）。
+- `r/<加密的名字>`：每帳號一個 recovery key，放在資料目錄最上層（🚫 帳號目錄底下：logout 不碰它）。
 
 這張圖決定了併發的形狀：
 
 | 檔案 | 誰會同時碰 | 有沒有競爭 |
 |---|---|---|
-| `m/`（matrix-sdk store） | **只有那一個帳號**的上游會話 | ❌ 沒有。一帳號一個 store、一個 writer |
+| `m/`（crypto store、`td.json`、`ks.sealed`） | **只有那一個帳號**：上游會話、收金鑰的 task、金鑰線的 queue | ❌ 沒有。一帳號一個 store；兩個 json 檔各只有一個 writer |
 | `session.sealed`／`k/`／`r/` | 那一個帳號，而且只在登入／登出／備份時 | ❌ 沒有 |
 | **`cache.db`** | **同一個 server 上每一個登入中的帳號**，同時 | 🚨 **有**，見 §2 |
 | 媒體池 | 任何帳號的下載 | 🟡 有，但池的格式是「一檔一鎖、順序 append」（media-pool），本來就設計成多寫入者 |

@@ -86,7 +86,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
   room_sync.rs           **房間那條線的內容**（/docs/design/rooms/room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
   room_crypto.rs         **房間的加解密**（/docs/design/keys/e2ee-rpc.md）：`refresh_room_devices`、加密送出與 1506 之後自動重拿（`wbf_send_encrypted`）、收到時解（`to_incoming`）、補解（`decrypt_stored`）；`RoomDevices`／`SendOptions` 是 DTO
-  key_share.rs           **後台送房間金鑰**（/docs/design/keys/e2ee-rpc.md §3.1）：一帳號一 task，送出／refresh／1506 之後 `queue_room_key_share` 交給它就走；走 `Keys` 線、`reuse` 🚫 開線（`init_keys` 開好線時 `wake_room_key_share`）；失敗 30 秒起加倍到 5 分鐘；登出收
+  key_share.rs           **金鑰線的 queue**（/docs/design/keys/e2ee-rpc.md §3.1）：一帳號一 task，送房間金鑰、重傳自己沒拿到 Ack 的金鑰；送出（加密之前）／refresh／1506 之後 `queue_room_key_share` 交給它就走；走 `Keys` 線、`reuse` 🚫 開線（`init_keys` 開好線時起 task、`line_opened`）；還沒送完的房封在 `m/ks.sealed`，重開照著補（/docs/design/storage/local-storage.md §6.2.2）；失敗 30 秒起加倍到 5 分鐘；登出收
   link_keeper.rs         **「該開的線都開著嗎」的鉤子**（/docs/design/daemon/link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
   wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：列表只問橋的 `JoinedRooms`、單一房間 `GetState` 與 `m.direct` 一起送、`Event/Send` 送文字（加不加密只看本地 `rooms.encrypted`、不知道就報錯；明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（/docs/design/daemon/link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（同一條線上的一個 client；一格是讀寫鎖，很多命令同時用、開／關獨佔）、
@@ -208,7 +208,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 - **已追蹤的人只靠 `update_tracked_users` 不會再查**：要「這個人變了、重查」用 `OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口）。
 - **上游 `encrypt` 在房間沒有 outbound session、或 session 過期時是 panic 不是回錯**（`expect("Session wasn't created nor shared")`、`assert!(!session.expired())`）：
   sdk 的 `encrypt_and_send` 自己先 `queue_room_key`（只碰本機：沒有就建、過期就換，維護者 2026-10-05 起🚫 上網），加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住，回 `Protocol`）。🚫 不要繞過它直接叫上游的 `encrypt_room_event_raw`。
-  上游 `share_room_key` 本身不上網（只排 to-device）；沒 Olm 通道的裝置排成 `m.no_olm` 但仍算沒分到，後台建好通道再分就補得到。
+  上游 `share_room_key` 本身不上網（只排 to-device）；沒 Olm 通道的裝置排成 `m.no_olm` 但仍算沒分到，後台建好通道再分就補得到——但拿到的是那時候的位置，所以 refresh 先建通道（/docs/design/keys/e2ee-rpc.md §2）。
+- **`XNonce::from_slice` 長度不對會 panic**：檔案裡讀來的 nonce 一律先過 `vault::decode_nonce`（壞的 `local.key`／`session.sealed` 曾經能讓 daemon 死掉，2026-10-06 key_share 的壞檔測試抓到）。
 - **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
 - ruma 組請求對要 token 的端點一定要給 token：引擎給占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填。
 - **D 槽會滿**：連結器 `1201`／`1180`／`1318`、`os error 112`（磁碟空間不足）、`invalid metadata` 先 `df -h /d`。🚫 不整個 `cargo clean`（重編 matrix-sdk 一輪十幾分鐘）。

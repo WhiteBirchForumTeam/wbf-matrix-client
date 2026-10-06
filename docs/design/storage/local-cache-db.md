@@ -107,28 +107,8 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 
 ### 4.6 各檔在磁碟上：一台機器一把鑰、一個 server 一份快取、一個帳號一套 session（維護者 2026-09-07 定）
 
-```
-<data dir>/
-  local.key                      主金鑰（/docs/design/storage/vault-and-keys.md §1），一台機器一把，所有帳號共用
-  current                        CLI 的目前帳號
-  account.lock                   登入、登出、destroy 全程握著的 OS 鎖（§5 的 destroy）
-  daemon.lock                    daemon 獨佔（/docs/design/overview/architecture-v2.md §0.2）
-  r/<b58>_<b58>                  recovery key（/docs/design/keys/room-key-backup.md §8）：檔名是 `recovery-key@mxid` 加密後的樣子。
-                                 🚫 logout 不碰它——那是它不放在帳號目錄底下的全部理由
-  s/<b58>_<b58>/                 **server host 加密後的名字**（/docs/design/storage/vault-and-keys.md §2.2）：外面看不出這台機器連過哪家
-    cache.db                     這個 server 上所有帳號共用（§5）
-    media/                       媒體儲存池（/docs/design/media/media-pool.md），跟 cache.db 同層、同範圍
-    a/
-      <b58>_<b58>/               帳號目錄：**localpart 加密後的名字**（同 /docs/design/storage/vault-and-keys.md §2.2）
-        session.sealed           第三把子金鑰封住的 session
-        m/                       matrix-sdk 的 store（§4.1）與 `td.json`，綁 device；logout 刪
-        k/snapshot               本地房間金鑰備份（/docs/design/keys/room-key-backup.md §4）；`account del`／`destroy` 連它一起刪
-
-⚠️ 中間那幾段（`r`／`s`／`a`／`m`／`k`）只有一個字母，理由是 Windows 的 MAX_PATH（/docs/design/storage/vault-and-keys.md §2.4.1）——
-兩段加密名字就吃掉 106 字元。
-```
-
-`<data dir>`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `$XDG_DATA_HOME`（沒設就 `~/.local/share`）。
+每個檔的位置、內容、加密、誰寫誰刪：**`/docs/design/storage/local-storage.md` §3 的目錄樹**（只畫在那裡，這裡🚫 再畫一份）。和這份有關的是：
+`cache.db` 與媒體池在 server 層（`s/<加密的 host>/`），`session.sealed`、`m/`、`k/` 在帳號層（`s/…/a/<加密的 localpart>/`），`local.key` 與 `r/` 在最上層。
 
 為什麼這樣分層（維護者 2026-09-07 定）：
 - **`local.key` 在頂層**：主金鑰的定位是「這台機器」（/docs/design/storage/vault-and-keys.md §1 第一條），passphrase 也是一台機器一個；一帳號一把會變成每個帳號各自問 passphrase。

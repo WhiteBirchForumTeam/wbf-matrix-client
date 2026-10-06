@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 /// 舊版（PR #9 之前）的明文 session 檔；看到它只提示，不讀。
 const LEGACY_SESSION_FILE_NAME: &str = "session.json";
 
-/// /docs/design/rpc-specs/wbf-cli-spec.md §7 的預設資料目錄。
+/// /docs/design/storage/local-storage.md §1 的預設資料目錄。
 ///
 /// Return:
 ///     Ok(PathBuf)      Windows `%APPDATA%\wbf-cli`；macOS `~/Library/Application Support/wbf-cli`；
