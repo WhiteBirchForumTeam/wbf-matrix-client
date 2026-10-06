@@ -209,7 +209,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
   訂了之後 server 隨時推東西進來（別人 claim 你一把 OTK 就推 CryptoState），而通道現在只有「送一個等一個」——這就是第 4 階段要解的事。
 - **已追蹤的人只靠 `update_tracked_users` 不會再查**：要「這個人變了、重查」用 `OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口）。
 - **上游 `encrypt` 在房間沒有 outbound session、或 session 過期時是 panic 不是回錯**（`expect("Session wasn't created nor shared")`、`assert!(!session.expired())`）：
-  sdk 的 `encrypt_and_send` 先問 `room_key_state`（有、沒到期、沒作廢、排過的全拿到 Ack），不是 `Ready` 就不加密；加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住，回 `Protocol`）。🚫 不要繞過它直接叫上游的 `encrypt_room_event_raw`。
+  sdk 的 `encrypt_and_send` 先問 `room_key_state`（有、沒到期、沒作廢、排過的全拿到 Ack），不是 `Ready` 就不加密；加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住），一樣回 `RoomKeyNotReady`（1402、交給後台）。🚫 不要繞過它直接叫上游的 `encrypt_room_event_raw`。
   上游 `share_room_key` 本身不上網（只排 to-device），而且**換金鑰時會丟掉舊那把還沒送出的 to-device**（只回新那把的待送）：所以金鑰只在後台建、換、送，送出只用全部 Ack 的那把（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）。
   沒 Olm 通道的裝置排成 `m.no_olm`，之後再補只拿得到之後的位置：所以 `distribute_room_key` 先 claim 建通道再排。
 - **`XNonce::from_slice` 長度不對會 panic**：檔案裡讀來的 nonce 一律先過 `vault::decode_nonce`（壞的 `local.key`／`session.sealed` 曾經能讓 daemon 死掉，2026-10-06 key_share 的壞檔測試抓到）。

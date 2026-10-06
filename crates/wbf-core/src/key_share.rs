@@ -786,7 +786,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 快到期的金鑰（剩不到 `PRE_ROTATE_MESSAGES` 則）在送出之後由後台提早換一把、先分完：下一則用的是新的、就緒的那把，
+    /// 快到期的金鑰（剩 `PRE_ROTATE_MESSAGES` 則以內）在送出之後由後台提早換一把、先分完：下一則用的是新的、就緒的那把，
     /// 🚫 等它到期才在送的路上卡住。
     #[tokio::test]
     async fn a_key_close_to_expiry_is_replaced_after_a_send_before_the_next_one() {

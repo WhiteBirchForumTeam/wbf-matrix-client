@@ -307,7 +307,7 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
   ↓ 交給後台對 V'' 分金鑰 → 回 1401 給 UI
 （後台，Keys 線）get_missing_sessions → /keys/claim 建好 Olm 通道 → share_room_key 排好（有人離開就換一把）→ /sendToDevice → 全部 Ack → 「對 V'' 就緒」
 （UI）帶 V'' 重送（同一個 txn_id）→ daemon 等「對 V'' 就緒」（最多 2 秒，等不到回 1402）→ 加密 → Misc 線 Event/Send
-同一個 txn_id 已經送成功過的，server 回原本的 event_id，不會再被擋。加密用的金鑰已經在 server 上了，對方收到訊息時金鑰只會更早、不會更晚。
+同一個 txn_id 已經送成功過的，server 回原本的 event_id，不會再被擋。加密用的金鑰已經在 server 上了，對方收到訊息時金鑰只會更早、不會更晚（建不起 Olm 通道的裝置例外，見 /docs/design/keys/e2ee-rpc.md §3 第 1 點）。
 ```
 
 📎 雜湊可以自己驗：`device_version::compute_device_keys_hash(user_id, /keys/query 的回應)` 照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 重算（黃金向量 `810b7c3be4` 有測試釘住），

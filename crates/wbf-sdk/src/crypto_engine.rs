@@ -132,7 +132,7 @@ pub enum RoomKeyState {
         session_id: String,
         /// 這把加密過幾則, example: 1
         message_count: u64,
-        /// 快到期了（剩不到 `PRE_ROTATE_MESSAGES` 則或 `PRE_ROTATE_AGE`）：送完之後該提早換一把
+        /// 快到期了（剩 `PRE_ROTATE_MESSAGES` 則以內或 `PRE_ROTATE_AGE` 以內）：送完之後該提早換一把
         due_for_rotation: bool,
     },
     /// 不行，例：還沒建過、到期或作廢了、還有 to-device 沒拿到 ACK。
@@ -328,7 +328,7 @@ impl OlmEngine {
     /// 🚨 這條路🚫 產生金鑰、🚫 換金鑰、🚫 任何金鑰的網路動作：先看 [`OlmEngine::room_key_state`]，不是 `Ready` 就不加密、回 `RoomKeyNotReady`，
     /// 由呼叫端讓後台（`distribute_room_key`）分完再送。所以每一則用的金鑰，排過的 to-device 都已經拿到 server 的 ACK。
     /// 上游的加密在「沒有 outbound session」與「session 過期」時是 **panic** 不是回錯：就緒檢查已經排除這兩條，
-    /// 檢查到加密之間剛好跨過期限的那一瞬間，用 `catch_unwind` 接住轉成錯（全域 P 條：失敗要有去處）。
+    /// 檢查到加密之間剛好跨過期限（或被後台換掉）的那一瞬間，用 `catch_unwind` 接住、回 `RoomKeyNotReady`（全域 P 條：失敗要有去處）。
     /// 號碼由呼叫端帶（UI 存著）：server 用它擋「送出方不知道最新裝置組合」。被 1506 擋是 `Ok(RoomDevicesChanged)` 不是 `Err`。
     ///
     /// Args:
@@ -337,10 +337,10 @@ impl OlmEngine {
     ///     message: example: &OutgoingRoomEvent { event_type: "m.room.message".into(), content: json!({"msgtype":"m.text","body":"hi"}), txn_id: "txn-1".into(), attachments: vec![] }
     /// Return:
     ///     Ok(SendOutcome::Sent)                 送進去了
-    ///     Ok(SendOutcome::RoomKeyNotReady)      金鑰還沒就緒，訊息沒加密、沒送
+    ///     Ok(SendOutcome::RoomKeyNotReady)      金鑰還沒就緒（含加密當下剛好到期），訊息沒送
     ///     Ok(SendOutcome::RoomDevicesChanged)   1506：號碼過期，訊息沒送
     ///     Err(Usage)                            房間 id 不合法
-    ///     Err(Protocol)                         加密失敗（含上游 panic 被接住的那種）
+    ///     Err(Protocol)                         加密失敗（上游回的錯）
     ///     Err(Server)                           其他拒絕（含宣告過 feature 卻漏帶號碼的 `InvalidRequest`）
     pub async fn encrypt_and_send<C: PackChannel>(
         &self,
@@ -360,19 +360,21 @@ impl OlmEngine {
             serde_json::value::to_raw_value(&message.content)
                 .map_err(|error| SdkError::Protocol(format!("event content: {error}")))?,
         );
-        let encrypted = AssertUnwindSafe(self.machine.encrypt_room_event_raw(
+        //    上游 panic ＝檢查完到加密之間金鑰剛好到期或被後台換掉：跟「沒就緒」同一個結果，呼叫端交後台、回 1402。
+        let Ok(encrypted) = AssertUnwindSafe(self.machine.encrypt_room_event_raw(
             &owned_room_id,
             &message.event_type,
             &raw_content,
         ))
         .catch_unwind()
         .await
-        .map_err(|_| {
-            SdkError::Protocol(
-                "encrypt: the room key expired between the readiness check and encrypting; send again".into(),
-            )
-        })?
-        .map_err(|error| SdkError::Protocol(format!("encrypt: {error}")))?;
+        else {
+            return Ok(SendOutcome::RoomKeyNotReady {
+                reason: "the room key expired between the readiness check and encrypting".into(),
+            });
+        };
+        let encrypted =
+            encrypted.map_err(|error| SdkError::Protocol(format!("encrypt: {error}")))?;
         let request = SendRequest {
             room_id: room_id.to_string(),
             event_type: "m.room.encrypted".to_string(),

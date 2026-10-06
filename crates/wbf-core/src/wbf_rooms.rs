@@ -79,6 +79,7 @@ impl Core {
     ///     Ok(String)                 event_id
     ///     Err(Usage)                 本地不知道這間房加不加密（UI 先拿房間）；或加密房但沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
+    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`（room_crypto.rs）
     pub(crate) async fn wbf_send_text(
         &self,
         account: &AccountDir,
@@ -127,6 +128,7 @@ impl Core {
     ///     Ok(String)                 event_id
     ///     Err(Usage)                 加密房但沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
+    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`（room_crypto.rs）
     ///     Err(Server)                `Conflict`：某個附件 mxc 不是本站的、找不到、不是自己傳的、或有墓碑
     pub(crate) async fn wbf_send_message(
         &self,
