@@ -196,7 +196,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `room <room_id>`（還沒做） | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
-| `read <room_id> [--limit <n>] [--before <event_id>] [--type <名>…] [--sender <mxid>]` | 歷史，從最新往回（上游怎麼問：wbf 走 `Event/Recent`、一般 Matrix 走 `/context`＋`/messages`，/docs/design/rpc-specs/rpc-spec.md §3.3）。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`undecryptable`、`outdated`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": event_id \| null }`，`next` 是 null 表示到頭了 |
+| `read <room_id> [--limit <n>] [--before <event_id>] [--type <名>…] [--sender <mxid>]` | 歷史，從最新往回（上游怎麼問：wbf 走 `Event/Recent`、一般 Matrix 走 `/context`＋`/messages`，/docs/design/rpc-specs/rpc-spec.md §3.3）。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`matrix_file`（也收它的 `msgtype`，例 `m.image`）、`deleted`、`undecryptable`、`outdated`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": event_id \| null }`，`next` 是 null 表示到頭了 |
 | `files <room_id> [--limit <n>] [--before <event_id>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
 
 事件的統一形狀（`read`、`watch`、`files` 都用）就是 /docs/design/rooms/chat-model.md §2.3 的 `Message` 序列化：
@@ -204,7 +204,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 欄位 | 說明 |
 |---|---|
 | `id`、`conversation`、`sender`、`sent_at` | event_id、room_id、mxid、`origin_server_ts`（毫秒，只當顯示用） |
-| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`deleted`（`reason`）、`undecryptable`（沒有欄位；`decrypted: false`、`undecryptable_reason` 在訊息上）、`outdated`（沒有欄位；本地快取裡目前的 edit 這個帳號還沒同步到）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
+| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`matrix_file`（標準 Matrix 附件：`attachment` = `{ msgtype, mxc, kind, name?, mimetype?, size?, file? }`、`caption`，/docs/design/rooms/chat-model.md §2.3）、`deleted`（`reason`）、`undecryptable`（沒有欄位；`decrypted: false`、`undecryptable_reason` 在訊息上）、`outdated`（沒有欄位；本地快取裡目前的 edit 這個帳號還沒同步到）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
 | `reply_to`、`edited_by`、`reactions` | 同一頁內的關係事件折進目標（/docs/design/rooms/chat-model.md §3.4） |
 | `decrypted` | `true`／`false`／`null`。`null` 表示本來就不是加密事件 |
 | `undecryptable_reason` | `decrypted` 是 `false` 才有，matrix-sdk 給的原因（example: `MissingMegolmSession`） |

@@ -18,6 +18,8 @@ use wbf_sdk::media_pool::PoolReader;
 use crate::accounts::AccountDir;
 use crate::download_queue::Downloader;
 use crate::error::{CoreError, CoreErrorKind};
+use crate::event::DownloadState;
+use crate::matrix_download::MatrixTransfer;
 use crate::Core;
 
 /// 本機原檔與池檔一次讀這麼多。
@@ -45,6 +47,8 @@ enum Origin {
         downloader: Arc<Downloader>,
         manifest: Arc<Manifest>,
     },
+    /// 還在下載的傳統檔（/docs/design/media/media-download.md §12.2）：跟它的 task 要已經寫進主檔的，還沒寫到就等。
+    Matrix(Arc<MatrixTransfer>),
 }
 
 /// 一段 Range 的明文，邊讀邊吐：記憶體裡同時最多一塊（或一段）。
@@ -95,14 +99,25 @@ impl MediaStream {
         let piece = match &mut self.origin {
             Origin::Local(file) => read_at(file, self.position, want)?,
             Origin::Pool(reader) => read_at(reader, self.position, want)?,
-            Origin::Chunks {
-                downloader,
-                manifest,
-            } => {
+            Origin::Chunks { .. } | Origin::Matrix(_) => {
                 // 只交 byte 位置：是哪一塊、從哪裡開始，照處理端手上那個檔驗過的切法，🚫 照描述自己算。
-                let piece = downloader
-                    .read_piece_at(manifest.clone(), self.position)
-                    .await?;
+                let piece = match &self.origin {
+                    Origin::Chunks {
+                        downloader,
+                        manifest,
+                    } => {
+                        downloader
+                            .read_piece_at(manifest.clone(), self.position)
+                            .await?
+                    }
+                    Origin::Matrix(transfer) => transfer.read_at(self.position).await?,
+                    Origin::Local(_) | Origin::Pool(_) => {
+                        return Err(CoreError::new(
+                            CoreErrorKind::Io,
+                            "the media source changed while reading",
+                        ))
+                    }
+                };
                 // 消費端自己再核一次：回來的那一塊真的涵蓋這個位置。
                 let covers = self
                     .position
@@ -213,6 +228,17 @@ impl Core {
                     origin: Origin::Pool(reader),
                 }));
             }
+            // 傳統格式的檔（`kind` 2、3，兩種帳號都有）：走 HTTP 的 task（/docs/design/media/media-download.md §12.2）。
+            if entry.kind != MediaKind::WbfChunked {
+                let attachment = cache.read().await.find_matrix_attachment_for(&me, mxc)?;
+                let Some(attachment) = attachment else {
+                    continue;
+                };
+                match self.open_matrix_source(account, mxc, attachment).await? {
+                    Some(source) => return Ok(Some(source)),
+                    None => continue,
+                }
+            }
             if !self.is_wbf_account(account).unwrap_or(false) {
                 continue;
             }
@@ -262,6 +288,74 @@ impl Core {
             )),
             false => Ok(None),
         }
+    }
+
+    /// 傳統檔的來源：還在下載就跟它的 task 要（沒在下載就起一個）、已經完整就從池給。
+    /// 事件沒給大小：`Content-Length` 與 Range 都要總長，所以等它下載完、從池給（/docs/design/media/media-download.md §12.2）。
+    ///
+    /// Return:
+    ///     Ok(Some(MediaSource))   讀得到
+    ///     Ok(None)                下載了卻還是不在池裡（下一個帳號再試）
+    ///     Err(...)                下載失敗、被取消
+    async fn open_matrix_source(
+        &self,
+        account: &AccountDir,
+        mxc: &str,
+        attachment: wbf_sdk::chat::MatrixAttachment,
+    ) -> Result<Option<MediaSource>, CoreError> {
+        let size = attachment.size;
+        let mimetype = attachment.mimetype.clone();
+        let kind = attachment.kind;
+        let (done, wait) = tokio::sync::oneshot::channel();
+        let waiter = size.is_none().then_some(done);
+        let job = self
+            .ensure_matrix_download(account, attachment, waiter)
+            .await?;
+        let transfer = self.matrix_transfers.find(&account.server_dir(), mxc);
+        match (job.state, size, transfer) {
+            (DownloadState::Downloading, Some(size), Some(transfer)) => Ok(Some(MediaSource {
+                mxc: mxc.to_string(),
+                size,
+                mimetype,
+                kind,
+                verified: Verification::Unknown,
+                origin: Origin::Matrix(transfer),
+            })),
+            (DownloadState::Downloading, None, _) => {
+                wait.await.map_err(|_| {
+                    CoreError::new(
+                        CoreErrorKind::Io,
+                        format!("the download of {mxc} stopped before it was complete"),
+                    )
+                })??;
+                self.complete_pool_source(account, mxc).await
+            }
+            // 已經完整、或剛好在這一刻完成（task 已經不在登記表裡）：從池給。
+            _ => self.complete_pool_source(account, mxc).await,
+        }
+    }
+
+    /// 池裡完整的那份。
+    async fn complete_pool_source(
+        &self,
+        account: &AccountDir,
+        mxc: &str,
+    ) -> Result<Option<MediaSource>, CoreError> {
+        let (cache, _me) = self.server_cache_and_me(account)?;
+        let Some(entry) = cache.read().await.find_media(mxc)? else {
+            return Ok(None);
+        };
+        let pool = self.pool_of(account)?;
+        Ok(
+            media::open_complete(&pool, &entry).map(|reader| MediaSource {
+                mxc: mxc.to_string(),
+                size: reader.plain_len(),
+                mimetype: entry.mimetype.clone(),
+                kind: entry.kind,
+                verified: entry.verified,
+                origin: Origin::Pool(reader),
+            }),
+        )
     }
 
     /// 本機已登入的帳號，mxc 的 server_name 跟帳號網域一樣的排前面。

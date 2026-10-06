@@ -434,8 +434,8 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 | 推播 `media.download` | — | `{ mxc, state, done, total, user, reason? }` | §5.5。`reason` 只在 `failed` 帶 |
 
 - 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。找不到是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
-- 一般 Matrix 帳號（走 matrix-sdk 的）的媒體沒有 `Download` 線，這四支加 `media.export_to` 都回 `1100`；傳統下載（`/_matrix/media`）跟傳統上傳一起做（/docs/design/rpc-specs/data-plane.md §7）。
-- 下載一律走 WS 的 `Download` 線：`transport` 參數對這幾支沒有意義。CLI 的 `download --no-cache` 不走下載處理端（直接逐塊寫到檔案，不碰池），等 CLI 改走 RPC 時一併收掉。
+- 一般 Matrix 帳號（走 matrix-sdk 的）沒有 `Download` 線：它只看得到標準 Matrix 附件（`kind` 2、3），走 §12 的 HTTP 下載；給它 `manifest` 回 `1100`。
+- 分塊檔的下載一律走 WS 的 `Download` 線、標準附件一律走 HTTP（§12）：`transport` 參數對這幾支沒有意義。CLI 的 `download --no-cache` 不走下載處理端（直接逐塊寫到檔案，不碰池），等 CLI 改走 RPC 時一併收掉。
 
 ### 7.2 GET 的路由
 
@@ -597,19 +597,32 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
    kind 3：大小對得上事件的 info.size（有給的話）→ 收尾（complete = 1、verified = 0），🚫 verifying（沒有 hash 可比）
 ```
 
-- **🚫 走 `Download` 線**：那條是 wbf 的 `Download/*`。傳統下載是一個普通的 HTTPS 請求，每個檔一個；**同一個下載處理端**照樣管它（§5.1）：
-  認領、downloading 表、取消旗標、進度推播 `media.download` 都一樣，只是「塊請求」換成「這條 HTTP 的下一段」。所有檔一起跑照舊。
+- **🚫 走 `Download` 線**：那條是 wbf 的 `Download/*`。傳統下載是一個普通的 HTTPS 請求，每個檔一個。
+  **每個檔一個 task**（`crates/wbf-core/src/matrix_download.rs`），🚫 進分塊的下載處理端（§5.1）：那邊的單位是「線上的一塊」，這邊是「一條 HTTP 從頭讀到尾」，
+  共用的只有池、`cache.db` 的列、取消（`media.cancel`）與推播 `media.download`。這個 task 是那個主檔唯一的寫入者，還在下載時 GET 要的明文也問它（§12.2）。
+  同一個 mxc 第二次要（`media.download`／`open`／`export_to`）就掛到同一個 task 上，🚫 再起一個。所有檔一起跑照舊。
 - **解密用上游的 `AttachmentDecryptor`**（`matrix-sdk-crypto`），🚫 自己刻 AES-CTR。它在讀到結尾時才比 hash、對不上回錯——正好是這裡要的時機。
-  它吃同步的 `Read`：跟上傳一樣在 `spawn_blocking` 裡跑，進出各一個有界 channel（/docs/design/rpc-specs/data-plane.md §7.2）。
+  它吃同步的 `Read`：餵它的是一個記憶體佇列，HTTP 的下一段進來才放進佇列、佇列有東西才叫它解（佇列空著叫＝它當成讀到結尾、拿去比 hash），
+  讀完才在佇列空著時叫最後一次。解一段只是幾十 KiB 的 XOR，🚫 `spawn_blocking`。實作在 `crates/wbf-sdk/src/matrix_media.rs`。
+- **端點**：先 `GET /_matrix/client/v1/media/download/…`（要驗證的那條），server 回 404 `M_UNRECOGNIZED`（舊 server 沒有）才退到 `/_matrix/media/v3/download/…`。
+  mxc 只收規格允許的字元（server_name＝主機名＋埠、media_id＝`[A-Za-z0-9_-]`）：它要拼進 URL 的路徑，🚫 讓 `/`、`..`、`?` 混進去。
+- **逾時**看整條線多久沒回應（60 秒，/docs/design/daemon/link-requests.md §4 同一個數），🚫 整個檔限時。
+- **進度** `done`／`total` 的單位是池的 64 KiB 段（傳統檔沒有塊）：`total` 從事件的 `info.size` 算，沒給就是 0（前端只能顯示「下載中」）。
 - **背壓**：池寫得慢就晚一點讀 HTTP 的下一段；記憶體裡同時只有幾段。🚫 整檔讀進記憶體（🚫 用 matrix-sdk 的 `get_media_content`，它回 `Vec<u8>`）。
 - **金鑰從哪來**：跟 §3.2 一樣從 `cache.db` 找引用這個 mxc 的事件，讀 `content_json` 的 `file`（`key`、`iv`、`hashes.sha256`、`v`）。
   `v` 不是 `"v2"`、缺任何一個欄位 → 這個 mxc 當壞的（fail closed），🚫 試著解。
-- **快取命中**（§5.3）：`kind` 2 比 `media.hash`（記的是事件的 `file.hashes.sha256`，/docs/design/storage/local-cache-db.md §5）跟這次的描述，對不上就是那則描述錯（回錯，完成的快取🚫 刪）；
-  `kind` 3 只能比大小（有的話）。
+- **同一個 mxc、兩份描述**（§5.3 的同一條規則）：列記的 `media.hash`（`kind` 2 是事件的 `file.hashes.sha256`，/docs/design/storage/local-cache-db.md §5）、
+  格式、大小（兩邊都有時）跟這次事件的比，檔名、型別🚫 比（轉發改名還是同一個檔）。對不上時：
+  - 已經完整 → 快取是真的，對不上的是這次的描述（寫錯或偽造的事件）：**回 `Integrity`、快取🚫 動**。
+  - 還沒完整、另一份描述**正在下載** → 回 `Integrity`：🚫 掛上去（拿到的會是別把金鑰解的資料）、🚫 換掉它的描述。
+  - 還沒完整、沒人在下載 → 兩份都還沒被整檔驗過：列換成這次的描述（`media_redescribe`）、從頭下載。先到的偽造事件因此擋不住後來的真事件。
+  - 收尾前 task 再問一次列：下載途中列被換成另一份描述，這次的結果🚫 記上去，當下載失敗、半成品丟掉。
+  實作：`crates/wbf-sdk/src/media.rs` 的 `is_same_matrix_file`／`is_same_matrix_description`。
 
 ### 12.2 GET：邊下載邊讀、驗證中也能讀，狀態碼說可不可信
 
 - 路由照 §7.2，只有兩個差別：**沒有 seek 暫存檔、沒有現拉**（一個 HTTP 從頭讀到尾，拉不了第 n 塊）。GET 要的位置還沒寫到，就停著等主檔寫到那裡。
+  事件沒給 `info.size`：不知道總長就給不了 `Content-Length` 與 Range，這個 GET 等整檔下載完才從池給。
 - **資料照給，狀態碼說它可不可信**（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2）：
   `kind` 2 的 `verified` 是 0（下載中、驗證中）或 2（驗不過）→ **412**、body 照給；是 1 → 200／206。`kind` 1、3 一律 200／206。
   從驗證中變成驗完的那一刻，已經在吐的 GET 🚫 中斷：狀態碼在開始時就送了，前端想知道結果看推播（§12.3）或再問一次（`HEAD`）。
@@ -665,6 +678,9 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
 - `kind` 1：下載中、完成後都是 200／206，不論 `verified`；區塊 sha256 對不上 → `verified = 2`、🚫 當壞檔、GET 照樣 2xx。
 - `kind` 3：🚫 `verifying`、完成時 `verified = 0`、GET 2xx；`info.size` 對不上 → `Integrity`。
 - 驗過的檔🚫 再驗：快取命中、匯出、GET 都🚫 再餵任何 hash 器。
+- 同一個 mxc 兩份描述（§12.1）：偽造的先到、沒下載過 → 換成真的那份、下載、`verified = 1`；之後拿偽造那份來要 → 1500、快取🚫 動；
+  一份正在下載時另一份來要 → 1500、正在下載的照常完成。
+- 取消：推播 `cancelled`、半成品刪掉、列 `complete = 0`；再要一次從頭下載、完成。
 - 從池匯出：`kind` 1、3 照匯、成功；`kind` 2 `verified = 1` 成功、`verified = 2` **照匯**（`to` 有檔）而且回 1501、`data` 是那份結果。
 - 跟 `AttachmentEncryptor` 互通：我們上傳的（/docs/design/rpc-specs/data-plane.md §7.2）用上游的 `AttachmentDecryptor` 解得開，反過來也是。
 - 真 server：用 matrix-sdk 的 Client（等同 Element 的格式）在加密房送一個附件，wbf 帳號 `media.open` → GET 整檔對。

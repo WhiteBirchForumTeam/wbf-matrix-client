@@ -352,6 +352,54 @@ pub fn is_same_file(entry: &MediaEntry, manifest: &Manifest) -> bool {
     same_size && same_sha256
 }
 
+/// 傳統格式的版本（/docs/design/media/media-download.md §12.1）：快取列跟這次事件的描述是不是同一個檔。
+/// 格式要一樣；兩邊都記了密文 hash（`matrix-sha256:`）就要一樣；兩邊都有大小就要一樣。🚫 算 hash，只比記下來的字。
+///
+/// Args:
+///     entry: 本地這個 mxc 的列
+///     description: 這次的事件來的, example: &MediaDescription::of_matrix_attachment(&attachment)
+/// Return:
+///     bool  true ＝ 同一個檔；false ＝ 對不上（同一個 mxc、另一把金鑰或另一個大小：寫錯或偽造的事件）
+pub fn is_same_matrix_file(entry: &MediaEntry, description: &MediaDescription) -> bool {
+    let recorded = MediaDescription {
+        kind: entry.kind,
+        name: None,
+        mimetype: None,
+        hash: entry.hash.clone(),
+        file_size: entry.file_size,
+        chunk_size: None,
+    };
+    is_same_matrix_description(&recorded, description)
+}
+
+/// 兩份傳統格式的描述說的是不是同一個檔（[`is_same_matrix_file`] 的規則；檔名、型別🚫 比：轉發時改名還是同一個檔）。
+///
+/// Args:
+///     one: 例如正在下載的那份
+///     other: 例如這次請求的那份
+/// Return:
+///     bool  true ＝ 格式、密文 hash、大小（兩邊都有時）都一樣
+pub fn is_same_matrix_description(one: &MediaDescription, other: &MediaDescription) -> bool {
+    // 收尾時沒 hash 的列會補上 `blake3:<池檔名>`（`media_finish`）：那不是事件給的，🚫 拿來比。
+    fn matrix_hash(hash: Option<&str>) -> Option<&str> {
+        hash.filter(|hash| hash.starts_with("matrix-sha256:"))
+    }
+    let same_hash = match (
+        matrix_hash(one.hash.as_deref()),
+        matrix_hash(other.hash.as_deref()),
+    ) {
+        (Some(one), Some(other)) => one == other,
+        (None, None) => true,
+        // 只有一邊有：一則說加密、一則說沒有（格式已經比過），或一則少了 hash——🚫 當成同一個。
+        _ => false,
+    };
+    let same_size = match (one.file_size, other.file_size) {
+        (Some(one), Some(other)) => one == other,
+        _ => true,
+    };
+    one.kind == other.kind && same_hash && same_size
+}
+
 /// 列說的跟這次的區塊不一樣（[`is_same_file`] 回 false）：丟掉這個 mxc 在本地的一切，列換成這次的描述、從頭來。
 /// 池檔還有別的 mxc 指著、或有人正在讀，就只清這一列不刪檔；主檔與 seek 暫存檔刪掉。⚠️ 呼叫者先確定沒人正在下載它。
 ///
@@ -737,5 +785,59 @@ mod tests {
         assert!(matches!(error, SdkError::Integrity(_)), "{error:?}");
         assert!(!dir.join("b.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_matrix_descriptions_are_the_same_file_only_with_the_same_kind_hash_and_size() {
+        use crate::media_kind::MediaKind;
+        let described = |kind, hash: Option<&str>, file_size| MediaDescription {
+            kind,
+            name: Some("a.png".into()),
+            mimetype: None,
+            hash: hash.map(str::to_string),
+            file_size,
+            chunk_size: None,
+        };
+        let encrypted = described(
+            MediaKind::MatrixEncrypted,
+            Some("matrix-sha256:AAA"),
+            Some(10),
+        );
+        let renamed = MediaDescription {
+            name: Some("forwarded.png".into()),
+            ..encrypted.clone()
+        };
+        assert!(
+            is_same_matrix_description(&encrypted, &renamed),
+            "a new name is the same file"
+        );
+        let no_size = described(MediaKind::MatrixEncrypted, Some("matrix-sha256:AAA"), None);
+        assert!(
+            is_same_matrix_description(&encrypted, &no_size),
+            "an unknown size does not differ"
+        );
+        for different in [
+            described(
+                MediaKind::MatrixEncrypted,
+                Some("matrix-sha256:BBB"),
+                Some(10),
+            ),
+            described(
+                MediaKind::MatrixEncrypted,
+                Some("matrix-sha256:AAA"),
+                Some(11),
+            ),
+            described(MediaKind::MatrixEncrypted, None, Some(10)),
+            described(MediaKind::MatrixPlain, None, Some(10)),
+        ] {
+            assert!(
+                !is_same_matrix_description(&encrypted, &different),
+                "{different:?}"
+            );
+        }
+        // 收尾時補的 `blake3:` 不是事件給的：明文檔完成後跟一則同大小的明文描述照樣是同一個。
+        let plain_done = described(MediaKind::MatrixPlain, Some("blake3:ab12"), Some(10));
+        let plain = described(MediaKind::MatrixPlain, None, Some(10));
+        assert!(is_same_matrix_description(&plain_done, &plain));
     }
 }

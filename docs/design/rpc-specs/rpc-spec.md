@@ -354,15 +354,15 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 `upload --stream`（stdin）在 daemon 模型下**就是資料平面的 PUT**（沒給 `size` 的 `media.create`，/docs/design/rpc-specs/data-plane.md §4.4），沒有對應的 method。
 
-### 3.6 媒體（`media.info` 有 `transport`；下載一律走 WS 的 `Download` 線）
+### 3.6 媒體（`media.info` 有 `transport`；分塊檔的下載走 WS 的 `Download` 線，標準 Matrix 附件走 HTTP）
 
 | method | params | result | core |
 |---|---|---|---|
 | `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 答得出 `file_size`／`chunk_size`／`content_type`，加上上游答不出來的 `cached: { complete, segments_written, bytes_on_disk }`（`segments_written` 是池主檔的 64 KiB 段數，只給顯示；下載中的進度看 `media.queue`）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
-| `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id }`、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading`、`verifying`；`kind`、`verified` 是 `media` 列的（沒有列就不在，/docs/design/media/media-download.md §12.3） | `media_download`：交給這個帳號的下載處理端（/docs/design/media/media-download.md §5）。`mxc` 的金鑰從這個帳號看得到的事件裡找，找不到 1100；一般 Matrix 帳號 1100 |
-| `media.open` | 同 `media.download` | `{ url, mxc, mimetype?, size, state, kind?, verified? }`（`kind` 2 而 `verified` 不是 1 時，讀那個 `url` 會是 412、body 照給，/docs/design/rpc-specs/data-plane.md §8.2）。`url` 是資料平面讀的 URL（/docs/design/rpc-specs/data-plane.md §8，不帶帳號、可以重用） | `media_open`；不完整也沒本機原檔就順便排進佇列。daemon 沒開資料平面回 100 |
+| `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id }`、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading`、`verifying`；`kind`、`verified` 是 `media` 列的（沒有列就不在，/docs/design/media/media-download.md §12.3） | `media_download`：分塊檔（`kind` 1）交給這個帳號的下載處理端（/docs/design/media/media-download.md §5），標準 Matrix 附件（`kind` 2、3）走 HTTP（同一份文件 §12，兩種帳號都行）。`mxc` 的金鑰從這個帳號看得到的事件裡找，找不到 1100；一般 Matrix 帳號給 `manifest` 1100；同一個 mxc 這則事件的描述跟本地已經下載好、或正在下載的那份不一樣 1500 |
+| `media.open` | 同 `media.download` | `{ url, mxc, mimetype?, size?, state, kind?, verified? }`（`size` 只在事件沒給 `info.size` 的傳統檔不在：那種檔的 GET 等整檔下載完才給，/docs/design/media/media-download.md §12.2；`kind` 2 而 `verified` 不是 1 時，讀那個 `url` 會是 412、body 照給，/docs/design/rpc-specs/data-plane.md §8.2）。`url` 是資料平面讀的 URL（/docs/design/rpc-specs/data-plane.md §8，不帶帳號、可以重用） | `media_open`；不完整也沒本機原檔就順便排進佇列。daemon 沒開資料平面回 100 |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }`，第一個是正在拉的 | `media_queue` |
-| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉 |
+| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉。標準 Matrix 附件🚫 續傳：半成品刪掉，再要從頭下載（/docs/design/media/media-download.md §12.4） |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, source_uri?, user?, server? }`（`source_uri` 是原檔的 URI，讀的時候優先讀它，/docs/design/rpc-specs/data-plane.md §8.1） | `{ upload_id, mxc, url, headers }`。`url` 是資料平面的 PUT URL（共享 token 加密的「用途 ‖ mxc」），`headers` 是 PUT 時要照抄的（`Wbf-Upload-Meta`：加密的上傳狀態）（/docs/design/rpc-specs/data-plane.md §4） | `create_upload`：有 `room` 就照房間決定加不加密；daemon 沒開資料平面回 100 |
 | `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`；已經存在就覆蓋，要不要覆蓋是 UI 先問）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", kind, verified, hash? }` | `export_media_to`：沒有就排、等它完成才寫到 `to`；從池匯出🚫 再算 hash，傳統加密的檔沒驗過或驗不過照匯、回 1501（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
 | `media.stats` | `{ user?, server? }` | `MediaStats` | `media_stats` |
@@ -522,7 +522,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 
 | 缺什麼 | 給誰用 |
 |---|---|
-| 一般 Matrix 帳號的傳統上傳與下載（`/_matrix/media`，/docs/design/rpc-specs/data-plane.md §7） | `media.create`、`media.download`、`media.open`、`media.export_to` |
+| 一般 Matrix 帳號的傳統上傳（`/_matrix/media`，/docs/design/rpc-specs/data-plane.md §7.2）；下載已經接上（§7.3） | `media.create` |
 
 ## 9. 明確不做的
 
@@ -567,7 +567,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（/docs/design/rooms/room-sync.md）；一般 Matrix matrix-sdk `/sync` | ✅ wbf：訂閱線由 daemon 自己開、看著、重開（/docs/design/daemon/link-pool.md §3.1），🚫 沒有開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`transport: "http"` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
-| `media.download`／`open`／`queue`／`cancel`、`media.export_to`、`GET`／`HEAD /media`、`media.download` 推播 | ✅ `media_ops`／`download_queue`／`media_stream`（/docs/design/media/media-download.md） | **WS** `Download` 線的 `Info`／`Read`＋媒體池＋seek 暫存檔。一般 Matrix 帳號 1100 | ✅ wbf（真 server 驗過）／❌ 一般 server |
+| `media.download`／`open`／`queue`／`cancel`、`media.export_to`、`GET`／`HEAD /media`、`media.download` 推播 | ✅ `media_ops`／`download_queue`／`media_stream`（/docs/design/media/media-download.md） | 分塊檔：**WS** `Download` 線的 `Info`／`Read`＋媒體池＋seek 暫存檔。標準 Matrix 附件：**HTTP** `/_matrix/client/v1/media/download`＋同一個池（`matrix_download`，/docs/design/media/media-download.md §12），兩種帳號都是 | ✅ wbf（真 server 驗過）／標準附件 ✅（假 server） |
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
 | `backup.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，/docs/design/daemon/account-session.md §6） | 🔁 還沒做：搬到 crypto 層＋橋的 `/room_keys` |
 | `recovery.list`／`show` | ✅ | 本機（`<data dir>/r/`） | ✅ |

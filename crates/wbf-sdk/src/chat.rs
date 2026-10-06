@@ -109,6 +109,29 @@ pub struct Attachment {
     pub block: ChunkedBlock,
 }
 
+/// 標準 Matrix 的附件（/docs/design/rpc-specs/data-plane.md §7.1 的 `kind` 2、3）。從事件內容來，🚫 是分塊。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixAttachment {
+    /// example: "m.image"
+    pub msgtype: String,
+    /// example: "mxc://matrix.org/AbCdEf"
+    pub mxc: String,
+    /// `MatrixEncrypted`（有 `file`）或 `MatrixPlain`（只有 `url`）
+    pub kind: crate::media_kind::MediaKind,
+    /// `filename`，沒有就用 `body`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `info.mimetype`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    /// `info.size`（明文的大小；事件沒給就是不知道）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// `kind` 2：事件裡的 `EncryptedFile` 原樣（`v`、`key`、`iv`、`hashes`、`url`），**含金鑰**；`kind` 3 沒有
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageKind {
@@ -120,6 +143,13 @@ pub enum MessageKind {
     /// 我們的分塊檔（`msgtype: org.wbftw.wbfuwunel.file`）。
     File {
         attachment: Attachment,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    /// 標準 Matrix 的附件（`m.file`／`m.image`／`m.video`／`m.audio`，帶 `url` 或 `file`，/docs/design/media/media-download.md §12）。
+    /// 別的 Matrix client（Element…）送的都是這種。
+    MatrixFile {
+        attachment: MatrixAttachment,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },

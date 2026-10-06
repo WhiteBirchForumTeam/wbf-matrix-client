@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use wbf_sdk::chat::MatrixAttachment;
 use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media;
@@ -74,6 +75,14 @@ pub enum MediaRef {
     Manifest(Manifest),
 }
 
+/// `MediaRef` 解出來的：是哪一種檔、金鑰在哪（/docs/design/rpc-specs/data-plane.md §7.1）。
+pub(crate) enum ResolvedMedia {
+    /// wbf 分塊（`kind` 1）：走下載處理端的 `Download` 線
+    Chunked(Manifest),
+    /// 標準 Matrix 附件（`kind` 2、3）：走 HTTP（`matrix_download.rs`）
+    Matrix(MatrixAttachment),
+}
+
 /// `media.download` 的回答：這個檔現在的樣子。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MediaJob {
@@ -96,8 +105,9 @@ pub struct OpenedMedia {
     pub mxc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mimetype: Option<String>,
-    /// 明文總長
-    pub size: u64,
+    /// 明文總長；傳統檔的事件沒給大小就不在（下載完才知道）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     pub state: DownloadState,
     /// `kind` 2 而 `verified` 不是 1 時，讀 URL 會是 412、body 照給（/docs/design/rpc-specs/data-plane.md §8.2）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,15 +215,23 @@ impl Core {
     ///     media: example: &MediaRef::Mxc("mxc://localhost/000000000000004d".into())
     /// Return:
     ///     Ok(MediaJob)     `complete`／`local_source`（不排）、`queued`、`downloading`
-    ///     Err(Usage)       找不到金鑰（這個帳號看不到引用它的事件）、manifest 是別台 server 的、一般 Matrix 帳號（傳統下載還沒接）
+    ///     Err(Usage)       找不到金鑰（這個帳號看不到引用它的事件）、manifest 是別台 server 的、一般 Matrix 帳號給了 manifest（它只有標準附件）
+    ///     Err(Integrity)   同一個 mxc，這則事件的描述跟本地已經下載好、或正在下載的那份不一樣（/docs/design/media/media-download.md §12.1）
     pub async fn media_download(
         &self,
         media: &MediaRef,
         target: &Target,
     ) -> Result<MediaJob, CoreError> {
         let account = self.account_or_current(target)?;
-        let manifest = self.resolve_media(&account, media).await?;
-        self.ensure_queued(&account, manifest, None, true).await
+        match self.resolve_media(&account, media).await? {
+            ResolvedMedia::Chunked(manifest) => {
+                self.ensure_queued(&account, manifest, None, true).await
+            }
+            ResolvedMedia::Matrix(attachment) => {
+                self.ensure_matrix_download(&account, attachment, None)
+                    .await
+            }
+        }
     }
 
     /// `media.open`：這個檔能不能開來讀、多大、什麼型別；不完整也沒原檔就順便排進佇列（/docs/design/media/media-download.md §7.1）。
@@ -227,13 +245,28 @@ impl Core {
         target: &Target,
     ) -> Result<OpenedMedia, CoreError> {
         let account = self.account_or_current(target)?;
-        let manifest = self.resolve_media(&account, media).await?;
-        let (mxc, mimetype, size) = (
-            manifest.mxc.clone(),
-            manifest.block.mimetype.clone(),
-            manifest.file_size(),
-        );
-        let job = self.ensure_queued(&account, manifest, None, true).await?;
+        let (mxc, mimetype, size, job) = match self.resolve_media(&account, media).await? {
+            ResolvedMedia::Chunked(manifest) => {
+                let (mxc, mimetype, size) = (
+                    manifest.mxc.clone(),
+                    manifest.block.mimetype.clone(),
+                    manifest.block.file_size,
+                );
+                let job = self.ensure_queued(&account, manifest, None, true).await?;
+                (mxc, mimetype, size, job)
+            }
+            ResolvedMedia::Matrix(attachment) => {
+                let (mxc, mimetype, size) = (
+                    attachment.mxc.clone(),
+                    attachment.mimetype.clone(),
+                    attachment.size,
+                );
+                let job = self
+                    .ensure_matrix_download(&account, attachment, None)
+                    .await?;
+                (mxc, mimetype, size, job)
+            }
+        };
         Ok(OpenedMedia {
             mxc,
             mimetype,
@@ -268,6 +301,10 @@ impl Core {
     ///     Ok(false)   都不在
     pub async fn media_cancel(&self, mxc: &str, target: &Target) -> Result<bool, CoreError> {
         let account = self.account_or_current(target)?;
+        // 傳統檔不在下載處理端裡（/docs/design/media/media-download.md §12）：兩邊都問。
+        if self.cancel_matrix_download(&account, mxc) {
+            return Ok(true);
+        }
         let downloader = self.downloader_of(&account).await?;
         Ok(downloader.cancel(mxc))
     }
@@ -296,49 +333,29 @@ impl Core {
         target: &Target,
     ) -> Result<ExportedMedia, CoreError> {
         let account = self.account_or_current(target)?;
-        let manifest = self.resolve_media(&account, media).await?;
-        let mxc = manifest.mxc.clone();
-        let sha256_hex = manifest.block.sha256.clone();
+        let resolved = self.resolve_media(&account, media).await?;
         let (cache, _me) = self.server_cache_and_me(&account)?;
-        if sha256_hex.is_some() {
-            let entry = cache.read().await.find_media(&mxc)?;
-            let original = entry
-                .filter(|entry| media::is_same_file(entry, &manifest))
-                .and_then(|entry| {
-                    let file_size = entry.file_size?;
-                    open_local_source(&entry).map(|(file, _)| (file, file_size, entry))
-                });
-            if let Some((file, file_size, entry)) = original {
-                let expected = media::ExpectedContent {
-                    file_size,
-                    sha256_hex: sha256_hex.clone(),
-                };
-                match export_blocking(file, to, expected).await {
-                    Ok(bytes) => {
-                        // 這台機器自己傳的原檔、剛剛整檔比過 sha256：可信，🚫 看 `verified`（/docs/design/rpc-specs/data-plane.md §8.2）。
-                        return Ok(ExportedMedia {
-                            bytes,
-                            source: "local_source".to_string(),
-                            kind: entry.kind,
-                            verified: entry.verified,
-                            hash: entry.hash,
-                        });
-                    }
-                    // 原檔在上傳之後被改過（大小沒變）：改從池匯出。
-                    Err(error) if error.kind == CoreErrorKind::Integrity => {
-                        self.events.progress(format!(
-                            "export {mxc}: the local original no longer matches ({}); exporting from the pool",
-                            error.message
-                        ));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
         let (done, wait) = tokio::sync::oneshot::channel();
-        let job = self
-            .ensure_queued(&account, manifest, Some(done), false)
-            .await?;
+        let (mxc, job) = match resolved {
+            ResolvedMedia::Chunked(manifest) => {
+                let mxc = manifest.mxc.clone();
+                if let Some(exported) = self.export_local_original(&cache, &manifest, to).await? {
+                    return Ok(exported);
+                }
+                let job = self
+                    .ensure_queued(&account, manifest, Some(done), false)
+                    .await?;
+                (mxc, job)
+            }
+            // 傳統檔還沒有「本機原檔」那條（一般 Matrix 帳號的上傳，/docs/design/rpc-specs/data-plane.md §7.2，還沒做）：一律從池匯出。
+            ResolvedMedia::Matrix(attachment) => {
+                let mxc = attachment.mxc.clone();
+                let job = self
+                    .ensure_matrix_download(&account, attachment, Some(done))
+                    .await?;
+                (mxc, job)
+            }
+        };
         let source = match job.state {
             DownloadState::Complete => "cache",
             _ => {
@@ -411,6 +428,57 @@ impl Core {
         Ok(exported)
     }
 
+    /// 分塊的檔從本機原檔匯出（/docs/design/media/media-download.md §7.3）：區塊帶 sha256、原檔在、大小對得上才用它，整檔比 sha256（原檔在池外、沒有保護）。
+    ///
+    /// Return:
+    ///     Ok(Some(ExportedMedia))   從原檔匯出了
+    ///     Ok(None)                  沒有可用的原檔、或原檔上傳後被改過：呼叫者改從池匯出
+    ///     Err(...)                  寫不了 `to`
+    async fn export_local_original(
+        &self,
+        cache: &crate::server_cache::ServerCache,
+        manifest: &Manifest,
+        to: &Path,
+    ) -> Result<Option<ExportedMedia>, CoreError> {
+        let Some(sha256_hex) = manifest.block.sha256.clone() else {
+            return Ok(None);
+        };
+        let mxc = &manifest.mxc;
+        let entry = cache.read().await.find_media(mxc)?;
+        let original = entry
+            .filter(|entry| media::is_same_file(entry, manifest))
+            .and_then(|entry| {
+                let file_size = entry.file_size?;
+                open_local_source(&entry).map(|(file, _)| (file, file_size, entry))
+            });
+        let Some((file, file_size, entry)) = original else {
+            return Ok(None);
+        };
+        let expected = media::ExpectedContent {
+            file_size,
+            sha256_hex: Some(sha256_hex),
+        };
+        match export_blocking(file, to, expected).await {
+            // 這台機器自己傳的原檔、剛剛整檔比過 sha256：可信，🚫 看 `verified`（/docs/design/rpc-specs/data-plane.md §8.2）。
+            Ok(bytes) => Ok(Some(ExportedMedia {
+                bytes,
+                source: "local_source".to_string(),
+                kind: entry.kind,
+                verified: entry.verified,
+                hash: entry.hash,
+            })),
+            // 原檔在上傳之後被改過（大小沒變）：改從池匯出。
+            Err(error) if error.kind == CoreErrorKind::Integrity => {
+                self.events.progress(format!(
+                    "export {mxc}: the local original no longer matches ({}); exporting from the pool",
+                    error.message
+                ));
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.export_to` 走 [`Core::export_media_to`]）。
     ///
     /// 🚫 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
@@ -458,26 +526,36 @@ impl Core {
         })
     }
 
-    /// 三種說法 → manifest（/docs/design/media/media-download.md §3.2「金鑰從哪來」）。
+    /// 三種說法 → 這個檔是哪一種、金鑰在哪（/docs/design/media/media-download.md §3.2「金鑰從哪來」、§12）。
+    /// wbf 帳號兩種都可能（同一個房裡可以有 wbf 分塊檔與別的 client 送的標準附件）；一般 Matrix 帳號只有標準附件。
     ///
     /// Return:
-    ///     Ok(Manifest)   `server` 是這個帳號的 session 的 server
-    ///     Err(Usage)     一般 Matrix 帳號；manifest 是別台 server 的；這個帳號看不到帶金鑰的事件
+    ///     Ok(ResolvedMedia::Chunked)   wbf 分塊（`manifest.server` 是這個帳號的 session 的 server）
+    ///     Ok(ResolvedMedia::Matrix)    標準 Matrix 附件
+    ///     Err(Usage)                   manifest 是別台 server 的、或一般 Matrix 帳號給了 manifest；這個帳號看不到帶金鑰的事件
+    ///     Err(Integrity)               分塊的區塊不能拿來下載
     pub(crate) async fn resolve_media(
         &self,
         account: &AccountDir,
         media: &MediaRef,
-    ) -> Result<Manifest, CoreError> {
-        if !self.is_wbf_account(account)? {
-            return Err(CoreError::new(
-                CoreErrorKind::Usage,
-                "this account is on a general Matrix server: its media is downloaded the traditional way (/_matrix/media), which is not wired yet",
-            ));
-        }
+    ) -> Result<ResolvedMedia, CoreError> {
+        let is_wbf = self.is_wbf_account(account)?;
         let session = self.session_of(account)?;
         let (cache, me) = self.server_cache_and_me(account)?;
+        let not_seen = |what: String| {
+            CoreError::new(
+                CoreErrorKind::Usage,
+                format!("{what}; pass the manifest, or the room and event_id"),
+            )
+        };
         let manifest = match media {
             MediaRef::Manifest(manifest) => {
+                if !is_wbf {
+                    return Err(CoreError::new(
+                        CoreErrorKind::Usage,
+                        "a manifest is a chunked (wbf) file: this account is on a general Matrix server",
+                    ));
+                }
                 // 消費端自己再問一次（A6）：daemon 也比過，但 manifest 是對方給的。
                 if crate::accounts::server_host_of(&manifest.server)
                     != crate::accounts::server_host_of(&session.server)
@@ -493,34 +571,47 @@ impl Core {
                 manifest.clone()
             }
             MediaRef::Mxc(mxc) => {
-                let block = cache.read().await.find_media_block_for(&me, mxc)?;
-                let block = block.ok_or_else(|| {
-                    CoreError::new(
-                        CoreErrorKind::Usage,
-                        format!("no event {me} can see carries the key of {mxc}; pass the manifest, or the room and event_id"),
-                    )
-                })?;
-                Manifest {
-                    server: session.server.clone(),
-                    mxc: mxc.clone(),
-                    block,
+                let reader = cache.read().await;
+                let block = match is_wbf {
+                    true => reader.find_media_block_for(&me, mxc)?,
+                    false => None,
+                };
+                match block {
+                    Some(block) => Manifest {
+                        server: session.server.clone(),
+                        mxc: mxc.clone(),
+                        block,
+                    },
+                    None => {
+                        let attachment = reader.find_matrix_attachment_for(&me, mxc)?;
+                        return attachment.map(ResolvedMedia::Matrix).ok_or_else(|| {
+                            not_seen(format!("no event {me} can see carries the key of {mxc}"))
+                        });
+                    }
                 }
             }
             MediaRef::Event { room, event_id } => {
-                let attachment = cache
-                    .read()
-                    .await
-                    .find_event_attachment(&me, room, event_id)?;
-                let attachment = attachment.ok_or_else(|| {
-                    CoreError::new(
-                        CoreErrorKind::Usage,
-                        format!("{event_id} in {room} is not a file {me} can see (or it is not decrypted yet)"),
-                    )
-                })?;
-                Manifest {
-                    server: session.server.clone(),
-                    mxc: attachment.mxc,
-                    block: attachment.block,
+                let reader = cache.read().await;
+                let attachment = match is_wbf {
+                    true => reader.find_event_attachment(&me, room, event_id)?,
+                    false => None,
+                };
+                match attachment {
+                    Some(attachment) => Manifest {
+                        server: session.server.clone(),
+                        mxc: attachment.mxc,
+                        block: attachment.block,
+                    },
+                    None => {
+                        let attachment =
+                            reader.find_event_matrix_attachment(&me, room, event_id)?;
+                        return attachment.map(ResolvedMedia::Matrix).ok_or_else(|| {
+                            CoreError::new(
+                                CoreErrorKind::Usage,
+                                format!("{event_id} in {room} is not a file {me} can see (or it is not decrypted yet)"),
+                            )
+                        });
+                    }
                 }
             }
         };
@@ -528,7 +619,7 @@ impl Core {
             .block
             .check_as_event_block()
             .map_err(|error| CoreError::new(CoreErrorKind::Integrity, error.to_string()))?;
-        Ok(manifest)
+        Ok(ResolvedMedia::Chunked(manifest))
     }
 
     /// 本地已經有了就回那個狀態；沒有就排進佇列（/docs/design/media/media-download.md §5.3 的表）。
@@ -706,6 +797,8 @@ impl Core {
         if let Some(downloader) = removed {
             downloader.stop();
         }
+        // 傳統格式的下載也是這個帳號的 token 在拉：一起收（/docs/design/media/media-download.md §12.4）。
+        self.stop_matrix_downloads_of(account);
     }
 
     /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
@@ -718,10 +811,12 @@ impl Core {
             .filter(|(account_dir, _)| account_dir.starts_with(server_dir))
             .map(|(_, downloader)| downloader.clone())
             .collect();
-        downloaders
+        let mut in_use: HashSet<String> = downloaders
             .iter()
             .flat_map(|downloader| downloader.list_open_names())
-            .collect()
+            .collect();
+        in_use.extend(self.matrix_transfers.list_pending_names(server_dir));
+        in_use
     }
 
     /// 列說的跟這次的區塊不一樣：丟掉本地的一切、列換成這次的描述（`media::forget_for_new_description`）。

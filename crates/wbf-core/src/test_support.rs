@@ -59,22 +59,31 @@ pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
 
 /// 開好一個 wbf 帳號（session 封好、`m/` 的 crypto store 建好，跟 login 一樣）。
 pub(crate) async fn core_with_wbf_account(dir: &std::path::Path) -> (Core, AccountDir) {
+    core_with_account_on(dir, DEAD, SessionBackend::WbfSdk).await
+}
+
+/// 同上，server 與 backend 自己給（例：傳統下載要一台真的回 HTTP 的假 server；一般 Matrix 帳號是 `MatrixSdkClient`）。
+pub(crate) async fn core_with_account_on(
+    dir: &std::path::Path,
+    server: &str,
+    backend: SessionBackend,
+) -> (Core, AccountDir) {
     wbf_sdk::vault::Vault::create(dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
     let core = Core::open(dir);
     core.unlock(None).unwrap();
     let vault = core.vault().unwrap();
-    let account = AccountDir::locate(dir, &vault.account_dir_key(), DEAD, ME).unwrap();
+    let account = AccountDir::locate(dir, &vault.account_dir_key(), server, ME).unwrap();
     std::fs::create_dir_all(&account.dir).unwrap();
     vault
         .seal_session(
             &account.session_path(),
             &Session {
-                server: DEAD.to_string(),
+                server: server.to_string(),
                 user_id: ME.to_string(),
                 device_id: "DEV".to_string(),
                 access_token: "syt_memory".to_string(),
                 store_dir: None,
-                backend: Some(SessionBackend::WbfSdk),
+                backend: Some(backend),
             },
         )
         .unwrap();

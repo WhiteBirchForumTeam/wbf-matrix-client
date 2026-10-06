@@ -465,7 +465,8 @@ UI ↔ daemon 的 **bytes 是明文**，保護靠「URL 是 daemon 用共享 tok
 | URL 與 meta（`e-`／`c-`、別的 token 發的拒、被改過的拒、用途不對的拒、meta 配不上 URL 的拒、沒帶 meta 的 400）、Host 檢查 | ✅ | daemon `data_plane::tests`、`tests/data_plane.rs` |
 | 續傳（固定大小再 PUT） | ✅（假 server） | core `a_sized_body_must_match_and_a_second_put_resumes` |
 | 一般 Matrix 帳號的傳統上傳（§7.2） | ❌（2026-10-06 定了形狀：串流 AES-CTR、只收固定大小、先問 `m.upload.size`） | |
-| 傳統格式附件的下載，兩種帳號（§7.3、/docs/design/media/media-download.md §12） | ❌（同上：`media.kind`／`verified`、邊下載邊讀、收尾才驗、🚫 seek、🚫 續傳） | |
+| `media.kind`／`verified`（cache.db v9）、下載完自動驗、GET 的 412、匯出的 1501（§8.2、/docs/design/media/media-download.md §12.3） | ✅ | sdk `media_kind::tests`、`cache::tests::media_kind_and_verification_are_recorded_and_checked`；core `download_queue::tests::a_traditional_encrypted_file_reads_but_is_trusted_only_once_it_matched`；daemon `data_plane::tests`（`status_for_trust`）、真 server `tests/real_server.rs` |
+| 傳統格式附件的下載，兩種帳號（§7.3、/docs/design/media/media-download.md §12）：HTTP 串流、`AttachmentDecryptor` 邊收邊解、進同一個池、邊下載邊讀、🚫 seek、🚫 續傳；同一個 mxc 兩份描述照 §12.1 | ✅（假 server） | sdk `tests/matrix_media.rs`、`tests/chat_mapping.rs` 的 `standard_attachments_are_recognised_and_a_broken_encrypted_one_is_not_taken_as_plain`、`media::tests::two_matrix_descriptions_are_the_same_file_only_with_the_same_kind_hash_and_size`；core `matrix_download::tests` |
 | `media.open`、`GET`／`HEAD /media`（Range、416、用途不對的 URL 不收）、下載處理端、seek 暫存檔（§8，/docs/design/media/media-download.md） | ✅ | daemon `data_plane::tests` 與 `tests/data_plane.rs`、core `download_queue::tests`、真 server `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms`；清單在 /docs/design/media/media-download.md §10 |
 | `source_uri`：`media.create` 收、封進 meta、傳完記進 `media` 列；URI 解析與大小比對；讀的時候優先讀原檔（§8.1） | ✅ | core `the_local_source_is_remembered_once_the_upload_is_sealed`、sdk `local_source::tests` |
 | UI 指定從第幾 byte 續傳 | ❌ | |

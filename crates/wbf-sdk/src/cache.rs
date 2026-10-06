@@ -152,6 +152,24 @@ impl MediaDescription {
             chunk_size: Some(block.chunk_size),
         })
     }
+
+    /// 標準 Matrix 的附件（`kind` 2、3）。`kind` 2 的 hash 記成 `matrix-sha256:<事件裡的 base64>`：算的是密文，🚫 跟 `sha256:` 互比。
+    pub fn of_matrix_attachment(attachment: &crate::chat::MatrixAttachment) -> MediaDescription {
+        let hash = attachment
+            .file
+            .as_ref()
+            .and_then(|file| file.get("hashes")?.get("sha256")?.as_str())
+            .filter(|hash| !hash.is_empty())
+            .map(|hash| format!("matrix-sha256:{hash}"));
+        MediaDescription {
+            kind: attachment.kind,
+            name: attachment.name.clone(),
+            mimetype: attachment.mimetype.clone(),
+            hash,
+            file_size: attachment.size,
+            chunk_size: None,
+        }
+    }
 }
 
 /// `forget_account` 的結果：清了什麼、哪些池檔已經沒人指、可以刪。
@@ -1520,6 +1538,83 @@ impl Cache {
         }))
     }
 
+    /// 同 [`Cache::find_event_attachment`]，只是要的是標準 Matrix 的附件（`m.file`／`m.image`…）。
+    ///
+    /// Return:
+    ///     Ok(Some(MatrixAttachment))   這則在、這個帳號看得到、是標準附件
+    ///     Ok(None)                     沒有、看不到、不是標準附件、還沒解開
+    pub fn find_event_matrix_attachment(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<crate::chat::MatrixAttachment>, SdkError> {
+        let found = self
+            .connection
+            .query_row(
+                "SELECT e.event_type, e.content_json FROM events e
+                   JOIN events_synced_log l ON l.event = e.id
+                   JOIN users reader ON reader.id = l.user
+                   JOIN rooms r ON r.id = e.room
+                 WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.event_id = ?3",
+                params![user_id, room_id, event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(found.and_then(|(event_type, content_json)| {
+            matrix_attachment_of(event_type.as_deref(), content_json.as_deref())
+        }))
+    }
+
+    /// 這個帳號看得到、引用這個 mxc 的標準 Matrix 附件（金鑰在它的 `file` 裡）。第一則就是。
+    ///
+    /// Return:
+    ///     Ok(Some(MatrixAttachment))
+    ///     Ok(None)   這個帳號看不到任何引用它的標準附件
+    pub fn find_matrix_attachment_for(
+        &self,
+        user_id: &str,
+        mxc: &str,
+    ) -> Result<Option<crate::chat::MatrixAttachment>, SdkError> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT e.event_type, e.content_json FROM media m
+                   JOIN event_media em ON em.media = m.id
+                   JOIN events e ON e.id = em.event
+                   JOIN events_synced_log l ON l.event = e.id
+                   JOIN users reader ON reader.id = l.user
+                 WHERE m.mxc = ?1 AND reader.mxid = ?2
+                 ORDER BY e.id",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![mxc, user_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            let (event_type, content_json) = row.map_err(db_error)?;
+            if let Some(attachment) =
+                matrix_attachment_of(event_type.as_deref(), content_json.as_deref())
+            {
+                if attachment.mxc == mxc {
+                    return Ok(Some(attachment));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // ---- forget ----
 
     /// 這份 `cache.db` 認得哪些帳號（`users` 列裡的權威 mxid）。
@@ -2065,21 +2160,38 @@ fn attachment_of(
     }
 }
 
-/// 內容是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔：建 `media`（已有就不動）與 `event_media`。
+/// 一則事件帶的標準 Matrix 附件（`m.file`／`m.image`…，/docs/design/rpc-specs/data-plane.md §7.1）：解得開、是檔才有。
+fn matrix_attachment_of(
+    event_type: Option<&str>,
+    content_json: Option<&str>,
+) -> Option<crate::chat::MatrixAttachment> {
+    let body = serde_json::from_str::<serde_json::Value>(content_json?).ok()?;
+    match kind_from_content(event_type?, &body, &serde_json::Value::Null) {
+        MessageKind::MatrixFile { attachment, .. } => Some(attachment),
+        _ => None,
+    }
+}
+
+/// 內容是檔（wbf 分塊，/docs/design/media/wbf-client-convention-for-chunk.md §5；或標準 Matrix 附件）：建 `media`（已有就不動）與 `event_media`。
 fn link_media_of(
     transaction: &Transaction<'_>,
     event: i64,
     event_type: Option<&str>,
     content_json: Option<&str>,
 ) -> Result<(), SdkError> {
-    let Some(attachment) = attachment_of(event_type, content_json) else {
-        return Ok(());
-    };
     // 區塊沒帶大小：約定裡一定有，沒有就🚫 建列（🚫 用 0 頂替，🚫 讓一則壞事件卡住整批寫入）。
-    let Some(description) = MediaDescription::of_chunked_block(&attachment.block) else {
+    let found = match attachment_of(event_type, content_json) {
+        Some(attachment) => MediaDescription::of_chunked_block(&attachment.block)
+            .map(|description| (attachment.mxc, description)),
+        None => matrix_attachment_of(event_type, content_json).map(|attachment| {
+            let description = MediaDescription::of_matrix_attachment(&attachment);
+            (attachment.mxc, description)
+        }),
+    };
+    let Some((mxc, description)) = found else {
         return Ok(());
     };
-    let media = media_row_id(transaction, &attachment.mxc, &description)?;
+    let media = media_row_id(transaction, &mxc, &description)?;
     transaction
         .prepare_cached("INSERT OR IGNORE INTO event_media (event, media) VALUES (?1, ?2)")
         .map_err(db_error)?

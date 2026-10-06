@@ -598,6 +598,10 @@ fn kind_matches(message: &Message, wanted: &str) -> bool {
     match &message.kind {
         MessageKind::Text { .. } => wanted == "text" || wanted == "m.room.message",
         MessageKind::File { .. } => wanted == "file" || wanted == "org.wbftw.wbfuwunel.file",
+        // 標準 Matrix 附件：kind 名，或它的 msgtype（`m.image`…）。
+        MessageKind::MatrixFile { attachment, .. } => {
+            wanted == "matrix_file" || wanted == attachment.msgtype
+        }
         MessageKind::Deleted { .. } => wanted == "deleted",
         MessageKind::Undecryptable => wanted == "undecryptable",
         MessageKind::Outdated => wanted == "outdated",

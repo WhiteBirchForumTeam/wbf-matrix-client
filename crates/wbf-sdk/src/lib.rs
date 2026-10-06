@@ -60,6 +60,8 @@ pub mod link;
 pub mod local_source;
 pub mod login;
 pub mod manifest;
+#[cfg(feature = "matrix")]
+pub mod matrix_media;
 #[cfg(feature = "cache")]
 pub mod media;
 pub mod media_kind;
