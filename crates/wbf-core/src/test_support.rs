@@ -71,15 +71,28 @@ pub(crate) async fn core_with_account_on(
     wbf_sdk::vault::Vault::create(dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
     let core = Core::open(dir);
     core.unlock(None).unwrap();
+    let account = add_account_on(&core, dir, server, ME, backend).await;
+    crate::accounts::write_current(dir, &account).unwrap();
+    (core, account)
+}
+
+/// 在已經解鎖的 core 裡多開一個帳號（同一台 server 就共用 `cache.db` 與池）；🚫 改 current。
+pub(crate) async fn add_account_on(
+    core: &Core,
+    dir: &std::path::Path,
+    server: &str,
+    user: &str,
+    backend: SessionBackend,
+) -> AccountDir {
     let vault = core.vault().unwrap();
-    let account = AccountDir::locate(dir, &vault.account_dir_key(), server, ME).unwrap();
+    let account = AccountDir::locate(dir, &vault.account_dir_key(), server, user).unwrap();
     std::fs::create_dir_all(&account.dir).unwrap();
     vault
         .seal_session(
             &account.session_path(),
             &Session {
                 server: server.to_string(),
-                user_id: ME.to_string(),
+                user_id: user.to_string(),
                 device_id: "DEV".to_string(),
                 access_token: "syt_memory".to_string(),
                 store_dir: None,
@@ -87,17 +100,16 @@ pub(crate) async fn core_with_account_on(
             },
         )
         .unwrap();
-    crate::accounts::write_current(dir, &account).unwrap();
     // wbf 帳號登入時就有 crypto store（login_ops::create_crypto_store_for）；引擎本身丟掉，`olm_engine_of` 要用再開。
     wbf_sdk::crypto_engine::OlmEngine::open(
         &account.matrix_store_dir(),
         &vault.matrix_store_key(),
-        ME,
+        user,
         "DEV",
     )
     .await
     .unwrap();
-    (core, account)
+    account
 }
 
 /// 橋 `Members` 的 body：房裡只有自己。假 server 的橋不存金鑰（查什麼都回空的），所以裝置雜湊是「沒有任何金鑰」的那個值。
@@ -1054,4 +1066,43 @@ pub(crate) async fn next_message(seen: &mut tokio::sync::broadcast::Receiver<Cor
     })
     .await
     .expect("a room.message arrives")
+}
+
+/// 這個 mxc 的 `media.download` 推播照帳號分好，等到 `users` 每個都收到結束的那一則（`complete`／`cancelled`／`failed`），最多 10 秒。
+pub(crate) async fn states_by_user_until_each_ends(
+    events: &mut tokio::sync::broadcast::Receiver<CoreEvent>,
+    mxc: &str,
+    users: &[&str],
+) -> std::collections::HashMap<String, Vec<crate::event::DownloadState>> {
+    use crate::event::DownloadState;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut seen: std::collections::HashMap<String, Vec<DownloadState>> =
+            std::collections::HashMap::new();
+        let ended = |states: &Vec<DownloadState>| {
+            states.last().is_some_and(|state| {
+                matches!(
+                    state,
+                    DownloadState::Complete | DownloadState::Cancelled | DownloadState::Failed
+                )
+            })
+        };
+        loop {
+            if users.iter().all(|user| seen.get(*user).is_some_and(&ended)) {
+                return seen;
+            }
+            if let Ok(CoreEvent::MediaDownload {
+                user,
+                mxc: event_mxc,
+                state,
+                ..
+            }) = events.recv().await
+            {
+                if event_mxc == mxc {
+                    seen.entry(user).or_default().push(state);
+                }
+            }
+        }
+    })
+    .await
+    .expect("every account hears how the download ended")
 }

@@ -27,6 +27,7 @@ PR #1–#74 合併（main `ac11c6b`，2026-10-06）；分支 `feat/matrix-media-
   讀是 `media.open` → `GET /media`（Range 就是 seek）。下載是每帳號一個處理端、所有檔一起跑（每檔一塊在途）、`Download` 線送收分開（`/docs/design/daemon/link-requests.md`）、池格式 v2、seek 暫存檔，
   進度是推播 `media.download`（`/docs/design/media/media-download.md`）。兩邊都對真 server 驗過。
   同一個 mxc 本地的 `media` 列說了算：描述不合一律 1500、🚫 換掉列；只給 `mxc` 照列挑事件、從訊息點下載由那則建列；`media.delete_local` 清本地（先取消正在下載的）（`/docs/design/media/media-download.md` §5.3、§7.4，維護者 2026-10-07）。
+  一個檔同時只有一個下載：同 server 的別的帳號再要就掛上去，進度與結果每個要過的帳號各推一則；`media.cancel` 誰叫都停（同一份 §5.1、§5.4、§5.5）。
 
 **還沒有**：UI；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；交叉簽章；
 已讀（`/docs/design/messages/read-receipts.md` 是草案）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。

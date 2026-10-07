@@ -291,13 +291,18 @@ impl Core {
         })
     }
 
-    /// `media.queue`：這個帳號的佇列，第一個是正在拉的。
+    /// `media.queue`：這個帳號要過的分塊檔，先列自己的處理端（第一個是正在拉的），再列同 server 別的帳號替它下載的（維護者 2026-10-07）。
     pub async fn media_queue(&self, target: &Target) -> Result<Vec<QueuedMedia>, CoreError> {
         let account = self.account_or_current(target)?;
-        let downloader = self.downloader_of(&account).await?;
-        Ok(downloader
-            .list_jobs()
+        let (_cache, me) = self.server_cache_and_me(&account)?;
+        let own = self.downloader_of(&account).await?;
+        let others = self
+            .list_downloaders_on(&account.server_dir())
             .into_iter()
+            .filter(|downloader| !Arc::ptr_eq(downloader, &own));
+        Ok(std::iter::once(own.clone())
+            .chain(others)
+            .flat_map(|downloader| downloader.list_jobs_of(&me))
             .map(|(mxc, name, status)| QueuedMedia {
                 mxc,
                 name,
@@ -309,18 +314,27 @@ impl Core {
     }
 
     /// `media.cancel`：正在拉就設旗標（處理完手上那一包就停）、排著就從佇列拿掉（/docs/design/media/media-download.md §5.4）。
+    /// 一個檔只有一個下載，要過它的帳號共用：誰叫都停，每個要過的帳號都收到 `cancelled`（維護者 2026-10-07）。
     ///
     /// Return:
-    ///     Ok(true)    在佇列或 `downloading` 表裡
+    ///     Ok(true)    這台 server 上有它在下載或排著
     ///     Ok(false)   都不在
     pub async fn media_cancel(&self, mxc: &str, target: &Target) -> Result<bool, CoreError> {
         let account = self.account_or_current(target)?;
-        // 傳統檔不在下載處理端裡（/docs/design/media/media-download.md §12）：兩邊都問。
-        if self.cancel_matrix_download(&account, mxc) {
-            return Ok(true);
+        Ok(self.cancel_downloads_on_server(&account, mxc))
+    }
+
+    /// 這台 server 上所有正在下載（或排著）這個 mxc 的都交取消：傳統的 task（登記表以 server 為鍵）與每個帳號已經起了的分塊處理端。
+    /// 全部都交（🚫 第一個取消成功就停）：job 可能轉到別的帳號的處理端去了；🚫 為了取消新起一個處理端。
+    ///
+    /// Return:
+    ///     bool   true ＝至少一個接了取消
+    fn cancel_downloads_on_server(&self, account: &AccountDir, mxc: &str) -> bool {
+        let mut cancelled = self.cancel_matrix_download(account, mxc);
+        for downloader in self.list_downloaders_on(&account.server_dir()) {
+            cancelled |= downloader.cancel(mxc);
         }
-        let downloader = self.downloader_of(&account).await?;
-        Ok(downloader.cancel(mxc))
+        cancelled
     }
 
     /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.3）：**解密寫到 `to`**。
@@ -870,11 +884,7 @@ impl Core {
         let server_dir = account.server_dir();
         let (cache, _me) = self.server_cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
-        // 兩條都問、全部都交（🚫 第一個取消成功就停）：同一台 server 的別的帳號可能也在拉它。
-        let mut cancelled = self.cancel_matrix_download(&account, mxc);
-        for downloader in self.list_downloaders_on(&server_dir) {
-            cancelled |= downloader.cancel(mxc);
-        }
+        let cancelled = self.cancel_downloads_on_server(&account, mxc);
         // 分塊的取消會把半成品留著續傳（/docs/design/media/media-download.md §5.4）：處理端關掉它之前🚫 刪。
         let pending_name = cache.read().await.media_pending_name(mxc)?;
         if let Some(pending_name) = pending_name {

@@ -5,7 +5,7 @@
 //! 跟 wbf 分塊的下載處理端（`download_queue.rs`）分開：那邊是 `Download` 線上一塊一塊的請求，這邊是一個 HTTP 從頭讀到尾，
 //! 🚫 seek、🚫 續傳（§12.4）；共用的只有池、`cache.db` 的列與推播 `media.download`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -53,6 +53,17 @@ pub(crate) struct MatrixTransfer {
     description: MediaDescription,
     pending_name: String,
     commands: mpsc::UnboundedSender<Command>,
+    /// 要過這個檔的帳號：進度與結果每個各推一則（/docs/design/media/media-download.md §12.1，維護者 2026-10-07）。跟 task 共用
+    listeners: Listeners,
+}
+
+/// 要過一個檔的帳號（mxid）。
+type Listeners = Arc<Mutex<BTreeSet<String>>>;
+
+fn lock_listeners(listeners: &Listeners) -> MutexGuard<'_, BTreeSet<String>> {
+    listeners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl MatrixTransfer {
@@ -193,6 +204,8 @@ impl Core {
             if !media::is_same_matrix_description(&existing.description, &description) {
                 return Err(described_otherwise(&mxc));
             }
+            // 同一個檔只有一個 task 在下載：這個帳號掛上去，之後的進度與結果也推給它。
+            lock_listeners(&existing.listeners).insert(me);
             if let Some(waiter) = waiter {
                 // 那個 task 剛好收了：等的人拿到「它停了」，重叫一次就會走池或重起。
                 if let Err(mpsc::error::SendError(Command::Wait(waiter))) =
@@ -207,6 +220,7 @@ impl Core {
         if let Some(waiter) = waiter {
             let _ = commands.send(Command::Wait(waiter));
         }
+        let listeners: Listeners = Arc::new(Mutex::new(BTreeSet::from([me.clone()])));
         files.insert(
             key.clone(),
             Arc::new(MatrixTransfer {
@@ -214,6 +228,7 @@ impl Core {
                 description: description.clone(),
                 pending_name: pending_name.clone(),
                 commands,
+                listeners: listeners.clone(),
             }),
         );
         drop(files);
@@ -225,6 +240,7 @@ impl Core {
             server: session.server,
             access_token: session.access_token,
             user: me,
+            listeners,
             cache,
             pool,
             events: self.events.clone(),
@@ -272,7 +288,10 @@ struct TransferTask {
     total: u32,
     server: String,
     access_token: String,
+    /// 起這個 task 的帳號（它的 token 在拉）
     user: String,
+    /// 推播發給誰：跟登記表那一項共用，後來掛上來的帳號也在裡面
+    listeners: Listeners,
     cache: Arc<ServerCache>,
     pool: MediaPool,
     events: EventSink,
@@ -482,15 +501,21 @@ impl TransferTask {
         verified: Option<Verification>,
         reason: Option<String>,
     ) {
-        self.events.emit(CoreEvent::MediaDownload {
-            user: self.user.clone(),
-            mxc: self.key.1.clone(),
-            state,
-            done,
-            total: self.total,
-            verified,
-            reason,
-        });
+        let mut recipients = lock_listeners(&self.listeners).clone();
+        if recipients.is_empty() {
+            recipients.insert(self.user.clone());
+        }
+        for user in recipients {
+            self.events.emit(CoreEvent::MediaDownload {
+                user,
+                mxc: self.key.1.clone(),
+                state,
+                done,
+                total: self.total,
+                verified,
+                reason: reason.clone(),
+            });
+        }
     }
 }
 
@@ -605,7 +630,19 @@ mod tests {
         event_id: &str,
         content: serde_json::Value,
     ) {
+        store_matrix_file_as(core, account, ME, event_id, content).await;
+    }
+
+    /// 同上，看得到它的是 `user`（同一台 server 的另一個帳號）。
+    async fn store_matrix_file_as(
+        core: &Core,
+        account: &AccountDir,
+        user: &str,
+        event_id: &str,
+        content: serde_json::Value,
+    ) {
         let (cache, _) = core.server_cache_and_me(account).unwrap();
+        let user = user.to_string();
         let event = serde_json::json!({
             "type": "m.room.message", "event_id": event_id, "room_id": ROOM,
             "sender": "@carol:localhost", "origin_server_ts": 1000, "content": content,
@@ -614,7 +651,7 @@ mod tests {
             .run(move |cache| {
                 cache
                     .upsert_events(
-                        ME,
+                        &user,
                         ROOM,
                         &[wbf_sdk::incoming::IncomingEvent::Plain { event }],
                     )
@@ -1145,6 +1182,9 @@ mod tests {
         let (commands, inbox) = mpsc::unbounded_channel();
         let (waiter, done) = oneshot::channel();
         let _ = commands.send(Command::Wait(waiter));
+        let listeners = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::from([
+            me.clone(),
+        ])));
         core.matrix_transfers.files().insert(
             key.clone(),
             Arc::new(MatrixTransfer {
@@ -1152,6 +1192,7 @@ mod tests {
                 description: MediaDescription::of_matrix_attachment(&attachment),
                 pending_name: pending_name.clone(),
                 commands,
+                listeners: listeners.clone(),
             }),
         );
         let task = TransferTask {
@@ -1162,6 +1203,7 @@ mod tests {
             server: "http://127.0.0.1:1".into(),
             access_token: "unused".into(),
             user: me,
+            listeners,
             cache: cache.clone(),
             pool: core.pool_of(&account).unwrap(),
             events: core.events.clone(),
@@ -1301,5 +1343,63 @@ mod tests {
             states.last().copied(),
             Some((DownloadState::Complete, Some(Verification::Unknown)))
         );
+    }
+
+    /// 維護者 2026-10-07：一個檔只有一個下載。同一台 server 的 B 也要 A 正在下載的傳統檔 → 掛到同一個 task 上（🚫 再起一個）；
+    /// 進度與結果兩個帳號都收到。
+    #[tokio::test]
+    async fn two_accounts_share_one_matrix_download_and_both_hear_its_end() {
+        let mxc = "mxc://localhost/Shared";
+        let plain = sample(300_000);
+        let (cipher, file) = encrypt(&plain, mxc);
+        let release = Arc::new(Notify::new());
+        let base = media_server(cipher, Some((150_000, release.clone()))).await;
+        let dir = scratch("mx-shared");
+        let (core, account) = core_with_account_on(&dir, &base, SessionBackend::WbfSdk).await;
+        let bob = "@bob:localhost";
+        add_account_on(&core, &dir, &base, bob, SessionBackend::WbfSdk).await;
+        let content = encrypted_content(mxc, file, plain.len());
+        store_matrix_file(&core, &account, "$s", content.clone()).await;
+        store_matrix_file_as(&core, &account, bob, "$s", content).await;
+        let mut events = core.subscribe();
+        let from_message = MediaRef::Event {
+            room: ROOM.into(),
+            event_id: "$s".into(),
+            mxc: Some(mxc.into()),
+        };
+        let as_bob = Target {
+            user: Some(bob.into()),
+            ..Target::default()
+        };
+        for target in [&Target::default(), &as_bob] {
+            let job = core.media_download(&from_message, target).await.unwrap();
+            assert_eq!(job.state, DownloadState::Downloading, "{target:?}");
+        }
+        let transfer = core
+            .matrix_transfers
+            .find(&account.server_dir(), mxc)
+            .expect("one task for the file");
+        assert_eq!(
+            super::lock_listeners(&transfer.listeners)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [ME.to_string(), bob.to_string()]
+        );
+        release.notify_one();
+        let seen = states_by_user_until_each_ends(&mut events, mxc, &[ME, bob]).await;
+        for user in [ME, bob] {
+            let states = &seen[user];
+            assert_eq!(
+                states.last(),
+                Some(&DownloadState::Complete),
+                "{user}: {states:?}"
+            );
+            assert!(
+                states.contains(&DownloadState::Verifying),
+                "{user} hears the progress too: {states:?}"
+            );
+        }
+        assert_eq!(read_whole(&core, mxc).await, (true, plain));
     }
 }

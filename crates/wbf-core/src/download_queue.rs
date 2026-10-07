@@ -11,7 +11,7 @@
 //!
 //! 塊怎麼驗、怎麼落地是 sdk 的 `MediaDownload`；這裡只管「誰、何時、做到哪」。DB 一律經 `ServerCache`（唯一寫入者）。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -110,6 +110,9 @@ struct QueueState {
     preparing: HashMap<String, Preparing>,
     downloading: HashMap<String, Arc<Downloading>>,
     waiters: HashMap<String, Vec<Waiter>>,
+    /// 要過這個檔的帳號（mxid）：進度與結果每個各推一則（/docs/design/media/media-download.md §5.5，維護者 2026-10-07）。
+    /// 跟 `waiters` 一樣跟著 job 走：job 轉給別的處理端時一起帶過去、job 結束時拿掉。
+    listeners: HashMap<String, BTreeSet<String>>,
     /// 處理端現在開著的主檔暫存名（掃描不准碰，`media::sweep` 的 `in_use`）。
     open_names: HashSet<String>,
     /// 下一個開始的檔拿第幾號（`Downloading::started`）。
@@ -133,8 +136,10 @@ impl Shared {
     }
 }
 
-/// 交一個「下載這個檔」的 job 進某個處理端的收件 queue：已經在跑、在收件 queue 或在準備就不重複，等的人掛上去。
+/// 交一個「下載這個檔」的 job 進某個處理端的收件 queue：已經在跑、在收件 queue 或在準備就不重複，等的人與要進度的帳號掛上去。
 ///
+/// Args:
+///     listeners: 要這個檔的帳號，之後的推播也給它們, example: {"@bob:localhost"}
 /// Return:
 ///     JobStatus   交進去之後（或本來）的樣子
 fn enqueue_into(
@@ -142,9 +147,10 @@ fn enqueue_into(
     events: &EventSink,
     manifest: Arc<Manifest>,
     waiters: Vec<Waiter>,
+    listeners: BTreeSet<String>,
 ) -> JobStatus {
     let mxc = manifest.mxc.clone();
-    let (status, newly_queued) = {
+    let (status, newly_queued, recipients) = {
         let mut state = shared.state();
         if !waiters.is_empty() {
             state
@@ -153,8 +159,13 @@ fn enqueue_into(
                 .or_default()
                 .extend(waiters);
         }
+        let recipients = {
+            let known = state.listeners.entry(mxc.clone()).or_default();
+            known.extend(listeners);
+            known.clone()
+        };
         match status_in(&state, &mxc) {
-            Some(status) => (status, false),
+            Some(status) => (status, false, recipients),
             None => {
                 state.inbox.push_back(DownloadJob {
                     mxc: mxc.clone(),
@@ -167,23 +178,42 @@ fn enqueue_into(
                         total: 0,
                     },
                     true,
+                    recipients,
                 )
             }
         }
     };
     if newly_queued {
-        events.emit(CoreEvent::MediaDownload {
-            user: shared.user.clone(),
-            mxc,
-            state: DownloadState::Queued,
-            done: 0,
-            total: 0,
-            verified: None,
-            reason: None,
+        emit_to_each(events, &recipients, &shared.user, |user| {
+            CoreEvent::MediaDownload {
+                user,
+                mxc: mxc.clone(),
+                state: DownloadState::Queued,
+                done: 0,
+                total: 0,
+                verified: None,
+                reason: None,
+            }
         });
     }
     shared.wake.notify_one();
     status
+}
+
+/// 一則推播發給要過這個檔的每個帳號（內容一樣、`user` 是收件的那個）；名單是空的就發給 `fallback_user`（這個處理端的帳號）。
+fn emit_to_each(
+    events: &EventSink,
+    recipients: &BTreeSet<String>,
+    fallback_user: &str,
+    event_for: impl Fn(String) -> CoreEvent,
+) {
+    if recipients.is_empty() {
+        events.emit(event_for(fallback_user.to_string()));
+        return;
+    }
+    for user in recipients {
+        events.emit(event_for(user.clone()));
+    }
 }
 
 /// 認領的主人：哪個帳號（GET 照它找處理端，`find_writer_of`）、哪一個處理端（連線）。
@@ -435,20 +465,42 @@ impl Downloader {
     ///     JobStatus   交進去之後（或本來）的樣子
     pub(crate) fn enqueue(&self, manifest: Arc<Manifest>, waiter: Option<Waiter>) -> JobStatus {
         let waiters: Vec<Waiter> = waiter.into_iter().collect();
+        // 這個帳號要過它：不管是哪個處理端在寫，進度與結果都推給它一份（維護者 2026-10-07）。
+        let listeners = BTreeSet::from([self.holder.user.clone()]);
         let downloading_elsewhere =
             self.claims
                 .find_other_downloader(&self.server_dir, &manifest.mxc, &self.holder);
         match downloading_elsewhere {
-            Some(queue) => enqueue_into(&queue, &self.events, manifest, waiters),
-            None => enqueue_into(&self.shared, &self.events, manifest, waiters),
+            Some(queue) => enqueue_into(&queue, &self.events, manifest, waiters, listeners),
+            None => enqueue_into(&self.shared, &self.events, manifest, waiters, listeners),
         }
     }
 
-    /// 現在的樣子（`media.queue`）：在跑的照開始的先後，再來是還沒開始的。
+    /// 這個處理端手上、這個帳號要過的 job（`media.queue`：別的帳號的處理端替它下載的也算）。順序同 [`Downloader::list_jobs`]。
     ///
+    /// Args:
+    ///     user: example: "@bob:localhost"
     /// Return:
-    ///     Vec<(mxc, 區塊的檔名, JobStatus)>
+    ///     Vec<(mxc, 區塊的檔名, JobStatus)>   沒有就是空的
+    pub(crate) fn list_jobs_of(&self, user: &str) -> Vec<(String, Option<String>, JobStatus)> {
+        self.list_jobs_where(|state, mxc| {
+            state
+                .listeners
+                .get(mxc)
+                .is_some_and(|listeners| listeners.contains(user))
+        })
+    }
+
+    /// 這個處理端手上全部的 job：在跑的照開始的先後，再來是還沒開始的。
+    #[cfg(test)]
     pub(crate) fn list_jobs(&self) -> Vec<(String, Option<String>, JobStatus)> {
+        self.list_jobs_where(|_, _| true)
+    }
+
+    fn list_jobs_where(
+        &self,
+        keep: impl Fn(&QueueState, &str) -> bool,
+    ) -> Vec<(String, Option<String>, JobStatus)> {
         let state = self.shared.state();
         let mut running: Vec<(&String, &Arc<Downloading>)> = state.downloading.iter().collect();
         running.sort_by_key(|(_, downloading)| downloading.started);
@@ -485,7 +537,11 @@ impl Downloader {
                 },
             )
         });
-        running.chain(preparing).chain(not_started).collect()
+        running
+            .chain(preparing)
+            .chain(not_started)
+            .filter(|(mxc, _, _)| keep(&state, mxc))
+            .collect()
     }
 
     /// `media.cancel`（/docs/design/media/media-download.md §5.4 的表）：正在跑 → 設旗標，在途的那一塊落地就停；還沒開始 → 拿掉。
@@ -493,7 +549,7 @@ impl Downloader {
     /// Return:
     ///     bool  true ＝ 在跑或還沒開始；false ＝ 都不是
     pub(crate) fn cancel(&self, mxc: &str) -> bool {
-        let removed_waiting = {
+        let (removed_waiting, listeners) = {
             let mut state = self.shared.state();
             if let Some(downloading) = state.downloading.get(mxc) {
                 downloading.cancelled.store(true, Ordering::SeqCst);
@@ -511,19 +567,24 @@ impl Downloader {
             if state.inbox.len() == before {
                 return false;
             }
-            state.waiters.remove(mxc).unwrap_or_default()
+            (
+                state.waiters.remove(mxc).unwrap_or_default(),
+                state.listeners.remove(mxc).unwrap_or_default(),
+            )
         };
         for waiter in removed_waiting {
             let _ = waiter.send(Err(cancelled_error(mxc)));
         }
-        self.events.emit(CoreEvent::MediaDownload {
-            user: self.shared.user.clone(),
-            mxc: mxc.to_string(),
-            state: DownloadState::Cancelled,
-            done: 0,
-            total: 0,
-            verified: None,
-            reason: None,
+        emit_to_each(&self.events, &listeners, &self.shared.user, |user| {
+            CoreEvent::MediaDownload {
+                user,
+                mxc: mxc.to_string(),
+                state: DownloadState::Cancelled,
+                done: 0,
+                total: 0,
+                verified: None,
+                reason: None,
+            }
         });
         true
     }
@@ -814,10 +875,32 @@ impl DownloadHandler {
             self.end_job(&mxc, JobEnd::Failed(error));
             return;
         };
-        let waiters = self.shared.state().waiters.remove(&mxc).unwrap_or_default();
-        // 這個帳號的 UI 收過一則 `queued`：補一則對方現在的樣子，🚫 讓它一直以為還在排。
-        let status = enqueue_into(&queue, &self.events, job.manifest, waiters);
-        self.push(&mxc, status.state, status.done, status.total, None, None);
+        let (waiters, listeners) = {
+            let mut state = self.shared.state();
+            (
+                state.waiters.remove(&mxc).unwrap_or_default(),
+                state.listeners.remove(&mxc).unwrap_or_default(),
+            )
+        };
+        // 要過它的帳號收過一則 `queued`：補一則對方現在的樣子，🚫 讓它們一直以為還在排。之後的推播由那個處理端發給它們。
+        let status = enqueue_into(
+            &queue,
+            &self.events,
+            job.manifest,
+            waiters,
+            listeners.clone(),
+        );
+        emit_to_each(&self.events, &listeners, &self.holder.user, |user| {
+            CoreEvent::MediaDownload {
+                user,
+                mxc: mxc.clone(),
+                state: status.state,
+                done: status.done,
+                total: status.total,
+                verified: None,
+                reason: None,
+            }
+        });
     }
 
     /// 主檔的「下一塊」（/docs/design/media/media-download.md §5.4）：暫存檔有就搬、不走網路；沒有就塞它的請求，等回覆。
@@ -1484,11 +1567,12 @@ impl DownloadHandler {
 
     /// job 結束：拿出表、發推播、叫醒等它的人。取消的檔留著（再要一次從斷點接）；還有 GET 在等它的塊就先開著。
     fn end_job(&mut self, mxc: &str, end: JobEnd) {
-        let (downloading, waiters) = {
+        let (downloading, waiters, listeners) = {
             let mut state = self.shared.state();
             (
                 state.downloading.remove(mxc),
                 state.waiters.remove(mxc).unwrap_or_default(),
+                state.listeners.remove(mxc).unwrap_or_default(),
             )
         };
         self.timers.remove(mxc);
@@ -1521,7 +1605,17 @@ impl DownloadHandler {
                 Err(error),
             ),
         };
-        self.push(mxc, state, done, total, verified, reason);
+        emit_to_each(&self.events, &listeners, &self.holder.user, |user| {
+            CoreEvent::MediaDownload {
+                user,
+                mxc: mxc.to_string(),
+                state,
+                done,
+                total,
+                verified,
+                reason: reason.clone(),
+            }
+        });
         for waiter in waiters {
             let _ = waiter.send(outcome.clone());
         }
@@ -1641,6 +1735,8 @@ impl DownloadHandler {
         }
     }
 
+    /// 推給要過這個檔的每個帳號（`QueueState::listeners`）。
+    ///
     /// Args:
     ///     verified: `complete` 一律帶（/docs/design/media/media-download.md §12.3），其他狀態是 None, example: Some(Verification::Matched)
     fn push(
@@ -1652,14 +1748,23 @@ impl DownloadHandler {
         verified: Option<Verification>,
         reason: Option<String>,
     ) {
-        self.events.emit(CoreEvent::MediaDownload {
-            user: self.holder.user.clone(),
-            mxc: mxc.to_string(),
-            state,
-            done,
-            total,
-            verified,
-            reason,
+        let listeners = self
+            .shared
+            .state()
+            .listeners
+            .get(mxc)
+            .cloned()
+            .unwrap_or_default();
+        emit_to_each(&self.events, &listeners, &self.holder.user, |user| {
+            CoreEvent::MediaDownload {
+                user,
+                mxc: mxc.to_string(),
+                state,
+                done,
+                total,
+                verified,
+                reason: reason.clone(),
+            }
         });
     }
 
@@ -1675,25 +1780,34 @@ impl DownloadHandler {
             self.claims.release(&self.server_dir, &mxc, &self.holder);
         }
         // 還沒處理的 job 與等的人（含別的處理端剛轉過來的，§5.1）：🚫 跟著收件 queue 一起悄悄消失，逐個回錯、推一則失敗。
-        let (unstarted, running, waiters) = {
+        let (unstarted, running, waiters, mut listeners) = {
             let mut state = self.shared.state();
             let unstarted: Vec<String> = state.inbox.drain(..).map(|job| job.mxc).collect();
             let running: Vec<String> = state.downloading.drain().map(|(mxc, _)| mxc).collect();
-            (unstarted, running, std::mem::take(&mut state.waiters))
+            (
+                unstarted,
+                running,
+                std::mem::take(&mut state.waiters),
+                std::mem::take(&mut state.listeners),
+            )
         };
         let error = downloader_gone();
         for waiter in waiters.into_values().flatten() {
             let _ = waiter.send(Err(error.clone()));
         }
         for mxc in unstarted.iter().chain(running.iter()) {
-            self.push(
-                mxc,
-                DownloadState::Failed,
-                0,
-                0,
-                None,
-                Some(error.message.clone()),
-            );
+            let recipients = listeners.remove(mxc).unwrap_or_default();
+            emit_to_each(&self.events, &recipients, &self.holder.user, |user| {
+                CoreEvent::MediaDownload {
+                    user,
+                    mxc: mxc.clone(),
+                    state: DownloadState::Failed,
+                    done: 0,
+                    total: 0,
+                    verified: None,
+                    reason: Some(error.message.clone()),
+                }
+            });
         }
     }
 }
@@ -2604,6 +2718,111 @@ mod tests {
             core.media_claims
                 .find_holder(&account.server_dir(), &manifest.mxc),
             None
+        );
+    }
+
+    /// 維護者 2026-10-07：一個檔只有一個下載。B 也要 A 正在下載的 X → B 🚫 再下載，掛上去；X 的進度與結果兩個帳號都收到，`media.queue` 兩邊都看得到。
+    #[tokio::test]
+    async fn two_accounts_share_one_download_and_both_hear_its_progress_and_end() {
+        let (core, account, server, manifest) = uploaded("dq-shared").await;
+        let (_, alice_id) = core.server_cache_and_me(&account).unwrap();
+        let mut events = core.subscribe();
+        hold_reads(&server).await;
+        let alice = core.downloader_of(&account).await.unwrap();
+        alice.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&alice).await;
+        let (bob, bob_server) =
+            start_another_account(&core, &account, &server, "@bob:localhost").await;
+        let status = bob.enqueue(Arc::new(manifest.clone()), None);
+        assert_eq!(status.state, DownloadState::Downloading);
+        let mxcs = |jobs: Vec<(String, Option<String>, JobStatus)>| {
+            jobs.into_iter().map(|(mxc, _, _)| mxc).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mxcs(alice.list_jobs_of("@bob:localhost")),
+            vec![manifest.mxc.clone()]
+        );
+        assert_eq!(
+            mxcs(alice.list_jobs_of(&alice_id)),
+            vec![manifest.mxc.clone()]
+        );
+        assert!(bob.list_jobs_of("@bob:localhost").is_empty());
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        let seen = states_by_user_until_each_ends(
+            &mut events,
+            &manifest.mxc,
+            &[alice_id.as_str(), "@bob:localhost"],
+        )
+        .await;
+        // 進度（每秒一則）跟「驗證中」走同一支 `push`：這個檔帶 sha256，收尾前一定有一則 `verifying`，拿它當「進度也推給 B」的證據。
+        assert!(manifest.block.sha256.is_some());
+        for user in [alice_id.as_str(), "@bob:localhost"] {
+            let states = &seen[user];
+            assert_eq!(
+                states.last(),
+                Some(&DownloadState::Complete),
+                "{user}: {states:?}"
+            );
+            assert!(
+                states.contains(&DownloadState::Verifying),
+                "{user} hears the progress too: {states:?}"
+            );
+        }
+        assert!(bob_server.download_reads.lock().unwrap().is_empty());
+        assert_eq!(reads(&server), (0..CHUNKS).collect::<Vec<_>>());
+        assert!(
+            alice.list_jobs_of("@bob:localhost").is_empty(),
+            "the end clears the list"
+        );
+    }
+
+    /// 維護者 2026-10-07：誰叫取消都停。B 的處理端在寫 X、A 也要過 X；A 叫 `media.cancel` → 那一個下載停，兩個帳號都收到 `cancelled`。
+    #[tokio::test]
+    async fn a_cancel_from_any_account_stops_the_one_download_for_everyone() {
+        let (core, account, server, manifest) = uploaded("dq-shared-cancel").await;
+        let (_, alice_id) = core.server_cache_and_me(&account).unwrap();
+        let mut events = core.subscribe();
+        let (bob, bob_server) =
+            start_another_account(&core, &account, &server, "@bob:localhost").await;
+        hold_reads(&bob_server).await;
+        bob.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&bob).await;
+        // B 的處理端照同一台 server 登記（跟 `downloader_of` 起的一樣），取消才找得到它。
+        core.downloaders
+            .lock()
+            .unwrap()
+            .insert(account.server_dir().join("bob-test"), Arc::new(bob));
+        let job = core
+            .media_download(&MediaRef::Manifest(manifest.clone()), &Target::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            job.state,
+            DownloadState::Downloading,
+            "alice joins bob's download"
+        );
+        assert!(core
+            .media_cancel(&manifest.mxc, &Target::default())
+            .await
+            .unwrap());
+        bob_server.read_permits.add_permits(READ_PERMITS as usize);
+        let seen = states_by_user_until_each_ends(
+            &mut events,
+            &manifest.mxc,
+            &[alice_id.as_str(), "@bob:localhost"],
+        )
+        .await;
+        for user in [alice_id.as_str(), "@bob:localhost"] {
+            assert_eq!(
+                seen[user].last(),
+                Some(&DownloadState::Cancelled),
+                "{user}: {:?}",
+                seen[user]
+            );
+        }
+        assert!(
+            server.download_reads.lock().unwrap().is_empty(),
+            "alice never downloaded it"
         );
     }
 

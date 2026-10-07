@@ -273,6 +273,11 @@ slots: Vec<u32>，長度 = chunk_count，初值 0
   - **別的處理端也要下載同一個檔**：🚫 再下載一次、🚫 排著等。job 轉給正在下載的那個處理端（它的收件 queue 記在認領裡），回的是它的狀態（通常是 `downloading`）；
     要等它完成的（`media.export_to`）掛到它身上。交 job 的時候就看；交進來之後對方才開始的，認領不到時一樣轉過去。那個處理端剛好在收（認領還沒放）就回錯、請他再試；
     轉過去之後它才收，它收攤時把收件 queue 裡沒處理的 job、在跑的、等的人一起回錯、推一則失敗，🚫 悄悄消失。
+  - **要過這個檔的帳號都聽得到它**（維護者 2026-10-07）：每個 job 帶一份「誰要過它」的名單（`QueueState::listeners`），跟等的人一樣跟著 job 轉過去、job 結束時拿掉。
+    進度、`verifying`、`complete`（帶 `verified`）、`cancelled`、`failed` 都給名單上的每個帳號各推一則（§5.5）；`media.queue` 也照這份名單列（§7.1）。
+    例：A 在下載 X、B 也要 X → B 的 job 轉給 A 的處理端、B 拿到 `downloading`，之後 A、B 都收到 X 的進度與最後的驗證結果。
+    「有沒有人在下載」問的是記憶體裡的認領表，🚫 問 DB：DB 不知道寫入者還活不活著，而資料目錄只有一個 daemon 獨佔（DB 只答「已經下載完了沒」）。
+    寫入的那個帳號登出：它的處理端收攤，名單上每個帳號都收到一則 `failed`；別的帳號再要一次就由它自己接著拉（主檔留著，§4.1 續傳）。
   - **只是 seek**（這個處理端沒在下載這個檔）：🚫 認領、🚫 開檔、🚫 寫任何東西，拉到就交給 GET（§6.1）。所以播放永遠不擋下載。
   - job 停了（取消、失敗）、GET 也不再等它的塊，檔就關掉、放掉認領（檔留著，下次接著拉）。
   - 處理端被收時它的認領一定放掉（`Drop`，🚫 不靠 abort 剛好停在哪一行），包括認領了、還在等 DB 建列、還沒開好的那幾個；收尾時先寫 DB 記完成、**才**放掉認領——反過來的話，別的帳號會在 DB 記完成之前接手、把剛進池的檔重下一次。
@@ -354,14 +359,15 @@ Chunk { mxc, next } 回來、主檔在等：
   GET 🚫 自己限時：處理端在線斷、逾時、驗不過時都會回它錯；播放器先放棄（斷線）就不等了。
 - **沒人看的時候照樣拉完**。**暫停**之後才加：加的時候是「走『下一塊』時先看暫停旗標」，只停主檔，🚫 不停 seek。
 
-**`media.cancel { mxc }`**：
+**`media.cancel { mxc }`**：一個檔只有一個下載，要過它的帳號共用，所以**誰叫都停**（維護者 2026-10-07）——這台 server 上每個帳號已經起了的處理端都交一次取消
+（job 可能轉到別的帳號的處理端去了），傳統檔的 task 也停（§12）；名單上的每個帳號都收到 `cancelled`。🚫 為了取消新起一個處理端。
 
 | 這個 mxc 在哪 | 做什麼 |
 |---|---|
 | `downloading` 表裡（正在拉） | `cancelled = true`。在途的那一塊落地之後就停；請求還排著沒送就當場停。處理端自己從表裡拿掉 |
 | 正在準備（還沒進表） | 記下來，處理端開始它之前看到就停 |
 | 收件 queue 裡（還沒開始） | 拿掉（它不在表裡） |
-| 都不在 | 回 `cancelled: false` |
+| 這台 server 上都不在 | 回 `cancelled: false` |
 
 ### 5.5 進度：daemon 負責（維護者 2026-10-01）
 
@@ -371,7 +377,9 @@ Chunk { mxc, next } 回來、主檔在等：
 - **推播 `media.download`**（要先 `subscribe`，/docs/design/rpc-specs/rpc-spec.md §4）：
   `{ mxc, state: "queued"|"downloading"|"verifying"|"complete"|"cancelled"|"failed", done: next, total, user, verified?, reason? }`（`verifying` 與 `complete` 帶的 `verified` 在 §12.3）。`queued` 是收到了、還沒處理。
   每個檔**最多每秒一則**，加上每次狀態改變一則（收到、開始、完成、取消、失敗）——🚫 不是每塊一則（那會把 `room.message` 擠掉，/docs/design/daemon/daemon-runtime.md §5.4）。
-- **`media.queue`** 隨時可以問現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`）。
+- **要過這個檔的每個帳號各推一則**（維護者 2026-10-07，§5.1）：內容一樣，`user` 是收件的那個帳號，所以 `subscribe` 帶 `user` 過濾的 UI 照樣收得到。
+  例：A 在下載 X、B 也要 X → 每次進度兩則（`user` 各是 A、B），最後兩則 `complete` 都帶同一個 `verified`。🚫 一則帶好幾個帳號（推播的形狀不變）。
+- **`media.queue`** 隨時可以問現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`）。列的是**這個帳號要過的**：先列自己的處理端，再列同 server 別的帳號替它下載的。
 - 播放中的進度照舊：就是那個 GET 收到多少 bytes。
 
 `media.export_to`（匯出）也排隊（維護者 2026-10-01）：交一個 job、等它完成，再照 `media.kind`／`verified` 寫到使用者指定的位置（從池匯出🚫 再算 hash）；`no_cache` 版也排隊（§7.3）。
@@ -436,11 +444,11 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 |---|---|---|---|
 | `media.download` | `{ mxc } \| { room, event_id, mxc? } \| { manifest }`（剛好給一種，給了不只一種是參數錯，🚫 不猜哪個優先；從訊息點下載的那種可以多帶 `mxc`，要是那則的附件），`user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }` | 建 job（§5.3；標準附件見 §12）。已經完整或有原檔就直接回 `complete`／`local_source`；`kind`、`verified` 是 `media` 列的（§12.3）。描述跟本地那一列不合 → 1500（§5.3） |
 | `media.open` | 同上 | `{ url, mxc, mimetype?, size?, state, kind?, verified? }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`verifying`、`queued`。`size` 只在事件沒給 `info.size` 的傳統檔不在（§12.2）。不完整也沒原檔 → 順便建 job |
-| `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`） |
-| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 正在拉 → 設 `downloading[mxc].cancelled`，在途的那一塊落地就停；還沒開始 → 拿掉（§5.4） |
+| `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 現在的樣子：這個帳號要過的分塊檔，在跑的（`downloading`）與還沒開始的（`queued`），含同 server 別的帳號替它下載的（§5.5）。傳統檔不在這裡 |
+| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | **誰叫都停**：這台 server 上那一個下載停掉、要過它的帳號都收到 `cancelled`。正在拉 → 設 `downloading[mxc].cancelled`，在途的那一塊落地就停；還沒開始 → 拿掉（§5.4） |
 | `media.delete_local` | `{ mxc, user?, server? }` | `{ mxc, removed: bool, cancelled: bool }` | 清掉這個 mxc 在本地的一切（池檔、半成品、seek 暫存檔、`media` 列），先取消這台 server 上所有正在下載它的（§7.4） |
 | `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI；已經存在就覆蓋）、`no_cache?` | `{ to, bytes, source, kind, verified, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成才寫到 `to`；從池匯出🚫 再算 hash、只核大小，傳統加密的檔沒驗過或驗不過照匯、回 1501（`data` 是這份結果）；從本機原檔匯出一律整檔比 sha256。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
-| 推播 `media.download` | — | `{ mxc, state, done, total, user, verified?, reason? }`；`state` 多一個 `verifying` | §5.5、§12.3。`complete` 一律帶 `verified`（0／1／2）；`reason` 只在 `failed` 帶 |
+| 推播 `media.download` | — | `{ mxc, state, done, total, user, verified?, reason? }`；`state` 多一個 `verifying` | §5.5、§12.3。`complete` 一律帶 `verified`（0／1／2）；`reason` 只在 `failed` 帶。要過這個檔的每個帳號各一則（`user` 是收件的那個） |
 
 - 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。只給 `mxc` 時照本地那一列挑（§5.3）；找不到（沒有列、或看得到的都跟列對不上）是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
 - 一般 Matrix 帳號（走 matrix-sdk 的）沒有 `Download` 線：它只看得到標準 Matrix 附件（`kind` 2、3），走 §12 的 HTTP 下載；給它 `manifest` 回 `1100`。
@@ -560,7 +568,7 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 | `MediaDownload` 對假 server：下載進池、去重、從完整的段續傳（塊跟段不對齊）、seek 拉過的塊主檔不再上網、區塊對不上就刪掉暫存檔；配額清理；掃描（不碰正在下載的、刪 v1、刪過期的）；清除本地（暫存檔還有人在寫就整個拒、放手後半成品與列都刪） | sdk `tests/media_cache.rs` |
 | 匯出的暫存檔：旁邊本來就有的 `<to>.partial` 不論成敗都原封不動、成功時覆蓋既有的 `to`、兩個匯出到同一個 `to` 互不踩（失敗的只刪自己的）、不留暫存檔 | sdk `media::tests` |
 | 線的發送 queue：送出🚫 等回覆、回覆倒著回也找得回自己的動作、插到最前面的先送、還沒送的拿得回來、線斷了在途的都回 `Network` | core `link_requests::tests` |
-| 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、準備中的 job 也取消得掉、`export_to`（含 `no_cache`、從池匯出🚫 再算 hash（列改指到別的池檔也照給）、推播依序 `verifying` → `complete` 帶 `verified`、快取命中回那一列的 `verified`、傳統加密檔驗了正確才可信（資料照讀）、原檔改過就改從池匯出）、描述對不上一律回錯（完整的快取與沒下載完的半成品、列都🚫 動，清掉之後才換得掉）、清除本地會取消正在跑的下載、等處理端關掉檔才刪、server 內部錯留著半成品而 NotFound 刪掉、逾時過一次壞塊照樣重拉一次、別的處理端在下載就把 job 與等的人轉過去（回 `downloading`、自己不上網；轉過去之後它才收，等的人當場拿到錯）、處理端被收會放掉認領、認領認處理端不認帳號（舊處理端放不掉新的、收了的不再收 job）、收掉的處理端讓等塊的 GET 當場拿到錯、只是 seek 🚫 認領、🚫 寫任何檔、下一塊🚫 再問 `Info`、別的帳號下載不等它、seek 照檔驗過的切法算塊號（描述寫錯塊大小照樣給對的 bytes）、只是 seek 的描述驗不過🚫 刪主檔、GET 只用跟本地那一列對得上的描述 | core `download_queue::tests` |
+| 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、準備中的 job 也取消得掉、`export_to`（含 `no_cache`、從池匯出🚫 再算 hash（列改指到別的池檔也照給）、推播依序 `verifying` → `complete` 帶 `verified`、快取命中回那一列的 `verified`、傳統加密檔驗了正確才可信（資料照讀）、原檔改過就改從池匯出）、描述對不上一律回錯（完整的快取與沒下載完的半成品、列都🚫 動，清掉之後才換得掉）、清除本地會取消正在跑的下載、等處理端關掉檔才刪、兩個帳號要同一個檔只有一個下載而兩個都收到進度與結果、`media.queue` 兩邊都列得到、任一個帳號取消就全停且兩個都收到 `cancelled`、server 內部錯留著半成品而 NotFound 刪掉、逾時過一次壞塊照樣重拉一次、別的處理端在下載就把 job 與等的人轉過去（回 `downloading`、自己不上網；轉過去之後它才收，等的人當場拿到錯）、處理端被收會放掉認領、認領認處理端不認帳號（舊處理端放不掉新的、收了的不再收 job）、收掉的處理端讓等塊的 GET 當場拿到錯、只是 seek 🚫 認領、🚫 寫任何檔、下一塊🚫 再問 `Info`、別的帳號下載不等它、seek 照檔驗過的切法算塊號（描述寫錯塊大小照樣給對的 bytes）、只是 seek 的描述驗不過🚫 刪主檔、GET 只用跟本地那一列對得上的描述 | core `download_queue::tests` |
 | URL：讀與上傳的 URL 不能互換；Range 解析 | daemon `data_plane::tests` |
 | HTTP：未解鎖 503、別的 daemon 發的／用途不對／本機沒紀錄 404、方法不對 405 | daemon `tests/data_plane.rs` |
 | 推播 `media.download` 的欄位 | daemon `push::tests` |
@@ -617,6 +625,9 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
     從訊息點下載（帶 `room`、`event_id`，可以再帶 `mxc`）由那則事件確定列；列已經在而描述不合 → RPC 回錯（UI 拿到的警告）、🚫 下載。
     取代第 12 條的「沒下載完就丟掉重來」：沒有任何路徑會換掉列的描述。
 24. **新增 `media.delete_local`**（§7.4）：清掉本地資料與 `media` 列，而且**先取消當下所有正在下載同一個 mxc 的**。
+25. **每個檔同時最多一個下載，要過它的帳號都聽得到**（§5.1、§5.5、§12.1，分塊與傳統都是）：A 在下載 X、B 也要 X → B 🚫 再下載，掛上去；
+    X 的進度與最後的驗證結果 A、B 都收到（每個帳號各推一則，`user` 是收件的那個）。
+26. **`media.cancel` 誰叫都停**（§5.4）：那一個下載整個停、要過它的帳號都收到 `cancelled`。
 
 ## 12. 傳統格式的附件（`kind` 2、3）（維護者 2026-10-06）
 
@@ -643,6 +654,8 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
   **每個檔一個 task**（`crates/wbf-core/src/matrix_download.rs`），🚫 進分塊的下載處理端（§5.1）：那邊的單位是「線上的一塊」，這邊是「一條 HTTP 從頭讀到尾」，
   共用的只有池、`cache.db` 的列、取消（`media.cancel`）與推播 `media.download`。這個 task 是那個主檔唯一的寫入者，還在下載時 GET 要的明文也問它（§12.2）。
   同一個 mxc 第二次要（`media.download`／`open`／`export_to`）就掛到同一個 task 上，🚫 再起一個。所有檔一起跑照舊。
+  登記表以「server＋mxc」為鍵，所以同一台 server 的別的帳號要同一個檔也掛到這個 task 上；task 記著要過它的帳號，進度與結果每個各推一則（§5.5，維護者 2026-10-07）。
+  拉的是起 task 的那個帳號的 token；它登出就停（§12.4）、要過的帳號都收到 `cancelled`，再要一次由要的那個帳號重起。
 - **解密用上游的 `AttachmentDecryptor`**（`matrix-sdk-crypto`），🚫 自己刻 AES-CTR。它在讀到結尾時才比 hash、對不上回錯——正好是這裡要的時機。
   它吃同步的 `Read`：餵它的是一個記憶體佇列，HTTP 的下一段進來才放進佇列、佇列有東西才叫它解（佇列空著叫＝它當成讀到結尾、拿去比 hash），
   讀完才在佇列空著時叫最後一次。解一段只是幾十 KiB 的 XOR，🚫 `spawn_blocking`。實作在 `crates/wbf-sdk/src/matrix_media.rs`。
@@ -726,6 +739,7 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
 - 清除：正在下載的被取消（`cancelled: true`）、半成品與列都沒了；只給 `mxc` 下載回 1100、從訊息點下載由那則重建、從頭下載完成。
 - task 開頭看到列已經完整（salvia 1 的窗口）→ 直接收尾、推播只有一則 `complete`、🚫 上網。
 - 取消：推播 `cancelled`、半成品刪掉、列 `complete = 0`；再要一次從頭下載、完成。
+- 同一台 server 兩個帳號要同一個檔：只有一個 task、名單是兩個帳號；兩個都收到 `verifying` 與 `complete`。
 - 從池匯出：`kind` 1、3 照匯、成功；`kind` 2 `verified = 1` 成功、`verified = 2` **照匯**（`to` 有檔）而且回 1501、`data` 是那份結果。
 - 跟 `AttachmentEncryptor` 互通：我們上傳的（/docs/design/rpc-specs/data-plane.md §7.2）用上游的 `AttachmentDecryptor` 解得開，反過來也是。
 - 真 server：用 matrix-sdk 的 Client（等同 Element 的格式）在加密房送一個附件，wbf 帳號 `media.open` → GET 整檔對。
