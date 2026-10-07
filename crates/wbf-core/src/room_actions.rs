@@ -989,6 +989,22 @@ mod tests {
             None
         );
 
+        // 解除封鎖只在目前是 `ban` 時改：還在邀請中的🚫 被改成 `leave`。
+        core.act_on_member(
+            MemberAction::Unban,
+            ROOM,
+            LOCAL_FRIEND,
+            None,
+            WriteSync::Both,
+            &target,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            membership_of(&core, &account, LOCAL_FRIEND, ROOM).await,
+            Some(Membership::Invite)
+        );
+
         core.act_on_member(
             MemberAction::Ban,
             ROOM,
