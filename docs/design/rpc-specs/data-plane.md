@@ -158,7 +158,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 
 - 「房間加不加密」問的是**這一刻**的 `m.room.encryption`，🚫 不用快取（過期的「沒加密」會把金鑰公開出去）。
 - `size: 0` 是 1100：協議沒有零塊的上傳。
-- 一般 Matrix 帳號走傳統上傳（§7.2）：要 `size`、受 `m.upload.size` 限制、`cipher` 只認沒給與 `none`。（實作之前仍回 1100。）
+- 一般 Matrix 帳號走傳統上傳（§7.2）：要 `size`、受 `m.upload.size` 限制、`cipher` 只認沒給與 `none`；回應沒有 `upload_id`。
 - `upload_id` 給 `upload.status`／`upload.abort` 用；UI 送訊息用的是 PUT 回的 manifest（§5）。
 - `source_uri` 跟上傳狀態一起封在 `Wbf-Upload-Meta` 裡（§2），PUT 傳完（`Seal` 成功、而且 server 沒截斷）才寫進 `media` 列；
   寫不進去只發一則提醒、PUT 照樣回 200（檔已經在 server 上了）。
@@ -404,7 +404,7 @@ PUT 回的 manifest（加密房，實際跑 `upload_matrix_media` 的結果印�
 |---|---|
 | 支援 | `Range` 單一一段：`bytes=a-b`、`bytes=a-`、`bytes=-n`（最後 n byte），終點超過檔尾就截到檔尾；沒帶、寫壞了、不只一段 → 整檔（RFC 9110 §14.2：認不得的 Range 可以不理）。`HEAD` 回一樣的標頭、沒有 body |
 | 回 | `200`（整檔）／`206 Partial Content`（有 Range，帶 `Content-Range`）；`Content-Type` 是 `media` 列的 mimetype（沒有就用區塊的），都沒有就 `application/octet-stream`；`Accept-Ranges: bytes`；`Content-Length`；`X-Content-Type-Options: nosniff` 與 `Content-Security-Policy: sandbox`（型別是寄件者填的，被瀏覽器當頁面打開時🚫 跑腳本） |
-| `412` | `kind` 2（傳統加密）的檔還沒驗、或驗不過：**body 照給**，跟 `200`／`206` 一樣（§8.2 的約定）。每個回應都帶 `Wbf-Media-Kind`、`Wbf-Media-Verified` |
+| `412` | `kind` 2（傳統加密）的檔還沒驗、或驗不過：**body 照給**，跟 `200`／`206` 一樣（§8.2 的約定）。`200`／`206`／`412` 都帶 `Wbf-Media-Kind`、`Wbf-Media-Verified`（其他狀態碼不帶檔案的資料，🚫 帶這兩個） |
 | `416` | Range 的起點在檔尾或之後（帶 `Content-Range: bytes */<大小>`） |
 | `404` | 不是這個 daemon 發的 URL、用途不對（上傳的 URL）、或本機沒有任何帳號有這個 mxc 的紀錄 |
 | `503` | 未解鎖 |
@@ -458,7 +458,7 @@ media 列在，而且 source_uri 不是空的
 
 - **為什麼只有 `kind` 2**：`kind` 1 每塊下載時各自 AEAD 驗過（不需要整檔 hash）；`kind` 3 沒有發送者給的 hash，驗不了也就沒有「沒驗過」可說；
   只有 `kind` 2 是「有 hash 可比、而 AES-CTR 本身擋不住竄改」（§7.3）。
-- **每個回應都帶兩個標頭**，讓前端知道 412 是哪一種：`Wbf-Media-Kind: 1|2|3`、`Wbf-Media-Verified: 0|1|2`（`HEAD` 也有，前端可以先問再決定要不要拿）。
+- **給了資料的回應（`200`／`206`／`412`）都帶兩個標頭**（`416`、`404`、`5xx` 這些提早回的🚫 帶），讓前端知道 412 是哪一種：`Wbf-Media-Kind: 1|2|3`、`Wbf-Media-Verified: 0|1|2`（`HEAD` 也有，前端可以先問再決定要不要拿）。
 - ⚠️ 412 對一般播放器就是錯誤：`<video src=…>` 這類直接吃 URL 的 🚫 會播還沒驗過的 `kind` 2。這是刻意的安全預設——
   要在驗完之前就播，UI 得自己用 HTTP client 拿、看到 412 仍然收 body。
 - 412 是「條件不成立」：這裡的條件是「這個檔驗過、而且正確」，而前端🚫 必帶任何條件標頭——條件是這個約定本身。

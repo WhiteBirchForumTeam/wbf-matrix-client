@@ -358,7 +358,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 
 | method | params | result | core |
 |---|---|---|---|
-| `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 答得出 `file_size`／`chunk_size`／`content_type`，加上上游答不出來的 `cached: { complete, segments_written, bytes_on_disk }`（`segments_written` 是池主檔的 64 KiB 段數，只給顯示；下載中的進度看 `media.queue`）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
+| `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 從 `media` 列答得出 `file_size`／`chunk_size`／`content_type`——分塊檔（`kind` 1）都有；傳統格式（`kind` 2、3）沒有 `chunk_size`、`file_size` 要事件給過 `info.size`。`server`／`both` 問的是 wbf 的 `Info`，`both` 只在 server 說是分塊檔（有塊大小）時才寫進 `media` 表。再加上上游答不出來的 `cached: { complete, segments_written, bytes_on_disk }`（`segments_written` 是池主檔的 64 KiB 段數，只給顯示；下載中的進度看 `media.queue`）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
 | `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id }`、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading`、`verifying`；`kind`、`verified` 是 `media` 列的（沒有列就不在，/docs/design/media/media-download.md §12.3） | `media_download`：分塊檔（`kind` 1）交給這個帳號的下載處理端（/docs/design/media/media-download.md §5），標準 Matrix 附件（`kind` 2、3）走 HTTP（同一份文件 §12，兩種帳號都行）。`mxc` 的金鑰從這個帳號看得到的事件裡找，找不到 1100；一般 Matrix 帳號給 `manifest` 1100；同一個 mxc 這則事件的描述跟本地已經下載好、或正在下載的那份不一樣 1500 |
 | `media.open` | 同 `media.download` | `{ url, mxc, mimetype?, size?, state, kind?, verified? }`（`size` 只在事件沒給 `info.size` 的傳統檔不在：那種檔的 GET 等整檔下載完才給，/docs/design/media/media-download.md §12.2；`kind` 2 而 `verified` 不是 1 時，讀那個 `url` 會是 412、body 照給，/docs/design/rpc-specs/data-plane.md §8.2）。`url` 是資料平面讀的 URL（/docs/design/rpc-specs/data-plane.md §8，不帶帳號、可以重用） | `media_open`；不完整也沒本機原檔就順便排進佇列。daemon 沒開資料平面回 100 |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }`，第一個是正在拉的 | `media_queue` |
@@ -491,6 +491,7 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 |---|---|
 | 1401 `room_devices_changed` | 重拿成功：`{ room_version: u64, members: { mxid: "序號-雜湊" }, txn_id: string }`——前兩個就是新的 `room_devices`（UI 存下、重送時帶回來），`txn_id` 是這則用的（UI 沒給的話是 daemon 產的，重送用同一個）。重拿也失敗：`{ txn_id: string, current_room_version: u64 或 null }`（server 沒給號碼時是 null），UI 自己叫 `room.refresh_devices` |
 | 1402 `room_key_not_ready` | `{ txn_id: string }`：這則用的（UI 沒給的話是 daemon 產的），重送用同一個。例：`{ "txn_id": "wbf-1791265069-3" }` |
+| 1401／1402 由 `room.send_file` 回的 | 上面那份再加 `manifest`（含金鑰，跟成功時的回應一樣敏感）：檔案已經在 server 上，用它走 `room.send_attachment` 重送、🚫 重傳（/docs/design/keys/e2ee-rpc.md §3） |
 | 1501 `unverified` | 這個方法成功時的 `result`，一字不差。`media.export_to`：`{ to, bytes, source, kind, verified }`，例：`{ "to": "file:///tmp/a.mp4", "bytes": 52428800, "source": "cache", "kind": 2, "verified": 2 }`（示意） |
 
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）

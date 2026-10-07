@@ -366,7 +366,7 @@ Chunk { mxc, next } 回來、主檔在等：
 - **`media.queue`** 隨時可以問現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`）。
 - 播放中的進度照舊：就是那個 GET 收到多少 bytes。
 
-`media.export_to`（匯出）也排隊（維護者 2026-10-01）：交一個 job、等它完成、整檔驗過再寫到使用者指定的位置；`no_cache` 版也排隊（§7.3）。
+`media.export_to`（匯出）也排隊（維護者 2026-10-01）：交一個 job、等它完成，再照 `media.kind`／`verified` 寫到使用者指定的位置（從池匯出🚫 再算 hash）；`no_cache` 版也排隊（§7.3）。
 
 ## 6. Seek
 
@@ -426,12 +426,12 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 
 | method | params | result | 說明 |
 |---|---|---|---|
-| `media.download` | `{ mxc } \| { room, event_id } \| { manifest }`（剛好給一種，給了不只一種是參數錯，🚫 不猜哪個優先），`user?`、`server?` | `{ mxc, state, done, total }` | 建 job（§5.3）。已經完整或有原檔就直接回 `complete`／`local_source` |
-| `media.open` | 同上 | `{ url, mxc, mimetype?, size, state }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`queued`。不完整也沒原檔 → 順便建 job |
+| `media.download` | `{ mxc } \| { room, event_id } \| { manifest }`（剛好給一種，給了不只一種是參數錯，🚫 不猜哪個優先），`user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }` | 建 job（§5.3；標準附件見 §12）。已經完整或有原檔就直接回 `complete`／`local_source`；`kind`、`verified` 是 `media` 列的（§12.3） |
+| `media.open` | 同上 | `{ url, mxc, mimetype?, size?, state, kind?, verified? }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`verifying`、`queued`。`size` 只在事件沒給 `info.size` 的傳統檔不在（§12.2）。不完整也沒原檔 → 順便建 job |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`） |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 正在拉 → 設 `downloading[mxc].cancelled`，在途的那一塊落地就停；還沒開始 → 拿掉（§5.4） |
-| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI；已經存在就覆蓋）、`no_cache?` | `{ to, bytes, source, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成、**整檔驗過**才寫到 `to`。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
-| 推播 `media.download` | — | `{ mxc, state, done, total, user, reason? }` | §5.5。`reason` 只在 `failed` 帶 |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI；已經存在就覆蓋）、`no_cache?` | `{ to, bytes, source, kind, verified, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成才寫到 `to`；從池匯出🚫 再算 hash、只核大小，傳統加密的檔沒驗過或驗不過照匯、回 1501（`data` 是這份結果）；從本機原檔匯出一律整檔比 sha256。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
+| 推播 `media.download` | — | `{ mxc, state, done, total, user, verified?, reason? }`；`state` 多一個 `verifying` | §5.5、§12.3。`complete` 一律帶 `verified`（0／1／2）；`reason` 只在 `failed` 帶 |
 
 - 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。找不到是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
 - 一般 Matrix 帳號（走 matrix-sdk 的）沒有 `Download` 線：它只看得到標準 Matrix 附件（`kind` 2、3），走 §12 的 HTTP 下載；給它 `manifest` 回 `1100`。
@@ -553,7 +553,7 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 10. **解析 job 的時候建 downloading 項**（§5.2）。
 11. **逾時看整條線**：有請求在等、而線整段沒有回應才算（/docs/design/daemon/link-requests.md §4）；心跳每 24 秒一定送（/docs/design/daemon/ws-receive-dispatch.md §5.1）。
 12. **快取命中要跟這次的描述對得上**（§5.3）：大小、塊大小（兩邊都有時 sha256）對不上就丟掉重來，照 PR #14 的規則。
-13. **`media.save_to` 改名 `media.export_to`、`to` 收 URI**（§7.3）：現在只做 `file://`；串流不算整檔 hash，匯出要整檔驗過。
+13. **`media.save_to` 改名 `media.export_to`、`to` 收 URI**（§7.3）：現在只做 `file://`；串流不算整檔 hash。（10-02 原本定「匯出要整檔驗過」，10-06 改成照 `kind`／`verified`、從池匯出🚫 再算，§7.3、§12.3。）
 
 2026-10-03：
 
@@ -674,7 +674,7 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
 
 - 假 server，`kind` 2 對的檔：推播依序 `downloading` → `verifying` → `complete` 帶 `verified: 1`；列 `complete = 1`、`verified = 1`；完成後 GET 是 200／206。
 - 假 server，`kind` 2 翻一個密文 bit：下載中 GET 是 **412、body 照給**（跟 200 會給的 bytes 一樣）；收尾🚫 刪檔、推播 `complete` 帶 `verified: 2`、列 `verified = 2`；之後 GET 仍是 412、body 照給。
-- 每個 GET／HEAD 回應都帶 `Wbf-Media-Kind`、`Wbf-Media-Verified`；有 Range 時 412 一樣帶 `Content-Range`、只給那一段。
+- 給了資料的 GET／HEAD 回應（200／206／412）都帶 `Wbf-Media-Kind`、`Wbf-Media-Verified`（416、404、5xx 🚫 帶）；有 Range 時 412 一樣帶 `Content-Range`、只給那一段。
 - `kind` 1：下載中、完成後都是 200／206，不論 `verified`；區塊 sha256 對不上 → `verified = 2`、🚫 當壞檔、GET 照樣 2xx。
 - `kind` 3：🚫 `verifying`、完成時 `verified = 0`、GET 2xx；`info.size` 對不上 → `Integrity`。
 - 驗過的檔🚫 再驗：快取命中、匯出、GET 都🚫 再餵任何 hash 器。

@@ -385,7 +385,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
 - 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
 
-還沒做：送 edit／delete／reaction／reply、建房、邀請、角色、置頂、已讀送出、裝置驗證、標準附件下載、`Unread`、`Tag`、`DeviceTrust`。
+還沒做：送 edit／delete／reaction／reply、建房、邀請、角色、置頂、已讀送出、裝置驗證、`Unread`、`Tag`、`DeviceTrust`。
 
 ## 7. 還開著的（再議）
 

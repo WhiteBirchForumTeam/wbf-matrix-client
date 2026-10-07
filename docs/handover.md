@@ -93,7 +93,7 @@ crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只
                          refresh／1506 之後 `prepare_room_key`；送出前 `is_room_key_ready_within`（沒就緒就交它準備、最多等 `ROOM_KEY_WAIT` 2 秒）；送出後 `room_key_used`（快到期就提早換）。
                          走 `Keys` 線、`reuse` 🚫 開線（`init_keys` 開好線時起 task、`line_opened`）；🚫 存檔；失敗 30 秒起加倍到 5 分鐘；登出收（等它真的結束才刪 `m/`）
   link_keeper.rs         **「該開的線都開著嗎」的鉤子**（/docs/design/daemon/link-pool.md §3.1）：`Core::ensure_links`，daemon 解鎖／登入後與背景迴圈每一輪叫
-  wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：列表只問橋的 `JoinedRooms`、單一房間 `GetState` 與 `m.direct` 一起送、`Event/Send` 送文字（加不加密只看本地 `rooms.encrypted`、不知道就報錯；明文房明文、加密房交給 room_crypto.rs 加密；加密房的檔案拒）。`is_wbf_account` 在 handles.rs
+  wbf_rooms.rs           **wbf 帳號的房間**（/docs/design/daemon/account-session.md §6）：列表只問橋的 `JoinedRooms`、單一房間 `GetState` 與 `m.direct` 一起送、`Event/Send` 送文字（加不加密只看本地 `rooms.encrypted`、不知道就報錯；明文房明文、加密房交給 room_crypto.rs 加密；送檔也走同一支 `wbf_send_message`，加密房要 `room_devices`）。`is_wbf_account` 在 handles.rs
   link_pool.rs           **連線池**（/docs/design/daemon/link-pool.md）：`LinkRole` 五條線（misc／upload／download／rooms／keys）、`logging_out_guard`（登出封池，丟掉就解封）、`LinkPool`（要用才開、死了下次重開、`close_all`）、`PooledClient`（同一條線上的一個 client；一格是讀寫鎖，很多命令同時用、開／關獨佔）、
                          `Core::client_of(…, role)` 是唯一閘門、`open_link`（session → Bearer 升級 → hello）、`close_links`（登出叫）、`received_hook`（pack → `CoreEvent::Received`）、
                          `open_link_count`（`daemon.info` 的 `links`）。單元測試用記憶體對接的假 opener
