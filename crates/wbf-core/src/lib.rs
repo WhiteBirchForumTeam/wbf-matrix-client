@@ -107,8 +107,8 @@ pub use link_keeper::EnsuredLinks;
 pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{
-    DirectDownloadResult, ExportedMedia, MediaGcReport, MediaJob, MediaRef, MediaStats, OpenedMedia,
-    QueuedMedia,
+    DeletedMedia, DirectDownloadResult, ExportedMedia, MediaGcReport, MediaJob, MediaRef,
+    MediaStats, OpenedMedia, QueuedMedia,
 };
 pub use media_stream::{MediaSource, MediaStream};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};

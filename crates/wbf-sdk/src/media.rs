@@ -22,11 +22,13 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::cache::{Cache, MediaDescription, MediaEntry};
+use crate::chat::MatrixAttachment;
+use crate::chunk_block::ChunkedBlock;
 use crate::chunk_crypto::{chunk_count, expected_plain_len};
 use crate::download::{open_chunk_data, verify_info, VerifiedTarget};
 use crate::error::SdkError;
 use crate::manifest::Manifest;
-use crate::media_kind::Verification;
+use crate::media_kind::{MediaKind, Verification};
 use crate::media_pool::{Finished, MediaPool, PoolReader, PoolWriter, SEEK_SUFFIX};
 use crate::protocol::InfoAck;
 use crate::seek_store::SeekStore;
@@ -329,27 +331,29 @@ pub fn open_complete(pool: &MediaPool, entry: &MediaEntry) -> Option<PoolReader>
     (Some(reader.plain_len()) == entry.file_size).then_some(reader)
 }
 
-/// 快取列跟這次的區塊說的是不是同一個檔（/docs/design/media/media-download.md §5.3，維護者 2026-10-02 照 PR #14 的規則）：
-/// 大小、塊大小要一樣；兩邊都帶 sha256 就要一樣。🚫 算 hash，只比記下來的字。
+/// 快取列跟這個區塊說的是不是同一個檔（/docs/design/media/media-download.md §5.3，比哪幾欄是維護者 2026-10-02 照 PR #14 定的）：
+/// 列要是分塊的檔；大小、塊大小要一樣；兩邊都帶 sha256 就要一樣。🚫 算 hash，只比記下來的字。
 ///
+/// Args:
+///     block: 某一則事件（或 manifest）的區塊, example: &manifest.block
 /// Return:
-///     bool  true ＝ 同一個檔，列可以照用；false ＝ 對不上，要丟掉重來（[`forget_for_new_description`]）
-pub fn is_same_file(entry: &MediaEntry, manifest: &Manifest) -> bool {
-    // 區塊沒帶大小＝不知道，🚫 當成「不一樣」去丟快取（入口 `check_as_event_block` 已經拒過，這裡消費端自己再問一次）。
-    let same_file_size = match manifest.block.file_size {
+///     bool  true ＝ 同一個檔，列可以照用；false ＝ 對不上（寫錯或偽造的描述）：拒這次的請求，列🚫 動
+pub fn is_same_block(entry: &MediaEntry, block: &ChunkedBlock) -> bool {
+    // 區塊沒帶大小＝不知道，🚫 當成「不一樣」（入口 `check_as_event_block` 已經拒過，這裡消費端自己再問一次）。
+    let same_file_size = match block.file_size {
         Some(claimed) => Some(claimed) == entry.file_size,
         None => true,
     };
-    let same_size = same_file_size && entry.chunk_size == Some(manifest.block.chunk_size);
+    let same_size = same_file_size && entry.chunk_size == Some(block.chunk_size);
     let recorded_sha256 = entry
         .hash
         .as_deref()
         .and_then(|hash| hash.strip_prefix("sha256:"));
-    let same_sha256 = match (recorded_sha256, manifest.block.sha256.as_deref()) {
+    let same_sha256 = match (recorded_sha256, block.sha256.as_deref()) {
         (Some(recorded), Some(claimed)) => recorded.eq_ignore_ascii_case(claimed),
         _ => true,
     };
-    same_size && same_sha256
+    entry.kind == MediaKind::WbfChunked && same_size && same_sha256
 }
 
 /// 傳統格式的版本（/docs/design/media/media-download.md §12.1）：快取列跟這次事件的描述是不是同一個檔。
@@ -400,35 +404,85 @@ pub fn is_same_matrix_description(one: &MediaDescription, other: &MediaDescripti
     one.kind == other.kind && same_hash && same_size
 }
 
-/// 列說的跟這次的區塊不一樣（[`is_same_file`] 回 false）：丟掉這個 mxc 在本地的一切，列換成這次的描述、從頭來。
-/// 池檔還有別的 mxc 指著、或有人正在讀，就只清這一列不刪檔；主檔與 seek 暫存檔刪掉。⚠️ 呼叫者先確定沒人正在下載它。
+/// 一個 mxc 的金鑰，取自某一則跟本地那一列說的是同一個檔的事件（[`find_key_matching_record`]）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordedFileKey {
+    /// wbf 分塊（`kind` 1）：事件的區塊
+    Chunked(ChunkedBlock),
+    /// 標準 Matrix 附件（`kind` 2、3）
+    Matrix(MatrixAttachment),
+}
+
+/// 只給 mxc 的下載（/docs/design/media/media-download.md §5.3）：照本地那一列的描述，挑這個帳號看得到、說的是同一個檔的第一則事件，拿它的金鑰。
+/// 同一個 mxc 寫錯或偽造的事件不管先到後到都🚫 被挑上；列換描述只有 `media.delete_local` 刪掉再從訊息下載一條路。
 ///
+/// Args:
+///     user_id: example: "@alice:localhost"
+///     entry: 本地這個 mxc 的列
 /// Return:
-///     Ok(())
-///     Err(Io)   DB 或檔案動不了
-pub fn forget_for_new_description(
+///     Ok(Some(RecordedFileKey))   列是哪一種格式就是哪一種
+///     Ok(None)                    這個帳號看不到跟列一致的事件（沒有引用它的、或都對不上）
+///     Err(Io)                     DB 讀不了
+pub fn find_key_matching_record(
+    cache: &Cache,
+    user_id: &str,
+    entry: &MediaEntry,
+) -> Result<Option<RecordedFileKey>, SdkError> {
+    if entry.kind == MediaKind::WbfChunked {
+        return Ok(cache
+            .list_media_blocks_for(user_id, &entry.mxc)?
+            .into_iter()
+            .find(|block| is_same_block(entry, block))
+            .map(RecordedFileKey::Chunked));
+    }
+    Ok(cache
+        .list_matrix_attachments_for(user_id, &entry.mxc)?
+        .into_iter()
+        .find(|attachment| {
+            is_same_matrix_file(entry, &MediaDescription::of_matrix_attachment(attachment))
+        })
+        .map(RecordedFileKey::Matrix))
+}
+
+/// `media.delete_local`（/docs/design/media/media-download.md §7.4）：刪這個 mxc 在本地的一切——池檔、主檔與 seek 暫存檔、`media` 列。
+/// 池檔還有別的 mxc 指著、或有人正在讀，就🚫 刪檔（列刪了之後沒人指著，掃描會收）。
+/// ⚠️ 呼叫者先取消它的下載、等寫入者放手；暫存檔還在 `in_use` 裡就整個拒、什麼都🚫 動。
+///
+/// Args:
+///     mxc: example: "mxc://localhost/000000000000004d"
+///     in_use: 這台 server 上正開著寫的暫存名, example: {"m12"}
+/// Return:
+///     Ok(true)      刪了（列本來在）
+///     Ok(false)     本來就沒有這一列
+///     Err(Usage)    還有人在寫它的暫存檔
+///     Err(Io)       DB 或檔案動不了
+pub fn del_local_copy(
     cache: &mut Cache,
     pool: &MediaPool,
-    manifest: &Manifest,
-) -> Result<(), SdkError> {
-    let Some(entry) = cache.find_media(&manifest.mxc)? else {
-        return Ok(());
+    mxc: &str,
+    in_use: &HashSet<String>,
+) -> Result<bool, SdkError> {
+    let Some(entry) = cache.find_media(mxc)? else {
+        return Ok(false);
     };
+    let pending_name = cache.media_pending_name(mxc)?;
+    if let Some(pending_name) = pending_name.as_deref() {
+        if in_use.contains(pending_name) {
+            return Err(SdkError::Usage(format!(
+                "{mxc} is still being written; try again when its download stops"
+            )));
+        }
+    }
+    // 先刪檔再刪列（同配額清理）：中途失敗時列還在，掃描看得到它、收得掉。
     if let Some(pool_file) = entry.pool_file.as_deref() {
         if cache.media_references(pool_file)? <= 1 && !pool.is_open(pool_file)? {
             pool.remove(pool_file)?;
         }
     }
-    if let Some(pending_name) = cache.media_pending_name(&manifest.mxc)? {
-        discard(pool, &pending_name);
+    if let Some(pending_name) = pending_name.as_deref() {
+        discard(pool, pending_name);
     }
-    let description = MediaDescription::of_chunked_block(&manifest.block).ok_or_else(|| {
-        SdkError::Usage(format!(
-            "{}: the description has no file_size",
-            manifest.mxc
-        ))
-    })?;
-    cache.media_redescribe(&manifest.mxc, &description)
+    Ok(cache.media_delete(mxc)?.is_some())
 }
 
 /// 匯出時要對上的內容（/docs/design/media/media-download.md §7.3 的 `media.export_to`）。大小一定比；hash 給了才算、才比。

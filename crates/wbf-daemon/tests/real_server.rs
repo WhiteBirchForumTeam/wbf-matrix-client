@@ -872,6 +872,18 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
             ),
         "推播先 verifying、再 complete 帶 verified 1：{pushed:?}"
     );
+    // 同一個 mxc、另一把金鑰的事件（寫錯或偽造）：本地那一列說了算，回 1500、🚫 下載（/docs/design/media/media-download.md §5.3）。
+    let (_, mut forged_file) = encrypt_like_element(&body);
+    forged_file["url"] = json!(mxc);
+    let forged_event = other
+        .send(
+            &room,
+            json!({ "msgtype": "m.file", "body": "enc.bin", "info": { "size": body.len() }, "file": forged_file }),
+        )
+        .await;
+    let forged = json!({ "room": room, "event_id": forged_event });
+    let refused = call_once_seen(&mut client, "media.download", &forged).await;
+    assert_eq!(refused["code"], 1500, "{refused}");
 
     // ── kind 2：密文被改過一個 bit ──
     let (mut cipher, mut file) = encrypt_like_element(&body);
@@ -940,6 +952,28 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
     );
     assert_eq!(whole, body);
 
+    // ── 清本地（`media.delete_local`，/docs/design/media/media-download.md §7.4）：之後只給 mxc 是 1100、從訊息點下載由那則重建 ──
+    let deleted = client
+        .call("media.delete_local", json!({ "mxc": mxc }))
+        .await;
+    println!("media.delete_local ← {deleted}");
+    assert_eq!(
+        (&deleted["code"], &deleted["result"]),
+        (
+            &json!(0),
+            &json!({ "mxc": mxc, "removed": true, "cancelled": false })
+        ),
+        "{deleted}"
+    );
+    let by_mxc = client.call("media.download", json!({ "mxc": mxc })).await;
+    println!("media.download {{ mxc }} ← {by_mxc}");
+    assert_eq!(by_mxc["code"], 1100, "no local record: {by_mxc}");
+    let from_message = json!({ "room": room, "event_id": event_id, "mxc": mxc });
+    let state = download_until_complete(&mut client, &from_message).await;
+    assert_eq!(state["result"]["kind"], 3, "{state}");
+    let (status, _, whole) = get(daemon.data_port, &url, None).await;
+    assert_eq!((status, whole), (200, body));
+
     other.logout().await;
     stop_daemon(daemon, client).await;
 }
@@ -965,6 +999,19 @@ async fn open_once_seen(client: &mut Client, by_event: &Value) -> Value {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     panic!("media.open never found the event: {opened}");
+}
+
+/// 事件進了快取之前是 1100（看不到這則）：輪詢到不是 1100 為止，回那個回應。
+async fn call_once_seen(client: &mut Client, method: &str, params: &Value) -> Value {
+    let mut reply = Value::Null;
+    for _ in 0..50 {
+        reply = client.call(method, params.clone()).await;
+        if reply["code"] != 1100 {
+            return reply;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("{method} never saw the event: {reply}");
 }
 
 async fn download_until_complete(client: &mut Client, by_event: &Value) -> Value {

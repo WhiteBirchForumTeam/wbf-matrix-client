@@ -2403,8 +2403,10 @@ mod tests {
         );
     }
 
+    /// 維護者 2026-10-07（取代 PR #14 的「沒完成就換描述重來」）：還沒下載完也一律拒另一份描述、半成品與列🚫 動；
+    /// `media.delete_local` 之後才換得掉。
     #[tokio::test]
-    async fn a_different_size_drops_an_unfinished_copy_and_starts_over() {
+    async fn a_different_size_is_refused_even_before_the_copy_is_complete() {
         let (core, account, server, manifest) = uploaded("dq-liar-unfinished").await;
         let mut events = core.subscribe();
         let target = Target::default();
@@ -2417,17 +2419,89 @@ mod tests {
         assert!(downloader.cancel(&manifest.mxc));
         server.read_permits.add_permits(READ_PERMITS as usize);
         wait_until(&mut events, &manifest.mxc, DownloadState::Cancelled).await;
-        // 兩份描述都還沒被整檔驗過：照 PR #14 的規則丟掉、照這份從頭來（這份是假的，所以下載失敗）。
+        let pool = core.pool_of(&account).unwrap();
+        let pending_before = pool.list_pending().unwrap();
+        assert!(!pending_before.is_empty(), "the unfinished file is kept");
         let mut liar = manifest.clone();
         liar.block.file_size = Some(SIZE as u64 + 16);
+        let error = core
+            .media_download(&MediaRef::Manifest(liar.clone()), &target)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        assert_eq!(pool.list_pending().unwrap(), pending_before);
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        let entry = cache
+            .read()
+            .await
+            .find_media(&manifest.mxc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.file_size,
+            Some(SIZE as u64),
+            "the record is unchanged"
+        );
+        // 原本那份照常接著下載完。
+        core.media_download(&media, &target).await.unwrap();
+        wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
+        assert_eq!(read_whole(&core, &manifest.mxc).await, body());
+        // 清掉之後，另一份描述才進得來（這份是假的：照它下載、失敗）。
+        let deleted = core.del_local_media(&manifest.mxc, &target).await.unwrap();
+        assert_eq!((deleted.removed, deleted.cancelled), (true, false));
+        assert!(
+            pool.list_files().unwrap().is_empty(),
+            "the pool file is gone"
+        );
         let job = core
             .media_download(&MediaRef::Manifest(liar), &target)
             .await
             .unwrap();
         assert_ne!(job.state, DownloadState::Complete);
         wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
-        // 原本那份再來一次：又對不上（列現在是假的那份）、也還沒完成，再丟一次、重下，拿到對的。
-        core.media_download(&media, &target).await.unwrap();
+    }
+
+    /// `media.delete_local`（/docs/design/media/media-download.md §7.4）：分塊的取消會留半成品續傳，所以清除要等處理端關掉它才刪；
+    /// 刪完半成品、seek 暫存檔、列都沒了。
+    #[tokio::test]
+    async fn deleting_a_chunked_file_cancels_its_download_and_waits_for_the_writer() {
+        let (core, account, server, manifest) = uploaded("dq-delete-running").await;
+        let mut events = core.subscribe();
+        let target = Target::default();
+        hold_reads(&server).await;
+        let downloader = core.downloader_of(&account).await.unwrap();
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        wait_until_the_first_read_is_out(&downloader).await;
+        let pool = core.pool_of(&account).unwrap();
+        assert!(!pool.list_pending().unwrap().is_empty());
+        let deleting = core.del_local_media(&manifest.mxc, &target);
+        tokio::pin!(deleting);
+        // 在途的那一塊還沒回來：處理端還開著那個檔，清除在等。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut deleting)
+                .await
+                .is_err(),
+            "it waits while the file is open"
+        );
+        server.read_permits.add_permits(READ_PERMITS as usize);
+        let deleted = deleting.await.unwrap();
+        assert_eq!((deleted.removed, deleted.cancelled), (true, true));
+        wait_until(&mut events, &manifest.mxc, DownloadState::Cancelled).await;
+        assert!(
+            pool.list_pending().unwrap().is_empty(),
+            "the unfinished file is gone"
+        );
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        assert!(cache
+            .read()
+            .await
+            .find_media(&manifest.mxc)
+            .unwrap()
+            .is_none());
+        // 從頭再來一次（manifest 帶金鑰：列照它重建）。
+        core.media_download(&MediaRef::Manifest(manifest.clone()), &target)
+            .await
+            .unwrap();
         wait_until(&mut events, &manifest.mxc, DownloadState::Complete).await;
         assert_eq!(read_whole(&core, &manifest.mxc).await, body());
     }
@@ -2897,7 +2971,8 @@ mod tests {
             .await
             .err()
             .expect("a description that does not match the record is not used");
-        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        // 跟「看不到金鑰」同一個錯（GET 都是 502，/docs/design/rpc-specs/data-plane.md §8）。
+        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
         // 直接拿它跟處理端要：沒人在下載，是只是 seek，`Info` 核出塊大小跟 server 的不一樣，回錯，🚫 給錯位置的明文。
         let downloader = core.downloader_of(&account).await.unwrap();
         let mut described_wrong = first.clone();

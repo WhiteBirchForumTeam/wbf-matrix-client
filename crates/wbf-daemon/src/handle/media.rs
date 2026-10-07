@@ -2,7 +2,7 @@
 //!
 //! `media.create` 只建檔、鑄 URL：bytes 走資料平面的 PUT（`data_plane.rs`，/docs/design/rpc-specs/data-plane.md）。
 //! 下載是每帳號一個下載處理端（/docs/design/media/media-download.md）：`media.download` 排、`media.open` 排並鑄讀的 URL（`GET /media`）、
-//! `media.queue` 問、`media.cancel` 停；`media.export_to` 沒有就排、等完成、整檔驗過才寫到 UI 給的 URI。
+//! `media.queue` 問、`media.cancel` 停、`media.delete_local` 清；`media.export_to` 沒有就排、等完成才寫到 UI 給的 URI。
 
 use std::path::PathBuf;
 
@@ -192,7 +192,7 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
     )
 }
 
-/// 要哪個檔：三種說法剛好給一種（/docs/design/media/media-download.md §7.1）。
+/// 要哪個檔：三種說法剛好給一種（/docs/design/media/media-download.md §7.1）；從訊息點下載的那種可以多帶 `mxc`（要是那則的附件）。
 #[derive(Deserialize)]
 struct MediaRefParams {
     #[serde(default)]
@@ -216,12 +216,16 @@ async fn media_ref_of(
 ) -> Result<MediaRef, Fail> {
     match (params.mxc, params.room, params.event_id, params.manifest) {
         (Some(mxc), None, None, None) => Ok(MediaRef::Mxc(mxc)),
-        (None, Some(room), Some(event_id), None) => Ok(MediaRef::Event { room, event_id }),
+        (mxc, Some(room), Some(event_id), None) => Ok(MediaRef::Event {
+            room,
+            event_id,
+            mxc,
+        }),
         (None, None, None, Some(manifest)) => Ok(MediaRef::Manifest(
             manifest_for_this_session(handle, core, manifest, target).await?,
         )),
         _ => Err(invalid_params(
-            "give exactly one of: mxc, room + event_id, manifest",
+            "give exactly one of: mxc, room + event_id (mxc optional), manifest",
         )),
     }
 }
@@ -291,6 +295,21 @@ pub(super) async fn media_cancel(handle: &Handle, core: &Core, params: Value) ->
         .media_cancel(&params.mxc, &handle.target(&params.target))
         .await?;
     Ok(json!({ "cancelled": cancelled }))
+}
+
+/// 清掉一個 mxc 在本地的一切（池檔、半成品、`media` 列），先取消這台 server 上所有正在下載它的（/docs/design/media/media-download.md §7.4）。
+pub(super) async fn media_delete_local(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        mxc: String,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    to_result(
+        core.del_local_media(&params.mxc, &handle.target(&params.target))
+            .await?,
+    )
 }
 
 /// 匯出（/docs/design/media/media-download.md §7.3）：明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。

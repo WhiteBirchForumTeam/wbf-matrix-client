@@ -1361,35 +1361,6 @@ impl Cache {
         Ok(())
     }
 
-    /// 這個 mxc 換一份描述、從頭來（`media::forget_for_new_description`，/docs/design/media/media-download.md §5.3）：
-    /// 格式、檔名、型別、hash、大小、塊大小換成這次的，下載進度與驗證結果清掉。`INSERT OR IGNORE` 不會蓋掉舊的描述，所以要這一支。
-    ///
-    /// Return:
-    ///     Ok(())
-    ///     Err(Io)   DB 寫不了、或描述違反列的 CHECK
-    pub fn media_redescribe(
-        &mut self,
-        mxc: &str,
-        description: &MediaDescription,
-    ) -> Result<(), SdkError> {
-        self.connection
-            .execute(
-                "UPDATE media SET kind = ?2, name = ?3, mimetype = ?4, hash = ?5, file_size = ?6, chunk_size = ?7,
-                     pool_file = NULL, complete = 0, verified = 0, segments_written = 0, bytes_on_disk = 0 WHERE mxc = ?1",
-                params![
-                    mxc,
-                    description.kind.to_number(),
-                    description.name,
-                    description.mimetype,
-                    description.hash,
-                    description.file_size.map(|size| size as i64),
-                    description.chunk_size.map(i64::from)
-                ],
-            )
-            .map_err(db_error)?;
-        Ok(())
-    }
-
     /// 還有幾個 `media` 列指著這個池檔（去重過的檔刪之前要問）。
     pub fn media_references(&self, pool_file: &str) -> Result<u64, SdkError> {
         self.connection
@@ -1454,50 +1425,29 @@ impl Cache {
         Ok(changed > 0)
     }
 
-    /// 這個帳號看得到的事件裡，引用這個 mxc 的那一份區塊（含檔案金鑰，/docs/design/media/media-download.md §3.2 的「金鑰從哪來」）。
+    /// 這個帳號看得到的事件裡，引用這個 mxc 的區塊（含檔案金鑰，/docs/design/media/media-download.md §3.2 的「金鑰從哪來」），照寫進來的順序。
     /// 🚫 不看別的帳號的：同一份 `cache.db` 裡有同 server 別人的事件，金鑰不跨帳號借。
+    /// 哪一份能用由呼叫者跟本地那一列比過才算（`media::find_key_matching_record`）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
     ///     mxc: example: "mxc://localhost/000000000000004d"
     /// Return:
-    ///     Ok(Some(ChunkedBlock))   找到一則解得開、附件就是這個 mxc 的事件（最早寫進來的那則）
-    ///     Ok(None)                 這個帳號沒有引用它的事件，或都解不出區塊
-    pub fn find_media_block_for(
+    ///     Ok(Vec<ChunkedBlock>)   空的 ＝ 這個帳號沒有引用它的事件，或都解不出區塊
+    pub fn list_media_blocks_for(
         &self,
         user_id: &str,
         mxc: &str,
-    ) -> Result<Option<crate::chunk_block::ChunkedBlock>, SdkError> {
-        let mut statement = self
-            .connection
-            .prepare_cached(
-                "SELECT e.event_type, e.content_json FROM media m
-                   JOIN event_media em ON em.media = m.id
-                   JOIN events e ON e.id = em.event
-                   JOIN events_synced_log l ON l.event = e.id
-                   JOIN users reader ON reader.id = l.user
-                 WHERE m.mxc = ?1 AND reader.mxid = ?2
-                 ORDER BY e.id",
-            )
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map(params![mxc, user_id], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
+    ) -> Result<Vec<crate::chunk_block::ChunkedBlock>, SdkError> {
+        Ok(self
+            .list_contents_linked_to(user_id, mxc)?
+            .into_iter()
+            .filter_map(|(event_type, content_json)| {
+                attachment_of(event_type.as_deref(), content_json.as_deref())
             })
-            .map_err(db_error)?;
-        for row in rows {
-            let (event_type, content_json) = row.map_err(db_error)?;
-            if let Some(attachment) = attachment_of(event_type.as_deref(), content_json.as_deref())
-            {
-                if attachment.mxc == mxc {
-                    return Ok(Some(attachment.block));
-                }
-            }
-        }
-        Ok(None)
+            .filter(|attachment| attachment.mxc == mxc)
+            .map(|attachment| attachment.block)
+            .collect())
     }
 
     /// 這個帳號看得到的某一則事件帶的附件（`media.download { room, event_id }`）。看的是這則自己的內容，🚫 不換成它目前的 edit。
@@ -1572,16 +1522,32 @@ impl Cache {
         }))
     }
 
-    /// 這個帳號看得到、引用這個 mxc 的標準 Matrix 附件（金鑰在它的 `file` 裡）。第一則就是。
+    /// 這個帳號看得到、引用這個 mxc 的標準 Matrix 附件（金鑰在它的 `file` 裡），照寫進來的順序。
+    /// 哪一則能用由呼叫者跟本地那一列比過才算（`media::find_key_matching_record`）：同一個 mxc 可能有寫錯或偽造的事件。
     ///
     /// Return:
-    ///     Ok(Some(MatrixAttachment))
-    ///     Ok(None)   這個帳號看不到任何引用它的標準附件
-    pub fn find_matrix_attachment_for(
+    ///     Ok(Vec<MatrixAttachment>)   空的 ＝ 這個帳號看不到任何引用它的標準附件
+    pub fn list_matrix_attachments_for(
         &self,
         user_id: &str,
         mxc: &str,
-    ) -> Result<Option<crate::chat::MatrixAttachment>, SdkError> {
+    ) -> Result<Vec<crate::chat::MatrixAttachment>, SdkError> {
+        Ok(self
+            .list_contents_linked_to(user_id, mxc)?
+            .into_iter()
+            .filter_map(|(event_type, content_json)| {
+                matrix_attachment_of(event_type.as_deref(), content_json.as_deref())
+            })
+            .filter(|attachment| attachment.mxc == mxc)
+            .collect())
+    }
+
+    /// 這個帳號看得到、經 `event_media` 連到這個 mxc 的事件內容，照寫進來的順序。
+    fn list_contents_linked_to(
+        &self,
+        user_id: &str,
+        mxc: &str,
+    ) -> Result<Vec<StoredContent>, SdkError> {
         let mut statement = self
             .connection
             .prepare_cached(
@@ -1602,17 +1568,73 @@ impl Cache {
                 ))
             })
             .map_err(db_error)?;
-        for row in rows {
-            let (event_type, content_json) = row.map_err(db_error)?;
-            if let Some(attachment) =
-                matrix_attachment_of(event_type.as_deref(), content_json.as_deref())
-            {
-                if attachment.mxc == mxc {
-                    return Ok(Some(attachment));
-                }
-            }
-        }
-        Ok(None)
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+    }
+
+    /// 從訊息點下載（`media.download { room, event_id }`）：由這則事件確定 `media` 列（/docs/design/media/media-download.md §5.3）——
+    /// 列不在就照它建（例如 `media.delete_local` 刪過），在就不動；再補上這則跟它的連結（`INSERT OR IGNORE`）。
+    /// 描述跟列合不合🚫 在這裡判斷，那是下載入口的事。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     event_id: example: "$file"
+    /// Return:
+    ///     Ok(true)    這個帳號看得到這則（是不是檔都算；不是檔就什麼都不寫）
+    ///     Ok(false)   沒有這則、或這個帳號看不到
+    ///     Err(Io)     DB 寫不了
+    pub fn media_link_event(
+        &mut self,
+        user_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<bool, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let found = transaction
+            .query_row(
+                "SELECT e.id, e.event_type, e.content_json FROM events e
+                   JOIN events_synced_log l ON l.event = e.id
+                   JOIN users reader ON reader.id = l.user
+                   JOIN rooms r ON r.id = e.room
+                 WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.event_id = ?3",
+                params![user_id, room_id, event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        let Some((event, event_type, content_json)) = found else {
+            return Ok(false);
+        };
+        link_media_of(
+            &transaction,
+            event,
+            event_type.as_deref(),
+            content_json.as_deref(),
+        )?;
+        transaction.commit().map_err(db_error)?;
+        Ok(true)
+    }
+
+    /// `media.delete_local`：刪這個 mxc 的列（`event_media` 的連結 ON DELETE CASCADE 一起沒）。池檔、暫存檔🚫 在這裡動（`media::del_local_copy` 先處理）。
+    ///
+    /// Return:
+    ///     Ok(Some(MediaEntry))   刪掉的那一列
+    ///     Ok(None)               本來就沒有
+    ///     Err(Io)                DB 寫不了
+    pub fn media_delete(&mut self, mxc: &str) -> Result<Option<MediaEntry>, SdkError> {
+        let Some(entry) = self.find_media(mxc)? else {
+            return Ok(None);
+        };
+        self.connection
+            .execute("DELETE FROM media WHERE mxc = ?1", params![mxc])
+            .map_err(db_error)?;
+        Ok(Some(entry))
     }
 
     // ---- forget ----
@@ -2147,6 +2169,9 @@ fn apply_redaction(
         None => set_current_edit(transaction, edited.id, None, 0),
     }
 }
+
+/// `events` 一列存的（`event_type`、`content_json`），交給 [`attachment_of`]／[`matrix_attachment_of`] 解。
+type StoredContent = (Option<String>, Option<String>);
 
 /// 一則事件帶的附件：解得開、是檔案（/docs/design/media/wbf-client-convention-for-chunk.md §5）才有。
 fn attachment_of(
@@ -3109,26 +3134,29 @@ mod tests {
         let alice_only = file("!r", "$f2", 2, "mxc://localhost/bbbb");
         put(&mut cache, ALICE, &[shared.clone(), alice_only.clone()]);
         put(&mut cache, BOB, std::slice::from_ref(&shared));
-        let block = cache
-            .find_media_block_for(ALICE, "mxc://localhost/bbbb")
-            .unwrap()
+        let blocks = cache
+            .list_media_blocks_for(ALICE, "mxc://localhost/bbbb")
             .unwrap();
-        assert_eq!(block.name.as_deref(), Some("a.txt"));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name.as_deref(), Some("a.txt"));
         assert!(
             cache
-                .find_media_block_for(BOB, "mxc://localhost/bbbb")
+                .list_media_blocks_for(BOB, "mxc://localhost/bbbb")
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "bob never saw the event that carries this file"
         );
+        assert_eq!(
+            cache
+                .list_media_blocks_for(BOB, "mxc://localhost/aaaa")
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(cache
-            .find_media_block_for(BOB, "mxc://localhost/aaaa")
+            .list_media_blocks_for(ALICE, "mxc://localhost/none")
             .unwrap()
-            .is_some());
-        assert!(cache
-            .find_media_block_for(ALICE, "mxc://localhost/none")
-            .unwrap()
-            .is_none());
+            .is_empty());
         let attachment = cache
             .find_event_attachment(ALICE, "!r", "$f2")
             .unwrap()
@@ -3161,6 +3189,49 @@ mod tests {
                 "{junk}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_media_row_is_rebuilt_from_the_event_it_is_downloaded_from() {
+        // `media.delete_local` 刪列（連結一起沒）→ 從訊息點下載時由那則事件重建（/docs/design/media/media-download.md §5.3）。
+        let (mut cache, dir) = open("media-relink");
+        let shared = file("!r", "$f1", 1, "mxc://localhost/aaaa");
+        let alice_only = file("!r", "$f2", 2, "mxc://localhost/bbbb");
+        put(&mut cache, ALICE, &[shared.clone(), alice_only.clone()]);
+        put(&mut cache, BOB, std::slice::from_ref(&shared));
+        let deleted = cache.media_delete("mxc://localhost/aaaa").unwrap().unwrap();
+        assert_eq!(deleted.mxc, "mxc://localhost/aaaa");
+        assert!(cache.find_media("mxc://localhost/aaaa").unwrap().is_none());
+        assert_eq!(
+            cache.count_rows("event_media").unwrap(),
+            1,
+            "the link went with the row"
+        );
+        assert!(cache
+            .media_delete("mxc://localhost/aaaa")
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .list_media_blocks_for(BOB, "mxc://localhost/aaaa")
+            .unwrap()
+            .is_empty());
+        // 看不到的那則🚫 拿來建。
+        assert!(!cache.media_link_event(BOB, "!r", "$f2").unwrap());
+        assert!(!cache.media_link_event(BOB, "!r", "$missing").unwrap());
+        assert!(cache.media_link_event(BOB, "!r", "$f1").unwrap());
+        let rebuilt = cache.find_media("mxc://localhost/aaaa").unwrap().unwrap();
+        assert_eq!(rebuilt.name.as_deref(), Some("a.txt"));
+        assert_eq!(
+            cache
+                .list_media_blocks_for(BOB, "mxc://localhost/aaaa")
+                .unwrap()
+                .len(),
+            1
+        );
+        // 再連一次不重複。
+        assert!(cache.media_link_event(ALICE, "!r", "$f1").unwrap());
+        assert_eq!(cache.count_rows("event_media").unwrap(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

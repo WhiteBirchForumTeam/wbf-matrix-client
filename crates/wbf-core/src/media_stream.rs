@@ -183,13 +183,11 @@ impl Core {
     /// Return:
     ///     Ok(Some(MediaSource))   讀得到（原檔、池、或可以現拉）
     ///     Ok(None)                本機沒有任何帳號有這個 mxc 的紀錄（404）
-    ///     Err(Usage)              有紀錄，但沒有完整的檔、而且看得到它的帳號都沒有金鑰（502）
-    ///     Err(Integrity)          有紀錄、沒有完整的檔，帳號看得到的描述跟那一列都對不上（502）
+    ///     Err(Usage)              有紀錄，但沒有完整的檔，而且沒有帳號看得到跟那一列一致的事件（沒金鑰、或描述都對不上；502）
     ///     Err(Locked)             還沒解鎖
     pub async fn find_media_source(&self, mxc: &str) -> Result<Option<MediaSource>, CoreError> {
         let accounts = self.list_accounts_for_media(mxc)?;
         let mut has_record = false;
-        let mut description_mismatched = false;
         for account in &accounts {
             let Ok((cache, me)) = self.server_cache_and_me(account) else {
                 continue;
@@ -228,34 +226,29 @@ impl Core {
                     origin: Origin::Pool(reader),
                 }));
             }
-            // 傳統格式的檔（`kind` 2、3，兩種帳號都有）：走 HTTP 的 task（/docs/design/media/media-download.md §12.2）。
-            if entry.kind != MediaKind::WbfChunked {
-                let attachment = cache.read().await.find_matrix_attachment_for(&me, mxc)?;
-                let Some(attachment) = attachment else {
-                    continue;
-                };
-                match self.open_matrix_source(account, mxc, attachment).await? {
-                    Some(source) => return Ok(Some(source)),
-                    None => continue,
+            // 現拉的金鑰只能從描述來，而只有 mxc 的 GET 照本地那一列挑（/docs/design/media/media-download.md §5.3）：
+            // 這個帳號看到的都跟列不是同一個檔（寫錯或偽造的事件）就換下一個帳號。
+            let key = media::find_key_matching_record(&*cache.read().await, &me, &entry)?;
+            let block = match key {
+                // 傳統格式的檔（`kind` 2、3，兩種帳號都有）：走 HTTP 的 task（/docs/design/media/media-download.md §12.2）。
+                Some(media::RecordedFileKey::Matrix(attachment)) => {
+                    match self.open_matrix_source(account, mxc, attachment).await? {
+                        Some(source) => return Ok(Some(source)),
+                        None => continue,
+                    }
                 }
-            }
-            if !self.is_wbf_account(account).unwrap_or(false) {
-                continue;
-            }
-            let Some(block) = cache.read().await.find_media_block_for(&me, mxc)? else {
-                continue;
+                Some(media::RecordedFileKey::Chunked(block))
+                    if self.is_wbf_account(account).unwrap_or(false) =>
+                {
+                    block
+                }
+                _ => continue,
             };
             let manifest = Arc::new(Manifest {
                 server: self.session_of(account)?.server,
                 mxc: mxc.to_string(),
                 block,
             });
-            // 現拉的金鑰只能從描述來：這個帳號看到的那則跟本地那一列不是同一個檔（寫錯或偽造的事件）就換下一個帳號。
-            // 切片🚫 用它（處理端照驗過的切法算），只是 seek 也🚫 寫檔，所以這裡擋的是「拿一把不可信的金鑰去拉」。
-            if !media::is_same_file(&entry, &manifest) {
-                description_mismatched = true;
-                continue;
-            }
             let reader_account = self.find_writer_of(account, mxc, &accounts);
             self.ensure_download_link(&reader_account).await;
             let downloader = self.downloader_of(&reader_account).await?;
@@ -275,16 +268,10 @@ impl Core {
                 },
             }));
         }
-        if description_mismatched {
-            return Err(CoreError::new(
-                CoreErrorKind::Integrity,
-                format!("{mxc} is not complete here, and no account here has a description that matches the local record"),
-            ));
-        }
         match has_record {
             true => Err(CoreError::new(
                 CoreErrorKind::Usage,
-                format!("{mxc} is not in the local pool and no account here can see the key to fetch it"),
+                format!("{mxc} is not complete here, and no account here can see a key that matches the local record"),
             )),
             false => Ok(None),
         }

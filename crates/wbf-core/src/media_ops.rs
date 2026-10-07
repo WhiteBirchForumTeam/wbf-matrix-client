@@ -64,13 +64,17 @@ pub struct DirectDownloadResult {
     pub sha256_verified: bool,
 }
 
-/// 要哪個檔（/docs/design/media/media-download.md §7.1）：三種說法，金鑰從哪來不同（§3.2）。
+/// 要哪個檔（/docs/design/media/media-download.md §7.1）：三種說法，金鑰從哪來不同（§3.2、§5.3）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MediaRef {
-    /// 只給 mxc：金鑰從這個帳號看得到、引用它的事件裡找。
+    /// 只給 mxc：照本地那一列的描述，金鑰從這個帳號看得到、跟列一致的事件裡找；沒有列就不能下載。
     Mxc(String),
-    /// 某一則訊息的附件。
-    Event { room: String, event_id: String },
+    /// 某一則訊息的附件（從訊息點下載）：由這則事件確定本地那一列。`mxc` 給了就要是這則的附件。
+    Event {
+        room: String,
+        event_id: String,
+        mxc: Option<String>,
+    },
     /// 直接給 manifest（含金鑰）。
     Manifest(Manifest),
 }
@@ -125,6 +129,16 @@ pub struct QueuedMedia {
     pub state: DownloadState,
     pub done: u32,
     pub total: u32,
+}
+
+/// `media.delete_local` 的結果。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeletedMedia {
+    pub mxc: String,
+    /// 本地有這一列、刪掉了（false ＝ 本來就沒有）
+    pub removed: bool,
+    /// 有正在下載（或排著）的被取消了
+    pub cancelled: bool,
 }
 
 /// `media.export_to` 的結果（寫到哪由呼叫者自己知道：RPC 回它收到的 URI、CLI 回 `-o`）。
@@ -446,7 +460,7 @@ impl Core {
         let mxc = &manifest.mxc;
         let entry = cache.read().await.find_media(mxc)?;
         let original = entry
-            .filter(|entry| media::is_same_file(entry, manifest))
+            .filter(|entry| media::is_same_block(entry, &manifest.block))
             .and_then(|entry| {
                 let file_size = entry.file_size?;
                 open_local_source(&entry).map(|(file, _)| (file, file_size, entry))
@@ -532,7 +546,8 @@ impl Core {
     /// Return:
     ///     Ok(ResolvedMedia::Chunked)   wbf 分塊（`manifest.server` 是這個帳號的 session 的 server）
     ///     Ok(ResolvedMedia::Matrix)    標準 Matrix 附件
-    ///     Err(Usage)                   manifest 是別台 server 的、或一般 Matrix 帳號給了 manifest；這個帳號看不到帶金鑰的事件
+    ///     Err(Usage)                   manifest 是別台 server 的、或一般 Matrix 帳號給了 manifest；只給 mxc 而本地沒有列、或這個帳號
+    ///                                  看得到的事件都跟列對不上；那則事件不是這個帳號看得到的檔、或不是給的那個 mxc
     ///     Err(Integrity)               分塊的區塊不能拿來下載
     pub(crate) async fn resolve_media(
         &self,
@@ -570,47 +585,73 @@ impl Core {
                 }
                 manifest.clone()
             }
+            // 只給 mxc：本地那一列說了算，挑跟它一致的事件拿金鑰（維護者 2026-10-07，/docs/design/media/media-download.md §5.3）。
             MediaRef::Mxc(mxc) => {
                 let reader = cache.read().await;
-                let block = match is_wbf {
-                    true => reader.find_media_block_for(&me, mxc)?,
-                    false => None,
-                };
-                match block {
-                    Some(block) => Manifest {
+                let entry = reader.find_media(mxc)?.ok_or_else(|| {
+                    not_seen(format!(
+                        "{mxc} has no local record (no event {me} has seen carries it)"
+                    ))
+                })?;
+                match media::find_key_matching_record(&reader, &me, &entry)? {
+                    Some(media::RecordedFileKey::Chunked(block)) if is_wbf => Manifest {
                         server: session.server.clone(),
                         mxc: mxc.clone(),
                         block,
                     },
-                    None => {
-                        let attachment = reader.find_matrix_attachment_for(&me, mxc)?;
-                        return attachment.map(ResolvedMedia::Matrix).ok_or_else(|| {
-                            not_seen(format!("no event {me} can see carries the key of {mxc}"))
-                        });
+                    Some(media::RecordedFileKey::Matrix(attachment)) => {
+                        return Ok(ResolvedMedia::Matrix(attachment));
+                    }
+                    // 一般 Matrix 帳號下載不了分塊的檔；或看得到的事件都跟列對不上。
+                    _ => {
+                        return Err(not_seen(format!(
+                            "no event {me} can see describes {mxc} the way the local record does"
+                        )));
                     }
                 }
             }
-            MediaRef::Event { room, event_id } => {
+            // 從訊息點下載：先由這則事件確定列（列不在就照它建、補連結），描述跟列合不合由下載入口判斷、不合就回錯。
+            MediaRef::Event {
+                room,
+                event_id,
+                mxc,
+            } => {
+                let (me_here, room_here, event_here) = (me.clone(), room.clone(), event_id.clone());
+                cache
+                    .run(move |cache| cache.media_link_event(&me_here, &room_here, &event_here))
+                    .await?;
+                let refuse_other_mxc = |found: &str| match mxc.as_deref() {
+                    Some(given) if given != found => Err(CoreError::new(
+                        CoreErrorKind::Usage,
+                        format!("{event_id} in {room} carries {found}, not {given}"),
+                    )),
+                    _ => Ok(()),
+                };
                 let reader = cache.read().await;
                 let attachment = match is_wbf {
                     true => reader.find_event_attachment(&me, room, event_id)?,
                     false => None,
                 };
                 match attachment {
-                    Some(attachment) => Manifest {
-                        server: session.server.clone(),
-                        mxc: attachment.mxc,
-                        block: attachment.block,
-                    },
+                    Some(attachment) => {
+                        refuse_other_mxc(&attachment.mxc)?;
+                        Manifest {
+                            server: session.server.clone(),
+                            mxc: attachment.mxc,
+                            block: attachment.block,
+                        }
+                    }
                     None => {
-                        let attachment =
-                            reader.find_event_matrix_attachment(&me, room, event_id)?;
-                        return attachment.map(ResolvedMedia::Matrix).ok_or_else(|| {
-                            CoreError::new(
-                                CoreErrorKind::Usage,
-                                format!("{event_id} in {room} is not a file {me} can see (or it is not decrypted yet)"),
-                            )
-                        });
+                        let attachment = reader
+                            .find_event_matrix_attachment(&me, room, event_id)?
+                            .ok_or_else(|| {
+                                CoreError::new(
+                                    CoreErrorKind::Usage,
+                                    format!("{event_id} in {room} is not a file {me} can see (or it is not decrypted yet)"),
+                                )
+                            })?;
+                        refuse_other_mxc(&attachment.mxc)?;
+                        return Ok(ResolvedMedia::Matrix(attachment));
                     }
                 }
             }
@@ -623,15 +664,14 @@ impl Core {
     }
 
     /// 本地已經有了就回那個狀態；沒有就排進佇列（/docs/design/media/media-download.md §5.3 的表）。
-    /// 列說的跟這次的區塊對不上（大小、塊大小、sha256，維護者 2026-10-02 照 PR #14）就丟掉重來，🚫 照用。
+    /// 列說的跟這次的區塊對不上（大小、塊大小、sha256）一律回錯、列🚫 動（維護者 2026-10-07）：要換描述先 `media.delete_local`。
     ///
     /// Args:
     ///     waiter: 要等它結束的話給一個；`complete`／`local_source` 時直接丟掉（呼叫者看 `state` 就知道不用等）
     ///     local_source_counts: false ＝ 本機原檔不算「已經有了」（匯出時原檔驗不過，要池裡那份）
     /// Return:
     ///     Ok(MediaJob)
-    ///     Err(Integrity)   列已經完整、池檔打得開，這次的描述對不上：快取留著，錯的是這次的描述
-    ///     Err(Usage)       列對不上，而這個檔正在用舊的描述下載：等它停了再來
+    ///     Err(Integrity)   本地這個 mxc 的列跟這次的描述對不上（不管下載完了沒）
     pub(crate) async fn ensure_queued(
         &self,
         account: &AccountDir,
@@ -641,25 +681,13 @@ impl Core {
     ) -> Result<MediaJob, CoreError> {
         let (cache, _me) = self.server_cache_and_me(account)?;
         let pool = self.pool_of(account)?;
-        let mut entry = cache.read().await.find_media(&manifest.mxc)?;
+        let entry = cache.read().await.find_media(&manifest.mxc)?;
         let mxc = manifest.mxc.clone();
         if let Some(described) = entry
-            .clone()
-            .filter(|entry| !media::is_same_file(entry, &manifest))
+            .as_ref()
+            .filter(|entry| !media::is_same_block(entry, &manifest.block))
         {
-            // 已經完整、整檔驗過的快取是真的：對不上的是這次的描述（寫錯或偽造的事件），回錯給這次的請求、快取🚫 動（維護者 2026-10-03）。
-            if media::open_complete(&pool, &described).is_some() {
-                return Err(CoreError::new(
-                    CoreErrorKind::Integrity,
-                    format!(
-                        "this description of {mxc} does not match the file already downloaded and verified (size {:?}, chunk size {:?}); the cached copy is kept",
-                        described.file_size, described.chunk_size
-                    ),
-                ));
-            }
-            // 還沒下載完：兩份描述都還沒被整檔驗過，照 PR #14 的規則丟掉重來。
-            self.forget_old_description(account, &manifest).await?;
-            entry = None;
+            return Err(other_description_error(&mxc, described));
         }
         if let Some(entry) = &entry {
             // 總塊數還不知道是 0（`MediaJob::total` 的約定）：不是分塊的檔沒有塊。
@@ -801,17 +829,21 @@ impl Core {
         self.stop_matrix_downloads_of(account);
     }
 
-    /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
-    fn list_media_in_use(&self, server_dir: &Path) -> HashSet<String> {
-        let downloaders: Vec<Arc<Downloader>> = self
-            .downloaders
+    /// 這台 server 上每個帳號已經起了的下載處理端（🚫 為了問而新起一個）。
+    fn list_downloaders_on(&self, server_dir: &Path) -> Vec<Arc<Downloader>> {
+        self.downloaders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|(account_dir, _)| account_dir.starts_with(server_dir))
             .map(|(_, downloader)| downloader.clone())
-            .collect();
-        let mut in_use: HashSet<String> = downloaders
+            .collect()
+    }
+
+    /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
+    fn list_media_in_use(&self, server_dir: &Path) -> HashSet<String> {
+        let mut in_use: HashSet<String> = self
+            .list_downloaders_on(server_dir)
             .iter()
             .flat_map(|downloader| downloader.list_open_names())
             .collect();
@@ -819,29 +851,50 @@ impl Core {
         in_use
     }
 
-    /// 列說的跟這次的區塊不一樣：丟掉本地的一切、列換成這次的描述（`media::forget_for_new_description`）。
-    /// 那個檔正開著（下載處理端正在用舊的描述寫）就🚫 動，回 Usage。
-    async fn forget_old_description(
+    /// `media.delete_local`（/docs/design/media/media-download.md §7.4）：清掉這個 mxc 在本地的一切——池檔、半成品、seek 暫存檔、`media` 列。
+    /// 先取消這台 server 上所有帳號正在下載它的（分塊與傳統兩條），等寫入者放手（最多 [`DELETE_WAITS_FOR_WRITER`]）才刪。
+    /// 之後要再下載就從訊息點（`{ room, event_id }`）：列由那則事件重建（/docs/design/media/media-download.md §5.3）。
+    ///
+    /// Args:
+    ///     mxc: example: "mxc://localhost/000000000000004d"
+    /// Return:
+    ///     Ok(DeletedMedia)   `removed` false ＝ 本地本來就沒有這一列
+    ///     Err(Usage)         取消了，但等不到寫入者放手（例如 GET 還在讀分塊下載中的檔）：什麼都🚫 刪，晚點再來
+    ///     Err(...)           DB、檔案動不了
+    pub async fn del_local_media(
         &self,
-        account: &AccountDir,
-        manifest: &Manifest,
-    ) -> Result<(), CoreError> {
-        let (cache, _me) = self.server_cache_and_me(account)?;
-        let pool = self.pool_of(account)?;
-        let in_use = self.list_media_in_use(&account.server_dir());
-        let manifest_here = manifest.clone();
-        cache
-            .run(move |cache| {
-                let pending_name = cache.media_pending_name(&manifest_here.mxc)?;
-                if pending_name.is_some_and(|name| in_use.contains(&name)) {
-                    return Err(wbf_sdk::SdkError::Usage(format!(
-                        "{} is being downloaded under another description; try again when it stops",
-                        manifest_here.mxc
-                    )));
-                }
-                media::forget_for_new_description(cache, &pool, &manifest_here)
-            })
-            .await
+        mxc: &str,
+        target: &Target,
+    ) -> Result<DeletedMedia, CoreError> {
+        let account = self.account_or_current(target)?;
+        let server_dir = account.server_dir();
+        let (cache, _me) = self.server_cache_and_me(&account)?;
+        let pool = self.pool_of(&account)?;
+        // 兩條都問、全部都交（🚫 第一個取消成功就停）：同一台 server 的別的帳號可能也在拉它。
+        let mut cancelled = self.cancel_matrix_download(&account, mxc);
+        for downloader in self.list_downloaders_on(&server_dir) {
+            cancelled |= downloader.cancel(mxc);
+        }
+        // 分塊的取消會把半成品留著續傳（/docs/design/media/media-download.md §5.4）：處理端關掉它之前🚫 刪。
+        let pending_name = cache.read().await.media_pending_name(mxc)?;
+        if let Some(pending_name) = pending_name {
+            let started = std::time::Instant::now();
+            while self.list_media_in_use(&server_dir).contains(&pending_name)
+                && started.elapsed() < DELETE_WAITS_FOR_WRITER
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let in_use = self.list_media_in_use(&server_dir);
+        let mxc_here = mxc.to_string();
+        let removed = cache
+            .run(move |cache| media::del_local_copy(cache, &pool, &mxc_here, &in_use))
+            .await?;
+        Ok(DeletedMedia {
+            mxc: mxc.to_string(),
+            removed,
+            cancelled,
+        })
     }
 
     /// `no_cache`：這次為了匯出才下載的，不留在池裡。還有別的 mxc 指著同一個池檔、或有人正在讀它，就只清這一列。
@@ -864,6 +917,25 @@ impl Core {
             })
             .await
     }
+}
+
+/// `media.delete_local` 取消下載之後，最多等寫入者放手這麼久（分塊的處理端等在途的那一塊落地才停）。
+pub(crate) const DELETE_WAITS_FOR_WRITER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 同一個 mxc，這次的描述跟本地那一列說的不是同一個檔（/docs/design/media/media-download.md §5.3、§12.1）：拒這次、列🚫 動。
+/// 先記下的那份說了算：寫錯或偽造的事件先到，真的那則也會被拒，UI 拿到這個錯就是警告；要換成這次的先 `media.delete_local`（維護者 2026-10-07）。
+pub(crate) fn other_description_error(
+    mxc: &str,
+    recorded: &wbf_sdk::cache::MediaEntry,
+) -> CoreError {
+    CoreError::new(
+        CoreErrorKind::Integrity,
+        format!(
+            "this description of {mxc} does not match the local record (kind {:?}, size {:?}, chunk size {:?}); refused, the local copy is kept. \
+             To replace it with this one, delete the local copy (media.delete_local) and download it from the message",
+            recorded.kind, recorded.file_size, recorded.chunk_size
+        ),
+    )
 }
 
 /// `media::export_to_path` 放到 blocking 執行緒上做（大檔會讀很久）。

@@ -304,10 +304,18 @@ Downloading {                                       一個正在下載的檔，�
 
 ### 5.3 處理一個「下載這個檔」的 job：先看 DB 與檔案
 
+**描述（金鑰）從哪來**（維護者 2026-10-07）：本地的 `media` 列說了算，它只在兩個地方生出來——事件寫進 `cache.db` 時（第一則引用這個 mxc 的事件，`INSERT OR IGNORE`），
+與「從訊息點下載」時由那則事件建（列不在的話，例如 `media.delete_local` 刪過，§7.4）。列一旦在，🚫 有任何路徑換掉它的描述。
+
+| 請求怎麼說 | 用哪份描述 |
+|---|---|
+| `{ mxc }` | **照列挑**：沒有列 → `1100`（叫 UI 從訊息點）；有列 → 這個帳號看得到、而且跟列說的是同一個檔的事件裡**第一則**的金鑰（`media::find_key_matching_record`）。都對不上（只看得到寫錯或偽造的）→ `1100` |
+| `{ room, event_id, mxc? }`（從訊息點下載） | **由這則事件確定列**：列不在就照它建、補上這則跟列的連結（`Cache::media_link_event`）；用這則的金鑰。給了 `mxc` 就要是這則的附件，否則 `1100`。列在而描述不合 → 下表第一列 |
+| `{ manifest }` | manifest 帶的；列不在由處理端照它建（§4.4） |
+
 | 本地狀況 | 做什麼 |
 |---|---|
-| 列說的跟這次的區塊對不上，**列已經完整、池檔打得開** | **🚫 刪**：整檔驗過的快取是真的，錯的是這次的描述（寫錯或偽造的事件）。回 `Integrity` 給這次的請求，快取原封不動（維護者 2026-10-03） |
-| 列說的跟這次的區塊對不上（大小、塊大小；兩邊都帶 sha256 時 sha256），**還沒下載完** | **丟掉**：主檔、暫存檔都刪，列換成這次的描述、從頭來（維護者 2026-10-02，照 PR #14 的規則：兩份描述都還沒被整檔驗過）。那個檔正在用舊的描述下載就回錯、🚫 動它 |
+| 列說的跟這次的描述對不上（格式、大小、塊大小；兩邊都帶 sha256 時 sha256），**不管下載完了沒、有沒有人正在下載** | **回 `Integrity`（1500）、🚫 下載、列與檔都🚫 動**。先記下的那份說了算：先到的是寫錯或偽造的事件，真的那則也會被拒——UI 拿到這個錯就是警告。要換成這次的，先 `media.delete_local`（§7.4）再從訊息下載（維護者 2026-10-07，取代 10-02 照 PR #14 的「沒下載完就丟掉重來」與 10-03 的「完整的才不刪」） |
 | `media` 列 `complete = 1`、池檔在 | 🚫 不下載：已經有了 |
 | 有本機原檔（/docs/design/rpc-specs/data-plane.md §8.1） | 🚫 不下載（`media.export_to` 例外，§7.3） |
 | 這個 mxc 已經在 `downloading` 表、正在準備或在收件 queue 裡 | 🚫 不重複 |
@@ -426,14 +434,15 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 
 | method | params | result | 說明 |
 |---|---|---|---|
-| `media.download` | `{ mxc } \| { room, event_id } \| { manifest }`（剛好給一種，給了不只一種是參數錯，🚫 不猜哪個優先），`user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }` | 建 job（§5.3；標準附件見 §12）。已經完整或有原檔就直接回 `complete`／`local_source`；`kind`、`verified` 是 `media` 列的（§12.3） |
+| `media.download` | `{ mxc } \| { room, event_id, mxc? } \| { manifest }`（剛好給一種，給了不只一種是參數錯，🚫 不猜哪個優先；從訊息點下載的那種可以多帶 `mxc`，要是那則的附件），`user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }` | 建 job（§5.3；標準附件見 §12）。已經完整或有原檔就直接回 `complete`／`local_source`；`kind`、`verified` 是 `media` 列的（§12.3）。描述跟本地那一列不合 → 1500（§5.3） |
 | `media.open` | 同上 | `{ url, mxc, mimetype?, size?, state, kind?, verified? }` | `url` 是 `/media/mxc/e-…`（/docs/design/rpc-specs/data-plane.md §8，不帶帳號）。`state`：`local_source`、`complete`、`downloading`、`verifying`、`queued`。`size` 只在事件沒給 `info.size` 的傳統檔不在（§12.2）。不完整也沒原檔 → 順便建 job |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }` | 現在的樣子：在跑的（`downloading`）與還沒開始的（`queued`） |
 | `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | 正在拉 → 設 `downloading[mxc].cancelled`，在途的那一塊落地就停；還沒開始 → 拿掉（§5.4） |
+| `media.delete_local` | `{ mxc, user?, server? }` | `{ mxc, removed: bool, cancelled: bool }` | 清掉這個 mxc 在本地的一切（池檔、半成品、seek 暫存檔、`media` 列），先取消這台 server 上所有正在下載它的（§7.4） |
 | `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI；已經存在就覆蓋）、`no_cache?` | `{ to, bytes, source, kind, verified, hash? }`；`source` 是 `local_source`、`cache`、`server` | 匯出（§7.3）：沒有就排、等它完成才寫到 `to`；從池匯出🚫 再算 hash、只核大小，傳統加密的檔沒驗過或驗不過照匯、回 1501（`data` 是這份結果）；從本機原檔匯出一律整檔比 sha256。`to` 現在只收 `file://`。`no_cache`：這次為了匯出才下載的，匯出完就從池拿掉（別的 mxc 還指著、或有人正在讀，就只清這一列），池裡本來就有的不動 |
 | 推播 `media.download` | — | `{ mxc, state, done, total, user, verified?, reason? }`；`state` 多一個 `verifying` | §5.5、§12.3。`complete` 一律帶 `verified`（0／1／2）；`reason` 只在 `failed` 帶 |
 
-- 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。找不到是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
+- 金鑰只從**這個帳號看得到的事件**裡找（§3.2）：同一份 `cache.db` 裡有同 server 別的帳號的事件，金鑰🚫 不跨帳號借。只給 `mxc` 時照本地那一列挑（§5.3）；找不到（沒有列、或看得到的都跟列對不上）是 `1100`，訊息叫你帶 manifest 或 `room` ＋ `event_id`。
 - 一般 Matrix 帳號（走 matrix-sdk 的）沒有 `Download` 線：它只看得到標準 Matrix 附件（`kind` 2、3），走 §12 的 HTTP 下載；給它 `manifest` 回 `1100`。
 - 分塊檔的下載一律走 WS 的 `Download` 線、標準附件一律走 HTTP（§12）：`transport` 參數對這幾支沒有意義。CLI 的 `download --no-cache` 不走下載處理端（直接逐塊寫到檔案，不碰池），等 CLI 改走 RPC 時一併收掉。
 
@@ -452,8 +461,8 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 - 1、2 在 GET 這邊直接讀；3～5 照 byte 位置一塊一塊當成 seek 的 job 交給下載處理端（§5.1：還沒完成的主檔與暫存檔只有下載者碰；§6.1、§6.2）。處理時檔剛好完成了，就從完整的池檔讀。
 - **URL 不帶帳號**：照本機已登入的帳號一個一個找有這個 mxc 紀錄的 `cache.db`，mxc 的 server_name 跟帳號網域一樣的先找。
   1、2 不要金鑰；要現拉就要那個帳號看得到帶金鑰的事件。有紀錄但沒有完整的檔、也沒有帳號拿得到金鑰 → 502；完全沒有紀錄 → 404。
-- **現拉要用的描述（金鑰）先挑跟本地那一列對得上的**（大小、塊大小、兩邊都有時 sha256，同 §5.3）：一個帳號看到的那則對不上（寫錯或偽造的事件）就換下一個帳號；
-  都對不上 → 502（`Integrity`）。切片🚫 用這份描述（§6.2），GET 自己再核一次拿回來的那一塊真的涵蓋它要的位置，對不上就斷線。
+- **現拉要用的描述（金鑰）照只給 `mxc` 的規則挑**（§5.3：這個帳號看得到、跟本地那一列說的是同一個檔的第一則）：一個帳號看到的都對不上（寫錯或偽造的事件）就換下一個帳號；
+  都對不上 → 502（跟「沒帳號拿得到金鑰」同一個錯）。切片🚫 用這份描述（§6.2），GET 自己再核一次拿回來的那一塊真的涵蓋它要的位置，對不上就斷線。
 - `HEAD` 回一樣的標頭、沒有 body。Range 只認單一一段（`bytes=a-b`、`bytes=a-`、`bytes=-n`），終點超過檔尾就截到檔尾；寫壞的、不只一段的就當沒帶、回整檔（RFC 9110 §14.2）；起點在檔尾或之後是 416。
 - 一個 GET 可能橫跨好幾種來源（前面在主檔、後面要現拉）：照塊號一塊一塊決定，邊讀邊吐。
 - 吐出去的是**明文**；記憶體裡同時最多一塊（或一段）。HTTP 回應用串流 body，背壓同上傳：播放器讀得慢，daemon 就晚一點讀下一塊。
@@ -488,6 +497,26 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 - 跟串流分開（維護者 2026-10-02）：`media.open`／GET 是串流，🚫 算整檔 hash，每段讀出來時池的 AEAD 已經驗過。
   📎 10-02 原本定「匯出要整檔驗（BLAKE3 ＋ 有就 SHA-256）」；10-06 改成上面那張表：`kind` 1 的整檔 hash 是重複的，`kind` 2 收尾時驗過、記在 `verified`。
 - 🔜 之後的形狀：還沒下載完就先交 job，下載完成時**自動匯出**、RPC 不必等著；現在是等它完成才回。
+
+### 7.4 清除本地：`media.delete_local`（維護者 2026-10-07）
+
+清掉一個 mxc 在本地的一切：池檔、pending 主檔、`m<id>.seek`、`media` 列（`event_media` 的連結 ON DELETE CASCADE 一起沒）。
+用途：§5.3 的 1500（先到的是寫錯或偽造的事件，真的那則被拒）之後換成真的，或使用者就是要把這個檔從本機拿掉。
+
+```jsonc
+// 示意（形狀照 /docs/design/rpc-specs/rpc-spec.md §1）：正在下載時清掉
+→ { "method": "media.delete_local", "params": { "mxc": "mxc://localhost/000000000000004d" }, "id": 7 }
+← { "code": 0, "msg": "ok", "id": 7, "result": { "mxc": "mxc://localhost/000000000000004d", "removed": true, "cancelled": true } }
+```
+
+1. **先取消，同一台 server 上所有正在下載它的**（維護者 10-07 補充）：傳統檔的 task（§12，登記表以 server 為鍵）與**每個帳號**已經起了的分塊處理端都交 `cancel`，
+   🚫 第一個成功就停（同 server 別的帳號可能也在拉它），🚫 為了取消新起一個處理端。`cancelled` 是「有沒有任何一個被取消」。
+2. **等寫入者放手**，最多 5 秒：分塊的取消會把半成品留著續傳（§5.4），在途的那一塊落地、處理端關掉檔之前🚫 刪。等不到（例如 GET 還在讀下載中的檔）→ `1100`、什麼都🚫 刪。
+3. **刪**（`media::del_local_copy`）：先刪檔再刪列（同配額清理，中途失敗時列還在、掃描收得掉）。池檔還有別的 mxc 指著、或有人正開著讀，就🚫 刪檔，列刪了之後沒人指著，掃描會收。
+   本地本來就沒有這一列 → `removed: false`、照樣成功。
+
+之後：只給 `mxc` 的下載回 `1100`（沒有列，§5.3）；從訊息點下載（`{ room, event_id, mxc? }`）由那則事件重建列、從頭下載。
+正在下載的傳統 task 收尾時再問一次列（§12.1）：列被刪了、或刪了又由別則事件重建，它的結果🚫 記上去、🚫 去清別人的列。
 
 ## 8. 斷在哪裡、會留下什麼
 
@@ -527,10 +556,12 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 | `MediaDownload` 對假 server：下載進池、去重、從完整的段續傳（塊跟段不對齊）、seek 拉過的塊主檔不再上網、區塊對不上就刪掉暫存檔；配額清理；掃描（不碰正在下載的、刪 v1、刪過期的） | sdk `tests/media_cache.rs` |
 | 匯出的暫存檔：旁邊本來就有的 `<to>.partial` 不論成敗都原封不動、成功時覆蓋既有的 `to`、兩個匯出到同一個 `to` 互不踩（失敗的只刪自己的）、不留暫存檔 | sdk `media::tests` |
 | 線的發送 queue：送出🚫 等回覆、回覆倒著回也找得回自己的動作、插到最前面的先送、還沒送的拿得回來、線斷了在途的都回 `Network` | core `link_requests::tests` |
-| 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、準備中的 job 也取消得掉、`export_to`（含 `no_cache`、從池匯出🚫 再算 hash（列改指到別的池檔也照給）、推播依序 `verifying` → `complete` 帶 `verified`、快取命中回那一列的 `verified`、傳統加密檔驗了正確才可信（資料照讀）、原檔改過就改從池匯出）、描述對不上時完整的快取不刪（回錯）而沒下載完的丟掉重來、server 內部錯留著半成品而 NotFound 刪掉、逾時過一次壞塊照樣重拉一次、別的處理端在下載就把 job 與等的人轉過去（回 `downloading`、自己不上網；轉過去之後它才收，等的人當場拿到錯）、處理端被收會放掉認領、認領認處理端不認帳號（舊處理端放不掉新的、收了的不再收 job）、收掉的處理端讓等塊的 GET 當場拿到錯、只是 seek 🚫 認領、🚫 寫任何檔、下一塊🚫 再問 `Info`、別的帳號下載不等它、seek 照檔驗過的切法算塊號（描述寫錯塊大小照樣給對的 bytes）、只是 seek 的描述驗不過🚫 刪主檔、GET 只用跟本地那一列對得上的描述 | core `download_queue::tests` |
+| 下載處理端：一塊一個 `Read`、三個檔一起跑時發送 queue 是 `A B C、A B C`、每檔同時一塊在途、重複要不重複、取消只再落地在途那一塊且再要接得上、seek 的請求在發送 queue 最前面而且同一塊只上網一次（含「主檔正在拉的那一塊」）、線斷了在途的請求重排、進度停在原地、線回來接著拉、線斷時進來的 seek 線回來先送、線斷時取消當場停、一塊壞了重拉一次／連兩次就當壞檔不留檔、準備中的 job 也取消得掉、`export_to`（含 `no_cache`、從池匯出🚫 再算 hash（列改指到別的池檔也照給）、推播依序 `verifying` → `complete` 帶 `verified`、快取命中回那一列的 `verified`、傳統加密檔驗了正確才可信（資料照讀）、原檔改過就改從池匯出）、描述對不上一律回錯（完整的快取與沒下載完的半成品、列都🚫 動，清掉之後才換得掉）、清除本地會取消正在跑的下載、等處理端關掉檔才刪、server 內部錯留著半成品而 NotFound 刪掉、逾時過一次壞塊照樣重拉一次、別的處理端在下載就把 job 與等的人轉過去（回 `downloading`、自己不上網；轉過去之後它才收，等的人當場拿到錯）、處理端被收會放掉認領、認領認處理端不認帳號（舊處理端放不掉新的、收了的不再收 job）、收掉的處理端讓等塊的 GET 當場拿到錯、只是 seek 🚫 認領、🚫 寫任何檔、下一塊🚫 再問 `Info`、別的帳號下載不等它、seek 照檔驗過的切法算塊號（描述寫錯塊大小照樣給對的 bytes）、只是 seek 的描述驗不過🚫 刪主檔、GET 只用跟本地那一列對得上的描述 | core `download_queue::tests` |
 | URL：讀與上傳的 URL 不能互換；Range 解析 | daemon `data_plane::tests` |
 | HTTP：未解鎖 503、別的 daemon 發的／用途不對／本機沒紀錄 404、方法不對 405 | daemon `tests/data_plane.rs` |
 | 推播 `media.download` 的欄位 | daemon `push::tests` |
+| `media` 列：事件只從這個帳號看得到的裡列、刪列連結跟著沒、從看得到的事件重建（看不到的🚫）、重連不重複 | sdk `cache::tests`（`a_deleted_media_row_is_rebuilt_from_the_event_it_is_downloaded_from`） |
+| `media.download` 的參數：`{ mxc, room }` 缺 `event_id`、`media.delete_local` 沒 `mxc` 是參數錯 | daemon `handle::tests` |
 | 真 server：池清掉 → `media.open { room, event_id }` → 從中間 Range（seek，206）→ 等它拉完 → 整檔對、有完成的推播、暫存檔不見了 | daemon `tests/real_server.rs` 的 `an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms` |
 
 ## 11. 維護者定的
@@ -552,13 +583,13 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 9. **seek 是一個事件一個 job**（§6.2）：它的塊請求放到發送 queue 最前面。
 10. **解析 job 的時候建 downloading 項**（§5.2）。
 11. **逾時看整條線**：有請求在等、而線整段沒有回應才算（/docs/design/daemon/link-requests.md §4）；心跳每 24 秒一定送（/docs/design/daemon/ws-receive-dispatch.md §5.1）。
-12. **快取命中要跟這次的描述對得上**（§5.3）：大小、塊大小（兩邊都有時 sha256）對不上就丟掉重來，照 PR #14 的規則。
+12. **快取命中要跟這次的描述對得上**（§5.3）：大小、塊大小（兩邊都有時 sha256）對不上就丟掉重來，照 PR #14 的規則。（10-07 改成一律回錯、🚫 丟，第 23 條。）
 13. **`media.save_to` 改名 `media.export_to`、`to` 收 URI**（§7.3）：現在只做 `file://`；串流不算整檔 hash。（10-02 原本定「匯出要整檔驗過」，10-06 改成照 `kind`／`verified`、從池匯出🚫 再算，§7.3、§12.3。）
 
 2026-10-03：
 
 14. **`to` 已經存在就覆蓋**（§7.3）：要不要覆蓋是 UI 先問使用者，daemon 🚫 再擋。
-15. **已經完整下載、驗過的快取🚫 因為一則描述對不上而刪**（§5.3）：錯的是那則描述，回錯給請求者。
+15. **已經完整下載、驗過的快取🚫 因為一則描述對不上而刪**（§5.3）：錯的是那則描述，回錯給請求者。（10-07 起沒完整的也一樣，第 23 條。）
 
 2026-10-04：
 
@@ -575,6 +606,13 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
     `verified`：0 還沒驗、不知道；1 驗了、正確；2 驗了、不正確。驗過就🚫 再驗。
 21. **下載完自動驗證**（§12.3）：推播 `media.download` 先報 `verifying`，驗完報 `complete` 帶 `verified`（成功 1、失敗 2）。驗不過🚫 刪檔。
 22. **從池匯出🚫 再算 hash，跟 GET 同一個約定**（§7.3）：`kind` 1 不檢查；`kind` 2 沒驗過或驗不過照匯、回 1501 `unverified`。
+
+2026-10-07（PR #75 審查 cirno 🟡1 之後）：
+
+23. **本地的 `media` 列說了算，描述不合一律回錯**（§5.3、§12.1，分塊與傳統兩條管線都是）：只給 `mxc` 的下載照列挑跟它一致的事件的金鑰，沒有列就是空的、回錯；
+    從訊息點下載（帶 `room`、`event_id`，可以再帶 `mxc`）由那則事件確定列；列已經在而描述不合 → RPC 回錯（UI 拿到的警告）、🚫 下載。
+    取代第 12 條的「沒下載完就丟掉重來」：沒有任何路徑會換掉列的描述。
+24. **新增 `media.delete_local`**（§7.4）：清掉本地資料與 `media` 列，而且**先取消當下所有正在下載同一個 mxc 的**。
 
 ## 12. 傳統格式的附件（`kind` 2、3）（維護者 2026-10-06）
 
@@ -607,17 +645,18 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
 - **端點**：先 `GET /_matrix/client/v1/media/download/…`（要驗證的那條），server 回 404 `M_UNRECOGNIZED`（舊 server 沒有）才退到 `/_matrix/media/v3/download/…`。
   mxc 只收規格允許的字元（server_name＝主機名＋埠、media_id＝`[A-Za-z0-9_-]`）：它要拼進 URL 的路徑，🚫 讓 `/`、`..`、`?` 混進去。
 - **逾時**看整條線多久沒回應（60 秒，/docs/design/daemon/link-requests.md §4 同一個數），🚫 整個檔限時。
-- **進度** `done`／`total` 的單位是池的 64 KiB 段（傳統檔沒有塊）：`total` 從事件的 `info.size` 算，沒給就是 0（前端只能顯示「下載中」）。
+- **進度** `done`／`total` 的單位是池的 64 KiB 段（傳統檔沒有塊）：`total` 從事件的 `info.size` 算，沒給就用列上記的大小，都沒有是 0（前端只能顯示「下載中」）；推播與 `media.download` 的回應用同一個數（PR #75 審查 salvia 2）。
 - **背壓**：池寫得慢就晚一點讀 HTTP 的下一段；記憶體裡同時只有幾段。🚫 整檔讀進記憶體（🚫 用 matrix-sdk 的 `get_media_content`，它回 `Vec<u8>`）。
-- **金鑰從哪來**：跟 §3.2 一樣從 `cache.db` 找引用這個 mxc 的事件，讀 `content_json` 的 `file`（`key`、`iv`、`hashes.sha256`、`v`）。
+- **金鑰從哪來**：跟 §3.2、§5.3 一樣——只給 `mxc` 照本地那一列挑引用它、跟列一致的事件，從訊息點下載就是那則；讀 `content_json` 的 `file`（`key`、`iv`、`hashes.sha256`、`v`）。
   `v` 不是 `"v2"`、缺任何一個欄位 → 這個 mxc 當壞的（fail closed），🚫 試著解。
-- **同一個 mxc、兩份描述**（§5.3 的同一條規則）：列記的 `media.hash`（`kind` 2 是事件的 `file.hashes.sha256`，/docs/design/storage/local-cache-db.md §5）、
-  格式、大小（兩邊都有時）跟這次事件的比，檔名、型別🚫 比（轉發改名還是同一個檔）。對不上時：
-  - 已經完整 → 快取是真的，對不上的是這次的描述（寫錯或偽造的事件）：**回 `Integrity`、快取🚫 動**。
-  - 還沒完整、另一份描述**正在下載** → 回 `Integrity`：🚫 掛上去（拿到的會是別把金鑰解的資料）、🚫 換掉它的描述。
-  - 還沒完整、沒人在下載 → 兩份都還沒被整檔驗過：列換成這次的描述（`media_redescribe`）、從頭下載。先到的偽造事件因此擋不住後來的真事件。
-  - 收尾前 task 再問一次列：下載途中列被換成另一份描述，這次的結果🚫 記上去，當下載失敗、半成品丟掉。
-  實作：`crates/wbf-sdk/src/media.rs` 的 `is_same_matrix_file`／`is_same_matrix_description`。
+- **同一個 mxc、兩份描述**（§5.3 的同一條規則，維護者 2026-10-07）：列記的 `media.hash`（`kind` 2 是事件的 `file.hashes.sha256`，/docs/design/storage/local-cache-db.md §5）、
+  格式、大小（兩邊都有時）跟這次事件的比，檔名、型別🚫 比（轉發改名還是同一個檔）。對不上 → **回 `Integrity`、🚫 下載、列與檔🚫 動**，不管下載完了沒、有沒有人在下載。
+  先到的偽造事件會擋住後來的真事件，UI 拿到的 1500 就是警告；要換成真的先 `media.delete_local`（§7.4）再從真的那則下載。
+  📎 10-06 的第一版是「還沒完整、沒人在下載就換成這次的描述重下」，PR #75 審查（cirno 🟡1）指出格式不同時那條永遠到不了，維護者 10-07 改成上面這樣。
+  - 正在下載的 task 照哪份描述在寫記在登記表上：另一份描述來要，🚫 掛上去（拿到的會是別把金鑰解的資料）、回 `Integrity`——比列之後消費端自己再問一次。
+  - task **開頭**再問一次列（PR #75 審查 salvia 1）：起 task 前讀的列可能已經舊了（上一個 task 剛收尾），完整就直接收尾、🚫 重下；列不在或換了就🚫 下載。
+  - 收尾前 task 再問一次列：下載途中列被刪了（`media.delete_local`）、或刪了又由別則事件重建，這次的結果🚫 記上去，當下載失敗、半成品丟掉，🚫 去清別人的列。
+  實作：`crates/wbf-sdk/src/media.rs` 的 `is_same_matrix_file`／`is_same_matrix_description`／`find_key_matching_record`。
 
 ### 12.2 GET：邊下載邊讀、驗證中也能讀，狀態碼說可不可信
 
@@ -678,8 +717,10 @@ GET /_matrix/client/v1/media/download/{server}/{media_id}（帶這個帳號的 a
 - `kind` 1：下載中、完成後都是 200／206，不論 `verified`；區塊 sha256 對不上 → `verified = 2`、🚫 當壞檔、GET 照樣 2xx。
 - `kind` 3：🚫 `verifying`、完成時 `verified = 0`、GET 2xx；`info.size` 對不上 → `Integrity`。
 - 驗過的檔🚫 再驗：快取命中、匯出、GET 都🚫 再餵任何 hash 器。
-- 同一個 mxc 兩份描述（§12.1）：偽造的先到、沒下載過 → 換成真的那份、下載、`verified = 1`；之後拿偽造那份來要 → 1500、快取🚫 動；
-  一份正在下載時另一份來要 → 1500、正在下載的照常完成。
+- 同一個 mxc 兩份描述（§12.1）：偽造的先到 → 從真的那則要 1500、🚫 起 task、列🚫 動；給的 `mxc` 不是那則的 → 1100；`media.delete_local` 之後從真的那則下載、`verified = 1`；
+  之後拿偽造那份來要 → 1500；只給 `mxc` 時用的是跟列一致的那則（偽造那則比較早寫進來也🚫 挑它）；一份正在下載時另一份來要 → 1500、正在下載的照常完成。
+- 清除：正在下載的被取消（`cancelled: true`）、半成品與列都沒了；只給 `mxc` 下載回 1100、從訊息點下載由那則重建、從頭下載完成。
+- task 開頭看到列已經完整（salvia 1 的窗口）→ 直接收尾、推播只有一則 `complete`、🚫 上網。
 - 取消：推播 `cancelled`、半成品刪掉、列 `complete = 0`；再要一次從頭下載、完成。
 - 從池匯出：`kind` 1、3 照匯、成功；`kind` 2 `verified = 1` 成功、`verified = 2` **照匯**（`to` 有檔）而且回 1501、`data` 是那份結果。
 - 跟 `AttachmentEncryptor` 互通：我們上傳的（/docs/design/rpc-specs/data-plane.md §7.2）用上游的 `AttachmentDecryptor` 解得開，反過來也是。

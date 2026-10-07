@@ -98,7 +98,7 @@ v1 讓最後一段可以短、靠檔長推長度，進度快照還要把湊不�
 
 **安全性質**：段號進 nonce 與 AAD → 段搬位置、跨檔拼接都解不開；nonce_base 每檔隨機 → 同內容兩次寫入密文不同（去重靠 hash，不靠密文）；一把金鑰配隨機 nonce_base 加段號，nonce 不重複；**每個段號只封一份明文**（續傳時重封的那段明文一定一樣；暫存名換了主人就整個重下，不續）；金鑰不進錯誤訊息。**不防**：能讀 `local.key` 的人（同 /docs/design/storage/vault-and-keys.md §1 的威脅模型）、檔案大小與數量。
 
-**快取命中的核對**：先比**列跟這次的區塊**（`media::is_same_file`：大小、塊大小，兩邊都帶時 sha256；對不上就丟掉重來，/docs/design/media/media-download.md §5.3），
+**快取命中的核對**：先比**列跟這次的區塊**（`media::is_same_block`：格式、大小、塊大小，兩邊都帶時 sha256；對不上就回錯、列與檔🚫 動，維護者 2026-10-07，/docs/design/media/media-download.md §5.3），
 再看池檔本身（`media::open_complete`：列說 `complete = 1`、池檔開得起來（池格式 v2、檔長是整數筆、最後一段解得開）、明文長度等於列的 `file_size`；任一不符就當沒有，重下）。
 這兩步🚫 算整檔 hash（串流照用）；區塊帶 sha256 時，下載收尾已經跟整檔的 SHA-256 比過、結果記在 `media.verified`；對不上也照樣進池、記 `verified = 2`（資料留著，讀的時候用狀態碼講，/docs/design/media/media-download.md §12.3）；
 從池匯出🚫 再算（/docs/design/media/media-download.md §7.3）。

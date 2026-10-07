@@ -23,7 +23,7 @@ use crate::accounts::AccountDir;
 use crate::download_queue::{cancelled_error, SeekPiece};
 use crate::error::{CoreError, CoreErrorKind};
 use crate::event::{CoreEvent, DownloadState, EventSink};
-use crate::media_ops::MediaJob;
+use crate::media_ops::{other_description_error, MediaJob};
 use crate::server_cache::ServerCache;
 use crate::Core;
 
@@ -114,6 +114,14 @@ fn described_otherwise(mxc: &str) -> CoreError {
     )
 }
 
+/// 這個 task 照著下載的那一列不在了：被 `media.delete_local` 刪了、或刪了又由別則事件重建。
+fn record_changed_error(mxc: &str) -> CoreError {
+    CoreError::new(
+        CoreErrorKind::Integrity,
+        format!("the local record of {mxc} was deleted or replaced while it was downloading; download it again from its message"),
+    )
+}
+
 /// 明文總長換成段數（`media.download` 的 `done`／`total`，傳統檔沒有塊、用池的 64 KiB 段）；不知道總長是 0。
 fn segments_of(size: Option<u64>) -> u32 {
     size.map(|size| u32::try_from(size.div_ceil(u64::from(SEGMENT_SIZE))).unwrap_or(u32::MAX))
@@ -129,7 +137,7 @@ impl Core {
     ///     waiter: 要等它結束的話給一個；已經完整時直接丟掉（呼叫者看 `state` 就知道不用等）
     /// Return:
     ///     Ok(MediaJob)     `complete`（不下載）或 `downloading`
-    ///     Err(Integrity)   本地這個 mxc 記的是別種格式的檔（🚫 拿這份描述去蓋它）
+    ///     Err(Integrity)   本地這個 mxc 的列跟這則的描述對不上（格式、密文 hash、大小；不管下載完了沒），或正照另一份描述在下載
     ///     Err(...)         DB、池開不了
     pub(crate) async fn ensure_matrix_download(
         &self,
@@ -143,7 +151,7 @@ impl Core {
         let mxc = attachment.mxc.clone();
         let description = MediaDescription::of_matrix_attachment(&attachment);
         let (mxc_here, description_here) = (mxc.clone(), description.clone());
-        let (mut entry, pending_name) = cache
+        let (entry, pending_name) = cache
             .run(move |cache| {
                 let entry = cache.media_begin(&mxc_here, &description_here)?;
                 let pending_name = cache.media_pending_name(&mxc_here)?.ok_or_else(|| {
@@ -154,39 +162,9 @@ impl Core {
                 Ok((entry, pending_name))
             })
             .await?;
-        if entry.kind != attachment.kind {
-            return Err(CoreError::new(
-                CoreErrorKind::Integrity,
-                format!(
-                    "{mxc} is recorded here as a different kind of file ({:?}, the event says {:?})",
-                    entry.kind, attachment.kind
-                ),
-            ));
-        }
+        // 格式、密文 hash、大小有一樣不合就拒，不管下載完了沒、有沒有人在下載（維護者 2026-10-07，取代先前的「沒完成就換描述重來」，/docs/design/media/media-download.md §12.1）。
         if !media::is_same_matrix_file(&entry, &description) {
-            // 已經完整的快取是真的：對不上的是這次的描述（寫錯或偽造的事件），回錯給這次的請求、快取🚫 動（跟分塊同一條，維護者 2026-10-03）。
-            if media::open_complete(&pool, &entry).is_some() {
-                return Err(CoreError::new(
-                    CoreErrorKind::Integrity,
-                    format!("this description of {mxc} does not match the file already downloaded (hash or size differs); the cached copy is kept"),
-                ));
-            }
-            // 另一份描述正在下載：🚫 掛上去（拿到的是別把金鑰解的資料）、🚫 換掉它的描述。
-            if self.matrix_transfers.find(&server_dir, &mxc).is_some() {
-                return Err(described_otherwise(&mxc));
-            }
-            // 兩份描述都還沒被整檔驗過：照分塊的規則換成這次的、從頭來（半成品由新的 task 開頭丟掉）。
-            let (mxc_here, description_here) = (mxc.clone(), description.clone());
-            entry = cache
-                .run(move |cache| {
-                    cache.media_redescribe(&mxc_here, &description_here)?;
-                    cache.find_media(&mxc_here)?.ok_or_else(|| {
-                        wbf_sdk::SdkError::Io(std::io::Error::other(
-                            "the media row vanished after redescribe",
-                        ))
-                    })
-                })
-                .await?;
+            return Err(other_description_error(&mxc, &entry));
         }
         let total = segments_of(attachment.size.or(entry.file_size));
         if media::open_complete(&pool, &entry).is_some() {
@@ -243,6 +221,7 @@ impl Core {
             key,
             transfers: self.matrix_transfers.clone(),
             attachment,
+            total,
             server: session.server,
             access_token: session.access_token,
             user: me,
@@ -289,6 +268,8 @@ struct TransferTask {
     key: (PathBuf, String),
     transfers: Arc<MatrixTransfers>,
     attachment: MatrixAttachment,
+    /// 推播的 `total`：跟 `media.download` 回的同一個數（事件沒給大小就用列上的）
+    total: u32,
     server: String,
     access_token: String,
     user: String,
@@ -320,9 +301,15 @@ impl TransferTask {
         if !matches!(outcome, Outcome::Complete(_)) {
             // 🚫 續傳（§12.4）：半成品刪掉、列回到「還沒下載」。
             let _ = self.pool.discard_pending(&self.pending_name);
-            let mxc = self.key.1.clone();
-            self.cache
-                .post(move |cache| cache.media_reset(&mxc), Vec::new());
+            let (mxc, own_name) = (self.key.1.clone(), self.pending_name.clone());
+            // 列已經被刪掉、或刪了又由別則事件重建（`media.delete_local`）：🚫 去清別人的列。
+            self.cache.post(
+                move |cache| match cache.media_pending_name(&mxc)? {
+                    Some(name) if name == own_name => cache.media_reset(&mxc),
+                    _ => Ok(()),
+                },
+                Vec::new(),
+            );
         }
         // 先從登記表拿掉：之後的 GET 走池（完成了）或重起一個（沒完成）。還在路上的命令收完再回。
         self.transfers.files().remove(&self.key);
@@ -365,7 +352,21 @@ impl TransferTask {
     ///     Err(...)              下載、解密、寫檔、DB 任一步失敗
     async fn download(&mut self) -> Result<Option<String>, CoreError> {
         let mxc = self.key.1.clone();
-        let total = segments_of(self.attachment.size);
+        let total = self.total;
+        // 起 task 之前看到的列可能已經舊了：上一個 task 在那之後剛收尾、從登記表拿掉，這裡才補上（PR #75 審查 salvia 1）。
+        // 開頭再問一次列：已經完整就直接收尾、🚫 重下；列被刪了或換了就🚫 下載。
+        let own = MediaDescription::of_matrix_attachment(&self.attachment);
+        let recorded = self.cache.read().await.find_media(&mxc)?;
+        let Some(entry) = recorded.filter(|entry| media::is_same_matrix_file(entry, &own)) else {
+            return Err(record_changed_error(&mxc));
+        };
+        if let (Some(pool_file), Some(_)) = (
+            entry.pool_file.clone(),
+            media::open_complete(&self.pool, &entry),
+        ) {
+            self.push(DownloadState::Complete, total, Some(entry.verified), None);
+            return Ok(Some(pool_file));
+        }
         // 🚫 續傳（§12.4）：之前留下的半成品（daemon 重開、取消）丟掉，從頭來。
         let _ = self.pool.discard_pending(&self.pending_name);
         let mut writer = self.pool.create_pending(&self.pending_name, &mxc)?;
@@ -419,11 +420,15 @@ impl TransferTask {
         if self.attachment.kind == MediaKind::MatrixEncrypted {
             self.push(DownloadState::Verifying, total, None, None);
         }
-        // 收尾前再問一次列：下載途中列被換成另一份描述（別則事件），這份結果🚫 記到它上面。走失敗的路：半成品丟掉。
-        let own = MediaDescription::of_matrix_attachment(&self.attachment);
-        let recorded = self.cache.read().await.find_media(&mxc)?;
-        if !recorded.is_some_and(|entry| media::is_same_matrix_file(&entry, &own)) {
-            return Err(described_otherwise(&mxc));
+        // 收尾前再問一次列：下載途中列被刪了（`media.delete_local`）、或刪了又由別則事件重建，這份結果🚫 記到它上面。走失敗的路：半成品丟掉。
+        let (recorded, recorded_name) = {
+            let reader = self.cache.read().await;
+            (reader.find_media(&mxc)?, reader.media_pending_name(&mxc)?)
+        };
+        let is_still_our_row = recorded_name.as_deref() == Some(self.pending_name.as_str())
+            && recorded.is_some_and(|entry| media::is_same_matrix_file(&entry, &own));
+        if !is_still_our_row {
+            return Err(record_changed_error(&mxc));
         }
         let finished = writer.finish()?;
         self.pool.adopt(&self.pending_name, &finished.hash_hex)?;
@@ -482,7 +487,7 @@ impl TransferTask {
             mxc: self.key.1.clone(),
             state,
             done,
-            total: segments_of(self.attachment.size),
+            total: self.total,
             verified,
             reason,
         });
@@ -522,7 +527,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::broadcast::Receiver;
-    use tokio::sync::Notify;
+    use tokio::sync::{mpsc, oneshot, Notify};
+    use wbf_sdk::cache::MediaDescription;
     use wbf_sdk::login::SessionBackend;
     use wbf_sdk::media_kind::{MediaKind, Verification};
 
@@ -531,6 +537,8 @@ mod tests {
     use crate::event::{CoreEvent, DownloadState};
     use crate::test_support::*;
     use crate::{Core, MediaRef, Target};
+
+    use super::{segments_of, Command, MatrixTransfer, TransferTask};
 
     /// 一台只回媒體 bytes 的 HTTP server。`hold` 給了就先送前 `head` 個 byte、等它 notify 才送剩下的（測「邊下載邊讀」與取消）。
     async fn media_server(body: Vec<u8>, hold: Option<(usize, Arc<Notify>)>) -> String {
@@ -690,6 +698,7 @@ mod tests {
         let media = MediaRef::Event {
             room: ROOM.into(),
             event_id: "$enc".into(),
+            mxc: Some(mxc.into()),
         };
         let job = core
             .media_download(&media, &Target::default())
@@ -852,6 +861,7 @@ mod tests {
         let media = MediaRef::Event {
             room: ROOM.into(),
             event_id: "$plain".into(),
+            mxc: None,
         };
         core.media_download(&media, &Target::default())
             .await
@@ -867,11 +877,11 @@ mod tests {
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
     }
 
-    /// 同一個 mxc、兩則事件給不同的 `file`（/docs/design/media/media-download.md §12.1，跟分塊同一條規則）：
-    /// 先到的是偽造的、還沒下載過 → 換成後來這份、照它的金鑰下載、驗過；之後再拿偽造那份來要 → 完整的快取是真的，回錯、快取🚫 動。
+    /// 同一個 mxc、兩則事件給不同的 `file`（/docs/design/media/media-download.md §5.3、§12.1，維護者 2026-10-07）：
+    /// 先到的是偽造的（列照它建）→ 從真的那則下載回 1500、🚫 下載、列🚫 動；`media.delete_local` 之後從真的那則下載成功、列換成真的；
+    /// 之後偽造那則再來回錯；只給 mxc 時挑的是跟列一致的那則（偽造那則的事件比較早，但🚫 挑它）。
     #[tokio::test]
-    async fn a_second_description_of_the_same_mxc_replaces_an_undownloaded_one_and_never_a_complete_one(
-    ) {
+    async fn a_forged_description_that_came_first_is_refused_until_the_local_copy_is_deleted() {
         let mxc = "mxc://localhost/Twice";
         let plain = sample(80_000);
         let (cipher, real_file) = encrypt(&plain, mxc);
@@ -881,6 +891,14 @@ mod tests {
                 .map(|byte| byte ^ 1)
                 .collect::<Vec<_>>(),
             mxc,
+        );
+        let forged_hash = format!(
+            "matrix-sha256:{}",
+            forged_file["hashes"]["sha256"].as_str().unwrap()
+        );
+        let real_hash = format!(
+            "matrix-sha256:{}",
+            real_file["hashes"]["sha256"].as_str().unwrap()
         );
         let base = media_server(cipher, None).await;
         let (core, account) = on_server("mx-twice", &base, SessionBackend::WbfSdk).await;
@@ -895,14 +913,53 @@ mod tests {
             &core,
             &account,
             "$real",
-            encrypted_content(mxc, real_file.clone(), plain.len()),
+            encrypted_content(mxc, real_file, plain.len()),
         )
         .await;
-        let mut events = core.subscribe();
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        let recorded_hash =
+            |cache: &wbf_sdk::cache::Cache| cache.find_media(mxc).unwrap().map(|entry| entry.hash);
         let real = MediaRef::Event {
             room: ROOM.into(),
             event_id: "$real".into(),
+            mxc: Some(mxc.into()),
         };
+        let forged = MediaRef::Event {
+            room: ROOM.into(),
+            event_id: "$forged".into(),
+            mxc: None,
+        };
+        let error = core
+            .media_download(&real, &Target::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
+        assert_eq!(
+            recorded_hash(&*cache.read().await),
+            Some(Some(forged_hash.clone()))
+        );
+        assert!(
+            core.matrix_transfers
+                .find(&account.server_dir(), mxc)
+                .is_none(),
+            "nothing was started"
+        );
+        // 給的 mxc 不是那則的附件：拒。
+        let elsewhere = MediaRef::Event {
+            room: ROOM.into(),
+            event_id: "$real".into(),
+            mxc: Some("mxc://localhost/Other".into()),
+        };
+        let error = core
+            .media_download(&elsewhere, &Target::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
+        // 清掉本地的、從真的那則再來。
+        let deleted = core.del_local_media(mxc, &Target::default()).await.unwrap();
+        assert_eq!((deleted.removed, deleted.cancelled), (true, false));
+        assert_eq!(recorded_hash(&*cache.read().await), None);
+        let mut events = core.subscribe();
         core.media_download(&real, &Target::default())
             .await
             .unwrap();
@@ -911,30 +968,229 @@ mod tests {
             states.last().copied(),
             Some((DownloadState::Complete, Some(Verification::Matched)))
         );
-        let forged = MediaRef::Event {
-            room: ROOM.into(),
-            event_id: "$forged".into(),
-        };
+        assert_eq!(
+            recorded_hash(&*cache.read().await),
+            Some(Some(real_hash.clone()))
+        );
         let error = core
             .media_download(&forged, &Target::default())
             .await
             .unwrap_err();
         assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
-        let (cache, _) = core.server_cache_and_me(&account).unwrap();
-        let entry = cache.read().await.find_media(mxc).unwrap().unwrap();
-        let real_hash = real_file["hashes"]["sha256"].as_str().unwrap();
+        // 偽造那則現在也連在這一列上（從它點過），而且比真的那則早寫進來：只給 mxc 時🚫 挑它。
         assert_eq!(
-            (entry.complete, entry.verified, entry.hash),
-            (
-                true,
-                Verification::Matched,
-                Some(format!("matrix-sha256:{real_hash}"))
-            )
+            cache
+                .read()
+                .await
+                .list_matrix_attachments_for(ME, mxc)
+                .unwrap()
+                .len(),
+            2
+        );
+        let job = core
+            .media_download(&MediaRef::Mxc(mxc.into()), &Target::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (job.state, job.verified),
+            (DownloadState::Complete, Some(Verification::Matched))
         );
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
     }
 
-    /// 正照一份描述在下載時，另一份描述來要同一個 mxc：🚫 掛上去（會拿到別把金鑰解的資料）、🚫 換掉它的描述；正在下載的照常完成。
+    /// 只給 mxc、列還沒下載（/docs/design/media/media-download.md §5.3）：用的是跟列一致的那則的金鑰，🚫 最早寫進來的那則。
+    #[tokio::test]
+    async fn an_mxc_alone_downloads_with_the_key_of_the_event_that_matches_the_record() {
+        let mxc = "mxc://localhost/Pick";
+        let plain = sample(70_000);
+        let (cipher, real_file) = encrypt(&plain, mxc);
+        let (_, forged_file) = encrypt(&plain, mxc);
+        let base = media_server(cipher, None).await;
+        let (core, account) = on_server("mx-pick", &base, SessionBackend::WbfSdk).await;
+        store_matrix_file(
+            &core,
+            &account,
+            "$forged",
+            encrypted_content(mxc, forged_file, plain.len()),
+        )
+        .await;
+        // 列換成真的那則的：刪掉再從它點（這時偽造那則的連結跟著列沒了），再從偽造那則點一次（被拒，但連上了）。
+        store_matrix_file(
+            &core,
+            &account,
+            "$real",
+            encrypted_content(mxc, real_file, plain.len()),
+        )
+        .await;
+        core.del_local_media(mxc, &Target::default()).await.unwrap();
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        let relinked = cache
+            .run(|cache| {
+                Ok((
+                    cache.media_link_event(ME, ROOM, "$real")?,
+                    cache.media_link_event(ME, ROOM, "$forged")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(relinked, (true, true));
+        let mut events = core.subscribe();
+        core.media_download(&MediaRef::Mxc(mxc.into()), &Target::default())
+            .await
+            .unwrap();
+        let states = states_until_the_end(&mut events, mxc).await;
+        assert_eq!(
+            states.last().copied(),
+            Some((DownloadState::Complete, Some(Verification::Matched))),
+            "the forged key would not decrypt to the hash"
+        );
+        assert_eq!(read_whole(&core, mxc).await, (true, plain));
+    }
+
+    /// `media.delete_local`（/docs/design/media/media-download.md §7.4）：正在下載的傳統檔先取消，半成品、列都沒了；
+    /// 只給 mxc 就不能再下載（沒有列），從訊息點就由那則重建、從頭下載。
+    #[tokio::test]
+    async fn deleting_a_matrix_file_cancels_its_download_and_leaves_nothing() {
+        let mxc = "mxc://localhost/Delete";
+        let plain = sample(300_000);
+        let release = Arc::new(Notify::new());
+        let base = media_server(plain.clone(), Some((150_000, release.clone()))).await;
+        let (core, account) = on_server("mx-delete", &base, SessionBackend::WbfSdk).await;
+        store_matrix_file(
+            &core,
+            &account,
+            "$d",
+            serde_json::json!({ "msgtype": "m.file", "body": "d.bin", "info": { "size": plain.len() }, "url": mxc }),
+        )
+        .await;
+        let mut events = core.subscribe();
+        core.media_download(&MediaRef::Mxc(mxc.into()), &Target::default())
+            .await
+            .unwrap();
+        let deleted = core.del_local_media(mxc, &Target::default()).await.unwrap();
+        assert_eq!(
+            deleted,
+            crate::DeletedMedia {
+                mxc: mxc.into(),
+                removed: true,
+                cancelled: true
+            }
+        );
+        let states = states_until_the_end(&mut events, mxc).await;
+        assert_eq!(
+            states.last().copied(),
+            Some((DownloadState::Cancelled, None))
+        );
+        let pool = core.pool_of(&account).unwrap();
+        assert!(pool.list_pending().unwrap().is_empty());
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        // 被取消的 task 收尾時🚫 去清（或重建）列。
+        cache.run(|_| Ok(())).await.unwrap();
+        assert!(cache.read().await.find_media(mxc).unwrap().is_none());
+        let error = core
+            .media_download(&MediaRef::Mxc(mxc.into()), &Target::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
+        release.notify_waiters();
+        let from_message = MediaRef::Event {
+            room: ROOM.into(),
+            event_id: "$d".into(),
+            mxc: Some(mxc.into()),
+        };
+        let job = core
+            .media_download(&from_message, &Target::default())
+            .await
+            .unwrap();
+        assert_eq!(job.state, DownloadState::Downloading);
+        release.notify_one();
+        let states = states_until_the_end(&mut events, mxc).await;
+        assert_eq!(
+            states.last().copied(),
+            Some((DownloadState::Complete, Some(Verification::Unknown)))
+        );
+        assert_eq!(read_whole(&core, mxc).await, (true, plain));
+    }
+
+    /// PR #75 審查 salvia 1：起 task 之前讀的列已經舊了（上一個 task 剛收尾）——task 開頭再問一次列，完整就直接收尾、🚫 重下。
+    /// 這裡直接起一個 task 對著已經完整的列，server 是一個連不上的位址：真的去下載就會失敗。
+    #[tokio::test]
+    async fn a_task_started_after_the_file_completed_finishes_without_downloading() {
+        let mxc = "mxc://localhost/Late";
+        let plain = sample(90_000);
+        let (cipher, file) = encrypt(&plain, mxc);
+        let base = media_server(cipher, None).await;
+        let (core, account) = on_server("mx-late", &base, SessionBackend::WbfSdk).await;
+        store_matrix_file(
+            &core,
+            &account,
+            "$late",
+            encrypted_content(mxc, file, plain.len()),
+        )
+        .await;
+        let mut events = core.subscribe();
+        core.media_download(&MediaRef::Mxc(mxc.into()), &Target::default())
+            .await
+            .unwrap();
+        states_until_the_end(&mut events, mxc).await;
+        let (cache, me) = core.server_cache_and_me(&account).unwrap();
+        let attachment = cache
+            .read()
+            .await
+            .find_event_matrix_attachment(ME, ROOM, "$late")
+            .unwrap()
+            .unwrap();
+        let pending_name = cache.read().await.media_pending_name(mxc).unwrap().unwrap();
+        let key = (account.server_dir(), mxc.to_string());
+        let (commands, inbox) = mpsc::unbounded_channel();
+        let (waiter, done) = oneshot::channel();
+        let _ = commands.send(Command::Wait(waiter));
+        core.matrix_transfers.files().insert(
+            key.clone(),
+            Arc::new(MatrixTransfer {
+                account_dir: account.dir.clone(),
+                description: MediaDescription::of_matrix_attachment(&attachment),
+                pending_name: pending_name.clone(),
+                commands,
+            }),
+        );
+        let task = TransferTask {
+            key,
+            transfers: core.matrix_transfers.clone(),
+            total: segments_of(attachment.size),
+            attachment,
+            server: "http://127.0.0.1:1".into(),
+            access_token: "unused".into(),
+            user: me,
+            cache: cache.clone(),
+            pool: core.pool_of(&account).unwrap(),
+            events: core.events.clone(),
+            pending_name,
+            inbox,
+            reads: Vec::new(),
+            waiters: Vec::new(),
+        };
+        tokio::spawn(task.run());
+        let finished = tokio::time::timeout(Duration::from_secs(10), done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(finished.is_ok(), "{finished:?}");
+        let states = states_until_the_end(&mut events, mxc).await;
+        assert_eq!(
+            states,
+            vec![(DownloadState::Complete, Some(Verification::Matched))],
+            "no downloading, no second verification"
+        );
+        let entry = cache.read().await.find_media(mxc).unwrap().unwrap();
+        assert_eq!(
+            (entry.complete, entry.verified),
+            (true, Verification::Matched)
+        );
+        assert_eq!(read_whole(&core, mxc).await, (true, plain));
+    }
+
+    /// 正照一份描述在下載時，另一份描述來要同一個 mxc：跟列對不上、回錯（🚫 掛上去，會拿到別把金鑰解的資料）；正在下載的照常完成。
     #[tokio::test]
     async fn another_description_cannot_join_a_download_in_progress() {
         let mxc = "mxc://localhost/Busy";
@@ -966,6 +1222,7 @@ mod tests {
         let real = MediaRef::Event {
             room: ROOM.into(),
             event_id: "$real".into(),
+            mxc: None,
         };
         core.media_download(&real, &Target::default())
             .await
@@ -973,6 +1230,7 @@ mod tests {
         let other = MediaRef::Event {
             room: ROOM.into(),
             event_id: "$other".into(),
+            mxc: None,
         };
         let error = core
             .media_download(&other, &Target::default())
