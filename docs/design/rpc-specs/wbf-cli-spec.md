@@ -142,7 +142,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 |
 |---|---|
 | `info <mxc> [--manifest <m.json>]` | 印 `Info` 的 Ack（server 知道的欄位）。有 manifest 就順便解描述印出來，並做 /docs/design/media/wbf-client-convention-for-chunk.md §3.1 第 2 條的核對 |
-| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：本機有上傳時的原檔（大小對）就從它複製（stdout `source: local_source`）；池裡有完整檔就不連 server（`source: cache`、`hash` 是快取記的校驗碼）；沒有就交給下載處理端、進池、可續傳，再從池複製到 `-o`（`source: server`）。stdout 是 `{ out, bytes, source, hash? }`（同 RPC 的 `media.export_to`，/docs/design/media/media-download.md §7.3：整檔驗過才寫到 `-o`；本機原檔要區塊帶 sha256 才用；`-o` 已經存在就覆蓋）。快取路徑上驗不過仍 exit 3：那是壞檔，池裡的半成品一起刪掉；網路斷了才留著給下次續（/docs/design/media/media-download.md §5.4）；`-o` 都不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
+| `download --manifest <m.json> [-o <out>] [--no-cache]` | `Info` → 逐塊 `Read` → 解密 → 寫檔。全部檢查照 /docs/design/media/wbf-client-convention-for-chunk.md §3.1，任一不過刪掉半成品、exit 3。沒給 `-o` 用描述的 `name`，沒有就 `download.bin`。**登入中預設走媒體快取**（§3.5）：本機有上傳時的原檔（大小對）就從它複製（stdout `source: local_source`）；池裡有完整檔就不連 server（`source: cache`、`hash` 是快取記的校驗碼）；沒有就交給下載處理端、進池、可續傳，再從池複製到 `-o`（`source: server`）。stdout 是 `{ out, bytes, source, kind, verified, hash? }`（同 RPC 的 `media.export_to`，/docs/design/media/media-download.md §7.3：從池匯出🚫 再算 hash、只核大小（每段讀出時過了池的 AEAD）；本機原檔要區塊帶 sha256 才用、一律整檔比；`-o` 已經存在就覆蓋。`--manifest` 一定是分塊檔，`kind` 是 1）。快取路徑上驗不過仍 exit 3：那是壞檔，池裡的半成品一起刪掉；網路斷了才留著給下次續（/docs/design/media/media-download.md §5.4）；`-o` 都不會產生。`--no-cache` 或 `--token` 模式直接寫檔不進池 |
 | `seek --manifest <m.json> --at <pos> [--len <n>]` | 只 `Read` 含 `pos` 的那一塊（`--len` 跨塊就多讀），解密後把 `pos` 起的明文寫到 stdout。這是驗收「不必下載前面」的命令 |
 
 下載的參數都從 manifest 來，不提供 `--key` 這種零散參數：金鑰不該出現在命令列與 shell 歷史裡。
@@ -184,8 +184,8 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 |
 |---|---|
 | `rooms` | 列出加入的房間：/docs/design/rooms/chat-model.md §2.1 的 `RoomListEntry` 陣列（`id`、`kind`、`name`、`topic`、`encrypted`、`member_count`、`my_power_level`、`can_send_message`、`direct_peer`、`refreshed_at`）。wbf 帳號只問加入了哪些房：沒拿過的那幾間除了 `id` 都是 `null`（`send --text` 那間房時會拿） |
-| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }`。送之前先拿一次這間房（`sync=both`）：wbf 帳號送文字只看本地記的加不加密（/docs/design/keys/e2ee-rpc.md §7），CLI 沒有常駐的快取。📌 **wbf 帳號的加密房**：還沒做——CLI 不帶 `room_devices`，回 1100（RPC 那邊怎麼送見 /docs/design/rpc-specs/rpc-spec.md §3.3） |
-| `send <room_id> --file <file> [--caption <c>] [--cipher …] [--chunk-size …] [--sha256] [--manifest <out>] [--yes]` | upload（含續傳）後把 /docs/design/media/wbf-client-convention-for-chunk.md §5 的事件送進房間；印 `{ "event_id", "mxc" }`。房間沒 E2EE：**送之前印警告並要求確認**（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）、強制 `cipher: none`（給別的 `--cipher` 就 exit 1：加密區塊的 key 會公開）；`--yes` 跳過確認給腳本用。⚠️ 一般 Matrix 帳號附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）帶不出去，stderr 會印警告；📌 **wbf 帳號**事件走 `Event/Send`、附件宣告成立（`attachment_declared: true`），加密房在上傳之前就拒（1100；/docs/design/daemon/account-session.md §6） |
+| `send <room_id> --text <msg>` | 送文字；印 `{ "event_id" }`。送之前先拿一次這間房（`sync=both`）：wbf 帳號送文字只看本地記的加不加密（/docs/design/keys/e2ee-rpc.md §7），CLI 沒有常駐的快取。📌 **wbf 帳號的加密房**（2026-10-07）：CLI 自己就是前端，同一個命令裡先 `refresh_room_devices`、再帶著那份 `room_devices` 送；被 1401 擋就用它 `data` 的新狀態與同一個 `txn_id` 再送一次（只一次，/docs/design/keys/e2ee-rpc.md §3）。一般 Matrix 帳號 matrix-sdk 自己管金鑰 |
+| `send <room_id> --file <file> [--caption <c>] [--cipher …] [--chunk-size …] [--sha256] [--manifest <out>] [--yes]` | upload（含續傳）後把 /docs/design/media/wbf-client-convention-for-chunk.md §5 的事件送進房間；印 `{ "event_id", "mxc" }`。房間沒 E2EE：**送之前印警告並要求確認**（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）、強制 `cipher: none`（給別的 `--cipher` 就 exit 1：加密區塊的 key 會公開）；`--yes` 跳過確認給腳本用。⚠️ 一般 Matrix 帳號附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）帶不出去，stderr 會印警告；📌 **wbf 帳號**事件走 `Event/Send`、附件宣告成立（`attachment_declared: true`）；加密房跟 `--text` 一樣先 refresh 再帶 `room_devices` 送；被 1401 擋就用錯誤帶回來的 manifest 與新狀態送一次附件（只一次，🚫 重傳檔案） |
 | `watch <room_id> tail \| wait <秒> \| once [--since <token>]` | 從 `/sync` 等**新**事件（現在起），來一個立刻印一個，一行一個 JSON。三種模式見 §3.4.2。認得 `org.wbftw.wbfuwunel.file` 就把區塊解出來當 manifest 印。📌 **wbf 帳號拒絕**（1100）：沒有 `/sync` 的迴圈，新訊息走 daemon 的訂閱＋推播（/docs/design/daemon/account-session.md §6） |
 | `ping` | `Ping`，印開線那次 `Hello` server 回的 features 與上限（🚫 再 hello，/docs/design/daemon/link-requests.md §7）。除錯用 |
 
@@ -196,7 +196,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 命令 | 做什麼 | stdout |
 |---|---|---|
 | `room <room_id>`（還沒做） | 房間本身：`GET .../rooms/{id}/state` 挑出來的欄位 | `{ "room_id", "name", "topic", "encrypted": bool, "member_count", "joined_members": [mxid…] }` |
-| `read <room_id> [--limit <n>] [--before <event_id>] [--type <名>…] [--sender <mxid>]` | 歷史，從最新往回（上游怎麼問：wbf 走 `Event/Recent`、一般 Matrix 走 `/context`＋`/messages`，/docs/design/rpc-specs/rpc-spec.md §3.3）。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁不受影響。`--type` 對的是模型的 `kind`（`text`、`file`、`deleted`、`undecryptable`、`outdated`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": event_id \| null }`，`next` 是 null 表示到頭了 |
+| `read <room_id> [--limit <n>] [--before <event_id>] [--type <名>…] [--sender <mxid>]` | 歷史，從最新往回（上游怎麼問：wbf 走 `Event/Recent`、一般 Matrix 走 `/context`＋`/messages`，/docs/design/rpc-specs/rpc-spec.md §3.3）。`--limit` 預設 50；`--before` 接上一頁印的 `next`，再往前翻。`--type`／`--sender` 是 client 端過濾，翻頁不受影響。⚠️ wbf 帳號的加密房：`read` 🚫 開金鑰線，別人剛分給這台的房間金鑰要等下一個會開金鑰線的命令（例 `send`）才拉得到，在那之前那幾則是 `undecryptable`（2026-10-07 實測；daemon 模式金鑰線一直開著，沒有這個問題；CLI 改走 RPC 之後就消失，/docs/handover.md §7 第 3 項）。`--type` 對的是模型的 `kind`（`text`、`file`、`matrix_file`（也收它的 `msgtype`，例 `m.image`）、`deleted`、`undecryptable`、`outdated`、`system`、`unsupported`）或原始 event type | `{ "events": [事件…], "next": event_id \| null }`，`next` 是 null 表示到頭了 |
 | `files <room_id> [--limit <n>] [--before <event_id>] [--save <dir>]` | `read` 只留 `org.wbftw.wbfuwunel.file`，把區塊解成 manifest（§5）印出來；`--save` 一個事件存一個 `<event_id>.json`，之後直接 `download --manifest` | `{ "files": [{ "event_id", "sender", "ts", "manifest" }…], "next" }` |
 
 事件的統一形狀（`read`、`watch`、`files` 都用）就是 /docs/design/rooms/chat-model.md §2.3 的 `Message` 序列化：
@@ -204,7 +204,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 欄位 | 說明 |
 |---|---|
 | `id`、`conversation`、`sender`、`sent_at` | event_id、room_id、mxid、`origin_server_ts`（毫秒，只當顯示用） |
-| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`deleted`（`reason`）、`undecryptable`（沒有欄位；`decrypted: false`、`undecryptable_reason` 在訊息上）、`outdated`（沒有欄位；本地快取裡目前的 edit 這個帳號還沒同步到）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
+| `kind` 加它的欄位 | `text`（`body`、`formatted_html`）、`file`（`attachment` = `{ mxc, block }`、`caption`）、`matrix_file`（標準 Matrix 附件：`attachment` = `{ msgtype, mxc, kind, name?, mimetype?, size?, file? }`、`caption`，/docs/design/rooms/chat-model.md §2.3）、`deleted`（`reason`）、`undecryptable`（沒有欄位；`decrypted: false`、`undecryptable_reason` 在訊息上）、`outdated`（沒有欄位；本地快取裡目前的 edit 這個帳號還沒同步到）、`system`（`event_type`、`line`）、`unsupported`（`event_type`、`body`）。認不得的事件不丟 |
 | `reply_to`、`edited_by`、`reactions` | 同一頁內的關係事件折進目標（/docs/design/rooms/chat-model.md §3.4） |
 | `decrypted` | `true`／`false`／`null`。`null` 表示本來就不是加密事件 |
 | `undecryptable_reason` | `decrypted` 是 `false` 才有，matrix-sdk 給的原因（example: `MissingMegolmSession`） |

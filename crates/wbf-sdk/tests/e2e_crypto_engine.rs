@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use wbf_sdk::crypto_engine::{
-    room_key_share_settings, OlmEngine, OutgoingRoomEvent, RoomKeyState, SendOutcome,
+    room_key_share_settings, OlmEngine, OutgoingRoomEvent, RoomKeyRotation, RoomKeyState,
+    SendOutcome,
 };
 use wbf_sdk::login::{login_with_password, logout, Session};
 use wbf_sdk::protocol::{BRIDGE_FEATURE, DEVICE_FEATURE};
@@ -164,7 +165,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     let room_id = create_encrypted_room(&a.session).await;
     let to_device_requests = a
         .engine
-        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .expect("A shares the room key");
     assert!(to_device_requests >= 1, "{to_device_requests}");
@@ -238,7 +244,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     // 6. A 再分一次同一把：每台裝置都有了 → 沒有新的 to-device。
     let again_shared = a
         .engine
-        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .unwrap();
     assert_eq!(again_shared, 0);
@@ -255,7 +266,7 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
         .share_room_key(
             &parsed_room,
             std::iter::once(parsed_user.as_ref()),
-            room_key_share_settings(),
+            room_key_share_settings(RoomKeyRotation::of_encryption_content(None)),
         )
         .await
         .unwrap();
@@ -288,7 +299,12 @@ async fn a_room_key_travels_from_device_a_to_device_b_over_the_channel_only() {
     );
     let delivered = a
         .engine
-        .distribute_room_key(&mut a.ws, &pending_room, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &pending_room,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .unwrap();
     assert!(delivered >= 1, "{delivered}");
@@ -360,7 +376,12 @@ async fn a_live_subscription_receives_the_push_for_a_room_key_shared_while_it_is
     let room_id = create_encrypted_room(&a.session).await;
     let shared = a
         .engine
-        .distribute_room_key(&mut a.ws, &room_id, std::slice::from_ref(&user_id))
+        .distribute_room_key(
+            &mut a.ws,
+            &room_id,
+            std::slice::from_ref(&user_id),
+            RoomKeyRotation::of_encryption_content(None),
+        )
         .await
         .expect("A shares the room key");
     assert!(shared >= 1);
@@ -615,6 +636,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
             &mut alice.ws,
             &first.room_id,
             &first.versions.members.keys().cloned().collect::<Vec<_>>(),
+            RoomKeyRotation::of_encryption_content(None),
         )
         .await
         .expect("the background prepares the room key before the message");
@@ -741,6 +763,7 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
             &mut alice.ws,
             &second.room_id,
             &second.versions.members.keys().cloned().collect::<Vec<_>>(),
+            RoomKeyRotation::of_encryption_content(None),
         )
         .await
         .expect("the background prepares the room key for B2 before the resend");
@@ -815,4 +838,63 @@ async fn issue_45_acceptance_stale_room_version_is_refused_then_fixed_and_resent
         logout(&device.session).await.expect("logout");
         let _ = std::fs::remove_dir_all(&device.store_dir);
     }
+}
+
+/// 同一台狀態機上三個「送出所有待送請求」同時跑（新裝置開金鑰線時：上傳自己的金鑰、refresh 查成員、後台分金鑰）：三個都要成功。
+/// 沒有序列化時，它們各自拿到同一批 `/keys/query`、互相讓對方的回應過期，繞滿上限就失敗（2026-10-07 CLI 新裝置第一個命令實測）。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn concurrent_outgoing_request_loops_on_one_engine_all_finish() {
+    let (Some(target), Some(target_b)) = (target(), target_b()) else {
+        eprintln!(
+            "skipped: WBF_E2E_SERVER / USER / PASSWORD_FILE / USER_B / PASSWORD_B_FILE not set"
+        );
+        return;
+    };
+    let mut device = log_in_a_device(&target, &format!("concurrent-{}", std::process::id())).await;
+    let mut extra = Vec::new();
+    for _ in 0..2 {
+        let channel = Channel::connect(
+            &device.session.server,
+            &device.session.access_token,
+            Transport::WebSocket,
+        )
+        .await
+        .expect("ws");
+        let mut ws = WbfClient::new(channel);
+        ws.hello("concurrent", &[]).await.expect("hello");
+        extra.push(ws);
+    }
+    let bob = format!(
+        "@{}:{}",
+        target_b.user,
+        device
+            .session
+            .user_id
+            .split(':')
+            .nth(1)
+            .unwrap_or("localhost")
+    );
+    let users = [device.session.user_id.clone(), bob];
+    device.engine.track_users(&users).await.unwrap();
+    let mut extra = extra.into_iter();
+    let (mut second, mut third) = (extra.next().unwrap(), extra.next().unwrap());
+    let engine = &device.engine;
+    // 競態：一輪不一定撞得到。每一輪先把兩個人標成「裝置變了」（又有一批 `/keys/query` 要送），三條線再同時送。
+    for round in 0..5 {
+        if round > 0 {
+            engine.mark_users_changed(&users).await.unwrap();
+        }
+        let (one, two, three) = tokio::join!(
+            engine.send_outgoing_requests(&mut device.ws),
+            engine.send_outgoing_requests(&mut second),
+            engine.send_outgoing_requests(&mut third),
+        );
+        assert!(
+            one.is_ok() && two.is_ok() && three.is_ok(),
+            "round {round}: {one:?} / {two:?} / {three:?}"
+        );
+    }
+    logout(&device.session).await.expect("logout");
+    let _ = std::fs::remove_dir_all(&device.store_dir);
 }

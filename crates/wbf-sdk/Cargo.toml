@@ -25,7 +25,8 @@ zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+# `stream`：傳統上傳的 body 是邊收邊加密的串流（matrix_media.rs，/docs/design/rpc-specs/data-plane.md §7.2）；matrix-sdk 本來就開了它。
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "stream"] }
 http = "1"
 matrix-sdk = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk", default-features = false, features = ["e2e-encryption", "bundled-sqlite"], optional = true }
 # E2EE 的狀態機（`OlmMachine`）：只當加解密的引用，網路自己走 WS（/docs/design/keys/e2ee-walkthrough.md §13）。跟 matrix-sdk 同一棵 vendor 樹，版本一定一致。

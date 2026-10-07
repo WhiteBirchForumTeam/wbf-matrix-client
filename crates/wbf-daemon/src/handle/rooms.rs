@@ -12,9 +12,11 @@ use wbf_core::{
     cipher_for_plaintext_room, Core, HistoryQuery, RoomDevices, SendOptions, SyncMode,
     UploadRequest,
 };
-use wbf_sdk::{Manifest, RecentPlan};
+use wbf_sdk::{Manifest, MatrixManifest, RecentPlan};
 
-use super::{parse_params, to_result, Handle, Outcome, TargetParams, TransportParam};
+use super::{
+    invalid_params, parse_params, to_result, Handle, Outcome, TargetParams, TransportParam,
+};
 
 #[derive(Deserialize)]
 struct RoomParams {
@@ -84,7 +86,8 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
     #[derive(Deserialize)]
     struct Params {
         room: String,
-        manifest: Manifest,
+        /// wbf 的分塊 manifest（有 `block`）或傳統上傳的（有 `kind`，/docs/design/rpc-specs/data-plane.md §7.2）
+        manifest: Value,
         #[serde(default)]
         caption: Option<String>,
         #[serde(default)]
@@ -95,6 +98,24 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
         target: TargetParams,
     }
     let params: Params = parse_params(params)?;
+    // 傳統上傳的檔：標準附件、matrix-sdk 送（加密房它自己 Megolm）；沒有附件宣告這個機制（/docs/design/rpc-specs/data-plane.md §7.2）。
+    if params.manifest.get("block").is_none() {
+        let manifest: MatrixManifest = serde_json::from_value(params.manifest)
+            .map_err(|error| invalid_params(format!("manifest: {error}")))?;
+        let event_id = core
+            .send_matrix_attachment(
+                &params.room,
+                &manifest,
+                params.caption.as_deref(),
+                &handle.target(&params.target),
+            )
+            .await?;
+        return Ok(
+            json!({ "event_id": event_id, "mxc": manifest.mxc, "attachment_declared": false }),
+        );
+    }
+    let manifest: Manifest = serde_json::from_value(params.manifest)
+        .map_err(|error| invalid_params(format!("manifest: {error}")))?;
     let options = SendOptions {
         room_devices: params.room_devices,
         txn_id: params.txn_id,
@@ -102,13 +123,13 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
     let event_id = core
         .send_attachment(
             &params.room,
-            &params.manifest,
+            &manifest,
             params.caption.as_deref(),
             &options,
             &handle.target(&params.target),
         )
         .await?;
-    Ok(json!({ "event_id": event_id, "mxc": params.manifest.mxc, "attachment_declared": true }))
+    Ok(json!({ "event_id": event_id, "mxc": manifest.mxc, "attachment_declared": true }))
 }
 
 /// 確認這個房現在的人與裝置，並交給後台對這一刻的狀態先分好房間金鑰（UI 點進房、或自己發現版本號變了時叫；🚫 等後台分完）。
@@ -152,6 +173,11 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         mimetype: Option<String>,
         #[serde(default)]
         sha256: bool,
+        /// 加密房要（wbf 帳號）：同 `room.send_text`
+        #[serde(default)]
+        room_devices: Option<RoomDevices>,
+        #[serde(default)]
+        txn_id: Option<String>,
         #[serde(flatten)]
         transport: TransportParam,
         #[serde(flatten)]
@@ -183,11 +209,16 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         mimetype: params.mimetype,
         sha256: params.sha256,
     };
+    let options = SendOptions {
+        room_devices: params.room_devices,
+        txn_id: params.txn_id,
+    };
     let result = core
         .send_file(
             &params.room,
             &request,
             params.caption.as_deref(),
+            &options,
             transport,
             &target,
         )

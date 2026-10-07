@@ -324,7 +324,7 @@ LOCAL_ROOM_KEYS=on   ; built-in default
 
 | | |
 |---|---|
-| 內容 | 我們的 schema（v8）：`meta`、`users`、`rooms`、`events`、`events_synced_log`、`room_list`、`sync_state`、`read_positions`、`media`、`event_media`。每張表在 `/docs/design/storage/local-cache-db.md` §5 |
+| 內容 | 我們的 schema（v9：`media` 多了 `kind`、`verified`）：`meta`、`users`、`rooms`、`events`、`events_synced_log`、`room_list`、`sync_state`、`read_positions`、`media`、`event_media`。每張表在 `/docs/design/storage/local-cache-db.md` §5 |
 | 格式 | SQLite（WAL），開著的時候旁邊有 `-wal`、`-shm` |
 | 加密 | SQLCipher 整檔，第一把子金鑰當 raw key；開檔時 `cipher_version` 是空的（沒連到 SQLCipher）就拒絕 |
 | 權限 | SQLite 預設（umask），🚫 0600——內容整檔加密，權限不是防線 |

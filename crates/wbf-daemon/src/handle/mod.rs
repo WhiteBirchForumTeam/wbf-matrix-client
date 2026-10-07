@@ -377,6 +377,7 @@ impl Handle {
             "media.open" => Box::pin(media::media_open(self, core, params)),
             "media.queue" => Box::pin(media::media_queue(self, core, params)),
             "media.cancel" => Box::pin(media::media_cancel(self, core, params)),
+            "media.delete_local" => Box::pin(media::media_delete_local(self, core, params)),
             "server.ping" => Box::pin(media::server_ping(self, core, params)),
             "backup.status" => Box::pin(backup::backup_status(self, core, params)),
             "backup.upload" => Box::pin(backup::backup_upload(self, core, params)),
@@ -833,6 +834,7 @@ mod tests {
             ("upload.status", json!({ "upload_id": 1 })),
             ("upload.abort", json!({ "upload_id": 1 })),
             ("media.info", json!({ "mxc": "mxc://x/y" })),
+            ("media.delete_local", json!({ "mxc": "mxc://x/y" })),
             (
                 "media.export_to",
                 json!({ "manifest": manifest, "to": format!("file:///{}", dir.path().join("o").display().to_string().replace('\\', "/").trim_start_matches('/')) }),
@@ -884,6 +886,11 @@ mod tests {
                 json!({ "room": "!r:localhost", "manifest": { "mxc": 7 } }),
             ),
             ("media.export_to", json!({ "manifest": {}, "to": "x" })),
+            ("media.delete_local", json!({})),
+            (
+                "media.download",
+                json!({ "mxc": "mxc://x/y", "room": "!r:localhost" }),
+            ),
             (
                 "media.export_to",
                 json!({ "mxc": "mxc://x/y", "to": "http://127.0.0.1:1/from_ui/mxc/y" }),

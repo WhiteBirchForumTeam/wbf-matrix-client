@@ -58,6 +58,88 @@ fn file_message_needs_a_valid_block_else_unsupported() {
 }
 
 #[test]
+/// 標準 Matrix 附件（/docs/design/rpc-specs/data-plane.md §7.1）：有 `file` 是加密的（kind 2）、只有 `url` 是明文的（kind 3）；
+/// `file` 不完整🚫 退成明文、🚫 當成一個檔；`filename` 跟 `body` 不一樣時 `body` 是說明。
+fn standard_attachments_are_recognised_and_a_broken_encrypted_one_is_not_taken_as_plain() {
+    use wbf_sdk::media_kind::MediaKind;
+    let encrypted = json!({
+        "type": "m.room.message", "event_id": "$e", "sender": "@a:localhost", "origin_server_ts": 1,
+        "content": {
+            "msgtype": "m.image", "body": "看這張", "filename": "cat.jpg",
+            "info": { "mimetype": "image/jpeg", "size": 1234 },
+            "file": { "url": "mxc://matrix.org/AbC", "v": "v2", "iv": "w+sE15fzSc0AAAAAAAAAAA",
+                      "key": { "kty": "oct", "alg": "A256CTR", "ext": true, "k": "qcHVMSgYg-71CauWBezXI5qkaRb0LuIy-Wx5kIaHMIA", "key_ops": ["encrypt", "decrypt"] },
+                      "hashes": { "sha256": "fdSLu/YkRx3Wyh3KQabP3rd6+SFiKg5lsJZQHtkSAYA" } }
+        }
+    });
+    let message = message_from_json(&encrypted);
+    let MessageKind::MatrixFile {
+        attachment,
+        caption,
+    } = &message.kind
+    else {
+        panic!("{:?}", message.kind)
+    };
+    assert_eq!(
+        (
+            attachment.mxc.as_str(),
+            attachment.kind,
+            attachment.name.as_deref(),
+            attachment.mimetype.as_deref(),
+            attachment.size,
+            caption.as_deref()
+        ),
+        (
+            "mxc://matrix.org/AbC",
+            MediaKind::MatrixEncrypted,
+            Some("cat.jpg"),
+            Some("image/jpeg"),
+            Some(1234),
+            Some("看這張")
+        )
+    );
+    assert!(attachment.file.is_some());
+
+    let plain = json!({
+        "type": "m.room.message", "event_id": "$p", "sender": "@a:localhost", "origin_server_ts": 1,
+        "content": { "msgtype": "m.file", "body": "a.pdf", "url": "mxc://matrix.org/Pdf" }
+    });
+    let message = message_from_json(&plain);
+    let MessageKind::MatrixFile {
+        attachment,
+        caption,
+    } = &message.kind
+    else {
+        panic!("{:?}", message.kind)
+    };
+    assert_eq!(
+        (
+            attachment.kind,
+            attachment.name.as_deref(),
+            caption.as_deref()
+        ),
+        (MediaKind::MatrixPlain, Some("a.pdf"), None)
+    );
+    assert!(attachment.file.is_none());
+
+    // `file` 少了 hash：🚫 退回外層的 `url` 當明文（那會把密文當明文給出去）。
+    let mut broken = encrypted.clone();
+    broken["content"]["file"]["hashes"] = json!({});
+    broken["content"]["url"] = json!("mxc://matrix.org/AbC");
+    assert!(matches!(
+        message_from_json(&broken).kind,
+        MessageKind::Unsupported { .. }
+    ));
+    // 不是 mxc：🚫 當成檔。
+    let mut not_mxc = plain.clone();
+    not_mxc["content"]["url"] = json!("https://example.org/a.pdf");
+    assert!(matches!(
+        message_from_json(&not_mxc).kind,
+        MessageKind::Unsupported { .. }
+    ));
+}
+
+#[test]
 fn redacted_and_unknown_events_are_not_dropped() {
     let redacted = json!({
         "type": "m.room.message", "event_id": "$r", "sender": "@a:localhost", "origin_server_ts": 1,
@@ -206,4 +288,119 @@ fn relation_whose_target_is_not_on_the_page_is_kept() {
     assert!(
         matches!(&messages[0].kind, MessageKind::Unsupported { event_type, .. } if event_type == "m.reaction")
     );
+}
+
+/// 我們傳統上傳的檔送出去的事件（/docs/design/rpc-specs/data-plane.md §7.2）：收的那邊（同一支解析）讀回來是同一個檔、同一種格式、同一個說明。
+#[test]
+fn a_traditional_upload_is_sent_as_a_standard_attachment_that_reads_back_the_same() {
+    use wbf_sdk::event_json::matrix_file_message_content;
+    use wbf_sdk::media_kind::MediaKind;
+    use wbf_sdk::MatrixManifest;
+    let file = json!({ "v": "v2", "url": "mxc://matrix.org/AbCdEf", "iv": "<iv>",
+                       "key": { "kty": "oct", "alg": "A256CTR", "k": "<key>", "ext": true, "key_ops": ["encrypt", "decrypt"] },
+                       "hashes": { "sha256": "<sha256>" } });
+    let encrypted = MatrixManifest {
+        server: "https://matrix.org".into(),
+        mxc: "mxc://matrix.org/AbCdEf".into(),
+        kind: MediaKind::MatrixEncrypted,
+        name: "cat.png".into(),
+        mimetype: Some("image/png".into()),
+        size: 81234,
+        file: Some(file.clone()),
+    };
+    let content = matrix_file_message_content(&encrypted, Some("look")).unwrap();
+    assert_eq!(
+        content,
+        json!({ "msgtype": "m.image", "body": "look", "filename": "cat.png",
+                "info": { "size": 81234, "mimetype": "image/png" }, "file": file })
+    );
+    let event = json!({ "type": "m.room.message", "event_id": "$f", "sender": "@a:matrix.org", "origin_server_ts": 1, "content": content });
+    match message_from_json(&event).kind {
+        MessageKind::MatrixFile {
+            attachment,
+            caption,
+        } => {
+            assert_eq!(
+                (
+                    attachment.mxc.as_str(),
+                    attachment.kind,
+                    attachment.name.as_deref(),
+                    attachment.size
+                ),
+                (
+                    "mxc://matrix.org/AbCdEf",
+                    MediaKind::MatrixEncrypted,
+                    Some("cat.png"),
+                    Some(81234)
+                )
+            );
+            assert_eq!(caption.as_deref(), Some("look"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let plain = MatrixManifest {
+        mimetype: Some("application/pdf".into()),
+        name: "report.pdf".into(),
+        kind: MediaKind::MatrixPlain,
+        file: None,
+        ..encrypted.clone()
+    };
+    assert_eq!(
+        matrix_file_message_content(&plain, None).unwrap(),
+        json!({ "msgtype": "m.file", "body": "report.pdf", "url": "mxc://matrix.org/AbCdEf",
+                "info": { "size": 81234, "mimetype": "application/pdf" } })
+    );
+}
+
+/// 帶回來的 manifest 說的跟它帶的對不上：🚫 送（加密房的檔沒 `file`、明文的帶了金鑰、`file` 指著另一個 mxc、`file` 不齊）。
+#[test]
+fn a_traditional_manifest_that_contradicts_itself_is_not_sent() {
+    use wbf_sdk::event_json::matrix_file_message_content;
+    use wbf_sdk::media_kind::MediaKind;
+    use wbf_sdk::MatrixManifest;
+    let file = json!({ "v": "v2", "url": "mxc://matrix.org/AbCdEf", "iv": "<iv>", "key": { "k": "<key>" }, "hashes": { "sha256": "<sha256>" } });
+    let base = MatrixManifest {
+        server: "https://matrix.org".into(),
+        mxc: "mxc://matrix.org/AbCdEf".into(),
+        kind: MediaKind::MatrixEncrypted,
+        name: "a.bin".into(),
+        mimetype: None,
+        size: 10,
+        file: Some(file.clone()),
+    };
+    let mut other_mxc = file.clone();
+    other_mxc["url"] = json!("mxc://matrix.org/Other");
+    let mut no_hash = file.clone();
+    no_hash["hashes"] = json!({});
+    for broken in [
+        MatrixManifest {
+            file: None,
+            ..base.clone()
+        },
+        MatrixManifest {
+            kind: MediaKind::MatrixPlain,
+            ..base.clone()
+        },
+        MatrixManifest {
+            kind: MediaKind::WbfChunked,
+            ..base.clone()
+        },
+        MatrixManifest {
+            file: Some(other_mxc),
+            ..base.clone()
+        },
+        MatrixManifest {
+            file: Some(no_hash),
+            ..base.clone()
+        },
+    ] {
+        assert!(
+            matches!(
+                matrix_file_message_content(&broken, None),
+                Err(wbf_sdk::SdkError::Usage(_))
+            ),
+            "{broken:?}"
+        );
+    }
+    assert!(matrix_file_message_content(&base, None).is_ok());
 }

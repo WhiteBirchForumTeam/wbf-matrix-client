@@ -34,11 +34,20 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
     let target = context.target();
     if let Some(text) = &args.text {
         // 送文字只看本地的加密標記、本地不知道就回 Usage（/docs/design/keys/e2ee-rpc.md §7）；CLI 沒有常駐的快取，所以先拿一次房間。
-        core.conversation(&args.room, SyncMode::Both, &target)
+        let conversation = core
+            .conversation(&args.room, SyncMode::Both, &target)
             .await?;
-        let event_id = core
-            .send_text(&args.room, text, &wbf_core::SendOptions::default(), &target)
-            .await?;
+        let options = send_options_for(core, &args.room, conversation.encrypted, &target).await?;
+        let event_id = match core.send_text(&args.room, text, &options, &target).await {
+            // 剛好在 refresh 與送出之間有人進出、換了裝置（1401）：照它帶回來的新狀態與同一個 txn_id 再送一次（只一次）。
+            Err(error) if error.kind == CoreErrorKind::RoomDevicesChanged => {
+                match options_after_room_devices_changed(&error) {
+                    Some(again) => core.send_text(&args.room, text, &again, &target).await?,
+                    None => return Err(error),
+                }
+            }
+            sent => sent?,
+        };
         return print_json(&json!({ "event_id": event_id }));
     }
     let Some(file) = &args.file else {
@@ -76,20 +85,85 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
         mimetype: None,
         sha256: args.sha256,
     };
-    let result = core
+    // 加密房一樣先確認房裡的人與裝置。
+    let options = send_options_for(core, &args.room, conversation.encrypted, &target).await?;
+    let sent = core
         .send_file(
             &args.room,
             &request,
             args.caption.as_deref(),
+            &options,
             context.transport,
             &target,
         )
-        .await?;
+        .await;
+    let (event_id, manifest) = match sent {
+        Ok(result) => (result.event_id, result.manifest),
+        // 傳完才被 1401 擋：檔案已經在 server 上、manifest 在 `data` 裡。用新狀態與同一個 txn_id 送一次附件（只一次，🚫 重傳檔案）。
+        Err(error) if error.kind == CoreErrorKind::RoomDevicesChanged => {
+            let manifest = error.data.as_ref().and_then(|data| {
+                serde_json::from_value::<wbf_sdk::Manifest>(data.get("manifest")?.clone()).ok()
+            });
+            let (Some(again), Some(manifest)) =
+                (options_after_room_devices_changed(&error), manifest)
+            else {
+                return Err(error);
+            };
+            let event_id = core
+                .send_attachment(
+                    &args.room,
+                    &manifest,
+                    args.caption.as_deref(),
+                    &again,
+                    &target,
+                )
+                .await?;
+            (event_id, manifest)
+        }
+        Err(error) => return Err(error),
+    };
     // ⚠️ manifest 含金鑰：給了路徑就用**私有權限**寫（/docs/design/rpc-specs/wbf-cli-spec.md §5）。
     if let Some(path) = &args.manifest {
-        write_private(path, &result.manifest.to_json()?)?;
+        write_private(path, &manifest.to_json()?)?;
     }
-    print_json(&json!({ "event_id": result.event_id, "mxc": result.mxc }))
+    print_json(&json!({ "event_id": event_id, "mxc": manifest.mxc }))
+}
+
+/// 加密房要帶的房間狀態：CLI 自己就是前端，同一個命令裡先 `refresh_room_devices` 再送（/docs/design/keys/e2ee-rpc.md §2、§3）。
+/// 一般 Matrix 帳號不用（matrix-sdk 自己管金鑰），明文房也不用。
+///
+/// Return:
+///     Ok(SendOptions)   加密房的 wbf 帳號帶 `room_devices`；其他是預設（都不帶）
+///     Err(...)          refresh 失敗（不在房裡、裝置雜湊對不上…）：🚫 送
+async fn send_options_for(
+    core: &wbf_core::Core,
+    room: &str,
+    encrypted: bool,
+    target: &wbf_core::Target,
+) -> Result<wbf_core::SendOptions, CoreError> {
+    if !encrypted || !core.is_wbf_account_for(target)? {
+        return Ok(wbf_core::SendOptions::default());
+    }
+    let refreshed = core.refresh_room_devices(room, None, target).await?;
+    Ok(wbf_core::SendOptions {
+        room_devices: Some(refreshed),
+        txn_id: None,
+    })
+}
+
+/// 1401 的 `data`：daemon 已經重拿了房間狀態（`{room_version, members, txn_id}`）→ 重送要帶的選項。
+///
+/// Return:
+///     Some(SendOptions)   新的 `room_devices` 與同一個 `txn_id`
+///     None                重拿也失敗了（`data` 沒有 `room_version`）、或形狀認不得：照原錯誤回
+fn options_after_room_devices_changed(error: &CoreError) -> Option<wbf_core::SendOptions> {
+    let data = error.data.as_ref()?;
+    let room_devices: wbf_core::RoomDevices = serde_json::from_value(data.clone()).ok()?;
+    let txn_id = data.get("txn_id")?.as_str()?.to_string();
+    Some(wbf_core::SendOptions {
+        room_devices: Some(room_devices),
+        txn_id: Some(txn_id),
+    })
 }
 
 pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), CoreError> {

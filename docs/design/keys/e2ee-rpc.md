@@ -123,7 +123,11 @@
 - 重拿也失敗：`data` 只有 `{ txn_id, current_room_version }`，`msg` 說明，UI 自己叫 `room.refresh_devices`。
 - 🚫 **daemon 不自動重送**：使用者可能已經撤回或改了，重送的政策在 UI。1402 也一樣。
 
-加密房的**檔案**走資料平面：UI 先 `media.create` ＋ `PUT` 傳完，再 `room.send_attachment` 帶 PUT 回的 manifest 與同一份 `room_devices`，1506、1402 的處理跟文字一樣（/docs/design/rpc-specs/data-plane.md §5）。路徑版的 `room.send_file` 在加密房仍拒（§8）。
+加密房的**檔案**走資料平面：UI 先 `media.create` ＋ `PUT` 傳完，再 `room.send_attachment` 帶 PUT 回的 manifest 與同一份 `room_devices`，1506、1402 的處理跟文字一樣（/docs/design/rpc-specs/data-plane.md §5）。
+路徑版的 `room.send_file`（2026-10-07 起）一樣帶 `room_devices`：這一刻房間加不加密問 server、`cipher` 跟房間對不上或加密房沒帶 `room_devices` 都在**上傳之前**拒；
+傳完拿真的區塊再對一次（續傳用的是狀態檔裡那份加密）、走同一支 `wbf_send_message`。被 1506、1402 擋時檔案已經在 server 上：錯誤的 `data` 多帶 `manifest`（含金鑰，跟成功時的回應一樣敏感），UI 用它改走 `room.send_attachment` 重送、🚫 重傳檔案。
+CLI 自己就是前端：`send` 在加密房（wbf 帳號）同一個命令裡先 `refresh_room_devices` 再帶著送；被 1401 擋就用 `data` 與同一個 `txn_id` 再送一次（只一次）——
+文字重送 `send_text`，檔案拿 `data.manifest` 走 `send_attachment`。
 
 ### 3.1 金鑰線的後台（`key_share.rs`）
 
@@ -135,6 +139,10 @@
   - `AfterSend(房, …)`：剛送出一則。只讀本機看這把是不是快到期；是就「先丟掉、再分一把」，🚫 每則都上網。
   - 自己的金鑰：開 `Keys` 線時上傳裝置金鑰、補一次性金鑰（§5）沒拿到 Ack 的，交給它重傳。
 - **分一個房做的事**（sdk `distribute_room_key`）：
+  0. 問這個房的 `m.room.encryption`（只問這一項）拿換金鑰的期限 `rotation_period_ms`／`rotation_period_msgs`（2026-10-07）：沒設（或不是正整數）的那一項用上游預設（一週／100 則），
+     問不到就這輪不分、留著重試（🚫 當成預設：房主設的可能比較短）。現在那把是照別的期限建的（房主改過）就先丟掉、照新的建——上游只在到期／作廢時換，
+     所以房主改了期限，下一次 refresh（UI 進房）就照新的。上游自己把時間夾在一小時以上、則數夾在 1–10 000；「快到期」的門檻用同樣的夾法，
+     再縮到期限的四分之一（預設仍是剩 5 則／1 小時；例：8 則的房剩 2 則就換），🚫 每送一則就換一把。
   1. 要提早換就先丟掉現在那把（`discard_room_key`，只丟一次，重試🚫 再丟）；
   2. 追蹤這些人，該查的 `/keys/query`；
   3. 缺 Olm 通道的裝置 `/keys/claim` 一次性金鑰、建通道——**一定在排之前**：上游的房間金鑰是在排的那一刻、照 session 當下的位置匯出的，
@@ -144,6 +152,8 @@
   6. 再看一次就緒（`room_key_state`）：是就記下「這個房對這個號碼就緒」、叫醒在等的送出。
 - **走哪條線**：`Keys`。金鑰的網路動作都在這條：後台分金鑰、refresh（§2）、自己的金鑰上傳（§5）。
   後台用 `reuse`，🚫 自己開線：線沒開就等。vault 解鎖、線開好時（`init_keys`）就起這個 task 並叫醒它。
+  ⚠️ 同一台狀態機的「送出所有待送請求」（sdk `send_outgoing_requests`）一次只跑一個（2026-10-07）：開線時的上傳自己的金鑰、refresh、後台分金鑰會同時進來，
+  沒有序列化時它們各自拿同一批 `/keys/query` 去送、互相讓對方的回應過期，繞滿上限就失敗（CLI 新裝置第一個命令實測 35 個查詢）。
 - **失敗**：留著，隔一段時間（30 秒起、加倍到 5 分鐘）再試；發 `Note` 講一聲。在等的送出等到時間就回 1402，不跟著等重試。
   裝置雜湊的比對（fail closed）只在 refresh 做（§2）；後台🚫 另外判斷要不要發。
 - **🚫 存檔**：就緒表只在記憶體；待送的 to-device 在上游 crypto store 的 session 上。重開之後下一次 refresh 或送出會再交進來（§8 第 3 點）。
@@ -170,6 +180,10 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 - **金鑰到了**（`key_sync.rs` 每匯進一批，`ImportReport.room_keys` 是這批帶來的新房間金鑰）：對每一把，去 cache 找「這個房、用這把 session 加密、還沒解」的
   （`list_undecrypted_ciphertexts(BySession)`，`json_extract(raw_event, '$.content.session_id')`），解開、補存明文，
   **commit 之後照收訊息那條路發 `room.message`**（同一個 `event_id`，UI 當更新）。已經解了的不動、不再發。
+- **`room.history` 讀到還沒解開的**（2026-10-07，`room_crypto.rs` 的 `retry_undecrypted_in_page`）：`sync` 是 `local`／`both` 時，這一頁裡還是密文的那幾則
+  拿去再解一次（同一支 `decrypt_stored(… EventIds …)`），解開的補存、換掉頁裡那幾則，🚫 發 `room.message`（UI 正在讀這一頁）。
+  補的是「金鑰到了、解開了、但當時寫 cache 失敗」那一批：那把金鑰已經匯入，不會再有「金鑰到了」叫它們。再試失敗只發 `Note`、照原樣回頁（🚫 讓讀歷史失敗）。
+  `sync: server` 🚫 寫庫，那條拿到的就是剛解的；`sync.recent` 本來就會把這一輪拉到的密文（含原本就在 cache 裡的）再解一次。
 - 引擎開不起來（crypto store 壞了之類）：講一聲，密文照存；之後引擎好了、金鑰那半會補解。
 
 ## 7. 程式碼接縫
@@ -188,16 +202,14 @@ daemon 自己 🚫 不動作；UI 決定要不要對開著的房叫 `room.refres
 
 ## 8. 不在這支（已知的缺口）
 
-- **路徑版送檔進加密房**：`room.send_file` 在加密房拒絕（資料平面那條可以，/docs/design/rpc-specs/data-plane.md）。
 - **`devices.changed` 🚫 觸發後台**：誰的裝置變了仍是 UI 決定要不要 refresh（§4，2026-09-29 定的）；refresh 之後才交給後台。
 - **daemon 重開之後的第一則要等**：就緒表只在記憶體裡，重開後每個房的第一則都要等後台對那個房間版本號跑一輪（金鑰都還在的話只是查一次、什麼都不用送）。UI 點進房就 refresh 的話，這一輪在使用者按送出前就做完了。
 - **上游升級會清掉自己的房間金鑰**：上游的 migration 清過兩次 `outbound_group_session`（格式變了就整張清、讓它換金鑰）。對我們無害：送出前會發現「這個房沒有金鑰」、等後台分一把新的；被清掉的那把沒送到的 to-device 從來沒被拿來加密過。
 - **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
 - **建不起 Olm 通道的裝置也讀不到**：對方沒有 fallback key、一次性金鑰又被領光時，那台只收到 `m.no_olm`、房間照樣算就緒（§3 第 1 點）；它之後補到通道，下一次分金鑰才補給它（只從當下的位置）。🚫 每送一則就重 claim（matrix-sdk 那樣）：只有不支援 fallback key 的舊 client 會遇到。
-- **房間自己設的換金鑰期限**：`room_key_share_settings` 用上游預設（一週／100 則），🚫 還沒讀 `m.room.encryption` 的 `rotation_period_*`。
 - **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，/docs/design/keys/e2ee-walkthrough.md §16）。
-- **補解寫失敗的那批不會自動重試**：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
-  那把金鑰已經匯入，之後不會再觸發補解（只有同一把金鑰再來才會）。要不要加一個觸發點（例如 `room.history` 讀到未解的就試一次）待維護者決定。
+- **補解寫失敗的那批要等有人讀到才再試**：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
+  `room.history` 讀到那一頁、或 `sync.recent` 再拉到它們時才再解（§6，2026-10-07 照 /docs/handover.md §7 的預設做）。🚫 背景自己掃整個 cache。
 
 ## 9. 測試
 

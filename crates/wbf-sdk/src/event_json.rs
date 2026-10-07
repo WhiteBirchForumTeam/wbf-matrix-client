@@ -4,8 +4,9 @@
 //! 所以 `backend/matrix_sdk`（feature `matrix`）與 `recent`（純 WS）共用同一份轉換，不會漂移。
 //! 解密狀態（`decrypted`）這裡一律 None：只有 matrix-sdk 的 `TimelineEvent` 知道，由它的 adapter 補。
 
-use crate::chat::{Attachment, Message, MessageKind, Reaction};
+use crate::chat::{Attachment, MatrixAttachment, Message, MessageKind, Reaction};
 use crate::incoming::IncomingEvent;
+use crate::media_kind::MediaKind;
 use crate::protocol::event_seqs;
 
 /// /docs/design/media/wbf-client-convention-for-chunk.md §5 的 msgtype 與區塊 key。
@@ -47,6 +48,80 @@ pub fn file_message_content(
             "caption".to_string(),
             serde_json::Value::String(caption.to_string()),
         );
+    }
+    Ok(content)
+}
+
+/// 傳統上傳的檔當成標準 Matrix 附件送（/docs/design/rpc-specs/data-plane.md §7.2）：`msgtype` 看 `mimetype`（`image/*` → `m.image`、
+/// `video/*` → `m.video`、`audio/*` → `m.audio`，其他 `m.file`）；有說明時 `body` 是說明、檔名放 `filename`（Matrix 規格 v1.10）。
+///
+/// Args:
+///     manifest: PUT 回、UI 帶回來的那份
+///     caption: example: Some("看這個")
+/// Return:
+///     Ok(Value)    `kind` 2：`{"msgtype", "body", "info": {"size", "mimetype"?}, "file", "filename"?}`；`kind` 3：`file` 換成 `"url": mxc`
+///     Err(Usage)   `kind` 1；`kind` 2 沒有 `file`、`kind` 3 帶了 `file`；組出來的收的那邊認不得（`file` 不齊、`url` 跟 mxc 不一樣）
+pub fn matrix_file_message_content(
+    manifest: &crate::manifest::MatrixManifest,
+    caption: Option<&str>,
+) -> Result<serde_json::Value, crate::error::SdkError> {
+    let usage = |message: String| crate::error::SdkError::Usage(message);
+    let mimetype = manifest.mimetype.as_deref().unwrap_or("");
+    let msgtype = match mimetype.split('/').next() {
+        Some("image") => "m.image",
+        Some("video") => "m.video",
+        Some("audio") => "m.audio",
+        _ => "m.file",
+    };
+    let mut info = serde_json::json!({ "size": manifest.size });
+    if let (Some(mimetype), Some(fields)) = (&manifest.mimetype, info.as_object_mut()) {
+        fields.insert(
+            "mimetype".into(),
+            serde_json::Value::String(mimetype.clone()),
+        );
+    }
+    let mut content = serde_json::json!({
+        "msgtype": msgtype,
+        "body": caption.unwrap_or(&manifest.name),
+        "info": info,
+    });
+    let Some(fields) = content.as_object_mut() else {
+        return Err(usage("the event content is not an object".into()));
+    };
+    if caption.is_some() {
+        fields.insert(
+            "filename".into(),
+            serde_json::Value::String(manifest.name.clone()),
+        );
+    }
+    match (manifest.kind, &manifest.file) {
+        (MediaKind::MatrixEncrypted, Some(file)) => {
+            fields.insert("file".into(), file.clone());
+        }
+        (MediaKind::MatrixPlain, None) => {
+            fields.insert(
+                "url".into(),
+                serde_json::Value::String(manifest.mxc.clone()),
+            );
+        }
+        (kind, file) => return Err(usage(format!(
+            "{}: a {kind:?} manifest {} file description cannot be sent as a standard attachment",
+            manifest.mxc,
+            if file.is_some() {
+                "with a"
+            } else {
+                "without a"
+            }
+        ))),
+    }
+    // 消費端自己再問一次：組出來的要是收的那邊（同一支解析）認得的、指著同一個 mxc、同一種格式。
+    let parsed = matrix_attachment_of_content(msgtype, &content)
+        .map_err(|why| usage(format!("{}: {why}", manifest.mxc)))?;
+    if parsed.mxc != manifest.mxc || parsed.kind != manifest.kind {
+        return Err(usage(format!(
+            "{}: the file description points at {} ({:?})",
+            manifest.mxc, parsed.mxc, parsed.kind
+        )));
     }
     Ok(content)
 }
@@ -213,6 +288,19 @@ pub(crate) fn kind_from_content(
                         body,
                     },
                 },
+                "m.file" | "m.image" | "m.video" | "m.audio" => {
+                    match matrix_attachment_of_content(msgtype, content) {
+                        Ok(attachment) => MessageKind::MatrixFile {
+                            caption: matrix_caption(content),
+                            attachment,
+                        },
+                        // 沒有 mxc、加密描述不完整：當成解不開的檔，顯示 body（🚫 猜成明文）。
+                        Err(reason) => MessageKind::Unsupported {
+                            event_type: format!("{event_type}/{msgtype} ({reason})"),
+                            body,
+                        },
+                    }
+                }
                 other => MessageKind::Unsupported {
                     event_type: format!("{event_type}/{other}"),
                     body,
@@ -255,6 +343,70 @@ fn file_attachment(content: &serde_json::Value) -> Result<Attachment, String> {
         .check_as_event_block()
         .map_err(|error| error.to_string())?;
     Ok(Attachment { mxc, block })
+}
+
+/// 標準 Matrix 附件的 content（`m.file`／`m.image`…）→ `MatrixAttachment`（/docs/design/rpc-specs/data-plane.md §7.1）。
+/// 有 `file` 就是加密的（`kind` 2）：`file.url` 是 mxc，`v` 要是 `"v2"`，`key`、`iv`、`hashes.sha256` 都要在，少一個就🚫 當成一個檔；
+/// 只有 `url` 是明文的（`kind` 3）。有 `file` 去不完整，🚫 退回 `url` 當明文（那會把密文當明文給出去）。
+///
+/// Args:
+///     msgtype: example: "m.image"
+///     content: 事件的 content
+/// Return:
+///     Ok(MatrixAttachment)
+///     Err(String)   沒有 mxc、或加密描述不完整（給人看的理由）
+pub(crate) fn matrix_attachment_of_content(
+    msgtype: &str,
+    content: &serde_json::Value,
+) -> Result<MatrixAttachment, String> {
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let info = content.get("info");
+    let (kind, mxc, file) = match content.get("file") {
+        Some(file) => {
+            let mxc = text(file.get("url")).ok_or("encrypted file without url")?;
+            if text(file.get("v")).as_deref() != Some("v2") {
+                return Err("encrypted file is not v2".into());
+            }
+            if !file.get("key").is_some_and(|key| key.is_object())
+                || text(file.get("iv")).is_none()
+                || text(file.get("hashes").and_then(|hashes| hashes.get("sha256"))).is_none()
+            {
+                return Err("encrypted file without key, iv or sha256".into());
+            }
+            (MediaKind::MatrixEncrypted, mxc, Some(file.clone()))
+        }
+        None => (
+            MediaKind::MatrixPlain,
+            text(content.get("url")).ok_or("no url")?,
+            None,
+        ),
+    };
+    if !mxc.starts_with("mxc://") {
+        return Err(format!("{mxc:?} is not an mxc URI"));
+    }
+    Ok(MatrixAttachment {
+        msgtype: msgtype.to_string(),
+        mxc,
+        kind,
+        name: text(content.get("filename")).or_else(|| text(content.get("body"))),
+        mimetype: text(info.and_then(|info| info.get("mimetype"))),
+        size: info
+            .and_then(|info| info.get("size"))
+            .and_then(|size| size.as_u64()),
+        file,
+    })
+}
+
+/// Matrix 的附件說明（規格 v1.10）：有 `filename` 而且跟 `body` 不一樣，`body` 就是說明；否則沒有說明。
+fn matrix_caption(content: &serde_json::Value) -> Option<String> {
+    let body = content.get("body").and_then(|value| value.as_str())?;
+    let filename = content.get("filename").and_then(|value| value.as_str())?;
+    (!body.is_empty() && body != filename).then(|| body.to_string())
 }
 
 fn system_line(event_type: &str, content: &serde_json::Value, raw: &serde_json::Value) -> String {

@@ -157,7 +157,7 @@ struct Work {
 ⚠️ 代價說實話：`media.gc` 那一件會在寫入執行緒上跑完整個掃描（列與 `pending/`、`media/<hh>/` 的目錄、刪檔）；池很大的時候，這段時間同一台 server 的新訊息排在它後面。
 它是使用者按的（或一個程序裡每台 server 第一次起下載處理端時一次），🚫 不在背景定時跑。哪天池大到這件事看得出來，再把「列出要刪的」與「刪檔」拆開。
 
-讀（`find_media`、`find_media_block_for`、`find_event_attachment`）走讀連線，跟其他讀一樣。🚫 正式碼沒有繞過寫入者直接開 `cache.db` 的路（`Core::cache_of` 只在測試建置存在）。
+讀（`find_media`、`list_media_blocks_for`、`find_event_attachment`）走讀連線，跟其他讀一樣。🚫 正式碼沒有繞過寫入者直接開 `cache.db` 的路（`Core::cache_of` 只在測試建置存在）。
 
 ### 2.4 為什麼 `m/` 不需要這一套
 

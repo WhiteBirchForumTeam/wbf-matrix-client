@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use support::fake_server::FakeServer;
-use wbf_sdk::cache::{Cache, CacheIdentity, MediaEntry};
+use wbf_sdk::cache::{Cache, CacheIdentity, MediaDescription, MediaEntry};
 use wbf_sdk::channel::PackChannel;
 use wbf_sdk::media::{self, MediaDownload};
 use wbf_sdk::media_pool::{MediaPool, SEGMENT_SIZE};
@@ -98,17 +98,8 @@ fn reads_so_far(server: &FakeServer) -> usize {
 }
 
 fn open_download(cache: &mut Cache, pool: &MediaPool, manifest: &Manifest) -> MediaDownload {
-    let block = &manifest.block;
-    cache
-        .media_begin(
-            &manifest.mxc,
-            block.name.as_deref(),
-            block.mimetype.as_deref(),
-            block.sha256.as_deref(),
-            manifest.file_size(),
-            block.chunk_size,
-        )
-        .unwrap();
+    let description = MediaDescription::of_chunked_block(&manifest.block).unwrap();
+    cache.media_begin(&manifest.mxc, &description).unwrap();
     let name = cache.media_pending_name(&manifest.mxc).unwrap().unwrap();
     MediaDownload::open(pool, &name, manifest).unwrap()
 }
@@ -162,7 +153,7 @@ async fn download_whole(
             return Err(error);
         }
     }
-    let finished = download.finish(pool)?;
+    let (finished, verified) = download.finish(pool)?;
     let bytes_on_disk = pool.bytes_on_disk(&finished.hash_hex)?;
     cache.media_finish(
         &manifest.mxc,
@@ -170,6 +161,7 @@ async fn download_whole(
         finished.segments,
         finished.plain_len,
         bytes_on_disk,
+        verified,
     )?;
     Ok(cache.find_media(&manifest.mxc)?.unwrap())
 }
@@ -219,7 +211,7 @@ async fn a_download_lands_in_the_pool_and_the_same_content_dedups() {
     assert_eq!(cache.media_bytes_on_disk().unwrap(), entry.bytes_on_disk);
     // 列說的長度跟檔不一樣：不算完整。
     let mut wrong = entry.clone();
-    wrong.file_size = 1;
+    wrong.file_size = Some(1);
     assert!(media::open_complete(&pool, &wrong).is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -310,7 +302,12 @@ async fn the_main_file_takes_a_seek_fetched_chunk_without_the_network() {
         1 + 4,
         "chunk 2 came from the seek file"
     );
-    let finished = download.finish(&pool).unwrap();
+    let (finished, verified) = download.finish(&pool).unwrap();
+    assert_eq!(
+        verified,
+        wbf_sdk::media_kind::Verification::Matched,
+        "the block's sha256 matches the whole file"
+    );
     assert!(
         !pool.seek_path("m1").exists(),
         "the seek file goes when the main file is done"
@@ -564,5 +561,41 @@ async fn sweep_resets_missing_files_and_removes_what_nobody_claims() {
     .unwrap();
     assert_eq!(swept.removed_pending, 1, "{swept:?}");
     assert!(pool.list_pending().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `media.delete_local` 的那一半（/docs/design/media/media-download.md §7.4）：暫存檔還有人在寫就整個拒、什麼都🚫 動；
+/// 放手之後半成品與列都刪掉；本來就沒有是 false。
+#[test]
+fn deleting_a_local_copy_refuses_while_it_is_being_written_and_then_takes_everything() {
+    let dir = scratch("del-local");
+    let (mut cache, pool) = open_cache_and_pool(&dir);
+    let mxc = "mxc://fake/del";
+    let description = MediaDescription {
+        kind: wbf_sdk::media_kind::MediaKind::WbfChunked,
+        name: None,
+        mimetype: None,
+        hash: None,
+        file_size: Some(200_000),
+        chunk_size: Some(CHUNK),
+    };
+    cache.media_begin(mxc, &description).unwrap();
+    let name = cache.media_pending_name(mxc).unwrap().unwrap();
+    let mut writer = pool.create_pending(&name, mxc).unwrap();
+    writer.write_all(&sample(70_000, 1)).unwrap();
+    drop(writer);
+    assert!(!pool.list_pending().unwrap().is_empty());
+    let busy: HashSet<String> = [name.clone()].into();
+    let error = media::del_local_copy(&mut cache, &pool, mxc, &busy).unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error:?}");
+    assert!(cache.find_media(mxc).unwrap().is_some(), "the row is kept");
+    assert!(
+        !pool.list_pending().unwrap().is_empty(),
+        "the unfinished file is kept"
+    );
+    assert!(media::del_local_copy(&mut cache, &pool, mxc, &HashSet::new()).unwrap());
+    assert!(cache.find_media(mxc).unwrap().is_none());
+    assert!(pool.list_pending().unwrap().is_empty());
+    assert!(!media::del_local_copy(&mut cache, &pool, mxc, &HashSet::new()).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }

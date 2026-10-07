@@ -4241,6 +4241,7 @@ name = "wbf-core"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "matrix-sdk-crypto",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4265,6 +4266,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "matrix-sdk-crypto",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -14,7 +14,7 @@ use wbf_sdk::login::{Session, SessionBackend};
 use wbf_sdk::media_pool::MediaPool;
 
 use crate::accounts::AccountDir;
-use crate::Core;
+use crate::{Core, Target};
 
 impl Core {
     /// 這個帳號封著的 session。
@@ -80,6 +80,16 @@ impl Core {
     ///     Err(NotLoggedIn)
     pub(crate) fn is_wbf_account(&self, account: &AccountDir) -> Result<bool, CoreError> {
         Ok(self.session_of(account)?.backend == Some(SessionBackend::WbfSdk))
+    }
+
+    /// 前端用的同一個問題（例：CLI 送加密房前要不要先 `refresh_room_devices`——只有 wbf 帳號要，一般 Matrix 帳號 matrix-sdk 自己管）。
+    ///
+    /// Return:
+    ///     Ok(bool)   同 `is_wbf_account`
+    ///     Err(...)   沒這個帳號、沒登入
+    pub fn is_wbf_account_for(&self, target: &Target) -> Result<bool, CoreError> {
+        let account = self.account_or_current(target)?;
+        self.is_wbf_account(&account)
     }
 
     /// 這個帳號所屬 server 的 `cache.db`（/docs/design/storage/local-cache-db.md §5，同 server 的帳號共用）。

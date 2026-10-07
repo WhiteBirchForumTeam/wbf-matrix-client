@@ -36,3 +36,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"
+# 真 server 的 e2e 用：像別的 client（Element…）那樣上傳標準附件、送事件（tests/real_server.rs）。兩個都跟 wbf-sdk 同一份。
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+matrix-sdk-crypto = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk-crypto" }

@@ -71,6 +71,9 @@ pub enum CoreErrorKind {
     RoomKeyNotReady,
     /// 完整性檢查不過（CRC、AEAD 標籤）。
     Integrity,
+    /// **事情做了、資料照給，但它沒驗過或驗不過**（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2；跟 GET 的 412 同一件事）。
+    /// [`CoreError::data`] 是成功時會給的那份結果。🚫 重試：不是「沒做」。
+    Unverified,
     Timeout,
 }
 
@@ -102,6 +105,7 @@ impl CoreErrorKind {
             CoreErrorKind::RoomDevicesChanged => 1401,
             CoreErrorKind::RoomKeyNotReady => 1402,
             CoreErrorKind::Integrity => 1500,
+            CoreErrorKind::Unverified => 1501,
             CoreErrorKind::Timeout => 1600,
         }
     }
@@ -215,6 +219,7 @@ mod tests {
             (CoreErrorKind::RoomDevicesChanged, 1401),
             (CoreErrorKind::RoomKeyNotReady, 1402),
             (CoreErrorKind::Integrity, 1500),
+            (CoreErrorKind::Unverified, 1501),
             (CoreErrorKind::Timeout, 1600),
         ];
         for (kind, code) in table {

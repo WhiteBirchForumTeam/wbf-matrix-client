@@ -60,8 +60,11 @@ pub mod link;
 pub mod local_source;
 pub mod login;
 pub mod manifest;
+#[cfg(feature = "matrix")]
+pub mod matrix_media;
 #[cfg(feature = "cache")]
 pub mod media;
+pub mod media_kind;
 pub mod media_pool;
 pub mod protocol;
 pub mod room_keys;
@@ -88,7 +91,7 @@ pub use error::SdkError;
 pub use incoming::{EventPage, IncomingEvent};
 pub use link::{AckPolicy, Heartbeat, StreamHandle, Subscription, WsLink};
 pub use login::Session;
-pub use manifest::{Manifest, UploadState};
+pub use manifest::{Manifest, MatrixManifest, MatrixUpload, UploadState};
 pub use room_keys::{get_snapshot_status, SnapshotStatus};
 pub use sessions::{no_hook, Received, ReceivedHook, Route, SessionKey};
 pub use upload::SentSummary;

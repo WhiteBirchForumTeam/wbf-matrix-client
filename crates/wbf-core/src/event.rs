@@ -101,6 +101,8 @@ pub enum CoreEvent {
         done: u32,
         /// 總塊數；還不知道是 0
         total: u32,
+        /// 整檔 hash 的比對結果（/docs/design/media/media-download.md §12.3）：`complete` 一律帶，其他狀態是 `None`
+        verified: Option<wbf_sdk::media_kind::Verification>,
         /// `failed` 的理由（給人看的）；其他狀態是 `None`
         reason: Option<String>,
     },
@@ -135,7 +137,9 @@ pub enum DownloadState {
     Queued,
     /// 正在拉（在 `downloading` 表裡）。
     Downloading,
-    /// 主檔完成、進了池。
+    /// 讀完了、正在拿整檔 hash 跟發送者給的比（/docs/design/media/media-download.md §12.3）。只有有 hash 可比的檔會有這一則。
+    Verifying,
+    /// 主檔完成、進了池。驗不過也是完成（資料留著），結果看 `verified`。
     Complete,
     /// 被 `media.cancel` 停了：主檔與暫存檔留著，再排一次從斷點接。
     Cancelled,

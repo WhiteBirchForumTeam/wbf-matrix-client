@@ -21,11 +21,14 @@ use sha2::{Digest, Sha256};
 
 use zeroize::Zeroizing;
 
-use crate::cache::{Cache, MediaEntry};
+use crate::cache::{Cache, MediaDescription, MediaEntry};
+use crate::chat::MatrixAttachment;
+use crate::chunk_block::ChunkedBlock;
 use crate::chunk_crypto::{chunk_count, expected_plain_len};
 use crate::download::{open_chunk_data, verify_info, VerifiedTarget};
 use crate::error::SdkError;
 use crate::manifest::Manifest;
+use crate::media_kind::{MediaKind, Verification};
 use crate::media_pool::{Finished, MediaPool, PoolReader, PoolWriter, SEEK_SUFFIX};
 use crate::protocol::InfoAck;
 use crate::seek_store::SeekStore;
@@ -229,13 +232,14 @@ impl MediaDownload {
         }
     }
 
-    /// 收尾（/docs/design/media/media-download.md §4.1）：封最後一段、核對長度與區塊的 sha256、adopt 進池、刪 seek 暫存檔。
+    /// 收尾（/docs/design/media/media-download.md §4.1）：封最後一段、核對長度、拿區塊的 sha256 比整檔、adopt 進池、刪 seek 暫存檔。
+    /// sha256 對不上🚫 刪檔：每塊都過了 AEAD，結果記進 `verified`、要不要用由前端決定（維護者 2026-10-06，/docs/design/media/media-download.md §12.3）。
     ///
     /// Return:
-    ///     Ok(Finished)     `hash_hex` 就是池檔名
-    ///     Err(Integrity)   長度或 sha256 對不上：主檔與暫存檔都刪了，呼叫者把列 reset
-    ///     Err(Io)          寫不了、搬不了
-    pub fn finish(self, pool: &MediaPool) -> Result<Finished, SdkError> {
+    ///     Ok((Finished, Verification))   `hash_hex` 就是池檔名；區塊沒帶 sha256 是 `Unknown`、對上 `Matched`、對不上 `Mismatched`
+    ///     Err(Integrity)                 長度對不上：主檔與暫存檔都刪了，呼叫者把列 reset
+    ///     Err(Io)                        寫不了、搬不了
+    pub fn finish(self, pool: &MediaPool) -> Result<(Finished, Verification), SdkError> {
         let MediaDownload {
             manifest,
             pending_name,
@@ -254,18 +258,10 @@ impl MediaDownload {
             )));
         }
         let finished = writer.finish()?;
-        if let Some(expected) = manifest.block.sha256.as_deref() {
-            if !expected.eq_ignore_ascii_case(&finished.sha256_hex) {
-                discard(pool, &pending_name);
-                return Err(SdkError::Integrity(format!(
-                    "sha256 mismatch: block {expected}, file {}",
-                    finished.sha256_hex
-                )));
-            }
-        }
+        let verified = Verification::of_hex(manifest.block.sha256.as_deref(), &finished.sha256_hex);
         pool.adopt(&pending_name, &finished.hash_hex)?;
         pool.discard_seek(&pending_name)?;
-        Ok(finished)
+        Ok((finished, verified))
     }
 
     /// 壞檔：主檔與 seek 暫存檔都刪（列由呼叫者 reset）。
@@ -326,82 +322,179 @@ fn discard(pool: &MediaPool, pending_name: &str) {
 ///
 /// Return:
 ///     Some(PoolReader)   能用
-///     None               列說沒完成、沒有檔名、檔不在、打不開、長度不對
+///     None               列說沒完成、沒有檔名、檔不在、打不開、列沒有大小、長度不對
 pub fn open_complete(pool: &MediaPool, entry: &MediaEntry) -> Option<PoolReader> {
     if !entry.complete {
         return None;
     }
     let reader = pool.open_read(entry.pool_file.as_deref()?).ok()?;
-    (reader.plain_len() == entry.file_size).then_some(reader)
+    (Some(reader.plain_len()) == entry.file_size).then_some(reader)
 }
 
-/// 快取列跟這次的區塊說的是不是同一個檔（/docs/design/media/media-download.md §5.3，維護者 2026-10-02 照 PR #14 的規則）：
-/// 大小、塊大小要一樣；兩邊都帶 sha256 就要一樣。🚫 算 hash，只比記下來的字。
+/// 快取列跟這個區塊說的是不是同一個檔（/docs/design/media/media-download.md §5.3，比哪幾欄是維護者 2026-10-02 照 PR #14 定的）：
+/// 列要是分塊的檔；大小、塊大小要一樣；兩邊都帶 sha256 就要一樣。🚫 算 hash，只比記下來的字。
 ///
+/// Args:
+///     block: 某一則事件（或 manifest）的區塊, example: &manifest.block
 /// Return:
-///     bool  true ＝ 同一個檔，列可以照用；false ＝ 對不上，要丟掉重來（[`forget_for_new_description`]）
-pub fn is_same_file(entry: &MediaEntry, manifest: &Manifest) -> bool {
-    // 區塊沒帶大小＝不知道，🚫 當成「不一樣」去丟快取（入口 `check_as_event_block` 已經拒過，這裡消費端自己再問一次）。
-    let same_file_size = match manifest.block.file_size {
-        Some(claimed) => claimed == entry.file_size,
+///     bool  true ＝ 同一個檔，列可以照用；false ＝ 對不上（寫錯或偽造的描述）：拒這次的請求，列🚫 動
+pub fn is_same_block(entry: &MediaEntry, block: &ChunkedBlock) -> bool {
+    // 區塊沒帶大小＝不知道，🚫 當成「不一樣」（入口 `check_as_event_block` 已經拒過，這裡消費端自己再問一次）。
+    let same_file_size = match block.file_size {
+        Some(claimed) => Some(claimed) == entry.file_size,
         None => true,
     };
-    let same_size = same_file_size && entry.chunk_size == manifest.block.chunk_size;
+    let same_size = same_file_size && entry.chunk_size == Some(block.chunk_size);
     let recorded_sha256 = entry
         .hash
         .as_deref()
         .and_then(|hash| hash.strip_prefix("sha256:"));
-    let same_sha256 = match (recorded_sha256, manifest.block.sha256.as_deref()) {
+    let same_sha256 = match (recorded_sha256, block.sha256.as_deref()) {
         (Some(recorded), Some(claimed)) => recorded.eq_ignore_ascii_case(claimed),
         _ => true,
     };
-    same_size && same_sha256
+    entry.kind == MediaKind::WbfChunked && same_size && same_sha256
 }
 
-/// 列說的跟這次的區塊不一樣（[`is_same_file`] 回 false）：丟掉這個 mxc 在本地的一切，列換成這次的描述、從頭來。
-/// 池檔還有別的 mxc 指著、或有人正在讀，就只清這一列不刪檔；主檔與 seek 暫存檔刪掉。⚠️ 呼叫者先確定沒人正在下載它。
+/// 傳統格式的版本（/docs/design/media/media-download.md §12.1）：快取列跟這次事件的描述是不是同一個檔。
+/// 格式要一樣；兩邊都記了密文 hash（`matrix-sha256:`）就要一樣；兩邊都有大小就要一樣。🚫 算 hash，只比記下來的字。
 ///
+/// Args:
+///     entry: 本地這個 mxc 的列
+///     description: 這次的事件來的, example: &MediaDescription::of_matrix_attachment(&attachment)
 /// Return:
-///     Ok(())
-///     Err(Io)   DB 或檔案動不了
-pub fn forget_for_new_description(
+///     bool  true ＝ 同一個檔；false ＝ 對不上（同一個 mxc、另一把金鑰或另一個大小：寫錯或偽造的事件）
+pub fn is_same_matrix_file(entry: &MediaEntry, description: &MediaDescription) -> bool {
+    let recorded = MediaDescription {
+        kind: entry.kind,
+        name: None,
+        mimetype: None,
+        hash: entry.hash.clone(),
+        file_size: entry.file_size,
+        chunk_size: None,
+    };
+    is_same_matrix_description(&recorded, description)
+}
+
+/// 兩份傳統格式的描述說的是不是同一個檔（[`is_same_matrix_file`] 的規則；檔名、型別🚫 比：轉發時改名還是同一個檔）。
+///
+/// Args:
+///     one: 例如正在下載的那份
+///     other: 例如這次請求的那份
+/// Return:
+///     bool  true ＝ 格式、密文 hash、大小（兩邊都有時）都一樣
+pub fn is_same_matrix_description(one: &MediaDescription, other: &MediaDescription) -> bool {
+    // 收尾時沒 hash 的列會補上 `blake3:<池檔名>`（`media_finish`）：那不是事件給的，🚫 拿來比。
+    fn matrix_hash(hash: Option<&str>) -> Option<&str> {
+        hash.filter(|hash| hash.starts_with("matrix-sha256:"))
+    }
+    let same_hash = match (
+        matrix_hash(one.hash.as_deref()),
+        matrix_hash(other.hash.as_deref()),
+    ) {
+        (Some(one), Some(other)) => one == other,
+        (None, None) => true,
+        // 只有一邊有：一則說加密、一則說沒有（格式已經比過），或一則少了 hash——🚫 當成同一個。
+        _ => false,
+    };
+    let same_size = match (one.file_size, other.file_size) {
+        (Some(one), Some(other)) => one == other,
+        _ => true,
+    };
+    one.kind == other.kind && same_hash && same_size
+}
+
+/// 一個 mxc 的金鑰，取自某一則跟本地那一列說的是同一個檔的事件（[`find_key_matching_record`]）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordedFileKey {
+    /// wbf 分塊（`kind` 1）：事件的區塊
+    Chunked(ChunkedBlock),
+    /// 標準 Matrix 附件（`kind` 2、3）
+    Matrix(MatrixAttachment),
+}
+
+/// 只給 mxc 的下載（/docs/design/media/media-download.md §5.3）：照本地那一列的描述，挑這個帳號看得到、說的是同一個檔的第一則事件，拿它的金鑰。
+/// 同一個 mxc 寫錯或偽造的事件不管先到後到都🚫 被挑上；列換描述只有 `media.delete_local` 刪掉再從訊息下載一條路。
+///
+/// Args:
+///     user_id: example: "@alice:localhost"
+///     entry: 本地這個 mxc 的列
+/// Return:
+///     Ok(Some(RecordedFileKey))   列是哪一種格式就是哪一種
+///     Ok(None)                    這個帳號看不到跟列一致的事件（沒有引用它的、或都對不上）
+///     Err(Io)                     DB 讀不了
+pub fn find_key_matching_record(
+    cache: &Cache,
+    user_id: &str,
+    entry: &MediaEntry,
+) -> Result<Option<RecordedFileKey>, SdkError> {
+    if entry.kind == MediaKind::WbfChunked {
+        return Ok(cache
+            .list_media_blocks_for(user_id, &entry.mxc)?
+            .into_iter()
+            .find(|block| is_same_block(entry, block))
+            .map(RecordedFileKey::Chunked));
+    }
+    Ok(cache
+        .list_matrix_attachments_for(user_id, &entry.mxc)?
+        .into_iter()
+        .find(|attachment| {
+            is_same_matrix_file(entry, &MediaDescription::of_matrix_attachment(attachment))
+        })
+        .map(RecordedFileKey::Matrix))
+}
+
+/// `media.delete_local`（/docs/design/media/media-download.md §7.4）：刪這個 mxc 在本地的一切——池檔、主檔與 seek 暫存檔、`media` 列。
+/// 池檔還有別的 mxc 指著、或有人正在讀，就🚫 刪檔（列刪了之後沒人指著，掃描會收）。
+/// ⚠️ 呼叫者先取消它的下載、等寫入者放手；暫存檔還在 `in_use` 裡就整個拒、什麼都🚫 動。
+///
+/// Args:
+///     mxc: example: "mxc://localhost/000000000000004d"
+///     in_use: 這台 server 上正開著寫的暫存名, example: {"m12"}
+/// Return:
+///     Ok(true)      刪了（列本來在）
+///     Ok(false)     本來就沒有這一列
+///     Err(Usage)    還有人在寫它的暫存檔
+///     Err(Io)       DB 或檔案動不了
+pub fn del_local_copy(
     cache: &mut Cache,
     pool: &MediaPool,
-    manifest: &Manifest,
-) -> Result<(), SdkError> {
-    let Some(entry) = cache.find_media(&manifest.mxc)? else {
-        return Ok(());
+    mxc: &str,
+    in_use: &HashSet<String>,
+) -> Result<bool, SdkError> {
+    let Some(entry) = cache.find_media(mxc)? else {
+        return Ok(false);
     };
+    let pending_name = cache.media_pending_name(mxc)?;
+    if let Some(pending_name) = pending_name.as_deref() {
+        if in_use.contains(pending_name) {
+            return Err(SdkError::Usage(format!(
+                "{mxc} is still being written; try again when its download stops"
+            )));
+        }
+    }
+    // 先刪檔再刪列（同配額清理）：中途失敗時列還在，掃描看得到它、收得掉。
     if let Some(pool_file) = entry.pool_file.as_deref() {
         if cache.media_references(pool_file)? <= 1 && !pool.is_open(pool_file)? {
             pool.remove(pool_file)?;
         }
     }
-    if let Some(pending_name) = cache.media_pending_name(&manifest.mxc)? {
-        discard(pool, &pending_name);
+    if let Some(pending_name) = pending_name.as_deref() {
+        discard(pool, pending_name);
     }
-    let block = &manifest.block;
-    cache.media_redescribe(
-        &manifest.mxc,
-        block.name.as_deref(),
-        block.mimetype.as_deref(),
-        block.sha256.as_deref(),
-        manifest.file_size(),
-        block.chunk_size,
-    )
+    Ok(cache.media_delete(mxc)?.is_some())
 }
 
-/// 匯出時要對上的內容（/docs/design/media/media-download.md §7.3 的 `media.export_to`）。至少要有一個 hash：沒東西可比就🚫 匯出。
+/// 匯出時要對上的內容（/docs/design/media/media-download.md §7.3 的 `media.export_to`）。大小一定比；hash 給了才算、才比。
+/// 從池匯出🚫 給 hash（每段讀出時過了池的 AEAD，`kind` 2 的整檔 hash 下載時已經驗過、記在 `verified`）；從本機原檔匯出一定給 sha256（原檔在池外、沒有保護）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpectedContent {
     pub file_size: u64,
-    /// 明文的 BLAKE3（池檔的檔名就是它）
-    pub blake3_hex: Option<String>,
-    /// 區塊帶的 sha256（上傳者算的）
+    /// 區塊帶的 sha256（上傳者算的）；None ＝ 🚫 算
     pub sha256_hex: Option<String>,
 }
 
-/// 把明文整個寫到 `to`，邊寫邊算整檔的 BLAKE3／SHA-256（/docs/design/media/media-download.md §7.3）：先寫一個**這次自己獨占建立**的暫存檔
+/// 把明文整個寫到 `to`，給了哪個 hash 就邊寫邊算哪個（/docs/design/media/media-download.md §7.3）：先寫一個**這次自己獨占建立**的暫存檔
 /// （`<to>.partial.<pid>-<n>`）、fsync，大小與每個給了的 hash 都對上才改名成 `to`；對不上就只刪那個暫存檔、`to` 🚫 被動過。
 /// 🚫 碰別人的檔：旁邊本來就有的 `<to>.partial` 之類一律不開、不刪。成功時 `to` 已經存在就**覆蓋**（要不要覆蓋是 UI 先問使用者，維護者 2026-10-03）。
 ///
@@ -410,23 +503,18 @@ pub struct ExpectedContent {
 ///     to: 使用者指定的位置, example: "C:/Users/me/v.mp4"
 /// Return:
 ///     Ok(u64)          寫了幾 byte
-///     Err(Integrity)   大小或 hash 對不上
-///     Err(Usage)       一個 hash 都沒給、`to` 沒有檔名
+///     Err(Integrity)   大小或給了的 hash 對不上
+///     Err(Usage)       `to` 沒有檔名
 ///     Err(Io)          讀不了來源、寫不了、改不了名
-pub fn export_verified<R: Read>(
+pub fn export_to_path<R: Read>(
     mut source: R,
     to: &Path,
     expected: &ExpectedContent,
 ) -> Result<u64, SdkError> {
-    if expected.blake3_hex.is_none() && expected.sha256_hex.is_none() {
-        return Err(SdkError::Usage(
-            "nothing to verify the export against (no BLAKE3, no sha256)".into(),
-        ));
-    }
     let (mut file, partial) = create_own_partial(to)?;
     let written = (|| {
-        let mut blake3 = blake3::Hasher::new();
-        let mut sha256 = Sha256::new();
+        // 沒給 hash 就🚫 算（從池匯出是這樣）。
+        let mut sha256 = expected.sha256_hex.as_ref().map(|_| Sha256::new());
         let mut buffer = Zeroizing::new(vec![0u8; 1 << 16]);
         let mut bytes = 0u64;
         loop {
@@ -434,8 +522,9 @@ pub fn export_verified<R: Read>(
             let Some(piece) = buffer.get(..read).filter(|piece| !piece.is_empty()) else {
                 break;
             };
-            blake3.update(piece);
-            sha256.update(piece);
+            if let Some(sha256) = sha256.as_mut() {
+                sha256.update(piece);
+            }
             file.write_all(piece)?;
             bytes += piece.len() as u64;
         }
@@ -446,15 +535,7 @@ pub fn export_verified<R: Read>(
                 expected.file_size
             )));
         }
-        if let Some(wanted) = expected.blake3_hex.as_deref() {
-            let actual = blake3.finalize().to_hex().to_string();
-            if !wanted.eq_ignore_ascii_case(&actual) {
-                return Err(SdkError::Integrity(format!(
-                    "BLAKE3 mismatch: expected {wanted}, got {actual}"
-                )));
-            }
-        }
-        if let Some(wanted) = expected.sha256_hex.as_deref() {
+        if let (Some(wanted), Some(sha256)) = (expected.sha256_hex.as_deref(), sha256) {
             let actual = hex::encode(sha256.finalize());
             if !wanted.eq_ignore_ascii_case(&actual) {
                 return Err(SdkError::Integrity(format!(
@@ -662,7 +743,6 @@ mod tests {
     fn expected_for(bytes: &[u8]) -> ExpectedContent {
         ExpectedContent {
             file_size: bytes.len() as u64,
-            blake3_hex: Some(blake3::hash(bytes).to_hex().to_string()),
             sha256_hex: Some(hex::encode(Sha256::digest(bytes))),
         }
     }
@@ -686,14 +766,14 @@ mod tests {
         // 驗不過：那個 .partial 原封不動，`to` 沒出現。
         let mut wrong = expected_for(&body);
         wrong.sha256_hex = Some("00".repeat(32));
-        let error = export_verified(&body[..], &to, &wrong).unwrap_err();
+        let error = export_to_path(&body[..], &to, &wrong).unwrap_err();
         assert!(matches!(error, SdkError::Integrity(_)), "{error:?}");
         assert_eq!(std::fs::read(&theirs).unwrap(), b"somebody else's download");
         assert!(!to.exists());
         assert!(leftovers(&dir, &["movie.mp4.partial"]).is_empty());
         // 成功：一樣不碰它，`to` 寫好、沒有留下暫存檔。
         assert_eq!(
-            export_verified(&body[..], &to, &expected_for(&body)).unwrap(),
+            export_to_path(&body[..], &to, &expected_for(&body)).unwrap(),
             body.len() as u64
         );
         assert_eq!(std::fs::read(&to).unwrap(), body);
@@ -708,7 +788,7 @@ mod tests {
         let to = dir.join("a.bin");
         std::fs::write(&to, b"old").unwrap();
         let body = b"new content".to_vec();
-        export_verified(&body[..], &to, &expected_for(&body)).unwrap();
+        export_to_path(&body[..], &to, &expected_for(&body)).unwrap();
         assert_eq!(std::fs::read(&to).unwrap(), body);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -721,12 +801,12 @@ mod tests {
         let bad = vec![9u8; 1 << 20];
         let (to_good, to_bad, good_here) = (to.clone(), to.clone(), good.clone());
         let succeeding = std::thread::spawn(move || {
-            export_verified(&good_here[..], &to_good, &expected_for(&good_here))
+            export_to_path(&good_here[..], &to_good, &expected_for(&good_here))
         });
         let failing = std::thread::spawn(move || {
             let mut wrong = expected_for(&bad);
-            wrong.blake3_hex = Some("00".repeat(32));
-            export_verified(&bad[..], &to_bad, &wrong)
+            wrong.sha256_hex = Some("00".repeat(32));
+            export_to_path(&bad[..], &to_bad, &wrong)
         });
         assert!(succeeding.join().unwrap().is_ok());
         assert!(failing.join().unwrap().is_err());
@@ -734,5 +814,84 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), good);
         assert!(leftovers(&dir, &["a.bin"]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 沒給 hash（從池匯出）：只核大小、🚫 算任何 hash（維護者 2026-10-06，/docs/design/media/media-download.md §7.3）。大小不對照樣拒。
+    #[test]
+    fn an_export_without_a_hash_only_checks_the_size() {
+        let dir = scratch("nohash");
+        let to = dir.join("a.bin");
+        let body = b"from the pool".to_vec();
+        let size_only = ExpectedContent {
+            file_size: body.len() as u64,
+            sha256_hex: None,
+        };
+        assert_eq!(
+            export_to_path(&body[..], &to, &size_only).unwrap(),
+            body.len() as u64
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), body);
+        let short = ExpectedContent {
+            file_size: body.len() as u64 + 1,
+            sha256_hex: None,
+        };
+        let error = export_to_path(&body[..], &dir.join("b.bin"), &short).unwrap_err();
+        assert!(matches!(error, SdkError::Integrity(_)), "{error:?}");
+        assert!(!dir.join("b.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_matrix_descriptions_are_the_same_file_only_with_the_same_kind_hash_and_size() {
+        use crate::media_kind::MediaKind;
+        let described = |kind, hash: Option<&str>, file_size| MediaDescription {
+            kind,
+            name: Some("a.png".into()),
+            mimetype: None,
+            hash: hash.map(str::to_string),
+            file_size,
+            chunk_size: None,
+        };
+        let encrypted = described(
+            MediaKind::MatrixEncrypted,
+            Some("matrix-sha256:AAA"),
+            Some(10),
+        );
+        let renamed = MediaDescription {
+            name: Some("forwarded.png".into()),
+            ..encrypted.clone()
+        };
+        assert!(
+            is_same_matrix_description(&encrypted, &renamed),
+            "a new name is the same file"
+        );
+        let no_size = described(MediaKind::MatrixEncrypted, Some("matrix-sha256:AAA"), None);
+        assert!(
+            is_same_matrix_description(&encrypted, &no_size),
+            "an unknown size does not differ"
+        );
+        for different in [
+            described(
+                MediaKind::MatrixEncrypted,
+                Some("matrix-sha256:BBB"),
+                Some(10),
+            ),
+            described(
+                MediaKind::MatrixEncrypted,
+                Some("matrix-sha256:AAA"),
+                Some(11),
+            ),
+            described(MediaKind::MatrixEncrypted, None, Some(10)),
+            described(MediaKind::MatrixPlain, None, Some(10)),
+        ] {
+            assert!(
+                !is_same_matrix_description(&encrypted, &different),
+                "{different:?}"
+            );
+        }
+        // 收尾時補的 `blake3:` 不是事件給的：明文檔完成後跟一則同大小的明文描述照樣是同一個。
+        let plain_done = described(MediaKind::MatrixPlain, Some("blake3:ab12"), Some(10));
+        let plain = described(MediaKind::MatrixPlain, None, Some(10));
+        assert!(is_same_matrix_description(&plain_done, &plain));
     }
 }

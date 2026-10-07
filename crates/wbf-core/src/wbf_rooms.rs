@@ -174,28 +174,6 @@ impl Core {
             .await
     }
 
-    /// 這個房間現在加密了就拒絕：**路徑版**的送檔（`send_file`）還沒有加密那條；加密房的附件走資料平面（`attachment_ops.rs`）。明文的 `Event/Send` 不該進加密房。
-    ///
-    /// Return:
-    ///     Ok(())       沒加密
-    ///     Err(Usage)   加密了
-    pub(crate) async fn wbf_refuse_if_encrypted(
-        &self,
-        account: &AccountDir,
-        room: &str,
-    ) -> Result<(), CoreError> {
-        if self.wbf_is_room_encrypted(account, room).await? {
-            return Err(CoreError::new(
-                CoreErrorKind::Usage,
-                format!(
-                    "{room} is encrypted, and wbf accounts cannot send files there yet: this path sends a plaintext \
-                     attachment over Event/Send, and encrypted attachments are not wired (/docs/design/keys/e2ee-rpc.md §8)"
-                ),
-            ));
-        }
-        Ok(())
-    }
-
     /// 這個房間現在加密了嗎。
     ///
     /// Return:
@@ -223,7 +201,7 @@ impl Core {
     }
 
     /// `Event/Send` 一則事件（明文 content），附件在 meta 裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
-    /// 🚫 不檢查加不加密：呼叫端先過 [`Core::wbf_refuse_if_encrypted`]（送檔那條在上傳**之前**就要問，不然白傳）。
+    /// 🚫 不檢查加不加密：呼叫端走 [`Core::wbf_send_message`]（它照加不加密分流），送檔那條在上傳**之前**就要問，不然白傳。
     ///
     /// Args:
     ///     event_type: example: "m.room.message"

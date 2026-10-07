@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio::time::Instant;
-use wbf_sdk::crypto_engine::{OlmEngine, RoomKeyState};
+use wbf_sdk::crypto_engine::{OlmEngine, RoomKeyRotation, RoomKeyState};
 
 use crate::accounts::AccountDir;
 use crate::error::CoreError;
@@ -506,8 +506,12 @@ impl KeyShareTask {
             self.engine.discard_room_key(room).await?;
             want.discard_first = false;
         }
+        // 房間自己設的換金鑰期限（/docs/design/keys/e2ee-rpc.md §3.1）：每次分之前只問 `m.room.encryption` 這一項。
+        // 問不到就這輪不分、留著重試（🚫 當成預設：房主設的可能比較短）；沒有這一項（404）才是預設。
+        let encryption = line.state_event(room, "m.room.encryption", "").await?;
+        let rotation = RoomKeyRotation::of_encryption_content(encryption.as_ref());
         self.engine
-            .distribute_room_key(line, room, &want.members)
+            .distribute_room_key(line, room, &want.members, rotation)
             .await?;
         match self.engine.room_key_state(room).await? {
             RoomKeyState::Ready { .. } => {
@@ -842,6 +846,76 @@ mod tests {
             "the 95th message still used the first key"
         );
         assert_ne!(session_of(95), first, "the 96th used the replacement");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 房主在 `m.room.encryption` 設的期限（/docs/design/keys/e2ee-rpc.md §3.1）：照它建、照它換，提早換的門檻跟著縮
+    /// （8 則 → 剩 2 則就換：第 6 則送完就換）；原本照預設建的那把，下一次準備（UI 進房的 refresh）看到期限變了就先丟掉、照新的建。
+    #[tokio::test]
+    async fn the_rooms_own_rotation_period_is_read_and_a_changed_one_replaces_the_key() {
+        let dir = scratch("key-share-room-rotation");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let misc = encrypted_room_on_misc(&core, &account).await;
+        let keys = line_on_fake_server(&core, &account, LinkRole::Keys).await;
+        let session_now = || async {
+            match room_key_state(&core, &account).await {
+                RoomKeyState::Ready { session_id, .. } => Some(session_id),
+                RoomKeyState::NotReady { .. } => None,
+            }
+        };
+        core.send_text(ROOM, "0", &send_options("r-0"), &Target::default())
+            .await
+            .unwrap();
+        let by_default = session_now().await.expect("ready after the first send");
+
+        keys.room_is_encrypted.store(true, Ordering::SeqCst);
+        *keys.encryption_content.lock().unwrap() =
+            serde_json::json!({ "algorithm": "m.megolm.v1.aes-sha2", "rotation_period_msgs": 8 });
+        core.prepare_room_key(&account, ROOM, 7, vec![ME.to_string()])
+            .await;
+        wait_for_async(
+            || async {
+                session_now()
+                    .await
+                    .is_some_and(|session| session != by_default)
+            },
+            "the key made under the default period was replaced",
+        )
+        .await;
+        let by_room = session_now().await.unwrap();
+
+        for position in 1..=6 {
+            core.send_text(
+                ROOM,
+                &position.to_string(),
+                &send_options(&format!("r-{position}")),
+                &Target::default(),
+            )
+            .await
+            .unwrap();
+        }
+        wait_for_async(
+            || async {
+                session_now()
+                    .await
+                    .is_some_and(|session| session != by_room)
+            },
+            "with 8 messages per key, the background replaced it after the 6th",
+        )
+        .await;
+        core.send_text(ROOM, "7", &send_options("r-7"), &Target::default())
+            .await
+            .unwrap();
+        let sent = misc.sent_events.lock().unwrap().clone();
+        let session_of = |index: usize| {
+            serde_json::from_slice::<serde_json::Value>(&sent[index].4).unwrap()["session_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(session_of(0), by_default);
+        assert!((1..=6).all(|index| session_of(index) == by_room));
+        assert_ne!(session_of(7), by_room, "the 7th used the replacement");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

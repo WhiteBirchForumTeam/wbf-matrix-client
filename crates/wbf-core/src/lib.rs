@@ -71,6 +71,8 @@ mod link_keeper;
 pub mod link_pool;
 mod link_requests;
 mod login_ops;
+mod matrix_download;
+mod matrix_upload;
 mod media_ops;
 mod media_stream;
 mod misc_ops;
@@ -95,7 +97,7 @@ use wbf_sdk::Unlock;
 pub use account_ops::{AccountStatus, SwitchResult, WhoAmI};
 pub use accounts::AccountSummary;
 use accounts::{AccountDir, DataDirMap};
-pub use attachment_ops::NewUpload;
+pub use attachment_ops::{CreatedUpload, NewUpload};
 pub use backend_choice::{get_backend_for, BackendKind, MethodHome};
 pub use backup_ops::{BackupStatusReport, ImportResult, RecoveryStateReport, UploadResult};
 pub use error::{CoreError, CoreErrorKind};
@@ -105,8 +107,8 @@ pub use link_keeper::EnsuredLinks;
 pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{
-    DirectDownloadResult, ExportedMedia, MediaGcReport, MediaJob, MediaRef, MediaStats, OpenedMedia,
-    QueuedMedia,
+    DeletedMedia, DirectDownloadResult, ExportedMedia, MediaGcReport, MediaJob, MediaRef,
+    MediaStats, OpenedMedia, QueuedMedia,
 };
 pub use media_stream::{MediaSource, MediaStream};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
@@ -229,6 +231,8 @@ pub struct Core {
     >,
     /// 同一台 server 的同一個 mxc 現在由哪個帳號的下載處理端在寫：主檔與 seek 暫存檔是同 server 的帳號共用的，一個檔只能有一個寫入者。
     pub(crate) media_claims: std::sync::Arc<download_queue::MediaClaims>,
+    /// 正在下載的傳統格式附件（`matrix_download.rs`，/docs/design/media/media-download.md §12）：一個檔一個 task，同 server 同 mxc 只有一個。
+    pub(crate) matrix_transfers: std::sync::Arc<matrix_download::MatrixTransfers>,
     /// 這個程序裡掃過池的 server dir（第一次起下載處理端時掃一次，/docs/design/media/media-download.md §4.3）。
     pub(crate) media_swept: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// 「該開的線都開著嗎」的鉤子正在跑一輪（`link_keeper.rs`）：同時只跑一輪，後到的跳過（PR #61 審查 salvia／cirno 🟢）。
@@ -258,6 +262,7 @@ impl Core {
             crypto_engines: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             downloaders: std::sync::Mutex::new(std::collections::HashMap::new()),
             media_claims: std::sync::Arc::default(),
+            matrix_transfers: std::sync::Arc::default(),
             media_swept: std::sync::Mutex::new(std::collections::HashSet::new()),
             ensuring_links: std::sync::atomic::AtomicBool::new(false),
         }

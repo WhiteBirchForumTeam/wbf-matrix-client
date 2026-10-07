@@ -506,3 +506,135 @@ async fn the_matrix_sdk_client_keeps_only_state_and_crypto_on_disk() {
     logout(&session).await.expect("logout");
     let _ = std::fs::remove_dir_all(&store_dir);
 }
+
+/// 一般 Matrix 帳號的傳統上傳（/docs/design/rpc-specs/data-plane.md §7.2），走 matrix-sdk 的 Client 那條路（本機 wbfuwunel 登入一定走 wbf，
+/// 所以直接 `MatrixBackend::login`）：明文房、加密房各傳一個（上限、`/create`、串流 `/upload`）、當標準附件送出（加密房 matrix-sdk 用 Megolm）、
+/// 歷史裡讀回來是同一個檔，再照事件下載回來、整檔一樣（加密的 hash 對得上）。
+/// 另要 `WBF_E2E_ROOM`（明文房）與 `WBF_E2E_ENCRYPTED_ROOM`（加密房），帳號都已經加入。
+#[tokio::test]
+#[ignore]
+async fn a_traditional_upload_goes_into_plain_and_encrypted_rooms_and_downloads_back() {
+    use wbf_sdk::chat::{ChatBackend, MatrixAttachment};
+    use wbf_sdk::event_json::{matrix_file_message_content, messages_from_incoming};
+    use wbf_sdk::matrix_media::{
+        create_matrix_media, get_upload_size_limit, stream_matrix_media, upload_matrix_media,
+    };
+    use wbf_sdk::media_kind::{MediaKind, Verification};
+    let (Some(target), Some(plain_room), Some(encrypted_room)) =
+        (target(), env("WBF_E2E_ROOM"), env("WBF_E2E_ENCRYPTED_ROOM"))
+    else {
+        eprintln!("skipped: WBF_E2E_SERVER / USER / PASSWORD_FILE / ROOM / ENCRYPTED_ROOM not set");
+        return;
+    };
+    let store_dir = std::env::temp_dir().join(format!("wbf-e2e-up-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let key = wbf_sdk::vault::Key32([6u8; 32]);
+    let (backend, session) = wbf_sdk::backend::matrix_sdk::MatrixBackend::login(
+        &target.server,
+        &target.user,
+        &target.password,
+        "wbf-e2e-traditional-upload",
+        &store_dir,
+        &key,
+        false,
+    )
+    .await
+    .expect("matrix-sdk login");
+    backend
+        .sync_once(None, std::time::Duration::ZERO)
+        .await
+        .expect("sync_once");
+    let limit = get_upload_size_limit(&session.server, &session.access_token)
+        .await
+        .expect("media config");
+    eprintln!("m.upload.size = {limit:?}");
+    let body: Vec<u8> = (0..150_003u32)
+        .map(|position| (position % 249) as u8)
+        .collect();
+    for (room, encrypted) in [(&plain_room, false), (&encrypted_room, true)] {
+        assert_eq!(
+            backend
+                .is_room_encrypted(room)
+                .await
+                .expect("encryption state"),
+            encrypted,
+            "{room}"
+        );
+        let mxc = create_matrix_media(&session.server, &session.access_token)
+            .await
+            .expect("media create");
+        let upload = wbf_sdk::MatrixUpload {
+            server: session.server.clone(),
+            user_id: session.user_id.clone(),
+            mxc: mxc.clone(),
+            name: "traditional.bin".into(),
+            mimetype: Some("application/octet-stream".into()),
+            size: body.len() as u64,
+            encrypted,
+        };
+        let manifest = upload_matrix_media(
+            &session.server,
+            &session.access_token,
+            &upload,
+            &mut &body[..],
+        )
+        .await
+        .expect("upload");
+        let content = matrix_file_message_content(&manifest, Some("e2e")).expect("content");
+        let event_id = backend
+            .send_message_content(room, content)
+            .await
+            .expect("send");
+        // 歷史裡讀回來：標準附件、同一個 mxc、同一種格式（加密房是 matrix-sdk 解開自己送的那則）。
+        let page = backend.history(room, None, 10).await.expect("history");
+        let messages = messages_from_incoming(room, &page.events);
+        let sent = messages
+            .iter()
+            .find(|message| message.id == event_id)
+            .unwrap_or_else(|| panic!("{event_id} is in the history of {room}"));
+        let attachment: MatrixAttachment = match &sent.kind {
+            wbf_sdk::MessageKind::MatrixFile {
+                attachment,
+                caption,
+            } => {
+                assert_eq!(caption.as_deref(), Some("e2e"));
+                attachment.clone()
+            }
+            other => panic!("{room}: {other:?}"),
+        };
+        let kind = match encrypted {
+            true => MediaKind::MatrixEncrypted,
+            false => MediaKind::MatrixPlain,
+        };
+        assert_eq!(
+            (attachment.mxc.as_str(), attachment.kind),
+            (mxc.as_str(), kind)
+        );
+        // 照事件下載回來。
+        let (sink, mut pieces) = tokio::sync::mpsc::channel(4);
+        let collecting = tokio::spawn(async move {
+            let mut all = Vec::new();
+            while let Some(piece) = pieces.recv().await {
+                all.extend(piece);
+            }
+            all
+        });
+        let end = stream_matrix_media(&session.server, &session.access_token, &attachment, &sink)
+            .await
+            .expect("download");
+        drop(sink);
+        assert_eq!(
+            collecting.await.unwrap(),
+            body,
+            "{room}: the same bytes came back"
+        );
+        let verified = match encrypted {
+            true => Verification::Matched,
+            false => Verification::Unknown,
+        };
+        assert_eq!(end.verified, verified, "{room}");
+    }
+    drop(backend);
+    logout(&session).await.expect("logout");
+    let _ = std::fs::remove_dir_all(&store_dir);
+}

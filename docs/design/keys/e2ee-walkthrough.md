@@ -84,7 +84,7 @@ matrix-sdk 的 `room.send` 在裡面依序做：
 - matrix-sdk 帳號：`MatrixBackend::send_text` → `room.send`，①–⑧ 全在 matrix-sdk 裡，送之前 `sync_once`。
 - wbf 帳號：sdk `encrypt_and_send` 只在本機做⑤的「建／換 session、排好要送的」、再加密、⑦ 是原生 `Event/Send`（`0x14/0x02`）帶 `room_version`；
   ②③與⑤的「送出去」走橋、在後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1），送訊息🚫 等它（維護者 2026-10-05）；② 的「誰髒了」改成房間版本號（§16、/docs/design/keys/e2ee-rpc.md §3）。
-  加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5、§6）：附件宣告跟密文同一個 `Event/Send`。還沒做：路徑版送檔進加密房（/docs/design/keys/e2ee-rpc.md §8）。
+  加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5、§6）：附件宣告跟密文同一個 `Event/Send`。路徑版的 `room.send_file` 一樣帶 `room_devices` 進加密房（/docs/design/keys/e2ee-rpc.md §3）。
 
 ## 4. Bob 的 B1 收到並解開 Alice 的訊息
 
@@ -227,7 +227,8 @@ matrix-sdk 帳號：每一步都在 matrix-sdk 的 `Client` 裡走 HTTP。wbf �
 | 金鑰備份 | `/room_keys/*` | 橋 `0x17 0x30`–`0x3D` | 還沒做：wbf 帳號沒接（/docs/design/keys/e2ee-rpc.md §8） |
 | 簽章上傳、交叉簽章金鑰 | `/keys/signatures/upload`、`/keys/device_signing/upload` | 橋 `0x17 0x25`、`0x24`（換金鑰要 UIAA） | 還沒做：交叉簽章（/docs/design/keys/e2ee-rpc.md §8） |
 
-還沒做的，照 /docs/design/keys/e2ee-rpc.md §8 列一次：路徑版送檔進加密房（資料平面那條可以）；wbf 帳號的金鑰備份與「向自己其他裝置要金鑰」；房間自己設的換金鑰期限（`rotation_period_*`）；交叉簽章（分享策略仍是 `AllDevices`）。
+還沒做的，照 /docs/design/keys/e2ee-rpc.md §8 列一次：wbf 帳號的金鑰備份與「向自己其他裝置要金鑰」；交叉簽章（分享策略仍是 `AllDevices`）。
+（2026-10-07 做完：路徑版送檔進加密房、房間自己設的換金鑰期限 `rotation_period_*`、`room.history` 讀到未解的再試一次、CLI 送加密房。）
 
 ## 13. server 補齊之後：只把 matrix-sdk-crypto 當狀態機用，行不行
 

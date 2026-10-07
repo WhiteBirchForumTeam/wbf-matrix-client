@@ -2,13 +2,15 @@
 //!
 //! `media.create` 只建檔、鑄 URL：bytes 走資料平面的 PUT（`data_plane.rs`，/docs/design/rpc-specs/data-plane.md）。
 //! 下載是每帳號一個下載處理端（/docs/design/media/media-download.md）：`media.download` 排、`media.open` 排並鑄讀的 URL（`GET /media`）、
-//! `media.queue` 問、`media.cancel` 停；`media.export_to` 沒有就排、等完成、整檔驗過才寫到 UI 給的 URI。
+//! `media.queue` 問、`media.cancel` 停、`media.delete_local` 清；`media.export_to` 沒有就排、等完成才寫到 UI 給的 URI。
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use wbf_core::{Core, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest};
+use wbf_core::{
+    Core, CoreErrorKind, CreatedUpload, ExportedMedia, MediaRef, NewUpload, SyncMode, UploadRequest,
+};
 use wbf_sdk::local_source::local_path_of_file_uri;
 use wbf_sdk::Manifest;
 
@@ -40,24 +42,34 @@ pub(super) async fn media_create(handle: &Handle, core: &Core, params: Value) ->
             "this daemon has no data plane (it was not started with -s), so nothing could receive the bytes".into(),
         ));
     };
+    // wbf 帳號建分塊上傳、一般 Matrix 帳號建傳統上傳（/docs/design/rpc-specs/data-plane.md §7.2）：core 照帳號分。
     let upload = core
-        .create_upload(&params.upload, &handle.target(&params.target))
+        .create_media_upload(&params.upload, &handle.target(&params.target))
         .await?;
     let encrypted = handle.is_encryption_enforced();
-    let url_key = keys.to_upload_url_key(&upload.mxc, encrypted)?;
+    let url_key = keys.to_upload_url_key(upload.mxc(), encrypted)?;
+    let mxc = upload.mxc().to_string();
+    // 傳統上傳沒有上傳 id（server 那邊只有 mxc）。
+    let upload_id = match &upload {
+        CreatedUpload::Chunked(chunked) => Some(chunked.upload_id),
+        CreatedUpload::Matrix(_) => None,
+    };
     let meta = keys.to_upload_meta(
         &UploadMeta {
-            upload: upload.clone(),
+            upload,
             source_uri: params.source_uri,
         },
         encrypted,
     )?;
-    Ok(json!({
-        "upload_id": upload.upload_id,
-        "mxc": upload.mxc,
+    let mut reply = json!({
+        "mxc": mxc,
         "url": format!("http://127.0.0.1:{data_port}{UPLOAD_PATH}{url_key}"),
         "headers": { UPLOAD_META_HEADER: meta },
-    }))
+    });
+    if let (Some(upload_id), Some(fields)) = (upload_id, reply.as_object_mut()) {
+        fields.insert("upload_id".into(), json!(upload_id));
+    }
+    Ok(reply)
 }
 
 pub(super) async fn upload_file(handle: &Handle, core: &Core, params: Value) -> Outcome {
@@ -180,7 +192,7 @@ pub(super) async fn media_info(handle: &Handle, core: &Core, params: Value) -> O
     )
 }
 
-/// 要哪個檔：三種說法剛好給一種（/docs/design/media/media-download.md §7.1）。
+/// 要哪個檔：三種說法剛好給一種（/docs/design/media/media-download.md §7.1）；從訊息點下載的那種可以多帶 `mxc`（要是那則的附件）。
 #[derive(Deserialize)]
 struct MediaRefParams {
     #[serde(default)]
@@ -204,12 +216,16 @@ async fn media_ref_of(
 ) -> Result<MediaRef, Fail> {
     match (params.mxc, params.room, params.event_id, params.manifest) {
         (Some(mxc), None, None, None) => Ok(MediaRef::Mxc(mxc)),
-        (None, Some(room), Some(event_id), None) => Ok(MediaRef::Event { room, event_id }),
+        (mxc, Some(room), Some(event_id), None) => Ok(MediaRef::Event {
+            room,
+            event_id,
+            mxc,
+        }),
         (None, None, None, Some(manifest)) => Ok(MediaRef::Manifest(
             manifest_for_this_session(handle, core, manifest, target).await?,
         )),
         _ => Err(invalid_params(
-            "give exactly one of: mxc, room + event_id, manifest",
+            "give exactly one of: mxc, room + event_id (mxc optional), manifest",
         )),
     }
 }
@@ -281,6 +297,21 @@ pub(super) async fn media_cancel(handle: &Handle, core: &Core, params: Value) ->
     Ok(json!({ "cancelled": cancelled }))
 }
 
+/// 清掉一個 mxc 在本地的一切（池檔、半成品、`media` 列），先取消這台 server 上所有正在下載它的（/docs/design/media/media-download.md §7.4）。
+pub(super) async fn media_delete_local(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        mxc: String,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    to_result(
+        core.del_local_media(&params.mxc, &handle.target(&params.target))
+            .await?,
+    )
+}
+
 /// 匯出（/docs/design/media/media-download.md §7.3）：明文落地是**使用者要的**（/docs/design/rpc-specs/local-interface.md §8）。
 /// `to` 是 URI，意義跟 `media.create` 的 `source_uri` 同一套（/docs/design/rpc-specs/data-plane.md §8.1）：現在只收 `file://`；
 /// `http://`（daemon 用 PUT 丟給 UI，維護者 2026-10-02）之後才做。
@@ -309,14 +340,25 @@ pub(super) async fn media_export_to(handle: &Handle, core: &Core, params: Value)
         )));
     };
     let media = media_ref_of(handle, core, params.media, &params.target).await?;
-    let exported = core
+    let exported = match core
         .export_media_to(
             &media,
             &path,
             params.no_cache,
             &handle.target(&params.target),
         )
-        .await?;
+        .await
+    {
+        Ok(exported) => exported,
+        // 匯了、但沒驗過或驗不過（1501）：`data` 要跟成功時的 `result` 一字不差，補上 `to`（/docs/design/rpc-specs/rpc-spec.md §5.3）。
+        Err(mut error) if error.kind == CoreErrorKind::Unverified => {
+            if let Some(Value::Object(fields)) = error.data.as_mut() {
+                fields.insert("to".to_string(), json!(params.to));
+            }
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     to_result(Exported {
         to: &params.to,
         media: exported,

@@ -59,36 +59,57 @@ pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
 
 /// 開好一個 wbf 帳號（session 封好、`m/` 的 crypto store 建好，跟 login 一樣）。
 pub(crate) async fn core_with_wbf_account(dir: &std::path::Path) -> (Core, AccountDir) {
+    core_with_account_on(dir, DEAD, SessionBackend::WbfSdk).await
+}
+
+/// 同上，server 與 backend 自己給（例：傳統下載要一台真的回 HTTP 的假 server；一般 Matrix 帳號是 `MatrixSdkClient`）。
+pub(crate) async fn core_with_account_on(
+    dir: &std::path::Path,
+    server: &str,
+    backend: SessionBackend,
+) -> (Core, AccountDir) {
     wbf_sdk::vault::Vault::create(dir, &wbf_sdk::Unlock::NoPassphrase).unwrap();
     let core = Core::open(dir);
     core.unlock(None).unwrap();
+    let account = add_account_on(&core, dir, server, ME, backend).await;
+    crate::accounts::write_current(dir, &account).unwrap();
+    (core, account)
+}
+
+/// 在已經解鎖的 core 裡多開一個帳號（同一台 server 就共用 `cache.db` 與池）；🚫 改 current。
+pub(crate) async fn add_account_on(
+    core: &Core,
+    dir: &std::path::Path,
+    server: &str,
+    user: &str,
+    backend: SessionBackend,
+) -> AccountDir {
     let vault = core.vault().unwrap();
-    let account = AccountDir::locate(dir, &vault.account_dir_key(), DEAD, ME).unwrap();
+    let account = AccountDir::locate(dir, &vault.account_dir_key(), server, user).unwrap();
     std::fs::create_dir_all(&account.dir).unwrap();
     vault
         .seal_session(
             &account.session_path(),
             &Session {
-                server: DEAD.to_string(),
-                user_id: ME.to_string(),
+                server: server.to_string(),
+                user_id: user.to_string(),
                 device_id: "DEV".to_string(),
                 access_token: "syt_memory".to_string(),
                 store_dir: None,
-                backend: Some(SessionBackend::WbfSdk),
+                backend: Some(backend),
             },
         )
         .unwrap();
-    crate::accounts::write_current(dir, &account).unwrap();
     // wbf 帳號登入時就有 crypto store（login_ops::create_crypto_store_for）；引擎本身丟掉，`olm_engine_of` 要用再開。
     wbf_sdk::crypto_engine::OlmEngine::open(
         &account.matrix_store_dir(),
         &vault.matrix_store_key(),
-        ME,
+        user,
         "DEV",
     )
     .await
     .unwrap();
-    (core, account)
+    account
 }
 
 /// 橋 `Members` 的 body：房裡只有自己。假 server 的橋不存金鑰（查什麼都回空的），所以裝置雜湊是「沒有任何金鑰」的那個值。
@@ -101,6 +122,33 @@ pub(crate) fn members_body(room_version: u64) -> Value {
         }],
         "org.wbftw.room_version": room_version
     })
+}
+
+/// 兩條記憶體對接的線放進池裡：`Misc`（房間狀態、送事件）與 `Upload`（上傳）。各是一台假 server，狀態不共用——
+/// 送事件那台不驗 mxc，所以附件宣告只看它帶了什麼。房間版本號 7、成員只有自己。
+pub(crate) async fn misc_and_upload(
+    core: &Core,
+    account: &AccountDir,
+    encrypted: bool,
+) -> (FakeServer, FakeServer) {
+    let (misc_client, misc) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+    let (upload_client, upload) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+    let pool = core.pool_of_account(account).unwrap();
+    drop(
+        pool.acquire(LinkRole::Misc, || async move { Ok(misc_client) })
+            .await
+            .unwrap(),
+    );
+    drop(
+        pool.acquire(LinkRole::Upload, || async move { Ok(upload_client) })
+            .await
+            .unwrap(),
+    );
+    misc.room_is_encrypted
+        .store(encrypted, std::sync::atomic::Ordering::SeqCst);
+    *misc.members.lock().unwrap() = Some(members_body(7));
+    *misc.current_room_version.lock().unwrap() = Some(7);
+    (misc, upload)
 }
 
 /// 一條放進池裡的 `Keys` 線（記憶體對接的假 server）：refresh 走這條（/docs/design/keys/e2ee-rpc.md §3.1），
@@ -259,6 +307,8 @@ pub(crate) struct FakeServer {
     pub(crate) members: Arc<Mutex<Option<Value>>>,
     /// 橋 `GetStateEvent` 問 `m.room.encryption` 時：true 回 megolm 的 content，false 回 404（沒加密）。
     pub(crate) room_is_encrypted: Arc<std::sync::atomic::AtomicBool>,
+    /// 加密時 `m.room.encryption` 的 content（預設只有 megolm 的 `algorithm`；測換金鑰期限時加 `rotation_period_*`）。
+    pub(crate) encryption_content: Arc<Mutex<Value>>,
     /// `Event/Send`：學 server 的 F4——設了就是這個房目前的房間版本號，加密事件帶的號碼對不上就 1506（帶目前的號碼）。
     pub(crate) current_room_version: Arc<Mutex<Option<u64>>>,
     /// `Event/Send` 收下的：(room_id, type, room_version, txn_id, content)。
@@ -335,6 +385,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let hellos_t = hellos.clone();
     let members: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let room_is_encrypted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let encryption_content = Arc::new(Mutex::new(json!({ "algorithm": "m.megolm.v1.aes-sha2" })));
+    let encryption_content_t = encryption_content.clone();
     let current_room_version: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let sent_events: SentEvents = Arc::new(Mutex::new(Vec::new()));
     let sent_attachments: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -385,7 +437,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     error.flags |= flags::IS_BRIDGED;
                     error
                 } else {
-                    bridged_reply(&pack, &members_t, &encrypted_t)
+                    bridged_reply(&pack, &members_t, &encrypted_t, &encryption_content_t)
                 };
                 peer.sink.send(reply.encode().unwrap()).await.unwrap();
                 continue;
@@ -667,6 +719,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         hellos,
         members,
         room_is_encrypted,
+        encryption_content,
         current_room_version,
         sent_events,
         sent_attachments,
@@ -816,6 +869,7 @@ fn bridged_reply(
     pack: &Pack,
     members: &Arc<Mutex<Option<Value>>>,
     room_is_encrypted: &Arc<std::sync::atomic::AtomicBool>,
+    encryption_content: &Arc<Mutex<Value>>,
 ) -> Pack {
     let reply = |subtype: u8, meta: Value, data: Vec<u8>| Pack {
         kind: Kind::Control,
@@ -852,7 +906,7 @@ fn bridged_reply(
         }
     } else if is(BRIDGE_STATE_EVENT) {
         if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
-            ok(json!({ "algorithm": "m.megolm.v1.aes-sha2" }))
+            ok(encryption_content.lock().unwrap().clone())
         } else {
             rejected("NotFound", 1501, 404, "M_NOT_FOUND")
         }
@@ -867,7 +921,7 @@ fn bridged_reply(
         if room_is_encrypted.load(std::sync::atomic::Ordering::SeqCst) {
             state.push(
                 json!({ "type": "m.room.encryption", "state_key": "", "sender": ME,
-                               "content": { "algorithm": "m.megolm.v1.aes-sha2" } }),
+                               "content": encryption_content.lock().unwrap().clone() }),
             );
         }
         ok(Value::Array(state))
@@ -1012,4 +1066,43 @@ pub(crate) async fn next_message(seen: &mut tokio::sync::broadcast::Receiver<Cor
     })
     .await
     .expect("a room.message arrives")
+}
+
+/// 這個 mxc 的 `media.download` 推播照帳號分好，等到 `users` 每個都收到結束的那一則（`complete`／`cancelled`／`failed`），最多 10 秒。
+pub(crate) async fn states_by_user_until_each_ends(
+    events: &mut tokio::sync::broadcast::Receiver<CoreEvent>,
+    mxc: &str,
+    users: &[&str],
+) -> std::collections::HashMap<String, Vec<crate::event::DownloadState>> {
+    use crate::event::DownloadState;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut seen: std::collections::HashMap<String, Vec<DownloadState>> =
+            std::collections::HashMap::new();
+        let ended = |states: &Vec<DownloadState>| {
+            states.last().is_some_and(|state| {
+                matches!(
+                    state,
+                    DownloadState::Complete | DownloadState::Cancelled | DownloadState::Failed
+                )
+            })
+        };
+        loop {
+            if users.iter().all(|user| seen.get(*user).is_some_and(&ended)) {
+                return seen;
+            }
+            if let Ok(CoreEvent::MediaDownload {
+                user,
+                mxc: event_mxc,
+                state,
+                ..
+            }) = events.recv().await
+            {
+                if event_mxc == mxc {
+                    seen.entry(user).or_default().push(state);
+                }
+            }
+        }
+    })
+    .await
+    .expect("every account hears how the download ended")
 }

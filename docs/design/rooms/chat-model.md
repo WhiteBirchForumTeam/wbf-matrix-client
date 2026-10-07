@@ -131,6 +131,7 @@ pub struct Message {
 pub enum MessageKind {
     Text { body: String, formatted: Option<Formatted> },
     File { attachment: Attachment, caption: Option<String> },     // 我們的分塊檔；圖片影片也是 File，用 mimetype 分
+    MatrixFile { attachment: MatrixAttachment, caption: Option<String> },  // 標準 Matrix 附件（m.file／m.image／m.video／m.audio），下方「傳統附件」
     Deleted { by: PeerId, reason: Option<String> },
     System(SystemEvent),                  // 誰加入、改名、改權限…；UI 印成一行灰字
     Undecryptable,                        // 解不開的加密事件：跟 Deleted 一樣是明確的記號（decrypted: false 帶原因）
@@ -144,12 +145,40 @@ pub struct Attachment {
     pub block: ChunkedBlock,              // /docs/design/media/wbf-client-convention-for-chunk.md §5 的區塊，含 key；就是 manifest 的 block
 }
 
+pub struct MatrixAttachment {
+    pub msgtype: String,                  // "m.image"…
+    pub mxc: String,
+    pub kind: MediaKind,                  // 2＝有 file（加密）、3＝只有 url（/docs/design/rpc-specs/data-plane.md §7.1）
+    pub name: Option<String>, pub mimetype: Option<String>, pub size: Option<u64>,
+    pub file: Option<serde_json::Value>,  // kind 2：事件裡的 EncryptedFile 原樣，含金鑰
+}
+
 pub struct Edit { pub at: Timestamp, pub by: PeerId }
 pub struct Reaction { pub key: String, pub by: Vec<PeerId> }
 pub struct Formatted { pub html: String }          // 第一版只收不產：我們送純文字，收到別人的 HTML 就帶著
 pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: PeerId }, Kicked{..}, Banned{..},
                        NameChanged{..}, TopicChanged{..}, PowerLevelChanged{..}, EncryptionEnabled, Pinned{..}, Other(String) }
 ```
+
+**傳統附件**（`MatrixFile`，維護者 2026-10-06）：別的 client（Element…）送的標準附件。`kind` 看**事件內容**，🚫 看帳號：有 `file` 是 2，只有 `url` 是 3。
+`file` 欄位不齊（不是 `v2`、少 `key`／`iv`／`hashes.sha256`／`url`）→ 🚫 退回當成 `url` 的明文，整則當 `Unsupported`（fail closed）。
+`name` 取 `filename`，沒有就取 `body`；`filename` 在而且跟 `body` 不一樣時，`body` 是說明文字（`caption`）。下載與讀取照 /docs/design/media/media-download.md §12。
+JSON（實際跑 `event_json::message_from_json` 印出的 `kind`，金鑰換成 `<…>`）：
+
+```jsonc
+// m.image 帶 file：kind 2
+{ "kind": "matrix_file",
+  "attachment": { "msgtype": "m.image", "mxc": "mxc://matrix.org/AbCdEf", "kind": 2, "name": "cat.png", "mimetype": "image/png", "size": 81234,
+                  "file": { "hashes": { "sha256": "<sha256 base64>" }, "iv": "<iv>",
+                            "key": { "alg": "A256CTR", "ext": true, "k": "<key>", "key_ops": ["encrypt", "decrypt"], "kty": "oct" },
+                            "url": "mxc://matrix.org/AbCdEf", "v": "v2" } } }
+// m.file 只有 url，filename 跟 body 不一樣：kind 3、body 成了 caption
+{ "kind": "matrix_file",
+  "attachment": { "msgtype": "m.file", "mxc": "mxc://matrix.org/GhIjKl", "kind": 3, "name": "report.pdf", "size": 5000 },
+  "caption": "see the report" }
+```
+
+`room.history` 的 `types` 篩選（CLI 的 `read --type`）收 `matrix_file`，或它的 `msgtype`（`m.image`…）。
 
 ### 2.4 權限：維持 Matrix 的 power level，不自己搞一套（維護者定）
 
@@ -222,7 +251,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | 我們 | Matrix 事件 |
 |---|---|
 | `Text` | `m.room.message`，`msgtype: m.text`，`body`；有 `formatted_body` 就進 `Formatted` |
-| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5），路徑版送檔進加密房還沒接（/docs/design/keys/e2ee-rpc.md §8）。**別人的 `m.file`／`m.image`（標準附件，AES-CTR）：第一版當 `Unsupported`，印 type 與 `body`**，下載標準附件是之後的事 |
+| `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5）或路徑版 `room.send_file`，兩條都帶 `room_devices`（/docs/design/keys/e2ee-rpc.md §3）。別人的 `m.file`／`m.image`／`m.video`／`m.audio`（標準附件，AES-CTR 或明文）是 `MatrixFile`（§2.3），下載照 /docs/design/media/media-download.md §12 |
 | `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（/docs/design/messages/edits-and-redactions.md §2、§6，維護者 2026-09-14） |
@@ -356,7 +385,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
 - 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
 
-還沒做：送 edit／delete／reaction／reply、建房、邀請、角色、置頂、已讀送出、裝置驗證、標準附件下載、`Unread`、`Tag`、`DeviceTrust`。
+還沒做：送 edit／delete／reaction／reply、建房、邀請、角色、置頂、已讀送出、裝置驗證、`Unread`、`Tag`、`DeviceTrust`。
 
 ## 7. 還開著的（再議）
 

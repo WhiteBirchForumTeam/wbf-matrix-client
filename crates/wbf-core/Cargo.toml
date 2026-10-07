@@ -19,4 +19,6 @@ hex = "0.4"
 wbf-wire = { path = "../wbf-wire" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync", "macros", "rt"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "net"] }
+# 測傳統加密附件的下載（matrix_download.rs）：用上游的加密器造「Element 會送的那種檔」。跟 wbf-sdk 同一份。
+matrix-sdk-crypto = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk-crypto" }
