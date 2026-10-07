@@ -563,3 +563,39 @@ async fn sweep_resets_missing_files_and_removes_what_nobody_claims() {
     assert!(pool.list_pending().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `media.delete_local` 的那一半（/docs/design/media/media-download.md §7.4）：暫存檔還有人在寫就整個拒、什麼都🚫 動；
+/// 放手之後半成品與列都刪掉；本來就沒有是 false。
+#[test]
+fn deleting_a_local_copy_refuses_while_it_is_being_written_and_then_takes_everything() {
+    let dir = scratch("del-local");
+    let (mut cache, pool) = open_cache_and_pool(&dir);
+    let mxc = "mxc://fake/del";
+    let description = MediaDescription {
+        kind: wbf_sdk::media_kind::MediaKind::WbfChunked,
+        name: None,
+        mimetype: None,
+        hash: None,
+        file_size: Some(200_000),
+        chunk_size: Some(CHUNK),
+    };
+    cache.media_begin(mxc, &description).unwrap();
+    let name = cache.media_pending_name(mxc).unwrap().unwrap();
+    let mut writer = pool.create_pending(&name, mxc).unwrap();
+    writer.write_all(&sample(70_000, 1)).unwrap();
+    drop(writer);
+    assert!(!pool.list_pending().unwrap().is_empty());
+    let busy: HashSet<String> = [name.clone()].into();
+    let error = media::del_local_copy(&mut cache, &pool, mxc, &busy).unwrap_err();
+    assert!(matches!(error, SdkError::Usage(_)), "{error:?}");
+    assert!(cache.find_media(mxc).unwrap().is_some(), "the row is kept");
+    assert!(
+        !pool.list_pending().unwrap().is_empty(),
+        "the unfinished file is kept"
+    );
+    assert!(media::del_local_copy(&mut cache, &pool, mxc, &HashSet::new()).unwrap());
+    assert!(cache.find_media(mxc).unwrap().is_none());
+    assert!(pool.list_pending().unwrap().is_empty());
+    assert!(!media::del_local_copy(&mut cache, &pool, mxc, &HashSet::new()).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
