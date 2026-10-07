@@ -298,6 +298,30 @@ impl<C: PackChannel> WbfClient<C> {
         protocol::expect_bridge_reply(&request, response)
     }
 
+    /// 走橋叫一支房間相關的 Matrix 端點（/docs/design/rooms/room-actions.md §2）：變數先照橋的規則驗（`matrix_endpoint::check_variables`），body 原樣送、原樣收。
+    /// 一般 Matrix 帳號走同一張表的 HTTP 那條（`matrix_endpoint::call_over_http`），兩條回的 body 一樣。
+    ///
+    /// Args:
+    ///     endpoint: example: matrix_endpoint::LEAVE
+    ///     variables: path 與 query 變數, example: {"room_id": "!r:localhost"}
+    ///     body: POST／PUT 的 body；沒給送 `{}`, example: Some(&json!({"reason": "bye"}))
+    /// Return:
+    ///     Ok(Value)       Matrix 端點回的 body（空的當 `{}`）
+    ///     Err(Usage)      變數或 body 不合規則；沒 hello 或 server 沒宣告 bridge
+    ///     Err(Server)     帶 Matrix 的 `status`／`errcode`
+    ///     Err(Protocol)   body 不是 JSON
+    pub async fn call_matrix_endpoint(
+        &mut self,
+        endpoint: &crate::matrix_endpoint::MatrixEndpoint,
+        variables: &serde_json::Map<String, serde_json::Value>,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, SdkError> {
+        crate::matrix_endpoint::check_variables(endpoint, variables)?;
+        let body = crate::matrix_endpoint::encode_body(endpoint, body)?;
+        let reply = self.call_bridge(endpoint.bridge, variables, body).await?;
+        crate::matrix_endpoint::decode_reply_body(endpoint, &reply.body)
+    }
+
     /// 一個房間的房間版本號與每個已加入成員的裝置版本號（走橋的 `Members`，只要 `join` 的）。
     /// 送加密訊息前、與收到 1506 之後都靠它（wbfuwunel 的 `/docs/design/wbf-room-device-version.md` §5、§7.2）。
     ///

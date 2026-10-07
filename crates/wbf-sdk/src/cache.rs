@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use crate::chat::{Conversation, Message, MessageKind, Reaction, RoomListEntry};
+use crate::chat::{Conversation, Membership, Message, MessageKind, Reaction, RoomListEntry};
 use crate::chunk_block::ChunkedBlock;
 use crate::error::SdkError;
 use crate::event_json::{kind_from_content, FILE_MSGTYPE};
@@ -34,7 +34,8 @@ pub const CACHE_FILE_NAME: &str = "cache.db";
 /// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）；
 /// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、🚫 刪列，維護者 2026-10-05）。
 /// v9：`media.kind`、`media.verified`；`file_size`、`chunk_size` 只有 `kind` 1 一定有（維護者 2026-10-06，/docs/design/media/media-download.md §12）。
-const SCHEMA_VERSION: i64 = 9;
+/// v10：`room_list.joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，維護者 2026-10-07，/docs/design/rooms/room-actions.md §3）。
+const SCHEMA_VERSION: i64 = 10;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,7 +255,8 @@ impl Cache {
     // ---- room_list ----
 
     /// 拿回來的房間的樣子（一人一列；`Conversation` 是他看到的樣子）：整份蓋上去、記下什麼時候拿的。
-    /// 🚫 動 `joined`：加入了沒只由 [`Cache::record_joined_rooms`]（`room.list`）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設加入。
+    /// 🚫 動 `membership`：在不在房裡只由 [`Cache::record_joined_rooms`]（`room.list`）與房間動作（[`Cache::record_membership`]）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設 `join`。
+    /// 這份沒帶狀態（`state` 是 `null`，一般 Matrix 帳號的列表）就留著本地那份的 `state`：🚫 拿「這次沒問」蓋掉「上次問過的」。
     pub fn upsert_conversations(
         &mut self,
         user_id: &str,
@@ -266,9 +268,14 @@ impl Cache {
         {
             let mut insert = transaction
                 .prepare_cached(
-                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, joined) VALUES (?1, ?2, ?3, ?4, 1)
+                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership) VALUES (?1, ?2, ?3, ?4, 'join')
                      ON CONFLICT(user, room) DO UPDATE SET conversation_json = excluded.conversation_json,
                        refreshed_at = excluded.refreshed_at",
+                )
+                .map_err(db_error)?;
+            let mut stored = transaction
+                .prepare_cached(
+                    "SELECT conversation_json FROM room_list WHERE user = ?1 AND room = ?2",
                 )
                 .map_err(db_error)?;
             // 🚨 **只准 0 → 1，🚫 不准 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
@@ -281,11 +288,22 @@ impl Cache {
                 .map_err(db_error)?;
             for conversation in conversations {
                 let room = room_row_id(&transaction, &conversation.id)?;
+                let mut conversation = conversation.clone();
+                if conversation.state.is_none() {
+                    let previous: Option<Option<String>> = stored
+                        .query_row(params![user, room], |row| row.get(0))
+                        .optional()
+                        .map_err(db_error)?;
+                    conversation.state = previous
+                        .flatten()
+                        .and_then(|json| serde_json::from_str::<Conversation>(&json).ok())
+                        .and_then(|previous| previous.state);
+                }
                 insert
                     .execute(params![
                         room,
                         user,
-                        serde_json::to_string(conversation).map_err(|error| {
+                        serde_json::to_string(&conversation).map_err(|error| {
                             crate::error::cannot_serialize("Conversation", error)
                         })?,
                         now,
@@ -300,8 +318,8 @@ impl Cache {
     }
 
     /// server 說這個帳號加入了哪些房（`room.list`，維護者 2026-10-05）：跟本地比對差異。
-    /// 新的加一列（樣子是 NULL，等 `room.get`）；已經有的🚫 覆寫它的樣子，退出過又回來的標回加入；
-    /// 本地標加入、名單裡卻沒有的標 `joined = 0`，🚫 刪列。
+    /// 新的加一列（樣子是 NULL，等 `room.get`）；已經有的🚫 覆寫它的樣子，不是 `join` 的標回 `join`；
+    /// 本地是 `join`、名單裡卻沒有的標 `leave`，🚫 刪列。別的身分（`invite`、`knock`、`ban`）不在名單裡本來就對，🚫 動。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -317,8 +335,8 @@ impl Cache {
         {
             let mut insert = transaction
                 .prepare_cached(
-                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, joined) VALUES (?1, ?2, NULL, NULL, 1)
-                     ON CONFLICT(user, room) DO UPDATE SET joined = 1",
+                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership) VALUES (?1, ?2, NULL, NULL, 'join')
+                     ON CONFLICT(user, room) DO UPDATE SET membership = 'join'",
                 )
                 .map_err(db_error)?;
             for room_id in room_ids {
@@ -330,7 +348,9 @@ impl Cache {
         // 剛剛上面加的也在裡面，下面用 `joined_now` 濾掉。
         let marked_joined: Vec<i64> = {
             let mut statement = transaction
-                .prepare_cached("SELECT room FROM room_list WHERE user = ?1 AND joined = 1")
+                .prepare_cached(
+                    "SELECT room FROM room_list WHERE user = ?1 AND membership = 'join'",
+                )
                 .map_err(db_error)?;
             let rows = statement
                 .query_map(params![user], |row| row.get::<_, i64>(0))
@@ -339,7 +359,9 @@ impl Cache {
         };
         {
             let mut mark_left = transaction
-                .prepare_cached("UPDATE room_list SET joined = 0 WHERE user = ?1 AND room = ?2")
+                .prepare_cached(
+                    "UPDATE room_list SET membership = 'leave' WHERE user = ?1 AND room = ?2",
+                )
                 .map_err(db_error)?;
             for room in marked_joined
                 .into_iter()
@@ -371,18 +393,24 @@ impl Cache {
             .map(Option::flatten)
     }
 
-    /// 這個帳號現在加入的房（`joined = 1`），本地知道多少給多少（`room.list`）。
+    /// 這個帳號在這幾種身分裡的房，本地知道多少給多少（`room.list`；預設只問 `join`）。
     ///
+    /// Args:
+    ///     memberships: 要哪幾種；空的就是一個都不要, example: &[Membership::Join]
     /// Return:
     ///     Ok(Vec<RoomListEntry>)   照名稱排（還沒拿過的、沒名字的在前），同名照 id；
-    ///                              還沒拿過、或那份樣子解不開（/docs/design/storage/local-cache-db.md §1：壞資料當沒有）的，只有 id 與 `rooms.encrypted`
-    pub fn list_room_entries(&self, user_id: &str) -> Result<Vec<RoomListEntry>, SdkError> {
+    ///                              還沒拿過、或那份樣子解不開（/docs/design/storage/local-cache-db.md §1：壞資料當沒有）的，只有 id、身分與 `rooms.encrypted`
+    pub fn list_room_entries(
+        &self,
+        user_id: &str,
+        memberships: &[Membership],
+    ) -> Result<Vec<RoomListEntry>, SdkError> {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT r.room_id, l.conversation_json, l.refreshed_at, r.encrypted FROM room_list l
+                "SELECT r.room_id, l.conversation_json, l.refreshed_at, r.encrypted, l.membership FROM room_list l
                    JOIN users u ON u.id = l.user JOIN rooms r ON r.id = l.room
-                 WHERE u.mxid = ?1 AND l.joined = 1",
+                 WHERE u.mxid = ?1",
             )
             .map_err(db_error)?;
         let rows = statement
@@ -392,19 +420,29 @@ impl Cache {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<bool>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .map_err(db_error)?;
         let mut entries: Vec<RoomListEntry> = Vec::new();
         for row in rows {
-            let (room_id, json, refreshed_at, room_is_encrypted) = row.map_err(db_error)?;
+            let (room_id, json, refreshed_at, room_is_encrypted, membership) =
+                row.map_err(db_error)?;
+            // CHECK 擋著不認得的字；真的讀到了就當壞資料跳過（🚫 猜成哪一種）。
+            let Some(membership) = Membership::find_by_name(&membership) else {
+                continue;
+            };
+            if !memberships.contains(&membership) {
+                continue;
+            }
             let fetched = json.and_then(|json| serde_json::from_str::<Conversation>(&json).ok());
             let mut entry = match fetched {
                 Some(conversation) => RoomListEntry::from_conversation(
                     conversation,
+                    membership,
                     refreshed_at.and_then(|millis| u64::try_from(millis).ok()),
                 ),
-                None => RoomListEntry::unknown(&room_id),
+                None => RoomListEntry::unknown(&room_id, membership),
             };
             entry.encrypted = known_encryption(entry.encrypted, room_is_encrypted);
             entries.push(entry);
@@ -450,6 +488,215 @@ impl Cache {
         // 房間說加密就是加密（`known_encryption` 同一條）。
         conversation.encrypted |= room_is_encrypted == Some(true);
         Ok(Some(conversation))
+    }
+
+    /// 建房時就知道的「加不加密」（`room.create` 收到 ACK、`sync=both`）：寫進 `rooms.encrypted`，只升不降（同 `upsert_conversations`）。
+    /// `room.send_text` 只信這一格，建完馬上能送靠的就是它（/docs/design/rooms/room-actions.md §3）。
+    ///
+    /// Args:
+    ///     room_id: example: "!abc:localhost"
+    ///     encrypted: example: true
+    pub fn record_room_encryption(
+        &mut self,
+        room_id: &str,
+        encrypted: bool,
+    ) -> Result<(), SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let room = room_row_id(&transaction, room_id)?;
+        transaction
+            .execute(
+                "UPDATE rooms SET encrypted = CASE WHEN encrypted = 1 THEN 1 ELSE ?2 END WHERE id = ?1",
+                params![room, encrypted],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)
+    }
+
+    /// 房間動作收到 server 的 ACK 之後（`sync=both`），記這個帳號在這間房的身分（/docs/design/rooms/room-actions.md §3）。列不在就加一列（樣子是 NULL，等 `room.get`）。
+    ///
+    /// Args:
+    ///     user_id: 身分變了的那個帳號（本機登入的）, example: "@bob:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     membership: example: Membership::Leave
+    ///     only_if_now: 給了就只在目前是它的時候改（解除封鎖：只有 `ban` 才改成 `leave`）；列不在也🚫 加, example: Some(Membership::Ban)
+    /// Return:
+    ///     Ok(true)    寫了
+    ///     Ok(false)   `only_if_now` 對不上，🚫 寫
+    pub fn record_membership(
+        &mut self,
+        user_id: &str,
+        room_id: &str,
+        membership: Membership,
+        only_if_now: Option<Membership>,
+    ) -> Result<bool, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let user = user_row_id(&transaction, user_id)?;
+        let room = room_row_id(&transaction, room_id)?;
+        let written = match only_if_now {
+            None => transaction
+                .execute(
+                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership) VALUES (?1, ?2, NULL, NULL, ?3)
+                     ON CONFLICT(user, room) DO UPDATE SET membership = excluded.membership",
+                    params![room, user, membership.as_str()],
+                )
+                .map_err(db_error)?,
+            Some(now) => transaction
+                .execute(
+                    "UPDATE room_list SET membership = ?3 WHERE room = ?1 AND user = ?2 AND membership = ?4",
+                    params![room, user, membership.as_str(), now.as_str()],
+                )
+                .map_err(db_error)?,
+        };
+        transaction.commit().map_err(db_error)?;
+        Ok(written > 0)
+    }
+
+    /// 自己剛寫了一項房間狀態（`room.set_state` 與它的窄版收到 ACK、`sync=both`，/docs/design/rooms/room-actions.md §3）：
+    /// 自己那一列有拿過狀態就把那一項換進去、重算型別欄位（`room_state::conversation_with_state_event`）；沒拿過就🚫 寫。
+    /// 寫的是 `m.room.encryption`（有演算法）→ `rooms.encrypted = 1`，不管有沒有那一列（房間的事實，只升不降）。
+    /// 其他帳號那一列是它們自己看到的樣子，🚫 動。
+    ///
+    /// Args:
+    ///     user_id: 寫的人, example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     written: 寫的那一項, example: json!({"type": "m.room.name", "state_key": "", "content": {"name": "ops"}, "sender": "@alice:localhost", "event_id": "$n"})
+    /// Return:
+    ///     Ok(true)    自己那一列換好了
+    ///     Ok(false)   自己那一列沒拿過狀態（或那份解不開），只動了 `rooms.encrypted`（如果是加密）
+    pub fn record_written_state(
+        &mut self,
+        user_id: &str,
+        room_id: &str,
+        written: &serde_json::Value,
+    ) -> Result<bool, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let user = user_row_id(&transaction, user_id)?;
+        let room = room_row_id(&transaction, room_id)?;
+        let turns_encryption_on = written["type"].as_str() == Some("m.room.encryption")
+            && written["state_key"].as_str() == Some("")
+            && crate::room_state::is_encryption_content(&written["content"]);
+        if turns_encryption_on {
+            transaction
+                .execute(
+                    "UPDATE rooms SET encrypted = 1 WHERE id = ?1",
+                    params![room],
+                )
+                .map_err(db_error)?;
+        }
+        let stored: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT conversation_json FROM room_list WHERE user = ?1 AND room = ?2",
+                params![user, room],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let previous = stored
+            .flatten()
+            .and_then(|json| serde_json::from_str::<Conversation>(&json).ok());
+        let updated = match previous {
+            Some(previous) => crate::room_state::conversation_with_state_event(
+                &previous,
+                user_id,
+                written.clone(),
+            )?,
+            None => None,
+        };
+        let Some(updated) = updated else {
+            transaction.commit().map_err(db_error)?;
+            return Ok(false);
+        };
+        transaction
+            .execute(
+                "UPDATE room_list SET conversation_json = ?3 WHERE user = ?1 AND room = ?2",
+                params![
+                    user,
+                    room,
+                    serde_json::to_string(&updated)
+                        .map_err(|error| crate::error::cannot_serialize("Conversation", error))?
+                ],
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(true)
+    }
+
+    /// `room.forget` 的本地那半（server 已經 ACK，/docs/design/rooms/room-actions.md §3.1），一個 transaction：
+    /// 刪這個帳號那一列、它的已讀位置、它在這間房的事件可見性；這間房在本機**沒有別的帳號**（沒有 `room_list` 列、也看不到任何一則事件）
+    /// 才刪整間房的紀錄（`rooms` 那一列，事件與已讀跟著 CASCADE），連同「原本只被這間房的事件指著、現在一個連結都不剩」的 `media` 列。
+    /// 🚫 動池檔：列沒了之後沒人指著它，留給掃描（`media::sweep`）。沒綁事件的 `media` 列🚫 動（例：剛傳、事件還沒回來的）。
+    ///
+    /// Args:
+    ///     user_id: example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    /// Return:
+    ///     Ok(true)    整間房的本地紀錄清掉了
+    ///     Ok(false)   只刪了這個帳號的（還有別的帳號看得到這間房），或本地本來就沒有這間房
+    pub fn forget_room(&mut self, user_id: &str, room_id: &str) -> Result<bool, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let Some(room) = transaction
+            .query_row(
+                "SELECT id FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+        else {
+            return Ok(false);
+        };
+        if let Some(user) = find_user_row_id(&transaction, user_id)? {
+            for sql in [
+                "DELETE FROM room_list WHERE user = ?1 AND room = ?2",
+                "DELETE FROM read_positions WHERE user = ?1 AND room = ?2",
+                "DELETE FROM events_synced_log WHERE user = ?1 AND event IN (SELECT id FROM events WHERE room = ?2)",
+            ] {
+                transaction
+                    .execute(sql, params![user, room])
+                    .map_err(db_error)?;
+            }
+        }
+        // 兩個都看（/docs/design/rooms/room-actions.md §3.1）：別的帳號同步過這間房的事件、卻還沒有列，只看 `room_list` 會把它的紀錄一起清掉。
+        let someone_else_is_here: bool = transaction
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM room_list WHERE room = ?1)
+                     OR EXISTS (SELECT 1 FROM events_synced_log l JOIN events e ON e.id = l.event WHERE e.room = ?1)",
+                params![room],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if someone_else_is_here {
+            transaction.commit().map_err(db_error)?;
+            return Ok(false);
+        }
+        let linked_media: Vec<i64> = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT m.media FROM event_media m JOIN events e ON e.id = m.event WHERE e.room = ?1",
+                )
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![room], |row| row.get::<_, i64>(0))
+                .map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)?
+        };
+        transaction
+            .execute("DELETE FROM rooms WHERE id = ?1", params![room])
+            .map_err(db_error)?;
+        {
+            let mut delete_if_unlinked = transaction
+                .prepare(
+                    "DELETE FROM media WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM event_media WHERE media = ?1)",
+                )
+                .map_err(db_error)?;
+            for media in linked_media {
+                delete_if_unlinked
+                    .execute(params![media])
+                    .map_err(db_error)?;
+            }
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(true)
     }
 
     // ---- events ----
@@ -2479,7 +2726,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
                user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                conversation_json TEXT, refreshed_at INTEGER,
-               joined INTEGER NOT NULL DEFAULT 1 CHECK (joined IN (0, 1)),
+               membership TEXT NOT NULL DEFAULT 'join' CHECK (membership IN ('join', 'invite', 'knock', 'leave', 'ban')),
                PRIMARY KEY (user, room)) WITHOUT ROWID;
              CREATE TABLE sync_state (
                user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -2747,6 +2994,7 @@ mod tests {
             my_power_level: 0,
             can_send_message: true,
             direct_peer: None,
+            state: None,
         }
     }
 
@@ -2781,7 +3029,7 @@ mod tests {
             "🚫 不准降回明文"
         );
         assert_eq!(
-            cache.list_room_entries(ALICE).unwrap()[0].encrypted,
+            cache.list_room_entries(ALICE, &[Membership::Join]).unwrap()[0].encrypted,
             Some(true),
             "讀出來也要是加密"
         );
@@ -2819,7 +3067,7 @@ mod tests {
             .upsert_conversations(ALICE, &[room("!r", true)])
             .unwrap();
 
-        let bob_sees = cache.list_room_entries(BOB).unwrap();
+        let bob_sees = cache.list_room_entries(BOB, &[Membership::Join]).unwrap();
         assert_eq!(
             bob_sees[0].encrypted,
             Some(true),
@@ -2845,8 +3093,11 @@ mod tests {
             .record_joined_rooms(ALICE, &["!a".to_string(), "!b".to_string()])
             .unwrap();
         assert_eq!(
-            cache.list_room_entries(ALICE).unwrap(),
-            vec![RoomListEntry::unknown("!a"), RoomListEntry::unknown("!b")],
+            cache.list_room_entries(ALICE, &[Membership::Join]).unwrap(),
+            vec![
+                RoomListEntry::unknown("!a", Membership::Join),
+                RoomListEntry::unknown("!b", Membership::Join)
+            ],
             "only ids until room.get fetches them"
         );
         assert_eq!(cache.find_conversation(ALICE, "!a").unwrap(), None);
@@ -2858,7 +3109,7 @@ mod tests {
         cache
             .record_joined_rooms(ALICE, &["!a".to_string(), "!c".to_string()])
             .unwrap();
-        let listed = cache.list_room_entries(ALICE).unwrap();
+        let listed = cache.list_room_entries(ALICE, &[Membership::Join]).unwrap();
         let ids: Vec<&str> = listed.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -2884,7 +3135,7 @@ mod tests {
             .unwrap();
         assert!(
             cache
-                .list_room_entries(ALICE)
+                .list_room_entries(ALICE, &[Membership::Join])
                 .unwrap()
                 .iter()
                 .all(|entry| entry.id != "!b"),
@@ -2897,13 +3148,221 @@ mod tests {
                 &["!a".to_string(), "!b".to_string(), "!c".to_string()],
             )
             .unwrap();
-        let back = cache.list_room_entries(ALICE).unwrap();
+        let back = cache.list_room_entries(ALICE, &[Membership::Join]).unwrap();
         assert!(
             back.iter()
                 .any(|entry| entry.id == "!b" && entry.encrypted == Some(true)),
             "rejoined, with what was known: {back:?}"
         );
-        assert!(cache.list_room_entries(BOB).unwrap().is_empty());
+        assert!(cache
+            .list_room_entries(BOB, &[Membership::Join])
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 房間動作寫的身分（/docs/design/rooms/room-actions.md §3）：列不在就加、`room.list` 預設只列 `join`、要哪幾種自己挑；
+    /// 加入名單只把 `join` 的標成 `leave`，被邀請、敲門、封鎖的🚫 動；解除封鎖只在目前是 `ban` 時改。
+    #[test]
+    fn memberships_are_recorded_listed_by_kind_and_left_alone_by_the_joined_list() {
+        let (mut cache, dir) = open("memberships");
+        cache
+            .record_joined_rooms(ALICE, &["!a".to_string()])
+            .unwrap();
+        for (room, membership) in [
+            ("!i", Membership::Invite),
+            ("!k", Membership::Knock),
+            ("!b", Membership::Ban),
+        ] {
+            assert!(cache
+                .record_membership(ALICE, room, membership, None)
+                .unwrap());
+        }
+        let ids_in = |cache: &Cache, memberships: &[Membership]| -> Vec<String> {
+            let mut ids: Vec<String> = cache
+                .list_room_entries(ALICE, memberships)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids_in(&cache, &[Membership::Join]), ["!a"]);
+        assert_eq!(
+            ids_in(&cache, &[Membership::Invite, Membership::Ban]),
+            ["!b", "!i"]
+        );
+        assert!(ids_in(&cache, &[]).is_empty());
+        let invited = cache
+            .list_room_entries(ALICE, &[Membership::Invite])
+            .unwrap();
+        assert_eq!(invited[0].membership, Membership::Invite);
+
+        // 加入名單是空的：只有 `join` 的那間變 `leave`。
+        cache.record_joined_rooms(ALICE, &[]).unwrap();
+        assert_eq!(ids_in(&cache, &[Membership::Leave]), ["!a"]);
+        assert_eq!(
+            ids_in(
+                &cache,
+                &[Membership::Invite, Membership::Knock, Membership::Ban]
+            ),
+            ["!b", "!i", "!k"]
+        );
+
+        // 解除封鎖：只有 `ban` 才改成 `leave`；列不在🚫 加。
+        assert!(!cache
+            .record_membership(ALICE, "!i", Membership::Leave, Some(Membership::Ban))
+            .unwrap());
+        assert!(cache
+            .record_membership(ALICE, "!b", Membership::Leave, Some(Membership::Ban))
+            .unwrap());
+        assert!(!cache
+            .record_membership(ALICE, "!never", Membership::Leave, Some(Membership::Ban))
+            .unwrap());
+        assert_eq!(ids_in(&cache, &[Membership::Leave]), ["!a", "!b"]);
+        assert_eq!(cache.count_rows("room_list").unwrap(), 4, "!never 🚫 加列");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一般 Matrix 帳號的列表沒帶狀態（`state: null`）：🚫 拿它蓋掉上次 `room.get` 拿到的狀態。
+    #[test]
+    fn a_conversation_without_state_keeps_the_state_fetched_before() {
+        let (mut cache, dir) = open("keep-state");
+        let state =
+            vec![serde_json::json!({ "type": "m.room.create", "state_key": "", "content": {} })];
+        let fetched = Conversation {
+            state: Some(state.clone()),
+            ..room("!r", false)
+        };
+        cache.upsert_conversations(ALICE, &[fetched]).unwrap();
+        cache
+            .upsert_conversations(
+                ALICE,
+                &[Conversation {
+                    name: Some("new".into()),
+                    ..room("!r", false)
+                }],
+            )
+            .unwrap();
+        let read = cache.find_conversation(ALICE, "!r").unwrap().unwrap();
+        assert_eq!(read.name.as_deref(), Some("new"), "其他欄位照新的");
+        assert_eq!(read.state, Some(state));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自己寫了一項狀態（/docs/design/rooms/room-actions.md §3）：拿過狀態的列換掉那一項、重算；沒拿過的🚫 寫；寫加密一律升 `rooms.encrypted`。
+    #[test]
+    fn a_written_state_event_updates_the_writers_row_and_encryption_marks_the_room() {
+        let (mut cache, dir) = open("written-state");
+        let state = crate::room_state::conversation_from_state(
+            "!r",
+            ALICE,
+            &[
+                serde_json::json!({ "type": "m.room.create", "state_key": "", "sender": ALICE, "content": { "room_version": "10" } }),
+                serde_json::json!({ "type": "m.room.member", "state_key": ALICE, "content": { "membership": "join" } }),
+            ],
+            &[],
+        )
+        .unwrap();
+        cache.upsert_conversations(ALICE, &[state]).unwrap();
+        cache
+            .upsert_conversations(BOB, &[room("!r", false)])
+            .unwrap();
+        let named = serde_json::json!({ "type": "m.room.name", "state_key": "", "sender": ALICE, "event_id": "$n", "content": { "name": "ops" } });
+        assert!(cache.record_written_state(ALICE, "!r", &named).unwrap());
+        let alice_sees = cache.find_conversation(ALICE, "!r").unwrap().unwrap();
+        assert_eq!(alice_sees.name.as_deref(), Some("ops"));
+        assert!(alice_sees.state.unwrap().contains(&named));
+        assert!(
+            !cache.record_written_state(BOB, "!r", &named).unwrap(),
+            "BOB 那份沒拿過狀態"
+        );
+        assert_eq!(
+            cache.find_conversation(BOB, "!r").unwrap().unwrap(),
+            room("!r", false),
+            "別人那份🚫 動"
+        );
+
+        let encryption = serde_json::json!({ "type": "m.room.encryption", "state_key": "",
+                                             "content": { "algorithm": crate::room_state_edit::MEGOLM_ALGORITHM } });
+        assert!(!cache.record_written_state(BOB, "!r", &encryption).unwrap());
+        assert_eq!(
+            cache.find_room_encrypted("!r").unwrap(),
+            Some(true),
+            "沒拿過狀態也升"
+        );
+        assert!(!cache
+            .record_written_state(ALICE, "!never-seen", &encryption)
+            .unwrap());
+        assert_eq!(
+            cache.find_room_encrypted("!never-seen").unwrap(),
+            Some(true)
+        );
+        // 空的 encryption content 不算加密（fail closed 的方向同 is_encryption_content）
+        let empty =
+            serde_json::json!({ "type": "m.room.encryption", "state_key": "", "content": {} });
+        cache.record_written_state(ALICE, "!plain", &empty).unwrap();
+        assert_eq!(cache.find_room_encrypted("!plain").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `room.forget`（/docs/design/rooms/room-actions.md §3.1）：還有別的帳號看得到就只刪自己的；只剩自己才清整間房，
+    /// 連同只被這間房指著的 media 列；別間房也指著的、沒綁事件的🚫 動。
+    #[test]
+    fn forgetting_a_room_clears_its_history_only_when_nobody_else_here_sees_it() {
+        let (mut cache, dir) = open("forget-room");
+        let shared = file("!r", "$f1", 1, "mxc://localhost/aaaa");
+        let forwarded = file("!other", "$f9", 1, "mxc://localhost/bbbb");
+        let here_too = file("!r", "$f2", 2, "mxc://localhost/bbbb");
+        put(&mut cache, ALICE, &[shared.clone(), here_too, forwarded]);
+        put(&mut cache, BOB, std::slice::from_ref(&shared));
+        cache
+            .record_joined_rooms(ALICE, &["!r".to_string()])
+            .unwrap();
+        cache
+            .record_membership(ALICE, "!r", Membership::Leave, None)
+            .unwrap();
+        cache
+            .connection
+            .execute(
+                "INSERT INTO media (mxc, kind, segments_written, complete, bytes_on_disk, created_at, last_used_at, file_size, chunk_size)
+                 VALUES ('mxc://localhost/unlinked', 1, 0, 0, 0, 0, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        // BOB 還看得到 $f1（他沒有列，只有事件）：只刪 ALICE 的。
+        assert!(!cache.forget_room(ALICE, "!r").unwrap());
+        assert!(cache
+            .list_room_entries(ALICE, &[Membership::Leave])
+            .unwrap()
+            .is_empty());
+        assert!(
+            cache.history(ALICE, "!r", None, 10).unwrap().is_empty(),
+            "ALICE 看不到了"
+        );
+        assert_eq!(
+            ids(&cache.files(BOB, "!r", None, 10).unwrap()),
+            ["$f1"],
+            "BOB 的還在"
+        );
+
+        // BOB 也忘了：整間房清掉；aaaa 只被這間房指 → 刪列；bbbb 還被 !other 指 → 留；沒綁事件的 → 留。
+        assert!(cache.forget_room(BOB, "!r").unwrap());
+        assert_eq!(cache.find_room_encrypted("!r").unwrap(), None);
+        assert!(cache.find_media("mxc://localhost/aaaa").unwrap().is_none());
+        assert!(cache.find_media("mxc://localhost/bbbb").unwrap().is_some());
+        assert!(cache
+            .find_media("mxc://localhost/unlinked")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            ids(&cache.files(ALICE, "!other", None, 10).unwrap()),
+            ["$f9"],
+            "別間房🚫 動"
+        );
+        assert!(!cache.forget_room(BOB, "!r").unwrap(), "本地沒有這間房了");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3502,6 +3961,7 @@ mod tests {
             my_power_level: 100,
             can_send_message: true,
             direct_peer: None,
+            state: None,
         };
         cache
             .upsert_conversations(ALICE, std::slice::from_ref(&conversation))
@@ -3513,17 +3973,20 @@ mod tests {
             cache.find_conversation(ALICE, "!r").unwrap(),
             Some(conversation.clone())
         );
-        let listed = cache.list_room_entries(ALICE).unwrap();
+        let listed = cache.list_room_entries(ALICE, &[Membership::Join]).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
             RoomListEntry {
                 refreshed_at: None,
                 ..listed[0].clone()
             },
-            RoomListEntry::from_conversation(conversation, None)
+            RoomListEntry::from_conversation(conversation, Membership::Join, None)
         );
         assert!(listed[0].refreshed_at.is_some());
-        assert!(cache.list_room_entries(BOB).unwrap().is_empty());
+        assert!(cache
+            .list_room_entries(BOB, &[Membership::Join])
+            .unwrap()
+            .is_empty());
         assert_eq!(cache.find_conversation(BOB, "!r").unwrap(), None);
         assert_eq!(cache.count_rows("room_list").unwrap(), 1);
 

@@ -35,6 +35,7 @@ pub(crate) async fn remember_room(core: &Core, account: &AccountDir, room: &str,
         my_power_level: 0,
         can_send_message: true,
         direct_peer: None,
+        state: None,
     };
     cache
         .run(move |cache| cache.upsert_conversations(&me, &[conversation]))
@@ -327,7 +328,25 @@ pub(crate) struct FakeServer {
     pub(crate) fail_next_read: Arc<Mutex<Option<(&'static str, u64)>>>,
     /// 接下來幾個走橋的呼叫回 `Control/Error`（仍記在 `bridge_calls`）：測「後台送金鑰失敗就隔一段時間重試」。
     pub(crate) fail_bridged: Arc<std::sync::atomic::AtomicU32>,
+    /// 房間動作的橋（room_actions.rs 的測試）：收到的請求原樣、寫過的狀態與帳號資料。
+    pub(crate) rooms: Arc<Mutex<FakeRooms>>,
 }
+
+/// 假 server 上房間動作看得到的那一點點狀態。
+#[derive(Debug, Default)]
+pub(crate) struct FakeRooms {
+    /// 房間動作的請求：(kind, subtype, meta, body)，照收到的順序（讀狀態、讀帳號資料🚫 記）
+    pub(crate) requests: Vec<(Kind, u8, Value, Value)>,
+    /// `SetStateEvent` 寫的、`GetStateEvent` 讀的：(event_type, state_key) → content
+    pub(crate) state: std::collections::BTreeMap<(String, String), Value>,
+    /// `SetAccountData` 寫的、`GetAccountData` 讀的：event_type → content
+    pub(crate) account_data: std::collections::BTreeMap<String, Value>,
+    /// 下一個房間動作回 403 `M_FORBIDDEN`（一次性）：測「server 拒了就🚫 寫本地」。
+    pub(crate) forbid_next: bool,
+}
+
+/// 假 server 建的房。
+pub(crate) const CREATED_ROOM: &str = "!created:localhost";
 
 /// `read_permits` 一開始有幾個（測試要卡住就 `acquire_many(READ_PERMITS)` 收走）。
 pub(crate) const READ_PERMITS: u32 = 1 << 20;
@@ -401,6 +420,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let fail_read_t = fail_next_read.clone();
     let fail_bridged = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let fail_bridged_t = fail_bridged.clone();
+    let rooms: Arc<Mutex<FakeRooms>> = Arc::new(Mutex::new(FakeRooms::default()));
+    let rooms_t = rooms.clone();
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -437,7 +458,9 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     error.flags |= flags::IS_BRIDGED;
                     error
                 } else {
-                    bridged_reply(&pack, &members_t, &encrypted_t, &encryption_content_t)
+                    room_action_reply(&pack, &rooms_t).unwrap_or_else(|| {
+                        bridged_reply(&pack, &members_t, &encrypted_t, &encryption_content_t)
+                    })
                 };
                 peer.sink.send(reply.encode().unwrap()).await.unwrap();
                 continue;
@@ -729,7 +752,103 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         corrupt_reads,
         fail_next_read,
         fail_bridged,
+        rooms,
     }
+}
+
+/// 房間動作的橋（`wbf_sdk::matrix_endpoint` 的表）：記下請求、回「形狀對」的答案。
+/// `GetStateEvent`／`GetAccountData` 先看寫過的；沒寫過交給 [`bridged_reply`]（加密那條路的假答案）。
+///
+/// Return:
+///     Some(Pack)   這支是房間動作、答了
+///     None         不是（或沒寫過那一項），交給 `bridged_reply`
+fn room_action_reply(pack: &Pack, rooms: &Arc<Mutex<FakeRooms>>) -> Option<Pack> {
+    use wbf_sdk::matrix_endpoint as endpoints;
+    let meta: Value = serde_json::from_slice(&pack.meta).unwrap_or(Value::Null);
+    let body: Value = serde_json::from_slice(&pack.data).unwrap_or(Value::Null);
+    let is = |endpoint: &endpoints::MatrixEndpoint| {
+        (pack.kind, pack.subtype) == (endpoint.bridge.kind, endpoint.bridge.subtype)
+    };
+    let ack = |answer: Value| Pack {
+        kind: Kind::Control,
+        subtype: control::ACK,
+        flags: flags::IS_RESPONSE | flags::IS_BRIDGED,
+        id: pack.id,
+        seq: pack.seq,
+        meta: json!({ "status": 200 }).to_string().into_bytes(),
+        data: answer.to_string().into_bytes(),
+    };
+    let mut rooms = rooms.lock().unwrap();
+    let key_of = |meta: &Value| {
+        (
+            meta["event_type"].as_str().unwrap_or_default().to_string(),
+            meta["state_key"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    if is(&endpoints::GET_STATE_EVENT) {
+        return rooms.state.get(&key_of(&meta)).cloned().map(ack);
+    }
+    if is(&endpoints::GET_ACCOUNT_DATA) {
+        let event_type = meta["event_type"].as_str().unwrap_or_default();
+        return rooms.account_data.get(event_type).cloned().map(ack);
+    }
+    let answered = [
+        &endpoints::CREATE_ROOM,
+        &endpoints::JOIN,
+        &endpoints::KNOCK,
+        &endpoints::LEAVE,
+        &endpoints::FORGET,
+        &endpoints::INVITE,
+        &endpoints::KICK,
+        &endpoints::BAN,
+        &endpoints::UNBAN,
+        &endpoints::UPGRADE,
+        &endpoints::SET_STATE_EVENT,
+        &endpoints::SET_ACCOUNT_DATA,
+        &endpoints::SUMMARY,
+    ];
+    if !answered.iter().any(|endpoint| is(endpoint)) {
+        return None;
+    }
+    rooms
+        .requests
+        .push((pack.kind, pack.subtype, meta.clone(), body.clone()));
+    if std::mem::take(&mut rooms.forbid_next) {
+        return Some(Pack {
+            kind: Kind::Control,
+            subtype: control::ERROR,
+            flags: flags::IS_RESPONSE | flags::IS_BRIDGED,
+            id: pack.id,
+            seq: pack.seq,
+            meta: json!({ "code": "Forbidden", "code_id": 1302, "errcode": "M_FORBIDDEN",
+                          "message": "You don't have permission", "status": 403 })
+            .to_string()
+            .into_bytes(),
+            data: json!({ "errcode": "M_FORBIDDEN", "error": "You don't have permission" })
+                .to_string()
+                .into_bytes(),
+        });
+    }
+    let answer = if is(&endpoints::CREATE_ROOM) {
+        json!({ "room_id": CREATED_ROOM })
+    } else if is(&endpoints::JOIN) || is(&endpoints::KNOCK) {
+        let asked = meta["room_id_or_alias"].as_str().unwrap_or_default();
+        json!({ "room_id": if asked.starts_with('#') { ROOM } else { asked } })
+    } else if is(&endpoints::UPGRADE) {
+        json!({ "replacement_room": "!upgraded:localhost" })
+    } else if is(&endpoints::SET_STATE_EVENT) {
+        rooms.state.insert(key_of(&meta), body.clone());
+        json!({ "event_id": format!("$state{}", rooms.requests.len()) })
+    } else if is(&endpoints::SET_ACCOUNT_DATA) {
+        let event_type = meta["event_type"].as_str().unwrap_or_default().to_string();
+        rooms.account_data.insert(event_type, body.clone());
+        json!({})
+    } else if is(&endpoints::SUMMARY) {
+        json!({ "room_id": ROOM, "name": FAKE_ROOM_NAME, "num_joined_members": 1 })
+    } else {
+        json!({})
+    };
+    Some(ack(answer))
 }
 
 /// `Download/*` 的回答（wbfuwunel 的 /docs/design/chunked-upload-spec.md §4）：從上傳收下的塊給。

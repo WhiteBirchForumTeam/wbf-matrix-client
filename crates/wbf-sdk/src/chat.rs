@@ -40,6 +40,57 @@ pub struct Conversation {
     pub can_send_message: bool,
     /// `kind == Direct` 才有。
     pub direct_peer: Option<String>,
+    /// 房間狀態本身：成員事件（`m.room.member`）以外的每一項狀態事件，server 給什麼帶什麼（權限的整份內容、置頂清單…，/docs/design/rooms/room-actions.md §5.1）。
+    /// `null` ＝ 這一份沒拿狀態（一般 Matrix 帳號的 `room.list` 是從 Client 的 store 算的），🚫 是「沒有狀態」。
+    #[serde(default)]
+    pub state: Option<Vec<serde_json::Value>>,
+}
+
+/// 一個帳號在一間房裡的身分（Matrix 的 `membership`，/docs/design/rooms/room-actions.md §3）。本地的 `room_list` 一列記一個。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Membership {
+    /// 在裡面
+    Join,
+    /// 被邀請、還沒加入
+    Invite,
+    /// 敲門、等房內的人放行
+    Knock,
+    /// 主動離開，或被踢
+    Leave,
+    /// 被封鎖
+    Ban,
+}
+
+impl Membership {
+    /// Return:
+    ///     &str  Matrix 的寫法, example: "join"
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Membership::Join => "join",
+            Membership::Invite => "invite",
+            Membership::Knock => "knock",
+            Membership::Leave => "leave",
+            Membership::Ban => "ban",
+        }
+    }
+
+    /// Args:
+    ///     text: example: "ban"
+    /// Return:
+    ///     Some(Membership)
+    ///     None              不認得的字
+    pub fn find_by_name(text: &str) -> Option<Membership> {
+        [
+            Membership::Join,
+            Membership::Invite,
+            Membership::Knock,
+            Membership::Leave,
+            Membership::Ban,
+        ]
+        .into_iter()
+        .find(|membership| membership.as_str() == text)
+    }
 }
 
 /// 房間列表的一列（`room.list`，/docs/design/rooms/chat-model.md §2.1）：本地知道多少給多少，不知道的是 `null`。
@@ -56,6 +107,10 @@ pub struct RoomListEntry {
     pub my_power_level: Option<i64>,
     pub can_send_message: Option<bool>,
     pub direct_peer: Option<String>,
+    /// 同 [`Conversation::state`]
+    pub state: Option<Vec<serde_json::Value>>,
+    /// 這個帳號在這間房的身分（本地記的）。
+    pub membership: Membership,
     /// 這一間的樣子是什麼時候拿的（Unix 毫秒）。
     pub refreshed_at: Option<u64>,
 }
@@ -63,9 +118,10 @@ pub struct RoomListEntry {
 impl RoomListEntry {
     /// Args:
     ///     room_id: example: "!abc:localhost"
+    ///     membership: example: Membership::Join
     /// Return:
-    ///     RoomListEntry  只有 id，其他都是 null（加入了、還沒拿過）
-    pub fn unknown(room_id: &str) -> RoomListEntry {
+    ///     RoomListEntry  只有 id 與身分，其他都是 null（還沒拿過）
+    pub fn unknown(room_id: &str, membership: Membership) -> RoomListEntry {
         RoomListEntry {
             id: room_id.to_string(),
             kind: None,
@@ -76,15 +132,19 @@ impl RoomListEntry {
             my_power_level: None,
             can_send_message: None,
             direct_peer: None,
+            state: None,
+            membership,
             refreshed_at: None,
         }
     }
 
     /// Args:
     ///     conversation: 拿回來的那一間
+    ///     membership: example: Membership::Join
     ///     refreshed_at: 什麼時候拿的；沒存進本地的（`sync=server`）給 None, example: Some(1_700_000_000_000)
     pub fn from_conversation(
         conversation: Conversation,
+        membership: Membership,
         refreshed_at: Option<u64>,
     ) -> RoomListEntry {
         RoomListEntry {
@@ -97,6 +157,8 @@ impl RoomListEntry {
             my_power_level: Some(conversation.my_power_level),
             can_send_message: Some(conversation.can_send_message),
             direct_peer: conversation.direct_peer,
+            state: conversation.state,
+            membership,
             refreshed_at,
         }
     }

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::chat::MatrixAttachment;
 use crate::error::SdkError;
 use crate::manifest::{MatrixManifest, MatrixUpload};
+use crate::matrix_endpoint::server_error_of;
 use crate::media_kind::{MediaKind, Verification};
 
 /// 解密、加密一次處理最多這麼多。
@@ -63,7 +64,7 @@ pub async fn stream_matrix_media(
     .await?;
     // 舊 server 沒有驗證過的端點：退到舊的那條（一樣帶 token，server 不要就忽略）。
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        let error = matrix_error_of(response).await;
+        let error = server_error_of(response).await;
         if error.matrix_errcode() != Some("M_UNRECOGNIZED") {
             return Err(error);
         }
@@ -75,7 +76,7 @@ pub async fn stream_matrix_media(
         .await?;
     }
     if !response.status().is_success() {
-        return Err(matrix_error_of(response).await);
+        return Err(server_error_of(response).await);
     }
     let end = match attachment.kind {
         MediaKind::MatrixEncrypted => {
@@ -132,7 +133,7 @@ pub async fn get_upload_size_limit(
     .await?;
     // 舊 server 沒有驗證過的端點：退到舊的那條（跟下載同一個規則）。
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        let error = matrix_error_of(response).await;
+        let error = server_error_of(response).await;
         if error.matrix_errcode() != Some("M_UNRECOGNIZED") {
             return Err(error);
         }
@@ -144,7 +145,7 @@ pub async fn get_upload_size_limit(
         .await?;
     }
     if !response.status().is_success() {
-        return Err(matrix_error_of(response).await);
+        return Err(server_error_of(response).await);
     }
     let config: serde_json::Value = response
         .json()
@@ -173,7 +174,7 @@ pub async fn create_matrix_media(server: &str, access_token: &str) -> Result<Str
         .await
         .map_err(|error| SdkError::Network(format!("media create: {error}")))?;
     if !response.status().is_success() {
-        return Err(matrix_error_of(response).await);
+        return Err(server_error_of(response).await);
     }
     let created: serde_json::Value = response
         .json()
@@ -237,7 +238,7 @@ pub async fn upload_matrix_media<R: AsyncRead + Unpin>(
         (Err(error @ (SdkError::Usage(_) | SdkError::Io(_))), _) => return Err(error),
         (_, Err(error)) => return Err(SdkError::Network(format!("media upload: {error}"))),
         (_, Ok(response)) if !response.status().is_success() => {
-            return Err(matrix_error_of(response).await)
+            return Err(server_error_of(response).await)
         }
         (Err(error), Ok(_)) => return Err(error),
         (Ok(encryption), Ok(_)) => encryption,
@@ -412,33 +413,6 @@ async fn fetch(
         .send()
         .await
         .map_err(|error| SdkError::Network(format!("media download: {error}")))
-}
-
-/// 非 2xx → `Server`，meta 帶 `status` 與（有的話）`errcode`，讓 `is_not_found`、`matrix_errcode` 認得出來。
-async fn matrix_error_of(response: reqwest::Response) -> SdkError {
-    let status = response.status().as_u16();
-    let body = response.bytes().await.unwrap_or_default();
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let errcode = parsed
-        .get("errcode")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string();
-    let message = parsed
-        .get("error")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-    SdkError::Server {
-        code: match errcode.is_empty() {
-            true => format!("HTTP_{status}"),
-            false => errcode.clone(),
-        },
-        message,
-        meta: serde_json::json!({ "status": status, "errcode": errcode }),
-        code_id: None,
-    }
 }
 
 fn body_error(error: reqwest::Error) -> SdkError {

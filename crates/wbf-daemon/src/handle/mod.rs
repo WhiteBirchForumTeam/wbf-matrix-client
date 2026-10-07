@@ -19,6 +19,7 @@ mod accounts;
 mod backup;
 mod local;
 mod media;
+mod room_actions;
 mod rooms;
 
 use std::future::Future;
@@ -366,6 +367,69 @@ impl Handle {
             "room.send_attachment" => Box::pin(rooms::room_send_attachment(self, core, params)),
             "room.history" => Box::pin(rooms::room_history(self, core, params)),
             "room.files" => Box::pin(rooms::room_files(self, core, params)),
+            // 房間動作（/docs/design/rooms/room-actions.md §2）
+            "room.create" => Box::pin(room_actions::room_create(self, core, params)),
+            "room.join" => Box::pin(room_actions::room_join(self, core, params)),
+            "room.knock" => Box::pin(room_actions::room_knock(self, core, params)),
+            "room.leave" => Box::pin(room_actions::room_leave(self, core, params)),
+            "room.forget" => Box::pin(room_actions::room_forget(self, core, params)),
+            "room.invite" => Box::pin(room_actions::room_invite(self, core, params)),
+            "room.kick" => Box::pin(room_actions::room_kick(self, core, params)),
+            "room.ban" => Box::pin(room_actions::room_ban(self, core, params)),
+            "room.unban" => Box::pin(room_actions::room_unban(self, core, params)),
+            "room.upgrade" => Box::pin(room_actions::room_upgrade(self, core, params)),
+            "room.members" => Box::pin(room_actions::room_members(self, core, params)),
+            "room.joined_members" => {
+                Box::pin(room_actions::room_joined_members(self, core, params))
+            }
+            "room.summary" => Box::pin(room_actions::room_summary(self, core, params)),
+            "room.hierarchy" => Box::pin(room_actions::room_hierarchy(self, core, params)),
+            "room.mutual_rooms" => Box::pin(room_actions::room_mutual_rooms(self, core, params)),
+            "room.public_rooms" => Box::pin(room_actions::room_public_rooms(self, core, params)),
+            "room.get_visibility" => {
+                Box::pin(room_actions::room_get_visibility(self, core, params))
+            }
+            "room.set_visibility" => {
+                Box::pin(room_actions::room_set_visibility(self, core, params))
+            }
+            "room.resolve_alias" => Box::pin(room_actions::room_resolve_alias(self, core, params)),
+            "room.set_alias" => Box::pin(room_actions::room_set_alias(self, core, params)),
+            "room.delete_alias" => Box::pin(room_actions::room_delete_alias(self, core, params)),
+            "room.aliases" => Box::pin(room_actions::room_aliases(self, core, params)),
+            "room.get_state" => Box::pin(room_actions::room_get_state(self, core, params)),
+            "room.set_state" => Box::pin(room_actions::room_set_state(self, core, params)),
+            "room.set_name" => Box::pin(room_actions::room_set_name(self, core, params)),
+            "room.set_topic" => Box::pin(room_actions::room_set_topic(self, core, params)),
+            "room.set_avatar" => Box::pin(room_actions::room_set_avatar(self, core, params)),
+            "room.set_canonical_alias" => {
+                Box::pin(room_actions::room_set_canonical_alias(self, core, params))
+            }
+            "room.set_history_visibility" => Box::pin(room_actions::room_set_history_visibility(
+                self, core, params,
+            )),
+            "room.set_join_rule" => Box::pin(room_actions::room_set_join_rule(self, core, params)),
+            "room.set_guest_access" => {
+                Box::pin(room_actions::room_set_guest_access(self, core, params))
+            }
+            "room.enable_encryption" => {
+                Box::pin(room_actions::room_enable_encryption(self, core, params))
+            }
+            "room.set_power_levels" => {
+                Box::pin(room_actions::room_set_power_levels(self, core, params))
+            }
+            "room.pin" => Box::pin(room_actions::room_pin(self, core, params)),
+            "room.get_tags" => Box::pin(room_actions::room_get_tags(self, core, params)),
+            "room.set_tag" => Box::pin(room_actions::room_set_tag(self, core, params)),
+            "room.delete_tag" => Box::pin(room_actions::room_delete_tag(self, core, params)),
+            "room.get_account_data" => {
+                Box::pin(room_actions::room_get_account_data(self, core, params))
+            }
+            "room.set_account_data" => {
+                Box::pin(room_actions::room_set_account_data(self, core, params))
+            }
+            "room.set_direct" => Box::pin(room_actions::room_set_direct(self, core, params)),
+            "account.get_data" => Box::pin(room_actions::account_get_data(self, core, params)),
+            "account.set_data" => Box::pin(room_actions::account_set_data(self, core, params)),
             "sync.recent" => Box::pin(rooms::sync_recent(self, core, params)),
             "upload.file" => Box::pin(media::upload_file(self, core, params)),
             "upload.status" => Box::pin(media::upload_status(self, core, params)),
@@ -846,6 +910,140 @@ mod tests {
             ("backup.import", json!({})),
             ("backup.restore", json!({})),
             ("backup.create_recovery_key", json!({})),
+            // 房間動作（/docs/design/rooms/room-actions.md §2）
+            ("room.create", json!({ "encrypted": true, "name": "ops" })),
+            (
+                "room.join",
+                json!({ "room": "#lobby:localhost", "via": ["localhost"] }),
+            ),
+            ("room.knock", json!({ "room": "!r:localhost" })),
+            (
+                "room.leave",
+                json!({ "room": "!r:localhost", "reason": "bye" }),
+            ),
+            (
+                "room.forget",
+                json!({ "room": "!r:localhost", "sync": "server" }),
+            ),
+            (
+                "room.invite",
+                json!({ "room": "!r:localhost", "user_id": "@b:localhost" }),
+            ),
+            (
+                "room.kick",
+                json!({ "room": "!r:localhost", "user_id": "@b:localhost" }),
+            ),
+            (
+                "room.ban",
+                json!({ "room": "!r:localhost", "user_id": "@b:localhost" }),
+            ),
+            (
+                "room.unban",
+                json!({ "room": "!r:localhost", "user_id": "@b:localhost" }),
+            ),
+            (
+                "room.upgrade",
+                json!({ "room": "!r:localhost", "new_version": "11" }),
+            ),
+            (
+                "room.members",
+                json!({ "room": "!r:localhost", "membership": "join" }),
+            ),
+            ("room.joined_members", json!({ "room": "!r:localhost" })),
+            ("room.summary", json!({ "room": "#lobby:localhost" })),
+            (
+                "room.hierarchy",
+                json!({ "room": "!s:localhost", "limit": 5 }),
+            ),
+            ("room.mutual_rooms", json!({ "user_id": "@b:localhost" })),
+            ("room.public_rooms", json!({ "limit": 5 })),
+            (
+                "room.public_rooms",
+                json!({ "filter": { "generic_search_term": "x" } }),
+            ),
+            ("room.get_visibility", json!({ "room": "!r:localhost" })),
+            (
+                "room.set_visibility",
+                json!({ "room": "!r:localhost", "visibility": "public" }),
+            ),
+            ("room.resolve_alias", json!({ "alias": "#lobby:localhost" })),
+            (
+                "room.set_alias",
+                json!({ "alias": "#lobby:localhost", "room": "!r:localhost" }),
+            ),
+            ("room.delete_alias", json!({ "alias": "#lobby:localhost" })),
+            ("room.aliases", json!({ "room": "!r:localhost" })),
+            (
+                "room.get_state",
+                json!({ "room": "!r:localhost", "event_type": "m.room.name" }),
+            ),
+            (
+                "room.set_state",
+                json!({ "room": "!r:localhost", "event_type": "m.room.name", "content": { "name": "ops" } }),
+            ),
+            (
+                "room.set_name",
+                json!({ "room": "!r:localhost", "name": "ops" }),
+            ),
+            (
+                "room.set_topic",
+                json!({ "room": "!r:localhost", "topic": "t" }),
+            ),
+            (
+                "room.set_avatar",
+                json!({ "room": "!r:localhost", "url": "mxc://x/y" }),
+            ),
+            (
+                "room.set_canonical_alias",
+                json!({ "room": "!r:localhost", "alias": "#a:localhost" }),
+            ),
+            (
+                "room.set_history_visibility",
+                json!({ "room": "!r:localhost", "history_visibility": "joined" }),
+            ),
+            (
+                "room.set_join_rule",
+                json!({ "room": "!r:localhost", "join_rule": "invite" }),
+            ),
+            (
+                "room.set_guest_access",
+                json!({ "room": "!r:localhost", "guest_access": "forbidden" }),
+            ),
+            ("room.enable_encryption", json!({ "room": "!r:localhost" })),
+            (
+                "room.set_power_levels",
+                json!({ "room": "!r:localhost", "events_default": 100 }),
+            ),
+            (
+                "room.pin",
+                json!({ "room": "!r:localhost", "event_id": "$e", "pinned": true }),
+            ),
+            ("room.get_tags", json!({ "room": "!r:localhost" })),
+            (
+                "room.set_tag",
+                json!({ "room": "!r:localhost", "tag": "m.favourite", "order": 0.5 }),
+            ),
+            (
+                "room.delete_tag",
+                json!({ "room": "!r:localhost", "tag": "m.favourite" }),
+            ),
+            (
+                "room.get_account_data",
+                json!({ "room": "!r:localhost", "event_type": "x.y" }),
+            ),
+            (
+                "room.set_account_data",
+                json!({ "room": "!r:localhost", "event_type": "x.y", "content": {} }),
+            ),
+            (
+                "room.set_direct",
+                json!({ "room": "!r:localhost", "user_id": "@b:localhost", "direct": true }),
+            ),
+            ("account.get_data", json!({ "event_type": "m.direct" })),
+            (
+                "account.set_data",
+                json!({ "event_type": "x.y", "content": {} }),
+            ),
         ];
         for (method, params) in cases {
             let response = handle.call(request(method, params)).await;
@@ -896,6 +1094,32 @@ mod tests {
                 json!({ "mxc": "mxc://x/y", "to": "http://127.0.0.1:1/from_ui/mxc/y" }),
             ),
             ("vault.unlock", json!({ "passphrase_base64": "!!" })),
+            // 房間動作：`encrypted` 必填、`sync` 只收 both／server、型別不對（/docs/design/rooms/room-actions.md §1 第 5、7 條）
+            ("room.create", json!({ "name": "ops" })),
+            ("room.create", json!({ "encrypted": "yes" })),
+            (
+                "room.leave",
+                json!({ "room": "!r:localhost", "sync": "local" }),
+            ),
+            ("room.invite", json!({ "room": "!r:localhost" })),
+            (
+                "room.set_name",
+                json!({ "room": "!r:localhost", "name": 7 }),
+            ),
+            (
+                "room.set_state",
+                json!({ "room": "!r:localhost", "event_type": "m.room.name", "content": "ops" }),
+            ),
+            (
+                "room.pin",
+                json!({ "room": "!r:localhost", "event_id": "$e" }),
+            ),
+            ("room.set_power_levels", json!({ "events_default": 100 })),
+            (
+                "room.set_direct",
+                json!({ "room": "!r:localhost", "user_id": "@b:localhost" }),
+            ),
+            ("room.list", json!({ "membership": ["joined"] })),
         ];
         for (method, params) in cases {
             let response = handle.call(request(method, params)).await;

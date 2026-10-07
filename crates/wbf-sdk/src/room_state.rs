@@ -32,7 +32,7 @@ pub fn direct_peers_of_room(m_direct: Option<&Value>, room_id: &str) -> Vec<Stri
     peers
 }
 
-/// 一個房間的狀態 → `Conversation`。
+/// 一個房間的狀態 → `Conversation`。`state` 欄帶成員事件以外的每一項（/docs/design/rooms/room-actions.md §5.1）。
 ///
 /// Args:
 ///     room_id: example: "!r:x"
@@ -48,6 +48,119 @@ pub fn conversation_from_state(
     state: &[Value],
     direct_peers: &[String],
 ) -> Result<Conversation, SdkError> {
+    let member_count = state
+        .iter()
+        .filter(|event| {
+            is_member_event(event)
+                && event.pointer("/content/membership").and_then(Value::as_str) == Some("join")
+        })
+        .count() as u64;
+    let non_member_state = list_non_member_state(state);
+    let members_name = name_from_members(state, me);
+    describe(
+        room_id,
+        me,
+        non_member_state,
+        member_count,
+        direct_peers,
+        members_name,
+    )
+}
+
+/// 自己剛寫了一項狀態（`room.set_state` 收到 ACK、`sync=both`）：把它換進本地那份 `Conversation` 的 `state`，用同一套規則重算型別欄位
+/// （/docs/design/rooms/room-actions.md §3 的 `set_state` 那一列）。成員那幾欄（`member_count`、`direct_peer`）照舊：成員事件不在 `state` 裡。
+///
+/// ⚠️ 名字：房間沒有名字也沒有別名時，名字是用成員湊的（[`name_from_members`]），而成員不在 `state` 裡——
+/// 所以原本就是湊的，照舊；原本是名字或別名、這次把它拿掉了，就變 `None`，下一次 `room.get` 才湊得回來（🚫 留著已經不成立的舊名字）。
+///
+/// Args:
+///     previous: 本地那份（上次 `room.get` 看到的）
+///     me: example: "@alice:x"
+///     written: 這次寫的那項, example: json!({"type": "m.room.name", "state_key": "", "content": {"name": "ops"}, "sender": "@alice:x", "event_id": "$n"})
+/// Return:
+///     Ok(Some(Conversation))   換好、重算好
+///     Ok(None)                 本地那份沒有 `state`（沒拿過狀態）：🚫 能重算，呼叫端別寫
+///     Err(Protocol)            換完之後沒有 `m.room.create`
+pub fn conversation_with_state_event(
+    previous: &Conversation,
+    me: &str,
+    written: Value,
+) -> Result<Option<Conversation>, SdkError> {
+    let Some(previous_state) = &previous.state else {
+        return Ok(None);
+    };
+    if is_member_event(&written) {
+        // 成員事件不在 `state` 裡；改自己的顯示名不動型別欄位。
+        return Ok(Some(previous.clone()));
+    }
+    let (Some(event_type), Some(state_key)) = (
+        written.get("type").and_then(Value::as_str),
+        written.get("state_key").and_then(Value::as_str),
+    ) else {
+        return Err(SdkError::Protocol(
+            "the written state event has no type or state_key".into(),
+        ));
+    };
+    let mut state: Vec<Value> = previous_state
+        .iter()
+        .filter(|event| {
+            !(event["type"].as_str() == Some(event_type)
+                && event["state_key"].as_str() == Some(state_key))
+        })
+        .cloned()
+        .collect();
+    state.push(written);
+    let members_name = match explicit_name(previous_state) {
+        None => previous.name.clone(),
+        Some(_) => None,
+    };
+    let direct_peers: Vec<String> = match previous.kind {
+        ConversationKind::Direct => previous.direct_peer.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
+    describe(
+        &previous.id,
+        me,
+        state,
+        previous.member_count,
+        &direct_peers,
+        members_name,
+    )
+    .map(Some)
+}
+
+/// `Conversation::state` 帶的那一份：成員事件以外的每一項，原樣、照 server 給的順序（一般 Matrix 帳號的 `room.get` 也用它）。
+///
+/// Args:
+///     state: `GetState` 回的狀態事件
+/// Return:
+///     Vec<Value>  沒有就是空的
+pub fn list_non_member_state(state: &[Value]) -> Vec<Value> {
+    state
+        .iter()
+        .filter(|event| !is_member_event(event))
+        .cloned()
+        .collect()
+}
+
+fn is_member_event(event: &Value) -> bool {
+    event["type"].as_str() == Some("m.room.member")
+}
+
+/// 型別欄位怎麼從狀態算（[`conversation_from_state`] 與 [`conversation_with_state_event`] 共用，兩邊不會漂）。
+///
+/// Args:
+///     non_member_state: 成員事件以外的狀態，原樣放進 `state`
+///     members_name: 沒有名字也沒有別名時用的名字（成員湊的）
+fn describe(
+    room_id: &str,
+    me: &str,
+    non_member_state: Vec<Value>,
+    member_count: u64,
+    direct_peers: &[String],
+    members_name: Option<String>,
+) -> Result<Conversation, SdkError> {
+    let state = non_member_state.as_slice();
     let create = find_state(state, "m.room.create", "").ok_or_else(|| {
         SdkError::Protocol(format!("{room_id}: the room state has no m.room.create"))
     })?;
@@ -62,15 +175,6 @@ pub fn conversation_from_state(
         .unwrap_or(0);
     let can_send_message = my_power_level >= needed_to_send;
 
-    let joined: Vec<&Value> = state
-        .iter()
-        .filter(|event| {
-            event["type"].as_str() == Some("m.room.member")
-                && event.pointer("/content/membership").and_then(Value::as_str) == Some("join")
-        })
-        .collect();
-    let member_count = joined.len() as u64;
-
     // /docs/design/rooms/chat-model.md §3.1：m.direct 有它且成員剛好兩個才是 Direct；/docs/design/rooms/chat-model.md §3.2：發訊息的門檻只有 owner（100）達得到才是 Channel。
     let (kind, direct_peer) = if !direct_peers.is_empty() && member_count == 2 {
         (ConversationKind::Direct, direct_peers.first().cloned())
@@ -80,15 +184,7 @@ pub fn conversation_from_state(
         (ConversationKind::Group, None)
     };
 
-    let name = find_state(state, "m.room.name", "")
-        .and_then(|event| event.pointer("/content/name"))
-        .and_then(non_empty_string)
-        .or_else(|| {
-            find_state(state, "m.room.canonical_alias", "")
-                .and_then(|event| event.pointer("/content/alias"))
-                .and_then(non_empty_string)
-        })
-        .or_else(|| name_from_members(state, me));
+    let name = explicit_name(state).or(members_name);
     let topic = find_state(state, "m.room.topic", "")
         .and_then(|event| event.pointer("/content/topic"))
         .and_then(non_empty_string);
@@ -106,7 +202,20 @@ pub fn conversation_from_state(
         my_power_level,
         can_send_message,
         direct_peer,
+        state: Some(non_member_state),
     })
+}
+
+/// 房間自己說的名字：`m.room.name`，沒有就 `m.room.canonical_alias` 的別名。
+fn explicit_name(state: &[Value]) -> Option<String> {
+    find_state(state, "m.room.name", "")
+        .and_then(|event| event.pointer("/content/name"))
+        .and_then(non_empty_string)
+        .or_else(|| {
+            find_state(state, "m.room.canonical_alias", "")
+                .and_then(|event| event.pointer("/content/alias"))
+                .and_then(non_empty_string)
+        })
 }
 
 /// `m.room.encryption` 的 content 算不算「這房加密了」。
@@ -258,7 +367,62 @@ mod tests {
                 my_power_level: 0,
                 can_send_message: true,
                 direct_peer: None,
+                // 只多不少：成員事件以外的每一項原樣帶著（/docs/design/rooms/room-actions.md §5.1）
+                state: Some(state[..5].to_vec()),
             }
+        );
+    }
+
+    /// 自己寫了一項狀態之後，本地那份換掉那一項、用同一套規則重算（/docs/design/rooms/room-actions.md §3）：
+    /// 改權限 → `kind` 與 `can_send_message` 跟著變；成員數照舊；用成員湊的名字照舊，拿掉的名字🚫 留著。
+    #[test]
+    fn a_written_state_event_is_swapped_in_and_the_fields_are_recomputed() {
+        let state = vec![
+            create("@alice:x", "10"),
+            json!({ "type": "m.room.power_levels", "state_key": "", "content": { "users": { "@alice:x": 100 } } }),
+            member("@alice:x", "join", Some("Alice")),
+            member("@bob:x", "join", Some("Bob")),
+            member("@carol:x", "join", None),
+        ];
+        let before = conversation_from_state("!r:x", "@bob:x", &state, &[]).unwrap();
+        assert_eq!(before.name.as_deref(), Some("@carol:x, Alice"));
+        assert!(before.can_send_message);
+
+        let channel = json!({ "type": "m.room.power_levels", "state_key": "", "sender": "@alice:x", "event_id": "$pl",
+                              "content": { "users": { "@alice:x": 100 }, "events_default": 100 } });
+        let after = conversation_with_state_event(&before, "@bob:x", channel.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.kind, ConversationKind::Channel);
+        assert!(!after.can_send_message);
+        assert_eq!(after.member_count, 3, "成員不在 state 裡，成員數照舊");
+        assert_eq!(after.name, before.name, "原本就是成員湊的，照舊");
+        let swapped = after.state.as_ref().unwrap();
+        assert_eq!(swapped.len(), 2, "換掉那一項，🚫 多一份：{swapped:?}");
+        assert!(swapped.contains(&channel));
+
+        let named = json!({ "type": "m.room.name", "state_key": "", "content": { "name": "ops" } });
+        let with_name = conversation_with_state_event(&after, "@bob:x", named)
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_name.name.as_deref(), Some("ops"));
+        let unnamed = json!({ "type": "m.room.name", "state_key": "", "content": {} });
+        let without = conversation_with_state_event(&with_name, "@bob:x", unnamed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(without.name, None, "名字被拿掉了：🚫 留著已經不成立的 ops");
+
+        // 沒拿過狀態的那份（一般 Matrix 帳號的列表）：🚫 能重算。
+        let mut stateless = before.clone();
+        stateless.state = None;
+        assert_eq!(
+            conversation_with_state_event(
+                &stateless,
+                "@bob:x",
+                json!({ "type": "m.room.topic", "state_key": "", "content": {} })
+            )
+            .unwrap(),
+            None
         );
     }
 

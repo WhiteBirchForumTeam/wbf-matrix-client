@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use wbf_sdk::chat::{ChatBackend, Conversation, Message, MessageKind, RoomListEntry};
+use wbf_sdk::chat::{ChatBackend, Conversation, Membership, Message, MessageKind, RoomListEntry};
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::{Cipher, EventPage, IncomingEvent};
 
@@ -86,21 +86,24 @@ pub enum SyncMode {
 }
 
 impl Core {
-    /// 房間列表：加入了哪些房，每一間本地知道多少給多少（/docs/design/rooms/chat-model.md §2.1 的 `RoomListEntry`）。
+    /// 房間列表：這個帳號在哪些房，每一間本地知道多少給多少（/docs/design/rooms/chat-model.md §2.1 的 `RoomListEntry`）。
     /// wbf 帳號上網只問 `JoinedRooms`（一個請求），每一間的樣子是 UI 對看得到的房間叫 [`Core::conversation`] 拿的（維護者 2026-10-05）。
     ///
+    /// Args:
+    ///     memberships: 要哪幾種身分的房（/docs/design/rooms/room-actions.md §3）；UI 沒給就是 `[Join]`, example: &[Membership::Join]
     /// Return:
     ///     Ok(Vec<RoomListEntry>)   `Local`／`Both`：本地讀的（`Both` 先把加入名單的差異寫進去）；
-    ///                              `Server`：上游說的、🚫 寫庫（wbf 帳號只有 id）
+    ///                              `Server`：上游說的、🚫 寫庫（wbf 帳號只有 id）——server 只答「加入了哪些」，沒要 `Join` 就是空的
     pub async fn list_rooms(
         &self,
         sync: SyncMode,
+        memberships: &[Membership],
         target: &Target,
     ) -> Result<Vec<RoomListEntry>, CoreError> {
         let account = self.account_or_current(target)?;
         if sync == SyncMode::Local {
             let (cache, me) = self.server_cache_and_me(&account)?;
-            let entries = cache.read().await.list_room_entries(&me)?;
+            let entries = cache.read().await.list_room_entries(&me, memberships)?;
             return Ok(entries);
         }
         // wbf 帳號只拿名單；一般 Matrix 帳號的 Client 一次 /sync 就有每一間的樣子，拿到了就一起記。
@@ -120,13 +123,16 @@ impl Core {
         };
         if sync == SyncMode::Server {
             // 🚫 看一眼不寫庫。
+            if !memberships.contains(&Membership::Join) {
+                return Ok(Vec::new());
+            }
             let mut entries: Vec<RoomListEntry> = joined
                 .iter()
-                .map(|room| RoomListEntry::unknown(room))
+                .map(|room| RoomListEntry::unknown(room, Membership::Join))
                 .collect();
             for conversation in fetched {
                 if let Some(entry) = entries.iter_mut().find(|entry| entry.id == conversation.id) {
-                    *entry = RoomListEntry::from_conversation(conversation, None);
+                    *entry = RoomListEntry::from_conversation(conversation, Membership::Join, None);
                 }
             }
             return Ok(entries);
@@ -140,7 +146,7 @@ impl Core {
                 cache.record_joined_rooms(&me_here, &joined)
             })
             .await?;
-        let entries = cache.read().await.list_room_entries(&me)?;
+        let entries = cache.read().await.list_room_entries(&me, memberships)?;
         Ok(entries)
     }
 
@@ -163,10 +169,31 @@ impl Core {
             let fetched = if self.is_wbf_account(&account)? {
                 self.wbf_conversation(&account, room).await?
             } else {
-                self.synced_backend_of(&account, target.server_backup)
+                let mut conversation = self
+                    .synced_backend_of(&account, target.server_backup)
                     .await?
                     .conversation(room)
-                    .await?
+                    .await?;
+                // Client 的 store 算的型別欄位照舊；狀態本身另外問一次（只多不少，/docs/design/rooms/room-actions.md §5.1）。
+                let state = self
+                    .call_matrix_endpoint(
+                        &wbf_sdk::matrix_endpoint::GET_STATE,
+                        serde_json::Map::from_iter([(
+                            "room_id".to_string(),
+                            serde_json::json!(room),
+                        )]),
+                        None,
+                        target,
+                    )
+                    .await?;
+                let state = state.as_array().ok_or_else(|| {
+                    CoreError::new(
+                        CoreErrorKind::Server,
+                        format!("{room}: GetState did not answer a list"),
+                    )
+                })?;
+                conversation.state = Some(wbf_sdk::room_state::list_non_member_state(state));
+                conversation
             };
             if sync == SyncMode::Server {
                 return Ok(fetched);

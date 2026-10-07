@@ -23,7 +23,11 @@ pub async fn rooms_command(context: &Context) -> Result<(), CoreError> {
     // wbf 帳號的列表只問加入了哪些房，沒拿過的那幾間除了 id 都是 null（/docs/design/rooms/chat-model.md §2.1）。
     let conversations = context
         .core()?
-        .list_rooms(SyncMode::Both, &context.target())
+        .list_rooms(
+            SyncMode::Both,
+            &[wbf_sdk::chat::Membership::Join],
+            &context.target(),
+        )
         .await?;
     print_value(&conversations)
 }
