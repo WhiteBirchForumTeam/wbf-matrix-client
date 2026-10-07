@@ -78,7 +78,8 @@ pub struct Conversation {
 **房間列表與單一房間分開拿**（維護者 2026-10-05）：daemon 是中間層，照 UI 的指令做，🚫 一個命令替 UI 做完所有事。
 
 - `room.list` 只問 server「加入了哪些房」（wbf 帳號是一個 `JoinedRooms`），跟本地比對差異：新的加一列、樣子先空著；拿過的🚫 覆寫；
-  退出的標起來（`room_list.joined = 0`），🚫 刪列。回給 UI 的是本地知道多少給多少：
+  退出的標起來（`room_list.membership = leave`），🚫 刪列（刪列只有 `room.forget`）。每列記這個帳號在這間房的身分（join／invite／knock／leave／ban，/docs/design/rooms/room-actions.md §3），
+  `room.list` 預設只列 `join` 的、要別的自己挑。回給 UI 的是本地知道多少給多少：
 
   ```rust
   pub struct RoomListEntry {          // 欄位跟 Conversation 同名，不知道的是 null
@@ -91,10 +92,12 @@ pub struct Conversation {
       pub my_power_level: Option<i64>,
       pub can_send_message: Option<bool>,
       pub direct_peer: Option<PeerId>,
+      pub state: Option<Vec<StateEvent>>,  // 同 Conversation.state
+      pub membership: Membership,     // 這個帳號在這間房的身分（本地記的）
       pub refreshed_at: Option<u64>,  // 這一間的樣子什麼時候拿的；null ＝ 還沒拿過（這時 name 的 null 是「不知道」）
   }
   ```
-- `room.get` 拿**一間**的樣子（wbf 帳號是那一間的 `GetState` ＋ `m.direct`）。UI 對看得到、還沒名字的房間自己叫它（一千間房、畫面上十間，就叫十次），
+- `room.get` 拿**一間**的樣子（wbf 帳號是那一間的 `GetState` ＋ `m.direct`），只多不少：型別欄位之外多帶 `state`（成員事件以外的每一項狀態事件原樣，權限、置頂都在裡面，/docs/design/rooms/room-actions.md §5.1）。UI 對看得到、還沒名字的房間自己叫它（一千間房、畫面上十間，就叫十次），
   拿回來的寫進本地、轉給 UI，下一次 `room.list` 就帶著。點進房間也是叫它。
 - 送文字只看本地記的「加不加密」，所以要先 `room.get` 過那間房（/docs/design/keys/e2ee-rpc.md §7）。
 
@@ -215,6 +218,9 @@ pub trait Backend {
 }
 ```
 
+房間動作（建房、加入、退出、忘記、邀請、踢人、封鎖、改狀態、改權限、置頂…）的權威在 /docs/design/rooms/room-actions.md：不在這個 trait 裡、也🚫 分帳號種類各寫一份——
+一張端點表兩條路（wbf 帳號走橋、一般 Matrix 帳號走同一個 HTTP 端點，`wbf_sdk::matrix_endpoint`），參數與結果照 Matrix 原樣（維護者 2026-10-07）。
+
 `send_file` 收的是 `Attachment`：上傳是 `wbf-sdk` 現有的 `WbfClient` 做的，**與 Backend 無關**。這條線畫在這裡是刻意的：
 之後換自己的協定，上傳那半邊已經是我們的了。
 
@@ -230,12 +236,14 @@ Matrix 沒有「DM」型別，只有慣例：建房時 `is_direct: true`，雙�
 - `kind == Direct` 的條件：`m.direct` 裡有它，**且**已加入的成員剛好兩個。不滿足就當 Group，不猜。
 - 同一個 peer 有多個 Direct：取最近有訊息的那個當「這個人的對話」，其他照列但 `direct_peer` 一樣填；UI 可以合併顯示。
   **不**自動退出多的那些（那是使用者的資料）。
-- `create(Direct, invite=[p])`：先找既有的，有就回它，沒有才建（`is_direct: true`，加寫 `m.direct`）。這是 Telegram 的「一個人一個聊天」。
-- 還沒做：多個 Direct 的挑選與合併、`create`。
+- 建 Direct（`room.create { is_direct: true, invite: [p] }`）**一律建新房**，順便把「`p` → 這間房」寫進自己的 `m.direct`；🚫 先找既有的（維護者 2026-10-07：daemon 🚫 替 UI 串動作）。
+  「一個人一個聊天」要不要沿用舊房是 UI 從房間列表判斷的事（/docs/design/rooms/room-actions.md §1 第 2、3 條）。之後要改自己的 `m.direct` 叫 `room.set_direct`（/docs/design/rooms/room-actions.md §2.5）。
+- 還沒做：多個 Direct 的挑選與合併。
 
 ### 3.2 Channel：底層 do nothing，用原生邏輯達到功能（維護者定）
 
 不自己蓋 channel、不加任何 state 事件。UI 建「channel」時只是把 room 包裝成：`events_default` 設到只有 owner 達得到（100）、其他成員預設 0。
+那是 UI 自己的兩步：`room.create` 之後 `room.set_power_levels { events_default: 100 }`；daemon 🚫 認得「channel」、🚫 檢查值（維護者 2026-10-07，/docs/design/rooms/room-actions.md §4）。
 這樣其他 Matrix client 進來也是「看得到、發不出」，完全兼容。
 `ConversationKind::Channel` 是 adapter 從 power levels **推**出來的：發訊息的門檻高到只有 owner 達得到 → Channel。標準就是這樣，沒有「猜」。
 
@@ -375,7 +383,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 `wbf-sdk/src/chat.rs` 是 §2 的子集（檔頭也寫了）：
 
 - id 用 `String`，不包 newtype；對外仍是不透明字串。
-- `Conversation` 沒有 `avatar`、`last_message`、`unread`、`pinned`、`tags`；`member_count` 是 `u64`。
+- `Conversation` 沒有 `avatar`、`last_message`、`unread`、`pinned`、`tags` 這幾欄；頭像與置頂在它帶的整份 `state` 裡（`m.room.avatar`、`m.room.pinned_events`），標籤叫 `room.get_tags`。`member_count` 是 `u64`。
 - `Message`：`edited` 是 `edited_by: Option<String>`（改的人）；多了 `r_seq`／`g_seq`（§4.3）；沒有 `mentions_me`。
 - `MessageKind`：`Text` 的 HTML 是 `formatted_html`；`Deleted` 只有 `reason`；`System` 是 `event_type` 加一行 `line`，不逐種列 enum；`Unsupported` 多帶 `body`。
 - `Attachment` 只有 `mxc` 與 `block`。
@@ -385,7 +393,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
 - 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
 
-還沒做：送 edit／delete／reaction／reply、建房、邀請、角色、置頂、已讀送出、裝置驗證、`Unread`、`Tag`、`DeviceTrust`。
+還沒做：送 edit／delete／reaction／reply、已讀送出、裝置驗證、`Unread`、`DeviceTrust`、收邀請（被別人邀，等 wbfuwunel #111，/docs/design/rooms/room-actions.md §3.3）。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
 
 ## 7. 還開著的（再議）
 

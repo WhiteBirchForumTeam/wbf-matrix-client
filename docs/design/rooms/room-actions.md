@@ -1,6 +1,6 @@
-# 房間動作：建房、成員、權限、置頂（草案，維護者 2026-10-07 起逐條定）
+# 房間動作：建房、成員、權限、置頂（維護者 2026-10-07 逐條定）
 
-> 狀態：**草案，還沒動程式碼**。§1 是已經定的，§6 是還要維護者定的，§7 是這支 PR 要改的檔案清單。
+> §1 是定了的規則，§2–§5 是每支 RPC 與本地寫什麼（權威；/docs/design/rpc-specs/rpc-spec.md §3.3.1 只列 method 名），§6 是還要維護者定的，§7 是程式碼在哪。
 > 範圍：/docs/handover.md §7 第 2 項的「房間動作」那一半。訊息動作（回覆、編輯、收回、表情）與已讀排在後面幾支（維護者 2026-10-07）。
 
 ## 0. 一句話
@@ -10,9 +10,9 @@ UI 叫一個 RPC，daemon 做一個房間動作，回 server 給的結果。會�
 ## 1. 已定的（維護者 2026-10-07）
 
 1. **這支只做房間動作**：建房、加入、退出、忘記、邀請、踢人、封鎖、解除封鎖、改名、改主題、改權限、置頂。
-2. **建 Direct 一律建新房**：🚫 先找既有的 Direct（daemon 🚫 替 UI 串動作）。要不要沿用舊房由 UI 從房間列表判斷。
-   /docs/design/rooms/chat-model.md §3.1「`create(Direct)` 先找既有的」那一句照這條改。
-3. **`direct: true` 時 `room.create` 順便寫 `m.direct`**：建完房，daemon 讀帳號資料的 `m.direct`、把「對方 → 這間房」加進去、寫回。Matrix 規格要 client 做這件事；不寫的話，別的 client 不會把它當成一對一。
+2. **建 Direct 一律建新房**：🚫 先找既有的 Direct（daemon 🚫 替 UI 串動作）。要不要沿用舊房由 UI 從房間列表判斷（/docs/design/rooms/chat-model.md §3.1）。
+3. **`is_direct: true` 時 `room.create` 順便寫 `m.direct`**：建完房，daemon 讀帳號資料的 `m.direct`、把「每個 `invite` 的人 → 這間房」加進去、寫回。Matrix 規格要 client 做這件事；不寫的話，別的 client 不會把它當成一對一。
+   這一步失敗🚫 回錯（房已經建好了），推一則 `note` 請 UI 叫 `room.set_direct`。
 4. **channel 與權限全交給 UI**：daemon 🚫 認得「channel」。UI 自己「建房＋改權限」兩步；daemon 只負責**權限怎麼寫**（照 Matrix 的 `m.room.power_levels` 格式），
    要設多少、限制到哪、哪些人是什麼等級全是 UI 的事，daemon 🚫 檢查值（server 照 auth rules 擋，§4）。
 5. **建房時就指定加不加密**：Matrix 的 `createRoom` 支援（`initial_state` 帶 `m.room.encryption`，規格的標準寫法；wbfuwunel 的 /docs/bridge-specs/0x13-room.md `0x20` 也寫明「加密房間放在 `initial_state` 裡」），
@@ -36,8 +36,11 @@ UI 叫一個 RPC，daemon 做一個房間動作，回 server 給的結果。會�
 
 ## 2. RPC
 
-每支都帶 `user?`、`server?`（/docs/design/rpc-specs/rpc-spec.md §2）。**參數照 Matrix 的名字與格式，結果是 server 回的 body 原樣**（§1 第 14 條）；server 回的錯照原樣往上帶（例：權限不夠是 403 `M_FORBIDDEN`，core 的 `Server` 錯）。
-wbf 帳號走 wbfuwunel 的橋（/docs/bridge-specs/0x13-room.md、0x14-event.md、0x11-account.md，下表只寫 kind 與編號）；一般 Matrix 帳號走 matrix-sdk（有現成方法用現成的，沒有就照同一個 HTTP 端點送原始請求）。
+每支都帶 `user?`、`server?`（/docs/design/rpc-specs/rpc-spec.md §2）。**參數照 Matrix 的名字與格式，結果是 server 回的 body 原樣**（§1 第 14 條）；server 回的錯照原樣往上帶：`1400`，`data` 是 server 的 Matrix 錯誤（例：權限不夠是 `status` 403、`errcode` `M_FORBIDDEN`，/docs/design/rpc-specs/rpc-spec.md §5.3）。
+⚠️ `user`／`server` 已經是「哪個帳號」，所以**被動到的那個人叫 `user_id`**（Matrix body 本來就是這個名字）、公開目錄問哪一台叫 `directory_server`（Matrix 的 query 是 `server`，對不上是不得已）。
+**一張端點表、兩條路**（`crates/wbf-sdk/src/matrix_endpoint.rs`）：wbf 帳號走 wbfuwunel 的橋（wbfuwunel 的 /docs/bridge-specs/0x13-room.md、0x14-event.md、0x11-account.md，下表只寫 kind 與編號）；
+一般 Matrix 帳號照同一個 HTTP 端點送（同一份變數、同一份 body、同一個「變數合不合橋的規則」檢查）。🚫 各端點去找 matrix-sdk 有沒有現成方法：那會是兩份實作、遲早漂。
+matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間的讀都先 sync 一次）。
 「批 3／批 4」是 server 後來才開的端點，接之前先讀本 repo issue #55 列的十個坑（/docs/handover.md §6）。
 
 ### 2.1 成員與房間本身（Room kind）
@@ -49,22 +52,22 @@ wbf 帳號走 wbfuwunel 的橋（/docs/bridge-specs/0x13-room.md、0x14-event.md
 | `room.knock` | `{ room: "!id" \| "#別名", via?, reason? }` | `{ room_id }` | Room `0x2E`（批 3） |
 | `room.leave` | `{ room, reason? }` | `{}` | Room `0x22` |
 | `room.forget` | `{ room }` | `{ history_cleared: bool }`（§3.1；daemon 加的欄位） | Room `0x23`（server 要先 leave，不然 400） |
-| `room.invite` | `{ room, user, reason? }` | `{}` | Room `0x24` |
-| `room.kick`／`room.ban`／`room.unban` | `{ room, user, reason? }` | `{}` | Room `0x25`／`0x26`／`0x27` |
+| `room.invite` | `{ room, user_id, reason? }` | `{}` | Room `0x24`（被邀的人在 body） |
+| `room.kick`／`room.ban`／`room.unban` | `{ room, user_id, reason? }` | `{}` | Room `0x25`／`0x26`／`0x27` |
 | `room.upgrade` | `{ room, new_version }` | `{ replacement_room }` | Room `0x2D`（批 3） |
 | `room.members` | `{ room, membership?, not_membership? }` | server 的 body（`chunk` 加 wbfuwunel 的 `org.wbftw.room_version`） | Room `0x29` |
 | `room.joined_members` | `{ room }` | `{ joined: { mxid: { display_name, avatar_url } } }` | Room `0x2F`（批 3） |
 | `room.summary` | `{ room: "!id" \| "#別名", via? }` | server 的 body | Room `0x32`（批 3）。**還沒加入也能問**：被邀請時拿房名的另一條路 |
 | `room.hierarchy` | `{ room, from?, limit?, max_depth?, suggested_only? }` | server 的 body | Room `0x33`（批 3，space） |
-| `room.mutual_rooms` | `{ user, from? }` | server 的 body | Room `0x34`（批 3） |
-| `room.public_rooms` | `{ server?, limit?, since?, filter?, include_all_networks?, third_party_instance_id? }`（給了 `filter` 就走 Filtered） | server 的 body | Room `0x35`／`0x36`（批 4） |
+| `room.mutual_rooms` | `{ user_id, from? }` | server 的 body | Room `0x34`（批 3） |
+| `room.public_rooms` | `{ directory_server?, limit?, since?, filter?, include_all_networks?, third_party_instance_id?, room_types? }`（給了 `filter`／`include_all_networks`／`third_party_instance_id`／`room_types` 任一個就走 Filtered，`limit`／`since` 一起放進 body） | server 的 body | Room `0x35`／`0x36`（批 4） |
 | `room.get_visibility`／`room.set_visibility` | `{ room }`／`{ room, visibility }` | server 的 body | Room `0x30`／`0x31`（批 3，公開目錄） |
 | `room.resolve_alias` | `{ alias }` | `{ room_id, servers }` | Room `0x2A` |
 | `room.set_alias`／`room.delete_alias` | `{ alias, room }`／`{ alias }` | `{}` | Room `0x2B`／`0x2C` |
 | `room.aliases` | `{ room }` | `{ aliases }` | Room `0x37`（批 4） |
 
 `room.create`：除了 `encrypted`，每個參數都**原樣**進 CreateRoom 的 body（名字、格式、預設值都是 Matrix 的，daemon 🚫 補預設）。`encrypted: true` 時 daemon 在 `initial_state` 加
-`{ "type": "m.room.encryption", "state_key": "", "content": { "algorithm": "m.megolm.v1.aes-sha2" } }`；UI 自己在 `initial_state` 放了 `m.room.encryption` 而 `encrypted` 給 `false`（兩邊說的相反）→ 參數錯（`102`）。
+`{ "type": "m.room.encryption", "state_key": "", "content": { "algorithm": "m.megolm.v1.aes-sha2" } }`；UI 自己在 `initial_state` 放了 `m.room.encryption` 而 `encrypted` 給 `false`（兩邊說的相反）→ 用法錯（`1100`，`crates/wbf-sdk/src/room_state_edit.rs` 的 `to_create_room_body`）；沒帶 `encrypted` 是參數錯（`102`）。
 📎 想建「公開可搜」的房（/docs/design/rooms/chat-model.md §3.6）：`preset: "public_chat"`＋`initial_state` 帶 `m.room.history_visibility: world_readable`，要列進目錄再加 `visibility: "public"`——全是 UI 組。
 
 ### 2.2 房間狀態（Event kind 的 `0x21`–`0x23`）
@@ -94,7 +97,7 @@ wbf 帳號走 wbfuwunel 的橋（/docs/bridge-specs/0x13-room.md、0x14-event.md
 | `room.set_tag`／`room.delete_tag` | `{ room, tag, order? }`／`{ room, tag }` | `{}` | Account `0x2A`／`0x2B`（`m.favourite`、`m.lowpriority`、`u.自訂`） |
 | `room.get_account_data`／`room.set_account_data` | `{ room, event_type }`／`{ room, event_type, content }` | content（沒有是 `null`）／`{}` | Account `0x27`／`0x28` |
 | `account.get_data`／`account.set_data` | `{ event_type }`／`{ event_type, content }` | content（沒有是 `null`）／`{}` | Account `0x25`／`0x26`（帳號層，例 `m.direct`） |
-| `room.set_direct` | `{ room, user, direct: bool }` | `{}` | 讀 `m.direct` → 加或拿掉「`user` → `room`」→ 寫回（§2.5） |
+| `room.set_direct` | `{ room, user_id, direct: bool }` | `{}`（已經是那個狀態就🚫 寫） | 讀 `m.direct` → 加或拿掉「`user_id` → `room`」（那個人的清單空了就把他拿掉）→ 整份寫回（§2.5） |
 
 ### 2.4 太細、先不加的（維護者看過再說）
 
@@ -114,11 +117,10 @@ wbf 帳號走 wbfuwunel 的橋（/docs/bridge-specs/0x13-room.md、0x14-event.md
 
 ## 3. `sync=both` 時本地寫什麼
 
-**現況**：`cache.db` 的 `room_list` 已經是「一個帳號一列」——主鍵是（帳號, 房間），`joined` 0／1 記這個帳號在不在裡面，退出的🚫 刪列、標 0（v8，維護者 2026-10-05，/docs/design/storage/local-cache-db.md §5）。
+`cache.db` 的 `room_list` 是「一個帳號一列」——主鍵是（帳號, 房間），`membership` 記這個帳號在這間房的身分：`join`／`invite`／`knock`（敲門等回應，`room.knock` 才有）／`leave`／`ban`（§1 第 8、10 條，schema v10，/docs/design/storage/local-cache-db.md §5）。
+退出的🚫 刪列、標 `leave`；刪列只有 `room.forget`（§3.1）。
 例：A 建房、B 在裡面、C 不在 → A、B 各一列（`conversation_json` 是各自上次 `room.get` 看到的樣子），C 沒有列。
-
-**這支改成**：`joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，§1 第 8、10 條；`knock` 是敲門等回應，`room.knock` 才有），schema v10（升級表＝重建，跟 v9 一樣🚫 寫遷移）。
-「在房裡」＝ `membership = join`；`room.list` 預設只列 `join` 的（跟現在只列 `joined = 1` 一樣），另收 `membership?: ["join", "invite", …]` 要哪幾種自己挑。
+「在房裡」＝ `membership = join`；`room.list` 預設只列 `join` 的，另收 `membership?: ["join", "invite", …]` 要哪幾種自己挑，每列帶 `membership`。
 
 **帶 `sync` 的是會改本地的那幾支**：成員動作（§2.1 的 create、join、knock、leave、forget、invite、kick、ban、unban、upgrade）與狀態的寫入（§2.2 的 `set_state` 與它所有的窄版）。
 純讀的（members、summary、hierarchy、public_rooms、get_state、tags、account data…）本地沒存、🚫 帶 `sync`，一律問 server。標籤與帳號資料本地也沒存，寫入🚫 帶 `sync`。
@@ -130,12 +132,12 @@ wbf 帳號走 wbfuwunel 的橋（/docs/bridge-specs/0x13-room.md、0x14-event.md
 | `room.knock` | 自己那一列 `membership = knock`（列不在就加） |
 | `room.leave` | 自己那一列 `membership = leave`，🚫 刪、`conversation_json` 留著 |
 | `room.forget` | §3.1 |
-| `room.invite` | 被邀請的人**是這台機器登入的帳號**（同 server 的 `cache.db` 有它這個 user）→ 它那一列 `membership = invite`（列不在就加）。不是本機帳號就🚫 寫 |
-| `room.kick` | 被踢的人是本機帳號 → 它那一列 `membership = leave`（Matrix 裡被踢之後就是 `leave`） |
+| `room.invite` | 被邀請的人**是這台機器登入的帳號**（同一台 server；用它的 localpart 算出目錄、解開 session、mxid 逐字比對——`@bob:別台` 會算到同一個目錄，對不上就不是，fail closed；🚫 看 `cache.db` 的 `users`：那裡連事件的 sender 都有）→ 它那一列 `membership = invite`（列不在就加）。不是本機帳號就🚫 寫 |
+| `room.kick` | 被踢的人是本機帳號 → 它那一列 `membership = leave`（Matrix 裡被踢之後就是 `leave`；列不在就加） |
 | `room.ban` | 被封鎖的人是本機帳號 → 它那一列 `membership = ban`（列不在就加） |
 | `room.unban` | 被解除的人是本機帳號、它那一列是 `ban` → 改成 `leave`（Matrix 裡解除封鎖之後是 `leave`，要再邀請或自己加入才回來） |
 | `room.upgrade` | 新房（`replacement_room`）加一列 `membership = join`、`conversation_json` 空著；舊房那一列🚫 動（還在舊房裡，舊房多了墓碑，下次 `room.get` 看得到） |
-| `room.set_state` 與它所有的窄版 | 自己那一列有 `conversation_json` 就把它的 `state`（§5.1）裡那一項換成這次寫的，再用整份 `state` 重算型別欄位（`name`、`topic`、`encrypted`、`my_power_level`、`can_send_message`、`kind`；成員那幾欄 `member_count`、`direct_peer` 照舊）。沒有 `conversation_json`（還沒 `room.get` 過）就🚫 寫。其他帳號那一列是它們自己看到的樣子，下次它們 `room.get` 才更新 |
+| `room.set_state` 與它所有的窄版 | 自己那一列有拿過狀態（`conversation_json` 帶 `state`）就把那一項換成這次寫的，再用整份 `state` 重算型別欄位（`name`、`topic`、`encrypted`、`my_power_level`、`can_send_message`、`kind`；成員那幾欄 `member_count`、`direct_peer` 照舊；跟 `room.get` 同一套規則，`crates/wbf-sdk/src/room_state.rs` 的 `conversation_with_state_event`）。沒拿過狀態（還沒 `room.get` 過、或一般 Matrix 帳號只在 `room.list` 上）就🚫 寫。其他帳號那一列是它們自己看到的樣子，下次它們 `room.get` 才更新。⚠️ 名字：沒有名字也沒有別名的房，名字是用成員湊的（成員不在 `state` 裡）——原本就是湊的照舊；原本是名字或別名、這次把它拿掉了，就變 `null`，下次 `room.get` 才湊得回來（🚫 留著已經不成立的舊名字） |
 | 寫的是 `m.room.encryption`（`room.enable_encryption`，或 `room.set_state` 直接寫它） | 上一列之外，`rooms.encrypted = 1`，不管有沒有 `conversation_json`（§3.2；這一欄是房間的事實，所有帳號共用、只升不降） |
 
 `server`：一律只打遠端、🚫 碰本地。
@@ -153,7 +155,7 @@ wbf 帳號走 wbfuwunel 的橋（/docs/bridge-specs/0x13-room.md、0x14-event.md
    - 📎 媒體跟訊息的綁定：`event_media`（事件 ↔ `media` 列，ON DELETE CASCADE）。同一個 mxc 可以被好幾間房的事件指著（轉發），所以只刪「清完之後一個連結都不剩」的列。
    - 判斷「還有沒有別人」兩個都看（維護者的條件是「同一個房間 id 的列 ≤ 1」）：只看 `room_list` 的話，別的帳號同步過這間房的事件、卻還沒有列（例：`sync.recent` 拉到、還沒 `room.list`），它的紀錄會被一起清掉；不確定就不清（fail closed）。
 4. 本地那半一個 transaction 做完：中途失敗就本地整個沒動；因為 server 已經 ACK，照 §3 回成功（`history_cleared: false`）、另推一則 `note`。
-   之後再叫一次 `sync=both` 會重打一次 Forget——server 對已經忘記的房回什麼，實作時確認。
+   之後再叫一次 `sync=both` 會重打一次 Forget——server 對已經忘記的房回什麼還沒對真 server 試過（e2e 只走了第一次）。
 
 ### 3.2 `room.enable_encryption`：把明文房改成加密
 
@@ -225,17 +227,17 @@ server 其實存著這份（wbfuwunel 的 `src/service/rooms/state_cache/update.
 |---|---|
 | 數字欄（`users_default`、`events_default`、`state_default`、`invite`、`kick`、`ban`、`redact`） | 給了就換成這個值；沒給就照舊 |
 | `users`、`events`、`notifications`（對照表） | **逐個 key 合併**：給的 key 覆蓋、沒給的 key 照舊；某個 key 給 `null` ＝ 把它從表裡拿掉（回到預設） |
-| 都沒給 | 參數錯（`102`），🚫 寫一份一樣的回去 |
+| 都沒給 | 用法錯（`1100`），🚫 寫一份一樣的回去 |
+| 房間沒有 `m.room.power_levels` | 用法錯（`1100`）：🚫 從空的開始合——省掉的欄位會落到「事件在」的預設，建房者會丟掉 100；要寫就用 `room.set_state` 寫整份 |
 
-例：UI 把 bob 升成管理員、同時把發言門檻拉到 100（channel）：
+例（本機 wbfuwunel 實跑，`crates/wbf-daemon/tests/real_server.rs` 的 `room_actions_walk_the_server_and_the_local_rows_of_two_accounts`：alice 把發言門檻拉到 100，這間房在 `room.get` 就變成 `channel`）：
 
 ```jsonc
-// 示意（實作後換成實跑的輸出）
-→ { "method": "room.set_power_levels", "params": { "room": "!r:localhost", "users": { "@bob:localhost": 50 }, "events_default": 100 }, "id": 3 }
-← { "code": 0, "msg": "ok", "id": 3, "result": { "event_id": "$pl…" } }
+→ { "method": "room.set_power_levels", "params": { "user": "@alice:localhost", "room": "!jUZRmPusRwM8e4b0QV:localhost", "events_default": 100 }, "id": 80 }
+← { "code": 0, "id": 80, "msg": "ok", "result": { "event_id": "$4krhd_Y2vOHL6-96Xg7nkSboemHFwwmapLtmCGuiswo" } }
 ```
 
-值是什麼、合不合理 daemon 🚫 看（例：負數、比自己高）——server 會照 auth rules 擋，擋了回 403 `M_FORBIDDEN`。daemon 只擋「格式不是 Matrix 能接受的」：數字欄不是整數、`users` 的 key 不是 mxid（參數錯 `102`）。
+值是什麼、合不合理 daemon 🚫 看（例：負數、比自己高）——server 會照 auth rules 擋，擋了回 `1400`、`data` 是 403 `M_FORBIDDEN`。daemon 只擋「格式不是 Matrix 能接受的」：數字欄不是整數、對照表不是物件或值不是整數／`null`、`users` 的 key 不是 mxid、表上沒有的欄位（用法錯 `1100`，`crates/wbf-sdk/src/room_state_edit.rs` 的 `merge_power_levels`）。
 兩邊同時改，後寫的會蓋掉先寫的那幾項（Matrix 沒有 compare-and-set；matrix-sdk 的 `update_power_levels` 也是這樣）。
 
 ## 5. 置頂：`m.room.pinned_events`
@@ -259,7 +261,7 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
      可見性不是 `joined` 時這前提不成立，房間版本號與 `Members` 的裝置版本號都要算進被邀請者，不然被邀請者換了裝置，「送出前版本號要對」那道檢查擋不到。已在 #111 的末尾先提一句。
    - 要定的：**照可見性分給被邀請者**（client＋server 都改）還是維持現狀。
 
-## 6.1 已經定的（原本在這裡的問題，維護者 2026-10-07）
+### 6.1 已經定的（原本在這裡的問題，維護者 2026-10-07）
 
 - `room.get` 帶整份狀態（A，全拿，成員事件以外）。
 - `joined` 換成 `membership`，🚫 並存（量過：只在 `crates/wbf-sdk/src/cache.rs` 的 5 句 SQL 與 1 條測試）。
@@ -269,27 +271,18 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 - 本地寫不進去：回成功（以 server 的 ACK 為準）＋推 `note`（§3）。
 - 置頂清單由 `room.get` 給（§5.1）。
 - 參數、結果全部跟上游一樣，daemon 只是中轉站（§1 第 14 條）；通用的 `get_state`／`set_state`＋窄的方便版都給；房間相關的橋全接（§2）。
-- 收邀請：開 server issue 優先處理（wbfuwunel #111），client 先照「server 會推」接（§3.3）。
+- 收邀請：開 server issue 優先處理（wbfuwunel #111）；推播語意等 server 做完再補（§3.3）。
 
-## 7. 這支 PR 要改的檔案
+## 7. 程式碼在哪
 
-| 層 | 檔案 | 改什麼 |
+| 層 | 檔案 | 做什麼 |
 |---|---|---|
-| sdk | `crates/wbf-sdk/src/protocol.rs` | 新的 `BridgedEndpoint`：Room `0x20`–`0x27`、`0x2A`–`0x37`（`0x28` JoinedRooms、`0x29` Members 已有）、Event `0x23` SetStateEvent、Account `0x26`–`0x2B`；與它們的 meta 變數型別 |
-| sdk | `crates/wbf-sdk/src/client.rs` | `WbfClient`：每個橋一支薄的（照 Matrix 的 body 原樣送、原樣收），不在 sdk 加規則 |
-| sdk | `crates/wbf-sdk/src/backend/matrix_sdk.rs` | 一般 Matrix 帳號的同一組（有現成方法用現成的，沒有就送原始請求） |
-| sdk | `crates/wbf-sdk/src/cache.rs` | schema v10：`room_list.joined` 換成 `membership`；本地寫法（§3）；`forget_room_of`（§3.1，一個 transaction）；`room.list` 的 `membership` 篩選 |
-| sdk | `crates/wbf-sdk/src/chat.rs`、`room_state.rs` | `Conversation`／`RoomListEntry` 多帶 `state`（§5.1）；從 `state` 重算型別欄位（§3 的 `set_state` 那一列） |
-| sdk | `crates/wbf-sdk/src/power_levels.rs`（新，或放進 `room_state.rs`） | §4.2 的合併規則（純函數，單元測試） |
-| core | `crates/wbf-core/src/room_actions.rs`（新） | 每個動作一個入口：分帳號種類、組 body（`encrypted` → `initial_state`）、讀改寫（權限、置頂、`m.direct`）、`sync=both` 寫本地、寫不進去推 `note` |
-| core | `crates/wbf-core/src/room_sync.rs`、`wbf_rooms.rs` | `room.list` 讀寫 `membership`；收邀請的推送與補拿等 #111（§3.3）🚫 這支 |
-| core | `crates/wbf-core/src/lib.rs`、`event.rs` | 掛模組、匯出型別 |
-| daemon | `crates/wbf-daemon/src/handle/rooms.rs`、`handle/mod.rs`、`push.rs` | 參數解析（`sync` 只收 `both`／`server`）、dispatch、參數錯的測試 |
-| 測試 | core 的假 wbf server（`crates/wbf-core/src/test_support.rs` 的 `bridged_reply`）答新的橋；core 單元測試；daemon 真 server 測試加「建房 → 邀請 → 對方加入 → 踢 → 本地列」、「forget 清紀錄」、「明文房升級加密之後送的字是密文」、「改權限 → `room.get` 的 `state` 與 `can_send_message`」 | |
-| 文件 | /docs/design/rpc-specs/rpc-spec.md §3.3、§4、§10；/docs/design/rooms/chat-model.md §2.1、§2.6、§3.1、§3.2、§6；/docs/design/storage/local-cache-db.md §5（v10）；/docs/handover.md §1、§6、§7；這一份從草案改成定案 | |
-
-**順手一起修**（#75 審查的小項，維護者 2026-10-07：併進下一支）：
-- `crates/wbf-core/src/media_ops.rs` 的 `del_local_media`：「正在寫的檔」快照與刪除之間的空檔，快照挪進刪除那一步（cirno 🟢1）。
-- `crates/wbf-core/src/download_queue.rs` 的 `close_everything`：收攤時「準備中」的 job 也推 `failed`（cirno 🟢2）。
-- `crates/wbf-core/src/matrix_download.rs` 的 `ensure_matrix_download`：`open_complete` 叫兩次合成一次（rumia）。
-- `crates/wbf-sdk/src/event_json.rs`：fallback 字串 `"file"` 收成常數（rumia）。
+| sdk | `crates/wbf-sdk/src/matrix_endpoint.rs` | 一張端點表（橋的號碼＋HTTP 的 method、路徑模板、query 變數）；`check_variables`（橋的規則，兩條路都先過）、`encode_body`、`call_over_http` |
+| sdk | `crates/wbf-sdk/src/client.rs` | `WbfClient::call_matrix_endpoint`：同一張表的走橋那條 |
+| sdk | `crates/wbf-sdk/src/room_state_edit.rs` | §2.1 的 createRoom body、§4.2 的權限合併、§5 的置頂、§2.5 的 `m.direct`（純函數） |
+| sdk | `crates/wbf-sdk/src/room_state.rs`、`chat.rs` | `Conversation`／`RoomListEntry` 帶 `state` 與 `membership`；`conversation_with_state_event`（§3 的 `set_state` 那一列） |
+| sdk | `crates/wbf-sdk/src/cache.rs` | schema v10 的 `membership`；`record_membership`、`record_written_state`、`record_room_encryption`、`forget_room`（§3.1）；`list_room_entries` 的身分篩選 |
+| core | `crates/wbf-core/src/room_actions.rs` | 每個動作一個入口；`call_endpoint_raw` 是兩條路唯一的分岔點；`WriteSync`；寫不進去推 `note`；server 拒絕的 Matrix 錯誤放進 `data` |
+| core | `crates/wbf-core/src/rooms_ops.rs` | `room.list` 的身分篩選；一般 Matrix 帳號的 `room.get` 多問一次 `GetState` |
+| daemon | `crates/wbf-daemon/src/handle/room_actions.rs` | 參數解析（型別不對 `102`、`sync` 只收 `both`／`server`） |
+| 測試 | `crates/wbf-sdk/src/{matrix_endpoint,room_state,room_state_edit,cache}.rs` 的單元測試；`crates/wbf-core/src/room_actions.rs`（假 server：`test_support.rs` 的 `room_action_reply`）；`crates/wbf-daemon/src/handle/mod.rs` 的兩張參數表；真 server：`crates/wbf-sdk/tests/e2e_local_server.rs` 的 `the_matrix_endpoint_table_answers_the_same_over_http_and_over_the_bridge`、`crates/wbf-daemon/tests/real_server.rs` 的 `room_actions_walk_the_server_and_the_local_rows_of_two_accounts` | |

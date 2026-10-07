@@ -115,10 +115,10 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v9，就是 `wbf-sdk::cache` 建的）
+## 5. 快取的 schema（v10，就是 `wbf-sdk::cache` 建的）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
-📎 v8 → v9（`media` 加 `kind`、`verified`）一樣整個重建：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
+📎 升版一律整個重建（v9 → v10：`room_list.joined` 換成 `membership`，維護者 2026-10-07）：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
 
 三條原則：
 
@@ -139,7 +139,8 @@ CREATE TABLE users (id INTEGER PRIMARY KEY, mxid TEXT NOT NULL UNIQUE, first_see
 --   不准把它蓋回明文 —— 蓋回去的下一步是送檔用 `cipher: none`，把區塊金鑰公開出去（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 --   ⭐ 放 rooms 不放 room_list：加不加密是房間的性質、對每個帳號都一樣；room_list 是「這個帳號看到的樣子」。
 --   讀的時候（list_room_entries、find_conversation）這一欄說 1 就蓋掉 conversation_json 裡的 encrypted：房間的事實贏過帳號的舊印象。
---   寫的地方兩個：拿一間房的樣子（room.get → upsert_conversations；房間列表只記 id、🚫 寫這一欄），以及收到加密的證據（upsert_events 看到 m.room.encryption 或任何加密事件就設 1，2026-10-05）。
+--   寫的地方：拿一間房的樣子（room.get → upsert_conversations；房間列表只記 id、🚫 寫這一欄）、收到加密的證據（upsert_events 看到 m.room.encryption 或任何加密事件就設 1，2026-10-05），
+--   以及房間動作收到 ACK 之後（sync=both，/docs/design/rooms/room-actions.md §3）：room.create 寫建房時給的值（record_room_encryption）、寫了 m.room.encryption 就設 1（record_written_state）。
 --   送文字只看這一欄（find_room_encrypted；NULL 或沒有這列就報錯、請 UI 先拿房間，維護者 2026-10-05）；送附件照樣問 server 這一刻的狀態。
 --   ⚠️ 0 也可能是過期的：房間在這台沒在聽的時候開了加密，這一欄要到下次拿房間或收到加密的證據才升上去，中間送的文字是明文（/docs/design/keys/e2ee-rpc.md §7）。
 --   m.room.encryption 要帶非空的 algorithm 才算（room_state::is_encryption_content，跟拿房間同一個判斷）。
@@ -178,17 +179,21 @@ CREATE TABLE events_synced_log (
 CREATE INDEX events_synced_log_by_user ON events_synced_log (user, event);
 
 -- 房間列表，一人一列。conversation_json 是這個 user 看到的 Conversation（power level、can_send 都是 per user）；
--- 名稱、加密與否、人數都在 JSON 裡，不另開欄。
--- 兩個寫入點（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1）：
+-- 名稱、加密與否、人數、成員以外的整份狀態（state，/docs/design/rooms/room-actions.md §5.1）都在 JSON 裡，不另開欄。
+-- membership 是這個帳號在這間房的身分：join／invite／knock／leave（主動離開或被踢）／ban（維護者 2026-10-07）。退出🚫 刪列，刪列只有 room.forget。
+-- 寫入點（/docs/design/rooms/chat-model.md §2.1、/docs/design/rooms/room-actions.md §3）：
 --   room.list（record_joined_rooms）：只拿「加入了哪些」。新的加一列（conversation_json／refreshed_at 是 NULL ＝ 還沒拿過）；
---     已經有的🚫 覆寫它的樣子；名單裡沒有的標 joined = 0、🚫 刪列（回來了再標回 1）。
---   room.get（upsert_conversations）：一間的樣子整份蓋上去、記 refreshed_at；🚫 動 joined（加入了沒只由 room.list 寫，對退出的房叫 room.get 不會標回加入；新列預設 1）。
--- room.list 讀 joined = 1 的，本地知道多少給多少（RoomListEntry，不知道的是 null）；room.get sync=local 退出的也給（最後看到的樣子）。
+--     已經有的🚫 覆寫它的樣子、不是 join 的標回 join；本地是 join 而名單裡沒有的標 leave、🚫 刪列；invite／knock／ban 🚫 動（不在加入名單裡本來就對）。
+--   room.get（upsert_conversations）：一間的樣子整份蓋上去、記 refreshed_at；🚫 動 membership（新列預設 join）。
+--     這一份沒帶 state（一般 Matrix 帳號的列表是 Client 算的）就留著本地那份的 state。
+--   房間動作（sync=both、收到 ACK 之後）：record_membership 寫身分（列不在就加；解除封鎖只在目前是 ban 時改）；
+--     record_written_state 把自己寫的那一項狀態換進 state、重算型別欄位（沒拿過狀態的列🚫 寫）。
+-- room.list 讀要的那幾種身分（預設只有 join），本地知道多少給多少（RoomListEntry，不知道的是 null）；room.get sync=local 退出的也給（最後看到的樣子）。
 CREATE TABLE room_list (
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
   user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   conversation_json TEXT, refreshed_at INTEGER,
-  joined INTEGER NOT NULL DEFAULT 1 CHECK (joined IN (0, 1)),
+  membership TEXT NOT NULL DEFAULT 'join' CHECK (membership IN ('join', 'invite', 'knock', 'leave', 'ban')),
   PRIMARY KEY (user, room)) WITHOUT ROWID;
 
 -- 每個帳號的 Recent 水位線（cg_seq 是 per user 的：server 依 user 的可見範圍算）。
@@ -257,6 +262,9 @@ CREATE INDEX event_media_by_media ON event_media (media);
 - **讀取**（`history`／`files`）：`events JOIN events_synced_log JOIN users(reader) JOIN users(sender) JOIN rooms WHERE reader.mxid = ? AND room_id = ? AND hidden = 0 AND class IN ('msg', 'general')`，`r_seq DESC`，沒有 `r_seq` 退到 `origin_server_ts`（/docs/design/rooms/chat-model.md §4.3 的退化表）。每列從 `content_json` 組回 `Message`（/docs/design/messages/edits-and-redactions.md §8）；`files` 另加 `json_extract(content_json, '$.msgtype')` 是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔、而且沒被 redact。
 - **忘掉一個帳號**（`forget_account(user_id)`，UI 的「摧毀本帳號的本機紀錄」）：🚫 不是 `DELETE FROM users`（他可能是別人事件的 sender，會把事件 CASCADE 掉）。一個 transaction：刪他的 `events_synced_log`／`room_list`／`sync_state`／`read_positions` → `DELETE FROM events WHERE id NOT IN (SELECT event FROM events_synced_log)`（CASCADE 帶走 `event_media`）→ 沒事件指的 `media` 列（先記下 `pool_file`）→ 沒事件也沒清單的 `rooms`。回傳孤兒 `pool_file` 清單，**只含已經沒有別的 `media` 列指著的**（同 hash 去重過的檔可能還被別的 mxc 用）；呼叫者拿去刪池裡的檔，DB 先、檔案後。
   **預設不叫它；`account del`（即 `logout`）不叫它，只有 `account destroy` 叫。** 這個 server 已經沒有登入中的帳號時，登出直接刪 `cache.db`（維護者：「除非所有帳號被登出」）。
+- **忘掉一間房**（`forget_room(user_id, room_id)`，`room.forget sync=both`，/docs/design/rooms/room-actions.md §3.1）：一個 transaction。刪這個帳號的 `room_list` 列、`read_positions`、這間房的 `events_synced_log`；
+  本機**沒有別的帳號**（沒有 `room_list` 列、**也**看不到任何一則事件——兩個都看，不確定就不清）才刪 `rooms` 那一列（事件、已讀、列表跟著 CASCADE），
+  連同「原本只被這間房的事件指著、現在一個連結都不剩」的 `media` 列。🚫 動池檔（留給掃描，維護者 2026-10-07）；沒綁事件的 `media` 列🚫 動。
 - **`destroy` 的順序**（維護者 2026-09-15）：閘門 → 忘掉鏈 → 池檔 → 裝置層（登出）→ recovery key → 刪目錄。
   - 忘掉鏈**趁 `cache.db` 還在**時跑，走這台 server 的唯一寫入者 `ServerCache`，🚫 不另開 `cache_of` 連線；`cache.db` 不在就不開，🚫 不為了忘掉而建一個空的。
   - 🚨 **登入、登出、destroy 全程握著 `<data dir>/account.lock`**（仿 `daemon.lock`）：OS 層的排他鎖，拿不到就回 `account_busy`（1013），🚫 不排隊。檔案不刪、不寫內容；整個資料目錄一把，鎖檔名🚫 不帶 server 或帳號（否則在外面留痕跡）。所以 destroy 期間不會有登入冒出新目錄，反之亦然。
