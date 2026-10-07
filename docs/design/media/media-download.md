@@ -504,9 +504,13 @@ GET 把「明文第 `p` 個 byte」當成一個 job 交給處理端（一個事�
 用途：§5.3 的 1500（先到的是寫錯或偽造的事件，真的那則被拒）之後換成真的，或使用者就是要把這個檔從本機拿掉。
 
 ```jsonc
-// 示意（形狀照 /docs/design/rpc-specs/rpc-spec.md §1）：正在下載時清掉
-→ { "method": "media.delete_local", "params": { "mxc": "mxc://localhost/000000000000004d" }, "id": 7 }
-← { "code": 0, "msg": "ok", "id": 7, "result": { "mxc": "mxc://localhost/000000000000004d", "removed": true, "cancelled": true } }
+// 2026-10-07 對本機 wbfuwunel 實跑（crates/wbf-daemon/tests/real_server.rs 的 a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_data_plane，
+// 已經下載完的 kind 3 檔；之後只給 mxc 是 1100、從訊息點下載由那則重建）
+→ { "method": "media.delete_local", "params": { "mxc": "mxc://localhost/rvK2d8mAFFsvYNO09bmbNfRMa1pSkg6A" }, "id": 18 }
+← {"code":0,"id":18,"msg":"ok","result":{"cancelled":false,"mxc":"mxc://localhost/rvK2d8mAFFsvYNO09bmbNfRMa1pSkg6A","removed":true}}
+→ { "method": "media.download", "params": { "mxc": "mxc://localhost/YkCeMEGjO31um4bniiD4SddMCdKHhBdD" }, "id": 19 }   // 另一輪跑的、同一步
+← {"code":1100,"id":19,"msg":"mxc://localhost/YkCeMEGjO31um4bniiD4SddMCdKHhBdD has no local record (no event @alice:localhost has seen carries it); pass the manifest, or the room and event_id","result":null}
+// 正在下載時清掉，`cancelled` 是 true（core 的 deleting_a_matrix_file_cancels_its_download_and_leaves_nothing、download_queue 的 deleting_a_chunked_file_cancels_its_download_and_waits_for_the_writer）
 ```
 
 1. **先取消，同一台 server 上所有正在下載它的**（維護者 10-07 補充）：傳統檔的 task（§12，登記表以 server 為鍵）與**每個帳號**已經起了的分塊處理端都交 `cancel`，
