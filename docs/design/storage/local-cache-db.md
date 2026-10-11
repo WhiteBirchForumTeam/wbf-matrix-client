@@ -118,7 +118,7 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 ## 5. 快取的 schema（v10，就是 `wbf-sdk::cache` 建的）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
-📎 升版一律整個重建（v9 → v10：`room_list.joined` 換成 `membership`，維護者 2026-10-07）：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
+📎 升版一律整個重建（v9 → v10：`room_list.joined` 換成 `membership`，維護者 2026-10-07；多 `room_list.is_state_carried_over`）：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
 
 三條原則：
 
@@ -185,15 +185,16 @@ CREATE INDEX events_synced_log_by_user ON events_synced_log (user, event);
 --   room.list（record_joined_rooms）：只拿「加入了哪些」。新的加一列（conversation_json／refreshed_at 是 NULL ＝ 還沒拿過）；
 --     已經有的🚫 覆寫它的樣子、不是 join 的標回 join；本地是 join 而名單裡沒有的標 leave、🚫 刪列；invite／knock／ban 🚫 動（不在加入名單裡本來就對）。
 --   room.get（upsert_conversations）：一間的樣子整份蓋上去、記 refreshed_at；🚫 動 membership（新列預設 join）。
---     這一份沒帶 state（一般 Matrix 帳號的列表是 Client 算的）就留著本地那份的 state。
+--     這一份沒帶 state（一般 Matrix 帳號的列表是 Client 算的）就留著本地那份的 state，記 is_state_carried_over = 1（那份比這次的型別欄位舊）；帶了就記 0。
 --   房間動作（sync=both、收到 ACK 之後）：record_membership 寫身分（列不在就加；解除封鎖只在目前是 ban 時改）；
---     record_written_state 把自己寫的那一項狀態換進 state、重算型別欄位（沒拿過狀態的列🚫 寫）。
+--     record_written_state 把自己寫的那一項狀態換進 state、重算型別欄位（沒拿過狀態、is_state_carried_over = 1、或重算不出來的列🚫 寫）。
 -- room.list 讀要的那幾種身分（預設只有 join），本地知道多少給多少（RoomListEntry，不知道的是 null）；room.get sync=local 退出的也給（最後看到的樣子）。
 CREATE TABLE room_list (
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
   user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   conversation_json TEXT, refreshed_at INTEGER,
   membership TEXT NOT NULL DEFAULT 'join' CHECK (membership IN ('join', 'invite', 'knock', 'leave', 'ban')),
+  is_state_carried_over INTEGER NOT NULL DEFAULT 0 CHECK (is_state_carried_over IN (0, 1)),
   PRIMARY KEY (user, room)) WITHOUT ROWID;
 
 -- 每個帳號的 Recent 水位線（cg_seq 是 per user 的：server 依 user 的可見範圍算）。

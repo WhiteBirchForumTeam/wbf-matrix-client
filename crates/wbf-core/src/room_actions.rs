@@ -253,6 +253,7 @@ impl Core {
         target: &Target,
     ) -> Result<Value, CoreError> {
         let account = self.account_or_current(target)?;
+        let me = self.session_of(&account)?.user_id;
         let (endpoint, membership, name) = match how {
             EnterRoom::Join => (&matrix_endpoint::JOIN, Membership::Join, "room.join"),
             EnterRoom::Knock => (&matrix_endpoint::KNOCK, Membership::Knock, "room.knock"),
@@ -276,7 +277,6 @@ impl Core {
             .unwrap_or(room)
             .to_string();
         if sync == WriteSync::Both && room_id.starts_with('!') {
-            let me = self.session_of(&account)?.user_id;
             let room_here = room_id.clone();
             self.record_locally(&account, name, &room_id, move |cache| {
                 cache
@@ -300,6 +300,7 @@ impl Core {
         target: &Target,
     ) -> Result<Value, CoreError> {
         let account = self.account_or_current(target)?;
+        let me = self.session_of(&account)?.user_id;
         let left = self
             .call_endpoint_as(
                 &account,
@@ -309,7 +310,6 @@ impl Core {
             )
             .await?;
         if sync == WriteSync::Both {
-            let me = self.session_of(&account)?.user_id;
             let room_here = room.to_string();
             self.record_locally(&account, "room.leave", room, move |cache| {
                 cache
@@ -332,6 +332,7 @@ impl Core {
         target: &Target,
     ) -> Result<Value, CoreError> {
         let account = self.account_or_current(target)?;
+        let me = self.session_of(&account)?.user_id;
         self.call_endpoint_as(
             &account,
             &matrix_endpoint::FORGET,
@@ -341,7 +342,6 @@ impl Core {
         .await?;
         let mut history_cleared = false;
         if sync == WriteSync::Both {
-            let me = self.session_of(&account)?.user_id;
             let room_here = room.to_string();
             history_cleared = self
                 .record_locally(&account, "room.forget", room, move |cache| {
@@ -408,6 +408,7 @@ impl Core {
         target: &Target,
     ) -> Result<Value, CoreError> {
         let account = self.account_or_current(target)?;
+        let me = self.session_of(&account)?.user_id;
         let upgraded = self
             .call_endpoint_as(
                 &account,
@@ -421,7 +422,6 @@ impl Core {
             .and_then(Value::as_str)
             .map(str::to_string);
         if let (WriteSync::Both, Some(replacement)) = (sync, replacement) {
-            let me = self.session_of(&account)?.user_id;
             let replacement_here = replacement.clone();
             self.record_locally(&account, "room.upgrade", &replacement, move |cache| {
                 cache
@@ -565,6 +565,7 @@ impl Core {
         content: Value,
         sync: WriteSync,
     ) -> Result<Value, CoreError> {
+        let me = self.session_of(account)?.user_id;
         let written = self
             .call_endpoint_as(
                 account,
@@ -578,7 +579,6 @@ impl Core {
             )
             .await?;
         if sync == WriteSync::Both {
-            let me = self.session_of(account)?.user_id;
             let event = json!({
                 "type": event_type, "state_key": state_key, "content": content,
                 "sender": me, "event_id": written.get("event_id"),

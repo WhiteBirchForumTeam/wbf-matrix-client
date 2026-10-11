@@ -68,6 +68,7 @@ matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間�
 
 `room.create`：除了 `encrypted`，每個參數都**原樣**進 CreateRoom 的 body（名字、格式、預設值都是 Matrix 的，daemon 🚫 補預設）。`encrypted: true` 時 daemon 在 `initial_state` 加
 `{ "type": "m.room.encryption", "state_key": "", "content": { "algorithm": "m.megolm.v1.aes-sha2" } }`；UI 自己在 `initial_state` 放了 `m.room.encryption` 而 `encrypted` 給 `false`（兩邊說的相反）→ 用法錯（`1100`，`crates/wbf-sdk/src/room_state_edit.rs` 的 `to_create_room_body`）；沒帶 `encrypted` 是參數錯（`102`）。
+UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`state_key` 是空的、content 有非空的 `algorithm`，跟寫完狀態升 `rooms.encrypted` 是同一句：`crates/wbf-sdk/src/room_state.rs` 的 `is_encryption_event`），不是就 `1100`：🚫 當成「已經加密」而不補——那會建出明文房、本地卻記成加密（PR #76 審查）。
 📎 想建「公開可搜」的房（/docs/design/rooms/chat-model.md §3.6）：`preset: "public_chat"`＋`initial_state` 帶 `m.room.history_visibility: world_readable`，要列進目錄再加 `visibility: "public"`——全是 UI 組。
 
 ### 2.2 房間狀態（Event kind 的 `0x21`–`0x23`）
@@ -79,7 +80,7 @@ matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間�
 | `room.set_name` | `{ room, name }` | `{ event_id }` | `set_state`（`m.room.name`） |
 | `room.set_topic` | `{ room, topic }` | `{ event_id }` | `set_state`（`m.room.topic`） |
 | `room.set_avatar` | `{ room, url }`（mxc） | `{ event_id }` | `set_state`（`m.room.avatar`） |
-| `room.set_canonical_alias` | `{ room, alias?, alt_aliases? }` | `{ event_id }` | `set_state`（`m.room.canonical_alias`） |
+| `room.set_canonical_alias` | `{ room, alias?, alt_aliases? }`（都沒給就寫 `{}`：清掉正式別名，Matrix 合法） | `{ event_id }` | `set_state`（`m.room.canonical_alias`） |
 | `room.set_history_visibility` | `{ room, history_visibility: "world_readable" \| "shared" \| "invited" \| "joined" }` | `{ event_id }` | `set_state`（`m.room.history_visibility`） |
 | `room.set_join_rule` | `{ room, join_rule: "public" \| "invite" \| "knock" \| "restricted" \| "knock_restricted" \| "private", allow? }` | `{ event_id }` | `set_state`（`m.room.join_rules`） |
 | `room.set_guest_access` | `{ room, guest_access: "can_join" \| "forbidden" }` | `{ event_id }` | `set_state`（`m.room.guest_access`） |
@@ -137,8 +138,8 @@ matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間�
 | `room.ban` | 被封鎖的人是本機帳號 → 它那一列 `membership = ban`（列不在就加） |
 | `room.unban` | 被解除的人是本機帳號、它那一列是 `ban` → 改成 `leave`（Matrix 裡解除封鎖之後是 `leave`，要再邀請或自己加入才回來） |
 | `room.upgrade` | 新房（`replacement_room`）加一列 `membership = join`、`conversation_json` 空著；舊房那一列🚫 動（還在舊房裡，舊房多了墓碑，下次 `room.get` 看得到） |
-| `room.set_state` 與它所有的窄版 | 自己那一列有拿過狀態（`conversation_json` 帶 `state`）就把那一項換成這次寫的，再用整份 `state` 重算型別欄位（`name`、`topic`、`encrypted`、`my_power_level`、`can_send_message`、`kind`；成員那幾欄 `member_count`、`direct_peer` 照舊；跟 `room.get` 同一套規則，`crates/wbf-sdk/src/room_state.rs` 的 `conversation_with_state_event`）。沒拿過狀態（還沒 `room.get` 過、或一般 Matrix 帳號只在 `room.list` 上）就🚫 寫。其他帳號那一列是它們自己看到的樣子，下次它們 `room.get` 才更新。⚠️ 名字：沒有名字也沒有別名的房，名字是用成員湊的（成員不在 `state` 裡）——原本就是湊的照舊；原本是名字或別名、這次把它拿掉了，就變 `null`，下次 `room.get` 才湊得回來（🚫 留著已經不成立的舊名字） |
-| 寫的是 `m.room.encryption`（`room.enable_encryption`，或 `room.set_state` 直接寫它） | 上一列之外，`rooms.encrypted = 1`，不管有沒有 `conversation_json`（§3.2；這一欄是房間的事實，所有帳號共用、只升不降） |
+| `room.set_state` 與它所有的窄版 | 自己那一列有拿過狀態（`conversation_json` 帶 `state`）就把那一項換成這次寫的，再用整份 `state` 重算型別欄位（`name`、`topic`、`encrypted`、`my_power_level`、`can_send_message`、`kind`；成員那幾欄 `member_count`、`direct_peer` 照舊；跟 `room.get` 同一套規則，`crates/wbf-sdk/src/room_state.rs` 的 `conversation_with_state_event`）。沒拿過狀態（還沒 `room.get` 過、或一般 Matrix 帳號只在 `room.list` 上）就🚫 寫。那份 `state` 是列表留下來的（`room_list.is_state_carried_over`：一般 Matrix 帳號的 `room.list` 帶來新的型別欄位、狀態則是上次 `room.get` 的）也🚫 寫：拿舊狀態重算會把新的名字、權限改回舊的。重算不出來（例：存著的狀態沒有 `m.room.create`）也🚫 寫那一列、照樣回成功；下一次 `room.get` 整份蓋上。其他帳號那一列是它們自己看到的樣子，下次它們 `room.get` 才更新。⚠️ 名字：沒有名字也沒有別名的房，名字是用成員湊的（成員不在 `state` 裡）——原本就是湊的照舊；原本是名字或別名、這次把它拿掉了，就變 `null`，下次 `room.get` 才湊得回來（🚫 留著已經不成立的舊名字） |
+| 寫的是 `m.room.encryption`（`room.enable_encryption`，或 `room.set_state` 直接寫它） | 上一列之外，`rooms.encrypted = 1`，不管有沒有 `conversation_json`、上一列寫沒寫（重算失敗🚫 把它一起回滾）（§3.2；這一欄是房間的事實，所有帳號共用、只升不降） |
 
 `server`：一律只打遠端、🚫 碰本地。
 **寫本地失敗**（DB 壞了）：成功以 server 的 ACK 為準，照樣回成功，另推一則 `note`（例：`room.leave: !r:localhost was left on the server, but the local room list could not be updated (…); call room.list sync=both`）。🚫 回錯：回錯 UI 會以為動作沒做而重做一次（維護者 2026-10-07）。

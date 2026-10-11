@@ -343,7 +343,7 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 | 哪一組 | method | 帶 `sync`（`both` 預設／`server`） |
 |---|---|---|
 | 成員與房間本身 | `room.create`、`room.join`、`room.knock`、`room.leave`、`room.forget`、`room.invite`、`room.kick`、`room.ban`、`room.unban`、`room.upgrade` | ✅ |
-| 純讀、本地沒存 | `room.members`、`room.joined_members`、`room.summary`、`room.hierarchy`、`room.mutual_rooms`、`room.public_rooms`、`room.get_visibility`、`room.set_visibility`、`room.resolve_alias`、`room.set_alias`、`room.delete_alias`、`room.aliases` | — |
+| 本地沒存（讀或寫，🚫 帶 `sync`） | `room.members`、`room.joined_members`、`room.summary`、`room.hierarchy`、`room.mutual_rooms`、`room.public_rooms`、`room.get_visibility`、`room.set_visibility`、`room.resolve_alias`、`room.set_alias`、`room.delete_alias`、`room.aliases` | — |
 | 房間狀態 | `room.get_state`（—）；`room.set_state`、`room.set_name`、`room.set_topic`、`room.set_avatar`、`room.set_canonical_alias`、`room.set_history_visibility`、`room.set_join_rule`、`room.set_guest_access`、`room.enable_encryption`、`room.set_power_levels`、`room.pin` | ✅（`get_state` 除外）。⚠️ `room.enable_encryption` 的 `server` **只給除錯**：本地還記著明文，`room.send_text` 會送明文（/docs/design/rooms/room-actions.md §3.2） |
 | 標籤與帳號資料 | `room.get_tags`、`room.set_tag`、`room.delete_tag`、`room.get_account_data`、`room.set_account_data`、`account.get_data`、`account.set_data`、`room.set_direct` | — |
 

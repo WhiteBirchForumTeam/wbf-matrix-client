@@ -36,7 +36,8 @@ pub fn to_encryption_content() -> Value {
 ///     fields: CreateRoom 的其他欄位原樣（名字、格式、預設值都是 Matrix 的）, example: {"name": "週末聚餐", "preset": "private_chat"}
 /// Return:
 ///     Ok(Map)      要送的 body
-///     Err(Usage)   `initial_state` 不是陣列；UI 自己在 `initial_state` 放了 `m.room.encryption`、`encrypted` 卻給 false（兩邊說的相反）；body 裡有 `encrypted`
+///     Err(Usage)   `initial_state` 不是陣列；UI 自己在 `initial_state` 放了 `m.room.encryption`、`encrypted` 卻給 false（兩邊說的相反）；
+///                  那則 `m.room.encryption` 不是 [`crate::room_state::is_encryption_event`] 認得的（`state_key` 不是空的、沒有 `algorithm`）；body 裡有 `encrypted`
 pub fn to_create_room_body(
     encrypted: bool,
     mut fields: Map<String, Value>,
@@ -55,9 +56,20 @@ pub fn to_create_room_body(
             )))
         }
     };
-    let already_encrypted = initial_state
+    // 一則說自己是加密、卻不是加密的事件，會讓 server 建出明文房、本地卻記成加密：認不得就拒，🚫 當成「已經加密」。
+    let encryption_events: Vec<&Value> = initial_state
         .iter()
-        .any(|event| event["type"].as_str() == Some("m.room.encryption"));
+        .filter(|event| event["type"].as_str() == Some("m.room.encryption"))
+        .collect();
+    if let Some(malformed) = encryption_events
+        .iter()
+        .find(|event| !crate::room_state::is_encryption_event(event))
+    {
+        return Err(SdkError::Usage(format!(
+            "room.create: initial_state's m.room.encryption needs an empty state_key and an algorithm, not {malformed}"
+        )));
+    }
+    let already_encrypted = !encryption_events.is_empty();
     let mut initial_state = initial_state;
     match (encrypted, already_encrypted) {
         (false, true) => {
@@ -307,6 +319,19 @@ mod tests {
             (false, json!({ "initial_state": own })),
             (true, json!({ "initial_state": {} })),
             (true, json!({ "encrypted": true })),
+            // 說自己是加密、卻不是 server 會當成加密的那種：🚫 當成「已經加密」而不補（會建出明文房、本地卻記成加密，PR #76 oliver 🟡1）
+            (
+                true,
+                json!({ "initial_state": [{ "type": "m.room.encryption", "state_key": "x", "content": { "algorithm": MEGOLM_ALGORITHM } }] }),
+            ),
+            (
+                true,
+                json!({ "initial_state": [{ "type": "m.room.encryption", "state_key": "", "content": {} }] }),
+            ),
+            (
+                false,
+                json!({ "initial_state": [{ "type": "m.room.encryption", "state_key": "", "content": {} }] }),
+            ),
         ] {
             assert!(matches!(
                 to_create_room_body(encrypted, map(fields)),

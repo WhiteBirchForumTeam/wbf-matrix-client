@@ -34,7 +34,7 @@ pub const CACHE_FILE_NAME: &str = "cache.db";
 /// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）；
 /// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、🚫 刪列，維護者 2026-10-05）。
 /// v9：`media.kind`、`media.verified`；`file_size`、`chunk_size` 只有 `kind` 1 一定有（維護者 2026-10-06，/docs/design/media/media-download.md §12）。
-/// v10：`room_list.joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，維護者 2026-10-07，/docs/design/rooms/room-actions.md §3）。
+/// v10：`room_list.joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，維護者 2026-10-07，/docs/design/rooms/room-actions.md §3）；`room_list.is_state_carried_over`（`state` 是上次留下來的）。
 const SCHEMA_VERSION: i64 = 10;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
@@ -257,6 +257,7 @@ impl Cache {
     /// 拿回來的房間的樣子（一人一列；`Conversation` 是他看到的樣子）：整份蓋上去、記下什麼時候拿的。
     /// 🚫 動 `membership`：在不在房裡只由 [`Cache::record_joined_rooms`]（`room.list`）與房間動作（[`Cache::record_membership`]）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設 `join`。
     /// 這份沒帶狀態（`state` 是 `null`，一般 Matrix 帳號的列表）就留著本地那份的 `state`：🚫 拿「這次沒問」蓋掉「上次問過的」。
+    /// 留下來的那份比這次的型別欄位舊，所以記 `is_state_carried_over = 1`：[`Cache::record_written_state`] 看到它就🚫 拿那份重算（會把新的名字、權限改回舊的）。
     pub fn upsert_conversations(
         &mut self,
         user_id: &str,
@@ -268,9 +269,9 @@ impl Cache {
         {
             let mut insert = transaction
                 .prepare_cached(
-                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership) VALUES (?1, ?2, ?3, ?4, 'join')
+                    "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership, is_state_carried_over) VALUES (?1, ?2, ?3, ?4, 'join', ?5)
                      ON CONFLICT(user, room) DO UPDATE SET conversation_json = excluded.conversation_json,
-                       refreshed_at = excluded.refreshed_at",
+                       refreshed_at = excluded.refreshed_at, is_state_carried_over = excluded.is_state_carried_over",
                 )
                 .map_err(db_error)?;
             let mut stored = transaction
@@ -289,6 +290,7 @@ impl Cache {
             for conversation in conversations {
                 let room = room_row_id(&transaction, &conversation.id)?;
                 let mut conversation = conversation.clone();
+                let mut is_state_carried_over = false;
                 if conversation.state.is_none() {
                     let previous: Option<Option<String>> = stored
                         .query_row(params![user, room], |row| row.get(0))
@@ -298,6 +300,7 @@ impl Cache {
                         .flatten()
                         .and_then(|json| serde_json::from_str::<Conversation>(&json).ok())
                         .and_then(|previous| previous.state);
+                    is_state_carried_over = conversation.state.is_some();
                 }
                 insert
                     .execute(params![
@@ -307,6 +310,7 @@ impl Cache {
                             crate::error::cannot_serialize("Conversation", error)
                         })?,
                         now,
+                        is_state_carried_over,
                     ])
                     .map_err(db_error)?;
                 mark_encryption
@@ -552,8 +556,8 @@ impl Cache {
     }
 
     /// 自己剛寫了一項房間狀態（`room.set_state` 與它的窄版收到 ACK、`sync=both`，/docs/design/rooms/room-actions.md §3）：
-    /// 自己那一列有拿過狀態就把那一項換進去、重算型別欄位（`room_state::conversation_with_state_event`）；沒拿過就🚫 寫。
-    /// 寫的是 `m.room.encryption`（有演算法）→ `rooms.encrypted = 1`，不管有沒有那一列（房間的事實，只升不降）。
+    /// 自己那一列有拿過狀態就把那一項換進去、重算型別欄位（`room_state::conversation_with_state_event`）；沒拿過、那份狀態是列表留下來的（`is_state_carried_over`）、或重算不出來，就🚫 寫那一列（下一次 `room.get` 會整份蓋上）。
+    /// 寫的是 `m.room.encryption`（[`crate::room_state::is_encryption_event`]）→ `rooms.encrypted = 1`，不管有沒有那一列、重算成不成（房間的事實，只升不降；重算失敗🚫 把它一起回滾）。
     /// 其他帳號那一列是它們自己看到的樣子，🚫 動。
     ///
     /// Args:
@@ -562,7 +566,7 @@ impl Cache {
     ///     written: 寫的那一項, example: json!({"type": "m.room.name", "state_key": "", "content": {"name": "ops"}, "sender": "@alice:localhost", "event_id": "$n"})
     /// Return:
     ///     Ok(true)    自己那一列換好了
-    ///     Ok(false)   自己那一列沒拿過狀態（或那份解不開），只動了 `rooms.encrypted`（如果是加密）
+    ///     Ok(false)   自己那一列沒拿過狀態、那份解不開、狀態是留下來的、或重算不出來，只動了 `rooms.encrypted`（如果是加密）
     pub fn record_written_state(
         &mut self,
         user_id: &str,
@@ -572,10 +576,7 @@ impl Cache {
         let transaction = self.connection.transaction().map_err(db_error)?;
         let user = user_row_id(&transaction, user_id)?;
         let room = room_row_id(&transaction, room_id)?;
-        let turns_encryption_on = written["type"].as_str() == Some("m.room.encryption")
-            && written["state_key"].as_str() == Some("")
-            && crate::room_state::is_encryption_content(&written["content"]);
-        if turns_encryption_on {
+        if crate::room_state::is_encryption_event(written) {
             transaction
                 .execute(
                     "UPDATE rooms SET encrypted = 1 WHERE id = ?1",
@@ -583,25 +584,24 @@ impl Cache {
                 )
                 .map_err(db_error)?;
         }
-        let stored: Option<Option<String>> = transaction
+        let stored: Option<(Option<String>, bool)> = transaction
             .query_row(
-                "SELECT conversation_json FROM room_list WHERE user = ?1 AND room = ?2",
+                "SELECT conversation_json, is_state_carried_over FROM room_list WHERE user = ?1 AND room = ?2",
                 params![user, room],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(db_error)?;
-        let previous = stored
-            .flatten()
-            .and_then(|json| serde_json::from_str::<Conversation>(&json).ok());
-        let updated = match previous {
-            Some(previous) => crate::room_state::conversation_with_state_event(
-                &previous,
-                user_id,
-                written.clone(),
-            )?,
-            None => None,
+        // 只有「狀態跟型別欄位是同一次拿的」才重算；其他一律不寫那一列。
+        let previous = match stored {
+            Some((Some(json), false)) => serde_json::from_str::<Conversation>(&json).ok(),
+            _ => None,
         };
+        let updated = previous.and_then(|previous| {
+            crate::room_state::conversation_with_state_event(&previous, user_id, written.clone())
+                .ok()
+                .flatten()
+        });
         let Some(updated) = updated else {
             transaction.commit().map_err(db_error)?;
             return Ok(false);
@@ -2727,6 +2727,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                user INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                conversation_json TEXT, refreshed_at INTEGER,
                membership TEXT NOT NULL DEFAULT 'join' CHECK (membership IN ('join', 'invite', 'knock', 'leave', 'ban')),
+               is_state_carried_over INTEGER NOT NULL DEFAULT 0 CHECK (is_state_carried_over IN (0, 1)),
                PRIMARY KEY (user, room)) WITHOUT ROWID;
              CREATE TABLE sync_state (
                user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -3248,6 +3249,26 @@ mod tests {
         let read = cache.find_conversation(ALICE, "!r").unwrap().unwrap();
         assert_eq!(read.name.as_deref(), Some("new"), "其他欄位照新的");
         assert_eq!(read.state, Some(state));
+
+        // 留下來的狀態比列表的型別欄位舊：寫一項狀態時🚫 拿它重算（會把 `new` 改回舊的，PR #76 oliver 🟡3）
+        let topic = serde_json::json!({ "type": "m.room.topic", "state_key": "", "sender": ALICE, "content": { "topic": "t" } });
+        assert!(!cache.record_written_state(ALICE, "!r", &topic).unwrap());
+        let read = cache.find_conversation(ALICE, "!r").unwrap().unwrap();
+        assert_eq!(read.name.as_deref(), Some("new"));
+        assert_eq!(read.topic, None);
+
+        // 下一次帶著狀態拿（`room.get`）：又是同一次拿的，重算回來
+        let fetched_again = crate::room_state::conversation_from_state(
+            "!r",
+            ALICE,
+            &[serde_json::json!({ "type": "m.room.create", "state_key": "", "sender": ALICE, "content": { "room_version": "10" } })],
+            &[],
+        )
+        .unwrap();
+        cache.upsert_conversations(ALICE, &[fetched_again]).unwrap();
+        assert!(cache.record_written_state(ALICE, "!r", &topic).unwrap());
+        let read = cache.find_conversation(ALICE, "!r").unwrap().unwrap();
+        assert_eq!(read.topic.as_deref(), Some("t"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3304,6 +3325,21 @@ mod tests {
             serde_json::json!({ "type": "m.room.encryption", "state_key": "", "content": {} });
         cache.record_written_state(ALICE, "!plain", &empty).unwrap();
         assert_eq!(cache.find_room_encrypted("!plain").unwrap(), None);
+
+        // 重算不出來（存著的狀態沒有 `m.room.create`）：那一列🚫 寫，加密標記照升、🚫 一起回滾（PR #76 oliver 🟡2）
+        cache
+            .upsert_conversations(
+                ALICE,
+                &[Conversation {
+                    state: Some(Vec::new()),
+                    ..room("!no-create", false)
+                }],
+            )
+            .unwrap();
+        assert!(!cache
+            .record_written_state(ALICE, "!no-create", &encryption)
+            .unwrap());
+        assert_eq!(cache.find_room_encrypted("!no-create").unwrap(), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

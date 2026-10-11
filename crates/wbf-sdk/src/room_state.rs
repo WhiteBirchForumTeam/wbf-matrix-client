@@ -231,6 +231,19 @@ pub fn is_encryption_content(content: &Value) -> bool {
     non_empty_string(&content["algorithm"]).is_some()
 }
 
+/// 一則狀態事件算不算「這房加密了」：`m.room.encryption`、`state_key` 是空的、content 過 [`is_encryption_content`]。
+/// 建房的 `initial_state`（`room_state_edit::to_create_room_body`）與寫完狀態升 `rooms.encrypted`（`Cache::record_written_state`）共用這一句。
+///
+/// Args:
+///     event: example: &json!({"type": "m.room.encryption", "state_key": "", "content": {"algorithm": "m.megolm.v1.aes-sha2"}})
+/// Return:
+///     bool  三個條件都成立才是 true
+pub fn is_encryption_event(event: &Value) -> bool {
+    event["type"].as_str() == Some("m.room.encryption")
+        && event["state_key"].as_str() == Some("")
+        && is_encryption_content(&event["content"])
+}
+
 fn find_state<'a>(state: &'a [Value], event_type: &str, state_key: &str) -> Option<&'a Value> {
     // 同型別同 key 只該有一個；有多個就取最後一個（server 給的順序後面的比較新）。
     state.iter().rfind(|event| {
