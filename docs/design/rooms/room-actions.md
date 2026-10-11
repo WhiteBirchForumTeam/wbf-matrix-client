@@ -68,7 +68,7 @@ matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間�
 
 `room.create`：除了 `encrypted`，每個參數都**原樣**進 CreateRoom 的 body（名字、格式、預設值都是 Matrix 的，daemon 🚫 補預設）。`encrypted: true` 時 daemon 在 `initial_state` 加
 `{ "type": "m.room.encryption", "state_key": "", "content": { "algorithm": "m.megolm.v1.aes-sha2" } }`；UI 自己在 `initial_state` 放了 `m.room.encryption` 而 `encrypted` 給 `false`（兩邊說的相反）→ 用法錯（`1100`，`crates/wbf-sdk/src/room_state_edit.rs` 的 `to_create_room_body`）；沒帶 `encrypted` 是參數錯（`102`）。
-UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`state_key` 是空的、content 有非空的 `algorithm`，跟寫完狀態升 `rooms.encrypted` 是同一句：`crates/wbf-sdk/src/room_state.rs` 的 `is_encryption_event`），不是就 `1100`：🚫 當成「已經加密」而不補——那會建出明文房、本地卻記成加密（PR #76 審查）。
+UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`state_key` 是空的或省略——`initial_state` 省略時就是空字串，Matrix 規格——、content 有非空的 `algorithm`，跟寫完狀態升 `rooms.encrypted` 是同一句：`crates/wbf-sdk/src/room_state.rs` 的 `is_encryption_event`），不是就 `1100`：🚫 當成「已經加密」而不補——那會建出明文房、本地卻記成加密（PR #76 審查）。
 📎 想建「公開可搜」的房（/docs/design/rooms/chat-model.md §3.6）：`preset: "public_chat"`＋`initial_state` 帶 `m.room.history_visibility: world_readable`，要列進目錄再加 `visibility: "public"`——全是 UI 組。
 
 ### 2.2 房間狀態（Event kind 的 `0x21`–`0x23`）

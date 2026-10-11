@@ -37,7 +37,7 @@ pub fn to_encryption_content() -> Value {
 /// Return:
 ///     Ok(Map)      要送的 body
 ///     Err(Usage)   `initial_state` 不是陣列；UI 自己在 `initial_state` 放了 `m.room.encryption`、`encrypted` 卻給 false（兩邊說的相反）；
-///                  那則 `m.room.encryption` 不是 [`crate::room_state::is_encryption_event`] 認得的（`state_key` 不是空的、沒有 `algorithm`）；body 裡有 `encrypted`
+///                  那則 `m.room.encryption` 不是 [`crate::room_state::is_encryption_event`] 認得的（`state_key` 不是空的——省略算空的——、沒有 `algorithm`）；body 裡有 `encrypted`
 pub fn to_create_room_body(
     encrypted: bool,
     mut fields: Map<String, Value>,
@@ -61,10 +61,16 @@ pub fn to_create_room_body(
         .iter()
         .filter(|event| event["type"].as_str() == Some("m.room.encryption"))
         .collect();
-    if let Some(malformed) = encryption_events
-        .iter()
-        .find(|event| !crate::room_state::is_encryption_event(event))
-    {
+    if let Some(malformed) = encryption_events.iter().find(|event| {
+        // `initial_state` 的 `state_key` 省略時就是空字串（Matrix 規格、ruma 的 `InitialStateEvent`）；送出去的照 UI 給的原樣。
+        let mut keyed = Value::clone(event);
+        if let Some(fields) = keyed.as_object_mut() {
+            fields
+                .entry("state_key")
+                .or_insert_with(|| Value::String(String::new()));
+        }
+        !crate::room_state::is_encryption_event(&keyed)
+    }) {
         return Err(SdkError::Usage(format!(
             "room.create: initial_state's m.room.encryption needs an empty state_key and an algorithm, not {malformed}"
         )));
@@ -314,6 +320,12 @@ mod tests {
                          { "type": "m.room.history_visibility", "state_key": "", "content": { "history_visibility": "joined" } }]);
         let body = to_create_room_body(true, map(json!({ "initial_state": own.clone() }))).unwrap();
         assert_eq!(body["initial_state"], own);
+        // 省略 `state_key` 就是空字串（Matrix 規格）：認得、🚫 補第二份、原樣送出（PR #76 oliver 複審 🟡）
+        let keyless =
+            json!([{ "type": "m.room.encryption", "content": { "algorithm": MEGOLM_ALGORITHM } }]);
+        let body =
+            to_create_room_body(true, map(json!({ "initial_state": keyless.clone() }))).unwrap();
+        assert_eq!(body["initial_state"], keyless);
         // 兩邊說的相反、initial_state 不是陣列、多帶 encrypted：都是用法錯
         for (encrypted, fields) in [
             (false, json!({ "initial_state": own })),
