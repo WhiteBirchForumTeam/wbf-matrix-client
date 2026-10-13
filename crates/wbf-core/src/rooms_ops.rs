@@ -106,6 +106,10 @@ impl Core {
             let entries = cache.read().await.list_room_entries(&me, memberships)?;
             return Ok(entries);
         }
+        // server 只答「加入了哪些」：看一眼又沒要 `join`，答案一定是空的，🚫 白打一次上游。
+        if sync == SyncMode::Server && !memberships.contains(&Membership::Join) {
+            return Ok(Vec::new());
+        }
         // wbf 帳號只拿名單；一般 Matrix 帳號的 Client 一次 /sync 就有每一間的樣子，拿到了就一起記。
         let (joined, fetched) = if self.is_wbf_account(&account)? {
             (self.wbf_joined_rooms(&account).await?, Vec::new())
@@ -123,9 +127,6 @@ impl Core {
         };
         if sync == SyncMode::Server {
             // 🚫 看一眼不寫庫。
-            if !memberships.contains(&Membership::Join) {
-                return Ok(Vec::new());
-            }
             let mut entries: Vec<RoomListEntry> = joined
                 .iter()
                 .map(|room| RoomListEntry::unknown(room, Membership::Join))

@@ -329,7 +329,7 @@ impl MatrixEndpoint {
 ///     variables: example: {"room_id": "!r:localhost"}
 /// Return:
 ///     Ok(())
-///     Err(Usage)   少了 path 變數、path 變數不是字串或是 `.`／`..`、query 變數的型別不對、多了表上沒有的變數
+///     Err(Usage)   少了 path 變數、path 變數不是字串、是 `.`／`..`、或帶著 `\t`／`\n`／`\r`、query 變數的型別不對、多了表上沒有的變數
 pub fn check_variables(
     endpoint: &MatrixEndpoint,
     variables: &Map<String, Value>,
@@ -341,6 +341,12 @@ pub fn check_variables(
             Some(Value::String(value)) if value == "." || value == ".." => {
                 return Err(bad(format!(
                     "`{name}` cannot be {value:?} (the URL would drop that segment)"
+                )))
+            }
+            // URL 不是編碼而是**丟掉**這三個：`"a\tb"` 靜默變成 `"ab"`、`"..\n"` 繞過上一條、吃掉前一段（PR #76 cirno）。
+            Some(Value::String(value)) if value.contains(['\t', '\n', '\r']) => {
+                return Err(bad(format!(
+                    "`{name}` cannot contain a tab, newline or carriage return (the URL would drop it): {value:?}"
                 )))
             }
             Some(Value::String(_)) => {}
@@ -458,11 +464,11 @@ pub async fn call_over_http(
 }
 
 /// 模板 → URL：path 變數每一段各自 percent-encode（`#別名` 變 `%23`、event id 的 `/` 變 `%2F`），query 變數照順序附上，陣列是重複的參數。
-/// 呼叫前要先過 [`check_variables`]。
+/// 呼叫前要先過 [`check_variables`]。填完再比對一次段數（跟橋的 `fill_path` 同一個不變式）：URL 套件有任何正規化吃掉或多出一段，都拒、🚫 送到別的端點。
 ///
 /// Return:
 ///     Ok(Url)
-///     Err(Usage)   server 不是能接路徑的 URL
+///     Err(Usage)   server 不是能接路徑的 URL；填完的段數跟模板不一樣
 fn to_url(
     server: &str,
     endpoint: &MatrixEndpoint,
@@ -470,6 +476,14 @@ fn to_url(
 ) -> Result<reqwest::Url, SdkError> {
     let mut url = reqwest::Url::parse(server)
         .map_err(|error| SdkError::Usage(format!("server {server:?} is not a URL: {error}")))?;
+    // server 自己的路徑段（反向代理底下的 `/matrix` 之類），結尾的 `/` 不算：下面 `pop_if_empty` 會拿掉它。
+    let server_segment_count = url.path_segments().map_or(0, |segments| {
+        let segments: Vec<&str> = segments.collect();
+        segments
+            .len()
+            .saturating_sub(usize::from(segments.last() == Some(&"")))
+    });
+    let template_segment_count = endpoint.path.trim_start_matches('/').split('/').count();
     {
         let mut segments = url
             .path_segments_mut()
@@ -491,6 +505,14 @@ fn to_url(
                 }
             }
         }
+    }
+    let filled_segment_count = url.path_segments().map_or(0, Iterator::count);
+    if filled_segment_count != server_segment_count + template_segment_count {
+        return Err(SdkError::Usage(format!(
+            "{}: the filled path {:?} does not have the template's segments",
+            endpoint.name,
+            url.path()
+        )));
     }
     let query: Vec<(&str, String)> = variables
         .iter()
@@ -588,6 +610,11 @@ mod tests {
             json!({ "room_id": 1 }),
             json!({ "room_id": ".." }),
             json!({ "room_id": "." }),
+            // URL 丟掉而不編碼的三個字（PR #76 cirno）：繞過 `.`／`..` 那條、或靜默改掉值
+            json!({ "room_id": ".\n" }),
+            json!({ "room_id": "..\n" }),
+            json!({ "room_id": "a\tb" }),
+            json!({ "room_id": "!r:x\r" }),
             json!({ "room_id": "!r:x", "user_id": "@b:x" }),
         ] {
             assert!(
@@ -651,6 +678,30 @@ mod tests {
             url.as_str(),
             "http://localhost:6167/_matrix/client/v1/rooms/!s:localhost/hierarchy?limit=20&suggested_only=false"
         );
+        // server 自己有路徑（反向代理）：接在後面、段數照算
+        let url = to_url(
+            "http://localhost:6167/matrix/",
+            &LEAVE,
+            &vars(json!({ "room_id": "!r:x" })),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:6167/matrix/_matrix/client/v3/rooms/!r:x/leave"
+        );
+        // 第二道：就算沒先過 check_variables，填完少一段也拒（跟橋的 fill_path 同一個不變式）。
+        // ⚠️ 它只抓「段數變了」：`".\n"` 會變成空的一段（段數不變、值靜默變 `""`），那只有 check_variables 的 `\n` 那條擋得住。
+        for vanishing in ["..", "..\n"] {
+            let filled = to_url(
+                "http://localhost:6167",
+                &SET_ROOM_ACCOUNT_DATA,
+                &vars(json!({ "user_id": "@a:x", "room_id": vanishing, "event_type": "m.foo" })),
+            );
+            assert!(
+                matches!(filled, Err(SdkError::Usage(_))),
+                "{vanishing:?} → {filled:?}"
+            );
+        }
     }
 
     #[test]

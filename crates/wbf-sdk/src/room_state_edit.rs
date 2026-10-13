@@ -72,7 +72,7 @@ pub fn to_create_room_body(
         !crate::room_state::is_encryption_event(&keyed)
     }) {
         return Err(SdkError::Usage(format!(
-            "room.create: initial_state's m.room.encryption needs an empty state_key and an algorithm, not {malformed}"
+            "room.create: initial_state's m.room.encryption needs a state_key that is \"\" or left out (not null) and an algorithm, not {malformed}"
         )));
     }
     let already_encrypted = !encryption_events.is_empty();

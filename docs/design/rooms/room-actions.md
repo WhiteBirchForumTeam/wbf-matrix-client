@@ -278,7 +278,7 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 
 | 層 | 檔案 | 做什麼 |
 |---|---|---|
-| sdk | `crates/wbf-sdk/src/matrix_endpoint.rs` | 一張端點表（橋的號碼＋HTTP 的 method、路徑模板、query 變數）；`check_variables`（橋的規則，兩條路都先過）、`encode_body`、`call_over_http` |
+| sdk | `crates/wbf-sdk/src/matrix_endpoint.rs` | 一張端點表（橋的號碼＋HTTP 的 method、路徑模板、query 變數）；`check_variables`（橋的規則，兩條路都先過：wbfuwunel 的 /docs/bridge-specs/index.md §1.3——缺、型別、`.`／`..`、值裡有 `\t`／`\n`／`\r`、表上沒有的）、`encode_body`、`call_over_http`（填完路徑再比對段數，跟橋的 `fill_path` 同一個不變式） |
 | sdk | `crates/wbf-sdk/src/client.rs` | `WbfClient::call_matrix_endpoint`：同一張表的走橋那條 |
 | sdk | `crates/wbf-sdk/src/room_state_edit.rs` | §2.1 的 createRoom body、§4.2 的權限合併、§5 的置頂、§2.5 的 `m.direct`（純函數） |
 | sdk | `crates/wbf-sdk/src/room_state.rs`、`chat.rs` | `Conversation`／`RoomListEntry` 帶 `state` 與 `membership`；`conversation_with_state_event`（§3 的 `set_state` 那一列） |

@@ -83,6 +83,8 @@ fn is_read_only(method: &str) -> bool {
 ///
 /// ⚠️ 值認不得時回 `None`：那次請求會被 handler 用 `102` 擋下來，而回應🚫 不該宣稱
 /// 「我用了某一種」—— 它一種都沒用。
+/// ⚠️ 寫本地的房間動作（/docs/design/rpc-specs/rpc-spec.md §3.3.1 帶 `sync` 的那些）用的是 `WriteSync`：沒帶是 `both`、`local` 認不得，
+/// 所以🚫 照讀的那套（預設 `local`）解，那會回報 handler 沒用的那一種。
 /// 📎 名單跟 handler 各自解析同一個欄位，看起來像重複；但 handler 要的是**型別化的參數**，
 /// 這裡要的是**回應要不要帶**。⭐ 兩者都少不了，而漏掉這裡只會少一個資訊欄位，🚫 不會做錯事。
 fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
@@ -93,6 +95,40 @@ fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
         "room.files",
         "media.info",
     ];
+    const WITH_WRITE_SYNC: &[&str] = &[
+        "room.create",
+        "room.join",
+        "room.knock",
+        "room.leave",
+        "room.forget",
+        "room.invite",
+        "room.kick",
+        "room.ban",
+        "room.unban",
+        "room.upgrade",
+        "room.set_state",
+        "room.set_name",
+        "room.set_topic",
+        "room.set_avatar",
+        "room.set_canonical_alias",
+        "room.set_history_visibility",
+        "room.set_join_rule",
+        "room.set_guest_access",
+        "room.enable_encryption",
+        "room.set_power_levels",
+        "room.pin",
+    ];
+    if WITH_WRITE_SYNC.contains(&method) {
+        // `null` 在這幾支是 102（`#[serde(default)]` 只管「沒給」），所以跟認不得的值一樣🚫 回報。
+        let write_sync = match params.get("sync") {
+            None => Some(wbf_core::WriteSync::default()),
+            Some(value) => serde_json::from_value(value.clone()).ok(),
+        };
+        return write_sync.map(|write_sync| match write_sync {
+            wbf_core::WriteSync::Both => wbf_core::SyncMode::Both,
+            wbf_core::WriteSync::Server => wbf_core::SyncMode::Server,
+        });
+    }
     if !WITH_SYNC.contains(&method) {
         return None;
     }
@@ -845,6 +881,57 @@ mod tests {
         assert_eq!(response.sync, None);
         let json = serde_json::to_value(&response).unwrap();
         assert!(json.get("sync").is_none(), "{json}");
+    }
+
+    /// 寫本地的房間動作（/docs/design/rpc-specs/rpc-spec.md §3.3.1 標 ✅ 的 21 支）也認得 `sync`，回應一樣要回報（PR #76 cirno）：
+    /// 它們的預設是 `both`、`local` 認不得 —— 🚫 照讀的那套報成 `local`。名單照文件抄，不引用正式碼的常數（那樣漏掉一支兩邊一起漏）。
+    #[tokio::test]
+    async fn room_actions_report_the_write_sync_they_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        handle.core().await.create_vault(None).unwrap();
+        for method in [
+            "room.create",
+            "room.join",
+            "room.knock",
+            "room.leave",
+            "room.forget",
+            "room.invite",
+            "room.kick",
+            "room.ban",
+            "room.unban",
+            "room.upgrade",
+            "room.set_state",
+            "room.set_name",
+            "room.set_topic",
+            "room.set_avatar",
+            "room.set_canonical_alias",
+            "room.set_history_visibility",
+            "room.set_join_rule",
+            "room.set_guest_access",
+            "room.enable_encryption",
+            "room.set_power_levels",
+            "room.pin",
+        ] {
+            // 參數不齊、沒有帳號：一定失敗，但失敗的回應也要帶（§2）
+            let response = handle.call(request(method, json!({}))).await;
+            assert_eq!(
+                response.sync,
+                Some(wbf_core::SyncMode::Both),
+                "{method}: {response:?}"
+            );
+            let response = handle
+                .call(request(method, json!({ "sync": "server" })))
+                .await;
+            assert_eq!(response.sync, Some(wbf_core::SyncMode::Server), "{method}");
+            for unknown in [json!("local"), Value::Null] {
+                let response = handle
+                    .call(request(method, json!({ "sync": unknown })))
+                    .await;
+                assert_eq!(response.code, code::INVALID_PARAMS, "{method}: {unknown}");
+                assert_eq!(response.sync, None, "{method}: {unknown}");
+            }
+        }
     }
 
     #[tokio::test]
