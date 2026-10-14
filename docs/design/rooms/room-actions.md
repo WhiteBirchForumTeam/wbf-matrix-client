@@ -167,26 +167,83 @@ UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`st
   所以 rpc-spec 要把這個值標成「除錯用」。
 - 已經加密的房再叫一次：daemon 🚫 先問，照送；server 收了就是多一則一樣的狀態事件，本地本來就是 1。
 
-### 3.3 收邀請（等 wbfuwunel #111，這支🚫 做）
+### 3.3 收邀請（issue #77；草案，等維護者點頭）
 
-> 維護者 2026-10-07 開工時定：「invite 的推播語意先不做，等 server 完成後補」。下面是 #111 做完之後那一支的形狀，這支只做到 `membership` 收得下 `invite`。
+server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/design/events/invites-on-the-wire.md（下面簡稱「server §n」）。
+維護者 2026-10-14 定了三件：**跟房間線共用**、**daemon 加一個「是不是本站說的」欄位**、**一般 Matrix 帳號的推播也一起做**（⚠️ 第三件有個前提不成立，見 §3.3.5）。
 
-**現況**：wbf 帳號收不到邀請。訂閱線只推已加入的房（wbfuwunel 的 /docs/design/events/event-push.md §1）、`JoinedRooms` 只列已加入的、還沒加入時讀房間狀態是 403。
-標準 Matrix 是 `/sync` 的 `rooms.invite`，每間附一份縮減過的狀態（`invite_state`：建房事件、房名、頭像、加入規則、別名、加不加密、邀請的那則成員事件）。
-server 其實存著這份（wbfuwunel 的 `src/service/rooms/state_cache/update.rs` 的 `mark_as_invited`），只是沒路送給 wbf client——#111 請 server 優先補。
+**現況**：wbf 帳號收不到邀請——訂閱線只推已加入的房、`JoinedRooms` 只列已加入的、還沒加入時讀房間狀態是 403。Matrix 也沒有「列出我被邀請的房」的端點，邀請只從 `/sync` 來，所以 server 造了自己的一條流 `0x05 Invite`。
 
-**#111 做完之後 client 這樣接**（server 定了不一樣，照 server 的對齊）：
+#### 3.3.1 線上的形狀（server §5，摘要）
 
-| 收到 | 本地（這個帳號那一列） | 推給 UI |
+| subtype | 方向 | 要點 |
 |---|---|---|
-| 推送 `invite { room_id, inviter, is_direct, reason?, state }` | `membership = invite`（列不在就加）；那份縮減狀態存進新的一欄 `invite_json`（`{ inviter, is_direct, reason?, state }` 原樣），`conversation_json` 🚫 動 | 新推播 `room.membership { user, room, membership: "invite", invite: {…} }` |
-| 推送 `invite_gone { room_id, membership }` | `membership` 改成它說的（`leave`／`ban`／`join`），`invite_json` 清掉 | `room.membership { user, room, membership }` |
-| 補拿（重連、`room.list sync=both` 時一起問）`{ invites: […] }` | 跟推送一樣寫；本地是 `invite`、補拿的清單裡卻沒有的 → 改成 `leave`（跟 `room.list` 處理退出的房同一套） | 有變的才推 |
+| `0x04 Subscribe` | client → server | 回 `{ latest_count }`；之後的 `Push`／`Gone` 抄這個 `id` |
+| `0x01 Fetch` | client → server | `{ ci_seq?, batch? }`，回一串 `0x02 Batch`；**只走 WS** |
+| `0x02 Batch` | server → client | `{ tc, bc, os?, ns?, counts, r }`，data 是 `bc` 間房，每間 `{ room_id, inviter?, is_direct, reason?, state }`；**`r == 0` 才是補完**；`bc == 0` 時🚫 帶 `os`／`ns` |
+| `0x06 Push` | server → client | `{ room_id, inviter?, is_direct, reason?, is, sc, gap }`，data 是 `sc` 則縮減狀態；`sc == 0` 只會是太大被降級（server §5.3） |
+| `0x07 Gone` | server → client | `{ room_id, membership, is, gap }`；`membership` 是 `leave`／`ban`／`join`／`knock` |
+| `0x05 Unsubscribe` | client → server | `{}` |
 
-- `room.list { membership: ["invite"] }` 列被邀請的房時，每一列帶 `invite`（`invite_json` 的內容）；`room.get` 對被邀請的房照舊會被 server 拒（還沒加入），所以 UI 顯示「某某邀你加入某某房」靠的是 `invite`。
-- 還沒等到 #111 的替代：`room.summary`（§2.1，批 3，還沒加入也能問房名）。
-- 一般 Matrix 帳號：matrix-sdk 的 sync 本來就收邀請與縮減狀態（`Client::invited_rooms`），同一套寫法，不用等 server。
-- `invite_json` 是 `room_list` 的新欄，跟著那一支加（這支的 v10 🚫 加：沒有人寫它）。
+🚨 **server 定了每次連線走一輪完整快照、🚫 留跨連線的水位**（server §3.3）：被收回的邀請**只能靠「不在快照裡」發現**，帶舊水位回來會永遠留著已經被收回的邀請。`ci_seq` 只是同一輪之內的續傳游標。
+
+#### 3.3.2 誰做什麼（⚠️ 跟訊息那條線刻意不同）
+
+| | daemon | UI |
+|---|---|---|
+| 開線（房間線）時 `Invite/Subscribe`，接著跑一輪 `Fetch` 到 `r == 0` | ✅ 自動 | — |
+| `gap: true`（server 說這條流掉過東西）→ 再跑一輪 | ✅ 自動 | — |
+| 存水位 | 🚫（server §3.3） | 🚫 |
+| 本地的邀請清單 | `room_list` 那一列：`membership = invite`、`invite_json`（§3.3.3） | 讀 `room.list { membership: ["invite"] }` |
+| 「房名、頭像是誰說的」 | 算好 `is_from_this_server` 給出去（§3.3.4） | 決定怎麼顯示 |
+| 接受／拒絕 | 照舊：`room.join`／`room.leave` | 叫哪一支 |
+
+⚠️ **訊息那條線 daemon 🚫 補窗**（維護者 2026-09-22，/docs/design/rooms/room-sync.md §0：漏了 UI 自己決定要不要補）。邀請這條反過來，是因為**它的語意不一樣**：訊息補一段就停，往回多遠是 UI 的選擇；邀請**必須補齊**，少一間就是「有人邀你、你永遠不知道」，而且 server 把它寫成 client 的義務（server §8 ①）。
+🚫 存任何狀態（沒有水位、沒有游標落地），所以還是「純」：跟金鑰線的「上線追平」同一類（/docs/design/keys/key-sync.md）。
+
+#### 3.3.3 寫本地的規則（server §8 的六條，逐條對應）
+
+一輪 `Fetch` 期間，daemon 在記憶體裡記「這一輪開始之後被 `Push`／`Gone` 碰過的房 → 它的 `is`」（一輪結束就丟）：
+
+| 收到 | `room_list` 那一列（這個帳號的） |
+|---|---|
+| `Batch` 的一間 | 那間這一輪被碰過、而且碰的 `is` ≥ 這筆的 count → 🚫 寫（推播比較新，server §8 ②'）；否則 `membership = invite`（列不在就加）、`invite_json` 換成這筆 |
+| `r == 0`（補完） | 本地是 `invite`、這一輪沒出現、這一輪也沒被碰過的 → `membership = leave`、`invite_json = NULL`（離線期間被收回的；為什麼結束看不出來，標 `leave`，跟 `room.list` 處理退出的房同一套）。⚠️ **補到一半斷了就🚫 刪**：那不是快照（server §8 ②） |
+| `Push` | 按 `room_id` 取代（server §8 ③）：`membership = invite`、`invite_json` 換成這筆。`sc == 0` 時那份 `state` 留著本地原本的（🚫 拿「太大沒送」蓋掉「之前拿到的」，跟 `room.get` 的 `state` 同一條） |
+| `Gone` | `membership` 改成它說的（`knock` 照寫）、`invite_json = NULL` |
+| `bc == 0` 的批次 | 🚫 推進續傳游標（沒有 `ns`） |
+
+`invite_json` 是 `room_list` 的新欄（**schema v11**），內容是那筆原樣：`{ inviter?, is_direct, reason?, state: [...] }`。`conversation_json` 🚫 動（被邀請的房沒有「它看到的樣子」）。
+
+#### 3.3.4 給 UI 的
+
+- `room.list { membership: ["invite"] }`：每一列多帶 `invite`：
+  ```jsonc
+  { "id": "!r:localhost", "membership": "invite", /* 其他欄位照 RoomListEntry，不知道的是 null */
+    "invite": { "inviter": "@alice:localhost", "is_direct": false, "reason": "來吃飯",
+                "state": [ /* 縮減狀態原樣：m.room.create、m.room.name、…、被邀請者自己的 m.room.member */ ],
+                "is_from_this_server": true } }
+  ```
+  - `sync=local`：讀本地。`sync=server`：跑一輪 `Fetch`、回那份快照、🚫 寫庫。`sync=both`：跑一輪、照 §3.3.3 寫、再從本地讀。
+- 推播 `room.membership`（有變的那一列才推）：
+  ```jsonc
+  { "user": "@bob:localhost", "room": "!r:localhost", "membership": "invite", "invite": { /* 同上 */ } }
+  { "user": "@bob:localhost", "room": "!r:localhost", "membership": "leave" }
+  ```
+- 🚨 **`is_from_this_server`**（daemon 加的，維護者 2026-10-14）：`inviter` 的網域跟這個帳號的網域**逐字相同**才是 `true`；沒有 `inviter`、網域解不出來，一律 `false`（fail closed）。
+  `false` 時 `state` 裡的房名、頭像、topic 都是**對方 server 說的**：縮減狀態沒有簽章，就算有也驗不動（要先加入才驗得了，而要不要加入正是這則邀請在問的，server §5.2.3）。UI 🚫 該把它當成已驗證的事實顯示。只有 `inviter` 本身有協定綁定。
+- `room.get` 對被邀請的房照舊會被 server 拒（還沒加入）；UI 顯示「某某邀你加入某某房」靠的是 `invite`。
+
+#### 3.3.5 一般 Matrix 帳號（⚠️ 有一個前提要維護者再看）
+
+matrix-sdk 的 `/sync` 本來就帶 `rooms.invite`（被邀請的房與縮減狀態），寫本地照 §3.3.3 的同一套（`Gone` 換成「上次是 invite、這次不是」）。
+🚨 **但一般 Matrix 帳號現在沒有常駐的同步迴圈**：daemon 只在要用時跑一次 `sync_once`（逾時 0，`crates/wbf-sdk/src/backend/matrix_sdk.rs`）——所以它們**連訊息都沒有即時推播**。
+⇒ 「推播一起做」有兩種做法，要維護者選：
+
+| | 做法 | 範圍 |
+|---|---|---|
+| 甲 | 每次本來就會跑的 `sync_once`（`room.list sync=both` 之類）順便比對邀請，有變就推 `room.membership` | 小：不是即時，UI 叫了才有 |
+| 乙 | 給一般 Matrix 帳號開一個常駐的長輪詢同步迴圈，邀請即時推 | 大：那個迴圈會順便變成「一般 Matrix 帳號的訊息即時推播」的地基，建議另開一支 |
 
 ## 4. 權限：`room.set_power_levels`
 
@@ -254,16 +311,14 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 
 ## 6. 還要維護者定的
 
-1. **分房間金鑰要不要算進被邀請的人**（維護者 2026-10-07 點出的設計缺口，**不在這支的範圍**，要另開一支 E2EE 的 PR＋server issue）：
-   - matrix-sdk：房間的歷史可見性是 `joined` 才只分給已加入的，其他三種連被邀請的人也分（vendor 的 `matrix-sdk-base/src/client.rs` `share_room_key`）。
-   - 我們：不管可見性一律只分給已加入的；告訴加密元件的設定也寫死成預設的 `shared`（`crates/wbf-sdk/src/crypto_engine.rs` 的 `room_key_share_settings`）。
-     結果：可見性是 `shared`／`invited` 的房，被邀請期間別人送的密文，那個人加入後解不開——跟房間的設定說的不一樣。
-   - 要改得 server 一起改：wbfuwunel 的 /docs/design/keys/room-device-version.md 第 110、114、360 行定了「邀請不算進房間版本號（無權看的人不必管）」，那是在「被邀請者看不到」的前提下定的；
-     可見性不是 `joined` 時這前提不成立，房間版本號與 `Members` 的裝置版本號都要算進被邀請者，不然被邀請者換了裝置，「送出前版本號要對」那道檢查擋不到。已在 #111 的末尾先提一句。
-   - 要定的：**照可見性分給被邀請者**（client＋server 都改）還是維持現狀。
+目前只有 §3.3.5 的甲／乙（一般 Matrix 帳號的邀請推播怎麼做）。
 
-### 6.1 已經定的（原本在這裡的問題，維護者 2026-10-07）
+### 6.1 已經定的（原本在這裡的問題）
 
+- **分房間金鑰算不算被邀請的人**（維護者 2026-10-07 在 server 那邊定，權威是 wbfuwunel 的 /docs/design/keys/invite-key-scope.md）：
+  - 房間的歷史可見性是 `joined` → 只算已加入的（現狀）；`shared`／`invited`／`world_readable` → 已加入的＋被邀請的（跟 matrix-sdk 的 `share_room_key` 一樣）。可見性改了不特別處理：拿舊版本號送出會吃 `1506`。
+  - server 還沒實作（2026-10-14 看 wbfuwunel main：`is_membership_counted` 仍只算 `Join`／`Leave`／`Ban`）。
+  - client：金鑰是 client 照 server 的 `Members` 發的，server 改完收件人自然多了被邀請者。client 要跟著改的是 `crates/wbf-sdk/src/crypto_engine.rs` 的 `room_key_share_settings`（可見性寫死成 `shared`，改成照房間的）與 `crates/wbf-core/src/key_share.rs` 文件裡的「join 成員」；server 合併後另開一支。
 - `room.get` 帶整份狀態（A，全拿，成員事件以外）。
 - `joined` 換成 `membership`，🚫 並存（量過：只在 `crates/wbf-sdk/src/cache.rs` 的 5 句 SQL 與 1 條測試）。
 - `room.enable_encryption` 照樣做（§3.2）。
