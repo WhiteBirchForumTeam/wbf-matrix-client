@@ -167,7 +167,7 @@ UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`st
   所以 rpc-spec 要把這個值標成「除錯用」。
 - 已經加密的房再叫一次：daemon 🚫 先問，照送；server 收了就是多一則一樣的狀態事件，本地本來就是 1。
 
-### 3.3 收邀請（issue #77；草案，等維護者點頭）
+### 3.3 收邀請（issue #77；維護者 2026-10-14 定、已實作）
 
 server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/design/events/invites-on-the-wire.md（下面簡稱「server §n」）。
 維護者 2026-10-14 定的：**跟房間線共用**、**開線只訂閱、補拿是 UI 叫的 RPC**（§3.3.2）、**主動補一輪另開 `room.invites`、`room.list` 照舊從 db 列（含推播寫進來的邀請）**（§3.3.4）、**daemon 加一個「是不是本站說的」欄位**（§3.3.4）、**一般 Matrix 帳號走甲**（§3.3.5）。
@@ -234,12 +234,17 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
 - **新的 `room.invites { user?, server? }`**：主動補一輪邀請（我們自己加的補窗；🚫 帶 `sync`：跟 `sync.recent` 一樣本來就是去上游拿的）。
   - 跑一輪 `Fetch` 到 `r == 0`、照 §3.3.3 寫進 db（含補完時刪掉沒出現的）、有變的列推 `room.membership`，回這一輪的快照。
   - UI 首次啟動叫一次；之後靠推播。看到推播帶 `gap: true` 時再叫一次。
-  - 中途斷了回錯、🚫 刪任何一列（已經寫進去的那幾間留著：那些是真的邀請），UI 再叫一次就是新的一輪。
-  - 回應：
+  - 中途斷了回錯、🚫 寫任何一列（快照在補完時一個 transaction 寫完，補到一半的什麼都不寫），UI 再叫一次就是新的一輪。
+  - 回應（2026-10-14 對本機 wbfuwunel 實跑，alice `room.invite` bob 帶 `reason: "e2e"`；`state` 只留兩則、其他略）：
     ```jsonc
     { "invites": [
-        { "room": "!r:localhost", "inviter": "@alice:localhost", "is_direct": false, "reason": "來吃飯",
-          "state": [ /* 同上 */ ], "is_from_this_server": true } ] }
+        { "room": "!Wu9L3hJTeAjSzbIlOQ:localhost", "inviter": "@alice:localhost", "is_direct": false, "reason": "e2e",
+          "is_from_this_server": true,
+          "state": [
+            { "type": "m.room.name", "state_key": "", "sender": "@alice:localhost", "content": { "name": "room actions e2e" } },
+            /* m.room.create、m.room.join_rules、alice 的 m.room.member… */
+            { "type": "m.room.member", "state_key": "@bob:localhost", "sender": "@alice:localhost",
+              "content": { "displayname": "bob 🍃", "membership": "invite", "reason": "e2e" } } ] } ] }
     ```
 - 推播 `room.membership`：server 的每一則 `Push`／`Gone` 推一則，`gap` 原樣帶著；一輪 `Fetch` 寫完有變的列也推（不帶 `gap`）：
   ```jsonc
@@ -248,6 +253,8 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
   ```
   - `gap: true` 是 server 說「這條流在這之前掉過東西」（server §8 ④）：daemon 🚫 自己重跑，原樣轉給 UI，要不要叫 `room.invites` 補一輪是 UI 的事。
     📌 訊息那條線的 `gap` 是丟掉不轉的（UI 不需要知道洞，維護者 2026-09-22）；邀請這條要轉，因為它是「該補一輪了」唯一的訊號。
+    📌 本地自己掉的（收件匣滿過、一包解不開）也併進下一則的 `gap`：對 UI 來說「掉了」就是掉了，🚫 分是誰掉的。
+- server 還不認得 `Invite`（`Subscribe` 被拒）：房間的訂閱照跑、講一聲（`note`），只是沒有推播；`room.invites` 會拿到同一個錯。
 - 🚨 **`is_from_this_server`**（daemon 加的，維護者 2026-10-14）：`inviter` 的網域跟這個帳號的網域**逐字相同**才是 `true`；沒有 `inviter`、網域解不出來，一律 `false`（fail closed）。
   `false` 時 `state` 裡的房名、頭像、topic 都是**對方 server 說的**：縮減狀態沒有簽章，就算有也驗不動（要先加入才驗得了，而要不要加入正是這則邀請在問的，server §5.2.3）。UI 🚫 該把它當成已驗證的事實顯示。只有 `inviter` 本身有協定綁定。
 - `room.get` 對被邀請的房照舊會被 server 拒（還沒加入）；UI 顯示「某某邀你加入某某房」靠的是 `invite`。
@@ -357,4 +364,12 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 | core | `crates/wbf-core/src/room_actions.rs` | 每個動作一個入口；`call_endpoint_raw` 是兩條路唯一的分岔點；`WriteSync`；寫不進去推 `note`；server 拒絕的 Matrix 錯誤放進 `data` |
 | core | `crates/wbf-core/src/rooms_ops.rs` | `room.list` 的身分篩選；一般 Matrix 帳號的 `room.get` 多問一次 `GetState` |
 | daemon | `crates/wbf-daemon/src/handle/room_actions.rs` | 參數解析（型別不對 `102`、`sync` 只收 `both`／`server`） |
+| wire | `crates/wbf-wire/src/pack.rs` | `Kind::Invite`（`0x05`）與它的 subtype（§3.3.1） |
+| sdk | `crates/wbf-sdk/src/protocol.rs`、`client.rs` | `Invite` 的編碼與解析（`InviteItem`：`state` 空的是降級、`None`）；`WbfClient::invite_subscription`、`invite_fetch_round`（收到 `r == 0` 才回，`已收 + r ≤ tc`） |
+| sdk | `crates/wbf-sdk/src/cache.rs` | schema v11 的 `invite_json`；`record_invite`（沒帶 state 留著原本的）、`apply_invite_round`（§3.3.3 的整份取代，一個 transaction）；離開 `invite` 就清 `invite_json` |
+| sdk | `crates/wbf-sdk/src/chat.rs` | `Invite`／`RoomInvite`；`is_from_same_server`（`is_from_this_server` 的判準） |
+| sdk | `crates/wbf-sdk/src/backend/matrix_sdk.rs` | 一般 Matrix 帳號：`list_invites`（store 裡的被邀請清單＋縮減狀態）、`find_memberships`（不在清單裡的現在是什麼） |
+| core | `crates/wbf-core/src/invites.rs` | 推播寫本地＋`room.membership`（`record_invite_push`）；`room.invites`（`fetch_invites`）；`InviteRounds`：一輪裡被推播碰過的房（只在記憶體） |
+| core | `crates/wbf-core/src/room_sync.rs` | 房間線開線時多訂 `Invite`（被拒只講一聲）、同一個 task 收兩條訂閱 |
+| daemon | `crates/wbf-daemon/src/handle/rooms.rs`、`push.rs` | `room.invites` 的參數；`room.membership` 推播 |
 | 測試 | `crates/wbf-sdk/src/{matrix_endpoint,room_state,room_state_edit,cache}.rs` 的單元測試；`crates/wbf-core/src/room_actions.rs`（假 server：`test_support.rs` 的 `room_action_reply`）；`crates/wbf-daemon/src/handle/mod.rs` 的兩張參數表；真 server：`crates/wbf-sdk/tests/e2e_local_server.rs` 的 `the_matrix_endpoint_table_answers_the_same_over_http_and_over_the_bridge`、`crates/wbf-daemon/tests/real_server.rs` 的 `room_actions_walk_the_server_and_the_local_rows_of_two_accounts` | |

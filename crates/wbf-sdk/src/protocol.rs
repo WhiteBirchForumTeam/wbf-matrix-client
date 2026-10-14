@@ -4,7 +4,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use wbf_wire::pack::{control, device, download, event, flags, upload};
+use wbf_wire::pack::{control, device, download, event, flags, invite, upload};
 use wbf_wire::{EncryptedFileInfo, Kind, Pack};
 
 use crate::error::SdkError;
@@ -1422,4 +1422,340 @@ pub fn decode_counts(data: &[u8]) -> Result<Vec<u64>, SdkError> {
         })
         .collect::<Option<Vec<u64>>>()
         .ok_or_else(|| SdkError::Protocol("a count list chunk is shorter than 8 bytes".into()))
+}
+
+// ---- Invite（kind 0x05）：待處理的邀請（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5；client 端在 /docs/design/rooms/room-actions.md §3.3）----
+//
+// 形狀同構於 `Device`：`Subscribe` 被推、`Fetch` 補一輪，順序舊→新。跟它不一樣的兩處（server 的實作）：
+// - 一輪中途結束的邀請 server **跳過但照算進 `r`**，所以整輪的 `bc` 加總可以**少於** `tc`：檢查是 `已收 + r ≤ tc`，🚫 相等。
+// - `bc == 0` 的批次🚫 帶 `os`／`ns`（帶 0 會把續傳游標拉回開頭）。
+
+/// 一則邀請：`Batch` 的一筆，或 `Push` 的 meta 加 data。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteItem {
+    pub room_id: String,
+    /// 邀請者；server 從被邀請者自己那則成員事件的 `sender` 取，那是唯一有協定綁定的欄位（server §5.2）。
+    pub inviter: Option<String>,
+    pub is_direct: bool,
+    pub reason: Option<String>,
+    /// 縮減狀態原樣。None ＝ 太大、server 沒送（`Push` 的 `sc: 0`、`Batch` 的 `state: []`，server §5.3）——
+    /// 正常的邀請一定至少有被邀請者自己的成員事件，所以空的只會是降級，🚫 當成「沒有狀態」。
+    pub state: Option<Vec<serde_json::Value>>,
+}
+
+/// `Invite/Fetch` 的請求 meta。
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct InviteFetchRequest {
+    /// 同一輪中斷了要接著拉時，上一個 `Batch` 的 `ns`；🚫 跨連線的水位（server §3.3）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_seq: Option<u64>,
+    /// 一個 `Batch` 最多幾間；None 用 server 預設（64）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<u32>,
+}
+
+/// Args:
+///     request: example: InviteFetchRequest::default()
+///     id: client 選的會話號（型別 `SESSION`）, example: pack::id::compose(pack::id::SESSION, 31)
+pub fn invite_fetch(request: &InviteFetchRequest, id: u64, seq: u32) -> Result<Pack, SdkError> {
+    Ok(Pack {
+        kind: Kind::Invite,
+        subtype: invite::FETCH,
+        flags: 0,
+        id,
+        seq,
+        meta: serde_json::to_vec(request)
+            .map_err(|error| crate::error::cannot_serialize("InviteFetchRequest", error))?,
+        data: Vec::new(),
+    })
+}
+
+/// `Invite/Subscribe`（meta `{}`）：之後的 `Push`／`Gone` 都抄這個 `id`。
+///
+/// Args:
+///     id: client 選的會話號（型別 `SESSION`）, example: pack::id::compose(pack::id::SESSION, 32)
+pub fn invite_subscribe(id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Invite,
+        subtype: invite::SUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta: b"{}".to_vec(),
+        data: Vec::new(),
+    }
+}
+
+/// `Invite/Unsubscribe`（meta `{}`，回 `Ack {}`；沒訂也是 no-op）。
+pub fn invite_unsubscribe(id: u64, seq: u32) -> Pack {
+    Pack {
+        kind: Kind::Invite,
+        subtype: invite::UNSUBSCRIBE,
+        flags: 0,
+        id,
+        seq,
+        meta: b"{}".to_vec(),
+        data: Vec::new(),
+    }
+}
+
+/// `Invite/Subscribe` 的 Ack。
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct InviteSubscribeAck {
+    /// server 登記好訂閱那一刻的位置：之後的邀請都會推來。
+    pub latest_count: u64,
+}
+
+/// `Invite/Push` 的 meta：`InviteItem` 的欄位加 `is`／`sc`／`gap`。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct InvitePushMeta {
+    room_id: String,
+    #[serde(default)]
+    inviter: Option<String>,
+    is_direct: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    is: u64,
+    sc: u32,
+    #[serde(default = "gap_when_missing")]
+    gap: bool,
+}
+
+/// `Invite/Gone` 的 meta。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct InviteGoneMeta {
+    room_id: String,
+    membership: String,
+    is: u64,
+    #[serde(default = "gap_when_missing")]
+    gap: bool,
+}
+
+/// 邀請訂閱那個會話上收到的東西（都抄訂閱的 `id`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InviteSubscribeReply {
+    /// 登記好了（Ack 的 `seq` 抄請求）。
+    Acknowledged(InviteSubscribeAck),
+    /// 被邀請了。`is` 是那則成員事件的位置（跟 `Batch` 的 `counts` 同一個號碼空間，server §3.1）；
+    /// `gap` 真 ＝ 這條流在這之前掉過推播（該補一輪了，server §8 ④）——🚨 缺欄位當 true。
+    Push {
+        invite: InviteItem,
+        is: u64,
+        gap: bool,
+    },
+    /// 邀請結束了：`membership` 是造成它結束的新狀態（`leave`／`ban`／`join`／`knock`），原樣。
+    Gone {
+        room_id: String,
+        membership: String,
+        is: u64,
+        gap: bool,
+    },
+    /// `Unsubscribe` 的 Ack（`seq` 不是訂閱那個）。
+    Unsubscribed { seq: u32 },
+}
+
+/// Args:
+///     request: 送出的 `Subscribe` pack
+///     response: 訂閱會話收到的 pack
+/// Return:
+///     Ok(InviteSubscribeReply)
+///     Err(Server)      `Error`（例：走 HTTP 的 `Unsupported`、session 剛被登出的 `Unauthorized`）
+///     Err(Protocol)    `id` 沒抄、沒有 `IS_RESPONSE`、meta 不是那個形狀、`Push` 的 data 切不出 `sc` 則、不認得的 kind／subtype
+pub fn parse_invite_subscribe_reply(
+    request: &Pack,
+    response: &Pack,
+) -> Result<InviteSubscribeReply, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Subscribe reply id {} does not echo the request id {}",
+            response.id, request.id
+        )));
+    }
+    if response.flags & flags::IS_RESPONSE == 0 {
+        return Err(SdkError::Protocol(
+            "Invite/Subscribe reply without IS_RESPONSE".into(),
+        ));
+    }
+    match (response.kind, response.subtype) {
+        (Kind::Control, control::ACK) if response.seq == request.seq => Ok(
+            InviteSubscribeReply::Acknowledged(parse_meta(response)?),
+        ),
+        (Kind::Control, control::ACK) => Ok(InviteSubscribeReply::Unsubscribed {
+            seq: response.seq,
+        }),
+        (Kind::Invite, invite::PUSH) => {
+            let meta: InvitePushMeta = parse_meta(response)?;
+            let state = split_length_prefixed(&response.data)?
+                .into_iter()
+                .map(|bytes| {
+                    serde_json::from_slice(bytes).map_err(|error| {
+                        SdkError::Protocol(format!("Invite/Push state event is not JSON: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<serde_json::Value>, SdkError>>()?;
+            if state.len() != meta.sc as usize {
+                return Err(SdkError::Protocol(format!(
+                    "Invite/Push says sc={} but carries {} state events",
+                    meta.sc,
+                    state.len()
+                )));
+            }
+            Ok(InviteSubscribeReply::Push {
+                invite: InviteItem {
+                    room_id: meta.room_id,
+                    inviter: meta.inviter,
+                    is_direct: meta.is_direct,
+                    reason: meta.reason,
+                    state: Some(state).filter(|state| !state.is_empty()),
+                },
+                is: meta.is,
+                gap: meta.gap,
+            })
+        }
+        (Kind::Invite, invite::GONE) => {
+            let meta: InviteGoneMeta = parse_meta(response)?;
+            Ok(InviteSubscribeReply::Gone {
+                room_id: meta.room_id,
+                membership: meta.membership,
+                is: meta.is,
+                gap: meta.gap,
+            })
+        }
+        (kind, subtype) => Err(SdkError::Protocol(format!(
+            "expected Ack, Invite/Push or Invite/Gone on the invite subscription, got kind {kind:?} subtype {subtype:#04x}"
+        ))),
+    }
+}
+
+/// `Invite/Batch` 的 meta（server §5.1）。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct InviteBatchMeta {
+    /// 這一輪總共幾間（請求當下、上界之內的待處理邀請數）。
+    pub tc: u32,
+    /// 這批幾間。
+    pub bc: u32,
+    /// 這批最舊／最新的 count；`bc == 0` 時🚫 帶。
+    #[serde(default)]
+    pub os: Option<u64>,
+    #[serde(default)]
+    pub ns: Option<u64>,
+    /// 逐筆的 count，跟 data 一一對應。
+    pub counts: Vec<u64>,
+    /// 這批之後還剩幾間；**0 才是補完**。
+    pub r: u32,
+}
+
+/// 驗一個 `Invite/Batch`：`IS_RESPONSE`、`id` 抄 `Fetch`、`seq` 是這一輪的第幾個（從 0 嚴格 +1）。`Error` → `Server`。
+pub fn expect_invite_batch(
+    request: &Pack,
+    response: Pack,
+    expected_seq: u32,
+) -> Result<Pack, SdkError> {
+    if response.kind == Kind::Control && response.subtype == control::ERROR {
+        return Err(server_error(&response.meta));
+    }
+    if response.kind != Kind::Invite
+        || response.subtype != invite::BATCH
+        || response.flags & flags::IS_RESPONSE == 0
+    {
+        return Err(SdkError::Protocol(format!(
+            "expected an Invite/Batch response, got kind {:?} subtype {:#04x} flags {:#04x}",
+            response.kind, response.subtype, response.flags
+        )));
+    }
+    if response.id != request.id {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Batch id {} does not echo the Fetch id {}",
+            response.id, request.id
+        )));
+    }
+    if response.seq != expected_seq {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Batch seq {} where {expected_seq} was expected",
+            response.seq
+        )));
+    }
+    Ok(response)
+}
+
+/// 一間房在 `Batch` data 裡的 JSON（server 的 `to_entry`）。
+#[derive(Deserialize)]
+struct InviteEntryJson {
+    room_id: String,
+    #[serde(default)]
+    inviter: Option<String>,
+    is_direct: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    state: Vec<serde_json::Value>,
+}
+
+/// 一個 `Invite/Batch` → meta 與 `(count, 邀請)`，舊→新。
+///
+/// Return:
+///     Ok((InviteBatchMeta, Vec<(u64, InviteItem)>))
+///     Err(Protocol)   meta 不是這個形狀、`tc < bc + r`、長度前綴切不齊、間數跟 `bc` 或 `counts` 對不上、count 不是嚴格遞增、
+///                     `bc > 0` 時 `os`／`ns` 不是頭尾、`bc == 0` 卻帶了 `os`／`ns`、一間的 JSON 不是那個形狀
+pub fn parse_invite_batch(
+    batch: &Pack,
+) -> Result<(InviteBatchMeta, Vec<(u64, InviteItem)>), SdkError> {
+    let meta: InviteBatchMeta = parse_meta(batch)?;
+    if meta.tc < meta.bc.saturating_add(meta.r) {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Batch meta inconsistent: tc {} < bc {} + r {}",
+            meta.tc, meta.bc, meta.r
+        )));
+    }
+    let entries = split_length_prefixed(&batch.data)?;
+    if entries.len() as u32 != meta.bc || meta.counts.len() as u32 != meta.bc {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Batch meta says bc {} but data holds {} rooms and counts has {}",
+            meta.bc,
+            entries.len(),
+            meta.counts.len()
+        )));
+    }
+    if meta
+        .counts
+        .windows(2)
+        .any(|pair| matches!(pair, [older, newer] if older >= newer))
+    {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Batch counts are not strictly increasing: {:?}",
+            meta.counts
+        )));
+    }
+    let ends_match = match (meta.counts.first(), meta.counts.last()) {
+        (Some(first), Some(last)) => meta.os == Some(*first) && meta.ns == Some(*last),
+        _ => meta.os.is_none() && meta.ns.is_none(),
+    };
+    if !ends_match {
+        return Err(SdkError::Protocol(format!(
+            "Invite/Batch os {:?} / ns {:?} do not match counts {:?}",
+            meta.os, meta.ns, meta.counts
+        )));
+    }
+    let mut items = Vec::with_capacity(entries.len());
+    for (count, bytes) in meta.counts.iter().zip(entries) {
+        let entry: InviteEntryJson = serde_json::from_slice(bytes).map_err(|error| {
+            SdkError::Protocol(format!(
+                "Invite/Batch room {count} is not an invite entry: {error}"
+            ))
+        })?;
+        items.push((
+            *count,
+            InviteItem {
+                room_id: entry.room_id,
+                inviter: entry.inviter,
+                is_direct: entry.is_direct,
+                reason: entry.reason,
+                state: Some(entry.state).filter(|state| !state.is_empty()),
+            },
+        ));
+    }
+    Ok((meta, items))
 }

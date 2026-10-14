@@ -17,7 +17,7 @@
 | `Misc` | 一問一答：`Hello`／`Ping`、`Info`、橋、`Event/Send`、`Recent`（拉窗） | 一問一答的東西不該排在別人的長佇列後面 |
 | `Upload` | `Upload/*` | 資料平面，長時間高頻寫，最會塞爆佇列——只能塞爆自己 |
 | `Download` | `Download/*`（`Read`、串流） | 同上；跟上傳分開，一邊塞爆不拖另一邊（維護者 2026-09-21：媒體開兩條） |
-| `Rooms` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件） | 推播線，不跟資料平面共享佇列；量大但可重拉 |
+| `Rooms` | `Event/Subscribe`／`Push`／`DeviceChanged`（全局房間事件）；`Invite/Subscribe`／`Push`／`Gone`（邀請，/docs/design/rooms/room-actions.md §3.3，維護者 2026-10-14：跟房間線共用） | 推播線，不跟資料平面共享佇列；量大但可重拉 |
 | `Keys` | `Device/Subscribe`／`Push`／`CryptoState`（全局金鑰事件），以及 `Device/Fetch`／`ItemsDestroy`（拉、銷毀：server 只讓持有裝置佇列的那條連線銷毀，維護者 2026-09-24 同意） | 🚨 **掉了就沒了**：它必須有一條安靜的線，不跟任何大流量共享佇列（/docs/design/overview/architecture-v2.md §5.1.1）；跟 `Rooms` 分開靠的是 server 每台裝置給 8 條 WS（server #85） |
 
 - ⭐ 分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind：`Misc` 收各種 kind。例外是 `Device/Fetch`／`ItemsDestroy`：它們是拉窗、不是訂閱，

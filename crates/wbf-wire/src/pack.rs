@@ -30,6 +30,8 @@ pub enum Kind {
     Stream = 0x02,
     Upload = 0x03,
     Download = 0x04,
+    /// 邀請（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5；client 這邊在 /docs/design/rooms/room-actions.md §3.3）：自己一個訂閱、自己的 `id`／`seq`／`gap`，形狀同構於 `Device`。
+    Invite = 0x05,
     /// 連線背後的 session（wbfuwunel 的 /docs/design/wbf-wire-format.md §6.3）：`Login`、`Refresh`、`Logout`。client 這邊還沒用，先認得它才能解 server 的向量。
     Session = 0x10,
     /// 帳號（bridge-specs `0x11-account.md`）：沒有原生的 pack，全是走橋的 Matrix 端點（profile、account data）。
@@ -56,6 +58,7 @@ impl Kind {
             0x02 => Some(Kind::Stream),
             0x03 => Some(Kind::Upload),
             0x04 => Some(Kind::Download),
+            0x05 => Some(Kind::Invite),
             0x10 => Some(Kind::Session),
             0x11 => Some(Kind::Account),
             0x13 => Some(Kind::Room),
@@ -190,6 +193,24 @@ pub mod device {
     /// 只有 server → client：自己的金鑰存量，meta `{ otk_counts, unused_fallback_key_types, gap }`；
     /// 每個 `Subscribe` 之後一定跟一個，收包迴圈🚫 不能把它當成下一個請求的回覆。
     pub const CRYPTO_STATE: u8 = 0x08;
+}
+
+/// `Kind::Invite` 的 subtype（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5）。編號跟 `Event`／`Device` 對齊、`0x03` 故意留空。
+/// ⭐ 每次連線一輪完整快照、🚫 跨連線的水位：`ci_seq` 只是同一輪之內的續傳游標（同一份 §3.3）。
+/// `Fetch`／`Subscribe`／`Unsubscribe` 的 `id` 是 client 會話號（[`id::SESSION`]）。
+pub mod invite {
+    /// 拉一輪待處理的邀請，meta `{ ci_seq?, batch? }`；回應是一串 `Batch`（🚫 `Ack`），**只走 WS**。
+    pub const FETCH: u8 = 0x01;
+    /// 只有 server → client：`Fetch` 的一批，meta `{ tc, bc, os?, ns?, counts, r }`（`bc == 0` 時🚫 帶 `os`／`ns`）；
+    /// data 是 `bc` 筆，每筆 u32 大端長度＋一間房的 JSON。**`r == 0` 才是補完**。
+    pub const BATCH: u8 = 0x02;
+    /// 訂閱自己的邀請；回 `{ latest_count }`，之後每個 `Push`、`Gone` 抄這個 `id`。
+    pub const SUBSCRIBE: u8 = 0x04;
+    pub const UNSUBSCRIBE: u8 = 0x05;
+    /// 只有 server → client：被邀請了，meta `{ room_id, inviter?, is_direct, reason?, is, sc, gap }`，data 是 `sc` 則縮減狀態。
+    pub const PUSH: u8 = 0x06;
+    /// 只有 server → client：邀請結束了，meta `{ room_id, membership, is, gap }`。
+    pub const GONE: u8 = 0x07;
 }
 
 /// kind `0x10 Session`（wbfuwunel 的 /docs/design/wbf-wire-format.md §6.3）。

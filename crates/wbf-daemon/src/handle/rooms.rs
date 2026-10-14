@@ -54,6 +54,18 @@ pub(super) async fn room_list(handle: &Handle, core: &Core, params: Value) -> Ou
     )
 }
 
+/// `room.invites { user?, server? }`：主動補一輪邀請（/docs/design/rooms/room-actions.md §3.3.4）。🚫 `sync`：本來就是去上游拿、寫進本地的（跟 `sync.recent` 一樣）。
+pub(super) async fn room_invites(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let invites = core.fetch_invites(&handle.target(&params.target)).await?;
+    to_result(serde_json::json!({ "invites": invites }))
+}
+
 pub(super) async fn room_get(handle: &Handle, core: &Core, params: Value) -> Outcome {
     let params: RoomParams = parse_params(params)?;
     to_result(

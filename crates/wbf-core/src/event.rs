@@ -78,6 +78,19 @@ pub enum CoreEvent {
         /// true ＝ 這條連線前面有推送被丟掉（UI 該把開著的房都 refresh 一次）
         gap: bool,
     },
+    /// 這個帳號在某間房的身分因為邀請而變了（/docs/design/rooms/room-actions.md §3.3.4）：server 推來的 `Invite/Push`／`Gone` 每則一個，
+    /// UI 叫的 `room.invites` 補完一輪時有變的列也各一個。已經寫進本地之後才發。
+    Membership {
+        /// 身分變了的帳號（被邀請的人）
+        user: String,
+        /// example: "!r:localhost"
+        room: String,
+        membership: wbf_sdk::chat::Membership,
+        /// `membership` 是 `invite` 才有：寫進本地的那份
+        invite: Option<wbf_sdk::chat::Invite>,
+        /// server 說這條流在這之前掉過推播（該叫 `room.invites` 補一輪了）；補一輪寫出來的一律 false
+        gap: bool,
+    },
     /// 這個帳號的金鑰訂閱（`key_sync.rs`）怎麼了：追平了幾把、或停了（被另一台裝置接手、線死了）。
     /// 維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」這台裝置還在不在收金鑰。
     Keys {

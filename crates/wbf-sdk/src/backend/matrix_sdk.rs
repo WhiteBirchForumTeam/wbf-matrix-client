@@ -23,10 +23,10 @@ use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
-use matrix_sdk::ruma::events::MessageLikeEventType;
+use matrix_sdk::ruma::events::{MessageLikeEventType, StateEventType};
 use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
 use matrix_sdk::store::StoreConfig;
-use matrix_sdk::{Client, Room, SessionMeta};
+use matrix_sdk::{Client, Room, RoomState, SessionMeta};
 use matrix_sdk::{SqliteCryptoStore, SqliteStateStore, SqliteStoreConfig};
 
 use crate::chat::{
@@ -41,6 +41,18 @@ use crate::vault::Key32;
 
 /// 每次 `/sync` 最多等多久（server 端長輪詢）。
 const SYNC_POLL: Duration = Duration::from_secs(30);
+
+/// 被邀請的房拿哪幾種縮減狀態：跟 wbfuwunel 進門修剪留下的同一張（它的 /docs/design/events/invites-on-the-wire.md §6 ①，spec 建議的那幾格），
+/// 再加被邀請者自己的成員事件（[`MatrixBackend::list_invites`] 另外拿）。
+const INVITE_STATE_TYPES: [&str; 7] = [
+    "m.room.create",
+    "m.room.join_rules",
+    "m.room.canonical_alias",
+    "m.room.name",
+    "m.room.avatar",
+    "m.room.encryption",
+    "m.room.topic",
+];
 
 pub struct MatrixBackend {
     client: Client,
@@ -221,6 +233,99 @@ impl MatrixBackend {
             state: None,
         })
     }
+
+    /// 被邀請的房：sync 完 store 裡就是**完整的**清單（/docs/design/rooms/room-actions.md §3.3.5）。跟 wbf 的 `Invite/Batch` 同一個形狀：
+    /// 邀請者、`is_direct`、`reason` 從**被邀請者自己那則成員事件**取（wbfuwunel 的 `to_entry` 同一個取法），狀態是 [`INVITE_STATE_TYPES`] 加那則成員事件。
+    ///
+    /// Return:
+    ///     Ok(Vec<InviteItem>)  一間都沒有就是空的；一間什麼狀態都讀不到的 `state` 是 None
+    ///     Err(Network)         讀 store 失敗
+    pub async fn list_invites(&self) -> Result<Vec<crate::protocol::InviteItem>, SdkError> {
+        let store_error =
+            |error: matrix_sdk::Error| SdkError::Network(format!("invited room state: {error}"));
+        let mut invites = Vec::new();
+        for room in self.client.invited_rooms() {
+            let mut state = Vec::new();
+            for event_type in INVITE_STATE_TYPES {
+                let events = room
+                    .get_state_events(StateEventType::from(event_type))
+                    .await
+                    .map_err(store_error)?;
+                state.extend(events.iter().filter_map(to_state_json));
+            }
+            let own_member = room
+                .get_state_event(StateEventType::RoomMember, &self.me)
+                .await
+                .map_err(store_error)?
+                .as_ref()
+                .and_then(to_state_json);
+            let inviter = own_member
+                .as_ref()
+                .and_then(|member| member.get("sender"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let is_direct = own_member
+                .as_ref()
+                .and_then(|member| member.pointer("/content/is_direct"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let reason = own_member
+                .as_ref()
+                .and_then(|member| member.pointer("/content/reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            state.extend(own_member);
+            invites.push(crate::protocol::InviteItem {
+                room_id: room.room_id().to_string(),
+                inviter,
+                is_direct,
+                reason,
+                state: Some(state).filter(|state| !state.is_empty()),
+            });
+        }
+        Ok(invites)
+    }
+
+    /// 這幾間房現在在 store 裡的身分（一輪邀請補完時，本地是 `invite`、清單裡卻沒有的那幾間現在是什麼）。
+    ///
+    /// Args:
+    ///     room_ids: example: &["!r:localhost".to_string()]
+    /// Return:
+    ///     HashMap<String, Membership>  store 裡沒有、或 id 解不開的🚫 列（呼叫端當 `leave`）
+    pub fn find_memberships(
+        &self,
+        room_ids: &[String],
+    ) -> std::collections::HashMap<String, crate::chat::Membership> {
+        room_ids
+            .iter()
+            .filter_map(|room_id| {
+                let room = self.client.get_room(&RoomId::parse(room_id).ok()?)?;
+                let membership = match room.state() {
+                    RoomState::Joined => crate::chat::Membership::Join,
+                    RoomState::Left => crate::chat::Membership::Leave,
+                    RoomState::Invited => crate::chat::Membership::Invite,
+                    RoomState::Knocked => crate::chat::Membership::Knock,
+                    RoomState::Banned => crate::chat::Membership::Ban,
+                };
+                Some((room_id.clone(), membership))
+            })
+            .collect()
+    }
+}
+
+/// store 裡一則狀態事件的 JSON 原樣（已加入的房是完整的、被邀請的房是縮減的）；解不開就跳過。
+fn to_state_json(
+    event: &matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState,
+) -> Option<serde_json::Value> {
+    let json = match event {
+        matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Sync(raw) => {
+            raw.json().get()
+        }
+        matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Stripped(raw) => {
+            raw.json().get()
+        }
+    };
+    serde_json::from_str(json).ok()
 }
 
 impl ChatBackend for MatrixBackend {

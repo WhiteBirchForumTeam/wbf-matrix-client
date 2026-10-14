@@ -15,7 +15,7 @@ use wbf_sdk::protocol::{
 };
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
 use wbf_sdk::WsLink;
-use wbf_wire::pack::{control, device, download, event, flags, upload};
+use wbf_wire::pack::{control, device, download, event, flags, invite, upload};
 use wbf_wire::{Kind, Pack};
 
 use crate::accounts::AccountDir;
@@ -330,6 +330,72 @@ pub(crate) struct FakeServer {
     pub(crate) fail_bridged: Arc<std::sync::atomic::AtomicU32>,
     /// 房間動作的橋（room_actions.rs 的測試）：收到的請求原樣、寫過的狀態與帳號資料。
     pub(crate) rooms: Arc<Mutex<FakeRooms>>,
+    /// `Invite`（kind 0x05）：待處理的邀請、訂閱過的 id（invites.rs 的測試）。
+    pub(crate) invites: Arc<Mutex<FakeInvites>>,
+}
+
+/// 假 server 上的邀請（照 wbfuwunel 的 `src/api/client/wbf/invites.rs` 的送法）。
+#[derive(Debug, Default)]
+pub(crate) struct FakeInvites {
+    /// 待處理的：(count, 一間的 JSON `{ room_id, inviter?, is_direct, reason?, state }`)，舊→新
+    pub(crate) pending: Vec<(u64, Value)>,
+    /// 每個 `Invite/Subscribe` 的 id（照順序）
+    pub(crate) subscription_ids: Vec<u64>,
+    /// 收過幾個 `Invite/Fetch`
+    pub(crate) fetches: usize,
+    /// 一個 `Batch` 幾間；0 ＝ 全部一個
+    pub(crate) per_batch: usize,
+    /// 這一輪計畫給、但中途結束被跳過的間數：照 server 的做法算進 `tc`／`r`、不送（整輪的 `bc` 加總就會少於 `tc`）
+    pub(crate) skipped: usize,
+    /// 送完第一個 `Batch` 就回 `Error`：造「一輪中途斷了」
+    pub(crate) cut_after_first_batch: bool,
+    /// `Invite/Subscribe` 回 `Unsupported`：造「還不認得 `Invite` 的 server」
+    pub(crate) refuse_subscribe: bool,
+    /// 設了就在送 `Batch` 之前等它：測試在「一輪已經開始、快照還沒到」之間先推幾則（server §8 ②'）
+    pub(crate) hold_batches: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// 一則 `Invite/Push`（server → client）。
+pub(crate) fn invite_push(
+    subscription_id: u64,
+    seq: u32,
+    room: &str,
+    is: u64,
+    gap: bool,
+    state: &[Value],
+) -> Pack {
+    response(
+        Kind::Invite,
+        invite::PUSH,
+        subscription_id,
+        seq,
+        json!({ "room_id": room, "inviter": "@alice:localhost", "is_direct": false, "is": is,
+                "sc": state.len(), "gap": gap }),
+        length_prefixed(state),
+    )
+}
+
+/// 一則 `Invite/Gone`（server → client）。
+pub(crate) fn invite_gone(
+    subscription_id: u64,
+    seq: u32,
+    room: &str,
+    membership: &str,
+    is: u64,
+) -> Pack {
+    response(
+        Kind::Invite,
+        invite::GONE,
+        subscription_id,
+        seq,
+        json!({ "room_id": room, "membership": membership, "is": is, "gap": false }),
+        Vec::new(),
+    )
+}
+
+/// 一間待處理的邀請在 `Batch` 裡的 JSON（假 server 用）。
+pub(crate) fn invite_entry(room: &str, state: &[Value]) -> Value {
+    json!({ "room_id": room, "inviter": "@alice:localhost", "is_direct": false, "state": state })
 }
 
 /// 假 server 上房間動作看得到的那一點點狀態。
@@ -422,6 +488,8 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
     let fail_bridged_t = fail_bridged.clone();
     let rooms: Arc<Mutex<FakeRooms>> = Arc::new(Mutex::new(FakeRooms::default()));
     let rooms_t = rooms.clone();
+    let invites: Arc<Mutex<FakeInvites>> = Arc::new(Mutex::new(FakeInvites::default()));
+    let invites_t = invites.clone();
     let (bridge_t, members_t, encrypted_t, room_version_t, sent_t) = (
         bridge_calls.clone(),
         members.clone(),
@@ -721,6 +789,96 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
                     json!({}),
                     Vec::new(),
                 ),
+                // 邀請（wbfuwunel 的 invites.rs）：訂閱回 Ack `{latest_count}`；Fetch 一串 Batch、舊→新、`r` 遞減到 0。
+                (Kind::Invite, invite::SUBSCRIBE) => {
+                    let mut invites = invites_t.lock().unwrap();
+                    if invites.refuse_subscribe {
+                        response(
+                            Kind::Control,
+                            control::ERROR,
+                            pack.id,
+                            pack.seq,
+                            json!({ "code": "Unsupported", "code_id": 1204, "message": "no invites here" }),
+                            Vec::new(),
+                        )
+                    } else {
+                        invites.subscription_ids.push(pack.id);
+                        response(
+                            Kind::Control,
+                            control::ACK,
+                            pack.id,
+                            pack.seq,
+                            json!({ "latest_count": 100 }),
+                            Vec::new(),
+                        )
+                    }
+                }
+                (Kind::Invite, invite::UNSUBSCRIBE) => response(
+                    Kind::Control,
+                    control::ACK,
+                    pack.id,
+                    pack.seq,
+                    json!({}),
+                    Vec::new(),
+                ),
+                (Kind::Invite, invite::FETCH) => {
+                    let (packs, hold) = {
+                        let mut invites = invites_t.lock().unwrap();
+                        invites.fetches += 1;
+                        let planned = invites.pending.len() + invites.skipped;
+                        let per_batch = if invites.per_batch == 0 {
+                            invites.pending.len().max(1)
+                        } else {
+                            invites.per_batch
+                        };
+                        let mut chunks: Vec<Vec<(u64, Value)>> = invites
+                            .pending
+                            .chunks(per_batch)
+                            .map(<[_]>::to_vec)
+                            .collect();
+                        if chunks.is_empty() {
+                            chunks.push(Vec::new());
+                        }
+                        let last = chunks.len() - 1;
+                        let mut dealt_with = 0;
+                        let mut packs = Vec::new();
+                        for (seq, chunk) in chunks.into_iter().enumerate() {
+                            dealt_with += chunk.len();
+                            if seq == last {
+                                dealt_with += invites.skipped;
+                            }
+                            let counts: Vec<u64> = chunk.iter().map(|(count, _)| *count).collect();
+                            let mut meta = json!({ "tc": planned, "bc": chunk.len(), "counts": counts,
+                                                   "r": planned - dealt_with });
+                            if let (Some(oldest), Some(newest)) = (counts.first(), counts.last()) {
+                                meta["os"] = json!(oldest);
+                                meta["ns"] = json!(newest);
+                            }
+                            let entries: Vec<Value> =
+                                chunk.into_iter().map(|(_, entry)| entry).collect();
+                            packs.push(response(
+                                Kind::Invite,
+                                invite::BATCH,
+                                pack.id,
+                                seq as u32,
+                                meta,
+                                length_prefixed(&entries),
+                            ));
+                            if invites.cut_after_first_batch {
+                                packs.push(injected_error(pack.id, 0));
+                                break;
+                            }
+                        }
+                        (packs, invites.hold_batches.clone())
+                    };
+                    if let Some(hold) = hold {
+                        hold.notified().await;
+                    }
+                    for reply in packs {
+                        peer.sink.send(reply.encode().unwrap()).await.unwrap();
+                    }
+                    continue;
+                }
                 other => panic!("fake server got {other:?}"),
             };
             peer.sink.send(reply.encode().unwrap()).await.unwrap();
@@ -738,6 +896,7 @@ pub(crate) fn start_fake_server(mut peer: MemoryEnd, events: Arc<Mutex<Vec<Value
         fetch_requests,
         device_early_push,
         fail_next_fetch,
+        invites,
         bridge_calls,
         hellos,
         members,

@@ -397,6 +397,7 @@ impl Handle {
             "account.destroy" => Box::pin(accounts::account_destroy(self, core, params)),
             "room.list" => Box::pin(rooms::room_list(self, core, params)),
             "room.get" => Box::pin(rooms::room_get(self, core, params)),
+            "room.invites" => Box::pin(rooms::room_invites(self, core, params)),
             "room.send_text" => Box::pin(rooms::room_send_text(self, core, params)),
             "room.refresh_devices" => Box::pin(rooms::room_refresh_devices(self, core, params)),
             "room.send_file" => Box::pin(rooms::room_send_file(self, core, params)),
@@ -952,6 +953,7 @@ mod tests {
             ("account.destroy", json!({ "user": "@a:localhost" })),
             ("room.list", json!({})),
             ("room.get", json!({ "room": "!r:localhost" })),
+            ("room.invites", json!({})),
             (
                 "room.send_text",
                 json!({ "room": "!r:localhost", "body": "hi" }),
