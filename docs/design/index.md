@@ -36,6 +36,7 @@
 |---|---|
 | [`/docs/design/rooms/chat-model.md`](rooms/chat-model.md) | 聊天模型（Conversation／Peer／Message／Role）、怎麼對到 Matrix、Telegram 的形狀 |
 | [`/docs/design/rooms/room-sync.md`](rooms/room-sync.md) | 房間的訂閱線：訂閱事件、推播寫進快取、水位只由 UI 的 `Recent` 推 |
+| [`/docs/design/rooms/room-actions.md`](rooms/room-actions.md) | 房間動作：建房、成員、狀態讀寫、權限合併、置頂、標籤與 `m.direct`；一張端點表兩條路；本地的 `membership` 與 `room.forget` |
 
 ## `messages/`：訊息
 

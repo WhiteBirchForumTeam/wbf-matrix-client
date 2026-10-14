@@ -856,13 +856,11 @@ impl Core {
 
     /// 這台 server 上所有下載處理端正開著的暫存名（掃描不准碰）。
     fn list_media_in_use(&self, server_dir: &Path) -> HashSet<String> {
-        let mut in_use: HashSet<String> = self
-            .list_downloaders_on(server_dir)
-            .iter()
-            .flat_map(|downloader| downloader.list_open_names())
-            .collect();
-        in_use.extend(self.matrix_transfers.list_pending_names(server_dir));
-        in_use
+        list_names_in_use(
+            &self.list_downloaders_on(server_dir),
+            &self.matrix_transfers,
+            server_dir,
+        )
     }
 
     /// `media.delete_local`（/docs/design/media/media-download.md §7.4）：清掉這個 mxc 在本地的一切——池檔、半成品、seek 暫存檔、`media` 列。
@@ -895,10 +893,15 @@ impl Core {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
-        let in_use = self.list_media_in_use(&server_dir);
+        // 「誰還在寫」的快照在寫入者真的要刪的那一刻才拿（PR #75 審查 cirno 🟢1）：在外面先拿好再排隊的話，排隊那段時間新開始的下載看不到。
+        let downloaders = self.list_downloaders_on(&server_dir);
+        let transfers = self.matrix_transfers.clone();
         let mxc_here = mxc.to_string();
         let removed = cache
-            .run(move |cache| media::del_local_copy(cache, &pool, &mxc_here, &in_use))
+            .run(move |cache| {
+                let in_use = list_names_in_use(&downloaders, &transfers, &server_dir);
+                media::del_local_copy(cache, &pool, &mxc_here, &in_use)
+            })
             .await?;
         Ok(DeletedMedia {
             mxc: mxc.to_string(),
@@ -927,6 +930,20 @@ impl Core {
             })
             .await
     }
+}
+
+/// 這些下載處理端與傳統下載正開著的暫存名（這台 server 的）。
+fn list_names_in_use(
+    downloaders: &[std::sync::Arc<crate::download_queue::Downloader>],
+    transfers: &crate::matrix_download::MatrixTransfers,
+    server_dir: &Path,
+) -> HashSet<String> {
+    let mut in_use: HashSet<String> = downloaders
+        .iter()
+        .flat_map(|downloader| downloader.list_open_names())
+        .collect();
+    in_use.extend(transfers.list_pending_names(server_dir));
+    in_use
 }
 
 /// `media.delete_local` 取消下載之後，最多等寫入者放手這麼久（分塊的處理端等在途的那一塊落地才停）。

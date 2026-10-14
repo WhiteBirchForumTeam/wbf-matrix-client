@@ -400,6 +400,169 @@ async fn bridge_members_and_send_to_device_against_real_server() {
     logout(&session).await.expect("logout");
 }
 
+/// 房間動作的那張端點表（`matrix_endpoint`，/docs/design/rooms/room-actions.md §2）對真 server：**同一份變數、同一份 body，走 HTTP 與走橋回的一樣**。
+/// HTTP 那條是一般 Matrix 帳號的路，daemon 對本機 server 走不到（登入一定走 wbf），所以在這裡直接打：
+/// 建房（`initial_state` 帶加密）→ 空的 `state_key`（URL 最後一段是空的）讀寫 → 帳號資料、標籤（path 有 `@`、`!`）→ 404 認得出來 → 退出、忘記。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn the_matrix_endpoint_table_answers_the_same_over_http_and_over_the_bridge() {
+    use serde_json::{json, Map, Value};
+    use wbf_sdk::matrix_endpoint::{self as endpoints, call_over_http};
+    let Some(target) = target() else {
+        eprintln!("WBF_E2E_* not set; skipping");
+        return;
+    };
+    let session = login_with_password(
+        &target.server,
+        &target.user,
+        &target.password,
+        "wbf-sdk e2e endpoints",
+    )
+    .await
+    .expect("login");
+    let (server, token) = (session.server.as_str(), session.access_token.as_str());
+    let vars = |value: Value| -> Map<String, Value> { value.as_object().unwrap().clone() };
+    let channel = Channel::connect(server, token, Transport::WebSocket)
+        .await
+        .expect("ws");
+    let mut bridge = WbfClient::new(channel);
+    bridge
+        .hello("wbf-sdk e2e endpoints", &[])
+        .await
+        .expect("hello");
+
+    let body = wbf_sdk::room_state_edit::to_create_room_body(
+        true,
+        vars(json!({ "name": "endpoint table", "preset": "private_chat" })),
+    )
+    .unwrap();
+    let created = call_over_http(
+        server,
+        token,
+        &endpoints::CREATE_ROOM,
+        &Map::new(),
+        Some(&Value::Object(body)),
+    )
+    .await
+    .expect("CreateRoom over http");
+    let room = created["room_id"].as_str().expect("room_id").to_string();
+
+    let encryption =
+        vars(json!({ "room_id": room, "event_type": "m.room.encryption", "state_key": "" }));
+    let over_http = call_over_http(
+        server,
+        token,
+        &endpoints::GET_STATE_EVENT,
+        &encryption,
+        None,
+    )
+    .await
+    .expect("GetStateEvent over http (an empty last segment)");
+    let over_bridge = bridge
+        .call_matrix_endpoint(&endpoints::GET_STATE_EVENT, &encryption, None)
+        .await
+        .expect("GetStateEvent over the bridge");
+    assert_eq!(over_http, over_bridge);
+    assert_eq!(
+        over_http["algorithm"],
+        wbf_sdk::room_state_edit::MEGOLM_ALGORITHM
+    );
+
+    let topic = vars(json!({ "room_id": room, "event_type": "m.room.topic", "state_key": "" }));
+    let written = call_over_http(
+        server,
+        token,
+        &endpoints::SET_STATE_EVENT,
+        &topic,
+        Some(&json!({ "topic": "hi" })),
+    )
+    .await
+    .expect("SetStateEvent over http");
+    assert!(written["event_id"].is_string(), "{written}");
+    let read_back = bridge
+        .call_matrix_endpoint(&endpoints::GET_STATE_EVENT, &topic, None)
+        .await
+        .expect("read back over the bridge");
+    assert_eq!(read_back, json!({ "topic": "hi" }));
+
+    let account_data =
+        vars(json!({ "user_id": session.user_id, "room_id": room, "event_type": "org.wbftw.e2e" }));
+    call_over_http(
+        server,
+        token,
+        &endpoints::SET_ROOM_ACCOUNT_DATA,
+        &account_data,
+        Some(&json!({ "seen": 1 })),
+    )
+    .await
+    .expect("SetRoomAccountData over http");
+    assert_eq!(
+        bridge
+            .call_matrix_endpoint(&endpoints::GET_ROOM_ACCOUNT_DATA, &account_data, None)
+            .await
+            .expect("GetRoomAccountData over the bridge"),
+        json!({ "seen": 1 })
+    );
+    let tag = vars(json!({ "user_id": session.user_id, "room_id": room, "tag": "u.e2e" }));
+    call_over_http(
+        server,
+        token,
+        &endpoints::SET_TAG,
+        &tag,
+        Some(&json!({ "order": 0.5 })),
+    )
+    .await
+    .expect("SetTag over http");
+    let tags_vars = vars(json!({ "user_id": session.user_id, "room_id": room }));
+    let tags_http = call_over_http(server, token, &endpoints::GET_TAGS, &tags_vars, None)
+        .await
+        .expect("GetTags over http");
+    let tags_bridge = bridge
+        .call_matrix_endpoint(&endpoints::GET_TAGS, &tags_vars, None)
+        .await
+        .expect("GetTags over the bridge");
+    assert_eq!(tags_http, tags_bridge);
+    assert_eq!(tags_http["tags"]["u.e2e"]["order"], 0.5);
+
+    // 沒有這一項：兩條路都是認得出來的 404。
+    let avatar = vars(json!({ "room_id": room, "event_type": "m.room.avatar", "state_key": "" }));
+    let missing = call_over_http(server, token, &endpoints::GET_STATE_EVENT, &avatar, None)
+        .await
+        .unwrap_err();
+    assert!(missing.is_not_found(), "{missing:?}");
+    assert!(bridge
+        .call_matrix_endpoint(&endpoints::GET_STATE_EVENT, &avatar, None)
+        .await
+        .unwrap_err()
+        .is_not_found());
+
+    let room_only = vars(json!({ "room_id": room }));
+    call_over_http(
+        server,
+        token,
+        &endpoints::LEAVE,
+        &room_only,
+        Some(&json!({ "reason": "done" })),
+    )
+    .await
+    .expect("Leave over http");
+    call_over_http(server, token, &endpoints::FORGET, &room_only, None)
+        .await
+        .expect("Forget over http");
+    let joined = call_over_http(server, token, &endpoints::JOINED_ROOMS, &Map::new(), None)
+        .await
+        .expect("JoinedRooms over http");
+    assert!(
+        joined["joined_rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|listed| listed != room.as_str()),
+        "{joined}"
+    );
+    logout(&session).await.expect("logout");
+}
+
 /// 心跳對真 server（/docs/design/daemon/ws-receive-dispatch.md §5.1）：安靜的線每秒跳一次，Pong 經會話表回來、也過鉤子；三秒內至少兩個 Pong、線還開著、沒有無主。
 /// 📎 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
 #[tokio::test]

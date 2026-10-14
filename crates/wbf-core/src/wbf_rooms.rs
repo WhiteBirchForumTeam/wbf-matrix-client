@@ -24,7 +24,10 @@ use crate::Core;
 
 impl Core {
     /// `Misc` 線上的一個 client（同一條線上很多命令可以同時各拿一個，/docs/design/daemon/link-pool.md §5）。
-    async fn misc_client(&self, account: &AccountDir) -> Result<PooledClient, CoreError> {
+    pub(crate) async fn misc_client(
+        &self,
+        account: &AccountDir,
+    ) -> Result<PooledClient, CoreError> {
         self.client_of(
             account,
             Transport::WebSocket,
@@ -245,6 +248,7 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    use wbf_sdk::chat::Membership;
     use wbf_sdk::login::{Session, SessionBackend};
 
     use crate::accounts::AccountDir;
@@ -300,7 +304,9 @@ mod tests {
 
         // 走 WS 的：清單（server／both）、單一房間——到 `client_of` 開線那一步才失敗，而且是 Network。
         for outcome in [
-            core.list_rooms(SyncMode::Server, &target).await.map(|_| ()),
+            core.list_rooms(SyncMode::Server, &[Membership::Join], &target)
+                .await
+                .map(|_| ()),
             core.conversation("!r:localhost", SyncMode::Server, &target)
                 .await
                 .map(|_| ()),
@@ -395,7 +401,10 @@ mod tests {
         let target = Target::default();
         let joined_rooms_call = (BRIDGE_JOINED_ROOMS.kind, BRIDGE_JOINED_ROOMS.subtype);
 
-        let listed = core.list_rooms(SyncMode::Both, &target).await.unwrap();
+        let listed = core
+            .list_rooms(SyncMode::Both, &[Membership::Join], &target)
+            .await
+            .unwrap();
         let ids: Vec<&str> = listed.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(ids, vec![OTHER_ROOM, ROOM]);
         assert!(
@@ -424,7 +433,10 @@ mod tests {
         );
         assert!(!calls.contains(&joined_rooms_call), "{calls:?}");
 
-        let listed = core.list_rooms(SyncMode::Local, &target).await.unwrap();
+        let listed = core
+            .list_rooms(SyncMode::Local, &[Membership::Join], &target)
+            .await
+            .unwrap();
         let fetched = listed.iter().find(|entry| entry.id == ROOM).unwrap();
         assert_eq!(fetched.name.as_deref(), Some(FAKE_ROOM_NAME));
         assert_eq!(fetched.encrypted, Some(false));

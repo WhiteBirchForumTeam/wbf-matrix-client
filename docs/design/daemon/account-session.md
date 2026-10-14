@@ -78,7 +78,7 @@
 
 | 功能 | 一般 Matrix（走 Client） | wbf 帳號（不建 Client） |
 |---|---|---|
-| `room.list` 的 `server`／`both` | Client 的 /sync | 只問橋 `JoinedRooms`（0x13/0x28），一個請求；`both` 把差異寫進 `room_list`（新的只有 id、拿過的🚫 覆寫、退出的標 `joined = 0`）；`local` 不變。每一間的樣子🚫 在這裡問，是 UI 對看得到的房間叫 `room.get`（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1） |
+| `room.list` 的 `server`／`both` | Client 的 /sync | 只問橋 `JoinedRooms`（0x13/0x28），一個請求；`both` 把差異寫進 `room_list`（新的只有 id、拿過的🚫 覆寫、本地是 `join` 而名單沒有的標 `leave`，/docs/design/rooms/room-actions.md §3）；`local` 不變。每一間的樣子🚫 在這裡問，是 UI 對看得到的房間叫 `room.get`（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1） |
 | `room.get` 的 `server`／`both` | Client 的 /sync | 這一間的 `GetState`（0x14/0x21）＋`m.direct`（`GetAccountData` 0x11/0x25）一起送、組 `Conversation`，`both` 寫進 `room_list`。狀態超過 2 MiB 的房 server 回 `TooLarge`，原樣回給 UI |
 | `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機）；加密與否**只看本地的 `rooms.encrypted`**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §7）：本地不知道（沒拿過這間房）就是 1100、請 UI 先拿房間，🚫 當成明文、🚫 為它上網；**加密房**：只用後台已經分好的房間金鑰（等它對 UI 給的 `room_devices.room_version` 就緒，最多 2 秒，等不到 1402）、加密、帶號碼送（/docs/design/keys/e2ee-rpc.md §3、§3.1）；沒帶 `room_devices` 是 1100 |
 | `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（/docs/design/media/wbf-client-convention-for-chunk.md §5.2 的宣告，`attachment_declared: true`）；加密房要帶 `room_devices`，沒帶或 `cipher` 跟房間對不上都在**上傳之前**就拒（/docs/design/keys/e2ee-rpc.md §3）。兩邊的 content 同一份（`event_json::file_message_content`） |

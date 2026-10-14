@@ -12,6 +12,7 @@ use wbf_core::{
     cipher_for_plaintext_room, Core, HistoryQuery, RoomDevices, SendOptions, SyncMode,
     UploadRequest,
 };
+use wbf_sdk::chat::Membership;
 use wbf_sdk::{Manifest, MatrixManifest, RecentPlan};
 
 use super::{
@@ -33,13 +34,23 @@ pub(super) async fn room_list(handle: &Handle, core: &Core, params: Value) -> Ou
     struct Params {
         #[serde(default)]
         sync: SyncMode,
+        /// 要哪幾種身分的房（/docs/design/rooms/room-actions.md §3）；沒帶只列 `join`
+        #[serde(default = "only_joined")]
+        membership: Vec<Membership>,
         #[serde(flatten)]
         target: TargetParams,
     }
+    fn only_joined() -> Vec<Membership> {
+        vec![Membership::Join]
+    }
     let params: Params = parse_params(params)?;
     to_result(
-        core.list_rooms(params.sync, &handle.target(&params.target))
-            .await?,
+        core.list_rooms(
+            params.sync,
+            &params.membership,
+            &handle.target(&params.target),
+        )
+        .await?,
     )
 }
 

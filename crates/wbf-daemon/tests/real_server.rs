@@ -978,6 +978,329 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
     stop_daemon(daemon, client).await;
 }
 
+/// 房間動作（/docs/design/rooms/room-actions.md）：兩個帳號都登在**同一個 daemon**（共用 `cache.db`），一路看 server 怎麼答、本地的列怎麼跟著走。
+///
+/// 額外要 `WBF_E2E_USER_B`／`WBF_E2E_PASSWORD_B_FILE`（另一個帳號，例 `@bob:localhost`）。每一步看 code 與 server 的 body，🚫 看 msg。
+///
+/// | 步驟 | 驗什麼 |
+/// |---|---|
+/// | alice `room.create`（明文） | 回 server 的 `{room_id}`；本地 alice 那列 `join` |
+/// | alice `room.invite` bob | bob 是本機帳號 → bob 那列 `invite`（`room.list membership: ["invite"]`） |
+/// | bob `room.join` | bob 那列 `join` |
+/// | alice `room.set_power_levels { events_default: 100 }` | alice 本地重算成 `channel`；bob `room.get sync=both` 看到 `can_send_message: false` |
+/// | alice `room.set_name`、`room.get_state` | 寫進去的讀得回來 |
+/// | alice 送字、`room.pin` | `room.get` 的 `state` 帶 `m.room.pinned_events` |
+/// | alice `room.enable_encryption` | 本地標加密；沒帶 `room_devices` 送字 1100；帶了送出去，別的 client 從 server 拿到的是 `m.room.encrypted` |
+/// | bob（被設成發不了言之後）`room.set_name` | 1400，`data` 是 server 的 403 `M_FORBIDDEN` |
+/// | alice `room.kick` bob | bob 那列 `leave` |
+/// | bob `room.forget` | 還有 alice 看得到 → `history_cleared: false` |
+/// | alice `room.leave`、`room.forget` | 只剩自己 → `history_cleared: true`，列沒了 |
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_USER_B, WBF_E2E_PASSWORD_B_FILE"]
+async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let alice = std::env::var("WBF_E2E_USER").expect("WBF_E2E_USER");
+    let bob = std::env::var("WBF_E2E_USER_B").expect("WBF_E2E_USER_B");
+    let read_password = |name: &str| {
+        let text = std::fs::read_to_string(std::env::var(name).expect(name)).unwrap();
+        text.strip_suffix('\n').unwrap_or(&text).to_string()
+    };
+    let (alice_password, bob_password) = (
+        read_password("WBF_E2E_PASSWORD_FILE"),
+        read_password("WBF_E2E_PASSWORD_B_FILE"),
+    );
+
+    let dir = tempfile::Builder::new()
+        .prefix("wd")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
+    let reply = client.call("vault.create", json!({})).await;
+    assert_eq!(reply["code"], 0, "vault.create: {reply}");
+    for (user, password) in [(&alice, &alice_password), (&bob, &bob_password)] {
+        let reply = client
+            .call(
+                "account.add",
+                json!({ "server": server, "user": user, "password": password, "device_name": "wbf-daemon room actions e2e" }),
+            )
+            .await;
+        assert_eq!(reply["code"], 0, "account.add {user}: {reply}");
+    }
+    wait_for_links(&mut client, 10).await;
+    let membership_of = |listed: &Value, room: &str| -> Option<Value> {
+        listed["result"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["id"] == room)
+            .map(|entry| entry["membership"].clone())
+    };
+    let every_membership = json!(["join", "invite", "knock", "leave", "ban"]);
+
+    // ── 建房、邀請、加入 ──
+    let created = client
+        .call(
+            "room.create",
+            json!({ "user": alice, "encrypted": false, "name": "room actions e2e", "preset": "private_chat" }),
+        )
+        .await;
+    println!("room.create ← {created}");
+    assert_eq!(created["code"], 0, "{created}");
+    let room = created["result"]["room_id"].as_str().unwrap().to_string();
+    let listed = client.call("room.list", json!({ "user": alice })).await;
+    assert_eq!(
+        membership_of(&listed, &room),
+        Some(json!("join")),
+        "{listed}"
+    );
+
+    let invited = client
+        .call(
+            "room.invite",
+            json!({ "user": alice, "room": room, "user_id": bob, "reason": "e2e" }),
+        )
+        .await;
+    println!("room.invite ← {invited}");
+    assert_eq!(
+        (&invited["code"], &invited["result"]),
+        (&json!(0), &json!({})),
+        "{invited}"
+    );
+    let listed = client
+        .call(
+            "room.list",
+            json!({ "user": bob, "membership": ["invite"] }),
+        )
+        .await;
+    assert_eq!(
+        membership_of(&listed, &room),
+        Some(json!("invite")),
+        "bob 是本機帳號：{listed}"
+    );
+
+    let joined = client
+        .call("room.join", json!({ "user": bob, "room": room }))
+        .await;
+    assert_eq!(joined["code"], 0, "{joined}");
+    assert_eq!(joined["result"]["room_id"], room.as_str());
+    let listed = client.call("room.list", json!({ "user": bob })).await;
+    assert_eq!(
+        membership_of(&listed, &room),
+        Some(json!("join")),
+        "{listed}"
+    );
+
+    // ── 狀態：權限、名字、置頂 ──
+    let fetched = client
+        .call(
+            "room.get",
+            json!({ "user": alice, "room": room, "sync": "both" }),
+        )
+        .await;
+    assert_eq!(fetched["code"], 0, "{fetched}");
+    let state = fetched["result"]["state"]
+        .as_array()
+        .expect("room.get 帶整份狀態");
+    assert!(
+        state.iter().any(|event| event["type"] == "m.room.create"),
+        "{fetched}"
+    );
+    assert!(
+        state.iter().all(|event| event["type"] != "m.room.member"),
+        "成員事件🚫 放進 state"
+    );
+
+    let channel = client
+        .call(
+            "room.set_power_levels",
+            json!({ "user": alice, "room": room, "events_default": 100 }),
+        )
+        .await;
+    println!("room.set_power_levels ← {channel}");
+    assert_eq!(channel["code"], 0, "{channel}");
+    assert!(channel["result"]["event_id"].is_string(), "{channel}");
+    let local = client
+        .call("room.get", json!({ "user": alice, "room": room }))
+        .await;
+    assert_eq!(local["result"]["kind"], "channel", "本地跟著重算：{local}");
+    let bob_view = client
+        .call(
+            "room.get",
+            json!({ "user": bob, "room": room, "sync": "both" }),
+        )
+        .await;
+    assert_eq!(bob_view["result"]["can_send_message"], false, "{bob_view}");
+
+    let named = client
+        .call(
+            "room.set_name",
+            json!({ "user": alice, "room": room, "name": "renamed" }),
+        )
+        .await;
+    assert_eq!(named["code"], 0, "{named}");
+    let name = client
+        .call(
+            "room.get_state",
+            json!({ "user": alice, "room": room, "event_type": "m.room.name" }),
+        )
+        .await;
+    assert_eq!(name["result"], json!({ "name": "renamed" }), "{name}");
+    let missing = client
+        .call(
+            "room.get_state",
+            json!({ "user": alice, "room": room, "event_type": "m.room.topic" }),
+        )
+        .await;
+    assert_eq!(
+        (&missing["code"], &missing["result"]),
+        (&json!(0), &Value::Null),
+        "沒有這一項是 null：{missing}"
+    );
+
+    let refused = client
+        .call(
+            "room.set_name",
+            json!({ "user": bob, "room": room, "name": "mine now" }),
+        )
+        .await;
+    println!("room.set_name (bob) ← {refused}");
+    assert_eq!(refused["code"], 1400, "{refused}");
+    assert_eq!(
+        (&refused["data"]["status"], &refused["data"]["errcode"]),
+        (&json!(403), &json!("M_FORBIDDEN")),
+        "server 的錯照原樣：{refused}"
+    );
+
+    let sent = client
+        .call(
+            "room.send_text",
+            json!({ "user": alice, "room": room, "body": "pin me" }),
+        )
+        .await;
+    assert_eq!(sent["code"], 0, "建房時記了明文，送得出去：{sent}");
+    let event_id = sent["result"]["event_id"].as_str().unwrap().to_string();
+    let pinned = client
+        .call(
+            "room.pin",
+            json!({ "user": alice, "room": room, "event_id": event_id, "pinned": true }),
+        )
+        .await;
+    assert_eq!(pinned["code"], 0, "{pinned}");
+    let again = client
+        .call(
+            "room.pin",
+            json!({ "user": alice, "room": room, "event_id": event_id, "pinned": true }),
+        )
+        .await;
+    assert_eq!(again["result"], json!({}), "已經置頂：🚫 寫：{again}");
+    let fetched = client
+        .call(
+            "room.get",
+            json!({ "user": alice, "room": room, "sync": "both" }),
+        )
+        .await;
+    let pins = fetched["result"]["state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "m.room.pinned_events")
+        .map(|event| event["content"]["pinned"].clone());
+    assert_eq!(pins, Some(json!([event_id])), "{fetched}");
+
+    // ── 明文房升級加密 ──
+    let enabled = client
+        .call(
+            "room.enable_encryption",
+            json!({ "user": alice, "room": room }),
+        )
+        .await;
+    println!("room.enable_encryption ← {enabled}");
+    assert_eq!(enabled["code"], 0, "{enabled}");
+    let local = client
+        .call("room.get", json!({ "user": alice, "room": room }))
+        .await;
+    assert_eq!(local["result"]["encrypted"], true, "{local}");
+    let plain = client
+        .call(
+            "room.send_text",
+            json!({ "user": alice, "room": room, "body": "should not go out" }),
+        )
+        .await;
+    assert_eq!(plain["code"], 1100, "本地知道加密了：🚫 送明文：{plain}");
+    let refreshed = client
+        .call(
+            "room.refresh_devices",
+            json!({ "user": alice, "room": room }),
+        )
+        .await;
+    assert_eq!(refreshed["code"], 0, "{refreshed}");
+    let secret = client
+        .call(
+            "room.send_text",
+            json!({ "user": alice, "room": room, "body": "now encrypted", "room_devices": refreshed["result"] }),
+        )
+        .await;
+    assert_eq!(secret["code"], 0, "{secret}");
+    let other = OtherClient::login(&server, &alice, &alice_password).await;
+    let raw = other
+        .event(&room, secret["result"]["event_id"].as_str().unwrap())
+        .await;
+    assert_eq!(raw["type"], "m.room.encrypted", "server 上是密文：{raw}");
+    other.logout().await;
+
+    // ── 踢人、忘記 ──
+    let kicked = client
+        .call(
+            "room.kick",
+            json!({ "user": alice, "room": room, "user_id": bob }),
+        )
+        .await;
+    assert_eq!(kicked["code"], 0, "{kicked}");
+    let listed = client
+        .call(
+            "room.list",
+            json!({ "user": bob, "membership": every_membership }),
+        )
+        .await;
+    assert_eq!(
+        membership_of(&listed, &room),
+        Some(json!("leave")),
+        "{listed}"
+    );
+    let forgot = client
+        .call("room.forget", json!({ "user": bob, "room": room }))
+        .await;
+    println!("room.forget (bob) ← {forgot}");
+    assert_eq!(
+        forgot["result"],
+        json!({ "history_cleared": false }),
+        "alice 還看得到：{forgot}"
+    );
+
+    let left = client
+        .call("room.leave", json!({ "user": alice, "room": room }))
+        .await;
+    assert_eq!(left["code"], 0, "{left}");
+    let forgot = client
+        .call("room.forget", json!({ "user": alice, "room": room }))
+        .await;
+    println!("room.forget (alice) ← {forgot}");
+    assert_eq!(
+        forgot["result"],
+        json!({ "history_cleared": true }),
+        "{forgot}"
+    );
+    let listed = client
+        .call(
+            "room.list",
+            json!({ "user": alice, "membership": every_membership }),
+        )
+        .await;
+    assert_eq!(membership_of(&listed, &room), None, "{listed}");
+
+    stop_daemon(daemon, client).await;
+}
+
 /// 上游的加密器（Element 這類 client 用的同一份）：回（密文、事件裡的 `file`，`url` 由呼叫者填）。
 fn encrypt_like_element(plain: &[u8]) -> (Vec<u8>, Value) {
     use std::io::Read;
@@ -1102,6 +1425,31 @@ impl OtherClient {
             .as_str()
             .unwrap_or_else(|| panic!("send: {reply}"))
             .to_string()
+    }
+
+    /// server 上那則事件原樣（`GET /rooms/{room}/event/{event_id}`）：看它送出去的是不是密文。
+    async fn event(&self, room: &str, event_id: &str) -> Value {
+        let encode = |text: &str| {
+            text.replace('!', "%21")
+                .replace('$', "%24")
+                .replace(':', "%3A")
+                .replace('/', "%2F")
+                .replace('+', "%2B")
+        };
+        self.http
+            .get(format!(
+                "{}/_matrix/client/v3/rooms/{}/event/{}",
+                self.server,
+                encode(room),
+                encode(event_id)
+            ))
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn logout(&self) {

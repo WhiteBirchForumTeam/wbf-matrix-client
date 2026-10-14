@@ -1780,13 +1780,21 @@ impl DownloadHandler {
             self.claims.release(&self.server_dir, &mxc, &self.holder);
         }
         // 還沒處理的 job 與等的人（含別的處理端剛轉過來的，§5.1）：🚫 跟著收件 queue 一起悄悄消失，逐個回錯、推一則失敗。
-        let (unstarted, running, waiters, mut listeners) = {
+        // 「準備中」的也算：處理端可能就是在開檔、等 DB 的那一步被停掉的（PR #75 審查 cirno 🟢2）。
+        // 一個 mxc 可以同時在「準備中」與 `downloading`（開始了、還沒拿掉準備中就被停）：一個檔只推一則。
+        let (ended, waiters, mut listeners) = {
             let mut state = self.shared.state();
-            let unstarted: Vec<String> = state.inbox.drain(..).map(|job| job.mxc).collect();
+            let mut ended: Vec<String> = Vec::new();
+            let inbox: Vec<String> = state.inbox.drain(..).map(|job| job.mxc).collect();
+            let preparing: Vec<String> = state.preparing.drain().map(|(mxc, _)| mxc).collect();
             let running: Vec<String> = state.downloading.drain().map(|(mxc, _)| mxc).collect();
+            for mxc in inbox.into_iter().chain(preparing).chain(running) {
+                if !ended.contains(&mxc) {
+                    ended.push(mxc);
+                }
+            }
             (
-                unstarted,
-                running,
+                ended,
                 std::mem::take(&mut state.waiters),
                 std::mem::take(&mut state.listeners),
             )
@@ -1795,7 +1803,7 @@ impl DownloadHandler {
         for waiter in waiters.into_values().flatten() {
             let _ = waiter.send(Err(error.clone()));
         }
-        for mxc in unstarted.iter().chain(running.iter()) {
+        for mxc in &ended {
             let recipients = listeners.remove(mxc).unwrap_or_default();
             emit_to_each(&self.events, &recipients, &self.holder.user, |user| {
                 CoreEvent::MediaDownload {
@@ -3100,6 +3108,36 @@ mod tests {
         wait_until(&mut events, &manifest.mxc, DownloadState::Cancelled).await;
         assert!(downloader.list_jobs().is_empty());
         assert!(reads(&server).is_empty());
+    }
+
+    /// 處理端在「準備中」那一步被停（登出）：那個 job 一樣推一則 `failed`，🚫 悄悄消失（PR #75 審查 cirno 🟢2）。
+    #[tokio::test]
+    async fn a_job_being_prepared_when_the_downloader_stops_is_pushed_as_failed() {
+        let (core, account, _server, manifest) = uploaded("dq-stop-preparing").await;
+        let mut events = core.subscribe();
+        let downloader = core.downloader_of(&account).await.unwrap();
+        // 同上：唯一寫入者忙著，job 停在「準備中」。
+        let (cache, _) = core.server_cache_and_me(&account).unwrap();
+        cache.post(
+            |_| {
+                std::thread::sleep(Duration::from_millis(500));
+                Ok(())
+            },
+            Vec::new(),
+        );
+        downloader.enqueue(Arc::new(manifest.clone()), None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            downloader
+                .list_jobs()
+                .first()
+                .map(|(mxc, _, status)| (mxc.clone(), status.state)),
+            Some((manifest.mxc.clone(), DownloadState::Queued)),
+            "it is being prepared"
+        );
+        drop(downloader);
+        core.stop_downloader_of(&account);
+        wait_until(&mut events, &manifest.mxc, DownloadState::Failed).await;
     }
 
     /// 同一台 server 上「另一個帳號」的處理端：自己的線（另一台假 server，資料抄同一份）、同一個池與 cache.db、同一張認領表。

@@ -217,6 +217,8 @@ impl MatrixBackend {
             my_power_level,
             can_send_message,
             direct_peer,
+            // Client 的 store 算的，🚫 拿整份狀態：`room.get` 另外問（wbf-core 的 rooms_ops.rs），列表就是 null（chat.rs）。
+            state: None,
         })
     }
 }

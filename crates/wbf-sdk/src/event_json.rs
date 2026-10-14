@@ -12,6 +12,8 @@ use crate::protocol::event_seqs;
 /// /docs/design/media/wbf-client-convention-for-chunk.md §5 的 msgtype 與區塊 key。
 pub const FILE_MSGTYPE: &str = "org.wbftw.wbfuwunel.file";
 pub const CHUNKED_BLOCK_KEY: &str = "org.wbftw.wbfuwunel.chunked";
+/// 區塊沒帶檔名時，事件 `body` 裡用的名字。
+pub const UNNAMED_FILE: &str = "file";
 
 /// /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔案事件 content（`m.room.message`，msgtype 是 [`FILE_MSGTYPE`]）。
 /// matrix-sdk 那條路（`Room::send`）與 wbf 那條路（`Event/Send`）共用這一份，送出去的事件才不會漂。
@@ -32,7 +34,7 @@ pub fn file_message_content(
         .name
         .clone()
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "file".to_string());
+        .unwrap_or_else(|| UNNAMED_FILE.to_string());
     let body = match caption {
         Some(caption) => format!("{caption}\n{name}（WBF 分塊檔，需要 WBF client 才能開）"),
         None => format!("{name}（WBF 分塊檔，需要 WBF client 才能開）"),
@@ -104,7 +106,8 @@ pub fn matrix_file_message_content(
                 serde_json::Value::String(manifest.mxc.clone()),
             );
         }
-        (kind, file) => return Err(usage(format!(
+        (kind, file) => {
+            return Err(usage(format!(
             "{}: a {kind:?} manifest {} file description cannot be sent as a standard attachment",
             manifest.mxc,
             if file.is_some() {
@@ -112,7 +115,8 @@ pub fn matrix_file_message_content(
             } else {
                 "without a"
             }
-        ))),
+        )))
+        }
     }
     // 消費端自己再問一次：組出來的要是收的那邊（同一支解析）認得的、指著同一個 mxc、同一種格式。
     let parsed = matrix_attachment_of_content(msgtype, &content)
@@ -590,7 +594,7 @@ mod file_message_content_tests {
         );
         assert_eq!(content[CHUNKED_BLOCK_KEY]["cipher"], "none");
         assert_eq!(content[CHUNKED_BLOCK_KEY]["file_size"], 3);
-        // 沒 caption 就沒有那個欄位；沒名字用 "file"。
+        // 沒 caption 就沒有那個欄位；沒名字用 `UNNAMED_FILE`。
         let content = file_message_content(
             &Attachment {
                 mxc: "mxc://localhost/1".into(),

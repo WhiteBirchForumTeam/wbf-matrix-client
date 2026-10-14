@@ -32,6 +32,8 @@
 //! - `incoming`：上游給的事件原樣（`IncomingEvent`）、一頁的游標、事件分類與 edit 的有效性規則（/docs/design/messages/edits-and-redactions.md）。
 //! - `event_json`：原始 Matrix 事件 JSON → `Message`，matrix backend 與 `recent` 共用。
 //! - `chat`：聊天模型與 `ChatBackend` trait；`backend/matrix_sdk`（feature `matrix`）是第一個實作，房間這一側唯一 `use matrix_sdk` 的地方（E2EE 引擎在 `crypto_engine`）。
+//! - `matrix_endpoint`：房間相關的 Matrix 端點一張表，wbf 帳號走橋、一般 Matrix 帳號走同一個 HTTP 端點（/docs/design/rooms/room-actions.md §2）。
+//! - `room_state`：從房間狀態組出 `Conversation`；`room_state_edit`：改房間狀態與 `m.direct` 的純函數（權限合併、置頂、一對一標記）。
 //! - `device_version`：裝置版本號與房間版本號（server 的 `wbf-room-device-version.md`）：成員清單怎麼讀、1506 之後跟誰重查、雜湊怎麼自己重算。
 //! - `to_device_state`：to-device 的 `cd_seq` 與待銷毀清單，落在 `m/`（/docs/design/keys/to-device-client.md §2、§4）。
 //! - `local_source`（feature `cache`）：這台機器上的原檔——UI 給的 `media.source_uri` 怎麼解、大小對得上才讀它（/docs/design/rpc-specs/data-plane.md §8.1）。
@@ -60,6 +62,7 @@ pub mod link;
 pub mod local_source;
 pub mod login;
 pub mod manifest;
+pub mod matrix_endpoint;
 #[cfg(feature = "matrix")]
 pub mod matrix_media;
 #[cfg(feature = "cache")]
@@ -69,6 +72,7 @@ pub mod media_pool;
 pub mod protocol;
 pub mod room_keys;
 pub mod room_state;
+pub mod room_state_edit;
 pub mod seek_store;
 pub mod sessions;
 pub mod to_device_state;
