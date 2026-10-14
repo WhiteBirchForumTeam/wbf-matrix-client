@@ -170,7 +170,7 @@ UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`st
 ### 3.3 收邀請（issue #77；草案，等維護者點頭）
 
 server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/design/events/invites-on-the-wire.md（下面簡稱「server §n」）。
-維護者 2026-10-14 定了三件：**跟房間線共用**、**daemon 加一個「是不是本站說的」欄位**、**一般 Matrix 帳號的推播也一起做**（⚠️ 第三件有個前提不成立，見 §3.3.5）。
+維護者 2026-10-14 定的：**跟房間線共用**、**開線只訂閱、補拿是 UI 叫的 RPC**（§3.3.2）、**daemon 加一個「是不是本站說的」欄位**（§3.3.4）、**一般 Matrix 帳號走甲**（§3.3.5）。
 
 **現況**：wbf 帳號收不到邀請——訂閱線只推已加入的房、`JoinedRooms` 只列已加入的、還沒加入時讀房間狀態是 403。Matrix 也沒有「列出我被邀請的房」的端點，邀請只從 `/sync` 來，所以 server 造了自己的一條流 `0x05 Invite`。
 
@@ -187,23 +187,26 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
 
 🚨 **server 定了每次連線走一輪完整快照、🚫 留跨連線的水位**（server §3.3）：被收回的邀請**只能靠「不在快照裡」發現**，帶舊水位回來會永遠留著已經被收回的邀請。`ci_seq` 只是同一輪之內的續傳游標。
 
-#### 3.3.2 誰做什麼（⚠️ 跟訊息那條線刻意不同）
+#### 3.3.2 誰做什麼（跟訊息那條線同一套，維護者 2026-10-14）
+
+> 維護者 2026-10-14：「開線時，只訂閱邀請就好了。補拿一輪應該做成 rpc 指令，讓 ui 去叫。」
 
 | | daemon | UI |
 |---|---|---|
-| 開線（房間線）時 `Invite/Subscribe`，接著跑一輪 `Fetch` 到 `r == 0` | ✅ 自動 | — |
-| `gap: true`（server 說這條流掉過東西）→ 再跑一輪 | ✅ 自動 | — |
-| 存水位 | 🚫（server §3.3） | 🚫 |
+| 開線（房間線）時 `Invite/Subscribe` | ✅ 只訂閱，收推播寫本地 | — |
+| 補拿一輪 `Fetch` 到 `r == 0` | RPC 叫了才跑（§3.3.4 的 `room.list`） | 起來的當下、看到 `link.state` 線又通了、看到推播帶 `gap: true` 時叫 |
+| 存水位 | 🚫（server §3.3） | 🚫（每輪都是完整快照，不需要） |
 | 本地的邀請清單 | `room_list` 那一列：`membership = invite`、`invite_json`（§3.3.3） | 讀 `room.list { membership: ["invite"] }` |
 | 「房名、頭像是誰說的」 | 算好 `is_from_this_server` 給出去（§3.3.4） | 決定怎麼顯示 |
 | 接受／拒絕 | 照舊：`room.join`／`room.leave` | 叫哪一支 |
 
-⚠️ **訊息那條線 daemon 🚫 補窗**（維護者 2026-09-22，/docs/design/rooms/room-sync.md §0：漏了 UI 自己決定要不要補）。邀請這條反過來，是因為**它的語意不一樣**：訊息補一段就停，往回多遠是 UI 的選擇；邀請**必須補齊**，少一間就是「有人邀你、你永遠不知道」，而且 server 把它寫成 client 的義務（server §8 ①）。
-🚫 存任何狀態（沒有水位、沒有游標落地），所以還是「純」：跟金鑰線的「上線追平」同一類（/docs/design/keys/key-sync.md）。
+跟訊息那條線一樣（/docs/design/rooms/room-sync.md §0：daemon 只有訂閱新事件，🚫 主動叫 `Recent`，什麼時候補由 UI 觸發）。
+不一樣的只有「補到哪裡停」：訊息補一段就停、往回多遠是 UI 的選擇；邀請一輪就是**到 `r == 0` 為止**，daemon 在一支 RPC 裡跑完整輪才回（server 說補到一半的不是快照，§3.3.3），UI 🚫 自己接續傳游標。
 
 #### 3.3.3 寫本地的規則（server §8 的六條，逐條對應）
 
-一輪 `Fetch` 期間，daemon 在記憶體裡記「這一輪開始之後被 `Push`／`Gone` 碰過的房 → 它的 `is`」（一輪結束就丟）：
+一輪 `Fetch` 是 UI 叫的那支 RPC 在跑（走 Misc 線，跟 `Recent` 一樣一問一答、回應是一串 `Batch`；`Push`／`Gone` 照舊從房間線來）。
+這支 RPC 跑的期間，daemon 在記憶體裡記「這一輪開始之後被 `Push`／`Gone` 碰過的房 → 它的 `is`」，RPC 回了就丟（🚫 落地）。`is` 跟 `counts` 是同一個號碼空間（server §3.1），所以兩條線的先後不要緊：
 
 | 收到 | `room_list` 那一列（這個帳號的） |
 |---|---|
@@ -225,25 +228,27 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
                 "is_from_this_server": true } }
   ```
   - `sync=local`：讀本地。`sync=server`：跑一輪 `Fetch`、回那份快照、🚫 寫庫。`sync=both`：跑一輪、照 §3.3.3 寫、再從本地讀。
-- 推播 `room.membership`（有變的那一列才推）：
+  - ⭐ **這就是「補拿一輪」的 RPC**：🚫 另開一支 method。`membership` 裡有 `invite`、`sync` 不是 `local` 才跑 `Fetch`；只要 `join` 的照舊只問 `JoinedRooms`，兩個都要就兩個都問。
+  - 一輪在這支 RPC 裡跑到 `r == 0` 才回；中途斷了回錯、🚫 刪任何一列（已經寫進去的那幾間留著：那些是真的邀請），UI 再叫一次就是新的一輪。
+- 推播 `room.membership`：server 的每一則 `Push`／`Gone` 推一則，`gap` 原樣帶著；一輪 `Fetch` 寫完有變的列也推（不帶 `gap`）：
   ```jsonc
-  { "user": "@bob:localhost", "room": "!r:localhost", "membership": "invite", "invite": { /* 同上 */ } }
-  { "user": "@bob:localhost", "room": "!r:localhost", "membership": "leave" }
+  { "user": "@bob:localhost", "room": "!r:localhost", "membership": "invite", "invite": { /* 同上 */ }, "gap": false }
+  { "user": "@bob:localhost", "room": "!r:localhost", "membership": "leave", "gap": false }
   ```
+  - `gap: true` 是 server 說「這條流在這之前掉過東西」（server §8 ④）：daemon 🚫 自己重跑，原樣轉給 UI，要不要叫 `room.list` 補一輪是 UI 的事。
+    📌 訊息那條線的 `gap` 是丟掉不轉的（UI 不需要知道洞，維護者 2026-09-22）；邀請這條要轉，因為它是「該補一輪了」唯一的訊號。
 - 🚨 **`is_from_this_server`**（daemon 加的，維護者 2026-10-14）：`inviter` 的網域跟這個帳號的網域**逐字相同**才是 `true`；沒有 `inviter`、網域解不出來，一律 `false`（fail closed）。
   `false` 時 `state` 裡的房名、頭像、topic 都是**對方 server 說的**：縮減狀態沒有簽章，就算有也驗不動（要先加入才驗得了，而要不要加入正是這則邀請在問的，server §5.2.3）。UI 🚫 該把它當成已驗證的事實顯示。只有 `inviter` 本身有協定綁定。
 - `room.get` 對被邀請的房照舊會被 server 拒（還沒加入）；UI 顯示「某某邀你加入某某房」靠的是 `invite`。
 
-#### 3.3.5 一般 Matrix 帳號（⚠️ 有一個前提要維護者再看）
+#### 3.3.5 一般 Matrix 帳號（甲，維護者 2026-10-14）
 
-matrix-sdk 的 `/sync` 本來就帶 `rooms.invite`（被邀請的房與縮減狀態），寫本地照 §3.3.3 的同一套（`Gone` 換成「上次是 invite、這次不是」）。
-🚨 **但一般 Matrix 帳號現在沒有常駐的同步迴圈**：daemon 只在要用時跑一次 `sync_once`（逾時 0，`crates/wbf-sdk/src/backend/matrix_sdk.rs`）——所以它們**連訊息都沒有即時推播**。
-⇒ 「推播一起做」有兩種做法，要維護者選：
+一般 Matrix 帳號**沒有常駐的同步迴圈**：daemon 只在要用時跑一次 `sync_once`（逾時 0，`crates/wbf-sdk/src/backend/matrix_sdk.rs`），所以它們連訊息都沒有即時推播。這支🚫 開迴圈（那是另一件事：會變成一般 Matrix 帳號訊息即時推播的地基）。
 
-| | 做法 | 範圍 |
-|---|---|---|
-| 甲 | 每次本來就會跑的 `sync_once`（`room.list sync=both` 之類）順便比對邀請，有變就推 `room.membership` | 小：不是即時，UI 叫了才有 |
-| 乙 | 給一般 Matrix 帳號開一個常駐的長輪詢同步迴圈，邀請即時推 | 大：那個迴圈會順便變成「一般 Matrix 帳號的訊息即時推播」的地基，建議另開一支 |
+- matrix-sdk 的 `/sync` 本來就帶 `rooms.invite`（被邀請的房與縮減狀態），sync 完 store 裡就是**完整的**被邀請清單（跟 wbf 一輪 `Fetch` 補完同一個意思）。
+- `room.list { membership: ["invite"], sync }` 走跟 wbf 一樣的語意：`server` 回 store 那份、🚫 寫庫；`both` 照 §3.3.3 寫——清單裡有的寫 `invite`，本地是 `invite`、清單裡沒有的照 store 說的改（store 知道它現在是 `join`／`leave`／`ban`），有變的推 `room.membership`（`gap` 一律 `false`）。
+- 🚫 即時：UI 叫了才有（UI 起來的當下、定時、或使用者下拉時叫）。
+- `is_from_this_server` 同一套算法。
 
 ## 4. 權限：`room.set_power_levels`
 
@@ -311,7 +316,7 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 
 ## 6. 還要維護者定的
 
-目前只有 §3.3.5 的甲／乙（一般 Matrix 帳號的邀請推播怎麼做）。
+目前沒有（§3.3 收邀請的形狀等維護者看過、說開工）。
 
 ### 6.1 已經定的（原本在這裡的問題）
 
