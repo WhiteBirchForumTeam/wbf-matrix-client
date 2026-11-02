@@ -870,6 +870,8 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     /// `Invite/Fetch` 一整輪：一直收到 `r == 0` 才回（server §3.3：補到一半的不是快照）。🚫 帶 `ci_seq`：一支 RPC 就是新的一輪。
+    /// ⚠️ 🚫 把看過的最大 `is` 跨連線當 `ci_seq` 帶回去（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §3.3）：`is` 跟所有房間事件共用號碼，
+    /// 斷線期間漏掉、編號比它小的邀請會被濾掉，而且看不出來。守著它的是 `crates/wbf-sdk/tests/unit.rs` 的 `invite_packs_follow_the_server_shape`。
     ///
     /// Args:
     ///     per_pack_timeout: 每個 Batch 之間最多等多久, example: Duration::from_secs(30)

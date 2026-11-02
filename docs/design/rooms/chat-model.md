@@ -95,6 +95,8 @@ pub struct Conversation {
       pub state: Option<Vec<StateEvent>>,  // 同 Conversation.state
       pub membership: Membership,     // 這個帳號在這間房的身分（本地記的）
       pub refreshed_at: Option<u64>,  // 這一間的樣子什麼時候拿的；null ＝ 還沒拿過（這時 name 的 null 是「不知道」）
+      pub invite: Option<Invite>,     // 只有 membership == invite 的列才有（沒有就不帶這個欄位）：邀請者、is_direct、reason、縮減狀態、
+                                      // is_from_this_server（/docs/design/rooms/room-actions.md §3.3.4）
   }
   ```
 - `room.get` 拿**一間**的樣子（wbf 帳號是那一間的 `GetState` ＋ `m.direct`），只多不少：型別欄位之外多帶 `state`（成員事件以外的每一項狀態事件原樣，權限、置頂都在裡面，/docs/design/rooms/room-actions.md §5.1）。UI 對看得到、還沒名字的房間自己叫它（一千間房、畫面上十間，就叫十次），

@@ -5,7 +5,7 @@
 
 ## 1. 現況
 
-PR #1–#75 合併（main `0a06559`，2026-10-07）；分支 `feat/room-actions` 做完 §7 第 2 項的「房間動作」那一半（2026-10-07，待審）；#43（走橋的 GetEvent）是 2026-09-16 關掉、沒合——「跳到訊息」等 wbfuwunel #64 合了再開一支。已經能用的，照層次：
+PR #1–#78 合併（main `6f25d7f`，2026-11-02；#76 房間動作、#78 收邀請）；#43（走橋的 GetEvent）是 2026-09-16 關掉、沒合——「跳到訊息」等 wbfuwunel #64 合了再開一支。已經能用的，照層次：
 
 - **線上協議與媒體**：`wbf-wire` 的 codec 對著 server 的黃金向量；`wbf-sdk` 的分塊上傳／下載／seek／續傳／串流、每塊 AEAD（`/docs/design/media/wbf-client-convention-for-chunk.md`）。
 - **本地資料**：vault 與子金鑰、資料目錄兩層路徑加密（`/docs/design/storage/vault-and-keys.md`）；`cache.db` 一個 server 一份、多帳號混存、單一寫入者（`/docs/design/storage/local-cache-db.md`、`/docs/design/daemon/daemon-runtime.md` §2）；
@@ -21,6 +21,7 @@ PR #1–#75 合併（main `0a06559`，2026-10-07）；分支 `feat/room-actions`
   房間動作（建房、加入、退出、忘記、邀請、踢人、封鎖、狀態讀寫、權限合併、置頂、標籤、`m.direct`）：daemon 是中轉站、參數與結果照 Matrix，一張端點表兩條路（wbf 帳號走橋、一般 Matrix 帳號走同一個 HTTP 端點），
   本地每個帳號記自己的 `membership`、收到 ACK 才寫、寫不進去推 `note`；`room.get` 帶整份狀態（`/docs/design/rooms/room-actions.md`）。對真 server 驗過（兩個帳號同一個 daemon）。
   收邀請（`/docs/design/rooms/room-actions.md` §3.3）：房間線開線多訂 `Invite`、推來的寫本地並推 `room.membership`；主動補一輪是 UI 叫的 `room.invites`；`room.list` 的被邀請列帶 `invite`（含 `is_from_this_server`）。
+  房間線斷了重開：UI 收到 `rooms` 的 `link.state: opened` 就當成剛起來，再叫 `sync.recent` ＋ `room.invites`（daemon 🚫 自己叫，`/docs/design/rooms/room-sync.md` §3.1，issue #79）。
 - **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動（只在金鑰線的後台建、換、送；送訊息只用全部 Ack 的那把，等不到回 1402）、1506 之後 daemon 重拿再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
   房間自設的換金鑰期限（`m.room.encryption` 的 `rotation_period_*`）照做；`room.history` 讀到未解的再試一次；路徑版 `room.send_file` 與 CLI 的 `send` 都進得了加密房。

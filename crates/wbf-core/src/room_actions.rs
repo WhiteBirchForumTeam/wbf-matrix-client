@@ -6,7 +6,7 @@
 //!
 //! 會改到本地房間列的帶 [`WriteSync`]：`Both`（預設）收到 server 的 ACK 才寫本地；**寫不進去照樣回成功、另推一則 note**——
 //! 成功以 server 的 ACK 為準，回錯 UI 會以為沒做而重做一次（維護者 2026-10-07）。`Server` 🚫 碰本地。
-//! 收邀請（被別人邀）等 wbfuwunel #111（/docs/design/rooms/room-actions.md §3.3），🚫 在這裡。
+//! 收邀請（被別人邀）🚫 在這裡：推播與 `room.invites` 在 `invites.rs`（/docs/design/rooms/room-actions.md §3.3）。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};

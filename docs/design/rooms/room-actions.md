@@ -31,8 +31,9 @@ UI 叫一個 RPC，daemon 做一個房間動作，回 server 給的結果。會�
     daemon 自己加的只有兩件：`encrypted`（必填，轉成 `initial_state` 的 `m.room.encryption`）、`is_direct: true` 時順便寫 `m.direct`（第 3 條）。
     草案自己發明的 `public`／`direct` 拿掉，改用 Matrix 的 `preset`、`visibility`、`is_direct`。
 15. **房間相關的橋全接**：server 的 WS 幾乎全開，沒理由不用（§2 的清單）。太細、先不加的列在 §2.4。
-16. **收邀請等 server 做完再補**（§3.3）：已開 wbfuwunel #111（維護者要求優先）；這支🚫 接邀請的推送與補拿（維護者 2026-10-07 開工時定：「invite 的推播語意先不做，等 server 完成後補」）。
-    `membership` 的 `invite` 這支只由 `room.invite` 邀本機帳號時寫（§3）。
+16. **收邀請當時等 server 做完再補**：開了 wbfuwunel #111（維護者要求優先），房間動作那支🚫 接邀請的推送與補拿（維護者 2026-10-07 開工時定：「invite 的推播語意先不做，等 server 完成後補」）。
+    server 做完（wbfuwunel PR #113）之後由 issue #77 補上，形狀是維護者 2026-10-14 定的（§3.3）。
+    `membership` 的 `invite` 在房間動作那支只由 `room.invite` 邀本機帳號時寫（§3）；收邀請之後推播與 `room.invites` 也寫（§3.3.3）。
 
 ## 2. RPC
 
@@ -172,7 +173,7 @@ UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`st
 server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/design/events/invites-on-the-wire.md（下面簡稱「server §n」）。
 維護者 2026-10-14 定的：**跟房間線共用**、**開線只訂閱、補拿是 UI 叫的 RPC**（§3.3.2）、**主動補一輪另開 `room.invites`、`room.list` 照舊從 db 列（含推播寫進來的邀請）**（§3.3.4）、**daemon 加一個「是不是本站說的」欄位**（§3.3.4）、**一般 Matrix 帳號走甲**（§3.3.5）。
 
-**現況**：wbf 帳號收不到邀請——訂閱線只推已加入的房、`JoinedRooms` 只列已加入的、還沒加入時讀房間狀態是 403。Matrix 也沒有「列出我被邀請的房」的端點，邀請只從 `/sync` 來，所以 server 造了自己的一條流 `0x05 Invite`。
+**在這條流之前**：wbf 帳號收不到邀請——訂閱線只推已加入的房、`JoinedRooms` 只列已加入的、還沒加入時讀房間狀態是 403。Matrix 也沒有「列出我被邀請的房」的端點，邀請只從 `/sync` 來，所以 server 造了自己的一條流 `0x05 Invite`。
 
 #### 3.3.1 線上的形狀（server §5，摘要）
 
@@ -194,7 +195,8 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
 | | daemon | UI |
 |---|---|---|
 | 開線（房間線）時 `Invite/Subscribe` | ✅ 只訂閱，收推播寫本地 | — |
-| 補拿一輪 `Fetch` 到 `r == 0` | RPC 叫了才跑（§3.3.4 的 `room.invites`） | 首次啟動叫一次；看到推播帶 `gap: true` 時再叫 |
+| 補拿一輪 `Fetch` 到 `r == 0` | RPC 叫了才跑（§3.3.4 的 `room.invites`） | 首次啟動叫一次；看到推播帶 `gap: true` 時再叫；收到 `link.state { role: "rooms", state: "opened" }`（斷了重開）時再叫（/docs/design/rooms/room-sync.md §3.1，issue #79） |
+| 斷了重開 | 🚫 自己補；重開就重訂，兩個訂閱都 Ack 了才發 `opened` | 當成剛起來：叫 `sync.recent` ＋ `room.invites` |
 | 存水位 | 🚫（server §3.3） | 🚫（每輪都是完整快照，不需要） |
 | 本地的邀請清單 | `room_list` 那一列：`membership = invite`、`invite_json`（§3.3.3） | 讀 `room.list { membership: […, "invite"] }`（db 裡的，推播自動更新） |
 | 「房名、頭像是誰說的」 | 算好 `is_from_this_server` 給出去（§3.3.4） | 決定怎麼顯示 |
@@ -233,7 +235,7 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
   - `sync=server`／`both` 打上游拿的是**房間列表**（wbf 的 `JoinedRooms`、一般 Matrix 帳號的 `joined_rooms()`），**只有已加入的、沒有邀請**；`both` 寫回時本來就🚫 動 `invite`／`knock`／`ban` 的列（v10 的規則），所以快取裡的邀請不會被列表蓋掉。
 - **新的 `room.invites { user?, server? }`**：主動補一輪邀請（我們自己加的補窗；🚫 帶 `sync`：跟 `sync.recent` 一樣本來就是去上游拿的）。
   - 跑一輪 `Fetch` 到 `r == 0`、照 §3.3.3 寫進 db（含補完時刪掉沒出現的）、有變的列推 `room.membership`，回這一輪的快照。
-  - UI 首次啟動叫一次；之後靠推播。看到推播帶 `gap: true` 時再叫一次。
+  - UI 首次啟動叫一次；之後靠推播。看到推播帶 `gap: true` 時再叫一次；房間線斷了重開（收到 `rooms` 的 `link.state: opened`）也再叫一次——斷線那段的推播都丟了，新訂閱的 `gap` 是 `false`（/docs/design/rooms/room-sync.md §3.1）。
   - 中途斷了回錯、🚫 寫任何一列（快照在補完時一個 transaction 寫完，補到一半的什麼都不寫），UI 再叫一次就是新的一輪。
   - 回應（2026-10-14 對本機 wbfuwunel 實跑，alice `room.invite` bob 帶 `reason: "e2e"`；`state` 只留兩則、其他略）：
     ```jsonc
@@ -334,7 +336,7 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 
 ## 6. 還要維護者定的
 
-目前沒有（§3.3 收邀請的形狀等維護者看過、說開工）。
+目前沒有。
 
 ### 6.1 已經定的（原本在這裡的問題）
 
@@ -350,7 +352,7 @@ content 是 `{ "pinned": ["$event_id", …] }`（照順序）。`room.pin { pinn
 - 本地寫不進去：回成功（以 server 的 ACK 為準）＋推 `note`（§3）。
 - 置頂清單由 `room.get` 給（§5.1）。
 - 參數、結果全部跟上游一樣，daemon 只是中轉站（§1 第 14 條）；通用的 `get_state`／`set_state`＋窄的方便版都給；房間相關的橋全接（§2）。
-- 收邀請：開 server issue 優先處理（wbfuwunel #111）；推播語意等 server 做完再補（§3.3）。
+- 收邀請：開 server issue 優先處理（wbfuwunel #111）；server 做完（#113）之後已實作（§3.3，issue #77）；線重開時的補一輪是 UI 的規則（/docs/design/rooms/room-sync.md §3.1，issue #79）。
 
 ## 7. 程式碼在哪
 

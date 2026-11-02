@@ -659,6 +659,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 開一條房間線，走生產路徑（`open_link`）的順序：開線閉包裡 `init_connection`、池在閉包回來之後才發 `opened`。
+    /// 回 (假 server, 閉包跑完 `init_connection` 時 `opened` 已經發了沒)。
+    async fn open_rooms_line(
+        core: &Core,
+        account: &crate::accounts::AccountDir,
+        pool: &crate::link_pool::LinkPool,
+        events: &Arc<Mutex<Vec<Value>>>,
+    ) -> (FakeServer, bool) {
+        let (mut client, fake) = memory_client_with_hello(events.clone()).await;
+        let mut early = core.subscribe();
+        let mut opened_before_subscribed = false;
+        let opened_flag = &mut opened_before_subscribed;
+        drop(
+            pool.acquire(LinkRole::Rooms, || async move {
+                core.init_connection(account, LinkRole::Rooms, &mut client)
+                    .await?;
+                *opened_flag = std::iter::from_fn(|| early.try_recv().ok()).any(|event| {
+                    matches!(
+                        event,
+                        CoreEvent::Link {
+                            role: LinkRole::Rooms,
+                            state: LinkState::Opened,
+                            ..
+                        }
+                    )
+                });
+                Ok(client)
+            })
+            .await
+            .unwrap(),
+        );
+        (fake, opened_before_subscribed)
+    }
+
+    /// issue #79：UI 收到 `rooms` 的 `link.state: opened` 就叫 `sync.recent` 與 `room.invites`（/docs/design/rooms/room-sync.md §4）——
+    /// 所以第一次開與斷了重開，`opened` 都要在 `Event/Subscribe` 與 `Invite/Subscribe` 拿到 Ack **之後**才發；先發的話，UI 那一輪跟訂閱之間有一段沒人收。
+    #[tokio::test]
+    async fn the_rooms_line_says_opened_only_after_both_subscriptions_are_acknowledged() {
+        let dir = scratch("opened-after-subscribe");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let mut seen = core.subscribe();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let pool = core.pool_of_account(&account).unwrap();
+
+        let (fake, opened_early) = open_rooms_line(&core, &account, &pool, &events).await;
+        assert!(!opened_early, "第一次開：兩個訂閱都 Ack 了才發 opened");
+        assert_eq!(fake.subscription_ids.lock().unwrap().len(), 1);
+        assert_eq!(fake.invites.lock().unwrap().subscription_ids.len(), 1);
+        let subscription_id = fake.subscription_ids.lock().unwrap()[0];
+
+        // 訂閱會話結束 → task 關線（link.state: closed）→ 下一次開就是「重開」。
+        fake.outbound
+            .send(response(
+                Kind::Control,
+                control::ERROR,
+                subscription_id,
+                0,
+                json!({ "code": "M_UNKNOWN", "message": "gone" }),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        wait_for_async(
+            || async { !core.is_room_syncing(&account) },
+            "the task ends",
+        )
+        .await;
+
+        let (fake_again, opened_early) = open_rooms_line(&core, &account, &pool, &events).await;
+        assert!(!opened_early, "重開：一樣兩個訂閱都 Ack 了才發 opened");
+        assert_eq!(fake_again.subscription_ids.lock().unwrap().len(), 1);
+        assert_eq!(fake_again.invites.lock().unwrap().subscription_ids.len(), 1);
+
+        let rooms_states: Vec<LinkState> = std::iter::from_fn(|| seen.try_recv().ok())
+            .filter_map(|event| match event {
+                CoreEvent::Link {
+                    role: LinkRole::Rooms,
+                    state,
+                    ..
+                } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rooms_states,
+            vec![LinkState::Opened, LinkState::Closed, LinkState::Opened],
+            "UI 看得到的就是 opened／closed 兩種，🚫 第三種"
+        );
+        fake.task.abort();
+        fake_again.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Ack 之前就推來的包（server 先登記再回 Ack）跟之後的一樣：帶 `gap` 也要講一聲（PR #58 審查 salvia #656／cirno #658 🟢）。
     #[tokio::test]
     async fn a_gap_in_a_push_before_the_ack_is_reported_too() {

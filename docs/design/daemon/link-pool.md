@@ -119,6 +119,9 @@ CoreEvent::Received { user, role, kind: u8, subtype: u8, id: u64, seq: u32, rout
 
 - `Link`：開成功發 `Opened`；發現死了（下一次取用、或背景迴圈下一輪看到時）、`close`／`close_all` 發 `Closed` 帶理由。⚠️ 不是即時的——死了大約一分鐘內才被看到（心跳＋迴圈間隔，§3.1）。
   `sync.state` 那個帳號層的事件維持不變（它講的是「追平了沒」，不是哪條線）。
+  `Opened` 在開線閉包（`open_link`：hello → `init_connection`）回來之後才發，所以訂閱線的 `Opened` ＝ 訂閱都 Ack 了、從這一刻起在收。
+  ⭐ 這讓 `rooms` 的 `opened` 除了給人看，也是 UI 的動作訊號：收到就當成剛起來，再叫 `sync.recent` ＋ `room.invites`，補斷線那段丟掉的推播
+  （issue #79，維護者 2026-11-02；/docs/design/rooms/room-sync.md §3.1）。🚫 第三種狀態（`reopened` 之類）：只有 `Opened`／`Closed`，UI 起來時多叫一輪無妨。
 - `Received`：`ReceivedHook` 的那一頭。**只有標頭**（kind／subtype／id／seq／路徑），🚫 不帶 meta、🚫 不帶 data——data 可能是幾 MiB 的媒體塊或密文，
   而事件是 broadcast、每條 RPC 連線都會拿到一份。要內容的（訊息、金鑰）走**型別化**的事件（`room.message`、`keys.state` 那種）。
   這則的用途是**讓 UI 看得到線上發生了什麼**（除錯、狀態列），維護者：「rpc 發送到 UI 的 function 裡面判斷這個包要不要過去」——
