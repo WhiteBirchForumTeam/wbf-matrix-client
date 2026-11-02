@@ -183,6 +183,25 @@ pub fn push_of(event: &CoreEvent) -> Push {
             user: Some(user.clone()),
             job: None,
         },
+        // room.membership（/docs/design/rooms/room-actions.md §3.3.4）：`invite` 只在被邀請時帶，`gap` 一律帶。
+        CoreEvent::Membership {
+            user,
+            room,
+            membership,
+            invite,
+            gap,
+        } => {
+            let mut params =
+                json!({ "user": user, "room": room, "membership": membership, "gap": gap });
+            if let Some(invite) = invite {
+                insert_field(&mut params, "invite", json!(invite));
+            }
+            Push {
+                request: Request::push("room.membership", params),
+                user: Some(user.clone()),
+                job: None,
+            }
+        }
         CoreEvent::Keys {
             user,
             state,
@@ -419,6 +438,38 @@ mod tests {
         assert_eq!(
             changed.request.params,
             json!({ "user": "@a:x", "changed_user": "@b:x", "device_version": "4-0a1b2c3d4e", "rooms": { "!r:x": 9 }, "gap": false })
+        );
+        // room.membership（/docs/design/rooms/room-actions.md §3.3.4）：被邀請時帶 `invite`，其他🚫 帶；`gap` 一律帶。
+        let invited = push_of(&CoreEvent::Membership {
+            user: "@b:x".into(),
+            room: "!r:x".into(),
+            membership: wbf_sdk::chat::Membership::Invite,
+            invite: Some(wbf_sdk::chat::Invite {
+                inviter: Some("@a:x".into()),
+                is_direct: false,
+                reason: None,
+                state: None,
+                is_from_this_server: true,
+            }),
+            gap: true,
+        });
+        assert_eq!(invited.request.method, "room.membership");
+        assert_eq!(invited.user.as_deref(), Some("@b:x"));
+        assert_eq!(
+            invited.request.params,
+            json!({ "user": "@b:x", "room": "!r:x", "membership": "invite", "gap": true,
+                    "invite": { "inviter": "@a:x", "is_direct": false, "reason": null, "state": null, "is_from_this_server": true } })
+        );
+        let left = push_of(&CoreEvent::Membership {
+            user: "@b:x".into(),
+            room: "!r:x".into(),
+            membership: wbf_sdk::chat::Membership::Leave,
+            invite: None,
+            gap: false,
+        });
+        assert_eq!(
+            left.request.params,
+            json!({ "user": "@b:x", "room": "!r:x", "membership": "leave", "gap": false })
         );
         // media.download（/docs/design/media/media-download.md §5.5）：理由只在 failed 帶。
         let progress = push_of(&CoreEvent::MediaDownload {

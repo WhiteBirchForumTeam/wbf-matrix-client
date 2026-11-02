@@ -11,12 +11,14 @@
 //!
 //! 加密的事件收到時有金鑰就解（密文明文一起存），沒金鑰只存密文（維護者 2026-09-29，room_crypto.rs）；訂閱是純的，`seq` 跳號不管、`Subscribe` 不帶 `cg_seq`。
 //! `DeviceChanged` 原樣轉成 `CoreEvent::DeviceChanged` 給 UI，要不要 refresh 是 UI 的事（/docs/design/keys/e2ee-rpc.md §4）。
+//! 同一條線也訂邀請（`Invite/Subscribe`，維護者 2026-10-14：跟房間線共用、開線只訂閱，/docs/design/rooms/room-actions.md §3.3.2）：
+//! 推來的寫本地、發 `room.membership`（`invites.rs`）；補一輪是 UI 叫的 `room.invites`。server 還不認得 `Invite` 就只講一聲，房間的訂閱照跑。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use wbf_sdk::channel::Channel;
-use wbf_sdk::client::{RoomSubscription, WbfClient};
+use wbf_sdk::client::{InviteSubscription, RoomSubscription, WbfClient};
 use wbf_sdk::crypto_engine::OlmEngine;
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::protocol::{EventSubscribeReply, PushMeta};
@@ -58,6 +60,8 @@ struct RoomSyncTask {
     pool: Arc<LinkPool>,
     /// 解密用；None ＝ 引擎開不起來（講過一聲），密文照存、之後金鑰那半補解。
     engine: Option<Arc<OlmEngine>>,
+    /// 邀請推播要記在正在跑的那一輪 `room.invites` 裡（`invites.rs`）。
+    invite_rounds: Arc<crate::invites::InviteRounds>,
 }
 
 impl Core {
@@ -109,6 +113,19 @@ impl Core {
             }
         };
         let subscription = client.room_subscription(None, ACK_TIMEOUT).await?;
+        let invites = match client.invite_subscription(ACK_TIMEOUT).await {
+            Ok(invites) => Some(invites),
+            // server 拒了（還不認得 `Invite` 的舊 server）：房間的訂閱照跑、收不到邀請，講一聲。
+            // 線本身的錯（斷了、沒等到 Ack）照舊讓這條線算沒開成。
+            Err(wbf_sdk::SdkError::Server { .. }) | Err(wbf_sdk::SdkError::Protocol(_)) => {
+                self.events.progress(format!(
+                    "room sync: {} does not get invites pushed (the server refused Invite/Subscribe); room.invites still asks",
+                    account.label()
+                ));
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = RoomSyncTask {
             me,
@@ -116,9 +133,10 @@ impl Core {
             events: self.events.clone(),
             pool,
             engine,
+            invite_rounds: self.invite_rounds.clone(),
         };
         let handle = RoomSyncHandle {
-            task: tokio::spawn(task.run(subscription, stopped)),
+            task: tokio::spawn(task.run(subscription, invites, stopped)),
             stop: Some(stop),
         };
         // 舊的（線死了留下來的）在這裡被 Drop、abort。
@@ -169,6 +187,7 @@ impl RoomSyncTask {
     async fn run(
         self,
         mut subscription: RoomSubscription,
+        mut invites: Option<InviteSubscription>,
         mut stopped: tokio::sync::oneshot::Receiver<()>,
     ) {
         // Ack 之前就推來的：跟之後的一樣處理。
@@ -176,15 +195,51 @@ impl RoomSyncTask {
         for (meta, events) in early {
             self.on_push(meta, events).await;
         }
+        let early_invites: Vec<_> = invites
+            .as_mut()
+            .map(|invites| invites.early_pushes.drain(..).collect())
+            .unwrap_or_default();
+        for reply in early_invites {
+            self.on_invite(reply, false).await;
+        }
+        // 本地的邀請收件匣滿過：下一則邀請推播帶 `gap: true`（UI 只有這個訊號知道該補一輪）。
+        let mut invite_inbox_overflowed = false;
         loop {
             // 本地收件匣滿過＝丟過包：講一聲就好——補不補是 UI 的事（模組註解）。
             if subscription.take_gap() {
                 self.events
                     .progress("room sync: the subscription inbox overflowed; some pushes were dropped (sync.recent refetches them)");
             }
+            invite_inbox_overflowed |= invites.as_ref().is_some_and(InviteSubscription::take_gap);
+            let next_invite = async {
+                match invites.as_mut() {
+                    Some(invites) => invites.next(PUSH_IDLE_TIMEOUT).await,
+                    None => std::future::pending().await,
+                }
+            };
             let next = tokio::select! {
                 _ = &mut stopped => return,
                 next = subscription.next(PUSH_IDLE_TIMEOUT) => next,
+                invite = next_invite => {
+                    match invite {
+                        Ok(Some(reply)) => {
+                            self.on_invite(reply, std::mem::take(&mut invite_inbox_overflowed)).await;
+                            continue;
+                        }
+                        Err(wbf_sdk::SdkError::Timeout(_)) => continue,
+                        // 一包壞了就是漏一包：下一則帶 `gap`，繼續收。
+                        Err(wbf_sdk::SdkError::Protocol(why)) => {
+                            self.events.progress(format!(
+                                "room sync: an invite push could not be read and is dropped ({why}); room.invites refetches it"
+                            ));
+                            invite_inbox_overflowed = true;
+                            continue;
+                        }
+                        // 邀請的訂閱結束了：跟房間的一樣關線，重開時兩個一起重訂。
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                }
             };
             // 訂閱還活著的那幾種都 `continue`；走到下面的只有「訂閱結束了」，帶著原因。
             let why = match next {
@@ -230,6 +285,20 @@ impl RoomSyncTask {
             }
             return;
         }
+    }
+
+    /// 一則邀請推播：交給 `invites.rs`（記「這一輪碰過」→ 寫本地 → 發 `room.membership`）。
+    /// `local_gap` ＝ 本地在這之前丟過邀請推播（收件匣滿、壞包）：併進 server 的 `gap` 一起給 UI。
+    async fn on_invite(&self, reply: wbf_sdk::protocol::InviteSubscribeReply, local_gap: bool) {
+        crate::invites::record_invite_push(
+            &self.me,
+            &self.cache,
+            &self.events,
+            &self.invite_rounds,
+            reply,
+            local_gap,
+        )
+        .await;
     }
 
     /// 一包（Ack 之前推來的也走這裡）：`gap` 只講一聲；寫進 cache（照房分組；加密的有金鑰就解）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。

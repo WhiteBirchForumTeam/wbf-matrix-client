@@ -113,6 +113,65 @@ pub struct RoomListEntry {
     pub membership: Membership,
     /// 這一間的樣子是什麼時候拿的（Unix 毫秒）。
     pub refreshed_at: Option<u64>,
+    /// `membership` 是 `invite` 的列才有：邀請的內容（推播與 `room.invites` 寫進本地的，/docs/design/rooms/room-actions.md §3.3.4）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<Invite>,
+}
+
+/// 一則待處理的邀請給 UI 的樣子（/docs/design/rooms/room-actions.md §3.3.4）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invite {
+    /// 邀請者；這包東西裡**唯一**有協定綁定的欄位（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5.2）。
+    pub inviter: Option<String>,
+    pub is_direct: bool,
+    pub reason: Option<String>,
+    /// 縮減狀態原樣（`m.room.create`、`m.room.name`、…、被邀請者自己的 `m.room.member`）。
+    /// None ＝ server 因為太大沒送、本地也沒有之前拿到的（server §5.3）。
+    pub state: Option<Vec<serde_json::Value>>,
+    /// 🚨 `inviter` 的網域跟這個帳號的網域逐字相同才是 true（daemon 算的，維護者 2026-10-14）。
+    /// false 時 `state` 裡的房名、頭像、topic 都是對方 server 說的、沒有人驗過（server §5.2.3），🚫 當成已驗證的事實顯示。
+    pub is_from_this_server: bool,
+}
+
+impl Invite {
+    /// Args:
+    ///     invite: 線上來的那則（`state` 已經換成要給的那份）
+    ///     me: 這個帳號, example: "@bob:localhost"
+    pub fn from_item(invite: crate::protocol::InviteItem, me: &str) -> Invite {
+        Invite {
+            is_from_this_server: is_from_same_server(invite.inviter.as_deref(), me),
+            inviter: invite.inviter,
+            is_direct: invite.is_direct,
+            reason: invite.reason,
+            state: invite.state,
+        }
+    }
+}
+
+/// `room.invites` 回的一間：房間 id 加上 [`Invite`] 的欄位。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomInvite {
+    pub room: String,
+    #[serde(flatten)]
+    pub invite: Invite,
+}
+
+/// Args:
+///     inviter: example: Some("@alice:localhost")
+///     me: example: "@bob:localhost"
+/// Return:
+///     bool  兩個 mxid 的網域（第一個 `:` 之後）都解得出來、不是空的、而且逐字相同才是 true；沒有 `inviter`、解不出來都是 false（fail closed）
+pub fn is_from_same_server(inviter: Option<&str>, me: &str) -> bool {
+    let server_of = |mxid: &str| {
+        mxid.strip_prefix('@')
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(_, server)| server.to_string())
+            .filter(|server| !server.is_empty())
+    };
+    match (inviter.and_then(server_of), server_of(me)) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => false,
+    }
 }
 
 impl RoomListEntry {
@@ -135,6 +194,7 @@ impl RoomListEntry {
             state: None,
             membership,
             refreshed_at: None,
+            invite: None,
         }
     }
 
@@ -160,6 +220,7 @@ impl RoomListEntry {
             state: conversation.state,
             membership,
             refreshed_at,
+            invite: None,
         }
     }
 }

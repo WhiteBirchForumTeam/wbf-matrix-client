@@ -117,6 +117,53 @@ impl RoomSubscription {
     }
 }
 
+/// `invite_subscription` 的結果：Ack 的內容＋長活的訂閱（/docs/design/rooms/room-actions.md §3.3）。
+pub struct InviteSubscription {
+    pub ack: protocol::InviteSubscribeAck,
+    /// Ack 到之前就推來的（server 先登記再回 Ack，中間有新邀請就會這樣），已經解好。
+    pub early_pushes: Vec<protocol::InviteSubscribeReply>,
+    subscription: Subscription,
+    /// 送出去的那個 `Subscribe`：之後每個 pack 都拿它驗 id／seq。
+    request: Pack,
+}
+
+impl InviteSubscription {
+    /// 下一個推來的東西，已經解過。
+    ///
+    /// Return:
+    ///     Ok(Some(reply))   `Push`／`Gone`／退訂的 Ack
+    ///     Ok(None)          訂閱結束了（server 送了 `Error`）
+    ///     Err(Timeout)      連線活著、這段時間沒推
+    ///     Err(Network)      連線沒了
+    ///     Err(Protocol)     形狀不對（🚫 不吞：一包壞了就是漏一包，UI 用 `room.invites` 補一輪）
+    pub async fn next(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<protocol::InviteSubscribeReply>, SdkError> {
+        match self.subscription.next(timeout).await? {
+            Some(pack) => Ok(Some(protocol::parse_invite_subscribe_reply(
+                &self.request,
+                &pack,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 讀一次就清掉：true ＝ 收件匣滿過、丟過推播——跟 server 的 `gap` 一樣，補一輪。
+    pub fn take_gap(&self) -> bool {
+        self.subscription.take_gap()
+    }
+}
+
+/// `Invite/Fetch` 一輪補完的結果（`r == 0`）：請求當下所有待處理的邀請，舊→新。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InviteRound {
+    /// 這一輪總共幾間（server 計畫給的；中途結束的被跳過，所以 `items` 可以比它少）。
+    pub tc: u32,
+    /// `(count, 邀請)`，舊→新。
+    pub items: Vec<(u64, protocol::InviteItem)>,
+}
+
 /// `Recent` 一窗的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecentWindow {
@@ -780,6 +827,121 @@ impl<C: PackChannel> WbfClient<C> {
                 }
             }
         }
+    }
+
+    /// `Invite/Subscribe` 然後**一直收**（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5）：等到 `Ack` 才回，之後的 `Push`／`Gone` 從 handle 來。
+    /// 一條連線一個（server 照連線登記）；補一輪是 [`WbfClient::invite_fetch_round`]，🚫 在這裡做（/docs/design/rooms/room-actions.md §3.3.2）。
+    ///
+    /// Args:
+    ///     per_pack_timeout: 等 Ack 最久多久, example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(InviteSubscription)  訂到了
+    ///     Err(Server)             server 拒（`Unsupported`：走 HTTP、或 server 還不認得這個 kind）
+    ///     Err(Usage)              通道不能長活收
+    ///     Err(Protocol)           會話在 Ack 之前就結束
+    pub async fn invite_subscription(
+        &mut self,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<InviteSubscription, SdkError> {
+        let seq = self.allocate_seq();
+        let request = protocol::invite_subscribe(self.next_session_id(), seq);
+        let mut subscription = self.channel.subscribe(request.clone()).await?;
+        let mut early_pushes = Vec::new();
+        loop {
+            let Some(reply) = subscription.next(per_pack_timeout).await? else {
+                return Err(SdkError::Protocol(
+                    "Invite/Subscribe session ended before the Ack".into(),
+                ));
+            };
+            match protocol::parse_invite_subscribe_reply(&request, &reply)? {
+                protocol::InviteSubscribeReply::Acknowledged(ack) => {
+                    return Ok(InviteSubscription {
+                        ack,
+                        early_pushes,
+                        subscription,
+                        request,
+                    });
+                }
+                // Ack 之前不該有退訂的 Ack；有就跳過。
+                protocol::InviteSubscribeReply::Unsubscribed { .. } => {}
+                pushed => early_pushes.push(pushed),
+            }
+        }
+    }
+
+    /// `Invite/Fetch` 一整輪：一直收到 `r == 0` 才回（server §3.3：補到一半的不是快照）。🚫 帶 `ci_seq`：一支 RPC 就是新的一輪。
+    ///
+    /// Args:
+    ///     per_pack_timeout: 每個 Batch 之間最多等多久, example: Duration::from_secs(30)
+    /// Return:
+    ///     Ok(InviteRound)  這一輪的完整快照（可能是空的）
+    ///     Err(Server)      `Unsupported`（走 HTTP、server 不認得）等
+    ///     Err(Protocol)    Batch 形狀錯、`tc` 前後不一、`已收 + r > tc`、`r` 變大、跨 Batch 的 count 沒有往前、沒收到 `r = 0` 就結束
+    pub async fn invite_fetch_round(
+        &mut self,
+        per_pack_timeout: std::time::Duration,
+    ) -> Result<InviteRound, SdkError> {
+        let seq = self.allocate_seq();
+        let pack = protocol::invite_fetch(
+            &protocol::InviteFetchRequest::default(),
+            self.next_session_id(),
+            seq,
+        )?;
+        let mut round = InviteRound::default();
+        let mut expected_seq = 0u32;
+        let mut received = 0u32;
+        let mut previous_r: Option<u32> = None;
+        let mut newest: Option<u64> = None;
+        let mut finished = false;
+        let mut on_pack = |response: Pack| -> Result<bool, SdkError> {
+            let batch = protocol::expect_invite_batch(&pack, response, expected_seq)?;
+            let (meta, items) = protocol::parse_invite_batch(&batch)?;
+            if expected_seq == 0 {
+                round.tc = meta.tc;
+            } else if meta.tc != round.tc {
+                return Err(SdkError::Protocol(format!(
+                    "Invite/Batch {expected_seq} says tc {} but the round started with tc {}",
+                    meta.tc, round.tc
+                )));
+            }
+            received = received.saturating_add(meta.bc);
+            // 中途結束的被跳過、但照算進 `r`：收到的加剩下的只會 ≤ tc（模組那段註解）。
+            if received.saturating_add(meta.r) > round.tc {
+                return Err(SdkError::Protocol(format!(
+                    "Invite/Batch {expected_seq}: received {received} + r {} > tc {}",
+                    meta.r, round.tc
+                )));
+            }
+            if previous_r.is_some_and(|previous| meta.r > previous) {
+                return Err(SdkError::Protocol(format!(
+                    "Invite/Batch {expected_seq}: r went up from {previous_r:?} to {}",
+                    meta.r
+                )));
+            }
+            previous_r = Some(meta.r);
+            if let (Some(os), Some(ns)) = (meta.os, meta.ns) {
+                // 舊→新：跨 Batch 也要嚴格往前。空的那批沒有 `os`／`ns`，🚫 動 `newest`。
+                if newest.is_some_and(|previous| previous >= os) {
+                    return Err(SdkError::Protocol(format!(
+                        "Invite/Batch {expected_seq} starts at {os} but the previous batch ended at {newest:?}"
+                    )));
+                }
+                newest = Some(ns);
+            }
+            round.items.extend(items);
+            expected_seq += 1;
+            finished = meta.r == 0;
+            Ok(!finished)
+        };
+        self.channel
+            .request_stream(pack.clone(), per_pack_timeout, &mut on_pack)
+            .await?;
+        if !finished {
+            return Err(SdkError::Protocol(
+                "the channel ended the Invite/Fetch round before a Batch with r = 0".into(),
+            ));
+        }
+        Ok(round)
     }
 
     /// `Device/Unsubscribe`：下線前說出口的退出——解除這條連線對裝置佇列的持有（/docs/design/keys/to-device-client.md §4）。沒訂也是 no-op。

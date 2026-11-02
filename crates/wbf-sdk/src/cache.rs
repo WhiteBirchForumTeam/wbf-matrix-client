@@ -35,7 +35,8 @@ pub const CACHE_FILE_NAME: &str = "cache.db";
 /// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、🚫 刪列，維護者 2026-10-05）。
 /// v9：`media.kind`、`media.verified`；`file_size`、`chunk_size` 只有 `kind` 1 一定有（維護者 2026-10-06，/docs/design/media/media-download.md §12）。
 /// v10：`room_list.joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，維護者 2026-10-07，/docs/design/rooms/room-actions.md §3）；`room_list.is_state_carried_over`（`state` 是上次留下來的）。
-const SCHEMA_VERSION: i64 = 10;
+/// v11：`room_list.invite_json`（被邀請的那一列的邀請內容，維護者 2026-10-14，/docs/design/rooms/room-actions.md §3.3.3）。
+const SCHEMA_VERSION: i64 = 11;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +172,88 @@ impl MediaDescription {
             chunk_size: None,
         }
     }
+}
+
+/// 一輪邀請補完之後變了的一列（[`Cache::apply_invite_round`]）：給 `room.membership` 推播。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteChange {
+    pub room_id: String,
+    pub membership: Membership,
+    /// `membership` 是 `invite` 時，寫進去的那份
+    pub invite: Option<crate::protocol::InviteItem>,
+}
+
+/// `room_list.invite_json` 的內容：線上那則去掉 `room_id`（列已經是那間房）。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StoredInvite {
+    inviter: Option<String>,
+    is_direct: bool,
+    reason: Option<String>,
+    state: Option<Vec<serde_json::Value>>,
+}
+
+/// [`write_invite`] 寫了什麼。
+struct WrittenInvite {
+    invite: crate::protocol::InviteItem,
+    /// 跟原本那一列比，身分或內容有沒有變
+    changed: bool,
+}
+
+/// 寫一則邀請進那一列（[`Cache::record_invite`] 與 [`Cache::apply_invite_round`] 共用，規則只有一份）：
+/// `membership = invite`、`invite_json` 換成這則；這則沒帶 `state` 就留著原本那份。
+///
+/// Return:
+///     Ok(WrittenInvite)  寫進去的那份，以及有沒有變
+fn write_invite(
+    transaction: &rusqlite::Transaction<'_>,
+    user_id: &str,
+    invite: &crate::protocol::InviteItem,
+) -> Result<WrittenInvite, SdkError> {
+    let user = user_row_id(transaction, user_id)?;
+    let room = room_row_id(transaction, &invite.room_id)?;
+    let before: Option<(String, Option<String>)> = transaction
+        .query_row(
+            "SELECT membership, invite_json FROM room_list WHERE user = ?1 AND room = ?2",
+            params![user, room],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let stored_before = before
+        .as_ref()
+        .and_then(|(_, json)| json.as_deref())
+        .and_then(|json| serde_json::from_str::<StoredInvite>(json).ok());
+    let stored = StoredInvite {
+        inviter: invite.inviter.clone(),
+        is_direct: invite.is_direct,
+        reason: invite.reason.clone(),
+        state: invite.state.clone().or_else(|| {
+            stored_before
+                .as_ref()
+                .and_then(|stored| stored.state.clone())
+        }),
+    };
+    let changed = !matches!(&before, Some((membership, _)) if membership == Membership::Invite.as_str())
+        || stored_before.as_ref() != Some(&stored);
+    let json = serde_json::to_string(&stored)
+        .map_err(|error| crate::error::cannot_serialize("StoredInvite", error))?;
+    transaction
+        .execute(
+            "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership, invite_json) VALUES (?1, ?2, NULL, NULL, 'invite', ?3)
+             ON CONFLICT(user, room) DO UPDATE SET membership = 'invite', invite_json = excluded.invite_json",
+            params![room, user, json],
+        )
+        .map_err(db_error)?;
+    Ok(WrittenInvite {
+        invite: crate::protocol::InviteItem {
+            room_id: invite.room_id.clone(),
+            inviter: stored.inviter,
+            is_direct: stored.is_direct,
+            reason: stored.reason,
+            state: stored.state,
+        },
+        changed,
+    })
 }
 
 /// `forget_account` 的結果：清了什麼、哪些池檔已經沒人指、可以刪。
@@ -340,7 +423,7 @@ impl Cache {
             let mut insert = transaction
                 .prepare_cached(
                     "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership) VALUES (?1, ?2, NULL, NULL, 'join')
-                     ON CONFLICT(user, room) DO UPDATE SET membership = 'join'",
+                     ON CONFLICT(user, room) DO UPDATE SET membership = 'join', invite_json = NULL",
                 )
                 .map_err(db_error)?;
             for room_id in room_ids {
@@ -397,7 +480,7 @@ impl Cache {
             .map(Option::flatten)
     }
 
-    /// 這個帳號在這幾種身分裡的房，本地知道多少給多少（`room.list`；預設只問 `join`）。
+    /// 這個帳號在這幾種身分裡的房，本地知道多少給多少（`room.list`；預設只問 `join`）。被邀請的列帶 `invite`（`is_from_this_server` 拿 `user_id` 算）。
     ///
     /// Args:
     ///     memberships: 要哪幾種；空的就是一個都不要, example: &[Membership::Join]
@@ -412,7 +495,7 @@ impl Cache {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT r.room_id, l.conversation_json, l.refreshed_at, r.encrypted, l.membership FROM room_list l
+                "SELECT r.room_id, l.conversation_json, l.refreshed_at, r.encrypted, l.membership, l.invite_json FROM room_list l
                    JOIN users u ON u.id = l.user JOIN rooms r ON r.id = l.room
                  WHERE u.mxid = ?1",
             )
@@ -425,12 +508,13 @@ impl Cache {
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<bool>>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(db_error)?;
         let mut entries: Vec<RoomListEntry> = Vec::new();
         for row in rows {
-            let (room_id, json, refreshed_at, room_is_encrypted, membership) =
+            let (room_id, json, refreshed_at, room_is_encrypted, membership, invite_json) =
                 row.map_err(db_error)?;
             // CHECK 擋著不認得的字；真的讀到了就當壞資料跳過（🚫 猜成哪一種）。
             let Some(membership) = Membership::find_by_name(&membership) else {
@@ -449,6 +533,22 @@ impl Cache {
                 None => RoomListEntry::unknown(&room_id, membership),
             };
             entry.encrypted = known_encryption(entry.encrypted, room_is_encrypted);
+            // 只有還是 `invite` 的列帶；解不開當沒有（壞資料當沒有，/docs/design/storage/local-cache-db.md §1）。
+            entry.invite = invite_json
+                .filter(|_| membership == Membership::Invite)
+                .and_then(|json| serde_json::from_str::<StoredInvite>(&json).ok())
+                .map(|stored| {
+                    crate::chat::Invite::from_item(
+                        crate::protocol::InviteItem {
+                            room_id: room_id.clone(),
+                            inviter: stored.inviter,
+                            is_direct: stored.is_direct,
+                            reason: stored.reason,
+                            state: stored.state,
+                        },
+                        user_id,
+                    )
+                });
             entries.push(entry);
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
@@ -516,7 +616,8 @@ impl Cache {
         transaction.commit().map_err(db_error)
     }
 
-    /// 房間動作收到 server 的 ACK 之後（`sync=both`），記這個帳號在這間房的身分（/docs/design/rooms/room-actions.md §3）。列不在就加一列（樣子是 NULL，等 `room.get`）。
+    /// 房間動作收到 server 的 ACK 之後（`sync=both`）、或邀請的 `Gone`，記這個帳號在這間房的身分（/docs/design/rooms/room-actions.md §3）。列不在就加一列（樣子是 NULL，等 `room.get`）。
+    /// 不是 `invite` 就把 `invite_json` 清掉（那份邀請已經不成立）；寫 `invite` 的內容走 [`Cache::record_invite`]。
     ///
     /// Args:
     ///     user_id: 身分變了的那個帳號（本機登入的）, example: "@bob:localhost"
@@ -540,19 +641,117 @@ impl Cache {
             None => transaction
                 .execute(
                     "INSERT INTO room_list (room, user, conversation_json, refreshed_at, membership) VALUES (?1, ?2, NULL, NULL, ?3)
-                     ON CONFLICT(user, room) DO UPDATE SET membership = excluded.membership",
+                     ON CONFLICT(user, room) DO UPDATE SET membership = excluded.membership,
+                       invite_json = CASE WHEN excluded.membership = 'invite' THEN invite_json ELSE NULL END",
                     params![room, user, membership.as_str()],
                 )
                 .map_err(db_error)?,
             Some(now) => transaction
                 .execute(
-                    "UPDATE room_list SET membership = ?3 WHERE room = ?1 AND user = ?2 AND membership = ?4",
+                    "UPDATE room_list SET membership = ?3, invite_json = CASE WHEN ?3 = 'invite' THEN invite_json ELSE NULL END
+                     WHERE room = ?1 AND user = ?2 AND membership = ?4",
                     params![room, user, membership.as_str(), now.as_str()],
                 )
                 .map_err(db_error)?,
         };
         transaction.commit().map_err(db_error)?;
         Ok(written > 0)
+    }
+
+    /// 被邀請了（`Invite/Push`，或一輪 `Fetch` 的一筆經過 [`Cache::apply_invite_round`]）：那一列 `membership = invite`、`invite_json` 換成這則（列不在就加）。
+    /// 這則沒帶 `state`（太大 server 沒送）就留著本地原本那份（🚫 拿「這次沒送」蓋掉「之前拿到的」，/docs/design/rooms/room-actions.md §3.3.3）。
+    ///
+    /// Args:
+    ///     user_id: 被邀請的帳號, example: "@bob:localhost"
+    ///     invite: 線上來的那則, example: InviteItem { room_id: "!r:localhost".into(), inviter: Some("@alice:localhost".into()), is_direct: false, reason: None, state: Some(vec![]) }
+    /// Return:
+    ///     Ok(InviteItem)  寫進去的那份（`state` 是補過的）
+    pub fn record_invite(
+        &mut self,
+        user_id: &str,
+        invite: &crate::protocol::InviteItem,
+    ) -> Result<crate::protocol::InviteItem, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let written = write_invite(&transaction, user_id, invite)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(written.invite)
+    }
+
+    /// 一輪 `Fetch` 補完了（`r == 0`）：照 /docs/design/rooms/room-actions.md §3.3.3 寫一份完整快照，**一個 transaction**。
+    /// - 快照裡的每一間：這一輪被推播碰過、而且推播的 `is` ≥ 這筆的 count → 🚫 寫（推播比較新）；否則照 [`Cache::record_invite`] 寫。
+    /// - 本地是 `invite`、快照裡沒有、這一輪也沒被碰過的 → `membership` 改成 `departed` 說的（沒說就是 `leave`）、`invite_json` 清掉。
+    ///
+    /// Args:
+    ///     user_id: example: "@bob:localhost"
+    ///     round: `(count, 邀請)`；沒有 count 的來源（一般 Matrix 帳號）給 0, example: &[(7, invite)]
+    ///     touched: 這一輪開始之後被 `Push`／`Gone` 碰過的房 → 它的 `is`, example: &HashMap::from([("!r:localhost".to_string(), 9)])
+    ///     departed: 不在快照裡的房現在是什麼身分（知道的才給：matrix-sdk 的 store）, example: &HashMap::new()
+    /// Return:
+    ///     Ok(Vec<InviteChange>)  有變的那幾列（給 `room.membership` 推播）
+    pub fn apply_invite_round(
+        &mut self,
+        user_id: &str,
+        round: &[(u64, crate::protocol::InviteItem)],
+        touched: &std::collections::HashMap<String, u64>,
+        departed: &std::collections::HashMap<String, Membership>,
+    ) -> Result<Vec<InviteChange>, SdkError> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        let user = user_row_id(&transaction, user_id)?;
+        let mut changes = Vec::new();
+        let mut in_round = std::collections::HashSet::new();
+        for (count, invite) in round {
+            in_round.insert(invite.room_id.clone());
+            if touched
+                .get(&invite.room_id)
+                .is_some_and(|pushed| pushed >= count)
+            {
+                continue;
+            }
+            let written = write_invite(&transaction, user_id, invite)?;
+            if written.changed {
+                changes.push(InviteChange {
+                    room_id: invite.room_id.clone(),
+                    membership: Membership::Invite,
+                    invite: Some(written.invite),
+                });
+            }
+        }
+        let still_invited: Vec<String> = {
+            let mut statement = transaction
+                .prepare_cached(
+                    "SELECT r.room_id FROM room_list l JOIN rooms r ON r.id = l.room
+                     WHERE l.user = ?1 AND l.membership = 'invite'",
+                )
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map(params![user], |row| row.get::<_, String>(0))
+                .map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)?
+        };
+        for room_id in still_invited {
+            if in_round.contains(&room_id) || touched.contains_key(&room_id) {
+                continue;
+            }
+            let membership = departed
+                .get(&room_id)
+                .copied()
+                .filter(|membership| *membership != Membership::Invite)
+                .unwrap_or(Membership::Leave);
+            let room = room_row_id(&transaction, &room_id)?;
+            transaction
+                .execute(
+                    "UPDATE room_list SET membership = ?3, invite_json = NULL WHERE user = ?1 AND room = ?2",
+                    params![user, room, membership.as_str()],
+                )
+                .map_err(db_error)?;
+            changes.push(InviteChange {
+                room_id,
+                membership,
+                invite: None,
+            });
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(changes)
     }
 
     /// 自己剛寫了一項房間狀態（`room.set_state` 與它的窄版收到 ACK、`sync=both`，/docs/design/rooms/room-actions.md §3）：
@@ -2728,6 +2927,7 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                conversation_json TEXT, refreshed_at INTEGER,
                membership TEXT NOT NULL DEFAULT 'join' CHECK (membership IN ('join', 'invite', 'knock', 'leave', 'ban')),
                is_state_carried_over INTEGER NOT NULL DEFAULT 0 CHECK (is_state_carried_over IN (0, 1)),
+               invite_json TEXT,
                PRIMARY KEY (user, room)) WITHOUT ROWID;
              CREATE TABLE sync_state (
                user INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -3223,6 +3423,162 @@ mod tests {
             .unwrap());
         assert_eq!(ids_in(&cache, &[Membership::Leave]), ["!a", "!b"]);
         assert_eq!(cache.count_rows("room_list").unwrap(), 4, "!never 🚫 加列");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn invite(
+        room_id: &str,
+        inviter: &str,
+        state: Option<Vec<serde_json::Value>>,
+    ) -> crate::protocol::InviteItem {
+        crate::protocol::InviteItem {
+            room_id: room_id.into(),
+            inviter: Some(inviter.into()),
+            is_direct: false,
+            reason: None,
+            state,
+        }
+    }
+
+    fn bob_ids_in(cache: &Cache, memberships: &[Membership]) -> Vec<String> {
+        let mut ids: Vec<String> = cache
+            .list_room_entries(BOB, memberships)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn invite_of(cache: &Cache, room_id: &str) -> Option<crate::chat::Invite> {
+        cache
+            .list_room_entries(BOB, &[Membership::Invite])
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == room_id)
+            .and_then(|entry| entry.invite)
+    }
+
+    /// 邀請寫進那一列（/docs/design/rooms/room-actions.md §3.3.3）：`room.list` 帶得出來、`is_from_this_server` 照網域算；
+    /// 沒帶 state 的推播留著原本那份；離開 `invite` 就清掉；一般的列不帶 `invite`。
+    #[test]
+    fn an_invite_is_kept_on_its_row_until_the_membership_moves_on() {
+        let (mut cache, dir) = open("invites");
+        let named = vec![
+            serde_json::json!({ "type": "m.room.name", "state_key": "", "content": { "name": "ops" } }),
+        ];
+        cache
+            .record_invite(BOB, &invite("!r", ALICE, Some(named.clone())))
+            .unwrap();
+        let kept = invite_of(&cache, "!r").unwrap();
+        assert_eq!(kept.state, Some(named.clone()));
+        assert!(kept.is_from_this_server, "{ALICE} 跟 {BOB} 同一台");
+        // 太大沒送（state None）：留著之前那份，寫回去的也是補過的
+        let written = cache
+            .record_invite(BOB, &invite("!r", ALICE, None))
+            .unwrap();
+        assert_eq!(written.state, Some(named.clone()));
+        assert_eq!(invite_of(&cache, "!r").unwrap().state, Some(named));
+        // 別台的邀請者：🚫 本站說的
+        cache
+            .record_invite(BOB, &invite("!far", "@carol:elsewhere.example", None))
+            .unwrap();
+        let far = invite_of(&cache, "!far").unwrap();
+        assert!(!far.is_from_this_server);
+        assert_eq!(far.state, None, "從沒拿過狀態");
+        // 接受了：身分換掉、邀請的內容清掉；之後再被邀請（拒絕後重邀）又是新的一份
+        cache
+            .record_membership(BOB, "!r", Membership::Join, None)
+            .unwrap();
+        assert_eq!(invite_of(&cache, "!r"), None);
+        let joined = cache.list_room_entries(BOB, &[Membership::Join]).unwrap();
+        assert_eq!(joined[0].invite, None);
+        cache
+            .record_invite(BOB, &invite("!r", ALICE, None))
+            .unwrap();
+        assert_eq!(
+            invite_of(&cache, "!r").unwrap().state,
+            None,
+            "接受時已經清掉，🚫 撿回舊的"
+        );
+        // 加入名單把它標回 join 也清
+        cache.record_joined_rooms(BOB, &["!r".to_string()]).unwrap();
+        assert_eq!(invite_of(&cache, "!r"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一輪補完（/docs/design/rooms/room-actions.md §3.3.3、server 的 /docs/design/events/invites-on-the-wire.md §8 ②②'）：
+    /// 快照裡的寫、被比較新的推播碰過的🚫 寫；快照裡沒有的：沒被碰過才改掉（`departed` 說的，沒說是 `leave`），碰過的留著。
+    #[test]
+    fn a_completed_invite_round_replaces_the_list_except_what_newer_pushes_touched() {
+        let (mut cache, dir) = open("invite-round");
+        for room in [
+            "!kept",
+            "!withdrawn",
+            "!pushed-later",
+            "!banned",
+            "!older-push",
+        ] {
+            cache
+                .record_invite(BOB, &invite(room, ALICE, None))
+                .unwrap();
+        }
+        let fresh = vec![
+            serde_json::json!({ "type": "m.room.name", "state_key": "", "content": { "name": "new" } }),
+        ];
+        let round = vec![
+            (5, invite("!kept", ALICE, Some(fresh.clone()))),
+            (6, invite("!new", ALICE, None)),
+            // 推播在這一輪裡已經說它結束了（is 9 ≥ 7）：🚫 讓快照把它寫回來
+            (7, invite("!older-push", ALICE, Some(fresh.clone()))),
+            (8, invite("!gone-mid-round", ALICE, None)),
+        ];
+        let touched = std::collections::HashMap::from([
+            ("!pushed-later".to_string(), 12),
+            ("!older-push".to_string(), 9),
+            // 推播比快照舊（4 < 8）：照快照寫
+            ("!gone-mid-round".to_string(), 4),
+        ]);
+        let departed = std::collections::HashMap::from([("!banned".to_string(), Membership::Ban)]);
+        cache
+            .record_membership(BOB, "!gone-mid-round", Membership::Leave, None)
+            .unwrap();
+        let changes = cache
+            .apply_invite_round(BOB, &round, &touched, &departed)
+            .unwrap();
+        let mut changed: Vec<(&str, Membership)> = changes
+            .iter()
+            .map(|change| (change.room_id.as_str(), change.membership))
+            .collect();
+        changed.sort_by(|left, right| left.0.cmp(right.0));
+        assert_eq!(
+            changed,
+            [
+                ("!banned", Membership::Ban),
+                ("!gone-mid-round", Membership::Invite),
+                ("!kept", Membership::Invite),
+                ("!new", Membership::Invite),
+                ("!withdrawn", Membership::Leave),
+            ]
+        );
+        assert_eq!(invite_of(&cache, "!kept").unwrap().state, Some(fresh));
+        assert!(
+            invite_of(&cache, "!pushed-later").is_some(),
+            "推播碰過的🚫 刪"
+        );
+        assert_eq!(
+            invite_of(&cache, "!older-push").unwrap().state,
+            None,
+            "比較新的推播贏，快照那份🚫 寫"
+        );
+        assert_eq!(bob_ids_in(&cache, &[Membership::Leave]), ["!withdrawn"]);
+        assert_eq!(bob_ids_in(&cache, &[Membership::Ban]), ["!banned"]);
+        // 同一份再來一次：什麼都沒變就什麼都不推
+        let again = cache
+            .apply_invite_round(BOB, &round, &touched, &departed)
+            .unwrap();
+        assert!(again.is_empty(), "{again:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

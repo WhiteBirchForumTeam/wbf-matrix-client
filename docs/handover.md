@@ -20,6 +20,7 @@ PR #1–#75 合併（main `0a06559`，2026-10-07）；分支 `feat/room-actions`
   訊息的 edit／redact 照 `/docs/design/messages/edits-and-redactions.md` 存。
   房間動作（建房、加入、退出、忘記、邀請、踢人、封鎖、狀態讀寫、權限合併、置頂、標籤、`m.direct`）：daemon 是中轉站、參數與結果照 Matrix，一張端點表兩條路（wbf 帳號走橋、一般 Matrix 帳號走同一個 HTTP 端點），
   本地每個帳號記自己的 `membership`、收到 ACK 才寫、寫不進去推 `note`；`room.get` 帶整份狀態（`/docs/design/rooms/room-actions.md`）。對真 server 驗過（兩個帳號同一個 daemon）。
+  收邀請（`/docs/design/rooms/room-actions.md` §3.3）：房間線開線多訂 `Invite`、推來的寫本地並推 `room.membership`；主動補一輪是 UI 叫的 `room.invites`；`room.list` 的被邀請列帶 `invite`（含 `is_from_this_server`）。
 - **E2EE（wbf 帳號）**：金鑰線追平與匯入、佇列頭就是水位（`/docs/design/keys/key-sync.md`）；狀態放 UI、金鑰由 daemon 自動（只在金鑰線的後台建、換、送；送訊息只用全部 Ack 的那把，等不到回 1402）、1506 之後 daemon 重拿再回 1401（`/docs/design/keys/e2ee-rpc.md`）。
   加密房的**文字**收發對真 server 驗過（bob 登新裝置、舊版本號被擋、重送後新舊裝置都解得開）。
   房間自設的換金鑰期限（`m.room.encryption` 的 `rotation_period_*`）照做；`room.history` 讀到未解的再試一次；路徑版 `room.send_file` 與 CLI 的 `send` 都進得了加密房。
@@ -31,7 +32,7 @@ PR #1–#75 合併（main `0a06559`，2026-10-07）；分支 `feat/room-actions`
   同一個 mxc 本地的 `media` 列說了算：描述不合一律 1500、🚫 換掉列；只給 `mxc` 照列挑事件、從訊息點下載由那則建列；`media.delete_local` 清本地（先取消正在下載的）（`/docs/design/media/media-download.md` §5.3、§7.4，維護者 2026-10-07）。
   一個檔同時只有一個下載：同 server 的別的帳號再要就掛上去，進度與結果每個要過的帳號各推一則；`media.cancel` 誰叫都停（同一份 §5.1、§5.4、§5.5）。
 
-**還沒有**：UI；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；交叉簽章；收邀請（被別人邀，等 wbfuwunel #111）；訊息動作（回覆、編輯、收回、表情）；
+**還沒有**：UI；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；交叉簽章；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；訊息動作（回覆、編輯、收回、表情）；
 已讀（`/docs/design/messages/read-receipts.md` 是草案）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 📎 補解寫失敗那批的重試觸發點、CLI 送加密房：2026-10-07 照 §7 第 1 項的預設做了（`/docs/design/keys/e2ee-rpc.md` §3、§6），維護者可以在審查時改。
@@ -254,8 +255,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
 | **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 沒排（§7「之後」） | 新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；補解寫失敗那批要等 `room.history`／`sync.recent` 讀到才再試 |
-| 收不到別人的邀請（wbf 帳號） | 等 wbfuwunel #111（訂閱線推邀請、補拿待處理的邀請）；維護者 2026-10-07：推播語意先不做，server 完成後補（/docs/design/rooms/room-actions.md §3.3 是那一支的形狀） | 本地的 `invite` 只有「本機帳號邀本機帳號」寫得出來；別人邀的 UI 看不到（暫時可用 `room.summary` 問房名） |
-| 分房間金鑰沒算被邀請的人 | 等維護者定（/docs/design/rooms/room-actions.md §6）；要改的話是另一支 E2EE 的 PR＋server 的房間版本號一起改 | 歷史可見性是 `shared`／`invited` 的房，被邀請期間的密文那個人加入後解不開 |
+| 一般 Matrix 帳號沒有即時推播 | 沒有常駐的同步迴圈（只有要用時的 `sync_once`，/docs/design/rooms/room-actions.md §3.3.5）；要做是另一支 | 訊息與邀請都要 UI 叫了才有（`sync.recent`、`room.invites`） |
+| 分房間金鑰沒算被邀請的人 | 維護者 2026-10-07 在 server 那邊定了（wbfuwunel 的 /docs/design/keys/invite-key-scope.md），server 還沒實作；server 合併後 client 另開一支（/docs/design/rooms/room-actions.md §6.1） | 歷史可見性是 `shared`／`invited` 的房，被邀請期間的密文那個人加入後解不開 |
 | 交叉簽章沒 bootstrap | client 還沒接；server 的橋都有了（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`／`0x25`，驗證訊息走 to-device） | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
 | 跳到訊息的錨點（PR #43 走橋 GetEvent，2026-09-16 關掉、沒合） | 等 wbfuwunel #64（`Recent` 收 `before_event_id`），合了再開一支 | 跳到訊息還是兩個來回 |
@@ -269,7 +270,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 
 1. ~~**官方 Matrix 的傳統上傳與下載、E2EE 收尾**~~：2026-10-07 在分支 `feat/matrix-media-and-e2ee-finish` 做完（傳統格式下載與上傳、換金鑰期限、`room.history` 讀到未解的再試、
    路徑版 `room.send_file` 與 CLI 送加密房）。之後可以補：UI 主動命令重發金鑰；傳統上傳記 `source_uri`。
-2. **訊息功能**：~~房間動作（建房、邀請、改權限、置頂…）~~ 2026-10-07 在分支 `feat/room-actions` 做完（/docs/design/rooms/room-actions.md；收邀請等 wbfuwunel #111）。
+2. **訊息功能**：~~房間動作（建房、邀請、改權限、置頂…）~~ 2026-10-07 在分支 `feat/room-actions` 做完（/docs/design/rooms/room-actions.md）；~~收邀請~~ 2026-10-14 在分支 `feat/invites` 做完（同一份 §3.3，issue #77）。
    剩：訊息動作（回覆、編輯、收回、表情）、已讀三層（`/docs/design/messages/read-receipts.md`）、裝置驗證。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。

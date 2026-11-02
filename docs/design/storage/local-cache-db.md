@@ -115,10 +115,10 @@ local.key ──master──┬─ BLAKE3 derive_key("…cache sqlcipher v1")   
 - **`cache.db`（與媒體池）在 server 層，多帳號共用**：維護者要的是混存——user1 看得到 room1／2／3、user2 看得到 room1／2／4，不論誰登入都同步進同一個 DB，事件只存一份，可見性逐則記（§5）。共用範圍是同一個 server：`r_seq`／`g_seq` 是 fork server 發的，不同 homeserver 上序號不同。
 - **兩層目錄名都是加密的**（/docs/design/storage/vault-and-keys.md §2，維護者 2026-09-09 定）：`s/` 與 `a/` 底下都只看得到 `<b58>_<b58>`，要知道是哪家、是誰得用第六把子金鑰解。真正的 URL 與 mxid 仍然在 `session.sealed`。
 
-## 5. 快取的 schema（v10，就是 `wbf-sdk::cache` 建的）
+## 5. 快取的 schema（v11，就是 `wbf-sdk::cache` 建的）
 
 混存與整數主鍵是維護者 2026-09-07 定的；`events` 的欄位照 /docs/design/messages/edits-and-redactions.md（2026-09-14）。換 schema 就升版號、舊檔整個重建（§1）。
-📎 升版一律整個重建（v9 → v10：`room_list.joined` 換成 `membership`，維護者 2026-10-07；多 `room_list.is_state_carried_over`）：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
+📎 升版一律整個重建（v9 → v10：`room_list.joined` 換成 `membership`，維護者 2026-10-07；多 `room_list.is_state_carried_over`。v10 → v11：多 `room_list.invite_json`，維護者 2026-10-14）：升級後第一次開要重拉房間列表與訊息；`media` 列沒了，池裡沒人指著的檔會被掃描清掉（/docs/design/media/media-download.md §4.3、§8），要看就重下。
 
 三條原則：
 
@@ -188,6 +188,9 @@ CREATE INDEX events_synced_log_by_user ON events_synced_log (user, event);
 --     這一份沒帶 state（一般 Matrix 帳號的列表是 Client 算的）就留著本地那份的 state，記 is_state_carried_over = 1（那份比這次的型別欄位舊）；帶了就記 0。
 --   房間動作（sync=both、收到 ACK 之後）：record_membership 寫身分（列不在就加；解除封鎖只在目前是 ban 時改）；
 --     record_written_state 把自己寫的那一項狀態換進 state、重算型別欄位（沒拿過狀態、is_state_carried_over = 1、或重算不出來的列🚫 寫）。
+--   邀請（/docs/design/rooms/room-actions.md §3.3.3）：record_invite（推來的 Push）記 membership = invite、invite_json 換成這則（沒帶 state 就留著原本那份）；
+--     apply_invite_round（room.invites 補完一輪）一個 transaction 整份取代：被比較新的推播碰過的🚫 寫、本地是 invite 而快照裡沒有的標 leave。
+--     任何路徑把 membership 改成 invite 以外的（record_membership、record_joined_rooms）都清掉 invite_json。
 -- room.list 讀要的那幾種身分（預設只有 join），本地知道多少給多少（RoomListEntry，不知道的是 null）；room.get sync=local 退出的也給（最後看到的樣子）。
 CREATE TABLE room_list (
   room INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -195,6 +198,7 @@ CREATE TABLE room_list (
   conversation_json TEXT, refreshed_at INTEGER,
   membership TEXT NOT NULL DEFAULT 'join' CHECK (membership IN ('join', 'invite', 'knock', 'leave', 'ban')),
   is_state_carried_over INTEGER NOT NULL DEFAULT 0 CHECK (is_state_carried_over IN (0, 1)),
+  invite_json TEXT,                          -- membership = invite 才有：{ inviter, is_direct, reason, state }（線上那則去掉 room_id）
   PRIMARY KEY (user, room)) WITHOUT ROWID;
 
 -- 每個帳號的 Recent 水位線（cg_seq 是 per user 的：server 依 user 的可見範圍算）。

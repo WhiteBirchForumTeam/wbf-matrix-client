@@ -1248,3 +1248,237 @@ fn event_subscribe_and_push_match_the_server_vectors() {
         other => panic!("{other:?}"),
     }
 }
+
+/// `Invite`（kind 0x05）的形狀照 wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5 與它 `src/api/client/wbf/invites.rs`、`src/service/streams/invites.rs` 送的：
+/// 請求的 meta、`Push` 的 `sc` 與 data、`sc: 0` 是「太大沒送」、缺 `gap` 當 true、`Gone`、空的 `Batch` 不帶 `os`／`ns`。
+#[test]
+fn invite_packs_follow_the_server_shape() {
+    use wbf_sdk::protocol::{self, join_length_prefixed, InviteSubscribeReply};
+    use wbf_wire::pack::{control, flags, invite};
+    use wbf_wire::{Kind, Pack};
+    let subscribe = protocol::invite_subscribe(0x0100_0000_0000_0020, 3);
+    assert_eq!(
+        (subscribe.kind, subscribe.subtype),
+        (Kind::Invite, invite::SUBSCRIBE)
+    );
+    assert_eq!(subscribe.meta, b"{}");
+    let fetch = protocol::invite_fetch(&protocol::InviteFetchRequest::default(), 9, 4).unwrap();
+    assert_eq!(fetch.meta, b"{}", "一輪從頭：🚫 帶 ci_seq");
+    let resumed = protocol::invite_fetch(
+        &protocol::InviteFetchRequest {
+            ci_seq: Some(4711),
+            batch: Some(16),
+        },
+        9,
+        5,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&resumed.meta).unwrap(),
+        serde_json::json!({ "ci_seq": 4711, "batch": 16 })
+    );
+    assert_eq!(
+        protocol::invite_unsubscribe(9, 6).subtype,
+        invite::UNSUBSCRIBE
+    );
+
+    let reply = |kind: Kind, subtype: u8, seq: u32, meta: serde_json::Value, data: Vec<u8>| Pack {
+        kind,
+        subtype,
+        flags: flags::IS_RESPONSE,
+        id: subscribe.id,
+        seq,
+        meta: meta.to_string().into_bytes(),
+        data,
+    };
+    let ack = reply(
+        Kind::Control,
+        control::ACK,
+        3,
+        serde_json::json!({ "latest_count": 812 }),
+        Vec::new(),
+    );
+    assert_eq!(
+        protocol::parse_invite_subscribe_reply(&subscribe, &ack).unwrap(),
+        InviteSubscribeReply::Acknowledged(protocol::InviteSubscribeAck { latest_count: 812 })
+    );
+    let member = br#"{"type":"m.room.member","state_key":"@bob:localhost","sender":"@alice:localhost","content":{"membership":"invite"}}"#.to_vec();
+    let pushed = reply(
+        Kind::Invite,
+        invite::PUSH,
+        0,
+        serde_json::json!({ "room_id": "!r:localhost", "inviter": "@alice:localhost", "is_direct": true,
+                            "reason": "來吃飯", "is": 7, "sc": 1, "gap": false }),
+        join_length_prefixed(&[member]),
+    );
+    let InviteSubscribeReply::Push { invite, is, gap } =
+        protocol::parse_invite_subscribe_reply(&subscribe, &pushed).unwrap()
+    else {
+        panic!("not a push");
+    };
+    assert_eq!((is, gap, invite.is_direct), (7, false, true));
+    assert_eq!(invite.inviter.as_deref(), Some("@alice:localhost"));
+    assert_eq!(invite.reason.as_deref(), Some("來吃飯"));
+    assert_eq!(invite.state.unwrap()[0]["type"], "m.room.member");
+    // 太大被降級：`sc: 0`、data 空 → state 是 None（🚫 當成「沒有狀態」）；缺 gap 當 true
+    let degraded = reply(
+        Kind::Invite,
+        invite::PUSH,
+        1,
+        serde_json::json!({ "room_id": "!r:localhost", "is_direct": false, "is": 8, "sc": 0 }),
+        Vec::new(),
+    );
+    let InviteSubscribeReply::Push { invite, gap, .. } =
+        protocol::parse_invite_subscribe_reply(&subscribe, &degraded).unwrap()
+    else {
+        panic!("not a push");
+    };
+    assert_eq!((invite.state, invite.inviter, gap), (None, None, true));
+    let gone = reply(
+        Kind::Invite,
+        invite::GONE,
+        2,
+        serde_json::json!({ "room_id": "!r:localhost", "membership": "leave", "is": 9, "gap": false }),
+        Vec::new(),
+    );
+    assert_eq!(
+        protocol::parse_invite_subscribe_reply(&subscribe, &gone).unwrap(),
+        InviteSubscribeReply::Gone {
+            room_id: "!r:localhost".into(),
+            membership: "leave".into(),
+            is: 9,
+            gap: false
+        }
+    );
+
+    // Batch：照 server 的 `batch_pack` 與 `to_entry`
+    let batch = |meta: serde_json::Value, rooms: &[serde_json::Value]| Pack {
+        kind: Kind::Invite,
+        subtype: invite::BATCH,
+        flags: flags::IS_RESPONSE,
+        id: fetch.id,
+        seq: 0,
+        meta: meta.to_string().into_bytes(),
+        data: join_length_prefixed(
+            &rooms
+                .iter()
+                .map(|room| room.to_string().into_bytes())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    let (meta, items) = protocol::parse_invite_batch(&batch(
+        serde_json::json!({ "tc": 5, "bc": 2, "os": 7, "ns": 9, "counts": [7, 9], "r": 3 }),
+        &[
+            serde_json::json!({ "room_id": "!a:localhost", "inviter": "@alice:localhost", "is_direct": false,
+                                "state": [{ "type": "m.room.name", "state_key": "", "content": { "name": "ops" } }] }),
+            serde_json::json!({ "room_id": "!b:localhost", "is_direct": true, "state": [] }),
+        ],
+    ))
+    .unwrap();
+    assert_eq!((meta.tc, meta.r), (5, 3));
+    assert_eq!(items[0].0, 7);
+    assert_eq!(items[0].1.state.as_ref().unwrap().len(), 1);
+    assert_eq!(items[1].1.state, None, "state: [] 是一間裝不下被降級");
+    let (meta, items) = protocol::parse_invite_batch(&batch(
+        serde_json::json!({ "tc": 0, "bc": 0, "counts": [], "r": 0 }),
+        &[],
+    ))
+    .unwrap();
+    assert!(items.is_empty() && meta.os.is_none() && meta.ns.is_none());
+}
+
+#[test]
+fn invite_batches_reject_inconsistent_shapes() {
+    use wbf_sdk::protocol::{self, join_length_prefixed};
+    use wbf_sdk::SdkError;
+    use wbf_wire::pack::{flags, invite};
+    use wbf_wire::{Kind, Pack};
+    let batch = |meta: &str, rooms: &[&str]| Pack {
+        kind: Kind::Invite,
+        subtype: invite::BATCH,
+        flags: flags::IS_RESPONSE,
+        id: 7,
+        seq: 0,
+        meta: meta.as_bytes().to_vec(),
+        data: join_length_prefixed(
+            &rooms
+                .iter()
+                .map(|room| room.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    let room = r#"{"room_id":"!a:x","is_direct":false,"state":[]}"#;
+    for (meta, rooms, why) in [
+        (
+            r#"{"tc":2,"bc":2,"os":5,"ns":4,"counts":[5,4],"r":0}"#,
+            vec![room, room],
+            "count 不遞增",
+        ),
+        (
+            r#"{"tc":2,"bc":2,"os":4,"ns":6,"counts":[4,5],"r":0}"#,
+            vec![room, room],
+            "ns 不是最後一個 count",
+        ),
+        (
+            r#"{"tc":2,"bc":2,"os":4,"ns":5,"counts":[4],"r":0}"#,
+            vec![room, room],
+            "counts 少一個",
+        ),
+        (
+            r#"{"tc":1,"bc":1,"counts":[4],"r":0}"#,
+            vec![room],
+            "有房卻沒有 os／ns",
+        ),
+        (
+            r#"{"tc":0,"bc":0,"os":0,"ns":0,"counts":[],"r":0}"#,
+            vec![],
+            "空批次帶了 os／ns（帶 0 會把游標拉回開頭）",
+        ),
+        (
+            r#"{"tc":1,"bc":1,"os":4,"ns":4,"counts":[4],"r":1}"#,
+            vec![room],
+            "tc < bc + r",
+        ),
+        (
+            r#"{"tc":1,"bc":1,"os":4,"ns":4,"counts":[4],"r":0}"#,
+            vec![r#"{"room_id":"!a:x"}"#],
+            "少了 is_direct",
+        ),
+    ] {
+        assert!(
+            matches!(
+                protocol::parse_invite_batch(&batch(meta, &rooms)),
+                Err(SdkError::Protocol(_))
+            ),
+            "{why}"
+        );
+    }
+}
+
+/// `is_from_this_server` 的判準（/docs/design/rooms/room-actions.md §3.3.4）：網域逐字相同才 true，其他一律 false。
+#[test]
+fn an_invite_is_from_this_server_only_when_both_domains_match_exactly() {
+    use wbf_sdk::chat::is_from_same_server;
+    assert!(is_from_same_server(
+        Some("@alice:localhost"),
+        "@bob:localhost"
+    ));
+    assert!(is_from_same_server(
+        Some("@alice:host:8448"),
+        "@bob:host:8448"
+    ));
+    for (inviter, why) in [
+        (None, "沒有邀請者"),
+        (Some("@alice:elsewhere"), "別台"),
+        (Some("@alice:host:8448"), "同名不同 port"),
+        (Some("@alice:"), "網域是空的"),
+        (Some("alice:localhost"), "不是 mxid"),
+        (Some("@alice"), "沒有網域"),
+    ] {
+        assert!(!is_from_same_server(inviter, "@bob:host"), "{why}");
+    }
+    assert!(
+        !is_from_same_server(Some("@alice:localhost"), "@bob"),
+        "自己解不出網域"
+    );
+}

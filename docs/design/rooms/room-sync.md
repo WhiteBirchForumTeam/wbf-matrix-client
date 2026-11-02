@@ -25,11 +25,13 @@
 ```
 池開一條線（link_pool::open_link）
   connect(Bearer) → hello(features_of(role)) → init_connection(account, role, client)
-                                                 ├─ Rooms：Event/Subscribe（帳號層、不帶 rooms、不帶 cg_seq）→ 等 Ack → 起收推播的 task
+                                                 ├─ Rooms：Event/Subscribe（帳號層、不帶 rooms、不帶 cg_seq）→ 等 Ack
+                                                 │         → Invite/Subscribe（被拒只講一聲，/docs/design/rooms/room-actions.md §3.3）→ 起收推播的 task
                                                  ├─ Keys：金鑰那半（/docs/design/keys/key-sync.md）
                                                  └─ 其他角色：不做事
 收推播的 task（一帳號一個；線在池裡、task 只握訂閱的會話）
   Push{events} → 原樣 upsert（照房分組；存不了的擋掉、數出來）→ commit 之後發 room.message。🚫 不碰水位。
+  Invite/Push、Gone → 寫那一列的身分與邀請內容 → 發 room.membership（gap 原樣）。🚫 補一輪（那是 UI 叫的 room.invites）。
   gap／本地丟包／壞包／寫失敗 → 講一聲（Note），繼續收。🚫 不記洞、不補。
   線死了 / server 送 Error → task 把訂閱那格線關掉（socket 活著也一樣）、池發 link.state: closed（帶原因）、task 結束；🚫 task 不重訂（daemon 的看線迴圈下一輪重開就重訂，/docs/design/daemon/link-pool.md §3.1）
 UI

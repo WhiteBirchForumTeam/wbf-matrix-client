@@ -987,6 +987,8 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
 /// | alice `room.create`（明文） | 回 server 的 `{room_id}`；本地 alice 那列 `join` |
 /// | alice `room.invite` bob | bob 是本機帳號 → bob 那列 `invite`（`room.list membership: ["invite"]`） |
 /// | bob `room.join` | bob 那列 `join` |
+/// | server 推 bob 的 `Invite/Push`（/docs/design/rooms/room-actions.md §3.3） | `room.membership { membership: "invite", invite }`：邀請者是 alice、`is_from_this_server: true`、縮減狀態含 bob 自己的成員事件；`room.list` 那一列帶同一份；`room.invites` 補一輪也拿得到 |
+/// | bob `room.join` 之後 | `room.membership { membership: "join" }`（server 的 `Gone(join)`）、`room.invites` 不再有它 |
 /// | alice `room.set_power_levels { events_default: 100 }` | alice 本地重算成 `channel`；bob `room.get sync=both` 看到 `can_send_message: false` |
 /// | alice `room.set_name`、`room.get_state` | 寫進去的讀得回來 |
 /// | alice 送字、`room.pin` | `room.get` 的 `state` 帶 `m.room.pinned_events` |
@@ -1028,6 +1030,10 @@ async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
         assert_eq!(reply["code"], 0, "account.add {user}: {reply}");
     }
     wait_for_links(&mut client, 10).await;
+    let subscribed = client
+        .call("subscribe", json!({ "events": ["room.membership"] }))
+        .await;
+    assert_eq!(subscribed["code"], 0, "subscribe: {subscribed}");
     let membership_of = |listed: &Value, room: &str| -> Option<Value> {
         listed["result"]
             .as_array()?
@@ -1078,11 +1084,76 @@ async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
         "bob 是本機帳號：{listed}"
     );
 
+    // ── 收邀請（/docs/design/rooms/room-actions.md §3.3）：server 從 bob 的房間線推 `Invite/Push` → `room.membership`；`room.list` 的那一列帶 `invite`；`room.invites` 補一輪拿得到同一間 ──
+    let invited_push = wait_for_push(&mut client, |push| {
+        push["method"] == "room.membership"
+            && push["params"]["user"] == bob.as_str()
+            && push["params"]["room"] == room.as_str()
+            && push["params"]["membership"] == "invite"
+    })
+    .await;
+    println!("room.membership ← {invited_push}");
+    let pushed_invite = &invited_push["params"]["invite"];
+    assert_eq!(pushed_invite["inviter"], alice.as_str(), "{invited_push}");
+    assert_eq!(pushed_invite["reason"], "e2e", "{invited_push}");
+    assert_eq!(pushed_invite["is_from_this_server"], true, "{invited_push}");
+    assert!(
+        pushed_invite["state"].as_array().is_some_and(|state| state
+            .iter()
+            .any(|event| event["type"] == "m.room.member" && event["state_key"] == bob.as_str())),
+        "縮減狀態含 bob 自己的成員事件：{invited_push}"
+    );
+    let listed = client
+        .call(
+            "room.list",
+            json!({ "user": bob, "membership": ["invite"] }),
+        )
+        .await;
+    let listed_invite = listed["result"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["id"] == room.as_str()))
+        .map(|entry| entry["invite"].clone())
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        &listed_invite, pushed_invite,
+        "room.list 帶推播寫進來的那份：{listed}"
+    );
+    let fetched_invites = client.call("room.invites", json!({ "user": bob })).await;
+    println!("room.invites ← {fetched_invites}");
+    assert_eq!(fetched_invites["code"], 0, "{fetched_invites}");
+    let one = fetched_invites["result"]["invites"]
+        .as_array()
+        .and_then(|invites| {
+            invites
+                .iter()
+                .find(|invite| invite["room"] == room.as_str())
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(one["inviter"], alice.as_str(), "{fetched_invites}");
+    assert_eq!(one["is_from_this_server"], true, "{fetched_invites}");
+
     let joined = client
         .call("room.join", json!({ "user": bob, "room": room }))
         .await;
     assert_eq!(joined["code"], 0, "{joined}");
     assert_eq!(joined["result"]["room_id"], room.as_str());
+    // 接受了：server 推 `Invite/Gone(join)` → `room.membership { membership: "join" }`、沒有 `invite`
+    let gone_push = wait_for_push(&mut client, |push| {
+        push["method"] == "room.membership"
+            && push["params"]["user"] == bob.as_str()
+            && push["params"]["room"] == room.as_str()
+            && push["params"]["membership"] == "join"
+    })
+    .await;
+    assert!(gone_push["params"].get("invite").is_none(), "{gone_push}");
+    let invites_after = client.call("room.invites", json!({ "user": bob })).await;
+    assert!(
+        invites_after["result"]["invites"]
+            .as_array()
+            .is_some_and(|invites| invites.iter().all(|invite| invite["room"] != room.as_str())),
+        "加入之後不再是待處理的邀請：{invites_after}"
+    );
     let listed = client.call("room.list", json!({ "user": bob })).await;
     assert_eq!(
         membership_of(&listed, &room),
@@ -1335,6 +1406,18 @@ async fn call_once_seen(client: &mut Client, method: &str, params: &Value) -> Va
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     panic!("{method} never saw the event: {reply}");
+}
+
+/// 等到一則符合的推播（最多 10 秒）：推播只在等回應時收，所以拿 `daemon.info` 當輪詢。拿到的那則從佇列拿掉。
+async fn wait_for_push(client: &mut Client, wanted: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..100 {
+        if let Some(position) = client.pushes.iter().position(&wanted) {
+            return client.pushes.remove(position);
+        }
+        client.call("daemon.info", json!({})).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the push never came; seen: {:?}", client.pushes);
 }
 
 async fn download_until_complete(client: &mut Client, by_event: &Value) -> Value {

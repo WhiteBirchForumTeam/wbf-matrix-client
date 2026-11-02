@@ -62,6 +62,7 @@ mod download_queue;
 mod error;
 pub mod event;
 mod handles;
+mod invites;
 /// 「現在跑的是哪一個工作」——事件的歸屬（/docs/design/rpc-specs/rpc-spec.md §4）。
 pub mod job;
 mod key_share;
@@ -239,6 +240,8 @@ pub struct Core {
     pub(crate) media_swept: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// 「該開的線都開著嗎」的鉤子正在跑一輪（`link_keeper.rs`）：同時只跑一輪，後到的跳過（PR #61 審查 salvia／cirno 🟢）。
     pub(crate) ensuring_links: std::sync::atomic::AtomicBool,
+    /// 正在跑的 `room.invites` 那一輪裡，被推播碰過的房（`invites.rs`）：房間線的 task 記、那一輪補完時讀，只在記憶體。
+    pub(crate) invite_rounds: std::sync::Arc<invites::InviteRounds>,
 }
 
 impl Core {
@@ -267,6 +270,7 @@ impl Core {
             matrix_transfers: std::sync::Arc::default(),
             media_swept: std::sync::Mutex::new(std::collections::HashSet::new()),
             ensuring_links: std::sync::atomic::AtomicBool::new(false),
+            invite_rounds: std::sync::Arc::default(),
         }
     }
 

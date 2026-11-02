@@ -29,7 +29,7 @@ pub enum LinkRole {
     Upload,
     /// Download/*。
     Download,
-    /// 房間的訂閱線：全局房間事件（Event/Subscribe／Push／DeviceChanged）。
+    /// 房間的訂閱線：全局房間事件（Event/Subscribe／Push／DeviceChanged），以及邀請（Invite/Subscribe／Push／Gone，/docs/design/rooms/room-actions.md §3.3）。
     Rooms,
     /// 金鑰的訂閱線：全局金鑰事件（Device/Subscribe／Push／CryptoState），以及 Device/Fetch／ItemsDestroy（server 只讓持有裝置佇列的那條連線銷毀）。
     Keys,
