@@ -870,6 +870,9 @@ impl<C: PackChannel> WbfClient<C> {
     }
 
     /// `Invite/Fetch` 一整輪：一直收到 `r == 0` 才回（server §3.3：補到一半的不是快照）。🚫 帶 `ci_seq`：一支 RPC 就是新的一輪。
+    /// ⚠️ 🚫 把跨連線的水位當 `ci_seq` 帶回去（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §3.3）：`ci_seq` 只補得到「新增」、補不到「消失」——
+    /// 被收回的邀請那一列已經刪了，帶舊水位回來會永遠留著一則已收回的邀請。`ci_seq` 只是同一輪之內的續傳游標。
+    /// 守著它的是 `crates/wbf-sdk/tests/unit.rs` 的 `invite_packs_follow_the_server_shape`。
     ///
     /// Args:
     ///     per_pack_timeout: 每個 Batch 之間最多等多久, example: Duration::from_secs(30)
