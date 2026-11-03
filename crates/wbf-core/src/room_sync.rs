@@ -693,7 +693,7 @@ mod tests {
         (fake, opened_before_subscribed)
     }
 
-    /// issue #79：UI 收到 `rooms` 的 `link.state: opened` 就叫 `sync.recent` 與 `room.invites`（/docs/design/rooms/room-sync.md §4）——
+    /// issue #79：UI 收到 `rooms` 的 `link.state: opened` 就叫 `sync.recent` 與 `room.invites`（/docs/design/rooms/room-sync.md §3.1）——
     /// 所以第一次開與斷了重開，`opened` 都要在 `Event/Subscribe` 與 `Invite/Subscribe` 拿到 Ack **之後**才發；先發的話，UI 那一輪跟訂閱之間有一段沒人收。
     #[tokio::test]
     async fn the_rooms_line_says_opened_only_after_both_subscriptions_are_acknowledged() {

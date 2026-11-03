@@ -195,7 +195,7 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
 | | daemon | UI |
 |---|---|---|
 | 開線（房間線）時 `Invite/Subscribe` | ✅ 只訂閱，收推播寫本地 | — |
-| 補拿一輪 `Fetch` 到 `r == 0` | RPC 叫了才跑（§3.3.4 的 `room.invites`） | 首次啟動叫一次；看到推播帶 `gap: true` 時再叫；收到 `link.state { role: "rooms", state: "opened" }`（斷了重開）時再叫（/docs/design/rooms/room-sync.md §3.1，issue #79） |
+| 補拿一輪 `Fetch` 到 `r == 0` | RPC 叫了才跑（§3.3.4 的 `room.invites`） | 首次啟動叫一次；看到推播帶 `gap: true` 時再叫；收到 `link.state { role: "rooms", state: "opened" }`（斷了重開）時、UI 自己的 RPC 連線重連時再叫（/docs/design/rooms/room-sync.md §3.1，issue #79） |
 | 斷了重開 | 🚫 自己補；重開就重訂，兩個訂閱都 Ack 了才發 `opened` | 當成剛起來：叫 `sync.recent` ＋ `room.invites` |
 | 存水位 | 🚫（server §3.3） | 🚫（每輪都是完整快照，不需要） |
 | 本地的邀請清單 | `room_list` 那一列：`membership = invite`、`invite_json`（§3.3.3） | 讀 `room.list { membership: […, "invite"] }`（db 裡的，推播自動更新） |
@@ -235,7 +235,7 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
   - `sync=server`／`both` 打上游拿的是**房間列表**（wbf 的 `JoinedRooms`、一般 Matrix 帳號的 `joined_rooms()`），**只有已加入的、沒有邀請**；`both` 寫回時本來就🚫 動 `invite`／`knock`／`ban` 的列（v10 的規則），所以快取裡的邀請不會被列表蓋掉。
 - **新的 `room.invites { user?, server? }`**：主動補一輪邀請（我們自己加的補窗；🚫 帶 `sync`：跟 `sync.recent` 一樣本來就是去上游拿的）。
   - 跑一輪 `Fetch` 到 `r == 0`、照 §3.3.3 寫進 db（含補完時刪掉沒出現的）、有變的列推 `room.membership`，回這一輪的快照。
-  - UI 首次啟動叫一次；之後靠推播。看到推播帶 `gap: true` 時再叫一次；房間線斷了重開（收到 `rooms` 的 `link.state: opened`）也再叫一次——斷線那段的推播都丟了，新訂閱的 `gap` 是 `false`（/docs/design/rooms/room-sync.md §3.1）。
+  - UI 首次啟動叫一次；之後靠推播。看到推播帶 `gap: true` 時再叫一次；房間線斷了重開（收到 `rooms` 的 `link.state: opened`）也再叫一次——斷線那段的推播都丟了，新訂閱的 `gap` 是 `false`；UI 自己的 RPC 連線重連時同樣再叫（`link.state` 🚫 重播）（/docs/design/rooms/room-sync.md §3.1）。
   - 中途斷了回錯、🚫 寫任何一列（快照在補完時一個 transaction 寫完，補到一半的什麼都不寫），UI 再叫一次就是新的一輪。
   - 回應（2026-10-14 對本機 wbfuwunel 實跑，alice `room.invite` bob 帶 `reason: "e2e"`；`state` 只留兩則、其他略）：
     ```jsonc

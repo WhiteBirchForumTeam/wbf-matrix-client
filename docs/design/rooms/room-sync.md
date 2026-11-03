@@ -38,6 +38,7 @@ UI
   起來時 sync.recent（全局、g_seq 游標）：帶 since（它自己記的起點：上次的 cg_seq_after、或手上最後一則 room.message 的 g_seq），
   沒帶就用 daemon 存的上一次 Recent 的水位；回應 caught_up 是 false 就再叫。補不補、補到哪，全是 UI 的事。
   收到 link.state { role: "rooms", state: "opened" }（第一次開、斷了重開都發）：當成剛起來，再叫一次 sync.recent ＋ room.invites（§3.1，issue #79）。
+  UI 自己的 RPC 連線重連時也一樣（link.state 🚫 重播，斷著那段的 opened 收不到）。
   daemon 🚫 自己叫——這是 UI 的規則，跟 room.membership 的 gap: true 一樣。
   點進房間 room.history（單房）：本地翻頁用 r_seq；sync=both 打上游 Recent{rooms:[這房], before: 這房最舊那則的 g_seq}（跟訂閱線無關）。
 誰開這條線：Core::ensure_links（link_keeper.rs）——daemon 在 vault.unlock／account.add 之後、與常駐的看線迴圈每一輪叫它；開的時候就訂了
@@ -90,12 +91,14 @@ UI
 
 - 訊息：跟剛起來一樣叫（不帶 `since` 就從 daemon 存的上一次 Recent 的水位起；要帶就帶**收到 `closed` 之前**手上最後一則的 `g_seq`）。
   ⚠️ 🚫 帶 `opened` 之後才推來的那則的 `g_seq`：那會跳過斷線那段。
-- 邀請：`room.invites` 一輪快照整份取代，斷線期間新來的補上、被收回的標 `leave`（/docs/design/rooms/room-actions.md §3.3.2）。
+- 邀請：`room.invites` 一輪快照整份取代，斷線期間新來的補上、被收回的標 `leave`（/docs/design/rooms/room-actions.md §3.3.3）。
 - 裝置變動（`devices.changed`）：漏掉的 🚫 另外補。UI 手上的 `room_version` 舊了，送出時會被 server 擋、daemon 自動重拿、回 1401 帶新的那份（/docs/design/keys/e2ee-rpc.md §3）；
   UI 想提早就對開著的房 `room.refresh_devices`。
 - 第一次開線也發 `opened`，所以 UI 起來時會跟它自己那一次各叫一次：結果一樣，只多一輪。🚫 為了省這一輪加 `reopened` 之類的第三種狀態（維護者）。
+- UI 自己那條 RPC 連線重連時，也當成剛起來、叫同一組：`link.state` 是推播、🚫 重播（只送給當下連著的 RPC 連線），
+  RPC 斷著的時候房間線剛好重開，那個 `opened` 就收不到，而 daemon 🚫 自己補。多條 RPC 連線會各叫一輪，重複無害、只多一次抓取。
 
-**這條成立的前提**：`opened` 一定在 `Event/Subscribe` 與 `Invite/Subscribe` 都拿到 Ack **之後**才發——UI 叫的補拿跟訂閱之間才沒有一段沒人收
+**這條成立的前提**：`opened` 一定在 `Event/Subscribe` 拿到 Ack、`Invite/Subscribe` 拿到 Ack 或被舊 server 明說不認得**之後**才發——UI 叫的補拿跟訂閱之間才沒有一段沒人收
 （先訂再拿：訂之前的在快照／Recent 裡，訂之後的推過來，重疊的那段 `is`／`g_seq` 冪等）。
 它靠兩件事：`Core::open_link` 在開線閉包裡跑 `init_connection`（/docs/design/daemon/link-pool.md §3），`LinkPool::acquire` 在閉包回來之後才發 `Opened`（同一份 §4）。
 舊 server 拒了 `Invite/Subscribe` 也照樣發 `opened`（房間的訂閱照跑，§1）：`room.invites` 照叫、照拿得到。
