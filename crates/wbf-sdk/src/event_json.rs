@@ -5,7 +5,7 @@
 //! 解密狀態（`decrypted`）這裡一律 None：只有 matrix-sdk 的 `TimelineEvent` 知道，由它的 adapter 補。
 
 use crate::chat::{Attachment, MatrixAttachment, Message, MessageKind, Reaction};
-use crate::incoming::IncomingEvent;
+use crate::incoming::{check_replacement, EventClass, IncomingEvent, ReplacementSide};
 use crate::media_kind::MediaKind;
 use crate::protocol::event_seqs;
 
@@ -16,7 +16,7 @@ pub const CHUNKED_BLOCK_KEY: &str = "org.wbftw.wbfuwunel.chunked";
 pub const UNNAMED_FILE: &str = "file";
 
 /// /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔案事件 content（`m.room.message`，msgtype 是 [`FILE_MSGTYPE`]）。
-/// matrix-sdk 那條路（`Room::send`）與 wbf 那條路（`Event/Send`）共用這一份，送出去的事件才不會漂。
+/// matrix-sdk 那條路（`Room::send_raw`）與 wbf 那條路（`Event/Send`）共用這一份，送出去的事件才不會漂。
 ///
 /// Args:
 ///     attachment: example: &Attachment { mxc: "mxc://localhost/1122334455667788".into(), block: </docs/design/media/wbf-client-convention-for-chunk.md §5 的區塊> }
@@ -148,7 +148,7 @@ pub fn messages_from_json(
         conversation,
         reader,
         raws.iter()
-            .map(|raw| (message_from_json(raw), relation_of(raw)))
+            .map(|raw| PageEvent::new(message_from_json(raw), Some(raw)))
             .collect(),
     )
 }
@@ -189,7 +189,7 @@ pub fn messages_from_incoming(
                     IncomingEvent::Undecrypted { reason, .. } => Some(reason.clone()),
                     _ => None,
                 };
-                (message, incoming.cleartext().and_then(relation_of))
+                PageEvent::new(message, incoming.cleartext())
             })
             .collect(),
     )
@@ -507,48 +507,136 @@ pub(crate) fn relation_of(raw: &serde_json::Value) -> Option<Relation> {
     }
 }
 
+/// 一頁裡的一則事件：顯示用的 `Message`，加上折關係時要的事實（`aggregate`）。
+pub(crate) struct PageEvent {
+    message: Message,
+    relation: Option<Relation>,
+    /// 明文的 `type`；沒解開的是 None。
+    event_type: Option<String>,
+    is_state: bool,
+}
+
+impl PageEvent {
+    /// Args:
+    ///     message: 這則組好的 `Message`
+    ///     cleartext: 這則明文的事件 JSON，沒解開的是 None, example: {"type":"m.room.message","sender":"@a:x","content":{"msgtype":"m.text","body":"hi"}}
+    pub(crate) fn new(message: Message, cleartext: Option<&serde_json::Value>) -> PageEvent {
+        PageEvent {
+            message,
+            relation: cleartext.and_then(relation_of),
+            event_type: cleartext
+                .and_then(|raw| raw.get("type"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            is_state: cleartext.is_some_and(|raw| raw.get("state_key").is_some()),
+        }
+    }
+}
+
+/// `aggregate` 裡的一則：`Message` 加上它被當成 edit 的目標（或它自己是 edit）時給 `check_replacement` 的事實。
+struct PageEntry {
+    message: Message,
+    class: EventClass,
+    event_type: Option<String>,
+    is_state: bool,
+    /// 這一頁裡有 redaction 指向它。
+    is_redacted: bool,
+    /// 已經折進目標，不自成一則。
+    is_folded: bool,
+}
+
+impl PageEntry {
+    fn replacement_side(&self) -> ReplacementSide<'_> {
+        ReplacementSide {
+            sender: &self.message.sender,
+            class: self.class,
+            event_type: self.event_type.as_deref(),
+            is_state: self.is_state,
+            // 跟寫庫那條同一個判準：`decrypted` 不是 None 就是原本加密的。
+            was_encrypted: self.message.decrypted.is_some(),
+        }
+    }
+}
+
 /// 一頁裡的關係事件折進目標：`m.reaction` 聚合成 `reactions`、`m.replace` 覆蓋內容並標 `edited_by`、redaction 標 `Deleted`。
 /// 目標不在這一頁的關係事件照原樣留著（`Unsupported`），不丟。範圍只有這一頁（/docs/design/rooms/chat-model.md §3.4）。
-/// 關係事件照 `origin_server_ts` 舊到新套（同一個時間照頁裡的順序）：最新的 edit 贏，`mine` 是最早的那則（/docs/design/messages/message-actions.md §5）。
-pub(crate) fn aggregate(
-    conversation: &str,
-    reader: &str,
-    items: Vec<(Message, Option<Relation>)>,
-) -> Vec<Message> {
-    let mut messages: Vec<Message> = Vec::with_capacity(items.len());
-    let mut relations: Vec<(usize, Relation)> = Vec::new();
-    for (mut message, relation) in items {
+/// 規則跟寫庫那條一樣（/docs/design/messages/edits-and-redactions.md §5）：收回贏；edit 要過 `check_replacement` 才套，無效的折掉、不套。
+/// 其餘關係照 `origin_server_ts` 舊到新套（同一個時間照頁裡的順序）：最新的 edit 贏，`mine` 是最早的那則（/docs/design/messages/message-actions.md §5）。
+pub(crate) fn aggregate(conversation: &str, reader: &str, events: Vec<PageEvent>) -> Vec<Message> {
+    let mut entries: Vec<PageEntry> = Vec::with_capacity(events.len());
+    let mut redactions: Vec<(usize, Relation)> = Vec::new();
+    let mut others: Vec<(usize, u64, Relation)> = Vec::new();
+    for event in events {
+        let mut message = event.message;
         if message.conversation == "unknown" {
             message.conversation = conversation.to_string();
         }
-        let index = messages.len();
-        messages.push(message);
-        if let Some(relation) = relation {
-            relations.push((index, relation));
+        let class = match &event.relation {
+            Some(Relation::Reaction { .. }) => EventClass::Reaction,
+            Some(Relation::Replace { .. }) => EventClass::Edit,
+            Some(Relation::Redaction { .. }) => EventClass::Redact,
+            None if message.decrypted == Some(false) => EventClass::General,
+            None => EventClass::Msg,
+        };
+        let index = entries.len();
+        match event.relation {
+            Some(relation @ Relation::Redaction { .. }) => redactions.push((index, relation)),
+            Some(relation) => others.push((index, message.sent_at, relation)),
+            None => {}
+        }
+        entries.push(PageEntry {
+            message,
+            class,
+            event_type: event.event_type,
+            is_state: event.is_state,
+            is_redacted: false,
+            is_folded: false,
+        });
+    }
+
+    // 收回先套（照頁裡的順序）：之後的 edit 改不回被收回的訊息，被收回的表情與 edit 不算數。
+    for (index, relation) in redactions {
+        let Relation::Redaction { target, reason } = relation else {
+            continue;
+        };
+        let Some(target_entry) = entries.iter_mut().find(|entry| entry.message.id == target) else {
+            continue;
+        };
+        target_entry.message.kind = MessageKind::Deleted { reason };
+        target_entry.is_redacted = true;
+        // `index` 是上面 push 進 `entries` 時的位置：`None` 到不了，靜默跳過是設計。
+        if let Some(entry) = entries.get_mut(index) {
+            entry.is_folded = true;
         }
     }
-    relations.sort_by_key(|(index, _)| messages.get(*index).map_or(0, |message| message.sent_at));
-    let mut consumed = vec![false; messages.len()];
-    for (index, relation) in relations {
-        // `index` 是上面 push 進 `messages` 時的位置：拿不到就跳過（到不了）。
-        let Some((sender, relation_event_id)) = messages
-            .get(index)
-            .map(|message| (message.sender.clone(), message.id.clone()))
-        else {
-            continue;
-        };
+
+    others.sort_by_key(|(_, sent_at, _)| *sent_at);
+    for (index, _, relation) in others {
         let target = match &relation {
-            Relation::Reaction { target, .. }
-            | Relation::Replace { target, .. }
-            | Relation::Redaction { target, .. } => target.clone(),
+            Relation::Reaction { target, .. } | Relation::Replace { target, .. } => target.clone(),
+            Relation::Redaction { .. } => continue,
         };
-        let Some(target_message) = messages.iter_mut().find(|message| message.id == target) else {
+        let Some(target_index) = entries.iter().position(|entry| entry.message.id == target) else {
             continue;
         };
+        // `index` 是上面 push 進 `entries` 時的位置：`None` 到不了，靜默跳過是設計。
+        let Some(relation_entry) = entries.get_mut(index) else {
+            continue;
+        };
+        relation_entry.is_folded = true;
+        if relation_entry.is_redacted {
+            // 這則表情或 edit 自己被收回了：折掉、不算數。
+            continue;
+        }
+        let sender = relation_entry.message.sender.clone();
+        let relation_event_id = relation_entry.message.id.clone();
         match relation {
             Relation::Reaction { key, .. } => {
+                let Some(target_entry) = entries.get_mut(target_index) else {
+                    continue;
+                };
                 let mine = (sender == reader).then_some(relation_event_id);
-                let reactions = &mut target_message.reactions;
+                let reactions = &mut target_entry.message.reactions;
                 match reactions.iter_mut().find(|reaction| reaction.key == key) {
                     Some(reaction) => {
                         // 同一個人按了兩則只算一次；`mine` 留最早的那則。
@@ -567,24 +655,35 @@ pub(crate) fn aggregate(
                 }
             }
             Relation::Replace { new_content, .. } => {
-                target_message.kind =
+                let is_valid_edit = match (entries.get(target_index), entries.get(index)) {
+                    // 被收回的（這一頁收回的、server 回來就已收回的都是 `Deleted`）不再被改回文字。
+                    (Some(target_entry), Some(edit_entry)) => {
+                        !matches!(target_entry.message.kind, MessageKind::Deleted { .. })
+                            && check_replacement(
+                                &target_entry.replacement_side(),
+                                &edit_entry.replacement_side(),
+                            )
+                            .is_ok()
+                    }
+                    _ => false,
+                };
+                if !is_valid_edit {
+                    continue;
+                }
+                let Some(target_entry) = entries.get_mut(target_index) else {
+                    continue;
+                };
+                target_entry.message.kind =
                     kind_from_content("m.room.message", &new_content, &serde_json::Value::Null);
-                target_message.edited_by = Some(sender);
+                target_entry.message.edited_by = Some(sender);
             }
-            Relation::Redaction { reason, .. } => {
-                target_message.kind = MessageKind::Deleted { reason };
-            }
-        }
-        // `consumed` 跟 `messages` 等長：`None` 到不了，靜默跳過是設計。
-        if let Some(flag) = consumed.get_mut(index) {
-            *flag = true;
+            Relation::Redaction { .. } => {}
         }
     }
-    messages
+    entries
         .into_iter()
-        .zip(consumed)
-        .filter(|(_, consumed)| !consumed)
-        .map(|(message, _)| message)
+        .filter(|entry| !entry.is_folded)
+        .map(|entry| entry.message)
         .collect()
 }
 
@@ -608,7 +707,7 @@ mod file_message_content_tests {
         }
     }
 
-    /// Client 那條（`Room::send`）與 wbf 那條（`Event/Send`）送的是同一份 content：這裡釘它的形狀。
+    /// Client 那條（`Room::send_raw`）與 wbf 那條（`Event/Send`）送的是同一份 content：這裡釘它的形狀。
     #[test]
     fn file_message_content_carries_url_block_body_and_optional_caption() {
         let attachment = Attachment {

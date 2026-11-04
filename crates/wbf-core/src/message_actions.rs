@@ -257,9 +257,14 @@ fn list_mentions_of_editable_target(
                 "{event_id} is not decrypted here, so it cannot be checked or edited"
             )))
         }
-        _ => {
+        Some(EventClass::Edit | EventClass::Reaction | EventClass::Redact) => {
             return Err(usage(format!(
                 "{event_id} is not an original message (an edit, a reaction or a redaction): edit the original"
+            )))
+        }
+        None => {
+            return Err(usage(format!(
+                "{event_id} has an unreadable class in the local cache, so it cannot be checked or edited"
             )))
         }
     }

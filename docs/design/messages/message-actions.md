@@ -204,7 +204,10 @@ daemon **不**檢查目標是誰的、在不在本地：收回別人的訊息要
 - **`by` 照人去重**（順手修現在的 bug）：同一個人對同一個 key 有兩則（別的 client 送重了、或 §4.3 那個窗口），現在 `crates/wbf-sdk/src/cache.rs` 的 `list_reactions` 會把他算兩次。
   去重之後 `mine` 取**最早**的那則：讀本地是寫進來的順序（`ORDER BY x.id` 的第一則）；不寫庫的那條照 `origin_server_ts`（一頁可能是新到舊）。📎 兩則都在時，收回一則之後另一則還在、`mine` 換成它，UI 再點一次就收回它，照切換的規則一樣走得完。
 - 不寫庫的路（`sync=server`、watch 與推播的通知，`event_json::messages_from_incoming`）也算 `mine`，所以它收讀的帳號。
-  這條路的關係事件照 `origin_server_ts` 舊到新套：順便讓同一頁裡有兩個 edit 時是**最新**的贏（以前照頁的順序套，新到舊的頁會讓最舊的贏）。
+  這條路的規則跟寫庫那條一樣（審查 #81 補齊）：
+  1. **收回先套**：同一頁裡收回比 edit 早，還是收回贏，訊息**不**會被 edit 改回文字；被收回的表情與 edit 折掉、不算數，`mine` **不**指著已收回的那則。
+  2. **edit 要過 `check_replacement` 才套**（/docs/design/messages/edits-and-redactions.md §5）：別人送的、用明文改加密訊息的、改了 type 的都折掉、不套。
+  3. 其餘關係照 `origin_server_ts` 舊到新套：同一頁裡有兩個 edit 時是**最新**的贏（以前照頁的順序套，新到舊的頁會讓最舊的贏）。
 
 ## 6. 不在這支
 
@@ -218,6 +221,7 @@ daemon **不**檢查目標是誰的、在不在本地：收回別人的訊息要
 |---|---|---|
 | sdk（純函式） | `crates/wbf-sdk/src/message_content.rs` 的 tests | §3 的每個例子逐字；§3.2 那張表一列一條；編輯只通知新加的人 |
 | sdk（不寫庫的聚合） | `crates/wbf-sdk/tests/chat_mapping.rs` 的 `the_same_person_pressing_twice_counts_once_and_mine_is_the_earliest` | 新到舊的一頁：`by` 照人去重、`mine` 是最早的、別人讀沒有 `mine` |
+| sdk（不寫庫的聚合） | 同一個檔的 `a_redaction_older_than_an_edit_on_the_same_page_still_wins`、`an_edit_from_someone_else_is_folded_but_not_applied`、`a_plaintext_edit_cannot_replace_an_encrypted_message`、`a_reaction_or_edit_withdrawn_on_the_same_page_does_not_count` | §5 那三條規則：收回贏（新到舊、舊到新兩種頁）、別人的 edit 不套、明文 edit 改不了加密訊息、同一頁收回的表情與 edit 不算數 |
 | core（假 server） | `crates/wbf-core/src/message_actions.rs` 的 tests | 回覆送出的 content 逐字；編輯逐字；§4.2 每一條拒絕且什麼都不送；表情冪等（別人的、收回過的不算）；收回走橋 `0x14 0x24`；本地讀的去重與 `mine` |
 | daemon（真 server） | `crates/wbf-daemon/tests/real_server.rs` 的 `message_actions_reply_react_edit_and_redact_between_two_accounts` | alice 回覆、按表情、編輯、收回表情、收回訊息，明文房與加密房各一次；bob 從 `room.history` 看到折完的結果；server 上的原樣關係在明文那層；bob 收回 alice 的是 1400 |
 

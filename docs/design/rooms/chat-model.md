@@ -393,7 +393,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
   `history` 回原樣的 `EventPage`，不是 `Page<Message>`（/docs/design/messages/edits-and-redactions.md §8）。
 - `watch` 是 callback（`FnMut(Update) -> WatchControl` 加 deadline），不是 `Stream`：sync 迴圈在 backend 手上。
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
-- 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
+- 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著；折的規則跟寫庫那條一樣（收回贏、edit 過 `check_replacement` 才套，/docs/design/messages/message-actions.md §5）。
 
 送 edit／delete／reaction／reply 在 /docs/design/messages/message-actions.md。還沒做：已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
 

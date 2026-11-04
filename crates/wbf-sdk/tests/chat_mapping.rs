@@ -314,6 +314,130 @@ fn redaction_marks_target_deleted() {
     assert!(matches!(messages[0].kind, MessageKind::Deleted { .. }));
 }
 
+fn at(mut event: serde_json::Value, ts: u64) -> serde_json::Value {
+    event["origin_server_ts"] = json!(ts);
+    event
+}
+
+fn edit_of(id: &str, sender: &str, target: &str, body: &str) -> serde_json::Value {
+    relation(
+        id,
+        sender,
+        "m.room.message",
+        json!({
+            "msgtype": "m.text", "body": format!("* {body}"),
+            "m.relates_to": { "rel_type": "m.replace", "event_id": target },
+            "m.new_content": { "msgtype": "m.text", "body": body }
+        }),
+    )
+}
+
+fn redaction_of(id: &str, sender: &str, target: &str) -> serde_json::Value {
+    relation(id, sender, "m.room.redaction", json!({ "redacts": target }))
+}
+
+/// 收回比 edit 早、兩則在同一頁：還是收回贏，跟寫庫那條一樣（/docs/design/messages/edits-and-redactions.md §5）。
+/// 新到舊（`room.history`）與舊到新（watch）兩種順序都一樣。
+#[test]
+fn a_redaction_older_than_an_edit_on_the_same_page_still_wins() {
+    let newest_first = vec![
+        at(edit_of("$e", "@a:localhost", "$a", "resurrected"), 20),
+        at(redaction_of("$d", "@a:localhost", "$a"), 10),
+        at(text_event("$a", "first"), 5),
+    ];
+    let mut oldest_first = newest_first.clone();
+    oldest_first.reverse();
+    for page in [newest_first, oldest_first] {
+        let messages = messages_from_json("!r:localhost", READER, &page);
+        assert_eq!(messages.len(), 1, "the edit and the redaction fold away");
+        assert!(
+            matches!(messages[0].kind, MessageKind::Deleted { .. }),
+            "{:?}",
+            messages[0].kind
+        );
+        assert_eq!(messages[0].edited_by, None);
+    }
+}
+
+/// 別人送的 `m.replace` 指向你的訊息：折掉、不套（`check_replacement`，/docs/design/messages/edits-and-redactions.md §5）。
+#[test]
+fn an_edit_from_someone_else_is_folded_but_not_applied() {
+    let page = vec![
+        text_event("$a", "first"),
+        edit_of("$e", "@mallory:localhost", "$a", "forged"),
+    ];
+    let messages = messages_from_json("!r:localhost", READER, &page);
+    assert_eq!(
+        messages.len(),
+        1,
+        "an edit never shows as a message of its own"
+    );
+    assert!(matches!(&messages[0].kind, MessageKind::Text { body, .. } if body == "first"));
+    assert_eq!(messages[0].edited_by, None);
+}
+
+/// 加密的訊息只能用加密的 edit 改：明文的 edit 折掉、不套；加密的照套。
+#[test]
+fn a_plaintext_edit_cannot_replace_an_encrypted_message() {
+    use wbf_sdk::event_json::messages_from_incoming;
+    use wbf_sdk::incoming::IncomingEvent;
+    let target = IncomingEvent::Decrypted {
+        ciphertext: None,
+        cleartext: text_event("$a", "secret"),
+    };
+    let edit = edit_of("$e", "@a:localhost", "$a", "plain");
+
+    let page = vec![
+        target.clone(),
+        IncomingEvent::Plain {
+            event: edit.clone(),
+        },
+    ];
+    let messages = messages_from_incoming("!r:localhost", READER, &page);
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(&messages[0].kind, MessageKind::Text { body, .. } if body == "secret"));
+    assert_eq!(messages[0].edited_by, None);
+
+    let page = vec![
+        target,
+        IncomingEvent::Decrypted {
+            ciphertext: None,
+            cleartext: edit,
+        },
+    ];
+    let messages = messages_from_incoming("!r:localhost", READER, &page);
+    assert!(matches!(&messages[0].kind, MessageKind::Text { body, .. } if body == "plain"));
+    assert_eq!(messages[0].edited_by.as_deref(), Some("@a:localhost"));
+}
+
+/// 表情或 edit 跟收回它的那則在同一頁：不算數，`mine` 也不指著已收回的那則（/docs/design/messages/message-actions.md §5）。
+#[test]
+fn a_reaction_or_edit_withdrawn_on_the_same_page_does_not_count() {
+    let pressed = |id: &str, sender: &str| {
+        relation(
+            id,
+            sender,
+            "m.reaction",
+            json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$a", "key": "👍" } }),
+        )
+    };
+    let page = vec![
+        at(redaction_of("$undo_edit", "@a:localhost", "$e"), 40),
+        at(redaction_of("$undo_press", READER, "$press"), 30),
+        at(edit_of("$e", "@a:localhost", "$a", "second"), 20),
+        at(pressed("$other", "@c:localhost"), 15),
+        at(pressed("$press", READER), 10),
+        at(text_event("$a", "first"), 5),
+    ];
+    let messages = messages_from_json("!r:localhost", READER, &page);
+    assert_eq!(messages.len(), 1, "every relation folds into $a");
+    assert!(matches!(&messages[0].kind, MessageKind::Text { body, .. } if body == "first"));
+    assert_eq!(messages[0].edited_by, None);
+    let thumbs = &messages[0].reactions[0];
+    assert_eq!(thumbs.by, vec!["@c:localhost"]);
+    assert_eq!(thumbs.mine, None);
+}
+
 #[test]
 fn relation_whose_target_is_not_on_the_page_is_kept() {
     let page = vec![relation(
