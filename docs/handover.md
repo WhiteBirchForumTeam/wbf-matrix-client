@@ -272,7 +272,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 🚫 不要 --all：�
 1. ~~**官方 Matrix 的傳統上傳與下載、E2EE 收尾**~~：2026-10-07 在分支 `feat/matrix-media-and-e2ee-finish` 做完（傳統格式下載與上傳、換金鑰期限、`room.history` 讀到未解的再試、
    路徑版 `room.send_file` 與 CLI 送加密房）。之後可以補：UI 主動命令重發金鑰；傳統上傳記 `source_uri`。
 2. **訊息功能**：~~房間動作（建房、邀請、改權限、置頂…）~~ 2026-10-07 在分支 `feat/room-actions` 做完（/docs/design/rooms/room-actions.md）；~~收邀請~~ 2026-10-14 在分支 `feat/invites` 做完（同一份 §3.3，issue #77）。
-   剩：訊息動作（回覆、編輯、收回、表情）、已讀三層（`/docs/design/messages/read-receipts.md`）、裝置驗證。
+   剩：訊息動作（回覆、編輯、收回、表情；形狀 2026-11-04 定在 /docs/design/messages/message-actions.md，還沒實作）、已讀三層（`/docs/design/messages/read-receipts.md`）、裝置驗證。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 

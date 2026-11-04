@@ -262,7 +262,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 |---|---|
 | `Text` | `m.room.message`，`msgtype: m.text`，`body`；有 `formatted_body` 就進 `Formatted` |
 | `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5）或路徑版 `room.send_file`，兩條都帶 `room_devices`（/docs/design/keys/e2ee-rpc.md §3）。別人的 `m.file`／`m.image`／`m.video`／`m.audio`（標準附件，AES-CTR 或明文）是 `MatrixFile`（§2.3），下載照 /docs/design/media/media-download.md §12 |
-| `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
+| `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填（怎麼填：/docs/design/messages/message-actions.md §3.2） |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（/docs/design/messages/edits-and-redactions.md §2、§6，維護者 2026-09-14） |
 | `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
@@ -395,7 +395,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
 - 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
 
-還沒做：送 edit／delete／reaction／reply、已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
+還沒做：送 edit／delete／reaction／reply（形狀已定：/docs/design/messages/message-actions.md）、已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
 
 ## 7. 還開著的（再議）
 
