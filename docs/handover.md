@@ -162,7 +162,7 @@ vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/mat
 cargo test --workspace                       # 不含 matrix feature，快；含 cache feature 的測試要 --features cache
 cargo test -p wbf-sdk --features matrix      # 事件轉換、aggregate、錯密碼分類（起迷你 403 server）
 cargo clippy --workspace --all-targets --features wbf-sdk/matrix -- -D warnings   # 含 §8 那套「不准 panic」的 lint（crate 根的 deny）
-cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # FORBID --all：會格式化 submodule
+cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格式化 submodule
 ```
 
 對真 server（本機 wbfuwunel，Windows）：
@@ -207,11 +207,11 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # FORBID --all：會格
   在非 Unix 一律回 `true`（靠目錄 ACL）。所以「測試自己用 `std::fs::write` 寫 token 檔」
   在這裡全綠，到 Unix 上卻會被 daemon fail closed 擋掉、每個 process 測試都死在啟動
   （PR #31 審查 cirno🔴 抓到）。⭐ 寫測試用的私密檔一律走 `wbf_sdk::vault::write_private`，
-  FORBID 先 `std::fs::write` 再 chmod。📎 同一類的還有檔案鎖與權限位元 —— 平台差異的地方，
+  禁止先 `std::fs::write` 再 chmod。📎 同一類的還有檔案鎖與權限位元 —— 平台差異的地方，
   **綠燈只代表這個平台綠**。
 - **Windows 上剛關掉的 SQLite store 還會被握著幾百毫秒**：登出刪 `m/` 會撞 `os error 32`
   （`AccountDir::delete_matrix_store` 因此重試 10 × 100 ms）。⚠️ 它是**間歇的** —— 2026-09-13 對真
-  server 跑 daemon e2e 第一次紅、第二次就過。📎 重試完仍失敗就回錯，FORBID 吞掉：那時多半是別的程序
+  server 跑 daemon e2e 第一次紅、第二次就過。📎 重試完仍失敗就回錯，禁止吞掉：那時多半是別的程序
   開著同一個 store。
 - **core 的長工作 future 要 `Send`**：daemon 把每個請求 `tokio::spawn`，wbf-sdk 的回呼型別一律是
   `&mut (dyn FnMut(…) + Send)`。新加回呼型別漏了 `+ Send`，錯會在 daemon 的 `dispatch` 那一行爆，不在 sdk。
@@ -219,20 +219,20 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # FORBID --all：會格
 
 - ✅ ~~server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號不分裝置~~（wbfuwunel #78，2026-09-26 在 PR #88 修了：現在按 `(user, device, txn)` 算，跟 HTTP 一樣）。
   當時同帳號另一台裝置重用 txn_id 會拿到上次那則的 event_id，e2e 因此誤判過一次。client 的 `new_txn_id` 照舊是 128 位元隨機——修了之後也無害，不改。
-- **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server 回 `Forbidden`）：順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，FORBID 跳過 Subscribe 直接 Fetch。
+- **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server 回 `Forbidden`）：順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，禁止跳過 Subscribe 直接 Fetch。
   訂了之後 server 隨時推東西進來（別人 claim 你一把 OTK 就推 CryptoState），而通道現在只有「送一個等一個」——這就是第 4 階段要解的事。
 - **已追蹤的人只靠 `update_tracked_users` 不會再查**：要「這個人變了、重查」用 `OlmEngine::mark_users_changed`（走 `device_lists.changed` 同一個入口）。
 - **上游 `encrypt` 在房間沒有 outbound session、或 session 過期時是 panic 不是回錯**（`expect("Session wasn't created nor shared")`、`assert!(!session.expired())`）：
-  sdk 的 `encrypt_and_send` 先問 `room_key_state`（有、沒到期、沒作廢、排過的全拿到 Ack），不是 `Ready` 就不加密；加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住），一樣回 `RoomKeyNotReady`（1402、交給後台）。FORBID 繞過它直接叫上游的 `encrypt_room_event_raw`。
+  sdk 的 `encrypt_and_send` 先問 `room_key_state`（有、沒到期、沒作廢、排過的全拿到 Ack），不是 `Ready` 就不加密；加密那一步再用 `catch_unwind` 接住跨過期限那一瞬間（實測接得住），一樣回 `RoomKeyNotReady`（1402、交給後台）。禁止繞過它直接叫上游的 `encrypt_room_event_raw`。
   上游 `share_room_key` 本身不上網（只排 to-device），而且**換金鑰時會丟掉舊那把還沒送出的 to-device**（只回新那把的待送）：所以金鑰只在後台建、換、送，送出只用全部 Ack 的那把（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）。
   沒 Olm 通道的裝置排成 `m.no_olm`，之後再補只拿得到之後的位置：所以 `distribute_room_key` 先 claim 建通道再排。
 - **`XNonce::from_slice` 長度不對會 panic**：檔案裡讀來的 nonce 一律先過 `vault::decode_nonce`（壞的 `local.key`／`session.sealed` 曾經能讓 daemon 死掉，2026-10-06 key_share 的壞檔測試抓到）。
 - **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
 - ruma 組請求對要 token 的端點一定要給 token：引擎給占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填。
-- **D 槽會滿**：連結器 `1201`／`1180`／`1318`、`os error 112`（磁碟空間不足）、`invalid metadata` 先 `df -h /d`。FORBID 整個 `cargo clean`（重編 matrix-sdk 一輪十幾分鐘）。
+- **D 槽會滿**：連結器 `1201`／`1180`／`1318`、`os error 112`（磁碟空間不足）、`invalid metadata` 先 `df -h /d`。禁止整個 `cargo clean`（重編 matrix-sdk 一輪十幾分鐘）。
   先清「現在的建置用不到的舊產物」：等這一輪該編的都編完，對 `cargo test --workspace --no-run`、`cargo clippy --workspace --all-targets --features wbf-sdk/matrix`、
   `cargo test -p wbf-sdk --features matrix --no-run` 各跑一次 `--message-format=json`（都是新鮮度檢查、不重編），收 `compiler-artifact` 的檔名，`target/debug/deps` 裡不在清單上的就是舊的
-  （2026-09-29 這樣清出 2.47G，全是舊版 matrix-sdk 的變體）。還不夠才 `cargo clean -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-cli -p wbf-wire`（2026-09-21 清出 25.7G），FORBID 清 deps。
+  （2026-09-29 這樣清出 2.47G，全是舊版 matrix-sdk 的變體）。還不夠才 `cargo clean -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-cli -p wbf-wire`（2026-09-21 清出 25.7G），禁止清 deps。
 - `cargo fmt --all` 會格式化 `vendor/matrix-rust-sdk`（path dependency）。用 `-p`。commit 前看 `git -C vendor/matrix-rust-sdk status` 是空的。
 - 帶 `--features matrix` 的第一次編譯很久（matrix-sdk 全家）；放背景。
 - Windows 的 autocrlf 會把向量 JSON 換成 CRLF，`client_vectors.rs` 比對前有 normalize；`*.sh` 靠 `.gitattributes` 保持 LF。
@@ -240,8 +240,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # FORBID --all：會格
 - matrix-sdk 的錯誤不能 parse Display 字串抓 errcode（永遠抓不到），用 `client_api_error_kind()`。有回歸測試。
 - wbfuwunel 對 `Create` 的回應標頭 `id` 是新上傳 id，不是線上規格說的抄回 0；SDK 兩種都收，只對 `Create` 放寬。
 - `watch` 對齊「現在」要一次 sync，debug build 啟動超過一秒；測時序要留餘裕。
-- **同一條線再 `hello` 會蓋掉 feature 宣告**（server 把宣告記在連線上、下一個 Hello 覆蓋，沒帶就收回）：只有開線的人 hello，池發出去的 client 帶它的結果（`WbfClient::with_hello`）；FORBID 在池裡的線上重 hello（2026-10-05 拿掉 `ping`／`room.history`／`sync.recent` 三處）。
-- **FORBID 一個命令握著一個 `PooledClient` 再要同一條線的第二個**：一格是讀寫鎖，中間有人等寫鎖（登出、重開）就互等。要同時送就各拿各的（/docs/design/daemon/link-pool.md §5）。
+- **同一條線再 `hello` 會蓋掉 feature 宣告**（server 把宣告記在連線上、下一個 Hello 覆蓋，沒帶就收回）：只有開線的人 hello，池發出去的 client 帶它的結果（`WbfClient::with_hello`）；禁止在池裡的線上重 hello（2026-10-05 拿掉 `ping`／`room.history`／`sync.recent` 三處）。
+- **禁止一個命令握著一個 `PooledClient` 再要同一條線的第二個**：一格是讀寫鎖，中間有人等寫鎖（登出、重開）就互等。要同時送就各拿各的（/docs/design/daemon/link-pool.md §5）。
 - **測試裡開訂閱線要照正式路徑的順序**：`init_connection` 放在 `pool.acquire` 的開線閉包裡跑（`test_support::subscribed_keys`）。先 init 再放進池的話，task 一起來就 `reuse` 會看到空格，第一個 `CryptoState` 的補上傳落空（#62 的測試抓到過）。
 - **daemon 的真 server 測試要等線開好**：`account.add`／`vault.unlock` 之後五條線在背景開（/docs/design/daemon/link-pool.md §3.1）；要驗推播，先 `wait_for_links(5)` 再送——訂閱不補訂閱之前的訊息。
 - **`target/e2e/tuwunel.exe` 不一定是 server main 編的**：先在 wbfuwunel 看 `git branch --show-current`。2026-09-30 那顆是未合併的 `docs/room-version-prev`（房間版本號改成成員集合的雜湊、不遞增）——client 只比房間版本號相不相等，測試也只能這樣斷言。
@@ -287,15 +287,15 @@ UI 框架比較。
 - 一律開分支送 PR，merge commit，不 rebase、不 squash、不 amend、不 force push。
 - 每個 PR 描述要列「新增了對上游的哪些依賴」（/docs/design/overview/architecture-v2.md §8）。
 - 會 breaking Matrix 兼容的設計先寫給維護者，不自己選。
-- 🔒 **資料目錄綁定 daemon**（維護者 2026-09-30）：前端（UI、rpc-cli）只能發 RPC 請 daemon 改，FORBID 越過 daemon 直接寫；不拿 `daemon.lock` 就寫是非法侵占。
+- 🔒 **資料目錄綁定 daemon**（維護者 2026-09-30）：前端（UI、rpc-cli）只能發 RPC 請 daemon 改，禁止越過 daemon 直接寫；不拿 `daemon.lock` 就寫是非法侵占。
 - 📑 **引用文件寫從 repo 根目錄算的完整路徑加章節**（維護者 2026-09-30）：`/docs/design/keys/e2ee-rpc.md §3`；只有指同一份文件自己的章節才只寫 `§3`。搬家或改名時 grep 完整路徑就找得到每一處。
 - 📜 **設計文件只講現在的約定與理由**（維護者 2026-09-30）：被推翻的版本、進度、「第 N 步」「PR #x 合併了」不寫進文件，歷史在 git；改規則的那支 PR 同時掃掉舊說法。
 - 審查者 cirno／rumia／salvia 每個 PR 都會來；逐條回應，能改就改，不改講理由。
-- 🧭 **狀態放 UI、動作能自動就自動**（維護者 2026-09-29，/docs/design/keys/e2ee-rpc.md §0）：「誰記住什麼」預設是 UI（房間版本號、同步起點、`txn_id`），daemon 不存快照；「被擋之後該補的」daemon 順手做完再一起回（1506 → 自動 refresh、新狀態放錯誤的 `data`），但 FORBID 替 UI 做決定（不自動重送、`DeviceChanged` 只轉不叫 refresh）。兩題分開答：狀態放哪、動作能不能順手做完。
+- 🧭 **狀態放 UI、動作能自動就自動**（維護者 2026-09-29，/docs/design/keys/e2ee-rpc.md §0）：「誰記住什麼」預設是 UI（房間版本號、同步起點、`txn_id`），daemon 不存快照；「被擋之後該補的」daemon 順手做完再一起回（1506 → 自動 refresh、新狀態放錯誤的 `data`），但禁止替 UI 做決定（不自動重送、`DeviceChanged` 只轉不叫 refresh）。兩題分開答：狀態放哪、動作能不能順手做完。
 - 🔌 **訂閱與連線總是由 daemon 搞定**（維護者 2026-09-29，/docs/design/daemon/link-pool.md §3.1）：解鎖／登入後五條線全開、背景每 15 秒看一次；UI 收不收推播用 `subscribe`，**沒有**開關上游訂閱的 RPC。
 - 🧯 **正式碼不用會讓整支程式收掉的方法**（維護者 2026-09-23）：`unwrap()`、`expect()`、`panic!`、`unreachable!`、`todo!`、`[i]` 直接索引／切片。
   每個失敗要有去處（`?` 往上丟、給安全值、`get`／`split_at_checked`、mutex 用 `unwrap_or_else(|p| p.into_inner())`）；「這裡不可能失敗」不是理由，「CLI 炸了就炸了」也不是。
-  唯一的例外是「沒有它就沒有這支程式」的層級（runtime、主執行緒起不來），那也是講清楚、給 exit code，FORBID panic。
+  唯一的例外是「沒有它就沒有這支程式」的層級（runtime、主執行緒起不來），那也是講清楚、給 exit code，禁止 panic。
   **閘門在每個 crate 根**：`#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing, clippy::string_slice))]`——
   非測試建置有一個就編不過；測試建置（`#[cfg(test)]` 模組、`tests/*.rs`）放行，測試就是要看到它炸。
   這支 PR 把當時的 141 處全部給了去處（含 CLI）；server 端同一條規則在 wbfuwunel #83。

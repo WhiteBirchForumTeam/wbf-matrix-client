@@ -25,7 +25,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 4. **編輯先只做文字**：目標必須是 `m.text`。改附件說明（Telegram 的 `editMessageCaption`）之後再補。
 5. **同一個表情：UI 切換，daemon 照寫**（維護者 2026-11-04 原話：「UI 點第一下是新加表情，點第二下已存在的應該收回該表情，但 daemon 對送出／收回應該照寫」）：
    - **切換是 UI 的事**：這個 key 沒有 `mine` → 叫 `room.react`；有 `mine` → 拿它叫 `room.redact`。
-   - `room.react` 只會「加」，`room.redact` 只會「收」。daemon：FORBID 把 `room.react` 改成收回。
+   - `room.react` 只會「加」，`room.redact` 只會「收」。daemon：禁止把 `room.react` 改成收回。
    - daemon 唯一的「不再送」是冪等：本地看得到這個帳號已經按過同一個 key，就回那則的 `event_id`，不再送一則（§4.3）。效果跟同一個 `txn_id` 重送一樣。
 
 ## 2. RPC
@@ -74,7 +74,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 
 ### 3.1 回覆
 
-在原本的 content 上加 `m.relates_to`。FORBID 在 `body` 塞引文：規格已廢 fallback 引文（/docs/design/rooms/chat-model.md §3.4）。
+在原本的 content 上加 `m.relates_to`。禁止在 `body` 塞引文：規格已廢 fallback 引文（/docs/design/rooms/chat-model.md §3.4）。
 
 ```jsonc
 { "msgtype": "m.text", "body": "好",
@@ -97,7 +97,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 - 被回覆的人是自己 → 不加（規格：`m.mentions` 不放自己）。
 - `user_ids` 去重，照「`mentions` 的順序、被回覆的人放最後」排，測試好斷言。
 - ⚠️ 為什麼有回覆時一定要帶：只要送了 `m.mentions`，對方的 client 就**不再**從 body 文字裡找 @ 名字。
-  所以 body 裡 @ 到的其他人要由 UI 放進 `mentions`。daemon：FORBID 從 body 解析 @ 名字。
+  所以 body 裡 @ 到的其他人要由 UI 放進 `mentions`。daemon：禁止從 body 解析 @ 名字。
 
 ### 3.3 編輯（`room.edit`）
 

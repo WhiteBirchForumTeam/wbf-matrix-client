@@ -75,7 +75,7 @@ pub struct Conversation {
 }
 ```
 
-**房間列表與單一房間分開拿**（維護者 2026-10-05）：daemon 是中間層，照 UI 的指令做，FORBID 一個命令替 UI 做完所有事。
+**房間列表與單一房間分開拿**（維護者 2026-10-05）：daemon 是中間層，照 UI 的指令做，禁止一個命令替 UI 做完所有事。
 
 - `room.list` 只問 server「加入了哪些房」（wbf 帳號是一個 `JoinedRooms`），跟本地比對差異：新的加一列、樣子先空著；拿過的**不**覆寫；
   退出的標起來（`room_list.membership = leave`），**不**刪列（刪列只有 `room.forget`）。每列記這個帳號在這間房的身分（join／invite／knock／leave／ban，/docs/design/rooms/room-actions.md §3），
@@ -166,7 +166,7 @@ pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: 
 ```
 
 **傳統附件**（`MatrixFile`，維護者 2026-10-06）：別的 client（Element…）送的標準附件。`kind` 看**事件內容**，**不**看帳號：有 `file` 是 2，只有 `url` 是 3。
-`file` 欄位不齊（不是 `v2`、少 `key`／`iv`／`hashes.sha256`／`url`）→ FORBID 退回當成 `url` 的明文，整則當 `Unsupported`（fail closed）。
+`file` 欄位不齊（不是 `v2`、少 `key`／`iv`／`hashes.sha256`／`url`）→ 禁止退回當成 `url` 的明文，整則當 `Unsupported`（fail closed）。
 `name` 取 `filename`，沒有就取 `body`；`filename` 在而且跟 `body` 不一樣時，`body` 是說明文字（`caption`）。下載與讀取照 /docs/design/media/media-download.md §12。
 JSON（實際跑 `event_json::message_from_json` 印出的 `kind`，金鑰換成 `<…>`）：
 
@@ -238,7 +238,7 @@ Matrix 沒有「DM」型別，只有慣例：建房時 `is_direct: true`，雙�
 - `kind == Direct` 的條件：`m.direct` 裡有它，**且**已加入的成員剛好兩個。不滿足就當 Group，不猜。
 - 同一個 peer 有多個 Direct：取最近有訊息的那個當「這個人的對話」，其他照列但 `direct_peer` 一樣填；UI 可以合併顯示。
   **不**自動退出多的那些（那是使用者的資料）。
-- 建 Direct（`room.create { is_direct: true, invite: [p] }`）**一律建新房**，順便把「`p` → 這間房」寫進自己的 `m.direct`；**不**先找既有的（維護者 2026-10-07：FORBID daemon 替 UI 串動作）。
+- 建 Direct（`room.create { is_direct: true, invite: [p] }`）**一律建新房**，順便把「`p` → 這間房」寫進自己的 `m.direct`；**不**先找既有的（維護者 2026-10-07：禁止 daemon 替 UI 串動作）。
   「一個人一個聊天」要不要沿用舊房是 UI 從房間列表判斷的事（/docs/design/rooms/room-actions.md §1 第 2、3 條）。之後要改自己的 `m.direct` 叫 `room.set_direct`（/docs/design/rooms/room-actions.md §2.5）。
 - 還沒做：多個 Direct 的挑選與合併。
 
@@ -344,7 +344,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 | client 端 | `Message.r_seq: Option<i64>`、`Message.g_seq: Option<i64>`（`protocol::event_seqs`）。`unsigned` 是 server 加的、不進雜湊、送聯邦時被剥掉，其他 client 無感 |
 | offset | 一對 `(event_id, r_seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`r_seq` 是本地算術用；比較用 `r_seq` |
 | `sent_at` | 只當顯示用的時間 |
-| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r, more }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（wbfuwunel 的 pack-pipeline.md §6.4）：一窗收完且 **`more: false`** 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`more: true`（窗停在則數或**位元組**上限）帶 `before = 最後的 ls` 再一窗、水位不動。🚨 FORBID 拿 `tc < limit` 判斷追平：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14）；缺 `more` 當 `true`；空窗就是追平；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。水位只由 UI 叫的 `sync.recent` 動（/docs/design/rooms/room-sync.md §1） |
+| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r, more }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（wbfuwunel 的 pack-pipeline.md §6.4）：一窗收完且 **`more: false`** 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`more: true`（窗停在則數或**位元組**上限）帶 `before = 最後的 ls` 再一窗、水位不動。🚨 禁止拿 `tc < limit` 判斷追平：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14）；缺 `more` 當 `true`；空窗就是追平；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。水位只由 UI 叫的 `sync.recent` 動（/docs/design/rooms/room-sync.md §1） |
 | 還沒有的 | server 端「`r_seq` → 事件」的反查（跳到第 N 則直接問）：server 列為候選。在那之前用 `/messages` 二分逼近，或只提供「跳到快取裡有的第 N 則」 |
 
 **退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `r_seq`。client 必須顯式判斷它在不在，不靠巧合：

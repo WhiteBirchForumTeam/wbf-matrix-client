@@ -10,7 +10,7 @@ UI 叫一個 RPC，daemon 做一個房間動作，回 server 給的結果。會�
 ## 1. 已定的（維護者 2026-10-07）
 
 1. **這支只做房間動作**：建房、加入、退出、忘記、邀請、踢人、封鎖、解除封鎖、改名、改主題、改權限、置頂。
-2. **建 Direct 一律建新房**：**不**先找既有的 Direct（FORBID daemon 替 UI 串動作）。要不要沿用舊房由 UI 從房間列表判斷（/docs/design/rooms/chat-model.md §3.1）。
+2. **建 Direct 一律建新房**：**不**先找既有的 Direct（禁止 daemon 替 UI 串動作）。要不要沿用舊房由 UI 從房間列表判斷（/docs/design/rooms/chat-model.md §3.1）。
 3. **`is_direct: true` 時 `room.create` 順便寫 `m.direct`**：建完房，daemon 讀帳號資料的 `m.direct`、把「每個 `invite` 的人 → 這間房」加進去、寫回。Matrix 規格要 client 做這件事；不寫的話，別的 client 不會把它當成一對一。
    這一步失敗**不**回錯（房已經建好了），推一則 `note` 請 UI 叫 `room.set_direct`。
 4. **channel 與權限全交給 UI**：daemon **不**認得「channel」。UI 自己「建房＋改權限」兩步；daemon 只負責**權限怎麼寫**（照 Matrix 的 `m.room.power_levels` 格式），
@@ -40,7 +40,7 @@ UI 叫一個 RPC，daemon 做一個房間動作，回 server 給的結果。會�
 每支都帶 `user?`、`server?`（/docs/design/rpc-specs/rpc-spec.md §2）。**參數照 Matrix 的名字與格式，結果是 server 回的 body 原樣**（§1 第 14 條）；server 回的錯照原樣往上帶：`1400`，`data` 是 server 的 Matrix 錯誤（例：權限不夠是 `status` 403、`errcode` `M_FORBIDDEN`，/docs/design/rpc-specs/rpc-spec.md §5.3）。
 ⚠️ `user`／`server` 已經是「哪個帳號」，所以**被動到的那個人叫 `user_id`**（Matrix body 本來就是這個名字）、公開目錄問哪一台叫 `directory_server`（Matrix 的 query 是 `server`，對不上是不得已）。
 **一張端點表、兩條路**（`crates/wbf-sdk/src/matrix_endpoint.rs`）：wbf 帳號走 wbfuwunel 的橋（wbfuwunel 的 /docs/bridge-specs/0x13-room.md、0x14-event.md、0x11-account.md，下表只寫 kind 與編號）；
-一般 Matrix 帳號照同一個 HTTP 端點送（同一份變數、同一份 body、同一個「變數合不合橋的規則」檢查）。FORBID 各端點去找 matrix-sdk 的現成方法：那會是兩份實作、遲早漂。
+一般 Matrix 帳號照同一個 HTTP 端點送（同一份變數、同一份 body、同一個「變數合不合橋的規則」檢查）。禁止各端點去找 matrix-sdk 的現成方法：那會是兩份實作、遲早漂。
 matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間的讀都先 sync 一次）。
 「批 3／批 4」是 server 後來才開的端點，接之前先讀本 repo issue #55 列的十個坑（/docs/handover.md §6）。
 
@@ -69,7 +69,7 @@ matrix-sdk 的 store 下一次 sync 就看得到這些動作的結果（房間�
 
 `room.create`：除了 `encrypted`，每個參數都**原樣**進 CreateRoom 的 body（名字、格式、預設值都是 Matrix 的，daemon **不**補預設）。`encrypted: true` 時 daemon 在 `initial_state` 加
 `{ "type": "m.room.encryption", "state_key": "", "content": { "algorithm": "m.megolm.v1.aes-sha2" } }`；UI 自己在 `initial_state` 放了 `m.room.encryption` 而 `encrypted` 給 `false`（兩邊說的相反）→ 用法錯（`1100`，`crates/wbf-sdk/src/room_state_edit.rs` 的 `to_create_room_body`）；沒帶 `encrypted` 是參數錯（`102`）。
-UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`state_key` 是空的或省略——`initial_state` 省略時就是空字串，Matrix 規格——、content 有非空的 `algorithm`，跟寫完狀態升 `rooms.encrypted` 是同一句：`crates/wbf-sdk/src/room_state.rs` 的 `is_encryption_event`），不是就 `1100`：FORBID 把它當成「已經加密」、省掉 daemon 補的那則——那會建出明文房、本地卻記成加密（PR #76 審查）。
+UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`state_key` 是空的或省略——`initial_state` 省略時就是空字串，Matrix 規格——、content 有非空的 `algorithm`，跟寫完狀態升 `rooms.encrypted` 是同一句：`crates/wbf-sdk/src/room_state.rs` 的 `is_encryption_event`），不是就 `1100`：禁止把它當成「已經加密」、省掉 daemon 補的那則——那會建出明文房、本地卻記成加密（PR #76 審查）。
 📎 想建「公開可搜」的房（/docs/design/rooms/chat-model.md §3.6）：`preset: "public_chat"`＋`initial_state` 帶 `m.room.history_visibility: world_readable`，要列進目錄再加 `visibility: "public"`——全是 UI 組。
 
 ### 2.2 房間狀態（Event kind 的 `0x21`–`0x23`）
@@ -139,11 +139,11 @@ UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`st
 | `room.ban` | 被封鎖的人是本機帳號 → 它那一列 `membership = ban`（列不在就加） |
 | `room.unban` | 被解除的人是本機帳號、它那一列是 `ban` → 改成 `leave`（Matrix 裡解除封鎖之後是 `leave`，要再邀請或自己加入才回來） |
 | `room.upgrade` | 新房（`replacement_room`）加一列 `membership = join`、`conversation_json` 空著；舊房那一列**不**動（還在舊房裡，舊房多了墓碑，下次 `room.get` 看得到） |
-| `room.set_state` 與它所有的窄版 | 自己那一列有拿過狀態（`conversation_json` 帶 `state`）就把那一項換成這次寫的，再用整份 `state` 重算型別欄位（`name`、`topic`、`encrypted`、`my_power_level`、`can_send_message`、`kind`；成員那幾欄 `member_count`、`direct_peer` 照舊；跟 `room.get` 同一套規則，`crates/wbf-sdk/src/room_state.rs` 的 `conversation_with_state_event`）。沒拿過狀態（還沒 `room.get` 過、或一般 Matrix 帳號只在 `room.list` 上）就**不**寫。那份 `state` 是列表留下來的（`room_list.is_state_carried_over`：一般 Matrix 帳號的 `room.list` 帶來新的型別欄位、狀態則是上次 `room.get` 的）也**不**寫：拿舊狀態重算會把新的名字、權限改回舊的。重算不出來（例：存著的狀態沒有 `m.room.create`）也**不**寫那一列、照樣回成功；下一次 `room.get` 整份蓋上。其他帳號那一列是它們自己看到的樣子，下次它們 `room.get` 才更新。⚠️ 名字：沒有名字也沒有別名的房，名字是用成員湊的（成員不在 `state` 裡）——原本就是湊的照舊；原本是名字或別名、這次把它拿掉了，就變 `null`，下次 `room.get` 才湊得回來（FORBID 留著已經不成立的舊名字） |
+| `room.set_state` 與它所有的窄版 | 自己那一列有拿過狀態（`conversation_json` 帶 `state`）就把那一項換成這次寫的，再用整份 `state` 重算型別欄位（`name`、`topic`、`encrypted`、`my_power_level`、`can_send_message`、`kind`；成員那幾欄 `member_count`、`direct_peer` 照舊；跟 `room.get` 同一套規則，`crates/wbf-sdk/src/room_state.rs` 的 `conversation_with_state_event`）。沒拿過狀態（還沒 `room.get` 過、或一般 Matrix 帳號只在 `room.list` 上）就**不**寫。那份 `state` 是列表留下來的（`room_list.is_state_carried_over`：一般 Matrix 帳號的 `room.list` 帶來新的型別欄位、狀態則是上次 `room.get` 的）也**不**寫：拿舊狀態重算會把新的名字、權限改回舊的。重算不出來（例：存著的狀態沒有 `m.room.create`）也**不**寫那一列、照樣回成功；下一次 `room.get` 整份蓋上。其他帳號那一列是它們自己看到的樣子，下次它們 `room.get` 才更新。⚠️ 名字：沒有名字也沒有別名的房，名字是用成員湊的（成員不在 `state` 裡）——原本就是湊的照舊；原本是名字或別名、這次把它拿掉了，就變 `null`，下次 `room.get` 才湊得回來（禁止留著已經不成立的舊名字） |
 | 寫的是 `m.room.encryption`（`room.enable_encryption`，或 `room.set_state` 直接寫它） | 上一列之外，`rooms.encrypted = 1`，不管有沒有 `conversation_json`、上一列寫沒寫（重算失敗**不**把它一起回滾）（§3.2；這一欄是房間的事實，所有帳號共用、只升不降） |
 
 `server`：一律只打遠端，**不**碰本地。
-**寫本地失敗**（DB 壞了）：成功以 server 的 ACK 為準，照樣回成功，另推一則 `note`（例：`room.leave: !r:localhost was left on the server, but the local room list could not be updated (…); call room.list sync=both`）。FORBID 回錯：回錯 UI 會以為動作沒做而重做一次（維護者 2026-10-07）。
+**寫本地失敗**（DB 壞了）：成功以 server 的 ACK 為準，照樣回成功，另推一則 `note`（例：`room.leave: !r:localhost was left on the server, but the local room list could not be updated (…); call room.list sync=both`）。禁止回錯：回錯 UI 會以為動作沒做而重做一次（維護者 2026-10-07）。
 
 ### 3.1 `room.forget`：刪列，只剩自己時連聊天紀錄一起清
 
@@ -214,7 +214,7 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
 |---|---|
 | `Batch` 的一間 | 那間這一輪被碰過、而且碰的 `is` ≥ 這筆的 count → **不**寫（推播比較新，server §8 ②'）；否則 `membership = invite`（列不在就加）、`invite_json` 換成這筆 |
 | `r == 0`（補完） | 本地是 `invite`、這一輪沒出現、這一輪也沒被碰過的 → `membership = leave`、`invite_json = NULL`（離線期間被收回的；為什麼結束看不出來，標 `leave`，跟 `room.list` 處理退出的房同一套）。⚠️ **補到一半斷了就不刪**：那不是快照（server §8 ②） |
-| `Push` | 按 `room_id` 取代（server §8 ③）：`membership = invite`、`invite_json` 換成這筆。`sc == 0` 時那份 `state` 留著本地原本的（FORBID 拿「太大沒送」蓋掉「之前拿到的」，跟 `room.get` 的 `state` 同一條） |
+| `Push` | 按 `room_id` 取代（server §8 ③）：`membership = invite`、`invite_json` 換成這筆。`sc == 0` 時那份 `state` 留著本地原本的（禁止拿「太大沒送」蓋掉「之前拿到的」，跟 `room.get` 的 `state` 同一條） |
 | `Gone` | `membership` 改成它說的（`knock` 照寫）、`invite_json = NULL` |
 | `bc == 0` 的批次 | **不**推進續傳游標（沒有 `ns`） |
 
@@ -258,7 +258,7 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
     📌 本地自己掉的（收件匣滿過、一包解不開）也併進下一則的 `gap`：對 UI 來說「掉了」就是掉了，**不**分是誰掉的。
 - server 還不認得 `Invite`（`Subscribe` 被拒）：房間的訂閱照跑、講一聲（`note`），只是沒有推播；`room.invites` 會拿到同一個錯。
 - 🚨 **`is_from_this_server`**（daemon 加的，維護者 2026-10-14）：`inviter` 的網域跟這個帳號的網域**逐字相同**才是 `true`；沒有 `inviter`、網域解不出來，一律 `false`（fail closed）。
-  `false` 時 `state` 裡的房名、頭像、topic 都是**對方 server 說的**：縮減狀態沒有簽章，就算有也驗不動（要先加入才驗得了，而要不要加入正是這則邀請在問的，server §5.2.3）。UI：FORBID 把它當成已驗證的事實顯示。只有 `inviter` 本身有協定綁定。
+  `false` 時 `state` 裡的房名、頭像、topic 都是**對方 server 說的**：縮減狀態沒有簽章，就算有也驗不動（要先加入才驗得了，而要不要加入正是這則邀請在問的，server §5.2.3）。UI：禁止把它當成已驗證的事實顯示。只有 `inviter` 本身有協定綁定。
 - `room.get` 對被邀請的房照舊會被 server 拒（還沒加入）；UI 顯示「某某邀你加入某某房」靠的是 `invite`。
 
 #### 3.3.5 一般 Matrix 帳號（甲，維護者 2026-10-14）
@@ -311,7 +311,7 @@ server 那半是 wbfuwunel PR #113（issue #111），權威是它的 /docs/desig
 | 數字欄（`users_default`、`events_default`、`state_default`、`invite`、`kick`、`ban`、`redact`） | 給了就換成這個值；沒給就照舊 |
 | `users`、`events`、`notifications`（對照表） | **逐個 key 合併**：給的 key 覆蓋、沒給的 key 照舊；某個 key 給 `null` ＝ 把它從表裡拿掉（回到預設） |
 | 都沒給 | 用法錯（`1100`），**不**寫一份一樣的回去 |
-| 房間沒有 `m.room.power_levels` | 用法錯（`1100`）：FORBID 從空的開始合——省掉的欄位會落到「事件在」的預設，建房者會丟掉 100；要寫就用 `room.set_state` 寫整份 |
+| 房間沒有 `m.room.power_levels` | 用法錯（`1100`）：禁止從空的開始合——省掉的欄位會落到「事件在」的預設，建房者會丟掉 100；要寫就用 `room.set_state` 寫整份 |
 
 例（本機 wbfuwunel 實跑，`crates/wbf-daemon/tests/real_server.rs` 的 `room_actions_walk_the_server_and_the_local_rows_of_two_accounts`：alice 把發言門檻拉到 100，這間房在 `room.get` 就變成 `channel`）：
 
