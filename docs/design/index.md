@@ -77,4 +77,4 @@
 
 | 文件 | 講什麼 |
 |---|---|
-| [`/docs/design/wire/wbf-vectors.json`](wire/wbf-vectors.json) | 從 wbfuwunel 整份複製的黃金向量，🚫 不手改（wire `tests/vectors.rs`、sdk `tests/unit.rs` 讀它） |
+| [`/docs/design/wire/wbf-vectors.json`](wire/wbf-vectors.json) | 從 wbfuwunel 整份複製的黃金向量，FORBID 手改（wire `tests/vectors.rs`、sdk `tests/unit.rs` 讀它） |
