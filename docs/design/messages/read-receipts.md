@@ -121,23 +121,25 @@ wbfuwunel 的橋兩種都收（/docs/bridge-specs/0x15-receipt.md `0x22`），�
 - ⭐ 為什麼沒帶參數時落到 conf、最後落到 private：**「要不要被看見」是使用者的長期偏好**。第一個忘了帶參數的地方
   不該把使用者曝光出去 —— 那種錯誤是**不可回收的**（別人已經看到了）。參數是給 UI 做「這一則例外」用的。
 
-## 6 `daemon.reload_conf`：所有鍵立刻重讀（維護者 2026-11-05）
+## 6 `daemon.reload_conf`：立刻重讀，會影響連線的鍵例外（維護者 2026-11-05）
 
 ```jsonc
 { "method": "daemon.reload_conf", "params": {}, "id": 8 }
-→ { "ok": true, "changed": ["READ_RECEIPTS"], "warnings": [] }
+→ { "ok": true, "changed": ["READ_RECEIPTS"], "needs_restart": ["TRANSPORT"], "warnings": [] }
 ```
 
 - 讀的是**啟動時那一份**（同一個 `--config`，沒給就是資料目錄裡的 `wbf.conf`），規則跟啟動時一樣：檔案不在＝內建預設、`--config` 明指的不在或語法壞了＝錯誤。
-- **整份換、不套一半**：讀失敗 → 回 `1100`（帶原因）、**全部照舊**。讀成功 → 一次換掉，`changed` 列出值真的變了的鍵。
-- **上游會話不斷、本地連線不掉**（graceful）。每個鍵什麼時候生效：
+- **整份換、不套一半**：讀失敗 → 回 `1100`（帶原因）、**全部照舊**。讀成功 → 能重讀的鍵一次換掉，`changed` 列出值真的變了、而且已經生效的鍵。
+- **上游會話不斷、本地連線不掉**（graceful）。所以**會影響連線的鍵不重讀**：值變了也照舊用啟動時的，列進 `needs_restart`，daemon 完整重開才載入。
+  UI 拿 `needs_restart` 決定要不要提示使用者重開，**不**必去解析 `warnings` 的字。
 
 | 鍵 | 重讀之後 |
 |---|---|
 | `SERVER_BACKUP`、`LOCAL_ROOM_KEYS` | 下一個用到它的 RPC 起 |
 | `READ_RECEIPTS` | 下一個沒帶 `visible_to_others` 的 `room.read` 起 |
-| `TRANSPORT` | 沒帶 `transport` 的下一個 RPC 起；**線也跟著改**：`http` → `ws` 馬上開線（跟 `vault.unlock` 之後同一支 `ensure_links`）並開始常駐的重開迴圈；`ws` → `http` 馬上關掉所有 WS 線（各發 `link.state … closed`），因為 conf 的 `http` 是上限（/docs/design/overview/architecture-v2.md §5.1）。線上還在跑的請求照「線斷了」的那條路失敗 |
+| `TRANSPORT` | **不重讀**（會影響連線：決定開不開 WS 線，/docs/design/overview/architecture-v2.md §5.1）。值變了 → 進 `needs_restart`，完整重開才生效 |
 
+- 之後新加的鍵要在這張表上選一邊；**會影響連線的一律放「不重讀」那邊**。
 - 認不得的鍵照舊進 `warnings`（/docs/design/rpc-specs/wbf-cli-spec.md §10.4：警告、忽略、照跑）。
 
 ## 7 新房間
