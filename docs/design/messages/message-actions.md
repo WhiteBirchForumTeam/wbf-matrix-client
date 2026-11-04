@@ -6,7 +6,7 @@
 
 ## 0. 一句話
 
-UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 server 給的 `event_id`；送完🚫 寫本地，結果跟別人送的一樣從 Rooms 線推回來、照收的規則折進目標。
+UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 server 給的 `event_id`。daemon 送完**不**寫本地：結果跟別人送的一樣從 Rooms 線推回來，照收的規則折進目標。
 
 ## 1. 已定的（維護者 2026-11-04）
 
@@ -20,13 +20,13 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
    | 收回 | `deleteMessage` | 新的 `room.redact`：收回訊息、收回自己的表情都是它 | redaction |
 
 2. **收回自己的表情：`Reaction` 多一欄 `mine`**（甲）——讀的那個帳號自己按的那則反應的 `event_id`，UI 拿它叫 `room.redact`。
-   🚫 另開 `room.unreact`：收回表情在 Matrix 上就是收回一則事件，daemon 🚫 替 UI 找（§5）。
+   **不**另開 `room.unreact`：收回表情在 Matrix 上就是收回一則事件，那則的 id 已經在 `mine` 裡，daemon 不必替 UI 去找（§5）。
 3. **回覆填 `m.mentions`**：送出的 RPC 多一個 `mentions?`，原樣帶上去；有 `reply_to` 時 daemon 再把被回覆的人加進去（§3.2）。
 4. **編輯先只做文字**：目標必須是 `m.text`。改附件說明（Telegram 的 `editMessageCaption`）之後再補。
 5. **同一個表情：UI 切換，daemon 照寫**（維護者 2026-11-04 原話：「UI 點第一下是新加表情，點第二下已存在的應該收回該表情，但 daemon 對送出／收回應該照寫」）：
    - **切換是 UI 的事**：這個 key 沒有 `mine` → 叫 `room.react`；有 `mine` → 拿它叫 `room.redact`。
-   - **daemon 🚫 把 `room.react` 變成收回**。`room.react` 只會「加」，`room.redact` 只會「收」。
-   - daemon 唯一的「不再送」是冪等：本地看得到這個帳號已經按過同一個 key，就回那則的 `event_id`、🚫 再送一則（§4.3）。效果跟同一個 `txn_id` 重送一樣。
+   - `room.react` 只會「加」，`room.redact` 只會「收」。daemon：FORBID 把 `room.react` 改成收回。
+   - daemon 唯一的「不再送」是冪等：本地看得到這個帳號已經按過同一個 key，就回那則的 `event_id`，不再送一則（§4.3）。效果跟同一個 `txn_id` 重送一樣。
 
 ## 2. RPC
 
@@ -39,12 +39,12 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 | `room.send_attachment` | 現有的參數 ＋ `reply_to?`、`mentions?` | 不變 |
 | `room.edit` | `{ room, event_id, body, mentions?, room_devices?, txn_id? }` | `{ event_id }`：**edit 那則自己的** id |
 | `room.react` | `{ room, event_id, key, room_devices?, txn_id? }` | `{ event_id }`：那則反應的 id（冪等時是本地已有的那則） |
-| `room.redact` | `{ room, event_id, reason?, txn_id? }` | `{ event_id }`：**收回動作本身**那則的 id（不是被收回的那則） |
+| `room.redact` | `{ room, event_id, reason?, txn_id? }` | `{ event_id }`：**收回動作本身**那則的 id（被收回的那則是參數裡的 `event_id`） |
 
 - `event_id` 一律是**目標**（被回覆、被改、被按、被收回的那則）。
 - `mentions` 是 mxid 的陣列，例 `["@bob:localhost"]`。`@room`（`m.mentions.room`）不在這支。
-- `room_devices`、`txn_id`、1401／1402 跟 `room.send_text` 同一套（/docs/design/keys/e2ee-rpc.md §3）：加密房必帶 `room_devices`；`txn_id` 沒帶 daemon 產一個；🚫 自動重送。
-- `room.redact` **沒有 `room_devices`**：redaction 在 Matrix 上一律明文（§4.4）。
+- `room_devices`、`txn_id`、1401／1402 跟 `room.send_text` 同一套（/docs/design/keys/e2ee-rpc.md §3）：加密房必帶 `room_devices`；`txn_id` 沒帶 daemon 產一個；daemon NEVER 自動重送。
+- `room.redact` **沒有** `room_devices`：redaction 在 Matrix 上一律明文（§4.4）。
 
 ```jsonc
 → { "method": "room.send_text", "params": { "room": "!r:localhost", "body": "好", "reply_to": "$abc" } }
@@ -74,7 +74,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 
 ### 3.1 回覆
 
-在原本的 content 上加 `m.relates_to`；🚫 在 `body` 塞引文（規格已廢 fallback 引文，/docs/design/rooms/chat-model.md §3.4）。
+在原本的 content 上加 `m.relates_to`。FORBID 在 `body` 塞引文：規格已廢 fallback 引文（/docs/design/rooms/chat-model.md §3.4）。
 
 ```jsonc
 { "msgtype": "m.text", "body": "好",
@@ -90,12 +90,14 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 |---|---|---|
 | 沒有 | 沒有 | **整欄不帶**（跟現在一樣：對方照 body 文字找 @ 名字） |
 | 沒有 | 有 | `{ "user_ids": <mentions> }` |
-| 有 | 不管有沒有 | `{ "user_ids": <mentions> ∪ {被回覆的人} }` |
+| 有 | 有或沒有都一樣 | `{ "user_ids": <mentions> ∪ {被回覆的人} }` |
 
-- **被回覆的人從本地查**：目標在這個帳號的本地（`(room, event_id)` 找得到、而且這個帳號同步過）就取它的 `sender`；**查不到就不加、🚫 報錯**——回覆照送，只是對方可能不會被通知。
-- 被回覆的人是自己 → 不加（規格：🚫 提到自己）。
+- **被回覆的人從本地查**：目標在這個帳號的本地（`(room, event_id)` 找得到、而且這個帳號同步過）就取它的 `sender`。
+  查不到就不加，也**不**報錯：回覆照送，只是對方可能收不到通知。
+- 被回覆的人是自己 → 不加（規格：`m.mentions` 不放自己）。
 - `user_ids` 去重，照「`mentions` 的順序、被回覆的人放最後」排，測試好斷言。
-- ⚠️ 為什麼有回覆時一定要帶：只要送了 `m.mentions`，對方的 client 就🚫 再從 body 文字裡找 @ 名字。所以 body 裡 @ 到的其他人要由 UI 放進 `mentions`，daemon 🚫 parse body。
+- ⚠️ 為什麼有回覆時一定要帶：只要送了 `m.mentions`，對方的 client 就**不再**從 body 文字裡找 @ 名字。
+  所以 body 裡 @ 到的其他人要由 UI 放進 `mentions`。daemon：FORBID 從 body 解析 @ 名字。
 
 ### 3.3 編輯（`room.edit`）
 
@@ -106,9 +108,11 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 ```
 
 - 外層 `body` 是給不認得 edit 的 client 看的 fallback，照慣例前面加 `* `。
-- `m.new_content` 是**完整的新內容**（全量，/docs/design/messages/edits-and-redactions.md §5）。🚫 放 `m.relates_to`：回覆關係留在原訊息上，收的那半本來就是這樣讀（同一份 §5「`m.relates_to` 留自己原本的」）。
-- 帶了 `mentions`：`m.new_content.m.mentions = { user_ids: <mentions> }`（新版本的完整名單）；外層 `m.mentions` 只放**這次新加的**——`mentions` 減掉目標目前那一版的 `m.mentions.user_ids`（規格：改字🚫 重新通知已經被提過的人）。
-  沒帶 `mentions`：兩層都帶 `"m.mentions": {}`（改字🚫 通知任何人，也🚫 讓對方照 body 文字重新比對）。
+- `m.new_content` 是**完整的新內容**（全量，/docs/design/messages/edits-and-redactions.md §5），裡面**不**放 `m.relates_to`：
+  回覆關係留在原訊息上，收的那半本來就這樣讀（同一份 §5「`m.relates_to` 留自己原本的」）。
+- 帶了 `mentions`：`m.new_content.m.mentions = { user_ids: <mentions> }`（新版本的完整名單）；外層 `m.mentions` 只放**這次新加的**，
+  也就是 `mentions` 減掉目標目前那一版的 `m.mentions.user_ids`（規格：改字只通知新提到的人）。
+- 沒帶 `mentions`：兩層都帶 `"m.mentions": {}`。改字就**不**通知任何人，對方也**不會**照 body 文字重新比對。
 
 ### 3.4 表情（`room.react`）
 
@@ -117,7 +121,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$abc", "key": "👍" } }
 ```
 
-`key` 原樣送，daemon 🚫 檢查是不是 emoji（Matrix 的 key 是任意字串）；空字串 → 1100。
+`key` 原樣送：Matrix 的 key 是任意字串，daemon **不**檢查它是不是 emoji。空字串 → 1100。
 
 ### 3.5 收回（`room.redact`）
 
@@ -129,39 +133,39 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 
 - 加不加密看本地的 `rooms.encrypted`（/docs/design/rpc-specs/rpc-spec.md 的 `room.send_text` 那列）；不知道 → 1100。
 - 加密房：只用後台已經分好的房間金鑰，等就緒最多 2 秒，否則 1402；被 server 擋（號碼過期）→ daemon 重拿房間狀態、回 1401（/docs/design/keys/e2ee-rpc.md §3）。
-- **關係不會被包進密文**：上游加密時把 `m.relates_to` 拷到明文那層（vendor 的 `matrix-sdk-crypto/src/olm/group_sessions/outbound.rs:594`），server 與別的 client 都折得回目標。
-- **edit 與 reaction 的 event type 不是 `m.room.message`**：reaction 是 `m.reaction`。wbf 帳號送訊息的路（`crates/wbf-core/src/wbf_rooms.rs` 的 `wbf_send_message`）現在把 type 寫死成 `m.room.message`，要改成由呼叫者給。
+- **關係留在明文那層**：上游加密時把 `m.relates_to` 拷到明文那層（vendor 的 `matrix-sdk-crypto/src/olm/group_sessions/outbound.rs:594`），server 與別的 client 都折得回目標。
+- **reaction 的 event type 是 `m.reaction`**。wbf 帳號送訊息的路（`crates/wbf-core/src/wbf_rooms.rs` 的 `wbf_send_message`）現在把 type 寫死成 `m.room.message`，要改成由呼叫者給。
 
 ### 4.2 `room.edit` 先在本地擋（fail closed）
 
-目標必須**同時**滿足下面每一條，否則 1100、🚫 送：
+目標必須**同時**滿足下面每一條，否則回 1100、不送：
 
 | 條件 | 為什麼 |
 |---|---|
 | 在這個帳號的本地（`(room, event_id)` 找得到、這個帳號同步過） | 下面幾條都要讀它；找不到就驗不了 |
 | `sender` 是這個帳號自己 | 🚨 規格：sender 不同的 edit 無效 |
-| 本身不是 edit（`class` 是 `msg`） | 規格：🚫 edit 一個 edit |
-| 沒被收回（`is_redacted = 0`） | 收的那半會丟掉（/docs/design/messages/edits-and-redactions.md §5「寫入一個 edit 時」） |
-| 是 `m.room.message`、`msgtype` 是 `m.text` | 規格：edit 🚫 改 type；文字以外的這支不做（§1 第 4 條） |
-| 目標是加密的（`decrypted` 不是 NULL）→ 這次也要加密送 | 🚨 規格：明文 edit 蓋不掉加密訊息 |
+| 本身是一般訊息（`class` 是 `msg`），不是另一個 edit | 規格：edit 只能指向原始訊息 |
+| 還在（`is_redacted = 0`） | 已收回的目標，收的那半會丟掉它的 edit（/docs/design/messages/edits-and-redactions.md §5「寫入一個 edit 時」） |
+| 是 `m.room.message`、`msgtype` 是 `m.text` | 規格：edit 跟目標同一個 type；文字以外的這支不做（§1 第 4 條） |
+| 目標是加密的（`decrypted` 有值）→ 這次也要加密送 | 🚨 規格：加密訊息只能用加密的 edit 改 |
 
-⭐ **為什麼 daemon 擋、不交給 server**：這幾條違反了 server 照收，但**每個 client 都會丟掉那個 edit**（/docs/design/messages/edits-and-redactions.md §5 最後那張表）——送出看起來成功、其實沒人看得到。
-跟 `room.send_text`「本地不知道加不加密就報錯」是同一類：擋的是「送出去一定錯」，🚫 替 UI 做選擇。
+⭐ **為什麼 daemon 擋、不交給 server**：違反這幾條的 edit server 照收，但**每個 client 都會丟掉它**（/docs/design/messages/edits-and-redactions.md §5 最後那張表）。
+送出看起來成功，其實沒人看得到。這跟 `room.send_text`「本地不知道加不加密就報錯」是同一類：擋的是「送出去一定錯」的請求，**不是**替 UI 做選擇。
 
-📎 本地看到的可能比 server 舊（例：目標剛被別的裝置收回、還沒推到）。那種會照送，收的那半照規則丟掉——跟「送出之後才被收回」是同一件事。
+📎 本地看到的可能比 server 舊（例：目標剛被別的裝置收回、還沒推到）。那種會照送，收的那半照規則丟掉，跟「送出之後才被收回」是同一件事。
 
 ### 4.3 `room.react` 的冪等
 
-送之前查本地：這個帳號對這則、這個 `key` 已經有一則**沒被收回、這個帳號看得到**的反應 → 直接回它的 `event_id`、🚫 送。
-- 本地還沒有（例：剛送、還沒推回來）→ 照送。萬一 server 上因此有兩則，聚合會照人去重（§5），UI 看到的仍是一個。
-- 只查本地、🚫 問 server。
+送之前查本地：這個帳號對這則、這個 `key` 已經有一則**還在、這個帳號看得到**的反應 → 直接回它的 `event_id`，不送。
+- 本地還沒有（例：剛送、還沒推回來）→ 照送。萬一 server 上因此有兩則，聚合照人去重（§5），UI 看到的仍是一個。
+- 只查本地，**不**問 server。
 
 ### 4.4 `room.redact` 不加密、走端點表
 
-Matrix 的 redaction 在加密房也是明文，所以🚫 `room_devices`、🚫 1401／1402。
+Matrix 的 redaction 在加密房也是明文，所以**不**帶 `room_devices`，也**不會**回 1401／1402。
 走 `crates/wbf-sdk/src/matrix_endpoint.rs` 的那張表（多一列 `REDACT`，橋 `0x14 0x24`，wbfuwunel 的 /docs/bridge-specs/0x14-event.md）：
-wbf 帳號走橋、一般 Matrix 帳號走同一支 HTTP 端點——跟房間動作同一條接縫（/docs/design/rooms/room-actions.md）。
-daemon 🚫 檢查目標是誰的、在不在本地：收回別人的訊息要權限，由 server 照 power level 擋（1400）。
+wbf 帳號走橋、一般 Matrix 帳號走同一支 HTTP 端點，跟房間動作同一條接縫（/docs/design/rooms/room-actions.md）。
+daemon **不**檢查目標是誰的、在不在本地：收回別人的訊息要權限，由 server 照 power level 擋（1400）。
 
 ### 4.5 各帳號走哪條線
 
@@ -172,7 +176,7 @@ daemon 🚫 檢查目標是誰的、在不在本地：收回別人的訊息要�
 
 📎 「原生 `Event/Send` 收 `m.reaction` 型別」只讀過 server 文件、沒實跑，實作時在 e2e 裡驗。
 
-### 4.6 送完🚫 寫本地
+### 4.6 送完不寫本地
 
 跟 `room.send_text` 一樣：結果從 Rooms 線推回來，照 /docs/design/messages/edits-and-redactions.md §4 折進目標。UI 要「按下去就變」的話是 UI 自己先畫，等推播來再對齊。
 
@@ -185,9 +189,9 @@ daemon 🚫 檢查目標是誰的、在不在本地：收回別人的訊息要�
 ```
 
 - `mine` ＝**讀的那個帳號**（RPC 的 `user`）自己按的那則反應的 `event_id`；沒按過就整欄不帶。
-- 跟 `by` 同一條可見性規則（/docs/design/messages/edits-and-redactions.md §8「讀取」）：沒被收回、這個帳號同步過、沒 hide。
+- 跟 `by` 同一條可見性規則（/docs/design/messages/edits-and-redactions.md §8「讀取」）：還在、這個帳號同步過、沒 hide。
 - **`by` 照人去重**（順手修現在的 bug）：同一個人對同一個 key 有兩則（別的 client 送重了、或 §4.3 那個窗口），現在 `crates/wbf-sdk/src/cache.rs` 的 `list_reactions` 會把他算兩次。
-  去重之後 `mine` 取**最早**的那則（`ORDER BY x.id` 的第一則）。📎 兩則都在時，收回一則之後另一則還在、`mine` 換成它，UI 再點一次就收回它——照切換的規則一樣走得完。
+  去重之後 `mine` 取**最早**的那則（`ORDER BY x.id` 的第一則）。📎 兩則都在時，收回一則之後另一則還在、`mine` 換成它，UI 再點一次就收回它，照切換的規則一樣走得完。
 - 不寫庫的路（`sync=server`、watch 的通知，`event_json::messages_from_incoming`）也要算 `mine`，所以它要知道讀的帳號是誰。
 
 ## 6. 不在這支
