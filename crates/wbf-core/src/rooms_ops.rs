@@ -4,7 +4,7 @@
 //! 重拉，不是命令失敗）。所以這裡每個從 server 拿資料的路徑都是「拿到 → 試著寫快取 →
 //! 不管成不成功都回傳」。
 //!
-//! 🚫 這裡**不做任何互動**：「這個房間沒加密，你確定要送嗎」那種確認是前端的事（/docs/design/overview/architecture-v2.md §3）。
+//! 這裡**不做任何互動**：「這個房間沒加密，你確定要送嗎」那種確認是前端的事（/docs/design/overview/architecture-v2.md §3）。
 //! core 提供的是[`Core::conversation`]（讓前端問得到「加密了沒」）與一個**照做**的
 //! [`Core::send_file`]。
 
@@ -24,7 +24,7 @@ use crate::{Core, Target};
 use wbf_sdk::Transport;
 
 /// 一頁訊息。`next` 是下一頁的游標；⚠️ 過濾之後 `events` 可能是空的但 `next` 還在，
-/// 呼叫端要照 `next` 判斷有沒有下一頁，🚫 不要看 `events` 空不空。
+/// 呼叫端要照 `next` 判斷有沒有下一頁，禁止看 `events` 空不空。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MessagePage {
     pub events: Vec<Message>,
@@ -74,14 +74,14 @@ pub struct HistoryQuery {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncMode {
-    /// 只讀 `cache.db`，🚫 不連網。⚠️ 翻頁的 `before` 這時是 `r_seq` 的數字，不是 server 的 token。
+    /// 只讀 `cache.db`，**不**連網。⚠️ 翻頁的 `before` 這時是 `r_seq` 的數字，不是 server 的 token。
     #[default]
     Local,
-    /// 打上游、拿到什麼回什麼。🚫 **不寫快取** —— 這是「看一眼」，不是同步。
+    /// 打上游、拿到什麼回什麼。**不寫快取** —— 這是「看一眼」，不是同步。
     /// 📎 分開的理由：對帳時要看得見「上游說 A、本地存的是 B」，順手寫回去那個差異就消失了。
     Server,
     /// 打上游 → 寫進 `cache.db` → **再從本地讀一次**回傳。
-    /// ⭐ 回的是本地讀的結果，所以形狀跟 `Local` 一模一樣，呼叫端🚫 不必寫兩套解析。
+    /// ⭐ 回的是本地讀的結果，所以形狀跟 `Local` 一模一樣，呼叫端**不**必寫兩套解析。
     Both,
 }
 
@@ -93,7 +93,7 @@ impl Core {
     ///     memberships: 要哪幾種身分的房（/docs/design/rooms/room-actions.md §3）；UI 沒給就是 `[Join]`, example: &[Membership::Join]
     /// Return:
     ///     Ok(Vec<RoomListEntry>)   `Local`／`Both`：本地讀的（`Both` 先把加入名單的差異寫進去）；
-    ///                              `Server`：上游說的、🚫 寫庫（wbf 帳號只有 id）——server 只答「加入了哪些」，沒要 `Join` 就是空的
+    ///                              `Server`：上游說的、**不**寫庫（wbf 帳號只有 id）——server 只答「加入了哪些」，沒要 `Join` 就是空的
     pub async fn list_rooms(
         &self,
         sync: SyncMode,
@@ -106,7 +106,7 @@ impl Core {
             let entries = cache.read().await.list_room_entries(&me, memberships)?;
             return Ok(entries);
         }
-        // server 只答「加入了哪些」：看一眼又沒要 `join`，答案一定是空的，🚫 白打一次上游。
+        // server 只答「加入了哪些」：看一眼又沒要 `join`，答案一定是空的，**不**白打一次上游。
         if sync == SyncMode::Server && !memberships.contains(&Membership::Join) {
             return Ok(Vec::new());
         }
@@ -126,7 +126,7 @@ impl Core {
             (joined, conversations)
         };
         if sync == SyncMode::Server {
-            // 🚫 看一眼不寫庫。
+            // 看一眼**不**寫庫。
             let mut entries: Vec<RoomListEntry> = joined
                 .iter()
                 .map(|room| RoomListEntry::unknown(room, Membership::Join))
@@ -152,7 +152,7 @@ impl Core {
     }
 
     /// 一個房間本身（UI 點進去、或列表上看得到卻沒名字的那幾間；前端要問「加密了沒」也用它）。`sync` 同 [`Core::list_rooms`]。
-    /// 上網只問**這一間**（🚫 為了一間把整份列表重拿）。
+    /// 上網只問**這一間**（**不**為了一間把整份列表重拿）。
     ///
     /// Return:
     ///     Ok(Conversation)
@@ -207,7 +207,7 @@ impl Core {
         let (cache, me) = self.server_cache_and_me(&account)?;
         let found = cache.read().await.find_conversation(&me, room)?;
         found.ok_or_else(|| {
-            // ⚠️ 兩種「找不到」講的不是同一件事，🚫 不要都叫人去 `sync=both`
+            // ⚠️ 兩種「找不到」講的不是同一件事，禁止都叫人去 `sync=both`
             //（`Both` 走到這裡，代表上游剛剛才給過）（PR #32 審查 salvia🟡1）。
             let why = match sync {
                 SyncMode::Both => "fetched it but could not read it back from the local cache",
@@ -217,13 +217,15 @@ impl Core {
         })
     }
 
-    /// 送一則文字。
+    /// 送一則文字（`m.text`），可以帶回覆與提到（/docs/design/messages/message-actions.md §3.1、§3.2）。
     ///
     /// Args:
-    ///     options: wbf 帳號在加密房要 `room_devices`（UI 存的那份）；`txn_id` 重送用。一般 Matrix 帳號不看它, example: &SendOptions::default()
+    ///     options: wbf 帳號在加密房要 `room_devices`（UI 存的那份）；`txn_id` 重送用；`reply_to`、`mentions` 照 §3.2, example: &SendOptions::default()
     /// Return:
     ///     Ok(String)                 event_id
+    ///     Err(Usage)                 wbf 帳號：本地不知道這間房加不加密、或加密房沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    wbf 加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
+    ///     Err(RoomKeyNotReady)       wbf 加密房的金鑰在等待時間內沒準備好，訊息沒送
     pub async fn send_text(
         &self,
         room: &str,
@@ -232,14 +234,20 @@ impl Core {
         target: &Target,
     ) -> Result<String, CoreError> {
         let account = self.account_or_current(target)?;
-        if self.is_wbf_account(&account)? {
-            // 明文走 `Event/Send`；加密房等後台分好的房間金鑰就緒、再加密（wbf_rooms.rs → room_crypto.rs）。
-            return self.wbf_send_text(&account, room, body, options).await;
-        }
-        let backend = self
-            .synced_backend_of(&account, target.server_backup)
+        let content = serde_json::json!({ "msgtype": "m.text", "body": body });
+        let content = self
+            .add_reply_and_mentions_of(&account, room, content, options)
             .await?;
-        Ok(backend.send_text(room, body).await?)
+        // wbf 帳號：明文走 `Event/Send`；加密房等後台分好的房間金鑰就緒、再加密（wbf_rooms.rs → room_crypto.rs）。
+        self.send_room_event(
+            &account,
+            room,
+            wbf_sdk::message_content::MESSAGE_EVENT_TYPE,
+            content,
+            options,
+            target,
+        )
+        .await
     }
 
     /// 讀一頁歷史。
@@ -346,11 +354,11 @@ impl Core {
     ///
     /// | `sync` | 做什麼 |
     /// |---|---|
-    /// | `Local` | 只讀本地。🚫 **非 fork server 的房間不答**（沒有 `r_seq` 排不出順序，那種房「不快取、總是詢問」） |
+    /// | `Local` | 只讀本地。**非 fork server 的房間不答**（沒有 `r_seq` 排不出順序，那種房「不快取、總是詢問」） |
     /// | `Server` | 問上游、不寫庫 |
     /// | `Both` | **永遠問上游** → 寫進去 → 用這一頁的 `event_id` 從本地讀回，**順序照上游** |
     ///
-    /// ⚠️ `Both` 現在**每一頁都問上游**，🚫 不先判「本地有沒有洞」：本地的 `r_seq` 天生不連號
+    /// ⚠️ `Both` 現在**每一頁都問上游**，**不**先判「本地有沒有洞」：本地的 `r_seq` 天生不連號
     /// （reaction／edit／redaction 併進目標不存列、看不到的事件 server 會跳過、超大事件被跨過），
     /// 所以「連號＝沒洞」判不出來。要省這一趟，得記 server 保證過的範圍（之後的事）。
     async fn page_of(
@@ -362,7 +370,7 @@ impl Core {
         sync: SyncMode,
         server_backup: bool,
     ) -> Result<(Vec<Message>, Option<String>), CoreError> {
-        // 🚫 `limit = 0` 在入口就擋（PR #36 審查 cirno💡1）：wbf 那條會送 `Recent{limit: 0}` 拿回空頁、`next` 是 None，
+        // `limit = 0` 在入口就擋（PR #36 審查 cirno💡1）：wbf 那條會送 `Recent{limit: 0}` 拿回空頁、`next` 是 None，
         // UI 會讀成「到頭了」；matrix 那條卻回 Usage —— 同一個輸入兩種答案。三種 `sync` 都經過這裡，所以只擋這一次。
         if limit == 0 {
             return Err(CoreError::new(
@@ -377,14 +385,15 @@ impl Core {
             .upstream_page_of(account, room, limit, before, server_backup)
             .await?;
         if sync == SyncMode::Server {
-            // 🚫 看一眼不寫庫：只折這一頁裡的關係事件。
-            let messages = wbf_sdk::event_json::messages_from_incoming(room, &page.events);
+            // 看一眼**不**寫庫：只折這一頁裡的關係事件。
+            let me = self.session_of(account)?.user_id;
+            let messages = wbf_sdk::event_json::messages_from_incoming(room, &me, &page.events);
             return Ok((messages, page.next));
         }
         // `Both`：**原樣**寫進去等它落地（/docs/design/messages/edits-and-redactions.md），再用這一頁的 event_id 讀回。
         // ⭐ 上游決定**哪幾則、什麼順序**，本地決定**每一則長什麼樣**（已解密的明文不會被密文蓋掉、
         // 別頁的 edit／redact／reaction 已經套上、`hidden` 的不出來）。
-        // 🚫 不從本地「照 r_seq 重讀一頁」：非 fork server 的事件沒有 r_seq。
+        // **不**從本地「照 r_seq 重讀一頁」：非 fork server 的事件沒有 r_seq。
         let (cache, me) = self.server_cache_and_me(account)?;
         let event_ids: Vec<String> = page
             .events
@@ -405,7 +414,7 @@ impl Core {
             .read()
             .await
             .list_messages_by_event_ids(&me, room, &event_ids)?;
-        // 🚨 `next` 用**上游那一頁**的，🚫 不用讀回來的：最舊那則如果被 `hidden` 了，
+        // 🚨 `next` 用**上游那一頁**的，**不**用讀回來的：最舊那則如果被 `hidden` 了，
         // 讀回來的最後一則會比較新，UI 拿它往回問就會一直拿到同一頁。
         Ok((read_back, page.next))
     }
@@ -532,7 +541,7 @@ impl Core {
 
     /// 純本地的一頁。
     ///
-    /// 🚫 **非 fork server 的房間不答**（維護者 2026-09-14：那種房「不快取、總是詢問」）——
+    /// **非 fork server 的房間不答**（維護者 2026-09-14：那種房「不快取、總是詢問」）——
     /// 沒有 `r_seq` 就排不出順序，而拿時間戳排是錯的（/docs/design/rooms/chat-model.md §4.3）。
     async fn cached_page_of(
         &self,
@@ -649,7 +658,7 @@ fn kind_matches(message: &Message, wanted: &str) -> bool {
 
 /// 在沒有 E2EE 的房間送檔案時，唯一准的密碼學選擇（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 ///
-/// 🚫 **永遠不在沒 E2EE 的房間送加密的區塊**：那個區塊的金鑰會公開，等於用一個假的
+/// **禁止在沒 E2EE 的房間送加密的區塊**：那個區塊的金鑰會公開，等於用一個假的
 /// 保護感騙人。呼叫端要嘛用 `Cipher::None`，要嘛別送。
 pub fn cipher_for_plaintext_room(requested: Option<&str>) -> Result<Cipher, CoreError> {
     match requested {
@@ -773,7 +782,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚫 **一般 Matrix 房（沒有 `r_seq`）本地不答**（維護者 2026-09-14：「不快取，總是詢問」）——
+    /// **一般 Matrix 房（沒有 `r_seq`）本地不答**（維護者 2026-09-14：「不快取，總是詢問」）——
     /// 沒有 `r_seq` 就只剩時間戳可排，而那是錯的（/docs/design/rooms/chat-model.md §4.3）。第一頁、翻頁都一樣。
     #[tokio::test]
     async fn a_room_without_r_seq_is_never_answered_from_the_local_cache() {
@@ -794,7 +803,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚫 `limit = 0` 在入口就擋：空頁的意思是「沒有更舊的了」，要 0 則會假裝那件事（PR #36 審查 cirno💡1）。
+    /// `limit = 0` 在入口就擋：空頁的意思是「沒有更舊的了」，要 0 則會假裝那件事（PR #36 審查 cirno💡1）。
     /// ⚠️ 用 `server` 模式驗：它會打上游，所以要在**連網之前**就擋下來（session 指向沒人在聽的位址，連了就是 Network 錯）。
     #[tokio::test]
     async fn a_zero_limit_is_refused_before_anything_is_asked() {
@@ -817,7 +826,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 錨點不在本地（沒同步過、或上一頁是 `sync=server` 拿的）：🚫 不答一頁空的，說清楚。
+    /// 錨點不在本地（沒同步過、或上一頁是 `sync=server` 拿的）：**不**答一頁空的，說清楚。
     /// ⚠️ 空頁會被 UI 讀成「到頭了」。
     #[tokio::test]
     async fn an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty() {
@@ -840,7 +849,7 @@ mod tests {
 
     #[test]
     fn a_plaintext_room_only_takes_cipher_none() {
-        // 🚫 加密的區塊在明文房間裡，金鑰是公開的——那是假的保護感。
+        // ⚠️ 加密的區塊在明文房間裡，金鑰是公開的——那是假的保護感。
         assert_eq!(cipher_for_plaintext_room(None).unwrap(), Cipher::None);
         assert_eq!(
             cipher_for_plaintext_room(Some("none")).unwrap(),

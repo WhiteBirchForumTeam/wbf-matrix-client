@@ -2,9 +2,9 @@
 //! wbf 帳號走橋（[`crate::WbfClient::call_matrix_endpoint`]）、一般 Matrix 帳號照同一個 HTTP 端點送（[`call_over_http`]）；
 //! 兩條路吃同一份變數、同一份 body，回同一份 Matrix 的 body（server 的 e2e 釘過「走橋與走 HTTP 回的一樣」，本 repo issue #55）。
 //!
-//! 變數的規則照橋（wbfuwunel 的 /docs/bridge-specs/index.md §1.3）：path 變數是字串、🚫 `.`／`..`；query 變數是字串、數字、布林或它們的陣列；
+//! 變數的規則照橋（wbfuwunel 的 /docs/bridge-specs/index.md §1.3）：path 變數是字串、**不能**是 `.`／`..`；query 變數是字串、數字、布林或它們的陣列；
 //! 表上沒有的變數拒絕。兩條路送出前都過 [`check_variables`]，同一個錯在兩條路上長一樣。
-//! 號碼的權威在 server 的 /docs/bridge-specs/index.md；已經在 `protocol.rs` 的那幾個（`Members`、`JoinedRooms`、`GetState`、`GetStateEvent`、`GetAccountData`）引用那裡的常數，🚫 再抄一次。
+//! 號碼的權威在 server 的 /docs/bridge-specs/index.md；已經在 `protocol.rs` 的那幾個（`Members`、`JoinedRooms`、`GetState`、`GetStateEvent`、`GetAccountData`）引用那裡的常數，**不**再抄一次。
 
 use serde_json::{Map, Value};
 
@@ -86,7 +86,7 @@ pub const FORGET: MatrixEndpoint = MatrixEndpoint {
     path: "/_matrix/client/v3/rooms/{room_id}/forget",
     query: &[],
 };
-/// 被邀請的人在 **body** 的 `user_id`，🚫 meta。
+/// 被邀請的人在 **body** 的 `user_id`，**不**在 meta。
 pub const INVITE: MatrixEndpoint = MatrixEndpoint {
     name: "Invite",
     bridge: room(0x24),
@@ -201,7 +201,7 @@ pub const HIERARCHY: MatrixEndpoint = MatrixEndpoint {
     path: "/_matrix/client/v1/rooms/{room_id}/hierarchy",
     query: &["from", "limit", "max_depth", "suggested_only"],
 };
-/// ⚠️ `user_id` 是 query 變數，🚫 路徑的一段。
+/// ⚠️ `user_id` 是 query 變數，**不是**路徑的一段。
 pub const MUTUAL_ROOMS: MatrixEndpoint = MatrixEndpoint {
     name: "MutualRooms",
     bridge: room(0x34),
@@ -232,7 +232,7 @@ pub const ROOM_ALIASES: MatrixEndpoint = MatrixEndpoint {
     query: &[],
 };
 
-// ---- 0x14 Event 的狀態那三支（wbfuwunel 的 /docs/bridge-specs/0x14-event.md）----
+// ---- 0x14 Event 的狀態那三支與收回（wbfuwunel 的 /docs/bridge-specs/0x14-event.md）----
 
 /// ⚠️ 走橋時超過 2 MiB 是 `TooLarge`（`protocol::BRIDGE_ROOM_STATE`）。
 pub const GET_STATE: MatrixEndpoint = MatrixEndpoint {
@@ -242,7 +242,7 @@ pub const GET_STATE: MatrixEndpoint = MatrixEndpoint {
     path: "/_matrix/client/v3/rooms/{room_id}/state",
     query: &[],
 };
-/// 回**只有 content**；沒有這一項是 404。`state_key` 空字串是一個值，🚫 省。
+/// 回**只有 content**；沒有這一項是 404。`state_key` 空字串是一個值，禁止省略。
 pub const GET_STATE_EVENT: MatrixEndpoint = MatrixEndpoint {
     name: "GetStateEvent",
     bridge: protocol::BRIDGE_STATE_EVENT,
@@ -255,6 +255,14 @@ pub const SET_STATE_EVENT: MatrixEndpoint = MatrixEndpoint {
     bridge: event(0x23),
     method: HttpMethod::Put,
     path: "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}",
+    query: &[],
+};
+/// 收回一則（/docs/design/messages/message-actions.md §3.5）：回的 `event_id` 是**收回動作本身**那則。同一個 `txn_id` 重送只收回一次。
+pub const REDACT: MatrixEndpoint = MatrixEndpoint {
+    name: "Redact",
+    bridge: event(0x24),
+    method: HttpMethod::Put,
+    path: "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
     query: &[],
 };
 
@@ -380,7 +388,7 @@ pub fn check_variables(
 ///
 /// Return:
 ///     Ok(Vec<u8>)
-///     Err(Usage)   給了 body 的 GET／DELETE（橋與 HTTP 都不會帶它，🚫 默默丟掉）
+///     Err(Usage)   給了 body 的 GET／DELETE（橋與 HTTP 都不會帶它，**不**默默丟掉）
 pub fn encode_body(endpoint: &MatrixEndpoint, body: Option<&Value>) -> Result<Vec<u8>, SdkError> {
     match (endpoint.method, body) {
         (HttpMethod::Get | HttpMethod::Delete, Some(_)) => Err(SdkError::Usage(format!(
@@ -464,7 +472,7 @@ pub async fn call_over_http(
 }
 
 /// 模板 → URL：path 變數每一段各自 percent-encode（`#別名` 變 `%23`、event id 的 `/` 變 `%2F`），query 變數照順序附上，陣列是重複的參數。
-/// 呼叫前要先過 [`check_variables`]。填完再比對一次段數（跟橋的 `fill_path` 同一個不變式）：URL 套件有任何正規化吃掉或多出一段，都拒、🚫 送到別的端點。
+/// 呼叫前要先過 [`check_variables`]。填完再比對一次段數（跟橋的 `fill_path` 同一個不變式）：URL 套件有任何正規化吃掉或多出一段，都拒、**不**送到別的端點。
 ///
 /// Return:
 ///     Ok(Url)

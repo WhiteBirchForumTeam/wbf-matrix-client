@@ -1,7 +1,7 @@
 //! `room.*` 與 `sync.recent`（/docs/design/rpc-specs/rpc-spec.md §3.3、§3.4）。
 //!
-//! 🚫 沒有 `room.watch`：常駐之後新訊息走訂閱＋推播（下一支）。
-//! 🚫 沒有確認：沒 E2EE 的房間送檔案，CLI 會問「送明文嗎」；daemon 不問，
+//! **沒有** `room.watch`：常駐之後新訊息走訂閱＋推播（下一支）。
+//! **沒有**確認：沒 E2EE 的房間送檔案，CLI 會問「送明文嗎」；daemon 不問，
 //! 只守住那條不能破的規矩——**沒 E2EE 的房間永遠不送加密的區塊**（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
 
 use std::path::PathBuf;
@@ -54,7 +54,7 @@ pub(super) async fn room_list(handle: &Handle, core: &Core, params: Value) -> Ou
     )
 }
 
-/// `room.invites { user?, server? }`：主動補一輪邀請（/docs/design/rooms/room-actions.md §3.3.4）。🚫 `sync`：本來就是去上游拿、寫進本地的（跟 `sync.recent` 一樣）。
+/// `room.invites { user?, server? }`：主動補一輪邀請（/docs/design/rooms/room-actions.md §3.3.4）。**沒有** `sync`：本來就是去上游拿、寫進本地的（跟 `sync.recent` 一樣）。
 pub(super) async fn room_invites(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
@@ -74,29 +74,127 @@ pub(super) async fn room_get(handle: &Handle, core: &Core, params: Value) -> Out
     )
 }
 
+/// 送出的 RPC 共用的參數（/docs/design/keys/e2ee-rpc.md §3、/docs/design/messages/message-actions.md §2）。
+/// `room.edit` 帶了 `reply_to`、`room.react` 帶了 `reply_to`／`mentions`，core 回 1100。
+#[derive(Deserialize)]
+struct SendParams {
+    /// 加密房必帶：UI 存的那份（`room.refresh_devices` 回的）
+    #[serde(default)]
+    room_devices: Option<RoomDevices>,
+    #[serde(default)]
+    txn_id: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[serde(default)]
+    mentions: Option<Vec<String>>,
+}
+
+impl SendParams {
+    fn into_options(self) -> SendOptions {
+        SendOptions {
+            room_devices: self.room_devices,
+            txn_id: self.txn_id,
+            reply_to: self.reply_to,
+            mentions: self.mentions,
+        }
+    }
+}
+
 /// 加密房要帶 `room_devices`（UI 存的那份，`room.refresh_devices` 回的）；被擋回 1401，`data` 是 daemon 自動重拿的房間狀態（/docs/design/keys/e2ee-rpc.md §3）。
+/// `reply_to`、`mentions` 照 /docs/design/messages/message-actions.md §3.2。
 pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
         room: String,
         body: String,
+        #[serde(flatten)]
+        send: SendParams,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let event_id = core
+        .send_text(
+            &params.room,
+            &params.body,
+            &params.send.into_options(),
+            &handle.target(&params.target),
+        )
+        .await?;
+    Ok(json!({ "event_id": event_id }))
+}
+
+/// 改自己的一則文字（/docs/design/messages/message-actions.md §3.3、§4.2）：回 edit 那則自己的 `event_id`。目標不合就 1100、不送。
+pub(super) async fn room_edit(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        event_id: String,
+        body: String,
+        #[serde(flatten)]
+        send: SendParams,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let event_id = core
+        .edit_text(
+            &params.room,
+            &params.event_id,
+            &params.body,
+            &params.send.into_options(),
+            &handle.target(&params.target),
+        )
+        .await?;
+    Ok(json!({ "event_id": event_id }))
+}
+
+/// 按表情（/docs/design/messages/message-actions.md §3.4、§4.3）：只會「加」，收回是 `room.redact` 帶 `Reaction.mine`。本地已經按過同一個 `key` 就回那則、不再送。
+pub(super) async fn room_react(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        event_id: String,
+        key: String,
+        #[serde(flatten)]
+        send: SendParams,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let event_id = core
+        .react(
+            &params.room,
+            &params.event_id,
+            &params.key,
+            &params.send.into_options(),
+            &handle.target(&params.target),
+        )
+        .await?;
+    Ok(json!({ "event_id": event_id }))
+}
+
+/// 收回一則（訊息、自己的表情，/docs/design/messages/message-actions.md §3.5、§4.4）：回**收回動作本身**那則的 `event_id`。
+/// 一律明文，沒有 `room_devices`；server 拒了是 1400，`data` 是 server 的拒絕原樣。
+pub(super) async fn room_redact(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        event_id: String,
         #[serde(default)]
-        room_devices: Option<RoomDevices>,
+        reason: Option<String>,
         #[serde(default)]
         txn_id: Option<String>,
         #[serde(flatten)]
         target: TargetParams,
     }
     let params: Params = parse_params(params)?;
-    let options = SendOptions {
-        room_devices: params.room_devices,
-        txn_id: params.txn_id,
-    };
     let event_id = core
-        .send_text(
+        .redact(
             &params.room,
-            &params.body,
-            &options,
+            &params.event_id,
+            params.reason.as_deref(),
+            params.txn_id.as_deref(),
             &handle.target(&params.target),
         )
         .await?;
@@ -104,7 +202,7 @@ pub(super) async fn room_send_text(handle: &Handle, core: &Core, params: Value) 
 }
 
 /// 資料平面版的送檔最後一步（/docs/design/rpc-specs/data-plane.md §5）：UI 打 HTTP 傳完、拿到 manifest 之後，把那份 manifest 帶回來叫這支發訊息。
-/// daemon 🚫 不記傳完的上傳。加密房跟 `room.send_text` 一樣要 `room_devices`、被擋回 1401；重送用同一份 manifest 與 `txn_id`，檔案🚫 不必重傳。
+/// daemon **不**記傳完的上傳。加密房跟 `room.send_text` 一樣要 `room_devices`、被擋回 1401；重送用同一份 manifest 與 `txn_id`，檔案**不必**重傳。
 pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
@@ -113,14 +211,13 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
         manifest: Value,
         #[serde(default)]
         caption: Option<String>,
-        #[serde(default)]
-        room_devices: Option<RoomDevices>,
-        #[serde(default)]
-        txn_id: Option<String>,
+        #[serde(flatten)]
+        send: SendParams,
         #[serde(flatten)]
         target: TargetParams,
     }
     let params: Params = parse_params(params)?;
+    let options = params.send.into_options();
     // 傳統上傳的檔：標準附件、matrix-sdk 送（加密房它自己 Megolm）；沒有附件宣告這個機制（/docs/design/rpc-specs/data-plane.md §7.2）。
     if params.manifest.get("block").is_none() {
         let manifest: MatrixManifest = serde_json::from_value(params.manifest)
@@ -130,6 +227,7 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
                 &params.room,
                 &manifest,
                 params.caption.as_deref(),
+                &options,
                 &handle.target(&params.target),
             )
             .await?;
@@ -139,10 +237,6 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
     }
     let manifest: Manifest = serde_json::from_value(params.manifest)
         .map_err(|error| invalid_params(format!("manifest: {error}")))?;
-    let options = SendOptions {
-        room_devices: params.room_devices,
-        txn_id: params.txn_id,
-    };
     let event_id = core
         .send_attachment(
             &params.room,
@@ -155,7 +249,7 @@ pub(super) async fn room_send_attachment(handle: &Handle, core: &Core, params: V
     Ok(json!({ "event_id": event_id, "mxc": manifest.mxc, "attachment_declared": true }))
 }
 
-/// 確認這個房現在的人與裝置，並交給後台對這一刻的狀態先分好房間金鑰（UI 點進房、或自己發現版本號變了時叫；🚫 等後台分完）。
+/// 確認這個房現在的人與裝置，並交給後台對這一刻的狀態先分好房間金鑰（UI 點進房、或自己發現版本號變了時叫；**不**等後台分完）。
 /// 回的 `{room_version, members}` UI 存下來，送出時整份當 `room_devices` 帶回來（/docs/design/keys/e2ee-rpc.md §2）。
 pub(super) async fn room_refresh_devices(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
@@ -178,7 +272,7 @@ pub(super) async fn room_refresh_devices(handle: &Handle, core: &Core, params: V
 }
 
 /// 路徑版（/docs/design/rpc-specs/rpc-spec.md §3.3）：daemon 自己讀檔、上傳、送事件，一則回應。
-/// result 多帶 `manifest`（含金鑰）：前端要存就自己存，🚫 daemon 不落地。
+/// result 多帶 `manifest`（含金鑰）：前端要存就自己存，daemon **不**落地。
 pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) -> Outcome {
     #[derive(Deserialize)]
     struct Params {
@@ -196,11 +290,9 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         mimetype: Option<String>,
         #[serde(default)]
         sha256: bool,
-        /// 加密房要（wbf 帳號）：同 `room.send_text`
-        #[serde(default)]
-        room_devices: Option<RoomDevices>,
-        #[serde(default)]
-        txn_id: Option<String>,
+        /// 加密房要 `room_devices`（wbf 帳號）：同 `room.send_text`
+        #[serde(flatten)]
+        send: SendParams,
         #[serde(flatten)]
         transport: TransportParam,
         #[serde(flatten)]
@@ -210,7 +302,7 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
     let transport = handle.transport(&params.transport)?;
     let target = handle.target(&params.target);
     // ⚠️ 送檔前要知道這個房間**現在**加不加密：`Both` 去上游確認過再回答。
-    // 🚫 不能用 `Local` —— 快取裡的「沒加密」如果過期了，我們會把金鑰公開送出去。
+    // 禁止用 `Local` —— 快取裡的「沒加密」如果過期了，我們會把金鑰公開送出去。
     let conversation = core
         .conversation(&params.room, SyncMode::Both, &target)
         .await?;
@@ -232,10 +324,7 @@ pub(super) async fn room_send_file(handle: &Handle, core: &Core, params: Value) 
         mimetype: params.mimetype,
         sha256: params.sha256,
     };
-    let options = SendOptions {
-        room_devices: params.room_devices,
-        txn_id: params.txn_id,
-    };
+    let options = params.send.into_options();
     let result = core
         .send_file(
             &params.room,

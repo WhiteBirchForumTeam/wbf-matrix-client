@@ -1,7 +1,7 @@
 //! wbf 帳號的房間（/docs/design/daemon/account-session.md §6）：沒有 matrix-sdk 的 Client，房間列表走橋的 `JoinedRooms`（只有 id）、單一房間走 `GetState` ＋ `m.direct`（UI 點到哪間問哪間，維護者 2026-10-05），
 //! 送事件走 `Event/Send`（附件宣告終於帶得出去，/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
 //!
-//! 加密房的訊息走 `room_crypto.rs`（只用後台已經分好的房間金鑰：等它就緒、加密、帶 UI 給的房間版本號；送的路上🚫 建、換、分金鑰）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
+//! 加密房的訊息走 `room_crypto.rs`（只用後台已經分好的房間金鑰：等它就緒、加密、帶 UI 給的房間版本號；送的路上**不**建、換、分金鑰）。加密房的附件走資料平面那條（`attachment_ops.rs`）；
 //! 路徑版的 `send_file` 還拒加密房（/docs/design/keys/e2ee-rpc.md §8）。
 //! 「加不加密」：送**文字**只看本地記的（`rooms.encrypted`，拿房間時寫、收到加密的證據時往上升；不知道就報錯，維護者 2026-10-05）；
 //! 送**附件**問這一刻的狀態（/docs/design/rpc-specs/data-plane.md §4.1：過期的「沒加密」會把檔案金鑰公開在事件裡）。
@@ -37,7 +37,7 @@ impl Core {
         .await
     }
 
-    /// 加入了哪些房（走橋的 `JoinedRooms`，一個請求）。每一間的樣子🚫 在這裡問：UI 對看得到的房間叫 `room.get`（維護者 2026-10-05）。
+    /// 加入了哪些房（走橋的 `JoinedRooms`，一個請求）。每一間的樣子**不**在這裡問：UI 對看得到的房間叫 `room.get`（維護者 2026-10-05）。
     ///
     /// Return:
     ///     Ok(Vec<String>)   room id, example: vec!["!abc:localhost".to_string()]
@@ -73,35 +73,45 @@ impl Core {
         Ok(conversation_from_state(room, &me, &state, &peers)?)
     }
 
-    /// 送一則文字（`m.room.message`／`m.text`）：明文房直接送；加密房等後台分好的房間金鑰就緒、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上🚫 建、換、分金鑰）。
-    /// 加不加密只看本地記的（[`Core::find_local_room_encryption`]），🚫 為了送一則字再問 server。
+    /// 送一則沒有附件的事件（文字、編輯、表情）：明文房直接送；加密房等後台分好的房間金鑰就緒、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上**不**建、換、分金鑰）。
+    /// 加不加密只看本地記的（[`Core::find_local_room_encryption`]），**不**為了送一則字再問 server。
     ///
     /// Args:
+    ///     event_type: example: "m.room.message"
+    ///     content: 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
     ///     options: 加密房要 `room_devices`；`txn_id` 重送用, example: &SendOptions::default()
     /// Return:
     ///     Ok(String)                 event_id
     ///     Err(Usage)                 本地不知道這間房加不加密（UI 先拿房間）；或加密房但沒帶 `room_devices`
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
     ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`（room_crypto.rs）
-    pub(crate) async fn wbf_send_text(
+    pub(crate) async fn wbf_send_by_local_encryption(
         &self,
         account: &AccountDir,
         room: &str,
-        body: &str,
+        event_type: &str,
+        content: Value,
         options: &SendOptions,
     ) -> Result<String, CoreError> {
-        let content = serde_json::json!({ "msgtype": "m.text", "body": body });
         let encrypted = self.find_local_room_encryption(account, room).await?;
-        self.wbf_send_message(account, room, encrypted, content, Vec::new(), options)
-            .await
+        self.wbf_send_message(
+            account,
+            room,
+            event_type,
+            encrypted,
+            content,
+            Vec::new(),
+            options,
+        )
+        .await
     }
 
     /// 本地記的「這間房加不加密」（`rooms.encrypted`）：拿單一房間（`room.get`）時寫，收到加密的證據（`m.room.encryption`、加密事件）時往上升，只升不降。
     ///
     /// Return:
     ///     Ok(bool)     true ＝ 加密、false ＝ 明文
-    ///     Err(Usage)   本地沒有這間房、或不知道（只因收到事件才建出來的房）：UI 要先拿房間——🚫 當成明文
-    async fn find_local_room_encryption(
+    ///     Err(Usage)   本地沒有這間房、或不知道（只因收到事件才建出來的房）：UI 要先拿房間——**不**當成明文
+    pub(crate) async fn find_local_room_encryption(
         &self,
         account: &AccountDir,
         room: &str,
@@ -119,10 +129,11 @@ impl Core {
             })
     }
 
-    /// 送一則 `m.room.message`：明文房直接 `Event/Send`；加密房等後台分好的房間金鑰就緒、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上🚫 建、換、分金鑰）。
+    /// 送一則事件：明文房直接 `Event/Send`；加密房等後台分好的房間金鑰就緒、加密、帶 UI 給的房間版本號送（room_crypto.rs；送的路上**不**建、換、分金鑰）。
     /// 附件在**同一個請求**裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2），加密房也一樣。
     ///
     /// Args:
+    ///     event_type: `m.room.message`，表情是 `m.reaction`, example: "m.room.message"
     ///     encrypted: 這間房加不加密，由呼叫端決定怎麼問：文字看本地（[`Core::find_local_room_encryption`]）、附件問 server（[`Core::wbf_is_room_encrypted`]，送檔要先拿它核對區塊）
     ///     content: 明文 content, example: json!({"msgtype":"m.text","body":"hi"})
     ///     attachments: 這則用到的 mxc, example: vec!["mxc://localhost/1122334455667788".into()]
@@ -133,10 +144,12 @@ impl Core {
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋；`data` 是 daemon 自動重拿的房間狀態（room_crypto.rs）
     ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好，訊息沒送；`data`：`{txn_id}`（room_crypto.rs）
     ///     Err(Server)                `Conflict`：某個附件 mxc 不是本站的、找不到、不是自己傳的、或有墓碑
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn wbf_send_message(
         &self,
         account: &AccountDir,
         room: &str,
+        event_type: &str,
         encrypted: bool,
         content: Value,
         attachments: Vec<String>,
@@ -148,14 +161,7 @@ impl Core {
         };
         if !encrypted {
             return self
-                .wbf_send_event(
-                    account,
-                    room,
-                    "m.room.message",
-                    content,
-                    attachments,
-                    txn_id,
-                )
+                .wbf_send_event(account, room, event_type, content, attachments, txn_id)
                 .await;
         }
         let Some(devices) = &options.room_devices else {
@@ -168,7 +174,7 @@ impl Core {
             ));
         };
         let message = OutgoingRoomEvent {
-            event_type: "m.room.message".to_string(),
+            event_type: event_type.to_string(),
             content,
             txn_id,
             attachments,
@@ -181,7 +187,7 @@ impl Core {
     ///
     /// Return:
     ///     Ok(bool)   true ＝ 有 `m.room.encryption` 而且形狀認得
-    ///     Err(...)   問不到（線開不起來、server 拒）——🚫 不當成沒加密：不確定就不送明文
+    ///     Err(...)   問不到（線開不起來、server 拒）——**不**當成沒加密：不確定就不送明文
     pub(crate) async fn wbf_is_room_encrypted(
         &self,
         account: &AccountDir,
@@ -204,7 +210,7 @@ impl Core {
     }
 
     /// `Event/Send` 一則事件（明文 content），附件在 meta 裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。
-    /// 🚫 不檢查加不加密：呼叫端走 [`Core::wbf_send_message`]（它照加不加密分流），送檔那條在上傳**之前**就要問，不然白傳。
+    /// **不**檢查加不加密：呼叫端走 [`Core::wbf_send_message`]（它照加不加密分流），送檔那條在上傳**之前**就要問，不然白傳。
     ///
     /// Args:
     ///     event_type: example: "m.room.message"
@@ -295,7 +301,7 @@ mod tests {
     }
 
     /// /docs/design/daemon/account-session.md §6：wbf 帳號的房間命令走 WS（開線失敗是 `Network`），還掛在 Client 上的那幾支明講拒絕（`Usage`）。
-    /// 🚫 兩種都不該是「log in again」（`backend_of` 對 `store_dir: None` 的那句）——那是把 wbf 帳號誤認成舊版 session。
+    /// 兩種都**不該**是「log in again」（`backend_of` 對 `store_dir: None` 的那句）——那是把 wbf 帳號誤認成舊版 session。
     #[tokio::test]
     async fn a_wbf_account_routes_rooms_over_ws_and_refuses_what_still_needs_the_client() {
         let dir = scratch("routing");
@@ -314,7 +320,7 @@ mod tests {
             let error = outcome.expect_err("nobody is listening");
             assert_eq!(error.kind, CoreErrorKind::Network, "{error:?}");
         }
-        // 送文字只看本地記的「加不加密」：沒拿過這間房就是不知道，🚫 當成明文，也🚫 為它上網（維護者 2026-10-05）。
+        // 送文字只看本地記的「加不加密」：沒拿過這間房就是不知道，**不**當成明文，也**不**為它上網（維護者 2026-10-05）。
         let error = core
             .send_text(
                 "!r:localhost",

@@ -1,5 +1,5 @@
 //! 訂閱線的測試共用品（`room_sync.rs`／`key_sync.rs` 的測試）：記憶體對接的假 server（答 Hello、房間的 Subscribe／Recent／Unsubscribe、
-//! 金鑰的 Subscribe／Fetch／ItemsDestroy／Unsubscribe）、開好帳號的 `Core`、等待與讀快取的小工具。🚫 只在測試建置。
+//! 金鑰的 Subscribe／Fetch／ItemsDestroy／Unsubscribe）、開好帳號的 `Core`、等待與讀快取的小工具。只在測試建置。
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,7 +77,7 @@ pub(crate) async fn core_with_account_on(
     (core, account)
 }
 
-/// 在已經解鎖的 core 裡多開一個帳號（同一台 server 就共用 `cache.db` 與池）；🚫 改 current。
+/// 在已經解鎖的 core 裡多開一個帳號（同一台 server 就共用 `cache.db` 與池）；**不**改 current。
 pub(crate) async fn add_account_on(
     core: &Core,
     dir: &std::path::Path,
@@ -401,13 +401,13 @@ pub(crate) fn invite_entry(room: &str, state: &[Value]) -> Value {
 /// 假 server 上房間動作看得到的那一點點狀態。
 #[derive(Debug, Default)]
 pub(crate) struct FakeRooms {
-    /// 房間動作的請求：(kind, subtype, meta, body)，照收到的順序（讀狀態、讀帳號資料🚫 記）
+    /// 房間動作的請求：(kind, subtype, meta, body)，照收到的順序（讀狀態、讀帳號資料**不**記）
     pub(crate) requests: Vec<(Kind, u8, Value, Value)>,
     /// `SetStateEvent` 寫的、`GetStateEvent` 讀的：(event_type, state_key) → content
     pub(crate) state: std::collections::BTreeMap<(String, String), Value>,
     /// `SetAccountData` 寫的、`GetAccountData` 讀的：event_type → content
     pub(crate) account_data: std::collections::BTreeMap<String, Value>,
-    /// 下一個房間動作回 403 `M_FORBIDDEN`（一次性）：測「server 拒了就🚫 寫本地」。
+    /// 下一個房間動作回 403 `M_FORBIDDEN`（一次性）：測「server 拒了就**不**寫本地」。
     pub(crate) forbid_next: bool,
 }
 
@@ -965,6 +965,7 @@ fn room_action_reply(pack: &Pack, rooms: &Arc<Mutex<FakeRooms>>) -> Option<Pack>
         &endpoints::SET_STATE_EVENT,
         &endpoints::SET_ACCOUNT_DATA,
         &endpoints::SUMMARY,
+        &endpoints::REDACT,
     ];
     if !answered.iter().any(|endpoint| is(endpoint)) {
         return None;
@@ -1004,6 +1005,8 @@ fn room_action_reply(pack: &Pack, rooms: &Arc<Mutex<FakeRooms>>) -> Option<Pack>
         json!({})
     } else if is(&endpoints::SUMMARY) {
         json!({ "room_id": ROOM, "name": FAKE_ROOM_NAME, "num_joined_members": 1 })
+    } else if is(&endpoints::REDACT) {
+        json!({ "event_id": format!("$redaction{}", rooms.requests.len()) })
     } else {
         json!({})
     };
@@ -1174,7 +1177,7 @@ fn bridged_reply(
                 .into_bytes(),
         )
     };
-    // 編號用 sdk 的具名常數（wbfuwunel bridge-specs），🚫 不手寫 hex：常數改了這裡跟著走（PR #62 審查 rumia／cirno 🟡2）。
+    // 編號用 sdk 的具名常數（wbfuwunel bridge-specs），**不**手寫 hex：常數改了這裡跟著走（PR #62 審查 rumia／cirno 🟡2）。
     let is =
         |endpoint: BridgedEndpoint| (pack.kind, pack.subtype) == (endpoint.kind, endpoint.subtype);
     if is(BRIDGE_MEMBERS) {
@@ -1279,7 +1282,7 @@ pub(crate) async fn subscribed(
 
 /// 金鑰那條線訂好（含上線追平）、線放進池裡；回 `Device/Subscribe` 的 id 與池。
 /// ⚠️ 跟正式路徑（`open_link`）同一個順序：`init_connection` 在 `acquire` 的開線閉包裡跑、握著那一格——
-/// 收金鑰的 task 一起來就 `reuse` 那格時會等到線放進去，🚫 不會先看到空格（先 init 再放的話，第一個 `CryptoState` 的補上傳會落空）。
+/// 收金鑰的 task 一起來就 `reuse` 那格時會等到線放進去，**不**會先看到空格（先 init 再放的話，第一個 `CryptoState` 的補上傳會落空）。
 pub(crate) async fn subscribed_keys(
     core: &Core,
     account: &AccountDir,

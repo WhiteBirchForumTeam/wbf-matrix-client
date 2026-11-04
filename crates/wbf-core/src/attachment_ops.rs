@@ -2,7 +2,7 @@
 //! 前兩步是 UI 打 HTTP（`media.create` 拿 URL、PUT bytes 拿回 manifest），第三步是 UI 另外叫的 RPC（`room.send_attachment`）。
 //!
 //! core 不知道 HTTP：bytes 從一個 `AsyncRead` 進來；建好的上傳（[`UploadState`]）由呼叫端帶著（daemon 把它加密進 PUT 的 URL），
-//! 每一步再交回來。每一步都自己核對「這個上傳是不是這個帳號的」，🚫 不靠呼叫端記得查。
+//! 每一步再交回來。每一步都自己核對「這個上傳是不是這個帳號的」，**不**靠呼叫端記得查。
 //!
 //! 這裡是 wbf 帳號的分塊上傳；一般 Matrix 帳號走傳統上傳（`/_matrix/media`，`matrix_upload.rs`）。`media.create` 用的
 //! [`Core::create_media_upload`] 照帳號的種類分流、回 [`CreatedUpload`]，PUT 時原樣交回來。
@@ -54,7 +54,7 @@ pub struct NewUpload {
 pub enum CreatedUpload {
     /// wbf 帳號：分塊（含檔案金鑰）
     Chunked(UploadState),
-    /// 一般 Matrix 帳號：傳統 `/upload`（🚫 金鑰：PUT 時現產）
+    /// 一般 Matrix 帳號：傳統 `/upload`（**沒有**金鑰：PUT 時現產）
     Matrix(MatrixUpload),
 }
 
@@ -103,7 +103,7 @@ impl Core {
     /// Args:
     ///     request: example: &NewUpload { room: Some("!r:localhost".into()), name: "v.mkv".into(), size: Some(2147483648), ..Default::default() }
     /// Return:
-    ///     Ok(CreatedUpload)   `Chunked` 含檔案金鑰：🚫 不落地、不給前端
+    ///     Ok(CreatedUpload)   `Chunked` 含檔案金鑰：**不**落地、**不**給前端
     ///     Err(...)            同 [`Core::create_upload`]；傳統上傳另見 `Core::create_matrix_upload`
     pub async fn create_media_upload(
         &self,
@@ -128,7 +128,7 @@ impl Core {
     /// Args:
     ///     request: example: &NewUpload { room: Some("!r:localhost".into()), name: "v.mkv".into(), size: Some(2147483648), ..Default::default() }
     /// Return:
-    ///     Ok(UploadState)   含檔案金鑰：🚫 不落地、不給前端
+    ///     Ok(UploadState)   含檔案金鑰：**不**落地、**不**給前端
     ///     Err(Usage)        不是 wbf 帳號、`size` 是 0、`cipher` 認不得或跟房間對不上
     ///     Err(Server)／Err(Network)
     pub async fn create_upload(
@@ -175,7 +175,7 @@ impl Core {
     /// 固定大小可以續傳：同一個上傳再 PUT 一次整個 body，server 收過的塊照讀（整檔 SHA-256 要它們）但不再送。串流不能續傳。
     ///
     /// 傳完之後，UI 有給原檔位置（`source_uri`）就記進這個 mxc 的 `media` 列（/docs/design/rpc-specs/data-plane.md §8.1）：
-    /// 之後讀這個檔，原檔在、大小對得上就直接讀它。🚫 不檢查 URI 解不解得了——意義是 UI 定的，讀的時候才猜。
+    /// 之後讀這個檔，原檔在、大小對得上就直接讀它。**不**檢查 URI 解不解得了——意義是 UI 定的，讀的時候才猜。
     /// 記不起來只發一則提醒、照樣回 manifest：檔已經在 server 上了，讓 PUT 失敗只會逼 UI 重傳一個已經 `Seal` 的檔。
     ///
     /// Args:
@@ -217,13 +217,13 @@ impl Core {
             .seal_upload(upload, &final_block)
             .await?;
         if truncated {
-            // server 那份比原檔短：🚫 不記原檔，不然讀的人拿到的是 server 上沒有的後半段。
+            // server 那份比原檔短：**不**記原檔，不然讀的人拿到的是 server 上沒有的後半段。
             self.events.progress(format!(
                 "warning: the server truncated {} at its size limit",
                 manifest.mxc
             ));
         } else if let Some(source_uri) = source_uri {
-            // 走單一寫入者（server_cache.rs），🚫 不另開一條寫入連線。
+            // 走單一寫入者（server_cache.rs），**不**另開一條寫入連線。
             let (manifest_here, source_uri) = (manifest.clone(), source_uri.to_string());
             let remembered = match self.server_cache_and_me(&account) {
                 Ok((cache, _)) => {
@@ -246,17 +246,17 @@ impl Core {
     /// 把一個**傳完的**檔當附件送進房間（`room.send_attachment`，/docs/design/rpc-specs/data-plane.md §5）。
     /// 附件在同一個送訊息請求裡宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）；加密房的事件是密文，區塊（含檔案金鑰）在密文裡。
     ///
-    /// ⚠️ 要傳完：server 只認 `Seal` 過的媒體，宣告一個還在傳的 mxc 會被整則拒送。所以要的是 manifest（`Seal` 之後才有），🚫 不是建檔時那份區塊。
+    /// ⚠️ 要傳完：server 只認 `Seal` 過的媒體，宣告一個還在傳的 mxc 會被整則拒送。所以要的是 manifest（`Seal` 之後才有），**不是**建檔時那份區塊。
     /// 「上傳者是不是 sender」由 server 驗（不是就 `Conflict`）；這裡先擋掉「不是這台 server 的 manifest」。
     ///
     /// Args:
     ///     manifest: PUT 回的那份（或 `upload.file` 的）；事件用它的區塊
     ///     caption: example: Some("看這個")
-    ///     options: 加密房要 `room_devices`；`txn_id` 重送用
+    ///     options: 加密房要 `room_devices`；`txn_id` 重送用；`reply_to`、`mentions` 照 /docs/design/messages/message-actions.md §3.2
     /// Return:
     ///     Ok(String)                 event_id
     ///     Err(Usage)                 不是 wbf 帳號；manifest 是別台 server 的；區塊不能進事件；區塊跟房間對不上（明文房帶金鑰、加密房不加密）；加密房沒帶 `room_devices`
-    ///     Err(RoomDevicesChanged)    加密房被 1506 擋；帶新的 `room_devices`、同一份 manifest 與 `txn_id` 重送，檔案🚫 不必重傳
+    ///     Err(RoomDevicesChanged)    加密房被 1506 擋；帶新的 `room_devices`、同一份 manifest 與 `txn_id` 重送，檔案**不**必重傳
     ///     Err(Server)／Err(Network)
     pub async fn send_attachment(
         &self,
@@ -285,9 +285,13 @@ impl Core {
             block: manifest.block.clone(),
         };
         let content = wbf_sdk::event_json::file_message_content(&attachment, caption)?;
+        let content = self
+            .add_reply_and_mentions_of(&account, room, content, options)
+            .await?;
         self.wbf_send_message(
             &account,
             room,
+            wbf_sdk::message_content::MESSAGE_EVENT_TYPE,
             encrypted,
             content,
             vec![manifest.mxc.clone()],
@@ -382,7 +386,7 @@ impl Core {
     }
 
     /// 串流：讀到 EOF，每滿一塊送一塊，最後一塊帶 `IS_LAST`（/docs/design/media/wbf-client-convention-for-chunk.md §6）。
-    /// 🚫 不能續傳：server 已經收過塊的串流再 PUT 一次，新 body 跟舊的塊對不上（例如現錄的串流），拒絕。
+    /// **不能**續傳：server 已經收過塊的串流再 PUT 一次，新 body 跟舊的塊對不上（例如現錄的串流），拒絕。
     ///
     /// Return:
     ///     Ok((u64, bool))   (明文總長, server 有沒有截斷)
@@ -462,7 +466,7 @@ impl Core {
         ))
     }
 
-    /// 這個上傳是這個帳號（這台 server、這個人）建的嗎？🚫 不是就不碰：塊會進到別人的上傳裡、事件會宣告別人的媒體。
+    /// 這個上傳是這個帳號（這台 server、這個人）建的嗎？**不是**就不碰：塊會進到別人的上傳裡、事件會宣告別人的媒體。
     ///
     /// Return:
     ///     Ok(())       是
@@ -500,7 +504,7 @@ impl Core {
 ///     encrypted: 這個房現在加密了嗎
 ///     requested: 前端指定的, example: Some("aes-256-gcm")
 /// Return:
-///     Ok(Cipher)   加密房：指定的或預設的（🚫 不能是 `none`）；明文房：`none`
+///     Ok(Cipher)   加密房：指定的或預設的（**不能**是 `none`）；明文房：`none`
 ///     Err(Usage)   認不得的名字；加密房要 `none`（檔案會以明文存在 server 上）；明文房要加密（金鑰會公開在事件裡）
 fn cipher_for_room(encrypted: bool, requested: Option<&str>) -> Result<Cipher, CoreError> {
     if !encrypted {
@@ -519,7 +523,7 @@ fn cipher_for_room(encrypted: bool, requested: Option<&str>) -> Result<Cipher, C
 ///
 /// Return:
 ///     Ok(())       加密房配加密的區塊、明文房配 `none`
-///     Err(Usage)   其他（🚫 不送：明文房會公開金鑰，加密房會送一個 server 讀得到的檔）
+///     Err(Usage)   其他（**不**送：明文房會公開金鑰，加密房會送一個 server 讀得到的檔）
 pub(crate) fn refuse_block_not_matching_room(
     room: &str,
     encrypted: bool,
@@ -681,6 +685,7 @@ mod tests {
         let options = SendOptions {
             room_devices: Some(devices),
             txn_id: Some("t1".into()),
+            ..SendOptions::default()
         };
         let event_id = core
             .send_attachment(ROOM, &manifest, Some("看這個"), &options, &target)
@@ -690,7 +695,7 @@ mod tests {
         assert_eq!(
             misc.sent_events.lock().unwrap()[0].1,
             "m.room.encrypted",
-            "🚫 加密房不送明文事件"
+            "加密房不送明文事件"
         );
         assert_eq!(
             *misc.sent_attachments.lock().unwrap(),
@@ -747,7 +752,7 @@ mod tests {
         assert_eq!(
             refused.kind,
             CoreErrorKind::Usage,
-            "加密房的附件🚫 不能是明文"
+            "加密房的附件不能是明文"
         );
 
         let (_, encrypted_manifest) =
@@ -907,7 +912,7 @@ mod tests {
         assert!(misc.sent_events.lock().unwrap().is_empty());
     }
 
-    /// UI 給的原檔位置在傳完時記進 `media` 列（/docs/design/rpc-specs/data-plane.md §8.1）；🚫 不檢查它解不解得了——那是讀的時候的事。沒給就不建列。
+    /// UI 給的原檔位置在傳完時記進 `media` 列（/docs/design/rpc-specs/data-plane.md §8.1）；**不**檢查它解不解得了——那是讀的時候的事。沒給就不建列。
     #[tokio::test]
     async fn the_local_source_is_remembered_once_the_upload_is_sealed() {
         let dir = scratch("attach-source");
@@ -947,7 +952,7 @@ mod tests {
         );
     }
 
-    /// server 截斷過的上傳🚫 不記原檔——包括截斷發生在上一輪、這一輪續傳時被跳過的那段（Ack 不會再說一次，要從 `Status` 讀；PR #67 審查 cirno 🟢5b）。
+    /// server 截斷過的上傳**不**記原檔——包括截斷發生在上一輪、這一輪續傳時被跳過的那段（Ack 不會再說一次，要從 `Status` 讀；PR #67 審查 cirno 🟢5b）。
     #[tokio::test]
     async fn a_truncated_upload_does_not_remember_its_source_even_after_a_resume() {
         let dir = scratch("attach-truncated");
@@ -1004,7 +1009,7 @@ mod tests {
         assert_eq!(
             upload.uploads.lock().unwrap()[&1].chunks.len(),
             3,
-            "🚫 沒有多送"
+            "沒有多送"
         );
     }
 }

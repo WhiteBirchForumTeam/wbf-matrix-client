@@ -1,13 +1,13 @@
 //! 房間的加解密（/docs/design/keys/e2ee-rpc.md，維護者 2026-09-29 定的形狀）：refresh、加密送出、被 1506 擋之後自動重拿房間狀態、
 //! 收到時解密、金鑰到了補解。
 //!
-//! - **狀態放 UI**：房間版本號與每個成員的裝置版本號（[`RoomDevices`]）由 UI 存，送出時帶回來；daemon 🚫 不存每房的快照。
+//! - **狀態放 UI**：房間版本號與每個成員的裝置版本號（[`RoomDevices`]）由 UI 存，送出時帶回來；daemon **不**存每房的快照。
 //! - **送訊息只用已經分好的金鑰**（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：金鑰只在後台（`key_share.rs`）建、換、送；
 //!   送出前等「這個房的金鑰對 UI 帶來的房間版本號就緒」最多 `ROOM_KEY_WAIT`，等到才加密送出，等不到回 `RoomKeyNotReady`（訊息沒送）。
 //!   送出之後交給後台看要不要提早換。refresh 完也交給後台對新的版本先分好。
 //! - **金鑰的網路動作都走 `Keys` 線**：refresh（查成員、查裝置）與後台建通道、送金鑰；`Misc` 上只有 `Event/Send`。
 //! - **被 1506 擋**：daemon 自動 refresh（重拿成員、只重查變了的人、交給後台），把新的 [`RoomDevices`] 放進錯誤的 `data` 一起回；
-//!   🚫 不自動重送（重送是 UI 的事，用同一個 `txn_id`）。
+//!   **不**自動重送（重送是 UI 的事，用同一個 `txn_id`）。
 //! - **解密**：收到時有金鑰就解，密文明文一起存；沒金鑰只存密文。金鑰到了，找出那把 session 還沒解的立刻解、補存明文，
 //!   並照收訊息那條路發 `room.message`（同 `event_id`，UI 當更新）。
 
@@ -40,13 +40,18 @@ pub struct RoomDevices {
     pub members: BTreeMap<String, String>,
 }
 
-/// 送一則文字的選項（`room.send_text`）。
+/// 送一則事件的選項（`room.send_text`／`room.send_file`／`room.send_attachment`／`room.edit`／`room.react`）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SendOptions {
     /// 加密房必帶：UI 手上那份（`room.refresh_devices` 回的、或上一次 1506 的 `data`）。明文房不看它。
     pub room_devices: Option<RoomDevices>,
     /// 重送用同一個（server 冪等）；None ＝ daemon 產一個新的，被 1506 擋時放在 `data.txn_id` 回給 UI
     pub txn_id: Option<String>,
+    /// 回覆哪一則（只有送訊息的三支收；`room.edit`、`room.react` 帶了回 Usage）, example: Some("$abc".into())
+    pub reply_to: Option<String>,
+    /// 提到誰（/docs/design/messages/message-actions.md §3.2；`room.react` 帶了回 Usage）。None 跟 `Some(vec![])` 不一樣：
+    /// 送訊息時 None 且沒有回覆就整欄不帶，`room.edit` 的 None 是「改字不通知任何人」, example: Some(vec!["@bob:localhost".into()])
+    pub mentions: Option<Vec<String>>,
 }
 
 /// cache 裡要拿去補解的那一批。
@@ -60,7 +65,7 @@ pub(crate) enum StoredToDecrypt {
 impl RoomDevices {
     /// Return:
     ///     Ok(RoomDeviceVersions)
-    ///     Err(Usage)   某個成員的裝置版本號不是 `序號-雜湊`（UI 帶錯了；🚫 不猜）
+    ///     Err(Usage)   某個成員的裝置版本號不是 `序號-雜湊`（UI 帶錯了；**不**猜）
     fn to_versions(&self) -> Result<RoomDeviceVersions, CoreError> {
         let mut members = BTreeMap::new();
         for (user_id, text) in &self.members {
@@ -94,7 +99,7 @@ impl RoomDevices {
 }
 
 impl Core {
-    /// 確認這個房現在的人與裝置（UI 點進房、或自己發現版本號變了時叫），並交給後台對這一刻的狀態先分好房間金鑰；🚫 等後台分完。
+    /// 確認這個房現在的人與裝置（UI 點進房、或自己發現版本號變了時叫），並交給後台對這一刻的狀態先分好房間金鑰；**不**等後台分完。
     /// 查成員、查裝置都走 `Keys` 線（金鑰的事都在那條，/docs/design/keys/e2ee-rpc.md §3.1）；沒開就開（這是 UI 下的命令）。
     ///
     /// Args:
@@ -153,7 +158,7 @@ impl Core {
 
     /// wbf 帳號在加密房送一則事件：**只用已經分好的金鑰**（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）——
     /// 等這個房的金鑰對 UI 帶來的房間版本號就緒（還沒就交給後台準備，最多 `ROOM_KEY_WAIT`）→ 加密 → 帶號碼在 `Misc` 上送 → 交給後台看要不要提早換。
-    /// 🚫 在這裡建、換、送金鑰。等不到就回 `RoomKeyNotReady`，訊息沒加密、沒送。
+    /// **不**在這裡建、換、送金鑰。等不到就回 `RoomKeyNotReady`，訊息沒加密、沒送。
     /// 被 1506 擋 → 自動 refresh（`previous` 就是 UI 帶來的那份，只重查變了的人）→ 交給後台 → 回 `RoomDevicesChanged`，`data` 是新狀態加 `txn_id`。
     ///
     /// Args:
@@ -221,7 +226,7 @@ impl Core {
                 error,
             } => (current_room_version, error),
         };
-        // 被擋了：daemon 自動做下一步（重拿房間狀態、交給後台），連同錯誤一起回；🚫 不自動重送。
+        // 被擋了：daemon 自動做下一步（重拿房間狀態、交給後台），連同錯誤一起回；**不**自動重送。
         match self.refresh_on_keys_line(account, room, Some(&previous)).await {
             Ok(fresh) => Err(CoreError::new(
                 CoreErrorKind::RoomDevicesChanged,
@@ -285,7 +290,7 @@ pub(crate) async fn to_incoming(
 impl Core {
     /// `room.history` 讀本地（`local`／`both`）讀到還沒解開的：拿這幾則再試一次（/docs/design/keys/e2ee-rpc.md §6 的觸發點之三）。
     /// 補的是「金鑰到了、解開了、但當時寫 cache 失敗」那幾則——那把金鑰已經匯入，不會再有「金鑰到了」叫它們。
-    /// 解開的補存、換掉這一頁裡的那幾則；🚫 發 `room.message`（UI 正在讀這一頁）。失敗只講一聲、照原樣回（🚫 讓讀歷史失敗）。
+    /// 解開的補存、換掉這一頁裡的那幾則；**不**發 `room.message`（UI 正在讀這一頁）。失敗只講一聲、照原樣回（**不**讓讀歷史失敗）。
     ///
     /// Args:
     ///     room: example: "!r:localhost"
@@ -384,7 +389,7 @@ pub(crate) async fn decrypt_stored(
         return Ok(0);
     }
     let notices: Vec<CoreEvent> = if announce {
-        messages_from_incoming(room, &opened)
+        messages_from_incoming(room, me, &opened)
             .into_iter()
             .map(|message| CoreEvent::Message {
                 user: me.to_string(),
@@ -452,11 +457,12 @@ mod tests {
         SendOptions {
             room_devices: Some(devices.clone()),
             txn_id: Some(txn_id.to_string()),
+            ..SendOptions::default()
         }
     }
 
-    /// /docs/design/keys/e2ee-rpc.md 的整條送出：加密房沒帶 `room_devices` 就拒（🚫 不送明文）；refresh 回 UI 要存的那份；帶著它送出去的是密文、帶那個號碼；
-    /// 號碼過期被 1506 擋 → **daemon 自動重拿房間狀態**，錯誤是 `RoomDevicesChanged`、`data` 帶新狀態與同一個 `txn_id`，訊息沒送（🚫 不自動重送）；
+    /// /docs/design/keys/e2ee-rpc.md 的整條送出：加密房沒帶 `room_devices` 就拒（**不**送明文）；refresh 回 UI 要存的那份；帶著它送出去的是密文、帶那個號碼；
+    /// 號碼過期被 1506 擋 → **daemon 自動重拿房間狀態**，錯誤是 `RoomDevicesChanged`、`data` 帶新狀態與同一個 `txn_id`，訊息沒送（**不**自動重送）；
     /// UI 帶新狀態、同一個 `txn_id` 重送就過。
     #[tokio::test]
     async fn an_encrypted_send_carries_the_room_version_and_a_stale_one_comes_back_with_the_fresh_state(
@@ -474,7 +480,7 @@ mod tests {
         assert!(refused.message.contains("room_devices"), "{refused:?}");
         assert!(
             fake.sent_events.lock().unwrap().is_empty(),
-            "🚫 加密房不送明文"
+            "加密房不送明文"
         );
 
         let refreshed = core
@@ -485,7 +491,7 @@ mod tests {
         assert!(
             fake.bridge_calls.lock().unwrap().is_empty()
                 && !keys.bridge_calls.lock().unwrap().is_empty(),
-            "refresh 走 `Keys` 線、🚫 用 `Misc`"
+            "refresh 走 `Keys` 線、不用 `Misc`"
         );
         assert_eq!(refreshed.members.keys().collect::<Vec<_>>(), vec![ME]);
         let event_id = core
@@ -532,7 +538,7 @@ mod tests {
         assert_eq!(
             fake.sent_events.lock().unwrap().len(),
             1,
-            "被擋的那則沒送、🚫 不自動重送"
+            "被擋的那則沒送、不自動重送"
         );
 
         let fresh: RoomDevices = serde_json::from_value(data).unwrap();
@@ -573,13 +579,13 @@ mod tests {
         drop(sent);
         assert!(
             fake.bridge_calls.lock().unwrap().is_empty(),
-            "送文字只看本地記的加不加密，🚫 為它問 server（維護者 2026-10-05）"
+            "送文字只看本地記的加不加密，不為它問 server（維護者 2026-10-05）"
         );
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// UI 帶回來的裝置版本號形狀不對：`Usage`，🚫 不猜、不送。
+    /// UI 帶回來的裝置版本號形狀不對：`Usage`，**不**猜、**不**送。
     #[test]
     fn room_devices_with_a_bad_device_version_are_refused() {
         let devices = RoomDevices {
@@ -628,7 +634,7 @@ mod tests {
     }
 
     /// 補解寫失敗留下的密文（/docs/design/keys/e2ee-rpc.md §6）：那把金鑰已經匯入、不會再有「金鑰到了」叫它，
-    /// `room.history`（本地）讀到它就再試一次——回的那頁是明文、cache 補存了；🚫 發 `room.message`（UI 正在讀這頁）。再讀一次什麼都不用做。
+    /// `room.history`（本地）讀到它就再試一次——回的那頁是明文、cache 補存了；**不**發 `room.message`（UI 正在讀這頁）。再讀一次什麼都不用做。
     #[tokio::test]
     async fn a_ciphertext_left_in_the_cache_is_retried_when_the_history_reads_it() {
         let dir = scratch("crypto-history-retry");
@@ -769,7 +775,7 @@ mod tests {
     }
 
     /// 房間那條線推來一則密文、金鑰已經在：寫進 cache 的是解開的（密文照留）、`room.message` 帶明文。
-    /// 同一條線推來 `DeviceChanged`：原樣轉成 `CoreEvent::DeviceChanged` 給 UI（daemon 自己🚫 不動作）。
+    /// 同一條線推來 `DeviceChanged`：原樣轉成 `CoreEvent::DeviceChanged` 給 UI（daemon 自己**不**動作）。
     #[tokio::test]
     async fn the_rooms_line_decrypts_what_it_can_and_forwards_device_changes() {
         let dir = scratch("crypto-rooms-line");
@@ -834,7 +840,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `sync.recent` 拉到的密文：收批回呼是同步的、當下不解；整輪拉完、回給 UI 之前解開補存（🚫 不發 `room.message`：Recent 本來就不推）。
+    /// `sync.recent` 拉到的密文：收批回呼是同步的、當下不解；整輪拉完、回給 UI 之前解開補存（**不**發 `room.message`：Recent 本來就不推）。
     #[tokio::test]
     async fn recent_decrypts_what_it_pulled_before_answering() {
         let dir = scratch("crypto-recent");
@@ -896,7 +902,7 @@ mod tests {
                         }
                     }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    // 事件來源收攤了就不會再來：🚫 不空轉到 30 秒逾時（PR #62 審查 cirno 🟢）。
+                    // 事件來源收攤了就不會再來：**不**空轉到 30 秒逾時（PR #62 審查 cirno 🟢）。
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         panic!("the event channel closed before {event_id} arrived decrypted")
                     }

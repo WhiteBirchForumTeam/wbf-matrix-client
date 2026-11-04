@@ -12,7 +12,7 @@
 //! `content_json`，**兩者寫進去就不改**。edit／redact／reaction 的 `ref_event_id` 指目標；訊息自己的 `ref_event_id` 指
 //! **目前要顯示的 edit**，寫入時比 `modified_timestamp` 決定換不換（/docs/design/messages/edits-and-redactions.md §5）。redact 在目標那列打勾 `is_redacted`。
 //! 這裡只有 SQL 與我們的聊天模型（`Message`、`Conversation`），沒有 matrix-sdk、沒有網路。
-//! 🚫 金鑰不進錯誤訊息、不 log。
+//! 金鑰**不**進錯誤訊息、**不** log。
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +32,7 @@ use crate::vault::Key32;
 pub const CACHE_FILE_NAME: &str = "cache.db";
 /// 換 schema 就加一，舊檔整個重建（/docs/design/storage/local-cache-db.md §1）。v5：`events` 照 /docs/design/messages/edits-and-redactions.md 改；
 /// v6：`media.source_uri`（/docs/design/rpc-specs/data-plane.md §8.1）；v7：`chunks_written` 改名 `segments_written`（池格式 v2 記段數，/docs/design/media/media-download.md §4.4）；
-/// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、🚫 刪列，維護者 2026-10-05）。
+/// v8：`room_list` 的 `conversation_json`／`refreshed_at` 可以是 NULL（加入了、還沒拿過）、多 `joined`（退出的標 0、**不**刪列，維護者 2026-10-05）。
 /// v9：`media.kind`、`media.verified`；`file_size`、`chunk_size` 只有 `kind` 1 一定有（維護者 2026-10-06，/docs/design/media/media-download.md §12）。
 /// v10：`room_list.joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，維護者 2026-10-07，/docs/design/rooms/room-actions.md §3）；`room_list.is_state_carried_over`（`state` 是上次留下來的）。
 /// v11：`room_list.invite_json`（被邀請的那一列的邀請內容，維護者 2026-10-14，/docs/design/rooms/room-actions.md §3.3.3）。
@@ -88,6 +88,23 @@ pub struct EventPosition {
     pub g_seq: Option<i64>,
 }
 
+/// 一則訊息在一個讀者眼中現在的樣子（[`Cache::find_stored_target`]）：送出的那半拿它驗目標（/docs/design/messages/message-actions.md §4.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredTarget {
+    /// example: "@alice:localhost"
+    pub sender: String,
+    /// None ＝ 庫裡的字認不得（壞列）
+    pub class: Option<EventClass>,
+    pub is_redacted: bool,
+    /// 解開之後的 type；還沒解開是 None, example: Some("m.room.message".into())
+    pub event_type: Option<String>,
+    /// 原本是加密事件（不管解開了沒）
+    pub is_encrypted: bool,
+    /// 目前那一版的 content（被改過就是那個 edit 換上去的，同 `room.history` 顯示的那份）；
+    /// None ＝ 讀不到：不是一般訊息、已收回、還沒解開、目前的 edit 這個讀者沒同步到／hide 了／被收回了、壞列
+    pub current_content: Option<serde_json::Value>,
+}
+
 /// 本地閱讀位置（/docs/design/storage/local-cache-db.md §5 `read_positions`）：`event_id` 是權威，`r_seq` 給算術用。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPosition {
@@ -105,7 +122,7 @@ pub struct MediaEntry {
     pub name: Option<String>,
     pub mimetype: Option<String>,
     /// 明文的校驗碼，`<algo>:<hex>`：事件區塊有帶就是 `sha256:…`（上傳者算的），沒帶就下載完填 `blake3:…`（我們算的，同 `pool_file`）。
-    /// 還沒下載完而區塊也沒帶時是 None。`kind` 2 是 `matrix-sha256:<base64>`（密文的，🚫 跟 `sha256:` 互比）。
+    /// 還沒下載完而區塊也沒帶時是 None。`kind` 2 是 `matrix-sha256:<base64>`（密文的，禁止跟 `sha256:` 互比）。
     pub hash: Option<String>,
     /// 哪一種格式（/docs/design/rpc-specs/data-plane.md §7.1）
     pub kind: MediaKind,
@@ -115,7 +132,7 @@ pub struct MediaEntry {
     pub file_size: Option<u64>,
     /// 塊大小：只有 `kind` 1 有
     pub chunk_size: Option<u32>,
-    /// 主檔已經落地的完整段數（池格式 v2）。只給顯示用：🚫 不當續傳的依據，檔案本身才是進度（/docs/design/media/media-download.md §4.1）。
+    /// 主檔已經落地的完整段數（池格式 v2）。只給顯示用：**不**當續傳的依據，檔案本身才是進度（/docs/design/media/media-download.md §4.1）。
     pub segments_written: u64,
     pub complete: bool,
     pub bytes_on_disk: u64,
@@ -143,7 +160,7 @@ impl MediaDescription {
     ///
     /// Return:
     ///     Some(MediaDescription)   `kind` 1
-    ///     None                     區塊沒帶 `file_size`：約定裡一定有，沒有就🚫 當成一個檔（`kind` 1 的列 CHECK 要它）
+    ///     None                     區塊沒帶 `file_size`：約定裡一定有，沒有就**不**當成一個檔（`kind` 1 的列 CHECK 要它）
     pub fn of_chunked_block(block: &ChunkedBlock) -> Option<MediaDescription> {
         Some(MediaDescription {
             kind: MediaKind::WbfChunked,
@@ -155,7 +172,7 @@ impl MediaDescription {
         })
     }
 
-    /// 標準 Matrix 的附件（`kind` 2、3）。`kind` 2 的 hash 記成 `matrix-sha256:<事件裡的 base64>`：算的是密文，🚫 跟 `sha256:` 互比。
+    /// 標準 Matrix 的附件（`kind` 2、3）。`kind` 2 的 hash 記成 `matrix-sha256:<事件裡的 base64>`：算的是密文，禁止跟 `sha256:` 互比。
     pub fn of_matrix_attachment(attachment: &crate::chat::MatrixAttachment) -> MediaDescription {
         let hash = attachment
             .file
@@ -338,9 +355,9 @@ impl Cache {
     // ---- room_list ----
 
     /// 拿回來的房間的樣子（一人一列；`Conversation` 是他看到的樣子）：整份蓋上去、記下什麼時候拿的。
-    /// 🚫 動 `membership`：在不在房裡只由 [`Cache::record_joined_rooms`]（`room.list`）與房間動作（[`Cache::record_membership`]）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設 `join`。
-    /// 這份沒帶狀態（`state` 是 `null`，一般 Matrix 帳號的列表）就留著本地那份的 `state`：🚫 拿「這次沒問」蓋掉「上次問過的」。
-    /// 留下來的那份比這次的型別欄位舊，所以記 `is_state_carried_over = 1`：[`Cache::record_written_state`] 看到它就🚫 拿那份重算（會把新的名字、權限改回舊的）。
+    /// **不**動 `membership`：在不在房裡只由 [`Cache::record_joined_rooms`]（`room.list`）與房間動作（[`Cache::record_membership`]）寫，對退出的房叫 `room.get` 不會把它標回加入；新列預設 `join`。
+    /// 這份沒帶狀態（`state` 是 `null`，一般 Matrix 帳號的列表）就留著本地那份的 `state`：**不**拿「這次沒問」蓋掉「上次問過的」。
+    /// 留下來的那份比這次的型別欄位舊，所以記 `is_state_carried_over = 1`：[`Cache::record_written_state`] 看到它就**不**拿那份重算（會把新的名字、權限改回舊的）。
     pub fn upsert_conversations(
         &mut self,
         user_id: &str,
@@ -362,8 +379,8 @@ impl Cache {
                     "SELECT conversation_json FROM room_list WHERE user = ?1 AND room = ?2",
                 )
                 .map_err(db_error)?;
-            // 🚨 **只准 0 → 1，🚫 不准 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
-            // 「沒加密」—— 過期的、別的帳號舊的、有 bug 的 —— 都🚫 不准把已知加密的房間蓋回明文。
+            // 🚨 **只准 0 → 1，禁止 1 → 0**：Matrix 房間一開加密就關不掉，所以任何一份
+            // 「沒加密」—— 過期的、別的帳號舊的、有 bug 的 —— 都禁止把已知加密的房間蓋回明文。
             // ⭐ 蓋回去的下一步就是送檔時用 `cipher: none` 把區塊金鑰公開出去（/docs/design/media/wbf-client-convention-for-chunk.md §5.1）。
             let mut mark_encryption = transaction
                 .prepare_cached(
@@ -405,8 +422,8 @@ impl Cache {
     }
 
     /// server 說這個帳號加入了哪些房（`room.list`，維護者 2026-10-05）：跟本地比對差異。
-    /// 新的加一列（樣子是 NULL，等 `room.get`）；已經有的🚫 覆寫它的樣子，不是 `join` 的標回 `join`；
-    /// 本地是 `join`、名單裡卻沒有的標 `leave`，🚫 刪列。別的身分（`invite`、`knock`、`ban`）不在名單裡本來就對，🚫 動。
+    /// 新的加一列（樣子是 NULL，等 `room.get`）；已經有的**不**覆寫它的樣子，不是 `join` 的標回 `join`；
+    /// 本地是 `join`、名單裡卻沒有的標 `leave`，**不**刪列。別的身分（`invite`、`knock`、`ban`）不在名單裡本來就對，**不**動。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -467,7 +484,7 @@ impl Cache {
     /// Return:
     ///     Ok(Some(true))    加密
     ///     Ok(Some(false))   明文
-    ///     Ok(None)          沒有這間房、或不知道（只因收到事件才建出來的房，NULL）——🚫 當成明文
+    ///     Ok(None)          沒有這間房、或不知道（只因收到事件才建出來的房，NULL）——**不**當成明文
     pub fn find_room_encrypted(&self, room_id: &str) -> Result<Option<bool>, SdkError> {
         self.connection
             .query_row(
@@ -516,7 +533,7 @@ impl Cache {
         for row in rows {
             let (room_id, json, refreshed_at, room_is_encrypted, membership, invite_json) =
                 row.map_err(db_error)?;
-            // CHECK 擋著不認得的字；真的讀到了就當壞資料跳過（🚫 猜成哪一種）。
+            // CHECK 擋著不認得的字；真的讀到了就當壞資料跳過（**不**猜成哪一種）。
             let Some(membership) = Membership::find_by_name(&membership) else {
                 continue;
             };
@@ -623,10 +640,10 @@ impl Cache {
     ///     user_id: 身分變了的那個帳號（本機登入的）, example: "@bob:localhost"
     ///     room_id: example: "!abc:localhost"
     ///     membership: example: Membership::Leave
-    ///     only_if_now: 給了就只在目前是它的時候改（解除封鎖：只有 `ban` 才改成 `leave`）；列不在也🚫 加, example: Some(Membership::Ban)
+    ///     only_if_now: 給了就只在目前是它的時候改（解除封鎖：只有 `ban` 才改成 `leave`）；列不在也**不**加, example: Some(Membership::Ban)
     /// Return:
     ///     Ok(true)    寫了
-    ///     Ok(false)   `only_if_now` 對不上，🚫 寫
+    ///     Ok(false)   `only_if_now` 對不上，**不**寫
     pub fn record_membership(
         &mut self,
         user_id: &str,
@@ -659,7 +676,7 @@ impl Cache {
     }
 
     /// 被邀請了（`Invite/Push`，或一輪 `Fetch` 的一筆經過 [`Cache::apply_invite_round`]）：那一列 `membership = invite`、`invite_json` 換成這則（列不在就加）。
-    /// 這則沒帶 `state`（太大 server 沒送）就留著本地原本那份（🚫 拿「這次沒送」蓋掉「之前拿到的」，/docs/design/rooms/room-actions.md §3.3.3）。
+    /// 這則沒帶 `state`（太大 server 沒送）就留著本地原本那份（**不**拿「這次沒送」蓋掉「之前拿到的」，/docs/design/rooms/room-actions.md §3.3.3）。
     ///
     /// Args:
     ///     user_id: 被邀請的帳號, example: "@bob:localhost"
@@ -678,7 +695,7 @@ impl Cache {
     }
 
     /// 一輪 `Fetch` 補完了（`r == 0`）：照 /docs/design/rooms/room-actions.md §3.3.3 寫一份完整快照，**一個 transaction**。
-    /// - 快照裡的每一間：這一輪被推播碰過、而且推播的 `is` ≥ 這筆的 count → 🚫 寫（推播比較新）；否則照 [`Cache::record_invite`] 寫。
+    /// - 快照裡的每一間：這一輪被推播碰過、而且推播的 `is` ≥ 這筆的 count → **不**寫（推播比較新）；否則照 [`Cache::record_invite`] 寫。
     /// - 本地是 `invite`、快照裡沒有、這一輪也沒被碰過的 → `membership` 改成 `departed` 說的（沒說就是 `leave`）、`invite_json` 清掉。
     ///
     /// Args:
@@ -755,9 +772,9 @@ impl Cache {
     }
 
     /// 自己剛寫了一項房間狀態（`room.set_state` 與它的窄版收到 ACK、`sync=both`，/docs/design/rooms/room-actions.md §3）：
-    /// 自己那一列有拿過狀態就把那一項換進去、重算型別欄位（`room_state::conversation_with_state_event`）；沒拿過、那份狀態是列表留下來的（`is_state_carried_over`）、或重算不出來，就🚫 寫那一列（下一次 `room.get` 會整份蓋上）。
-    /// 寫的是 `m.room.encryption`（[`crate::room_state::is_encryption_event`]）→ `rooms.encrypted = 1`，不管有沒有那一列、重算成不成（房間的事實，只升不降；重算失敗🚫 把它一起回滾）。
-    /// 其他帳號那一列是它們自己看到的樣子，🚫 動。
+    /// 自己那一列有拿過狀態就把那一項換進去、重算型別欄位（`room_state::conversation_with_state_event`）；沒拿過、那份狀態是列表留下來的（`is_state_carried_over`）、或重算不出來，就**不**寫那一列（下一次 `room.get` 會整份蓋上）。
+    /// 寫的是 `m.room.encryption`（[`crate::room_state::is_encryption_event`]）→ `rooms.encrypted = 1`，不管有沒有那一列、重算成不成（房間的事實，只升不降；重算失敗**不**把它一起回滾）。
+    /// 其他帳號那一列是它們自己看到的樣子，**不**動。
     ///
     /// Args:
     ///     user_id: 寫的人, example: "@alice:localhost"
@@ -823,7 +840,7 @@ impl Cache {
     /// `room.forget` 的本地那半（server 已經 ACK，/docs/design/rooms/room-actions.md §3.1），一個 transaction：
     /// 刪這個帳號那一列、它的已讀位置、它在這間房的事件可見性；這間房在本機**沒有別的帳號**（沒有 `room_list` 列、也看不到任何一則事件）
     /// 才刪整間房的紀錄（`rooms` 那一列，事件與已讀跟著 CASCADE），連同「原本只被這間房的事件指著、現在一個連結都不剩」的 `media` 列。
-    /// 🚫 動池檔：列沒了之後沒人指著它，留給掃描（`media::sweep`）。沒綁事件的 `media` 列🚫 動（例：剛傳、事件還沒回來的）。
+    /// **不**動池檔：列沒了之後沒人指著它，留給掃描（`media::sweep`）。沒綁事件的 `media` 列**不**動（例：剛傳、事件還沒回來的）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -907,7 +924,7 @@ impl Cache {
     /// - 之前沒解開（`class = general`）的，這次帶著明文來：照明文分類，當作第一次處理。
     /// - 每則替 `user_id` 記一列 `events_synced_log`，已有就只更新 `last_synced_at`，`hidden` 不動。
     ///
-    /// 🚫 **不寫**：沒有 `event_id` 或 `sender` 的（不能被參照、不能比對誰改了誰的訊息）；
+    /// **不寫**：沒有 `event_id` 或 `sender` 的（不能被參照、不能比對誰改了誰的訊息）；
     /// 事件自己帶的 `room_id` 跟 `room_id` 參數不一樣的（不猜是哪一邊錯）。
     ///
     /// Args:
@@ -927,7 +944,7 @@ impl Cache {
             .written)
     }
 
-    /// 同 [`Cache::upsert_events`]，但連「不寫的幾則」一起回：進料口（推播、`Recent`）要把這個數字講出來，🚫 不靜默跳過（PR #58 審查 rumia 🔴）。
+    /// 同 [`Cache::upsert_events`]，但連「不寫的幾則」一起回：進料口（推播、`Recent`）要把這個數字講出來，**不**靜默跳過（PR #58 審查 rumia 🔴）。
     ///
     /// Return:
     ///     Ok(UpsertOutcome)   `written` 寫進去的；`unstorable` 沒有 `event_id`／`sender`、或 `room_id` 跟參數不同的（永遠存不了，不是這次失敗）
@@ -1003,7 +1020,7 @@ impl Cache {
             })?;
             let mut is_new_to_process = inserted;
             if !inserted {
-                // 🚫 raw_event、content_json 不覆蓋：只從 NULL 補。is_redacted 只升不降。
+                // raw_event、content_json **不**覆蓋：只從 NULL 補。is_redacted 只升不降。
                 transaction
                     .prepare_cached(
                         "UPDATE events SET raw_event = COALESCE(raw_event, ?2), r_seq = COALESCE(r_seq, ?3),
@@ -1039,7 +1056,7 @@ impl Cache {
             }
             // 這間房加密了的證據（`m.room.encryption`，或任何加密事件）：本地的「加不加密」往上升，只升不降。
             // 送文字只看它（維護者 2026-10-05）：拿完房間之後才開的加密，靠這裡補上。
-            // 認不認得 `m.room.encryption` 跟拿房間時同一個判斷（`is_encryption_content`），🚫 各寫一份。
+            // 認不認得 `m.room.encryption` 跟拿房間時同一個判斷（`is_encryption_content`），禁止各寫一份。
             let shows_encryption = incoming.decrypted().is_some()
                 || (text("type") == Some("m.room.encryption")
                     && crate::room_state::is_encryption_content(
@@ -1157,7 +1174,7 @@ impl Cache {
     /// 一則事件在房間裡的**位置**：翻頁時把 UI 給的 `event_id` 換成上游聽得懂的座標。
     ///
     /// 🚨 **只看這個帳號看得到的**（JOIN `events_synced_log`）：別的帳號同步進來、這個帳號從沒看過的事件，
-    /// 🚫 不准拿來當翻頁的錨 —— 那等於用 B 的可見範圍替 A 定位，而且洩漏「那則事件存在」。
+    /// 禁止拿來當翻頁的錨 —— 那等於用 B 的可見範圍替 A 定位，而且洩漏「那則事件存在」。
     /// ⚠️ `hidden` 的也算（刪給自己看的只是不顯示，位置照樣是真的）。
     ///
     /// Args:
@@ -1197,7 +1214,7 @@ impl Cache {
     /// ⭐ 用在「問完上游、寫進去、再從本地讀回這一頁」：上游決定**哪幾則、什麼順序**
     /// （`Recent` 照 `g_seq`、`/messages` 照拓樸序），本地決定**每一則長什麼樣**
     /// （已解密的明文不會被密文蓋掉、`hidden` 的不出來、別的帳號的看不到）。
-    /// 🚫 **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（/docs/design/rooms/chat-model.md §4.3）。
+    /// **不靠 `r_seq` 排**：非 fork server 的事件沒有它，而拿時間戳排是錯的（/docs/design/rooms/chat-model.md §4.3）。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -1393,7 +1410,7 @@ impl Cache {
     /// 訊息自己的 `ref_event_id` 指的那個 edit（寫入時已經驗過、選過最新的）。**有參照就以參照物為準**（維護者 2026-09-14）。
     ///
     /// 🚨 消費端再問一次（A6）：那一列必須**真的是指回這則的 edit、同一個 sender**，
-    /// 對不上就當沒被 edit 過，顯示原文 —— 🚫 不因為寫入端的一個 bug 就把別人的內容顯示成這則。
+    /// 對不上就當沒被 edit 過，顯示原文 —— **不**因為寫入端的一個 bug 就把別人的內容顯示成這則。
     /// 對得上之後照這個順序看那一列：
     ///
     /// 1. 這個帳號沒同步過 → 還沒同步到，版本過時（可見性跟 events 表完全一致）
@@ -1480,11 +1497,12 @@ impl Cache {
     }
 
     /// 參照這則的 reaction，🚨 **只算這個帳號同步過、沒 hide 的**（跟事件本身同一條可見性規則），被 redact 的不算。
+    /// 同一個人對同一個 key 有兩則只算一次；`mine` 是讀者自己最早的那則（/docs/design/messages/message-actions.md §5）。
     fn list_reactions(&self, user_id: &str, row: &EventRow) -> Result<Vec<Reaction>, SdkError> {
         let mut statement = self
             .connection
             .prepare_cached(
-                "SELECT x.content_json, u.mxid FROM events x
+                "SELECT x.content_json, u.mxid, x.event_id FROM events x
                  JOIN users u ON u.id = x.sender
                  JOIN events_synced_log l ON l.event = x.id
                  JOIN users reader ON reader.id = l.user
@@ -1498,12 +1516,13 @@ impl Cache {
                 Ok((
                     sql_row.get::<_, Option<String>>(0)?,
                     sql_row.get::<_, String>(1)?,
+                    sql_row.get::<_, String>(2)?,
                 ))
             })
             .map_err(db_error)?;
         let mut reactions: Vec<Reaction> = Vec::new();
         for reaction_row in rows {
-            let (body, by) = reaction_row.map_err(db_error)?;
+            let (body, by, reaction_event_id) = reaction_row.map_err(db_error)?;
             let Some(key) = body
                 .as_deref()
                 .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
@@ -1516,12 +1535,127 @@ impl Cache {
             else {
                 continue;
             };
+            // `ORDER BY x.id`：先寫進來的先到，所以第一次遇到的就是最早的那則。
+            let mine = (by == user_id).then_some(reaction_event_id);
             match reactions.iter_mut().find(|reaction| reaction.key == key) {
-                Some(reaction) => reaction.by.push(by),
-                None => reactions.push(Reaction { key, by: vec![by] }),
+                Some(reaction) => {
+                    if !reaction.by.contains(&by) {
+                        reaction.by.push(by);
+                    }
+                    if reaction.mine.is_none() {
+                        reaction.mine = mine;
+                    }
+                }
+                None => reactions.push(Reaction {
+                    key,
+                    by: vec![by],
+                    mine,
+                }),
             }
         }
         Ok(reactions)
+    }
+
+    /// 這個帳號自己對一則訊息按的、還在的那則反應（`room.react` 的冪等，/docs/design/messages/message-actions.md §4.3）。
+    /// 可見性同 `list_reactions`：這個帳號同步過、沒 hide、沒被收回。
+    ///
+    /// Args:
+    ///     user_id: 按的人，也是讀者, example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     target_event_id: 被按的那則, example: "$abc"
+    ///     key: example: "👍"
+    /// Return:
+    ///     Ok(Some(String))  那則反應的 event_id（有兩則時是最早的）
+    ///     Ok(None)          本地沒有
+    pub fn find_own_reaction(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        target_event_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, SdkError> {
+        self.connection
+            .prepare_cached(
+                "SELECT x.event_id FROM events x
+                 JOIN rooms r ON r.id = x.room
+                 JOIN users u ON u.id = x.sender
+                 JOIN events_synced_log l ON l.event = x.id
+                 JOIN users reader ON reader.id = l.user
+                 WHERE r.room_id = ?1 AND x.ref_event_id = ?2 AND x.class = 'reaction' AND x.is_redacted = 0
+                   AND u.mxid = ?3 AND reader.mxid = ?3 AND l.hidden = 0
+                   AND json_extract(x.content_json, '$.\"m.relates_to\".key') = ?4
+                 ORDER BY x.id LIMIT 1",
+            )
+            .map_err(db_error)?
+            .query_row(
+                params![room_id, target_event_id, user_id, key],
+                |sql_row| sql_row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// 一則訊息在這個讀者眼中現在的樣子，給送出的那半驗目標（/docs/design/messages/message-actions.md §3.2、§4.2）。
+    /// 可見性同 `room.history`：這個帳號同步過、沒 hide。
+    ///
+    /// Args:
+    ///     user_id: 讀者, example: "@alice:localhost"
+    ///     room_id: example: "!abc:localhost"
+    ///     event_id: example: "$abc"
+    /// Return:
+    ///     Ok(Some(StoredTarget))
+    ///     Ok(None)                這個帳號本地沒有這則（沒同步過、hide 了、不存在）
+    pub fn find_stored_target(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<StoredTarget>, SdkError> {
+        let row = self
+            .connection
+            .prepare_cached(&format!(
+                "SELECT {EVENT_ROW_COLUMNS}
+                 FROM events e
+                 JOIN events_synced_log l ON l.event = e.id
+                 JOIN users reader ON reader.id = l.user
+                 JOIN users s ON s.id = e.sender
+                 JOIN rooms r ON r.id = e.room
+                 WHERE reader.mxid = ?1 AND r.room_id = ?2 AND e.event_id = ?3 AND l.hidden = 0"
+            ))
+            .map_err(db_error)?
+            .query_row(params![user_id, room_id, event_id], event_row_from_sql)
+            .optional()
+            .map_err(db_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // 目前那一版：沒被改過是自己的 content；被改過換成那個 edit 的（同 `to_message`）。讀不到就是 None。
+        let own_content = row
+            .content_json
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok());
+        let current_content = match (&own_content, EventClass::from_column(&row.class)) {
+            (Some(own_content), Some(EventClass::Msg)) if !row.is_redacted => {
+                match self.find_current_edit(user_id, &row)? {
+                    CurrentEdit::NotEdited => Some(own_content.clone()),
+                    CurrentEdit::Visible { new_content, .. } => {
+                        Some(to_replaced_body(own_content, &new_content))
+                    }
+                    CurrentEdit::NotSynced | CurrentEdit::Hidden | CurrentEdit::Redacted { .. } => {
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        Ok(Some(StoredTarget {
+            sender: row.sender,
+            class: EventClass::from_column(&row.class),
+            is_redacted: row.is_redacted,
+            event_type: row.event_type,
+            is_encrypted: row.decrypted.is_some(),
+            current_content,
+        }))
     }
 
     /// 刪除的理由：本地有 redact 事件就用它的 `reason`，否則看 server 蓋在原樣上的 `redacted_because`。
@@ -1764,7 +1898,7 @@ impl Cache {
     }
 
     /// 下載完、檔已 adopt 進池：寫齊 `pool_file`、`complete`、`verified`、`file_size`（下載到的長度是事實，蓋掉區塊說的）、`bytes_on_disk`。
-    /// `complete` 與 `verified` 同一筆寫入：🚫 有「完成了卻還沒驗」落在 DB 裡（/docs/design/media/media-download.md §12.3）。
+    /// `complete` 與 `verified` 同一筆寫入：**不會**有「完成了卻還沒驗」落在 DB 裡（/docs/design/media/media-download.md §12.3）。
     ///
     /// Args:
     ///     verified: 收尾時比對的結果, example: Verification::Matched
@@ -1872,7 +2006,7 @@ impl Cache {
     }
 
     /// 這個帳號看得到的事件裡，引用這個 mxc 的區塊（含檔案金鑰，/docs/design/media/media-download.md §3.2 的「金鑰從哪來」），照寫進來的順序。
-    /// 🚫 不看別的帳號的：同一份 `cache.db` 裡有同 server 別人的事件，金鑰不跨帳號借。
+    /// **不**看別的帳號的：同一份 `cache.db` 裡有同 server 別人的事件，金鑰不跨帳號借。
     /// 哪一份能用由呼叫者跟本地那一列比過才算（`media::find_key_matching_record`）。
     ///
     /// Args:
@@ -1896,7 +2030,7 @@ impl Cache {
             .collect())
     }
 
-    /// 這個帳號看得到的某一則事件帶的附件（`media.download { room, event_id }`）。看的是這則自己的內容，🚫 不換成它目前的 edit。
+    /// 這個帳號看得到的某一則事件帶的附件（`media.download { room, event_id }`）。看的是這則自己的內容，**不**換成它目前的 edit。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -2019,7 +2153,7 @@ impl Cache {
 
     /// 從訊息點下載（`media.download { room, event_id }`）：由這則事件確定 `media` 列（/docs/design/media/media-download.md §5.3）——
     /// 列不在就照它建（例如 `media.delete_local` 刪過），在就不動；再補上這則跟它的連結（`INSERT OR IGNORE`）。
-    /// 描述跟列合不合🚫 在這裡判斷，那是下載入口的事。
+    /// 描述跟列合不合**不**在這裡判斷，那是下載入口的事。
     ///
     /// Args:
     ///     user_id: example: "@alice:localhost"
@@ -2067,7 +2201,7 @@ impl Cache {
         Ok(true)
     }
 
-    /// `media.delete_local`：刪這個 mxc 的列（`event_media` 的連結 ON DELETE CASCADE 一起沒）。池檔、暫存檔🚫 在這裡動（`media::del_local_copy` 先處理）。
+    /// `media.delete_local`：刪這個 mxc 的列（`event_media` 的連結 ON DELETE CASCADE 一起沒）。池檔、暫存檔**不**在這裡動（`media::del_local_copy` 先處理）。
     ///
     /// Return:
     ///     Ok(Some(MediaEntry))   刪掉的那一列
@@ -2087,7 +2221,7 @@ impl Cache {
 
     /// 這份 `cache.db` 認得哪些帳號（`users` 列裡的權威 mxid）。
     ///
-    /// 🚫 這裡只給資料，比對規則不在這一層：使用者打的字串怎麼對到這些值（大小寫、歧義
+    /// 這裡只給資料，比對規則**不**在這一層：使用者打的字串怎麼對到這些值（大小寫、歧義
     /// 怎麼辦）是 CLI 的政策，不是快取的（PR #21 審查 salvia🔴）。
     ///
     /// Return:
@@ -2103,7 +2237,7 @@ impl Cache {
         rows.collect::<Result<Vec<String>, _>>().map_err(db_error)
     }
 
-    /// 摧毀這個帳號的本機紀錄（UI 的選項；`logout` 不叫它）。🚫 不刪 `users` 列：他可能是別人事件的 sender。
+    /// 摧毀這個帳號的本機紀錄（UI 的選項；`logout` 不叫它）。**不**刪 `users` 列：他可能是別人事件的 sender。
     /// 一個 transaction：刪他的關聯列 → 沒人同步過的事件 → 沒事件指的媒體 → 沒事件也沒清單的房間。
     ///
     /// ⚠️ `user_id` 要是 `users` 列裡那串**權威** mxid（精確比對）。使用者打進來的字串
@@ -2176,7 +2310,7 @@ impl Cache {
         })
     }
 
-    /// 測試用後門：跑一句 UPDATE／DELETE（例如把 `last_used_at` 撥到很久以前）。🚫 正式碼不用；參數只收字串。
+    /// 測試用後門：跑一句 UPDATE／DELETE（例如把 `last_used_at` 撥到很久以前）。正式碼禁止用；參數只收字串。
     #[doc(hidden)]
     pub fn debug_execute(&mut self, sql: &str, params: &[&String]) -> Result<usize, SdkError> {
         // 只准 UPDATE（PR #14 審查 rumia 🟢2）：測試要的只是撥時間戳，不給它 DROP／DELETE 的能力。
@@ -2219,7 +2353,7 @@ impl Cache {
 const MEDIA_ROW_COLUMNS: &str = "mxc, pool_file, name, mimetype, hash, file_size, chunk_size, segments_written, complete, bytes_on_disk, created_at, last_used_at, source_uri, kind, verified";
 
 fn media_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaEntry> {
-    // CHECK 擋著不認得的數字；真的讀到就是壞列，回錯、🚫 猜成哪一種。
+    // CHECK 擋著不認得的數字；真的讀到就是壞列，回錯、**不**猜成哪一種。
     let kind_number = row.get::<_, i64>(13)?;
     let kind = MediaKind::from_number(kind_number).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -2449,7 +2583,7 @@ fn set_current_edit(
     Ok(())
 }
 
-/// 剛寫進來（或剛解開）的一則（/docs/design/messages/edits-and-redactions.md §4）。🚫 **不改任何一列的 `content_json`**。
+/// 剛寫進來（或剛解開）的一則（/docs/design/messages/edits-and-redactions.md §4）。**不改任何一列的 `content_json`**。
 ///
 /// - msg／edit 的內容是 /docs/design/media/wbf-client-convention-for-chunk.md §5 的檔 → 建 `media` 與 `event_media`（edit 的檔掛在 edit 自己那列）
 /// - 等著這則的 redact、edit（先到的）→ 現在處理
@@ -2548,7 +2682,7 @@ fn apply_edit(transaction: &Transaction<'_>, room: i64, edit: i64) -> Result<(),
 
 /// redact（/docs/design/messages/edits-and-redactions.md §6）：目標在本地就打勾 `is_redacted`、`modified_timestamp` 換成 redact 的 server 時間，這個 redact 標處理過；
 /// 目標還不在就留著 `is_processed = 0` 等它到。
-/// 🚫 不動目標的 `raw_event`、`content_json`：密文與明文都還在，可以復原（/docs/design/messages/edits-and-redactions.md §2）。
+/// **不**動目標的 `raw_event`、`content_json`：密文與明文都還在，可以復原（/docs/design/messages/edits-and-redactions.md §2）。
 /// ⭐ 目標還沒解開（general）也照打勾：刪不刪跟看不看得懂無關。
 /// ⭐ 被 redact 的是**某則訊息目前顯示的 edit** → 那則訊息退回剩下的有效 edit 裡最新的（沒有就顯示原文）。
 fn apply_redaction(
@@ -2650,7 +2784,7 @@ fn link_media_of(
     event_type: Option<&str>,
     content_json: Option<&str>,
 ) -> Result<(), SdkError> {
-    // 區塊沒帶大小：約定裡一定有，沒有就🚫 建列（🚫 用 0 頂替，🚫 讓一則壞事件卡住整批寫入）。
+    // 區塊沒帶大小：約定裡一定有，沒有就**不**建列（**不**用 0 頂替，也**不**讓一則壞事件卡住整批寫入）。
     let found = match attachment_of(event_type, content_json) {
         Some(attachment) => MediaDescription::of_chunked_block(&attachment.block)
             .map(|description| (attachment.mxc, description)),
@@ -2780,7 +2914,7 @@ fn media_row_id(
 // ---- 開檔 ----
 
 impl Cache {
-    /// 這份既有的 `cache.db` 說自己是哪個 server 的；🚫 不建、🚫 不重建、🚫 不動它。
+    /// 這份既有的 `cache.db` 說自己是哪個 server 的；**不**建、**不**重建、**不**動它。
     /// 給「只是要處理既有資料」的路徑用（destroy 的忘掉鏈）：那種路徑拿使用者打的 server 字串去開，
     /// 拼法一不同就會被 [`Cache::open`] 當成別台 server 的庫而整份刪掉重建（同 server 的其他帳號一起沒了）。
     ///
@@ -2994,7 +3128,7 @@ fn remove_database_files(path: &Path) -> Result<(), SdkError> {
 }
 
 /// 「加不加密」的兩個來源合起來：`rooms.encrypted` 是**房間的**事實，`conversation_json` 只是**這個帳號上次看到的樣子**。
-/// 房間說加密就是加密——🚫 讓一份舊的「沒加密」從讀的這一側漏出去。
+/// 房間說加密就是加密——**不**讓一份舊的「沒加密」從讀的這一側漏出去。
 ///
 /// Args:
 ///     seen: 這個帳號上次看到的（還沒拿過是 None）, example: Some(false)
@@ -3127,7 +3261,7 @@ mod tests {
     }
 
     /// 🚨 翻頁的錨**只認這個帳號看得到的事件**：BOB 同步進來、ALICE 從沒看過的，
-    /// 🚫 不准給 ALICE 當錨 —— 那等於用 BOB 的可見範圍替 ALICE 定位，還洩漏那則事件存在。
+    /// 禁止給 ALICE 當錨 —— 那等於用 BOB 的可見範圍替 ALICE 定位，還洩漏那則事件存在。
     #[test]
     fn an_event_only_another_account_synced_cannot_be_used_as_a_paging_anchor() {
         let (mut cache, dir) = open("position-visibility");
@@ -3143,17 +3277,17 @@ mod tests {
         assert_eq!(
             cache.find_event_position(ALICE, "!r", "$bobs").unwrap(),
             None,
-            "🚫 ALICE 沒看過就沒有這個錨"
+            "ALICE 沒看過就沒有這個錨"
         );
         assert_eq!(
             cache.find_event_position(BOB, "!other", "$bobs").unwrap(),
             None,
-            "🚫 別的房間的同名 id 也不算"
+            "別的房間的同名 id 也不算"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ⭐ 從本地讀回「上游那一頁」：**順序照給的**（🚫 不靠 `r_seq`、🚫 不靠時間戳），
+    /// ⭐ 從本地讀回「上游那一頁」：**順序照給的**（**不**靠 `r_seq`、**不**靠時間戳），
     /// 本地沒有的、`hidden` 的、別的帳號的都不出來。
     #[test]
     fn messages_read_back_by_event_id_keep_the_upstream_order_and_local_rules() {
@@ -3211,7 +3345,7 @@ mod tests {
     }
 
     /// 🚨 **加密只准升、不准降**：Matrix 房間一開加密就關不掉，所以一份過期的「沒加密」
-    /// 🚫 不准把已知加密的房間蓋回明文 —— 蓋回去的下一步是用 `cipher: none` 把區塊金鑰公開送出。
+    /// 禁止把已知加密的房間蓋回明文 —— 蓋回去的下一步是用 `cipher: none` 把區塊金鑰公開送出。
     #[test]
     fn a_room_once_known_encrypted_is_never_downgraded_to_plaintext() {
         let (mut cache, dir) = open("encrypted-ratchet");
@@ -3227,7 +3361,7 @@ mod tests {
         assert_eq!(
             column_encrypted(&cache, "!r"),
             Some(true),
-            "🚫 不准降回明文"
+            "禁止降回明文"
         );
         assert_eq!(
             cache.list_room_entries(ALICE, &[Membership::Join]).unwrap()[0].encrypted,
@@ -3285,7 +3419,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 房間列表只記「加入了哪些」（維護者 2026-10-05）：新的只有 id、已經拿過的🚫 被蓋掉、退出的標起來🚫 刪列、回來了再標回去。
+    /// 房間列表只記「加入了哪些」（維護者 2026-10-05）：新的只有 id、已經拿過的**不**被蓋掉、退出的標起來**不**刪列、回來了再標回去。
     #[test]
     fn the_joined_list_adds_new_rooms_keeps_what_was_fetched_and_marks_left_rooms_without_deleting()
     {
@@ -3330,7 +3464,7 @@ mod tests {
             cache.find_conversation(ALICE, "!b").unwrap().is_some(),
             "a left room still has its last view"
         );
-        // 對退出的房叫 room.get：樣子更新，但🚫 標回加入（加入了沒只由 room.list 寫）。
+        // 對退出的房叫 room.get：樣子更新，但**不**標回加入（加入了沒只由 room.list 寫）。
         cache
             .upsert_conversations(ALICE, &[room("!b", true)])
             .unwrap();
@@ -3363,7 +3497,7 @@ mod tests {
     }
 
     /// 房間動作寫的身分（/docs/design/rooms/room-actions.md §3）：列不在就加、`room.list` 預設只列 `join`、要哪幾種自己挑；
-    /// 加入名單只把 `join` 的標成 `leave`，被邀請、敲門、封鎖的🚫 動；解除封鎖只在目前是 `ban` 時改。
+    /// 加入名單只把 `join` 的標成 `leave`，被邀請、敲門、封鎖的**不**動；解除封鎖只在目前是 `ban` 時改。
     #[test]
     fn memberships_are_recorded_listed_by_kind_and_left_alone_by_the_joined_list() {
         let (mut cache, dir) = open("memberships");
@@ -3411,7 +3545,7 @@ mod tests {
             ["!b", "!i", "!k"]
         );
 
-        // 解除封鎖：只有 `ban` 才改成 `leave`；列不在🚫 加。
+        // 解除封鎖：只有 `ban` 才改成 `leave`；列不在就**不**加。
         assert!(!cache
             .record_membership(ALICE, "!i", Membership::Leave, Some(Membership::Ban))
             .unwrap());
@@ -3422,7 +3556,7 @@ mod tests {
             .record_membership(ALICE, "!never", Membership::Leave, Some(Membership::Ban))
             .unwrap());
         assert_eq!(ids_in(&cache, &[Membership::Leave]), ["!a", "!b"]);
-        assert_eq!(cache.count_rows("room_list").unwrap(), 4, "!never 🚫 加列");
+        assert_eq!(cache.count_rows("room_list").unwrap(), 4, "!never 不加列");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3480,7 +3614,7 @@ mod tests {
             .unwrap();
         assert_eq!(written.state, Some(named.clone()));
         assert_eq!(invite_of(&cache, "!r").unwrap().state, Some(named));
-        // 別台的邀請者：🚫 本站說的
+        // 別台的邀請者：**不是**本站說的
         cache
             .record_invite(BOB, &invite("!far", "@carol:elsewhere.example", None))
             .unwrap();
@@ -3500,7 +3634,7 @@ mod tests {
         assert_eq!(
             invite_of(&cache, "!r").unwrap().state,
             None,
-            "接受時已經清掉，🚫 撿回舊的"
+            "接受時已經清掉，不撿回舊的"
         );
         // 加入名單把它標回 join 也清
         cache.record_joined_rooms(BOB, &["!r".to_string()]).unwrap();
@@ -3509,7 +3643,7 @@ mod tests {
     }
 
     /// 一輪補完（/docs/design/rooms/room-actions.md §3.3.3、server 的 /docs/design/events/invites-on-the-wire.md §8 ②②'）：
-    /// 快照裡的寫、被比較新的推播碰過的🚫 寫；快照裡沒有的：沒被碰過才改掉（`departed` 說的，沒說是 `leave`），碰過的留著。
+    /// 快照裡的寫、被比較新的推播碰過的**不**寫；快照裡沒有的：沒被碰過才改掉（`departed` 說的，沒說是 `leave`），碰過的留著。
     #[test]
     fn a_completed_invite_round_replaces_the_list_except_what_newer_pushes_touched() {
         let (mut cache, dir) = open("invite-round");
@@ -3530,7 +3664,7 @@ mod tests {
         let round = vec![
             (5, invite("!kept", ALICE, Some(fresh.clone()))),
             (6, invite("!new", ALICE, None)),
-            // 推播在這一輪裡已經說它結束了（is 9 ≥ 7）：🚫 讓快照把它寫回來
+            // 推播在這一輪裡已經說它結束了（is 9 ≥ 7）：**不**讓快照把它寫回來
             (7, invite("!older-push", ALICE, Some(fresh.clone()))),
             (8, invite("!gone-mid-round", ALICE, None)),
         ];
@@ -3565,12 +3699,12 @@ mod tests {
         assert_eq!(invite_of(&cache, "!kept").unwrap().state, Some(fresh));
         assert!(
             invite_of(&cache, "!pushed-later").is_some(),
-            "推播碰過的🚫 刪"
+            "推播碰過的不刪"
         );
         assert_eq!(
             invite_of(&cache, "!older-push").unwrap().state,
             None,
-            "比較新的推播贏，快照那份🚫 寫"
+            "比較新的推播贏，快照那份不寫"
         );
         assert_eq!(bob_ids_in(&cache, &[Membership::Leave]), ["!withdrawn"]);
         assert_eq!(bob_ids_in(&cache, &[Membership::Ban]), ["!banned"]);
@@ -3582,7 +3716,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 一般 Matrix 帳號的列表沒帶狀態（`state: null`）：🚫 拿它蓋掉上次 `room.get` 拿到的狀態。
+    /// 一般 Matrix 帳號的列表沒帶狀態（`state: null`）：**不**拿它蓋掉上次 `room.get` 拿到的狀態。
     #[test]
     fn a_conversation_without_state_keeps_the_state_fetched_before() {
         let (mut cache, dir) = open("keep-state");
@@ -3606,7 +3740,7 @@ mod tests {
         assert_eq!(read.name.as_deref(), Some("new"), "其他欄位照新的");
         assert_eq!(read.state, Some(state));
 
-        // 留下來的狀態比列表的型別欄位舊：寫一項狀態時🚫 拿它重算（會把 `new` 改回舊的，PR #76 oliver 🟡3）
+        // 留下來的狀態比列表的型別欄位舊：寫一項狀態時**不**拿它重算（會把 `new` 改回舊的，PR #76 oliver 🟡3）
         let topic = serde_json::json!({ "type": "m.room.topic", "state_key": "", "sender": ALICE, "content": { "topic": "t" } });
         assert!(!cache.record_written_state(ALICE, "!r", &topic).unwrap());
         let read = cache.find_conversation(ALICE, "!r").unwrap().unwrap();
@@ -3628,7 +3762,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 自己寫了一項狀態（/docs/design/rooms/room-actions.md §3）：拿過狀態的列換掉那一項、重算；沒拿過的🚫 寫；寫加密一律升 `rooms.encrypted`。
+    /// 自己寫了一項狀態（/docs/design/rooms/room-actions.md §3）：拿過狀態的列換掉那一項、重算；沒拿過的**不**寫；寫加密一律升 `rooms.encrypted`。
     #[test]
     fn a_written_state_event_updates_the_writers_row_and_encryption_marks_the_room() {
         let (mut cache, dir) = open("written-state");
@@ -3658,7 +3792,7 @@ mod tests {
         assert_eq!(
             cache.find_conversation(BOB, "!r").unwrap().unwrap(),
             room("!r", false),
-            "別人那份🚫 動"
+            "別人那份不動"
         );
 
         let encryption = serde_json::json!({ "type": "m.room.encryption", "state_key": "",
@@ -3682,7 +3816,7 @@ mod tests {
         cache.record_written_state(ALICE, "!plain", &empty).unwrap();
         assert_eq!(cache.find_room_encrypted("!plain").unwrap(), None);
 
-        // 重算不出來（存著的狀態沒有 `m.room.create`）：那一列🚫 寫，加密標記照升、🚫 一起回滾（PR #76 oliver 🟡2）
+        // 重算不出來（存著的狀態沒有 `m.room.create`）：那一列**不**寫，加密標記照升、**不**一起回滾（PR #76 oliver 🟡2）
         cache
             .upsert_conversations(
                 ALICE,
@@ -3700,7 +3834,7 @@ mod tests {
     }
 
     /// `room.forget`（/docs/design/rooms/room-actions.md §3.1）：還有別的帳號看得到就只刪自己的；只剩自己才清整間房，
-    /// 連同只被這間房指著的 media 列；別間房也指著的、沒綁事件的🚫 動。
+    /// 連同只被這間房指著的 media 列；別間房也指著的、沒綁事件的**不**動。
     #[test]
     fn forgetting_a_room_clears_its_history_only_when_nobody_else_here_sees_it() {
         let (mut cache, dir) = open("forget-room");
@@ -3752,7 +3886,7 @@ mod tests {
         assert_eq!(
             ids(&cache.files(ALICE, "!other", None, 10).unwrap()),
             ["$f9"],
-            "別間房🚫 動"
+            "別間房不動"
         );
         assert!(!cache.forget_room(BOB, "!r").unwrap(), "本地沒有這間房了");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3837,7 +3971,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 只因為**收到事件**才建出來的房間列：**不知道**加不加密（NULL），🚫 不是明文（0）。
+    /// 只因為**收到事件**才建出來的房間列：**不知道**加不加密（NULL），**不是**明文（0）。
     #[test]
     fn a_room_seen_only_through_events_has_unknown_encryption_not_plaintext() {
         let (mut cache, dir) = open("encrypted-unknown");
@@ -3845,7 +3979,7 @@ mod tests {
         assert_eq!(
             column_encrypted(&cache, "!only-events"),
             None,
-            "🚫 不知道就是不知道——預設成 0 等於預設明文"
+            "不知道就是不知道——預設成 0 等於預設明文"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3979,7 +4113,7 @@ mod tests {
 
     #[test]
     fn the_key_of_a_file_comes_only_from_events_this_account_can_see() {
-        // 同一份 cache.db 裡有同 server 別的帳號的事件：下載要的區塊（含金鑰）🚫 不跨帳號借（/docs/design/media/media-download.md §7.1）。
+        // 同一份 cache.db 裡有同 server 別的帳號的事件：下載要的區塊（含金鑰）**不**跨帳號借（/docs/design/media/media-download.md §7.1）。
         let (mut cache, dir) = open("media-key");
         let shared = file("!r", "$f1", 1, "mxc://localhost/aaaa");
         let alice_only = file("!r", "$f2", 2, "mxc://localhost/bbbb");
@@ -4067,7 +4201,7 @@ mod tests {
             .list_media_blocks_for(BOB, "mxc://localhost/aaaa")
             .unwrap()
             .is_empty());
-        // 看不到的那則🚫 拿來建。
+        // 看不到的那則**不**拿來建。
         assert!(!cache.media_link_event(BOB, "!r", "$f2").unwrap());
         assert!(!cache.media_link_event(BOB, "!r", "$missing").unwrap());
         assert!(cache.media_link_event(BOB, "!r", "$f1").unwrap());
@@ -4473,7 +4607,7 @@ mod tests {
             .unwrap()
     }
 
-    /// 🚫 **raw_event 第一次寫入之後永遠不動**：同一則再來（內容不同也一樣）不覆蓋原樣、也不覆蓋顯示的內容。
+    /// **raw_event 第一次寫入之後永遠不動**：同一則再來（內容不同也一樣）不覆蓋原樣、也不覆蓋顯示的內容。
     #[test]
     fn the_raw_event_is_written_once_and_never_overwritten() {
         let (mut cache, dir) = open("raw-once");
@@ -4616,7 +4750,7 @@ mod tests {
     }
 
     /// 還沒解開的：class general、content_json NULL、is_processed 0，顯示成解不開。之後明文到了才處理，
-    /// 🚫 密文照樣留在 raw_event；🚫 再來一次密文不會把明文蓋回去。
+    /// 密文照樣留在 raw_event；再來一次密文**不會**把明文蓋回去。
     #[test]
     fn an_undecrypted_event_is_processed_when_its_cleartext_arrives_and_the_ciphertext_stays() {
         let (mut cache, dir) = open("general");
@@ -4675,7 +4809,7 @@ mod tests {
     }
 
     /// edit 後到：顯示的內容換成 new_content，🚨 回覆關係留原本的；edit 自己不出現在歷史裡。
-    /// 🚫 目標的 raw_event 與 content_json 都不動。
+    /// 目標的 raw_event 與 content_json 都**不**動。
     #[test]
     fn an_edit_changes_what_is_shown_but_not_the_targets_row() {
         let (mut cache, dir) = open("edit-after");
@@ -4735,7 +4869,7 @@ mod tests {
     }
 
     /// 🚨 資安：別人不能改你的訊息；明文 edit 不能蓋加密訊息（spec 的有效性規則）。
-    /// 而且無效的 edit 🚫 不會讓訊息被標成「改過」。
+    /// 而且無效的 edit **不會**讓訊息被標成「改過」。
     #[test]
     fn invalid_edits_are_ignored() {
         let (mut cache, dir) = open("edit-invalid");
@@ -4886,7 +5020,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚨 可見性跟 events 表完全一致：目前的 edit 讀者還沒同步到 → 過時的記號，🚫 原文與 edit 內容都不給。
+    /// 🚨 可見性跟 events 表完全一致：目前的 edit 讀者還沒同步到 → 過時的記號，原文與 edit 內容都**不**給。
     #[test]
     fn a_current_edit_the_reader_has_not_synced_is_outdated() {
         let (mut cache, dir) = open("edit-outdated");
@@ -4942,7 +5076,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 第一個 edit 🚫 不跟目標自己的時間比：發送端時鐘偏了，edit 的時間比原文早，也照樣生效。
+    /// 第一個 edit **不**跟目標自己的時間比：發送端時鐘偏了，edit 的時間比原文早，也照樣生效。
     #[test]
     fn the_first_edit_applies_even_if_its_clock_is_behind_the_original() {
         let (mut cache, dir) = open("edit-skew");
@@ -5059,7 +5193,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚨 讀取端再驗一次：訊息那列的 `ref_event_id` 被弄成指向別人的事件，🚫 不顯示那個內容。
+    /// 🚨 讀取端再驗一次：訊息那列的 `ref_event_id` 被弄成指向別人的事件，**不**顯示那個內容。
     #[test]
     fn a_pointer_to_something_that_is_not_its_edit_shows_the_original() {
         let (mut cache, dir) = open("edit-pointer-guard");
@@ -5085,7 +5219,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// redact 優先：打勾之後任何 edit 都不改它；🚫 原樣不動（可以復原）。redact 先到也一樣。
+    /// redact 優先：打勾之後任何 edit 都不改它；原樣**不**動（可以復原）。redact 先到也一樣。
     #[test]
     fn a_redaction_wins_over_edits_and_keeps_the_raw_event() {
         let (mut cache, dir) = open("redact");
@@ -5153,7 +5287,8 @@ mod tests {
             alice_view.reactions,
             vec![Reaction {
                 key: "👍".into(),
-                by: vec![BOB.into()]
+                by: vec![BOB.into()],
+                mine: None,
             }]
         );
         put(&mut cache, BOB, &[redaction_of("!r", "$x", "$r3")]);
@@ -5162,13 +5297,14 @@ mod tests {
             bob_view.reactions,
             vec![Reaction {
                 key: "👍".into(),
-                by: vec![CAROL.into()]
+                by: vec![CAROL.into()],
+                mine: None,
             }]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚫 不寫：沒有 sender 的（比對 edit 的 sender 會變成佔位值相等）、自己帶的 room_id 跟參數不一樣的。
+    /// **不**寫：沒有 sender 的（比對 edit 的 sender 會變成佔位值相等）、自己帶的 room_id 跟參數不一樣的。
     #[test]
     fn events_without_a_sender_or_from_another_room_are_not_written() {
         let (mut cache, dir) = open("refuse");
@@ -5224,7 +5360,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 防線：指標還指著一個被 redact 的 edit（正常流程會重設，這裡用 SQL 做出來）→ 已刪除，🚫 不顯示那個 edit 的內容。
+    /// 防線：指標還指著一個被 redact 的 edit（正常流程會重設，這裡用 SQL 做出來）→ 已刪除，**不**顯示那個 edit 的內容。
     #[test]
     fn a_current_edit_that_is_redacted_shows_deleted() {
         let (mut cache, dir) = open("edit-pointer-redacted");
@@ -5270,7 +5406,8 @@ mod tests {
             shown.reactions,
             vec![Reaction {
                 key: "👍".into(),
-                by: vec![CAROL.into()]
+                by: vec![CAROL.into()],
+                mine: None,
             }]
         );
         let _ = std::fs::remove_dir_all(&dir);

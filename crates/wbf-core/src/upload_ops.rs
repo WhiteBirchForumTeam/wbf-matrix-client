@@ -3,13 +3,13 @@
 //! ⚠️ **續傳狀態檔寫在使用者那個檔案旁邊**（`<file>.wbf-upload.json`）。那個位置是
 //! 命令列定的（/docs/design/rpc-specs/wbf-cli-spec.md §3.2、§6），在 daemon 模型下**不一定對**——daemon 可能根本
 //! 沒有那個目錄的寫入權（Android 的 SAF 給的是 `content://`，連路徑都沒有）。
-//! 🚫 **不在這裡發明新答案**：開著的項目是 /docs/design/overview/architecture-v2.md §7 第 9 點。
+//! **不在這裡發明新答案**：開著的項目是 /docs/design/overview/architecture-v2.md §7 第 9 點。
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use wbf_sdk::chat::{Attachment, ChatBackend};
+use wbf_sdk::chat::Attachment;
 use wbf_sdk::chunk_crypto::choose_chunk_size;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::vault::write_private;
@@ -54,7 +54,7 @@ pub struct SendFileResult {
     pub manifest: Manifest,
     /// ⚠️ 附件**有沒有向 server 宣告**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）。wbf 帳號走 `Event/Send`，一律是 `true`；
     /// 一般 Matrix 帳號走 matrix-sdk 的 `Room::send`，不能加 header，一律是 `false`。
-    /// 🚫 沒宣告的上傳過了保護期會被掃掉——這個欄位就是讓前端講得出這件事。
+    /// ⚠️ 沒宣告的上傳過了保護期會被掃掉——這個欄位就是讓前端講得出這件事。
     pub attachment_declared: bool,
 }
 
@@ -72,16 +72,16 @@ impl Core {
 
     /// 上傳一個檔案，然後把它當附件送進房間。
     ///
-    /// 🚫 **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（/docs/design/overview/architecture-v2.md §3）。前端要先問
+    /// **不做「這個房間沒加密，你確定嗎」的確認**：那是前端的事（/docs/design/overview/architecture-v2.md §3）。前端要先問
     /// [`Core::conversation`]，再用 [`crate::cipher_for_plaintext_room`] 決定 `cipher`。
     ///
     /// Args:
-    ///     options: wbf 帳號的加密房要 `room_devices`（`room.refresh_devices` 回的那份）；`txn_id` 重送用。一般 Matrix 帳號不看它
+    ///     options: wbf 帳號的加密房要 `room_devices`（`room.refresh_devices` 回的那份）；`txn_id` 重送用；`reply_to`、`mentions` 照 /docs/design/messages/message-actions.md §3.2
     /// Return:
     ///     Ok(SendFileResult)
     ///     Err(Usage)                 `cipher` 跟這一刻的房間對不上（明文房要 `none`、加密房不能 `none`）、加密房沒帶 `room_devices`——都在上傳**之前**
     ///     Err(RoomDevicesChanged)    加密房被 1506 擋：檔案已經在 server 上，`data` 多帶 `manifest`；用 `data` 的新狀態與同一個 `txn_id` 改走 `room.send_attachment` 帶它重送
-    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好（同上，`data.manifest`，檔案🚫 必重傳）
+    ///     Err(RoomKeyNotReady)       加密房的金鑰在等待時間內沒準備好（同上，`data.manifest`，檔案**不必**重傳）
     pub async fn send_file(
         &self,
         room: &str,
@@ -119,10 +119,14 @@ impl Core {
                 block: manifest.block.clone(),
             };
             let content = wbf_sdk::event_json::file_message_content(&attachment, caption)?;
+            let content = self
+                .add_reply_and_mentions_of(&account, room, content, options)
+                .await?;
             let sent = self
                 .wbf_send_message(
                     &account,
                     room,
+                    wbf_sdk::message_content::MESSAGE_EVENT_TYPE,
                     encrypted,
                     content,
                     vec![manifest.mxc.clone()],
@@ -132,7 +136,7 @@ impl Core {
             let event_id = match sent {
                 Ok(event_id) => event_id,
                 // 加密房被擋（1401）、金鑰沒準備好（1402）：檔案已經在 server 上。manifest 跟錯誤一起回（`data.manifest`，含金鑰，
-                // 跟成功時的回應一樣敏感），UI 改走 `room.send_attachment` 重送、🚫 重傳檔案。
+                // 跟成功時的回應一樣敏感），UI 改走 `room.send_attachment` 重送、**不**重傳檔案。
                 Err(error)
                     if matches!(
                         error.kind,
@@ -173,13 +177,25 @@ impl Core {
             mxc: manifest.mxc.clone(),
             block: manifest.block.clone(),
         };
-        // /docs/design/media/wbf-client-convention-for-chunk.md §5.2：附件宣告這一版帶不出去。⚠️ 講清楚，🚫 不裝作沒事——
+        // /docs/design/media/wbf-client-convention-for-chunk.md §5.2：附件宣告這一版帶不出去。⚠️ 講清楚，**不**裝作沒事——
         // 沒被引用的上傳過了 server 的保護期就會被掃掉。
         self.events.progress(format!(
             "attachment {} is NOT declared to the server (no Event/Send yet); an unreferenced upload is swept after the server's grace period",
             manifest.mxc
         ));
-        let event_id = backend.send_file(room, &attachment, caption).await?;
+        // content 跟 wbf 那條路（`Event/Send`）同一份：兩邊送出去的事件一模一樣，只有路不同。
+        let content = wbf_sdk::event_json::file_message_content(&attachment, caption)?;
+        let content = self
+            .add_reply_and_mentions_of(&account, room, content, options)
+            .await?;
+        let event_id = backend
+            .send_event_content(
+                room,
+                wbf_sdk::message_content::MESSAGE_EVENT_TYPE,
+                content,
+                options.txn_id.as_deref(),
+            )
+            .await?;
         Ok(SendFileResult {
             event_id,
             mxc: manifest.mxc.clone(),
@@ -369,6 +385,7 @@ mod tests {
         let options = SendOptions {
             room_devices: Some(devices),
             txn_id: Some("f1".into()),
+            ..SendOptions::default()
         };
         let refused = core
             .send_file(
@@ -402,7 +419,7 @@ mod tests {
         assert_eq!(
             misc.sent_events.lock().unwrap()[0].1,
             "m.room.encrypted",
-            "🚫 加密房不送明文事件"
+            "加密房不送明文事件"
         );
         assert_eq!(
             *misc.sent_attachments.lock().unwrap(),
@@ -410,7 +427,7 @@ mod tests {
             "附件跟密文同一個請求宣告"
         );
 
-        // 傳完才被擋（房間版本號變了，1401）：檔案已經在 server 上，manifest 跟錯誤一起回，改走 `send_attachment` 重送、🚫 重傳。
+        // 傳完才被擋（房間版本號變了，1401）：檔案已經在 server 上，manifest 跟錯誤一起回，改走 `send_attachment` 重送、**不**重傳。
         *misc.current_room_version.lock().unwrap() = Some(8);
         *keys.members.lock().unwrap() = Some(members_body(8));
         let blocked = core
@@ -434,6 +451,7 @@ mod tests {
         let again = SendOptions {
             room_devices: Some(serde_json::from_value(data.clone()).unwrap()),
             txn_id: data["txn_id"].as_str().map(str::to_string),
+            ..SendOptions::default()
         };
         let uploads_now = upload.uploads.lock().unwrap().len();
         core.send_attachment(ROOM, &manifest, None, &again, &target)
@@ -471,7 +489,7 @@ mod tests {
     #[test]
     fn the_resume_state_sits_next_to_the_file_it_is_for() {
         // ⚠️ 這個位置在 daemon 模型下不一定對（見模組註解），但現在的語意要釘住：
-        // 一個檔案一份狀態，🚫 不是全域一份。
+        // 一個檔案一份狀態，**不是**全域一份。
         assert_eq!(
             state_path_for(Path::new("/tmp/video.mkv")),
             PathBuf::from("/tmp/video.mkv.wbf-upload.json")
@@ -481,7 +499,7 @@ mod tests {
     #[test]
     fn an_unknown_cipher_is_refused_rather_than_silently_defaulted() {
         assert!(parse_cipher(None).is_ok());
-        // 🚫 打錯的加密法名字不能落到預設值：那會讓人以為用了他指定的那個。
+        // 打錯的加密法名字**不能**落到預設值：那會讓人以為用了他指定的那個。
         assert_eq!(
             parse_cipher(Some("rot13")).unwrap_err().kind,
             CoreErrorKind::Usage

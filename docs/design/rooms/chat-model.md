@@ -75,10 +75,10 @@ pub struct Conversation {
 }
 ```
 
-**房間列表與單一房間分開拿**（維護者 2026-10-05）：daemon 是中間層，照 UI 的指令做，🚫 一個命令替 UI 做完所有事。
+**房間列表與單一房間分開拿**（維護者 2026-10-05）：daemon 是中間層，照 UI 的指令做，禁止一個命令替 UI 做完所有事。
 
-- `room.list` 只問 server「加入了哪些房」（wbf 帳號是一個 `JoinedRooms`），跟本地比對差異：新的加一列、樣子先空著；拿過的🚫 覆寫；
-  退出的標起來（`room_list.membership = leave`），🚫 刪列（刪列只有 `room.forget`）。每列記這個帳號在這間房的身分（join／invite／knock／leave／ban，/docs/design/rooms/room-actions.md §3），
+- `room.list` 只問 server「加入了哪些房」（wbf 帳號是一個 `JoinedRooms`），跟本地比對差異：新的加一列、樣子先空著；拿過的**不**覆寫；
+  退出的標起來（`room_list.membership = leave`），**不**刪列（刪列只有 `room.forget`）。每列記這個帳號在這間房的身分（join／invite／knock／leave／ban，/docs/design/rooms/room-actions.md §3），
   `room.list` 預設只列 `join` 的、要別的自己挑。回給 UI 的是本地知道多少給多少：
 
   ```rust
@@ -159,14 +159,14 @@ pub struct MatrixAttachment {
 }
 
 pub struct Edit { pub at: Timestamp, pub by: PeerId }
-pub struct Reaction { pub key: String, pub by: Vec<PeerId> }
+pub struct Reaction { pub key: String, pub by: Vec<PeerId>, pub mine: Option<MessageId> }  // by 一人一次；mine 是讀者自己那則（/docs/design/messages/message-actions.md §5）
 pub struct Formatted { pub html: String }          // 第一版只收不產：我們送純文字，收到別人的 HTML 就帶著
 pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: PeerId }, Kicked{..}, Banned{..},
                        NameChanged{..}, TopicChanged{..}, PowerLevelChanged{..}, EncryptionEnabled, Pinned{..}, Other(String) }
 ```
 
-**傳統附件**（`MatrixFile`，維護者 2026-10-06）：別的 client（Element…）送的標準附件。`kind` 看**事件內容**，🚫 看帳號：有 `file` 是 2，只有 `url` 是 3。
-`file` 欄位不齊（不是 `v2`、少 `key`／`iv`／`hashes.sha256`／`url`）→ 🚫 退回當成 `url` 的明文，整則當 `Unsupported`（fail closed）。
+**傳統附件**（`MatrixFile`，維護者 2026-10-06）：別的 client（Element…）送的標準附件。`kind` 看**事件內容**，**不**看帳號：有 `file` 是 2，只有 `url` 是 3。
+`file` 欄位不齊（不是 `v2`、少 `key`／`iv`／`hashes.sha256`／`url`）→ 禁止退回當成 `url` 的明文，整則當 `Unsupported`（fail closed）。
 `name` 取 `filename`，沒有就取 `body`；`filename` 在而且跟 `body` 不一樣時，`body` 是說明文字（`caption`）。下載與讀取照 /docs/design/media/media-download.md §12。
 JSON（實際跑 `event_json::message_from_json` 印出的 `kind`，金鑰換成 `<…>`）：
 
@@ -220,7 +220,7 @@ pub trait Backend {
 }
 ```
 
-房間動作（建房、加入、退出、忘記、邀請、踢人、封鎖、改狀態、改權限、置頂…）的權威在 /docs/design/rooms/room-actions.md：不在這個 trait 裡、也🚫 分帳號種類各寫一份——
+房間動作（建房、加入、退出、忘記、邀請、踢人、封鎖、改狀態、改權限、置頂…）的權威在 /docs/design/rooms/room-actions.md：不在這個 trait 裡，也**不**分帳號種類各寫一份——
 一張端點表兩條路（wbf 帳號走橋、一般 Matrix 帳號走同一個 HTTP 端點，`wbf_sdk::matrix_endpoint`），參數與結果照 Matrix 原樣（維護者 2026-10-07）。
 
 `send_file` 收的是 `Attachment`：上傳是 `wbf-sdk` 現有的 `WbfClient` 做的，**與 Backend 無關**。這條線畫在這裡是刻意的：
@@ -238,14 +238,14 @@ Matrix 沒有「DM」型別，只有慣例：建房時 `is_direct: true`，雙�
 - `kind == Direct` 的條件：`m.direct` 裡有它，**且**已加入的成員剛好兩個。不滿足就當 Group，不猜。
 - 同一個 peer 有多個 Direct：取最近有訊息的那個當「這個人的對話」，其他照列但 `direct_peer` 一樣填；UI 可以合併顯示。
   **不**自動退出多的那些（那是使用者的資料）。
-- 建 Direct（`room.create { is_direct: true, invite: [p] }`）**一律建新房**，順便把「`p` → 這間房」寫進自己的 `m.direct`；🚫 先找既有的（維護者 2026-10-07：daemon 🚫 替 UI 串動作）。
+- 建 Direct（`room.create { is_direct: true, invite: [p] }`）**一律建新房**，順便把「`p` → 這間房」寫進自己的 `m.direct`；**不**先找既有的（維護者 2026-10-07：禁止 daemon 替 UI 串動作）。
   「一個人一個聊天」要不要沿用舊房是 UI 從房間列表判斷的事（/docs/design/rooms/room-actions.md §1 第 2、3 條）。之後要改自己的 `m.direct` 叫 `room.set_direct`（/docs/design/rooms/room-actions.md §2.5）。
 - 還沒做：多個 Direct 的挑選與合併。
 
 ### 3.2 Channel：底層 do nothing，用原生邏輯達到功能（維護者定）
 
 不自己蓋 channel、不加任何 state 事件。UI 建「channel」時只是把 room 包裝成：`events_default` 設到只有 owner 達得到（100）、其他成員預設 0。
-那是 UI 自己的兩步：`room.create` 之後 `room.set_power_levels { events_default: 100 }`；daemon 🚫 認得「channel」、🚫 檢查值（維護者 2026-10-07，/docs/design/rooms/room-actions.md §4）。
+那是 UI 自己的兩步：`room.create` 之後 `room.set_power_levels { events_default: 100 }`；daemon **不**認得「channel」，也**不**檢查值（維護者 2026-10-07，/docs/design/rooms/room-actions.md §4）。
 這樣其他 Matrix client 進來也是「看得到、發不出」，完全兼容。
 `ConversationKind::Channel` 是 adapter 從 power levels **推**出來的：發訊息的門檻高到只有 owner 達得到 → Channel。標準就是這樣，沒有「猜」。
 
@@ -262,12 +262,12 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 |---|---|
 | `Text` | `m.room.message`，`msgtype: m.text`，`body`；有 `formatted_body` 就進 `Formatted` |
 | `File` | `m.room.message`，`msgtype: org.wbftw.wbfuwunel.file`，區塊照 /docs/design/media/wbf-client-convention-for-chunk.md §5。**送出時同一個請求要宣告 `attachments`**（/docs/design/media/wbf-client-convention-for-chunk.md §5.2：`Event/Send` 的 meta，或過渡期 HTTP 的 `X-Wbf-Attachments` header），不然 server 過保護期把媒體清掉。wbf 帳號走 `Event/Send` 帶得出去；Matrix 帳號還帶不出去（§7）；加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5）或路徑版 `room.send_file`，兩條都帶 `room_devices`（/docs/design/keys/e2ee-rpc.md §3）。別人的 `m.file`／`m.image`／`m.video`／`m.audio`（標準附件，AES-CTR 或明文）是 `MatrixFile`（§2.3），下載照 /docs/design/media/media-download.md §12 |
-| `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填 |
+| `reply_to` | `m.relates_to.m.in_reply_to.event_id`；`body` 不再塞引文（新規格已廢引文），`m.mentions` 照填（怎麼填：/docs/design/messages/message-actions.md §3.2） |
 | `edited` | 收：`m.replace` 事件折進原訊息（adapter 做聚合）；送：`edit()` 發 `m.replace` |
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（/docs/design/messages/edits-and-redactions.md §2、§6，維護者 2026-09-14） |
 | `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
-| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（/docs/design/messages/edits-and-redactions.md §5）：手上的版本過時。UI 直接渲染的記號，🚫 原文與 edit 內容都不給；同步之後就是新版本（維護者 2026-09-14） |
-| `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>` |
+| `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（/docs/design/messages/edits-and-redactions.md §5）：手上的版本過時。UI 直接渲染的記號，原文與 edit 內容都**不**給；同步之後就是新版本（維護者 2026-09-14） |
+| `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>`（照人去重），讀者自己按的那則放 `mine`（/docs/design/messages/message-actions.md §5） |
 | `System` | `m.room.member`、`m.room.name`、`m.room.topic`、`m.room.power_levels`、`m.room.encryption`、`m.room.pinned_events`… |
 | `Unsupported` | 其他所有 type。**不丟**，這是 fail-safe：至少讓人看到「這裡有東西」 |
 
@@ -300,7 +300,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 
 ### 4.1 歷史
 
-`history(before, limit)` 回一頁加 `next: Option<Cursor>`，`None` 是到頭。🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token：UI 不分 server 是誰，一律拿手上最舊那則往回問（/docs/design/rpc-specs/rpc-spec.md §3.3）。
+`history(before, limit)` 回一頁加 `next: Option<Cursor>`，`None` 是到頭。🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），**不是** server 的翻頁 token：UI 不分 server 是誰，一律拿手上最舊那則往回問（/docs/design/rpc-specs/rpc-spec.md §3.3）。
 過濾（type、sender）在 client 端做（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1 的理由）。
 
 ### 4.2 watch 流
@@ -322,7 +322,7 @@ pub enum Update {
 
 現在的 `Update` 只有兩個變體，其他還沒做：
 
-- `NewEvents { conversation, events: Vec<IncomingEvent> }`：上游給的**原樣**（關係事件也在），🚫 不是折好的 `NewMessage`。快取要存原樣（/docs/design/messages/edits-and-redactions.md），通知由 core 用 `event_json::messages_from_incoming` 折好再發。
+- `NewEvents { conversation, events: Vec<IncomingEvent> }`：上游給的**原樣**（關係事件也在），**不是**折好的 `NewMessage`。快取要存原樣（/docs/design/messages/edits-and-redactions.md），通知由 core 用 `event_json::messages_from_incoming` 折好再發。
 - `ConversationLeft { id }`。新加入的房間用 `conversations()` 看，watch 不推。
 
 Matrix 帳號：matrix-sdk 的 sync 迴圈 → adapter 把每個增量翻成 `Update`。CLI 的 `watch tail|wait|once` 就是消費這個流、只留一個 conversation 的（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2）。
@@ -344,7 +344,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 | client 端 | `Message.r_seq: Option<i64>`、`Message.g_seq: Option<i64>`（`protocol::event_seqs`）。`unsigned` 是 server 加的、不進雜湊、送聯邦時被剥掉，其他 client 無感 |
 | offset | 一對 `(event_id, r_seq)`：`event_id` 是可攜的權威（聯邦、換 server 都認得），`r_seq` 是本地算術用；比較用 `r_seq` |
 | `sent_at` | 只當顯示用的時間 |
-| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r, more }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（wbfuwunel 的 pack-pipeline.md §6.4）：一窗收完且 **`more: false`** 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`more: true`（窗停在則數或**位元組**上限）帶 `before = 最後的 ls` 再一窗、水位不動。🚨 🚫 不看 `tc < limit`：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14）；缺 `more` 當 `true`；空窗就是追平；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。水位只由 UI 叫的 `sync.recent` 動（/docs/design/rooms/room-sync.md §1） |
+| 全域更新 | pack `Event/Recent`（kind `0x14`／subtype `0x01`；**只走 WS**，HTTP 回 `Error(Unsupported)`）：client 帶快取裡最新的 `g_seq` 當 `cg_seq`，一次要**一窗**（`limit` 預設 320、上限 500），回應是一串 `Event/Batch`（`0x03`，每批 `batch` 則、預設 10，meta `{ tc, bc, fs, ls, r, more }`，data 是 u32 大端長度前綴的事件 JSON，新到舊、自帶 `room_id`），`r = 0` 這窗結束。水位（wbfuwunel 的 pack-pipeline.md §6.4）：一窗收完且 **`more: false`** 就追平，`cg_seq` 存成**第一窗第一個 Batch 的 `fs`**；`more: true`（窗停在則數或**位元組**上限）帶 `before = 最後的 ls` 再一窗、水位不動。🚨 禁止拿 `tc < limit` 判斷追平：位元組上限滿的窗也是 `tc < limit`（wbfuwunel 2026-09-14）；缺 `more` 當 `true`；空窗就是追平；中途斷線已收到的有效、水位不動。請求的 `id` 由 client 選。三層（維護者 2026-09-08 定）：上層要 N 則（初開 app 一萬）→ 底層每次 `Recent` 一窗 ≤ 500 → server 每批 10 個 Batch；`WbfClient::recent_sync(cg_seq, RecentPlan { max_events, window, batch })` 負責拆窗、最後一窗縮成剩下的數量、湊滿或追平就停。這就是「初開 app 掛載一萬則」的實作，而且之後每次開都只拿差異。水位只由 UI 叫的 `sync.recent` 動（/docs/design/rooms/room-sync.md §1） |
 | 還沒有的 | server 端「`r_seq` → 事件」的反查（跳到第 N 則直接問）：server 列為候選。在那之前用 `/messages` 二分逼近，或只提供「跳到快取裡有的第 N 則」 |
 
 **退化（維護者接受）**：非 fork 的 server 上的 room 沒有 `r_seq`。client 必須顯式判斷它在不在，不靠巧合：
@@ -393,9 +393,9 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
   `history` 回原樣的 `EventPage`，不是 `Page<Message>`（/docs/design/messages/edits-and-redactions.md §8）。
 - `watch` 是 callback（`FnMut(Update) -> WatchControl` 加 deadline），不是 `Stream`：sync 迴圈在 backend 手上。
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
-- 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
+- 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著；折的規則跟寫庫那條一樣（收回贏、edit 過 `check_replacement` 才套，/docs/design/messages/message-actions.md §5）。
 
-還沒做：送 edit／delete／reaction／reply、已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
+送 edit／delete／reaction／reply 在 /docs/design/messages/message-actions.md。還沒做：已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
 
 ## 7. 還開著的（再議）
 

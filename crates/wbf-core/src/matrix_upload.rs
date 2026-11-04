@@ -1,6 +1,6 @@
 //! 一般 Matrix 帳號的傳統上傳（/docs/design/rpc-specs/data-plane.md §7.2）：建檔（問上限、預先拿 mxc）、收 bytes（串流進 `/upload`，
 //! 加密房邊收邊 AES-256-CTR）、把傳完的檔當標準附件送出。HTTP 與加密在 sdk 的 `matrix_media`；這裡管帳號、房間加不加密、
-//! 「這是不是這個帳號的上傳」。wbf 帳號一律走分塊（`attachment_ops.rs`），🚫 走這條。
+//! 「這是不是這個帳號的上傳」。wbf 帳號一律走分塊（`attachment_ops.rs`），**不**走這條。
 
 use tokio::io::AsyncRead;
 use wbf_sdk::event_json::matrix_file_message_content;
@@ -14,12 +14,12 @@ use crate::error::{CoreError, CoreErrorKind};
 use crate::{Core, Target};
 
 impl Core {
-    /// `media.create` 的一般 Matrix 帳號那半：先問 `m.upload.size`（超過就拒、🚫 讀任何 bytes），再 `/create` 預先拿 mxc。
+    /// `media.create` 的一般 Matrix 帳號那半：先問 `m.upload.size`（超過就拒、**不**讀任何 bytes），再 `/create` 預先拿 mxc。
     ///
     /// Args:
     ///     request: example: &NewUpload { room: Some("!r:matrix.org".into()), name: "cat.png".into(), size: Some(81234), ..Default::default() }
     /// Return:
-    ///     Ok(MatrixUpload)   🚫 金鑰（PUT 時現產）
+    ///     Ok(MatrixUpload)   **沒有**金鑰（PUT 時現產）
     ///     Err(Usage)         沒給 `size` 或是 0（`/upload` 要先講長度）、超過 server 的上限、`cipher` 不是 `none`、加密房要 `none`
     ///     Err(Server)／Err(Network)   問房間、問上限、`/create` 失敗
     pub(crate) async fn create_matrix_upload(
@@ -85,7 +85,7 @@ impl Core {
         })
     }
 
-    /// PUT 的 body 串流進 `/upload`（加密房邊收邊加密，key／IV 這次現產），回 manifest。🚫 續傳：斷了就再 PUT 一次整個 body（新的 key／IV）。
+    /// PUT 的 body 串流進 `/upload`（加密房邊收邊加密，key／IV 這次現產），回 manifest。**不**續傳：斷了就再 PUT 一次整個 body（新的 key／IV）。
     ///
     /// Args:
     ///     upload: `media.create` 建的那份
@@ -118,8 +118,9 @@ impl Core {
     /// 加密房只收 `kind` 2、明文房只收 `kind` 3（明文房的事件帶金鑰等於公開它）。
     ///
     /// Args:
-    ///     manifest: PUT 回、UI 帶回來的那份（🚫 信它：組事件時再驗一次）
+    ///     manifest: PUT 回、UI 帶回來的那份（**不**信它：組事件時再驗一次）
     ///     caption: example: Some("看這個")
+    ///     options: `reply_to`、`mentions` 照 /docs/design/messages/message-actions.md §3.2；`txn_id` 重送用；`room_devices` 不看（matrix-sdk 自己加密）, example: &SendOptions::default()
     /// Return:
     ///     Ok(String)   event_id
     ///     Err(Usage)   這個帳號是 wbf 帳號、manifest 是別台 server 的、格式跟房間對不上、manifest 自相矛盾
@@ -129,6 +130,7 @@ impl Core {
         room: &str,
         manifest: &MatrixManifest,
         caption: Option<&str>,
+        options: &crate::room_crypto::SendOptions,
         target: &Target,
     ) -> Result<String, CoreError> {
         let account = self.account_or_current(target)?;
@@ -149,7 +151,17 @@ impl Core {
         let encrypted = backend.is_room_encrypted(room).await?;
         refuse_kind_not_matching_room(room, encrypted, manifest.kind)?;
         let content = matrix_file_message_content(manifest, caption)?;
-        Ok(backend.send_message_content(room, content).await?)
+        let content = self
+            .add_reply_and_mentions_of(&account, room, content, options)
+            .await?;
+        Ok(backend
+            .send_event_content(
+                room,
+                wbf_sdk::message_content::MESSAGE_EVENT_TYPE,
+                content,
+                options.txn_id.as_deref(),
+            )
+            .await?)
     }
 
     /// Return:
@@ -174,7 +186,7 @@ impl Core {
 ///     kind: manifest 說的格式, example: MediaKind::MatrixEncrypted
 /// Return:
 ///     Ok(())       加密房配 `kind` 2、明文房配 `kind` 3
-///     Err(Usage)   其他（🚫 送：明文房的事件帶金鑰等於公開它、加密房會送一個 server 讀得到的檔；`kind` 1 不走這條路）
+///     Err(Usage)   其他（**不**送：明文房的事件帶金鑰等於公開它、加密房會送一個 server 讀得到的檔；`kind` 1 不走這條路）
 fn refuse_kind_not_matching_room(
     room: &str,
     encrypted: bool,
@@ -376,7 +388,7 @@ mod tests {
         );
     }
 
-    /// 超過 `m.upload.size`：拒、🚫 去拿 mxc。沒給大小、大小 0、wbf 的演算法名字：拒、🚫 碰網路。
+    /// 超過 `m.upload.size`：拒、**不**去拿 mxc。沒給大小、大小 0、wbf 的演算法名字：拒、**不**碰網路。
     #[tokio::test]
     async fn an_upload_over_the_limit_or_without_a_size_is_refused_before_anything_is_made() {
         let (base, seen) = media_server(10_000).await;
@@ -412,7 +424,7 @@ mod tests {
         assert!(paths(&seen).is_empty(), "refused before any request");
     }
 
-    /// 別人的上傳、wbf 帳號拿傳統的上傳或 manifest、別台 server 的 manifest：拒、🚫 碰網路。
+    /// 別人的上傳、wbf 帳號拿傳統的上傳或 manifest、別台 server 的 manifest：拒、**不**碰網路。
     #[tokio::test]
     async fn an_upload_or_manifest_that_is_not_this_accounts_is_refused() {
         let (base, seen) = media_server(1_000_000).await;
@@ -444,7 +456,13 @@ mod tests {
             file: None,
         };
         let error = core
-            .send_matrix_attachment(ROOM, &manifest, None, &target)
+            .send_matrix_attachment(
+                ROOM,
+                &manifest,
+                None,
+                &crate::SendOptions::default(),
+                &target,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
@@ -473,6 +491,7 @@ mod tests {
                     ..manifest
                 },
                 None,
+                &crate::SendOptions::default(),
                 &target,
             )
             .await

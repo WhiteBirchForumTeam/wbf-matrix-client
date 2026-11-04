@@ -41,7 +41,7 @@ pub struct Conversation {
     /// `kind == Direct` 才有。
     pub direct_peer: Option<String>,
     /// 房間狀態本身：成員事件（`m.room.member`）以外的每一項狀態事件，server 給什麼帶什麼（權限的整份內容、置頂清單…，/docs/design/rooms/room-actions.md §5.1）。
-    /// `null` ＝ 這一份沒拿狀態（一般 Matrix 帳號的 `room.list` 是從 Client 的 store 算的），🚫 是「沒有狀態」。
+    /// `null` ＝ 這一份沒拿狀態（一般 Matrix 帳號的 `room.list` 是從 Client 的 store 算的），**不是**「沒有狀態」。
     #[serde(default)]
     pub state: Option<Vec<serde_json::Value>>,
 }
@@ -95,7 +95,7 @@ impl Membership {
 
 /// 房間列表的一列（`room.list`，/docs/design/rooms/chat-model.md §2.1）：本地知道多少給多少，不知道的是 `null`。
 /// 列表只問 server「加入了哪些房」；每一間的樣子是 UI 對看得到的房間叫 `room.get` 拿回來、寫進本地的（維護者 2026-10-05）。
-/// 欄位跟 [`Conversation`] 同名；`refreshed_at` 是 `null` ＝ 這一間還沒拿過（`name` 的 `null` 這時是「不知道」，🚫 是「沒名字」）。
+/// 欄位跟 [`Conversation`] 同名；`refreshed_at` 是 `null` ＝ 這一間還沒拿過（`name` 的 `null` 這時是「不知道」，**不是**「沒名字」）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomListEntry {
     pub id: String,
@@ -129,7 +129,7 @@ pub struct Invite {
     /// None ＝ server 因為太大沒送、本地也沒有之前拿到的（server §5.3）。
     pub state: Option<Vec<serde_json::Value>>,
     /// 🚨 `inviter` 的網域跟這個帳號的網域逐字相同才是 true（daemon 算的，維護者 2026-10-14）。
-    /// false 時 `state` 裡的房名、頭像、topic 都是對方 server 說的、沒有人驗過（server §5.2.3），🚫 當成已驗證的事實顯示。
+    /// false 時 `state` 裡的房名、頭像、topic 都是對方 server 說的、沒有人驗過（server §5.2.3），禁止當成已驗證的事實顯示。
     pub is_from_this_server: bool,
 }
 
@@ -232,7 +232,7 @@ pub struct Attachment {
     pub block: ChunkedBlock,
 }
 
-/// 標準 Matrix 的附件（/docs/design/rpc-specs/data-plane.md §7.1 的 `kind` 2、3）。從事件內容來，🚫 是分塊。
+/// 標準 Matrix 的附件（/docs/design/rpc-specs/data-plane.md §7.1 的 `kind` 2、3）。從事件內容來，**不是**分塊。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixAttachment {
     /// example: "m.image"
@@ -286,7 +286,7 @@ pub enum MessageKind {
     /// 解不開的加密事件：跟 `Deleted` 一樣是明確的記號，UI 直接渲染（維護者 2026-09-14）。
     /// `Message.decrypted` 是 `Some(false)`，原因在 `undecryptable_reason`。
     Undecryptable,
-    /// 這則被 edit 過，但目前的那個 edit 這個帳號**還沒同步到**：本地手上的版本過時了，🚫 原文與 edit 內容都不給，
+    /// 這則被 edit 過，但目前的那個 edit 這個帳號**還沒同步到**：本地手上的版本過時了，原文與 edit 內容都**不**給，
     /// 同步之後就會是新版本（維護者 2026-09-14）。跟 `Deleted`、`Undecryptable` 一樣是 UI 直接渲染的記號。
     Outdated,
     /// 認不得的事件：照印 type，不丟（/docs/design/rooms/chat-model.md §3.4）。
@@ -300,7 +300,11 @@ pub enum MessageKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     pub key: String,
+    /// 按了這個 key 的人，一人一次（同一個人按了兩則也只算一次）。
     pub by: Vec<String>,
+    /// 讀的那個帳號自己按的那則反應的 `event_id`（兩則都在時取最早的）；沒按過是 None。UI 拿它叫 `room.redact` 收回（/docs/design/messages/message-actions.md §5）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mine: Option<String>,
 }
 
 /// 一則訊息，也是 /docs/design/rpc-specs/wbf-cli-spec.md §3.4.1 印的形狀。順序不在這裡：照 backend 交出來的順序（/docs/design/rooms/chat-model.md §4.3）。
@@ -369,7 +373,7 @@ pub trait ChatBackend {
 
     /// 歷史，從最新往回；`before` 接上一頁的 `next`。過濾在呼叫者端（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.1）。
     ///
-    /// 🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），🚫 不是 server 的翻頁 token ——
+    /// 🚨 `before` 與 `next` 都是 **`event_id`**（這一頁最舊那則），**不是** server 的翻頁 token ——
     /// UI 不分 server 是誰，一律拿手上最舊那則往回問（/docs/design/rooms/chat-model.md §4.3、/docs/design/rpc-specs/rpc-spec.md §3.3）。
     /// 回的是**原樣**的事件（/docs/design/messages/edits-and-redactions.md：原始事件存庫、顯示另外折）。
     async fn history(
@@ -378,19 +382,6 @@ pub trait ChatBackend {
         before: Option<&str>,
         limit: u32,
     ) -> Result<EventPage, SdkError>;
-
-    /// Return:
-    ///     Ok(String)   event_id
-    async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError>;
-
-    /// 送 /docs/design/media/wbf-client-convention-for-chunk.md §5 的事件。⚠️ 附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）在這條路帶不出去：matrix-sdk 不能在送訊息的請求加 header；
-    /// 實作要在回傳前把這件事講清楚（見 `backend/matrix_sdk.rs`）。wbf 帳號不走這個 trait，它走 `Event/Send`、有宣告。
-    async fn send_file(
-        &self,
-        id: &str,
-        attachment: &Attachment,
-        caption: Option<&str>,
-    ) -> Result<String, SdkError>;
 
     /// 從 `since` 起等新事件，每一則叫一次 `on_update`；callback 回 `Stop`、或 `deadline` 到了就結束。
     /// `since` 是 None 就從「現在」起：實作先對齊位置、不吐舊事件。
