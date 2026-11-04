@@ -62,7 +62,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
     };
 
     // /docs/design/media/wbf-client-convention-for-chunk.md §5.1：沒 E2EE 的房間走明文模式，送之前**警告並要求確認**。
-    // 🚫 這個確認是前端的事，core 不問（/docs/design/overview/architecture-v2.md §3）。
+    // 這個確認是前端的事，core **不**問（/docs/design/overview/architecture-v2.md §3）。
     let conversation = core
         .conversation(&args.room, SyncMode::Both, &target)
         .await?;
@@ -73,7 +73,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
             "warning: room {} is NOT encrypted: the file will be stored in plaintext on the server and readable by every member and the server itself",
             args.room
         );
-        // 🚫 永遠不在沒 E2EE 的房間送加密的區塊（那個區塊的金鑰會公開）。
+        // 禁止在沒 E2EE 的房間送加密的區塊（那個區塊的金鑰會公開）。
         let cipher = cipher_for_plaintext_room(args.cipher.as_deref())?;
         if !args.yes && !confirm("send it in plaintext anyway?")? {
             return Err(CoreError::new(CoreErrorKind::Usage, "cancelled"));
@@ -103,7 +103,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
         .await;
     let (event_id, manifest) = match sent {
         Ok(result) => (result.event_id, result.manifest),
-        // 傳完才被 1401 擋：檔案已經在 server 上、manifest 在 `data` 裡。用新狀態與同一個 txn_id 送一次附件（只一次，🚫 重傳檔案）。
+        // 傳完才被 1401 擋：檔案已經在 server 上、manifest 在 `data` 裡。用新狀態與同一個 txn_id 送一次附件（只一次，**不**重傳檔案）。
         Err(error) if error.kind == CoreErrorKind::RoomDevicesChanged => {
             let manifest = error.data.as_ref().and_then(|data| {
                 serde_json::from_value::<wbf_sdk::Manifest>(data.get("manifest")?.clone()).ok()
@@ -138,7 +138,7 @@ pub async fn send_command(context: &Context, args: &SendArgs) -> Result<(), Core
 ///
 /// Return:
 ///     Ok(SendOptions)   加密房的 wbf 帳號帶 `room_devices`；其他是預設（都不帶）
-///     Err(...)          refresh 失敗（不在房裡、裝置雜湊對不上…）：🚫 送
+///     Err(...)          refresh 失敗（不在房裡、裝置雜湊對不上…）：**不**送
 async fn send_options_for(
     core: &wbf_core::Core,
     room: &str,
@@ -151,7 +151,7 @@ async fn send_options_for(
     let refreshed = core.refresh_room_devices(room, None, target).await?;
     Ok(wbf_core::SendOptions {
         room_devices: Some(refreshed),
-        txn_id: None,
+        ..wbf_core::SendOptions::default()
     })
 }
 
@@ -167,6 +167,7 @@ fn options_after_room_devices_changed(error: &CoreError) -> Option<wbf_core::Sen
     Some(wbf_core::SendOptions {
         room_devices: Some(room_devices),
         txn_id: Some(txn_id),
+        ..wbf_core::SendOptions::default()
     })
 }
 
@@ -175,7 +176,7 @@ pub async fn watch_command(context: &Context, args: &WatchArgs) -> Result<(), Co
     let mode = watch_mode_from_name(&args.mode, args.seconds, args.timeout)?;
     let once = args.mode == "once";
     // ⚠️ `watch` 是串流：訊息從事件來，一則印一行（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2 的 JSON Lines）。
-    // 所以要先訂閱再開始，🚫 不能等 `watch()` 回來才印。
+    // 所以要先訂閱再開始，禁止等 `watch()` 回來才印。
     let mut events = context.core()?.subscribe();
     let printer = tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
@@ -261,7 +262,7 @@ pub async fn files_command(
 ///     SyncMode  true → `Local`；false → **`Both`**
 ///
 /// ⚠️ 沒帶旗標對的是 `Both` 而不是 `Server`：**CLI 本來就是「打上游＋寫穿快取」**，
-/// 而 `Server` 是新的「看一眼不寫庫」語意 —— 🚫 不要悄悄改掉 CLI 的行為。
+/// 而 `Server` 是新的「看一眼不寫庫」語意 —— 禁止悄悄改掉 CLI 的行為。
 fn sync_of(from_cache: bool) -> SyncMode {
     match from_cache {
         true => SyncMode::Local,

@@ -22,7 +22,7 @@ daemon ──{ method, params }（沒有 id）──> 前端        推播：pro
 
 ## 1. 線上封裝：RPC 自己的極簡 pack（維護者 2026-09-12 定）
 
-**WS 上一律 binary frame**，🚫 沒有 text frame。每一個 frame 就是一個 pack：
+**WS 上一律 binary frame**，**沒有** text frame。每一個 frame 就是一個 pack：
 
 ```
 pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
@@ -30,16 +30,16 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 
 | 欄位 | 值 | 意思 |
 |---|---|---|
-| `ver` | `0x01` | pack 格式的版本。起始值 1。⚠️ 這是**封裝**的版本，🚫 不是 `hello` 談的 `protocol`（那是訊息內容的版本） |
-| `type` | `0x00` | 未定。🚫 不能送，收到就是 `BAD_FRAME` |
+| `ver` | `0x01` | pack 格式的版本。起始值 1。⚠️ 這是**封裝**的版本，**不是** `hello` 談的 `protocol`（那是訊息內容的版本） |
+| `type` | `0x00` | 未定。禁止送，收到就是 `BAD_FRAME` |
 | | `0x01` | **明文**：`data` 就是 JSON bytes |
 | | `0x02` | **密文**：`data = nonce(24) ‖ XChaCha20-Poly1305(key, nonce, aad, JSON bytes)`（金鑰與 aad 在 /docs/design/rpc-specs/local-interface.md §4） |
 | `data` | | **沒有長度欄位**——長度由 WS frame 給 |
 
-- ⭐ **`type` 只回答一件事：這包是明文還是密文。** 它🚫 不表示種類、不表示方向、不表示成敗——那些都在 JSON 裡。
-- 📎 這跟 homeserver 那套 `wbf-pack`（`wbf-wire`）**無關**，只是借它「極簡二進位前綴」的做法。🚫 不共用 codec。
+- ⭐ **`type` 只回答一件事：這包是明文還是密文。** 它**不**表示種類、不表示方向、不表示成敗——那些都在 JSON 裡。
+- 📎 這跟 homeserver 那套 `wbf-pack`（`wbf-wire`）**無關**，只是借它「極簡二進位前綴」的做法。**不**共用 codec。
 - **daemon 送出去的每一則都經過同一個封裝器**：`pack(type, json) -> bytes`／`unpack(bytes) -> (type, json)`，
-  🚫 不要在每個 method 各自組 bytes——「哪些該加密」的判斷只能有一個地方（§1.1）。
+  禁止在每個 method 各自組 bytes——「哪些該加密」的判斷只能有一個地方（§1.1）。
 - frame 上限 1 MiB（含前綴）。超過 → `BAD_FRAME`。
 - `ver` 認不得 → `BAD_FRAME`。現在只認 `0x01`。
 
@@ -52,13 +52,13 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 ```
 
 - **client 預設永遠送 `0x02`，包括 `hello`。** 沒有 token 就送不出解得開的包，第一包就驗不過（/docs/design/rpc-specs/local-interface.md §4）。
-- daemon 有一個**全局狀態 `encryption_enforced`，預設開**。開著的時候：client 送來 `0x01` → `BAD_FRAME`（🚫 不接受降級）；
+- daemon 有一個**全局狀態 `encryption_enforced`，預設開**。開著的時候：client 送來 `0x01` → `BAD_FRAME`（**不**接受降級）；
   daemon 的正常回應與推播一律 `0x02`。
 - **`0x01` 在 enforce 開著時只有一種用途：協議層錯誤的 close 通知（§1.4）。** 那是唯一一種「對方可能沒有金鑰」的情況，
   用密文告知等於沒告知；而且**它一定緊接著關連線**，所以不存在「UI 收到一包明文卻以為是正常回應」的問題。
 - **手動降級**：`daemon.set_encryption { enforced: false }`（本身要走 `0x02` 送）把全局狀態關掉。之後 daemon 接受 `0x01` 的請求、
   對 `0x01` 的請求用 `0x01` 回、推播用那條連線最後一次請求的 type。開回去用同一個 method。
-  ⚠️ 這是**除錯用**（抓包看明文），🚫 不是給前端省事的：Desktop／Android 永遠送 `0x02`。
+  ⚠️ 這是**除錯用**（抓包看明文），**不是**給前端省事的：Desktop／Android 永遠送 `0x02`。
   📎 `daemon.info` 回 `encryption_enforced` 讓人看得到現在是哪一種。
 
 ### 1.2 連線的生命週期
@@ -91,17 +91,17 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 **`instance`：這次啟動的身分**（維護者 2026-09-13）。daemon 起來時鑄一個 UUID v4，活著的期間不變。
 
 - ⭐ 它回答的是前端唯一問得出口的那個問題：**「我現在講話的還是剛才那一個 daemon 嗎？」**
-  🚫 port 答不了（會被重複使用）、🚫 pid 也答不了（會被回收）。同一個 `instance` ＝ 同一個實例，
+  port 答不了（會被重複使用）、pid 也答不了（會被回收）。同一個 `instance` ＝ 同一個實例，
   所以前端手上的所有狀態（訂閱、進行中的 `id`、解鎖與否）都還算數；換了就是全部重來。
 - 同一個值同時出現在**四個地方**：stdout 的 ready 那行、`<data dir>/daemon.json`、`hello` 的
-  result、`daemon.info` 的 result —— ⭐ 一個值一個來源，🚫 不各鑄一個。
+  result、`daemon.info` 的 result —— ⭐ 一個值一個來源，**不**各鑄一個。
 - `pid` 與 `uptime_seconds` 一起回：`pid` 給人（去 kill 它、去看 log），`uptime_seconds` 讓前端
-  一眼看出「它是不是剛剛才重開過」。⚠️ **判斷同不同一個實例只准用 `instance`**，🚫 不要用 pid。
+  一眼看出「它是不是剛剛才重開過」。⚠️ **判斷同不同一個實例只准用 `instance`**，禁止用 pid。
 
 **`client`：正式名稱，`wbf-matrix` 開頭**。
 
 - 格式 `<正式名稱> <版本>`：`wbf-matrix-rpc-cli 0.1.0`、`wbf-matrix-desktop 0.3.0`、`wbf-matrix-android 0.1.0`。
-  🚫 不是簡稱（`rpc-cli`）——簡稱是文件裡的寫法（/docs/design/overview/architecture-v2.md §0.1），不是線上的識別。
+  **不是**簡稱（`rpc-cli`）——簡稱是文件裡的寫法（/docs/design/overview/architecture-v2.md §0.1），不是線上的識別。
 - daemon 做**基礎檢查**：不以 `wbf-matrix` 開頭 → `BAD_CLIENT`（§1.4），關連線，**跟 protocol 不對一樣拒絕**。
   這不是安全機制（token 才是），是擋掉「有人拿別的東西亂連」與「寫錯名字」的第一道門。
 - 之後只進 log。
@@ -112,12 +112,12 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
   沒有交集 → `PROTOCOL_MISMATCH`（§1.4），關連線。
 - ⭐ **常態是 daemon 升級、前端沒升**：daemon 版本往上走的時候**維持能講舊協議**，舊前端照用。
   只有 **breaking**（舊協議真的沒辦法再服務）才把那個版本從表裡拿掉——那時候舊前端一連上來就被**明確拒絕**，
-  🚫 不是連上了之後某個 method 突然壞掉。
+  **不是**連上了之後某個 method 突然壞掉。
 - 反過來前端比 daemon 新（前端送 `[3, 2]`、daemon 只會 `[2]`）→ 談成 `2`，前端自己降級。
 - 現在 daemon 只有 `[2]`（`SUPPORTED_PROTOCOLS`，`crates/wbf-daemon/src/protocol.rs`）。
   **版本號只寫在一個地方**：同檔的 `CURRENT_PROTOCOL`，支援表與測試送的 `hello` 都從它拿；升版就改它（維護者 2026-10-05）。
   版本紀錄：**2**（2026-10-05，維護者定）`room.list` 回 `[RoomListEntry]`、送文字前要 `room.get` 過那間房（§3.3，/docs/design/rooms/chat-model.md §2.1），
-  舊前端的 `room.list` 解不了、送文字一律 1100，所以 **1 從表裡拿掉**（只會講 1 的前端 `hello` 就拿到 `PROTOCOL_MISMATCH`）。**談定之後那條連線上的每一則都是那個版本的形狀**，🚫 中途不換。
+  舊前端的 `room.list` 解不了、送文字一律 1100，所以 **1 從表裡拿掉**（只會講 1 的前端 `hello` 就拿到 `PROTOCOL_MISMATCH`）。**談定之後那條連線上的每一則都是那個版本的形狀**，中途**不**換。
 
 📎 `msg` 一律英文（/docs/design/rpc-specs/wbf-cli-spec.md §4 同一條）。語言協商考慮過，維護者 2026-09-12 判定多餘：`msg` 是給人看的除錯字串，
 使用者看到的字由前端照 `code` 自己翻。
@@ -127,7 +127,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 ### 1.4 協議層錯誤：`0x01` 的 close 通知，然後關連線
 
 🚨 daemon **關掉一條連線之前一定先送一包 `type = 0x01`（明文）**。它的 JSON **跟正常回應同一個形狀**
-（`code`／`msg`／`result`／`id`，/docs/design/rpc-specs/local-interface.md §6），🚫 不是另一套：
+（`code`／`msg`／`result`／`id`，/docs/design/rpc-specs/local-interface.md §6），**不是**另一套：
 
 ```jsonc
 { "code": 9001, "msg": "could not decrypt the first frame; the daemon token does not match",
@@ -135,7 +135,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 ```
 
 ⭐ 這樣前端的 frame 翻譯器只有一條路：**先看 `type`，`0x02` 就解密、`0x01` 就直接 JSON decode，然後全部進同一個
-`{ code, msg, result, id }` 的處理**。🚫 不要為了 close 通知另寫一個 parser。
+`{ code, msg, result, id }` 的處理**。禁止為了 close 通知另寫一個 parser。
 
 | `code` | `result.close` | 什麼時候 |
 |---|---|---|
@@ -152,7 +152,7 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 - ⚠️ **「解開之後是 JSON、但不是一個請求」不是協議層的事**：那是 `100`（§5.1），回完**連線照用**。
   判準還是同一條 —— 封裝壞了（解不開、不是 JSON）連線就沒救了；一則寫壞的請求只是那一則壞了。
   📎 例外是 `hello` 之前：還沒談成協議，所以寫壞的請求一律 `9003` 關掉。
-- `id`：對得上某個請求（`hello` 被拒）就帶那個 `id`；對不上（解不開、shutdown）就 `null`。🚫 不省略欄位。
+- `id`：對得上某個請求（`hello` 被拒）就帶那個 `id`；對不上（解不開、shutdown）就 `null`。**不**省略欄位。
   📎 `100` 的 `id`：JSON 裡的 `id` 剛好是整數就帶著它回（`method` 壞掉時前端還配得起來），否則 `null`。
 - `result.close` 是**大寫底線**的字串，跟 `code` 一對一——留著是給人讀 log 用，前端判斷用 `code`。
 - 這則之後緊接 WS close frame（status 1008 policy violation；`SHUTTING_DOWN` 用 1001 going away）。
@@ -173,14 +173,14 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | 值 | daemon 做什麼 | 寫 `cache.db` |
 |---|---|---|
 | **`local`（預設）** | 只讀 `cache.db` | ❌ |
-| `server` | 打上游、拿到什麼就回什麼 | 🚫 **不寫**（這是「看一眼」，不是同步） |
+| `server` | 打上游、拿到什麼就回什麼 | **不寫**（這是「看一眼」，不是同步） |
 | `both` | 打上游 → 寫進 `cache.db` → **再從本地讀一次**回傳 | ✅ |
 
-- ⭐ `both` 回的是**本地讀的結果**，形狀跟 `local` 一模一樣 —— UI 🚫 不必為兩種模式寫兩套解析。
-- 🚫 **沒有 `auto`**：延遲從毫秒跳到秒這件事，要由呼叫者決定，🚫 不是 daemon 猜。
+- ⭐ `both` 回的是**本地讀的結果**，形狀跟 `local` 一模一樣 —— UI **不必**為兩種模式寫兩套解析。
+- **沒有 `auto`**：延遲從毫秒跳到秒這件事，要由呼叫者決定，**不是** daemon 猜。
 - 判準：**本地快取有那份東西的 method 才有這個參數**。帳號列表、recovery key 那些是這台機器的檔案
   （沒有「上游版本」），`sync.recent`／`server.ping`／`backup.*` 本來就是上游的。
-- ⚠️ 回傳的型別裡**只有 server 知道的欄位**，`local` 時就讓它們**不在**，🚫 不編造
+- ⚠️ 回傳的型別裡**只有 server 知道的欄位**，`local` 時就讓它們**不在**，**不**編造
   （`media.info` 的 `total_len`／`truncated`／`verified` 就是）。⭐ 少一個欄位是誠實，填一個假數字不是。
 
 🚨 **認得 `sync` 的 method，回應要回報這次用的是哪一種**（維護者 2026-09-13）：
@@ -190,10 +190,10 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 ```
 
 - **只要那個 method 認得 `sync` 就帶，不管請求有沒有帶** —— ⭐ 這樣前端知道「沒帶時預設是什麼」，
-  🚫 不必去記規格，也不必猜這份資料是本地的還是剛從上游拿的。
+  **不必**去記規格，也不必猜這份資料是本地的還是剛從上游拿的。
 - ⚠️ **失敗的回應也帶**：「我去打了上游然後失敗」跟「我只讀本地然後沒有」是兩件事。
-- 🚫 **值認不得（`102`）時不帶**：那次它一種都沒用，宣稱用了哪一種是說謊。
-- 不認得 `sync` 的 method **沒有這個欄位**（🚫 不是 `null`）。
+- **值認不得（`102`）時不帶**：那次它一種都沒用，宣稱用了哪一種是說謊。
+- 不認得 `sync` 的 method **沒有這個欄位**（**不是** `null`）。
 
 🚨 **`transport` 就是選 backend**（維護者 2026-09-13 定案）：
 
@@ -202,30 +202,30 @@ pack = ver(1 byte) ‖ type(1 byte) ‖ data(變長，到 frame 結尾)
 | **`ws`**（**沒帶就是它**） | **wbf 客製協議** | `wbf-sdk`（`BackendKind::WbfSdk`） |
 | **`http`** | **原生 Matrix HTTP** | `matrix-sdk`（`BackendKind::MatrixSdk`） |
 
-🚫 **wbf 底下不再細分 ws／http —— wbf 協議一律 WS。** pack-over-HTTP 只剩 **debug** 用途，
-⚠️ 它不是「wbf 的 HTTP 模式」，🚫 前端碰不到它。
+**wbf 底下不再細分 ws／http —— wbf 協議一律 WS。** pack-over-HTTP 只剩 **debug** 用途，
+⚠️ 它不是「wbf 的 HTTP 模式」，前端碰不到它。
 
-**怎麼解析**（daemon 探測「這台講不講 wbf」，🚫 前端不指定 backend）：
+**怎麼解析**（daemon 探測「這台講不講 wbf」，前端**不**指定 backend）：
 
 ```text
 http ─────────────────────────> matrix-sdk（永遠）
-ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 不報錯，那是 no-op）
+ws ──┬── 這台不講 wbf ────────> matrix-sdk（不報錯，那是 no-op）
      ├── 這個 method 還沒有 ws ─> matrix-sdk（🚧 暫時）
      └── 其他 ────────────────> wbf
 ```
 
 - 🚨 **沒帶 `transport` 就是 `ws`**，所以預設就是「對方講 wbf 用 wbf，不講就 fallback 到 matrix-sdk」。
-  ⚠️ 那份預設只有一個地方寫著：`Transport::default()`（`wbf-sdk` 的 `channel.rs`），🚫 各層不再自己寫死一份。
+  ⚠️ 那份預設只有一個地方寫著：`Transport::default()`（`wbf-sdk` 的 `channel.rs`），各層**不**再自己寫死一份。
 - ⭐ **`ws` 打到一般 homeserver 不是錯，是 no-op**：前端不必先知道對方是誰才敢送參數。
 - ⚠️ **只有一種情況報錯**：那個 feature **只有 wbf 講得出來**（`sync.recent`、`upload.*`、
   `media.*`、`server.ping`、`room.refresh_devices`），而這條路到不了 wbf —— 那時它就是**關的**（`1100`）。
   兩種理由訊息分開講：**走 `http`** vs **對方不是 wbf**。⭐ 講出來比默默給一個空答案好。
 - 🚧 **「還沒有 ws」那一格**：程式裡每個呼叫點自己標 `MethodHome`（`crates/wbf-core/src/backend_choice.rs`；
-  🚫 不是一串字串比對——名字跟實際走哪條會漂移）。`StillOnMatrixSdk` 現在沒有呼叫點；
+  **不是**一串字串比對——名字跟實際走哪條會漂移）。`StillOnMatrixSdk` 現在沒有呼叫點；
   wbf 帳號還做不到的（`backup.*` 回 1100、`account.whoami`／`del` 走 HTTP）看 §10 的「底層」欄與 /docs/design/daemon/account-session.md §6。
   ⭐ server 端補上 ws 的定義就搬過去，**這一層一個字都不用改**。
 - **backend 怎麼探**：不帶 token 的 WS `Hello`，講得出協議版本就是 wbf（/docs/design/daemon/account-session.md §1）。
-  ⭐ 連不上、不回、看不懂 → 一般 homeserver。🚫 不寫進設定檔：那是 server 那邊的事實，它會變。
+  ⭐ 連不上、不回、看不懂 → 一般 homeserver。**不**寫進設定檔：那是 server 那邊的事實，它會變。
   帳號登入時探到哪一邊就封進 `session.sealed`，之後不再探（/docs/design/daemon/account-session.md §2）。
 
 - ⚠️ **`server_backup` 不在 RPC 上**：那是 `wbf.conf` 的開關（/docs/design/rpc-specs/wbf-cli-spec.md §10），**由 daemon 讀 conf 填進 `Target`**。
@@ -246,9 +246,9 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 | `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, links, cache_queue, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；`links` ＝ 所有帳號加起來現在開著幾條上游的線（/docs/design/daemon/link-pool.md；一個 wbf 帳號五條都開好就是 5，daemon 的看線迴圈會把它補回去）；`cache_queue` ＝ cache 寫入者還有幾件在排隊（一直漲＝寫得比收得慢）；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（/docs/design/overview/architecture-v2.md §7 第 4 點），這條只是「有人能把它關掉」的最低限度。關機之後進來的請求回 `107` |
-| `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：🚫 不斷上游會話、🚫 不掉連線）。⭐ 前端改設定（例如已讀要不要公開，/docs/design/messages/read-receipts.md §3）之後叫它，🚫 不必重開 daemon。還沒做 |
-| `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（🚫 不覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
-| `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶（但一樣要叫：daemon 起來時一律未解鎖，/docs/design/rpc-specs/local-interface.md §5）；`passphrase` 模式帶**原始 bytes** 的 base64（/docs/design/storage/vault-and-keys.md §3） | `{ ok: true, key_mode }` | `unlock`。成功之後 daemon 在背景把每個登入的 wbf 帳號的五條線開起來（/docs/design/daemon/link-pool.md §3.1），🚫 不等它回應就先回；已經解鎖再叫一次也會觸發 |
+| `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：**不**斷上游會話、**不**掉連線）。⭐ 前端改設定（例如已讀要不要公開，/docs/design/messages/read-receipts.md §3）之後叫它，**不必**重開 daemon。還沒做 |
+| `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（**不**覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
+| `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶（但一樣要叫：daemon 起來時一律未解鎖，/docs/design/rpc-specs/local-interface.md §5）；`passphrase` 模式帶**原始 bytes** 的 base64（/docs/design/storage/vault-and-keys.md §3） | `{ ok: true, key_mode }` | `unlock`。成功之後 daemon 在背景把每個登入的 wbf 帳號的五條線開起來（/docs/design/daemon/link-pool.md §3.1），**不**等它回應就先回；已經解鎖再叫一次也會觸發 |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
 | `vault.remove_passphrase` | — | `{ ok: true, key_mode: "plain" }` | `set_passphrase(None)` |
 
@@ -257,7 +257,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 | 想要的 | 怎麼做 |
 |---|---|
-| **UI 的 lock／unlock**（暫時離開、閒置） | **UI 自己那一層**鎖畫面。🚫 不動 daemon：daemon 照樣連著 server、照樣寫 DB、照樣發通知——⭐ 使用者離開時收到訊息，回來就該看到它，而不是一段空白 |
+| **UI 的 lock／unlock**（暫時離開、閒置） | **UI 自己那一層**鎖畫面。**不**動 daemon：daemon 照樣連著 server、照樣寫 DB、照樣發通知——⭐ 使用者離開時收到訊息，回來就該看到它，而不是一段空白 |
 | **真的鎖上**（金鑰離開記憶體） | `daemon.shutdown`，要用再 `daemon -s` 起一次。⭐ 這才是「鎖 vault」的真正意思：停掉所有訂閱、關掉所有連線、程序結束、`Vault` 在 drop 時被 zeroize |
 
 為什麼不做一個 `vault.lock`：**它做不到它名字承諾的事。** 請求各自跑，`call()` 一進來就先拿一份
@@ -266,43 +266,46 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 持有者放手才會被抹掉。那時回 `{ok: true}` 是在說謊，而一個回報成功、邊界卻沒成立的安全操作
 **比明確失敗危險得多**。⭐ 與其做一個「盡量鎖」，不如只留一條真的做得到的路（shutdown）。
 
-🚨 **fresh 資料目錄的起手式是 `vault.create`，🚫 不是 `account.add`**：`account.add` 🚫 不替前端建 vault。
+🚨 **fresh 資料目錄的起手式是 `vault.create`，不是 `account.add`**：`account.add` **不**替前端建 vault。
 
 - 替前端偷建的那把只能是 **plain**，所以想要 passphrase 的前端被迫「先落一份 plain `local.key` → 再
   `vault.set_passphrase` 重包」。⭐ 中間那段時間磁碟上的主金鑰**沒有 passphrase 保護**，
   而 `vault.set_passphrase` 又要求 vault 已經解鎖 —— fresh 狀態下那條路根本走不到。
 - 所以「要不要 passphrase」在**建的那一步**就要決定，跟 CLI 的 `login` 一樣一步到位。
 - 沒建就去叫別的 method：閘門回 **`1002`**（不是 `1001`）——⭐ 「還沒有 vault」與「有但鎖著」的
-  下一步不同（`vault.create` vs `vault.unlock`），所以🚫 不共用一個 code；`msg` 裡直接寫下一步。
+  下一步不同（`vault.create` vs `vault.unlock`），所以**不**共用一個 code；`msg` 裡直接寫下一步。
 
-⚠️ passphrase 用 base64 而不是字串：它是任意 bytes（可以是一個 mp3）。🚫 不提供 `passphrase_file`
+⚠️ passphrase 用 base64 而不是字串：它是任意 bytes（可以是一個 mp3）。**不**提供 `passphrase_file`
 ——那是「daemon 替前端讀檔」，web 前端根本給不出檔案路徑，而 rpc-cli 自己讀了再送不多一行。
 
 ### 3.2 帳號
 
 | method | params | result | core |
 |---|---|---|---|
-| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。⚠️ **要先 `vault.create`**：🚫 它不替前端建 vault。成功之後同 `vault.unlock`：背景開線 |
+| `account.add` | `{ server: string, user: string, password: string, device_name?: string }`。`device_name` 預設 `"wbf-matrix-client"` | `LoginResult`：`{ user_id, device_id, server, switched_from? }` | `log_in`。⚠️ **要先 `vault.create`**：它**不**替前端建 vault。成功之後同 `vault.unlock`：背景開線 |
 | `account.list` | — | `AccountStatus`：`{ accounts: [{ user_id?, server, localpart, logged_in, current }], undecryptable_hint? }` | `account_status` |
 | `account.switch` | `{ user, server? }` | `SwitchResult`：`{ current, switched_from?, logged_in }` | `switch_current` |
 | `account.whoami` | `{ user?, server? }` | `{ user_id, device_id, server }` | `whoami` |
 | `account.del` | `{ user, server?, accept_history_loss?: bool }` | `{ user }` | `log_out`。閘門擋下 → `1021` |
 | `account.destroy` | `{ user, server?, accept_history_loss?: bool }` | `DestroyResult`：`{ user, events_removed, media_removed, pool_files_removed, recovery_key_destroyed, account_dir_removed, server_dir_removed }` | `destroy_account` |
 
-⚠️ `password` 在 RPC 上是明文字串——它在加密的 frame 裡，而且**只在這一則**。daemon 🚫 不留、不進 log、不進任何推播。
-🚫 沒有「確認」這種互動：`account.destroy` 沒有 `--yes`，前端要問就自己問（daemon 不代前端做決定，/docs/design/overview/architecture-v2.md §3）。
+⚠️ `password` 在 RPC 上是明文字串——它在加密的 frame 裡，而且**只在這一則**。daemon **不**留、不進 log、不進任何推播。
+**沒有**「確認」這種互動：`account.destroy` 沒有 `--yes`，前端要問就自己問（daemon 不代前端做決定，/docs/design/overview/architecture-v2.md §3）。
 
 ### 3.3 房間
 
 | method | params | result | core |
 |---|---|---|---|
-| `room.list` | `{ membership?: ["join" \| "invite" \| "knock" \| "leave" \| "ban"], user?, server?, sync? }`。**有 `sync`**（§2）；`membership` 沒帶是 `["join"]` | `[RoomListEntry]`（/docs/design/rooms/chat-model.md §2.1）：這個帳號在那幾種身分裡的房，每列帶 `membership`；被邀請的列多帶 `invite`（下面 `room.invites` 的一間去掉 `room`）；本地知道多少給多少、不知道的是 `null`；`refreshed_at` 是 `null` ＝ 這間還沒 `room.get` 過 | `list_rooms`。上網只問「加入了哪些房」（wbf 帳號一個 `JoinedRooms`），`both` 把差異寫進本地（新的加列、拿過的🚫 覆寫、本地是 `join` 而名單沒有的標 `leave`、🚫 刪）再讀本地；`server` 🚫 寫庫，wbf 帳號只有 id、只答得出 `join`（維護者 2026-10-05）。別的身分由房間動作（§3.3.1）與邀請的推播／`room.invites` 寫（/docs/design/rooms/room-actions.md §3.3）；打上游只拿房間列表、沒有邀請，寫回時🚫 動邀請的列（維護者 2026-10-14） |
+| `room.list` | `{ membership?: ["join" \| "invite" \| "knock" \| "leave" \| "ban"], user?, server?, sync? }`。**有 `sync`**（§2）；`membership` 沒帶是 `["join"]` | `[RoomListEntry]`（/docs/design/rooms/chat-model.md §2.1）：這個帳號在那幾種身分裡的房，每列帶 `membership`；被邀請的列多帶 `invite`（下面 `room.invites` 的一間去掉 `room`）；本地知道多少給多少、不知道的是 `null`；`refreshed_at` 是 `null` ＝ 這間還沒 `room.get` 過 | `list_rooms`。上網只問「加入了哪些房」（wbf 帳號一個 `JoinedRooms`），`both` 把差異寫進本地（新的加列、拿過的**不**覆寫、本地是 `join` 而名單沒有的標 `leave`、**不**刪）再讀本地；`server` **不**寫庫，wbf 帳號只有 id、只答得出 `join`（維護者 2026-10-05）。別的身分由房間動作（§3.3.1）與邀請的推播／`room.invites` 寫（/docs/design/rooms/room-actions.md §3.3）；打上游只拿房間列表、沒有邀請，寫回時**不**動邀請的列（維護者 2026-10-14） |
 | `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation`：型別欄位＋ `state`（成員事件以外的每一項狀態事件原樣：權限的整份內容、置頂清單…，/docs/design/rooms/room-actions.md §5.1） | `conversation`。上網只問**這一間**（wbf 帳號是它的 `GetState` ＋ `m.direct`；一般 Matrix 帳號是 Client 算的欄位加一個 HTTP `GET /state`），`both` 寫進本地、下一次 `room.list` 就帶著。UI 對看得到、還沒名字的房間自己叫它 |
-| `room.invites` | `{ user?, server? }`。🚫 `sync`：本來就是去上游拿、寫進本地的（跟 `sync.recent` 一樣） | `{ invites: [{ room, inviter, is_direct, reason, state, is_from_this_server }] }`：補完之後本地所有待處理的邀請，照房間 id 排。`state` 是縮減狀態原樣（`null` ＝ server 太大沒送、本地也沒有）；🚨 `is_from_this_server` 是 `false` 時房名、頭像、topic 都是對方 server 說的，🚫 當成已驗證的事實顯示 | `fetch_invites`。主動補一輪（我們自己加的補窗，維護者 2026-10-14）：wbf 帳號跑一輪 `Invite/Fetch` 到 `r == 0`；一般 Matrix 帳號跑一次 `/sync` 讀 store。補完整份取代本地的邀請（這一輪裡被推播碰過的房以推播為準）、有變的推 `room.membership`；中途斷了回錯、🚫 寫任何一列。UI 首次啟動叫一次、看到 `room.membership` 帶 `gap: true` 再叫、收到 `link.state { role: "rooms", state: "opened" }`（斷了重開，/docs/design/rooms/room-sync.md §3.1）再叫、UI 自己的 RPC 連線重連時再叫；daemon 🚫 自己叫。一般 Matrix 帳號沒有推播，要 UI 自己再叫（/docs/design/rooms/room-actions.md §3.3） |
-| `room.send_text` | `{ room, body, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（/docs/design/keys/e2ee-rpc.md §3） | `{ event_id }` | `send_text`。加不加密看本地記的（`room.get sync=both` 拿過的房間；只在 `room.list` 上、還沒拿過的是不知道）：wbf 帳號沒拿過這間房、或本地不知道它加不加密 → **1100**，請先拿房間（維護者 2026-10-05：daemon 🚫 為了送一則字再問 server）。加密房：**只用後台已經分好的房間金鑰**——等這個房的金鑰對 `room_devices.room_version` 就緒（最多 2 秒，等不到回 **1402**、訊息沒送）→ 加密、帶 `room_version` 送（/docs/design/keys/e2ee-rpc.md §3）；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3）；兩種都🚫 自動重送 |
-| `room.refresh_devices` | `{ room, previous?, user?, server? }`。`previous` 是 UI 手上的上一份（`{ room_version, members }`）：帶了只重查裝置版本號變了的人 | `{ room_version, members: { mxid: "序號-雜湊" } }`——**UI 存下來**，送出時整份當 `room_devices` 帶回來。例：`{ "room_version": 9, "members": { "@alice:localhost": "1-810b7c3be4", "@bob:localhost": "4-0a1b2c3d4e" } }`（2026-10-06 拿掉了 `shared`） | `refresh_room_devices`（走 `Keys` 線）：拿成員清單與版本號 → 只重查變了的人 → 雜湊對不上重查一次、還不對就拒（fail closed）→ 交給後台對這一刻的狀態先分好房間金鑰（/docs/design/keys/e2ee-rpc.md §2、§3.1），🚫 等它分完。UI 點進房就叫，第一則就不用等。wbf 帳號才有；一般 Matrix 1100 |
-| `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, room_devices?, txn_id?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔）。**加密房（wbf 帳號）必帶 `room_devices`**，同 `room.send_text`；沒帶、`cipher` 跟房間對不上都在上傳之前 1100 | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（/docs/design/rpc-specs/wbf-cli-spec.md §5），daemon 不落地 | `send_file`。長工作：推 `progress`。加密房被擋回 1401、金鑰沒準備好回 1402：檔案已經在 server 上，`data` 多帶 `manifest`，改用 `room.send_attachment` 帶它重送、🚫 重傳檔案（/docs/design/keys/e2ee-rpc.md §3） |
-| `room.send_attachment` | `{ room, manifest, caption?, room_devices?, txn_id?, user?, server? }`。**資料平面版**的最後一步：UI 打 HTTP 傳完（`PUT` 回 manifest）之後，把那份 manifest 原樣帶回來（/docs/design/rpc-specs/data-plane.md §5）。加密房同 `room.send_text` 要 `room_devices` | `{ event_id, mxc, attachment_declared }` | `send_attachment`：核對 manifest 是這個帳號那台 server 的、區塊跟房間對得上；加密房被擋回 1401、金鑰沒準備好回 1402。manifest 沒有 `block`（一般 Matrix 帳號傳統上傳回的那種，/docs/design/rpc-specs/data-plane.md §7.2）走 `send_matrix_attachment`：標準附件、matrix-sdk 送（加密房它自己 Megolm）、`room_devices`／`txn_id` 不用、`attachment_declared` 是 `false`；加密房只收 `kind` 2、明文房只收 `kind` 3，對不上 1100 |
+| `room.invites` | `{ user?, server? }`。**沒有** `sync`：本來就是去上游拿、寫進本地的（跟 `sync.recent` 一樣） | `{ invites: [{ room, inviter, is_direct, reason, state, is_from_this_server }] }`：補完之後本地所有待處理的邀請，照房間 id 排。`state` 是縮減狀態原樣（`null` ＝ server 太大沒送、本地也沒有）；🚨 `is_from_this_server` 是 `false` 時房名、頭像、topic 都是對方 server 說的，禁止當成已驗證的事實顯示 | `fetch_invites`。主動補一輪（我們自己加的補窗，維護者 2026-10-14）：wbf 帳號跑一輪 `Invite/Fetch` 到 `r == 0`；一般 Matrix 帳號跑一次 `/sync` 讀 store。補完整份取代本地的邀請（這一輪裡被推播碰過的房以推播為準）、有變的推 `room.membership`；中途斷了回錯、**不**寫任何一列。UI 首次啟動叫一次、看到 `room.membership` 帶 `gap: true` 再叫、收到 `link.state { role: "rooms", state: "opened" }`（斷了重開，/docs/design/rooms/room-sync.md §3.1）再叫、UI 自己的 RPC 連線重連時再叫；daemon **不**自己叫。一般 Matrix 帳號沒有推播，要 UI 自己再叫（/docs/design/rooms/room-actions.md §3.3） |
+| `room.send_text` | `{ room, body, reply_to?, mentions?, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（/docs/design/keys/e2ee-rpc.md §3）。`reply_to` 是被回覆那則的 `event_id`、`mentions` 是 mxid 的陣列：送出的 `m.mentions` 照 /docs/design/messages/message-actions.md §3.2 | `{ event_id }` | `send_text`。加不加密看本地記的（`room.get sync=both` 拿過的房間；只在 `room.list` 上、還沒拿過的是不知道）：wbf 帳號沒拿過這間房、或本地不知道它加不加密 → **1100**，請先拿房間（維護者 2026-10-05：daemon **不**為了送一則字再問 server）。加密房：**只用後台已經分好的房間金鑰**——等這個房的金鑰對 `room_devices.room_version` 就緒（最多 2 秒，等不到回 **1402**、訊息沒送）→ 加密、帶 `room_version` 送（/docs/design/keys/e2ee-rpc.md §3）；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3）；兩種都**不**自動重送 |
+| `room.edit` | `{ room, event_id, body, mentions?, room_devices?, txn_id?, user?, server? }`。`event_id` 是被改的那則；`mentions` 是新版本提到誰，沒帶＝改字不通知任何人；加密、`txn_id` 同 `room.send_text` | `{ event_id }`：**edit 那則自己的** id | `edit_text`（/docs/design/messages/message-actions.md §3.3、§4.2）。目標要在這個帳號的本地、是自己送的、是原始訊息、還在、是 `m.text`；不合就 **1100**、不送（`msg` 寫哪一條）。帶了 `reply_to` 也是 1100 |
+| `room.react` | `{ room, event_id, key, room_devices?, txn_id?, user?, server? }`。`key` 原樣送、空字串 1100；加密同 `room.send_text` | `{ event_id }`：那則反應的 id | `react`（§3.4、§4.3）。只會「加」；本地看得到這個帳號已經按過同一個 `key` 就回那則、不再送（只查本地）。切換是 UI 的事：這個 key 有 `Reaction.mine` 就拿它叫 `room.redact` |
+| `room.redact` | `{ room, event_id, reason?, txn_id?, user?, server? }`。收回訊息、收回自己的表情都是它；**沒有** `room_devices`（redaction 一律明文） | `{ event_id }`：**收回動作本身**那則的 id | `redact`（§3.5、§4.4）。走端點表 `REDACT`：wbf 帳號走橋 `0x14 0x24`、一般 Matrix 帳號 HTTP `PUT …/redact/{event_id}/{txn_id}`。不檢查目標是誰的：server 拒了（權限不夠是 403）回 **1400**，`data` 是 server 的拒絕原樣（§5.3） |
+| `room.refresh_devices` | `{ room, previous?, user?, server? }`。`previous` 是 UI 手上的上一份（`{ room_version, members }`）：帶了只重查裝置版本號變了的人 | `{ room_version, members: { mxid: "序號-雜湊" } }`——**UI 存下來**，送出時整份當 `room_devices` 帶回來。例：`{ "room_version": 9, "members": { "@alice:localhost": "1-810b7c3be4", "@bob:localhost": "4-0a1b2c3d4e" } }`（2026-10-06 拿掉了 `shared`） | `refresh_room_devices`（走 `Keys` 線）：拿成員清單與版本號 → 只重查變了的人 → 雜湊對不上重查一次、還不對就拒（fail closed）→ 交給後台對這一刻的狀態先分好房間金鑰（/docs/design/keys/e2ee-rpc.md §2、§3.1），**不**等它分完。UI 點進房就叫，第一則就不用等。wbf 帳號才有；一般 Matrix 1100 |
+| `room.send_file` | `{ room, path, caption?, cipher?, chunk_size?, name?, mimetype?, sha256?, reply_to?, mentions?, room_devices?, txn_id?, transport?, user?, server? }`。**路徑版**：daemon 自己讀檔、上傳、送事件，一則回應。給有路徑的前端（rpc-cli、Desktop 拖檔）。**加密房（wbf 帳號）必帶 `room_devices`**，同 `room.send_text`；沒帶、`cipher` 跟房間對不上都在上傳之前 1100 | `{ event_id, mxc, attachment_declared, manifest }`。⚠️ `manifest` 含金鑰：前端要存就自己用私有權限存（/docs/design/rpc-specs/wbf-cli-spec.md §5），daemon 不落地 | `send_file`。長工作：推 `progress`。加密房被擋回 1401、金鑰沒準備好回 1402：檔案已經在 server 上，`data` 多帶 `manifest`，改用 `room.send_attachment` 帶它重送、**不**重傳檔案（/docs/design/keys/e2ee-rpc.md §3） |
+| `room.send_attachment` | `{ room, manifest, caption?, reply_to?, mentions?, room_devices?, txn_id?, user?, server? }`。**資料平面版**的最後一步：UI 打 HTTP 傳完（`PUT` 回 manifest）之後，把那份 manifest 原樣帶回來（/docs/design/rpc-specs/data-plane.md §5）。加密房同 `room.send_text` 要 `room_devices` | `{ event_id, mxc, attachment_declared }` | `send_attachment`：核對 manifest 是這個帳號那台 server 的、區塊跟房間對得上；加密房被擋回 1401、金鑰沒準備好回 1402。manifest 沒有 `block`（一般 Matrix 帳號傳統上傳回的那種，/docs/design/rpc-specs/data-plane.md §7.2）走 `send_matrix_attachment`：標準附件、matrix-sdk 送（加密房它自己 Megolm）、`room_devices`／`txn_id` 不用、`attachment_declared` 是 `false`；加密房只收 `kind` 2、明文房只收 `kind` 3，對不上 1100 |
 | `room.history` | `{ room, limit?: 50, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「往回翻：`before` 與 `next`」 |
 | `room.files` | `{ room, limit?: 50, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
 | `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（read-receipts） |
@@ -316,7 +319,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（🚫 
 
 | `sync` | 做什麼 |
 |---|---|
-| `local`（預設） | 只讀本地。🚫 **一般 Matrix 房（沒有 `r_seq`）不答**：那種房「不快取回答、總是詢問」，拿時間戳排是錯的。🚫 錨點不在本地也不答（空頁會被讀成「到頭了」）。兩種都回 `1100` |
+| `local`（預設） | 只讀本地。**一般 Matrix 房（沒有 `r_seq`）不答**：那種房「不快取回答、總是詢問」，拿時間戳排是錯的。錨點不在本地也**不**答（空頁會被讀成「到頭了」）。兩種都回 `1100` |
 | `server` | 問上游、**不寫庫** |
 | `both` | **永遠問上游** → 寫進去（已解密的不被密文蓋掉；沒有的插入，解不開也存）→ 用這一頁的 `event_id` 從本地讀回，**順序照上游** |
 
@@ -325,31 +328,31 @@ daemon 怎麼問上游（backend 照探測，`room.history` 沒有 `transport` �
 | backend | 怎麼從 `event_id` 往回翻 |
 |---|---|
 | wbf-sdk | 本地查那則的 **`g_seq`** → `Event/Recent{ rooms: [這個房], before: g_seq }`（wbfuwunel #51） |
-| matrix-sdk | `/context/{event_id}` 拿 `prev_batch_token` → `/messages` 往回。🚫 **不暫存 token** |
+| matrix-sdk | `/context/{event_id}` 拿 `prev_batch_token` → `/messages` 往回。**不暫存 token** |
 
 - ⚠️ wbf 要的 `g_seq` 只在本地有。錨點本地查不到（例如上一頁是 `sync=server` 拿的，沒寫庫）→ 改走 `/context`，它只要 `event_id`。
-- ⚠️ `both` 暫時**每一頁都問上游**，🚫 不先判本地有沒有洞：本地 `r_seq` 天生不連號（reaction／edit／redaction 併進目標不存列、
+- ⚠️ `both` 暫時**每一頁都問上游**，**不**先判本地有沒有洞：本地 `r_seq` 天生不連號（reaction／edit／redaction 併進目標不存列、
   看不到的事件 server 會跳過、超大事件被跨過），「連號＝沒洞」判不出來。之後有 server 推送再確認。
 - 🚨 `both` 的 `next` 用**上游那一頁**的：最舊那則被 `hidden` 的話，讀回來的最後一則比較新，拿它往回問會一直拿到同一頁。
 - ⚠️ 聯邦開了之後：wbf 那一窗到底 ≠ 房間到頭（更早的在別台 server），那時要走 `/messages`（wbfuwunel 的 /docs/design/room-seq-and-recent.md §2.1）。
 
-🚫 **沒有 `room.watch`**。CLI 的 `watch tail|wait|once` 是「一個命令一個程序」的產物；daemon 常駐，
+**沒有 `room.watch`**。CLI 的 `watch tail|wait|once` 是「一個命令一個程序」的產物；daemon 常駐，
 新訊息走**訂閱＋推播**（§4）。rpc-cli 要模擬 `watch once --timeout` 就是「訂閱、等第一則、退訂」。
 
 ### 3.3.1 房間動作（權威在 /docs/design/rooms/room-actions.md §2）
 
-daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server 回的 body 原樣**；每支的 params、result、本地寫什麼都在那份文件，🚫 在這裡重抄（兩份會漂）。
+daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server 回的 body 原樣**；每支的 params、result、本地寫什麼都在那份文件，**不**在這裡重抄（兩份會漂）。
 每支都帶 `user?`、`server?`（§2）；所以**被動到的那個人叫 `user_id`**（Matrix body 的名字）、公開目錄問哪一台叫 `directory_server`。
 
 | 哪一組 | method | 帶 `sync`（`both` 預設／`server`） |
 |---|---|---|
 | 成員與房間本身 | `room.create`、`room.join`、`room.knock`、`room.leave`、`room.forget`、`room.invite`、`room.kick`、`room.ban`、`room.unban`、`room.upgrade` | ✅ |
-| 本地沒存（讀或寫，🚫 帶 `sync`） | `room.members`、`room.joined_members`、`room.summary`、`room.hierarchy`、`room.mutual_rooms`、`room.public_rooms`、`room.get_visibility`、`room.set_visibility`、`room.resolve_alias`、`room.set_alias`、`room.delete_alias`、`room.aliases` | — |
+| 本地沒存（讀或寫，**不**帶 `sync`） | `room.members`、`room.joined_members`、`room.summary`、`room.hierarchy`、`room.mutual_rooms`、`room.public_rooms`、`room.get_visibility`、`room.set_visibility`、`room.resolve_alias`、`room.set_alias`、`room.delete_alias`、`room.aliases` | — |
 | 房間狀態 | `room.get_state`（—）；`room.set_state`、`room.set_name`、`room.set_topic`、`room.set_avatar`、`room.set_canonical_alias`、`room.set_history_visibility`、`room.set_join_rule`、`room.set_guest_access`、`room.enable_encryption`、`room.set_power_levels`、`room.pin` | ✅（`get_state` 除外）。⚠️ `room.enable_encryption` 的 `server` **只給除錯**：本地還記著明文，`room.send_text` 會送明文（/docs/design/rooms/room-actions.md §3.2） |
 | 標籤與帳號資料 | `room.get_tags`、`room.set_tag`、`room.delete_tag`、`room.get_account_data`、`room.set_account_data`、`account.get_data`、`account.set_data`、`room.set_direct` | — |
 
 - 帶 `sync` 的是會改本地房間列的：`both` 收到 server 的 ACK 才寫；**本地寫不進去照樣回成功**、另推一則 `note`（成功以 server 的 ACK 為準，維護者 2026-10-07）。
-- 讀一項、一份帳號資料（`room.get_state`、`room.get_account_data`、`account.get_data`）沒有是 `result: null`，🚫 錯誤。
+- 讀一項、一份帳號資料（`room.get_state`、`room.get_account_data`、`account.get_data`）沒有是 `result: null`，**不是**錯誤。
 - server 拒了是 `1400`，`data` 是 server 給的 Matrix 錯誤（§5.3）。
 
 ### 3.4 同步
@@ -376,13 +379,13 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 | method | params | result | core |
 |---|---|---|---|
 | `media.info` | `{ mxc, manifest?, transport?, user?, server?, sync? }`。**有 `sync`** | `MediaInfo`。⭐ 媒體**不可變**，所以 `local` 從 `media` 列答得出 `file_size`／`chunk_size`／`content_type`——分塊檔（`kind` 1）都有；傳統格式（`kind` 2、3）沒有 `chunk_size`、`file_size` 要事件給過 `info.size`。`server`／`both` 問的是 wbf 的 `Info`，`both` 只在 server 說是分塊檔（有塊大小）時才寫進 `media` 表。再加上上游答不出來的 `cached: { complete, segments_written, bytes_on_disk }`（`segments_written` 是池主檔的 64 KiB 段數，只給顯示；下載中的進度看 `media.queue`）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**不在** | `media_info`。`both` 順手把 server 說的寫進 `media` 表 |
-| `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id, mxc? }`（從訊息點下載；`mxc` 給了要是那則的附件）、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading`、`verifying`；`kind`、`verified` 是 `media` 列的（沒有列就不在，/docs/design/media/media-download.md §12.3） | `media_download`：分塊檔（`kind` 1）交給這個帳號的下載處理端（/docs/design/media/media-download.md §5），標準 Matrix 附件（`kind` 2、3）走 HTTP（同一份文件 §12，兩種帳號都行）。本地的 `media` 列說了算（/docs/design/media/media-download.md §5.3，維護者 2026-10-07）：只給 `mxc` 照列挑這個帳號看得到、跟列一致的事件的金鑰，沒有列或沒有一致的 1100；`{ room, event_id }` 由那則事件確定列（列不在就照它建）；一般 Matrix 帳號給 `manifest` 1100；描述跟本地那一列不合（不管下載完了沒）1500、🚫 下載，要換先 `media.delete_local` |
+| `media.download` | 剛好一種：`{ mxc }`、`{ room, event_id, mxc? }`（從訊息點下載；`mxc` 給了要是那則的附件）、`{ manifest }`；加 `user?`、`server?` | `{ mxc, state, done, total, kind?, verified? }`。`state`：`complete`、`local_source`（都不排）、`queued`、`downloading`、`verifying`；`kind`、`verified` 是 `media` 列的（沒有列就不在，/docs/design/media/media-download.md §12.3） | `media_download`：分塊檔（`kind` 1）交給這個帳號的下載處理端（/docs/design/media/media-download.md §5），標準 Matrix 附件（`kind` 2、3）走 HTTP（同一份文件 §12，兩種帳號都行）。本地的 `media` 列說了算（/docs/design/media/media-download.md §5.3，維護者 2026-10-07）：只給 `mxc` 照列挑這個帳號看得到、跟列一致的事件的金鑰，沒有列或沒有一致的 1100；`{ room, event_id }` 由那則事件確定列（列不在就照它建）；一般 Matrix 帳號給 `manifest` 1100；描述跟本地那一列不合（不管下載完了沒）1500、**不**下載，要換先 `media.delete_local` |
 | `media.open` | 同 `media.download` | `{ url, mxc, mimetype?, size?, state, kind?, verified? }`（`size` 只在事件沒給 `info.size` 的傳統檔不在：那種檔的 GET 等整檔下載完才給，/docs/design/media/media-download.md §12.2；`kind` 2 而 `verified` 不是 1 時，讀那個 `url` 會是 412、body 照給，/docs/design/rpc-specs/data-plane.md §8.2）。`url` 是資料平面讀的 URL（/docs/design/rpc-specs/data-plane.md §8，不帶帳號、可以重用） | `media_open`；不完整也沒本機原檔就順便排進佇列。daemon 沒開資料平面回 100 |
 | `media.queue` | `{ user?, server? }` | `{ items: [{ mxc, name?, state, done, total }] }`，第一個是正在拉的 | `media_queue`：這個帳號要過的分塊檔，含同 server 別的帳號替它下載的（一個檔只有一個下載，/docs/design/media/media-download.md §5.1）；傳統檔不在這裡 |
-| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：**誰叫都停**（維護者 2026-10-07）——這台 server 上那一個下載停掉，要過它的帳號都收到 `cancelled` 推播。正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉。標準 Matrix 附件🚫 續傳：半成品刪掉，再要從頭下載（/docs/design/media/media-download.md §5.4、§12.4） |
-| `media.delete_local` | `{ mxc, user?, server? }` | `{ mxc, removed: bool, cancelled: bool }`（`removed` false ＝本地本來就沒有） | `del_local_media`：先取消這台 server 上所有帳號正在下載它的（分塊與傳統兩條）、等寫入者放手（最多 5 秒，等不到 1100、🚫 刪），再刪池檔、半成品、seek 暫存檔、`media` 列（/docs/design/media/media-download.md §7.4）。之後只給 `mxc` 下載不了，從訊息點就由那則重建 |
+| `media.cancel` | `{ mxc, user?, server? }` | `{ cancelled: bool }` | `media_cancel`：**誰叫都停**（維護者 2026-10-07）——這台 server 上那一個下載停掉，要過它的帳號都收到 `cancelled` 推播。正在拉的處理完手上那一包就停（檔留著，再排接著拉）；排著的從佇列拿掉。標準 Matrix 附件**不**續傳：半成品刪掉，再要從頭下載（/docs/design/media/media-download.md §5.4、§12.4） |
+| `media.delete_local` | `{ mxc, user?, server? }` | `{ mxc, removed: bool, cancelled: bool }`（`removed` false ＝本地本來就沒有） | `del_local_media`：先取消這台 server 上所有帳號正在下載它的（分塊與傳統兩條）、等寫入者放手（最多 5 秒，等不到 1100、**不**刪），再刪池檔、半成品、seek 暫存檔、`media` 列（/docs/design/media/media-download.md §7.4）。之後只給 `mxc` 下載不了，從訊息點就由那則重建 |
 | `media.create` | `{ room?, name, size?, mimetype?, cipher?, chunk_size?, source_uri?, user?, server? }`（`source_uri` 是原檔的 URI，讀的時候優先讀它，/docs/design/rpc-specs/data-plane.md §8.1） | `{ upload_id?, mxc, url, headers }`。`url` 是資料平面的 PUT URL（共享 token 加密的「用途 ‖ mxc」），`headers` 是 PUT 時要照抄的（`Wbf-Upload-Meta`：加密的上傳狀態）（/docs/design/rpc-specs/data-plane.md §4）。`upload_id` 只有 wbf 帳號有 | `create_media_upload`：wbf 帳號建分塊上傳（`create_upload`，有 `room` 就照房間決定加不加密）；一般 Matrix 帳號建傳統上傳（`create_matrix_upload`，/docs/design/rpc-specs/data-plane.md §7.2：要 `size`、超過 `m.upload.size` 1100、`cipher` 只認 `none`、沒給 `room` 是明文）；daemon 沒開資料平面回 100 |
-| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`；已經存在就覆蓋，要不要覆蓋是 UI 先問）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", kind, verified, hash? }` | `export_media_to`：沒有就排、等它完成才寫到 `to`；從池匯出🚫 再算 hash，傳統加密的檔沒驗過或驗不過照匯、回 1501（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
+| `media.export_to` | 同 `media.download` 的三種說法，加 `to`（URI，現在只收 `file://`；已經存在就覆蓋，要不要覆蓋是 UI 先問）、`no_cache?: bool` | `{ to, bytes, source: "local_source"\|"cache"\|"server", kind, verified, hash? }` | `export_media_to`：沒有就排、等它完成才寫到 `to`；從池匯出**不**再算 hash，傳統加密的檔沒驗過或驗不過照匯、回 1501（/docs/design/media/media-download.md §7.3）。`no_cache`：這次下載的匯出完就從池拿掉。長工作。**明文落地是使用者要的**（/docs/design/rpc-specs/local-interface.md §8） |
 | `media.stats` | `{ user?, server? }` | `MediaStats` | `media_stats` |
 | `media.gc` | `{ quota_mib?: 2048, protect_days?: 7, user?, server? }` | `MediaGcReport` | `collect_media_garbage` |
 
@@ -405,7 +408,7 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 
 | method | params | result | core |
 |---|---|---|---|
-| `server.ping` | `{ transport?, user?, server? }` | `ServerHello` | `ping(transport, target)`：送 `Ping`，回開線那次 `Hello` 的答案（🚫 再 hello，/docs/design/daemon/link-requests.md §7） |
+| `server.ping` | `{ transport?, user?, server? }` | `ServerHello` | `ping(transport, target)`：送 `Ping`，回開線那次 `Hello` 的答案（**不**再 hello，/docs/design/daemon/link-requests.md §7） |
 
 ### 3.9 訂閱、取消
 
@@ -424,25 +427,25 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 
 | method | params | 什麼時候 |
 |---|---|---|
-| `progress` | `{ id?: number, done: number, total?: number, note: string }`。`id` 是**哪個請求**的進度，不在任何請求裡就沒有這個欄位（同 `note`） | 長工作跑的時候。`total` 不知道就不帶（串流）。`note` 給人看，🚫 不做邏輯 |
+| `progress` | `{ id?: number, done: number, total?: number, note: string }`。`id` 是**哪個請求**的進度，不在任何請求裡就沒有這個欄位（同 `note`） | 長工作跑的時候。`total` 不知道就不帶（串流）。`note` 給人看，UI 禁止拿它做邏輯 |
 | `room.message` | `{ user, room, message: Message }`（/docs/design/rooms/chat-model.md §2.2，含 `decrypted`／`undecryptable_reason`） | 這個帳號收到一則新訊息（sync 或 `Event/Push` 進來、解完密、寫進快取**之後**）。金鑰晚到、之後補解開的舊訊息也再發一次（**同一個 `event_id`**，UI 當更新，/docs/design/keys/e2ee-rpc.md §6）；`sync.recent` 拉到的不發（UI 拉完自己讀） |
 | `sync.state` | `{ user, state: "connected"\|"disconnected"\|"catching_up"\|"caught_up", cg_seq? }` | 跟 server 的連線狀態變了。還沒有人發（§10）；線的開關看 `link.state` |
 | `vault.state` | `{ unlocked: bool }` | 另一條連線解鎖了——多條連線各自平等（/docs/design/rpc-specs/local-interface.md §7），所以要互相通知。還沒做 |
-| `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。🚫 daemon 不重播（沒留著），但🚫 也不假裝沒事。⚠️ **這是連線層的訊號**：它只保證「這條連線漏了某些事件」，🚫 不保證漏掉的裡面有它訂的那些（daemon 不替每條訂閱各記一份 lag）；寧可多報一次重讀，🚫 不假裝沒漏。什麼都沒訂的連線不收它 |
-| `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（🚫 不是 `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。🚫 不做邏輯 |
-| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }` | 這個帳號對 homeserver 的某一條線開了或關了（/docs/design/daemon/link-pool.md §4）。五條線由 daemon 在 `vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（/docs/design/daemon/link-pool.md §3.1）。⚠️ 「關了」不是即時的：線死後大約一分鐘內才被看到。🔴 `rooms` 的 `opened`（第一次開與重開都發）在兩個訂閱都 Ack 之後才發：UI 收到就當成剛起來，再叫一次 `sync.recent` ＋ `room.invites`（斷線那段的推播都丟了，server 🚫 留；/docs/design/rooms/room-sync.md §3.1）。UI 自己的 RPC 連線重連時也一樣叫一次（`link.state` 🚫 重播，斷著那段的 `opened` 收不到）。daemon 🚫 自己叫、🚫 分「第一次」「重開」兩種 |
+| `desync` | `{ missed: number, user? }` | 🚨 **這條連線漏掉了推播**（它讀得太慢、事件被覆蓋掉）。收到就**重讀**（房間列表、開著那間的最新一頁、未讀數）——全都是本地讀，很便宜。daemon **不**重播（沒留著），但也**不**假裝沒事。⚠️ **這是連線層的訊號**：它只保證「這條連線漏了某些事件」，**不**保證漏掉的裡面有它訂的那些（daemon 不替每條訂閱各記一份 lag）；寧可多報一次重讀，**不**假裝沒漏。什麼都沒訂的連線不收它 |
+| `note` | `{ id?: number, note: string }`。`id` 是哪個請求發的（core 的 `CoreEvent::Note`）；**不在任何請求裡就沒有這個欄位**（**不是** `null`，`progress` 同） | 一句給人看的話；跟 `progress` 一樣，發那個請求的連線不用訂也收得到。UI 禁止拿它做邏輯 |
+| `link.state` | `{ user, role: "misc"\|"upload"\|"download"\|"rooms"\|"keys", state: "opened"\|"closed", reason? }` | 這個帳號對 homeserver 的某一條線開了或關了（/docs/design/daemon/link-pool.md §4）。五條線由 daemon 在 `vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（/docs/design/daemon/link-pool.md §3.1）。⚠️ 「關了」不是即時的：線死後大約一分鐘內才被看到。🔴 `rooms` 的 `opened`（第一次開與重開都發）在兩個訂閱都 Ack 之後才發：UI 收到就當成剛起來，再叫一次 `sync.recent` ＋ `room.invites`（斷線那段的推播都丟了，server **不**留；/docs/design/rooms/room-sync.md §3.1）。UI 自己的 RPC 連線重連時也一樣叫一次（`link.state` **不**重播，斷著那段的 `opened` 收不到）。daemon **不**自己叫、**不**分「第一次」「重開」兩種 |
 | `room.membership` | `{ user, room, membership, invite?, gap }`（/docs/design/rooms/room-actions.md §3.3.4）；`invite` 只在 `membership` 是 `invite` 時帶，形狀同 `room.invites` 的一間去掉 `room` | 這個帳號在一間房的身分因為邀請而變了：`Rooms` 線上 server 推來的 `Invite/Push`／`Gone` 每則一個（`gap` 原樣：`true` ＝ 這條流在這之前掉過推播，該叫 `room.invites` 補一輪了），`room.invites` 補完有變的列也各一個（`gap: false`）。寫進本地之後才發 |
-| `devices.changed` | `{ user, changed_user, device_version, rooms: { room: room_version }, gap }`（/docs/design/keys/e2ee-rpc.md §4） | `Rooms` 線上 server 推來「某人的裝置變了」，原樣轉。daemon 自己🚫 不動作；要不要對開著的房 `room.refresh_devices` 是 UI 的事（`gap: true` ＝ 前面有推送被丟，開著的房都 refresh 一次） |
+| `devices.changed` | `{ user, changed_user, device_version, rooms: { room: room_version }, gap }`（/docs/design/keys/e2ee-rpc.md §4） | `Rooms` 線上 server 推來「某人的裝置變了」，原樣轉。daemon 自己**不**動作；要不要對開著的房 `room.refresh_devices` 是 UI 的事（`gap: true` ＝ 前面有推送被丟，開著的房都 refresh 一次） |
 | `media.download` | `{ user, mxc, state: "queued"\|"downloading"\|"verifying"\|"complete"\|"cancelled"\|"failed", done, total, verified?, reason? }`（/docs/design/media/media-download.md §5.5、§12.3；`complete` 一律帶 `verified`：0 沒驗、1 正確、2 不正確） | 一個下載 job 的狀態改變時一則、拉的途中每個 job 最多每秒一則。**要過這個檔的每個帳號各一則**（`user` 是收件的那個；同 server 的 A、B 都要 X 時只有一個下載，兩個都收到，維護者 2026-10-07）。`done`／`total` 是塊數（`total` 還不知道是 0）；`reason` 只在 `failed` 帶（給人看） |
 | `keys.state` | `{ user, state: "caught_up"\|"stopped", imported?, room_keys?, reason? }`（/docs/design/keys/key-sync.md §2） | 這個帳號的金鑰訂閱：`caught_up`＝一批 to-device 匯完、銷毀完（`imported` 則、`room_keys` 把新房間金鑰——UI 拿它決定要不要重解密文）；`stopped`＝這條訂閱結束了（被同一裝置後來的連線接手、線死了）：金鑰那條線跟著關，daemon 的看線迴圈下一輪（最多 15 秒）重開、重訂，重訂完會再來一則 `caught_up`。維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」 |
-| `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，🚫 沒有 meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
+| `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，**沒有** meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
 - 推播**要先 `subscribe`**（/docs/design/rpc-specs/local-interface.md §6）。`progress`／`note` 例外：**發出長工作的那條連線自動收到自己請求的**，不必訂——不然每個前端都要多寫一步。
-- 推播是「不用輪詢」，🚫 不是「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
+- 推播是「不用輪詢」，**不是**「保證看得到全部」：慢的訂閱者會掉事件（`wbf-core::event::EVENT_QUEUE`），掉了就重查狀態。
   🚨 **但掉了一定要發 `desync`**：不講的話 UI 永遠不會去重查（它以為自己收齊了）。
-- 🚨 **媒體的 bytes 🚫 走這裡**（維護者 2026-09-13）：UI 的上傳與播放是**資料平面的 HTTP**（§6），進度就是那個 HTTP 傳輸自己的進度。
-  **背景下載**（2026-10-01）沒有 HTTP 可看，進度走推播 `media.download`：每個檔最多每秒一則＋狀態改變，🚫 每塊一則。
-  ⭐ 所以 RPC 通道上🚫 沒有 bytes、🚫 沒有每塊一則的進度，它基本上永遠是暢通的。
+- 🚨 **媒體的 bytes 不走這裡**（維護者 2026-09-13）：UI 的上傳與播放是**資料平面的 HTTP**（§6），進度就是那個 HTTP 傳輸自己的進度。
+  **背景下載**（2026-10-01）沒有 HTTP 可看，進度走推播 `media.download`：每個檔最多每秒一則＋狀態改變，**不是**每塊一則。
+  ⭐ 所以 RPC 通道上**沒有** bytes、**沒有**每塊一則的進度，它基本上永遠是暢通的。
   📎 `progress` 只給**daemon 自己在跑的長工作**：路徑版的 `room.send_file`／`upload.file`、`sync.recent`、`backup.*`——都是低頻的。
 
 ## 5. code 表（定了就不改）
@@ -459,10 +462,10 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 | 101 | `unknown_method` | 沒這個 method |
 | 102 | `invalid_params` | 缺必填、型別不對、base64 解不開、路徑不是絕對路徑 |
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
-| 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。🚫 不排隊，讓前端決定 |
+| 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。**不**排隊，讓前端決定 |
 | 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
-| 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。🚫 不是前端的錯，所以🚫 不關連線 |
-| 109 | `no_write_access` | 這個 daemon **沒有寫這個資料目錄的權**：別人握著排他鎖（/docs/design/overview/architecture-v2.md §0.2）。⚠️ 跟 `1001`（vault 鎖著）不是同一件事 —— 那是「還沒解鎖」，這是「這個目錄現在是別人的」。前端該做的是去連**那一個** daemon，🚫 不是重試 |
+| 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。**不是**前端的錯，所以**不**關連線 |
+| 109 | `no_write_access` | 這個 daemon **沒有寫這個資料目錄的權**：別人握著排他鎖（/docs/design/overview/architecture-v2.md §0.2）。⚠️ 跟 `1001`（vault 鎖著）不是同一件事 —— 那是「還沒解鎖」，這是「這個目錄現在是別人的」。前端該做的是去連**那一個** daemon，**不是**重試 |
 
 ### 5.2 core 層 ＝ `CoreErrorKind` 的號碼
 
@@ -490,35 +493,35 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 | 1501 | `unverified` | 3 |
 | 1600 | `timeout` | 5 |
 
-- `account_busy`（1013）：另一個 `account.add`／`account.del`／`account.destroy` 正握著 `<data dir>/account.lock`（`crates/wbf-core/src/account_lock.rs`），或這個帳號正在登出（/docs/design/daemon/account-session.md §4）。🚫 daemon 不排隊，前端決定要不要稍後再試。
-- `server_pending_removal`（1014）：`account.add` 的那台 server 目錄帶著 `to_be_deleted.lock`（destroy 最後一個帳號時放的，刪完整個目錄才會消失）。它還在就代表上次刪到一半停了；🚫 core 不自己收拾，`msg` 說出要手動刪的目錄（維護者 2026-09-15）。
-- 號碼**留了縫**（1006–1009、1015–1019……）：同一族拆新 variant 就填進去，🚫 不重排。
-- `usage`（1100）是過渡桶子（`error.rs` 自己標的）：每次前端需要分辨就拆一個新號碼出去，🚫 讓前端 parse `msg`。
+- `account_busy`（1013）：另一個 `account.add`／`account.del`／`account.destroy` 正握著 `<data dir>/account.lock`（`crates/wbf-core/src/account_lock.rs`），或這個帳號正在登出（/docs/design/daemon/account-session.md §4）。daemon **不**排隊，前端決定要不要稍後再試。
+- `server_pending_removal`（1014）：`account.add` 的那台 server 目錄帶著 `to_be_deleted.lock`（destroy 最後一個帳號時放的，刪完整個目錄才會消失）。它還在就代表上次刪到一半停了；core **不**自己收拾，`msg` 說出要手動刪的目錄（維護者 2026-09-15）。
+- 號碼**留了縫**（1006–1009、1015–1019……）：同一族拆新 variant 就填進去，禁止重排。
+- `usage`（1100）是過渡桶子（`error.rs` 自己標的）：每次前端需要分辨就拆一個新號碼出去，**不**讓前端 parse `msg`。
 - `msg` 就是 `CoreError.message`，給人看。**`kind` 的名字不另外放進回應**——`code` 就是它，一個欄位夠了（/docs/design/rpc-specs/local-interface.md §6）。
 - RPC 層錯誤（1xx）的 exit code 一律 **1**（用法錯），除了 `105` 是 **130**（跟 Ctrl-C 一樣的慣例）。
 - 協議層（9xxx）的 exit code：`9001` token 錯 → **1**；其餘 → **4**（網路：連線建不起來）。
 - `room_devices_changed`（1401）：加密訊息被 server 擋（server 的 1506 `RoomDevicesChanged`：帶的房間版本號過期）。訊息**沒送**；daemon 已經自動重拿房間狀態、交給後台對新的狀態分金鑰（/docs/design/keys/e2ee-rpc.md §3.1），新的狀態在 `data`（§5.3）。用同一個 `txn_id` 帶 `data` 重送就過（送出時會等金鑰就緒，等不到回 1402）。
 - `room_key_not_ready`（1402）：加密房的房間金鑰在等待時間（2 秒）內沒準備好（例：`Keys` 線不通、這個房第一次送又剛好很慢）。訊息**沒加密、沒送**；後台照樣繼續分，用同一個 `txn_id` 重送就好（`data` 帶這則的 `txn_id`，§5.3；維護者 2026-10-06：送訊息只用已經分好的金鑰，/docs/design/keys/e2ee-rpc.md §3）。exit code 跟逾時同一級（5）。
 - `unverified`（1501）：**事情做了、資料照給，但它沒驗過或驗不過**（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2；跟 GET 的 412 是同一件事）。
-  現在只有 `media.export_to` 匯出傳統加密的檔（`kind` 2）而 `verified` 是 0 或 2 時回：檔**已經寫到 `to`**，`data` 是成功時會給的那份結果（§5.3），要不要留由 UI 決定、跟使用者講。不是「沒做」，所以🚫 重試。
+  現在只有 `media.export_to` 匯出傳統加密的檔（`kind` 2）而 `verified` 是 0 或 2 時回：檔**已經寫到 `to`**，`data` 是成功時會給的那份結果（§5.3），要不要留由 UI 決定、跟使用者講。不是「沒做」，所以禁止重試。
 
 ### 5.3 錯誤回應的 `data`
 
-少數錯誤會順手帶東西回來，放在回應的 `data`（`result` 照樣是 `null`）；**沒有就不在**（🚫 不送 `null`），成功回應永遠沒有。
+少數錯誤會順手帶東西回來，放在回應的 `data`（`result` 照樣是 `null`）；**沒有就不在**（**不**送 `null`），成功回應永遠沒有。
 
 | code | `data` |
 |---|---|
 | 1401 `room_devices_changed` | 重拿成功：`{ room_version: u64, members: { mxid: "序號-雜湊" }, txn_id: string }`——前兩個就是新的 `room_devices`（UI 存下、重送時帶回來），`txn_id` 是這則用的（UI 沒給的話是 daemon 產的，重送用同一個）。重拿也失敗：`{ txn_id: string, current_room_version: u64 或 null }`（server 沒給號碼時是 null），UI 自己叫 `room.refresh_devices` |
 | 1402 `room_key_not_ready` | `{ txn_id: string }`：這則用的（UI 沒給的話是 daemon 產的），重送用同一個。例：`{ "txn_id": "wbf-1791265069-3" }` |
-| 1401／1402 由 `room.send_file` 回的 | 上面那份再加 `manifest`（含金鑰，跟成功時的回應一樣敏感）：檔案已經在 server 上，用它走 `room.send_attachment` 重送、🚫 重傳（/docs/design/keys/e2ee-rpc.md §3） |
-| 1400 `server`（房間動作，§3.3.1） | server 的拒絕原樣：`{ status, errcode, code?, code_id?, message? }`（走橋的是 wbf `Error` 的 meta，走 HTTP 的只有 `status`、`errcode`）。UI 拿 `status`／`errcode` 判斷、🚫 parse `msg`。例（本機 wbfuwunel 實跑，bob 權限不夠改名）：`` { "code": "Forbidden", "code_id": 1302, "errcode": "M_FORBIDDEN", "message": "Auth check failed: sender does not have enough power (Int(0)) for `m.room.name` event type (50)", "status": 403 } `` |
+| 1401／1402 由 `room.send_file` 回的 | 上面那份再加 `manifest`（含金鑰，跟成功時的回應一樣敏感）：檔案已經在 server 上，用它走 `room.send_attachment` 重送、**不**重傳（/docs/design/keys/e2ee-rpc.md §3） |
+| 1400 `server`（房間動作，§3.3.1） | server 的拒絕原樣：`{ status, errcode, code?, code_id?, message? }`（走橋的是 wbf `Error` 的 meta，走 HTTP 的只有 `status`、`errcode`）。UI 拿 `status`／`errcode` 判斷、禁止 parse `msg`。例（本機 wbfuwunel 實跑，bob 權限不夠改名）：`` { "code": "Forbidden", "code_id": 1302, "errcode": "M_FORBIDDEN", "message": "Auth check failed: sender does not have enough power (Int(0)) for `m.room.name` event type (50)", "status": 403 } `` |
 | 1501 `unverified` | 這個方法成功時的 `result`，一字不差。`media.export_to`：`{ to, bytes, source, kind, verified }`，例：`{ "to": "file:///tmp/a.mp4", "bytes": 52428800, "source": "cache", "kind": 2, "verified": 2 }`（示意） |
 
 ## 6. 資料平面（HTTP，`http://127.0.0.1:<data port>`）
 
 權威是 /docs/design/rpc-specs/data-plane.md：路徑、用共享 token 加密的 URL、狀態碼、上傳的兩步、續傳、附件宣告、一般 Matrix 的傳統上傳、`GET /media` 的 Range。
 🚨 **媒體本身的 bytes 只走那裡**（維護者 2026-09-30 再確認）：上傳是 UI HTTP `PUT` 給 daemon、下載是 `GET`；
-RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachment` 送事件、`media.open` 拿讀的 URL），🚫 不傳 bytes。
+RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachment` 送事件、`media.open` 拿讀的 URL），**不**傳 bytes。
 播放中的進度就是那個 GET 收到多少 bytes；背景下載的進度是推播 `media.download`（§4）。
 
 ## 7. 一次完整的例子：Desktop 送一個 2 GB 的影片進 E2EE 房
@@ -537,7 +540,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 ```
 
 兩步都由 UI 發動，順序固定（server 只認傳完的媒體，/docs/design/rpc-specs/data-plane.md §0）。PUT 失敗就沒有訊息；
-`room.send_attachment` 被 1401 擋，帶新的 `room_devices`、同一份 manifest 重送；回 1402 就用同一份 manifest 與 `txn_id` 重送。兩種都🚫 必重傳檔案。
+`room.send_attachment` 被 1401 擋，帶新的 `room_devices`、同一份 manifest 重送；回 1402 就用同一份 manifest 與 `txn_id` 重送。兩種都**不必**重傳檔案。
 
 ## 8. 跟 core 的差距
 
@@ -545,12 +548,12 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 
 ## 9. 明確不做的
 
-- 🚫 沒有批次請求（JSON-RPC 的陣列形式）：一條連線本來就能並行。
-- 🚫 沒有「哪個前端是主」：/docs/design/rpc-specs/local-interface.md §7。
-- 🚫 沒有壓縮：frame 上限 1 MiB，大的走資料平面。
-- 🚫 沒有 WS text frame、🚫 pack 裡沒有長度欄位、🚫 `type` 不表示種類：一包一則、長度由 WS 給、種類在 JSON 裡（§1）。
-- 🚫 daemon 不問終端、不彈視窗、不讀 passphrase 檔：全部從 RPC 進來（/docs/design/rpc-specs/local-interface.md §5）。
-- 🚫 `msg` 不當邏輯用、🚫 `code` 不重排、🚫 `method` 不改名——改名等於新 method 加舊的廢棄，廢棄的回 `101` 前先活一個版本。
+- **沒有**批次請求（JSON-RPC 的陣列形式）：一條連線本來就能並行。
+- **沒有**「哪個前端是主」：/docs/design/rpc-specs/local-interface.md §7。
+- **沒有**壓縮：frame 上限 1 MiB，大的走資料平面。
+- **沒有** WS text frame、pack 裡**沒有**長度欄位、`type` **不**表示種類：一包一則、長度由 WS 給、種類在 JSON 裡（§1）。
+- daemon **不**問終端、不彈視窗、不讀 passphrase 檔：全部從 RPC 進來（/docs/design/rpc-specs/local-interface.md §5）。
+- `msg` **不**當邏輯用、`code` **不**重排、`method` **不**改名——改名等於新 method 加舊的廢棄，廢棄的回 `101` 前先活一個版本。
 
 ## 10. 每個 method 的實作現況（判準見檔頭）
 
@@ -576,7 +579,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋，列表 `JoinedRooms`、單一房間 `GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（/docs/design/daemon/account-session.md §6） |
 | 房間動作（§3.3.1） | ✅ `room_actions`（/docs/design/rooms/room-actions.md） | 一張端點表兩條路（`wbf_sdk::matrix_endpoint`）：wbf 帳號 **WS** 的橋（Room `0x20`–`0x37`、Event `0x21`–`0x23`、Account `0x25`–`0x2B`）；一般 Matrix 帳號照同一個 **HTTP** 端點送 | ✅ wbf（真 server 驗過）／✅ 一般 server（sdk 層對真 server 驗過 HTTP 與橋回的一樣；daemon 對本機 server 走不到 HTTP 那條） |
 | `room.invites`、`room.membership` 推播 | ✅ `fetch_invites`／`CoreEvent::Membership`（`invites.rs`） | wbf 帳號：**WS** `Invite`（kind `0x05`），訂閱在 `Rooms` 線、一輪 `Fetch` 在 `Misc` 線；一般 Matrix：matrix-sdk `/sync` 的 `rooms.invite`（沒有推播） | ✅ wbf（真 server 驗過）／🔁 一般 server（只有編得過、沒對真 server 跑） |
-| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房只用後台分好的房間金鑰、加密、帶 `room_version`，/docs/design/keys/e2ee-rpc.md §3、§3.1）；一般 Matrix：`Room::send` | ✅ wbf（含加密，真 server 驗過）／🔁 一般 server |
+| `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房只用後台分好的房間金鑰、加密、帶 `room_version`，/docs/design/keys/e2ee-rpc.md §3、§3.1）；一般 Matrix：`Room::send_raw` | ✅ wbf（含加密，真 server 驗過）／🔁 一般 server |
 | `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** `Keys` 線的橋 `Members`＋`/keys/query`；建通道（`/keys/claim`）與 `sendToDevice` 不在這個命令裡，是後台在同一條線上做（/docs/design/keys/e2ee-rpc.md §3.1） | ✅（真 server 驗過） |
 | `devices.changed` 推播 | ✅ `CoreEvent::DeviceChanged` | **WS** `Event/DeviceChanged`（`Rooms` 線宣告 `org.wbftw.device_versions`） | ✅ |
 | `keys.state` 推播 | ✅ `CoreEvent::Keys`（/docs/design/keys/key-sync.md §2） | **WS** `Keys` 線的 `Device/*` | ✅ |
@@ -585,7 +588,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `room.history`／`room.files`（`sync: server\|both`） | ✅ | **WS** `Event/Recent{rooms}`（wbf server）；matrix-sdk `/context`＋`/messages`（一般 server）。wbf 帳號錨點不在本地 → 1100（還沒做：改用 wbfuwunel #64 的 `before_event_id`，/docs/design/daemon/account-session.md §6） | ✅ wbf／🔁 一般 server |
 | `room.history`／`room.files`（`sync: local`） | ✅ | 本機 `cache.db`（一般 Matrix 房不答） | ✅ |
 | `sync.recent` | ✅ | **WS** `Event/Recent`＋`Batch` | ✅ |
-| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（/docs/design/rooms/room-sync.md）；一般 Matrix matrix-sdk `/sync` | ✅ wbf：訂閱線由 daemon 自己開、看著、重開（/docs/design/daemon/link-pool.md §3.1），🚫 沒有開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
+| `room.message` 推播 | ✅（`CoreEvent::Message`：core 的 `room_sync`（wbf 帳號）與 `watch`（一般 Matrix）都發） | **WS** `Event/Subscribe`／`Push`（/docs/design/rooms/room-sync.md）；一般 Matrix matrix-sdk `/sync` | ✅ wbf：訂閱線由 daemon 自己開、看著、重開（/docs/design/daemon/link-pool.md §3.1），**沒有**開／關訂閱線的 RPC——UI 要收就 `subscribe` `room.message`；補窗是 UI 叫 `sync.recent` |
 | `upload.file`／`status`／`abort` | ✅ | **WS**（`transport: "http"` 是 fallback） | ✅ |
 | `media.info` | ✅ | **WS** `Info` | ✅ |
 | `media.download`／`open`／`queue`／`cancel`／`delete_local`、`media.export_to`、`GET`／`HEAD /media`、`media.download` 推播 | ✅ `media_ops`／`download_queue`／`media_stream`（/docs/design/media/media-download.md） | 分塊檔：**WS** `Download` 線的 `Info`／`Read`＋媒體池＋seek 暫存檔。標準 Matrix 附件：**HTTP** `/_matrix/client/v1/media/download`＋同一個池（`matrix_download`，/docs/design/media/media-download.md §12），兩種帳號都是 | ✅ wbf（真 server 驗過）／標準附件 ✅（wbf 帳號真 server 驗過；一般 Matrix 帳號假 server） |

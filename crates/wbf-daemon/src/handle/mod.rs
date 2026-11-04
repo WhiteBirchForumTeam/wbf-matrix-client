@@ -2,7 +2,7 @@
 //!
 //! 它是 /docs/design/rpc-specs/local-interface.md §9 閘門鏈裡「RPC 轉換 ⇔ daemon handle」那一格：把 JSON 的 `params`
 //! 反序列化成 core 的型別、叫一個 core 方法、把回傳序列化回去。**命令列的 arg 之後也走這裡**
-//! （/docs/design/overview/architecture-v2.md §0.2：arg → RPC 訊息 → 同一個 `call`），🚫 不留第二套分派。
+//! （/docs/design/overview/architecture-v2.md §0.2：arg → RPC 訊息 → 同一個 `call`），**不**留第二套分派。
 //!
 //! | 子模組 | method |
 //! |---|---|
@@ -60,7 +60,7 @@ pub const KEEP_LINKS_MAX_INTERVAL: std::time::Duration = std::time::Duration::fr
 ///
 /// 🚨 **判準是反過來寫的**：不是「列出會寫的」，而是「列出確定不寫的」，其餘落到**要寫權**那一邊
 /// （A5 的 fail closed）。⭐ 這樣新加一個 method 而忘了想它的人，得到的是「被要求拿鎖」，
-/// 🚫 不是「靜靜地寫進別人的資料庫」。
+/// **不是**「靜靜地寫進別人的資料庫」。
 ///
 /// 📎 名單很短是刻意的：`vault.*`／`account.*`／`room.*` 這些**看起來像唯讀的也會寫** ——
 /// `account.list` 要開 vault 解目錄名、`room.list` 會讓 matrix-sdk 的 store 寫東西。
@@ -79,14 +79,14 @@ fn is_read_only(method: &str) -> bool {
 ///     params: 已經正規化成物件的 params
 /// Return:
 ///     Some(SyncMode)  這個 method 有 `sync`；值是**這次實際會用的**（沒帶就是預設）
-///     None            這個 method 沒有 `sync`（回應就🚫 不帶那個欄位），或帶的值認不得
+///     None            這個 method 沒有 `sync`（回應就**不**帶那個欄位），或帶的值認不得
 ///
-/// ⚠️ 值認不得時回 `None`：那次請求會被 handler 用 `102` 擋下來，而回應🚫 不該宣稱
+/// ⚠️ 值認不得時回 `None`：那次請求會被 handler 用 `102` 擋下來，而回應**不**該宣稱
 /// 「我用了某一種」—— 它一種都沒用。
 /// ⚠️ 寫本地的房間動作（/docs/design/rpc-specs/rpc-spec.md §3.3.1 帶 `sync` 的那些）用的是 `WriteSync`：沒帶是 `both`、`local` 認不得，
-/// 所以🚫 照讀的那套（預設 `local`）解，那會回報 handler 沒用的那一種。
+/// 所以**不**照讀的那套（預設 `local`）解，那會回報 handler 沒用的那一種。
 /// 📎 名單跟 handler 各自解析同一個欄位，看起來像重複；但 handler 要的是**型別化的參數**，
-/// 這裡要的是**回應要不要帶**。⭐ 兩者都少不了，而漏掉這裡只會少一個資訊欄位，🚫 不會做錯事。
+/// 這裡要的是**回應要不要帶**。⭐ 兩者都少不了，而漏掉這裡只會少一個資訊欄位，**不**會做錯事。
 fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
     const WITH_SYNC: &[&str] = &[
         "room.list",
@@ -119,7 +119,7 @@ fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
         "room.pin",
     ];
     if WITH_WRITE_SYNC.contains(&method) {
-        // `null` 在這幾支是 102（`#[serde(default)]` 只管「沒給」），所以跟認不得的值一樣🚫 回報。
+        // `null` 在這幾支是 102（`#[serde(default)]` 只管「沒給」），所以跟認不得的值一樣**不**回報。
         let write_sync = match params.get("sync") {
             None => Some(wbf_core::WriteSync::default()),
             Some(value) => serde_json::from_value(value.clone()).ok(),
@@ -229,7 +229,7 @@ impl Handle {
             .filter(|port| *port != 0)
     }
 
-    /// 設資料平面的鑰（`main.rs` 讀完 token 之後）。只設得了一次：第二次被忽略，🚫 不換鑰（發出去的 URL 會全部失效）。
+    /// 設資料平面的鑰（`main.rs` 讀完 token 之後）。只設得了一次：第二次被忽略，**不**換鑰（發出去的 URL 會全部失效）。
     pub fn set_access_keys(&self, keys: AccessKeys) {
         let _ = self.access_keys.set(keys);
     }
@@ -307,7 +307,7 @@ impl Handle {
         })
     }
 
-    /// 一個請求進、一個回應出。🚫 這裡不印任何東西。
+    /// 一個請求進、一個回應出。這裡**不**印任何東西。
     pub async fn call(&self, request: Request) -> Response {
         let id = request.id;
         if self.is_shutting_down() {
@@ -319,7 +319,7 @@ impl Handle {
         }
         // 🚨 **要寫就要先有寫的能力**（/docs/design/overview/architecture-v2.md §0.2）。這是全 daemon 唯一檢查它的地方。
         // `-s` 在啟動時就拿到了，所以這裡是一個 atomic 讀；單發命令則是**第一個要寫的命令**
-        // 觸發去拿鎖。拿不到就回「我沒有寫的權限」，🚫 不重試、🚫 不降級成唯讀跑一半。
+        // 觸發去拿鎖。拿不到就回「我沒有寫的權限」，**不**重試、**不**降級成唯讀跑一半。
         if !is_read_only(&request.method) {
             if let Err(error) = self.grant_write_access() {
                 return Response::error(id, code::NO_WRITE_ACCESS, error.to_string());
@@ -331,7 +331,7 @@ impl Handle {
         }
         let params = params_or_empty_object(&request.params);
         // 這個 method 認得 `sync` 的話，回應要說出**這次實際用的是哪一種**（/docs/design/rpc-specs/rpc-spec.md §2）——
-        // ⭐ 包括「沒帶所以是預設」那種情況，這樣前端🚫 不必去記規格。
+        // ⭐ 包括「沒帶所以是預設」那種情況，這樣前端**不必**去記規格。
         let sync = sync_of_request(&request.method, &params);
         let outcome = self.dispatch(&core, &request.method, params).await;
         let response = match outcome {
@@ -345,7 +345,7 @@ impl Handle {
         }
     }
 
-    /// 擋下來的時候是「還沒有 vault」還是「有但鎖著」？兩者的下一步完全不同，所以🚫 不共用一個
+    /// 擋下來的時候是「還沒有 vault」還是「有但鎖著」？兩者的下一步完全不同，所以**不**共用一個
     /// `1001`：沒有 `local.key` 回 `1002` 並指向 `vault.create`（fresh 資料目錄的起手式，
     /// /docs/design/rpc-specs/rpc-spec.md §3.1），有但鎖著才是 `1001`（去 `vault.unlock`）。
     /// 📎 讀不到 `local.key` 的狀態（IO 壞了）也當成鎖著：不確定就拒絕。
@@ -399,6 +399,10 @@ impl Handle {
             "room.get" => Box::pin(rooms::room_get(self, core, params)),
             "room.invites" => Box::pin(rooms::room_invites(self, core, params)),
             "room.send_text" => Box::pin(rooms::room_send_text(self, core, params)),
+            // 訊息動作（/docs/design/messages/message-actions.md §2）
+            "room.edit" => Box::pin(rooms::room_edit(self, core, params)),
+            "room.react" => Box::pin(rooms::room_react(self, core, params)),
+            "room.redact" => Box::pin(rooms::room_redact(self, core, params)),
             "room.refresh_devices" => Box::pin(rooms::room_refresh_devices(self, core, params)),
             "room.send_file" => Box::pin(rooms::room_send_file(self, core, params)),
             "room.send_attachment" => Box::pin(rooms::room_send_attachment(self, core, params)),
@@ -533,8 +537,8 @@ impl Handle {
     }
 
     /// 「該開的線都開著嗎」的鉤子（`Core::ensure_links`，/docs/design/daemon/link-pool.md §3.1，維護者 2026-09-29）：`vault.unlock`、`account.add` 成功之後叫。
-    /// 背景跑，🚫 不擋那個 RPC 的回應（五條線×每個帳號、金鑰還要追平）；開關各自發 `link.state`，開不起來的發 `Note`。
-    /// conf 的 `TRANSPORT = http` 是上限（/docs/design/overview/architecture-v2.md §5.1）：一律 HTTP，🚫 不開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
+    /// 背景跑，**不**擋那個 RPC 的回應（五條線×每個帳號、金鑰還要追平）；開關各自發 `link.state`，開不起來的發 `Note`。
+    /// conf 的 `TRANSPORT = http` 是上限（/docs/design/overview/architecture-v2.md §5.1）：一律 HTTP，**不**開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
     /// 已經有一輪在跑時，core 那邊自己跳過（`ensuring_links` 旗），這裡不必再擋。
     async fn start_ensuring_links(&self) {
         if self.settings.transport == Transport::Http || self.is_shutting_down() {
@@ -548,7 +552,7 @@ impl Handle {
 
     /// 常駐時的背景迴圈（維護者 2026-09-29，/docs/design/daemon/link-pool.md §3.1）：每隔一段時間叫一次同一支鉤子，被關掉、死掉的線就在這裡重開。
     /// 很輕：鎖著、或正在登入／登出／摧毀，那一輪什麼都不做；開著的線只是看一眼。
-    /// 開不起來（server 不在）就拉長間隔（每次加倍，上限 [`KEEP_LINKS_MAX_INTERVAL`]），一輪全順就回到 [`KEEP_LINKS_INTERVAL`]：🚫 不對一台不在的 server 每 15 秒敲五次門。
+    /// 開不起來（server 不在）就拉長間隔（每次加倍，上限 [`KEEP_LINKS_MAX_INTERVAL`]），一輪全順就回到 [`KEEP_LINKS_INTERVAL`]：**不**對一台不在的 server 每 15 秒敲五次門。
     /// `daemon.shutdown` 一廣播就停。`TRANSPORT = http` 不開 WS 線，所以整個不跑。
     pub async fn keep_links_open(self: Arc<Handle>) {
         if self.settings.transport == Transport::Http {
@@ -727,7 +731,7 @@ mod tests {
     async fn a_fresh_data_dir_needs_vault_create_first_and_it_can_be_passphrase_mode() {
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
-        // 🚫 account.add 不替前端建 vault：fresh 資料目錄先 1002，訊息指向 vault.create。
+        // account.add **不**替前端建 vault：fresh 資料目錄先 1002，訊息指向 vault.create。
         let add = request(
             "account.add",
             json!({ "server": "http://127.0.0.1:9", "user": "@a:localhost", "password": "x" }),
@@ -736,7 +740,7 @@ mod tests {
         assert_eq!(response.code, 1002, "{}", response.msg);
         assert!(response.msg.contains("vault.create"), "{}", response.msg);
 
-        // ⭐ 想要 passphrase 模式的前端**一步**就建得成，🚫 不必先落一份 plain 再重包。
+        // ⭐ 想要 passphrase 模式的前端**一步**就建得成，**不必**先落一份 plain 再重包。
         let response = handle
             .call(request(
                 "vault.create",
@@ -754,11 +758,11 @@ mod tests {
             .await;
         assert!(response.code >= 1300, "{}", response.msg);
 
-        // 🚫 不覆蓋既有的 local.key（覆蓋＝把所有帳號鎖在門外）。
+        // **不**覆蓋既有的 local.key（覆蓋＝把所有帳號鎖在門外）。
         let response = handle.call(request("vault.create", json!({}))).await;
         assert_eq!(response.code, 1100, "{}", response.msg);
 
-        // daemon 重開 ＝ 回到未解鎖：這時 account.add 是 1001，🚫 不是「再建一把」。
+        // daemon 重開 ＝ 回到未解鎖：這時 account.add 是 1001，**不是**「再建一把」。
         // ⚠️ **先把第一個丟掉**：重開的意思是舊的沒了。不丟的話新的拿不到寫權（109）——
         // 那是對的行為，但測的就不是「重開」了。
         drop(handle);
@@ -787,7 +791,7 @@ mod tests {
         let response = handle.call(request("account.list", json!({}))).await;
         assert_eq!(response.code, 0, "{}", response.msg);
         assert_eq!(response.result["accounts"], json!([]));
-        // 🚫 沒有 vault.lock（維護者 2026-09-13：daemon 不需要這個 feature，/docs/design/rpc-specs/rpc-spec.md §3.1）。
+        // **沒有** vault.lock（維護者 2026-09-13：daemon 不需要這個 feature，/docs/design/rpc-specs/rpc-spec.md §3.1）。
         // 真正的「鎖上」是 daemon.shutdown 再重開 —— 換一個 Handle 就是那條路。
         let response = handle.call(request("vault.lock", Value::Null)).await;
         assert_eq!(response.code, code::UNKNOWN_METHOD, "{}", response.msg);
@@ -818,7 +822,7 @@ mod tests {
                 response.msg
             );
         }
-        // 🚫 失敗不會讓它以為自己有能力。
+        // 失敗**不**會讓它以為自己有能力。
         assert!(!handle.can_write());
 
         // 不碰資料目錄的照常回答。
@@ -835,14 +839,14 @@ mod tests {
     /// `sync` 沒帶就是 `local`，而 `local` **不連網**（/docs/design/rpc-specs/rpc-spec.md §2、/docs/design/daemon/daemon-runtime.md §3.1）。
     ///
     /// ⭐ 這條測得出「預設值對不對」：`local` 讀空的快取會**成功回一個空列表**，
-    /// 而打上游會失敗（測試裡沒有帳號、也沒有 server）。🚫 不必真的架一台 server 來分辨。
+    /// 而打上游會失敗（測試裡沒有帳號、也沒有 server）。**不必**真的架一台 server 來分辨。
     #[tokio::test]
     async fn sync_defaults_to_local_and_local_does_not_touch_the_network() {
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
         handle.core().await.create_vault(None).unwrap();
 
-        // 沒有帳號：`local` 走到「哪個帳號？」就停了，🚫 不會是網路錯。
+        // 沒有帳號：`local` 走到「哪個帳號？」就停了，**不**會是網路錯。
         let response = handle.call(request("room.list", json!({}))).await;
         assert_eq!(response.code, 1010, "{}", response.msg);
         let with_sync = handle
@@ -850,24 +854,24 @@ mod tests {
             .await;
         assert_eq!(with_sync.code, response.code, "沒帶 sync ＝ local");
 
-        // 認不得的值要被擋下來（102），🚫 不要默默當成某一種。
+        // 認不得的值要被擋下來（102），禁止默默當成某一種。
         let response = handle
             .call(request("room.list", json!({ "sync": "sometimes" })))
             .await;
         assert_eq!(response.code, code::INVALID_PARAMS, "{}", response.msg);
-        // ⚠️ 而且這種時候🚫 不該宣稱用了某一種 —— 它一種都沒用。
+        // ⚠️ 而且這種時候**不**該宣稱用了某一種 —— 它一種都沒用。
         assert_eq!(response.sync, None, "{response:?}");
     }
 
     /// 認得 `sync` 的 method，**回應要說出這次用的是哪一種**（維護者 2026-09-13）——
-    /// 包括「沒帶所以是預設」。不認得的 method 則🚫 不帶那個欄位。
+    /// 包括「沒帶所以是預設」。不認得的 method 則**不**帶那個欄位。
     #[tokio::test]
     async fn the_response_says_which_sync_it_used() {
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
         handle.core().await.create_vault(None).unwrap();
 
-        // 沒帶 → 回應說 local（前端因此🚫 不必去記預設是什麼）。
+        // 沒帶 → 回應說 local（前端因此**不必**去記預設是什麼）。
         let response = handle.call(request("room.list", json!({}))).await;
         assert_eq!(response.sync, Some(wbf_core::SyncMode::Local));
         // 帶了 → 原樣回報。⚠️ 連失敗的回應也要帶：「打了上游然後失敗」跟「只讀本地然後沒有」
@@ -877,7 +881,7 @@ mod tests {
             .await;
         assert_ne!(response.code, 0, "沒有帳號，本來就會失敗");
         assert_eq!(response.sync, Some(wbf_core::SyncMode::Server));
-        // 不認得 `sync` 的 method：欄位不在，🚫 不是 null。
+        // 不認得 `sync` 的 method：欄位不在，**不是** null。
         let response = handle.call(request("daemon.info", Value::Null)).await;
         assert_eq!(response.sync, None);
         let json = serde_json::to_value(&response).unwrap();
@@ -885,7 +889,7 @@ mod tests {
     }
 
     /// 寫本地的房間動作（/docs/design/rpc-specs/rpc-spec.md §3.3.1 標 ✅ 的 21 支）也認得 `sync`，回應一樣要回報（PR #76 cirno）：
-    /// 它們的預設是 `both`、`local` 認不得 —— 🚫 照讀的那套報成 `local`。名單照文件抄，不引用正式碼的常數（那樣漏掉一支兩邊一起漏）。
+    /// 它們的預設是 `both`、`local` 認不得 —— **不**照讀的那套報成 `local`。名單照文件抄，不引用正式碼的常數（那樣漏掉一支兩邊一起漏）。
     #[tokio::test]
     async fn room_actions_report_the_write_sync_they_used() {
         let dir = tempfile::tempdir().unwrap();
@@ -938,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn every_network_method_parses_its_params_and_reaches_core() {
         // 解鎖了但沒有帳號：每個 method 都該走到 core 然後被 core 拒絕（1000+），
-        // 🚫 不是 101 unknown、🚫 不是 102 params。這張表是 /docs/design/rpc-specs/rpc-spec.md §3 有 core 對應的全部。
+        // **不是** 101 unknown、**不是** 102 params。這張表是 /docs/design/rpc-specs/rpc-spec.md §3 有 core 對應的全部。
         let dir = tempfile::tempdir().unwrap();
         let handle = handle(dir.path());
         handle.core().await.create_vault(None).unwrap();
@@ -956,7 +960,19 @@ mod tests {
             ("room.invites", json!({})),
             (
                 "room.send_text",
-                json!({ "room": "!r:localhost", "body": "hi" }),
+                json!({ "room": "!r:localhost", "body": "hi", "reply_to": "$abc", "mentions": ["@b:localhost"] }),
+            ),
+            (
+                "room.edit",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "body": "hi" }),
+            ),
+            (
+                "room.react",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "key": "👍" }),
+            ),
+            (
+                "room.redact",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "reason": "typo" }),
             ),
             ("room.refresh_devices", json!({ "room": "!r:localhost" })),
             (
@@ -1162,6 +1178,19 @@ mod tests {
                 json!({ "room": "!r:localhost", "previous": { "members": {} } }),
             ),
             (
+                "room.send_text",
+                json!({ "room": "!r:localhost", "body": "hi", "mentions": "@b:localhost" }),
+            ),
+            (
+                "room.edit",
+                json!({ "room": "!r:localhost", "event_id": "$abc" }),
+            ),
+            (
+                "room.react",
+                json!({ "room": "!r:localhost", "event_id": "$abc" }),
+            ),
+            ("room.redact", json!({ "room": "!r:localhost" })),
+            (
                 "room.history",
                 json!({ "room": "!r:localhost", "limit": 10, "sync": "elsewhere" }),
             ),
@@ -1285,7 +1314,7 @@ mod tests {
         assert!(*signal.borrow());
     }
 
-    /// 看線的背景迴圈：`daemon.shutdown` 一廣播就停（在睡的那段也一樣，🚫 不等到下一輪）；`TRANSPORT = http` 根本不跑。
+    /// 看線的背景迴圈：`daemon.shutdown` 一廣播就停（在睡的那段也一樣，**不**等到下一輪）；`TRANSPORT = http` 根本不跑。
     #[tokio::test]
     async fn the_link_keeper_stops_on_shutdown_and_never_runs_over_http() {
         let dir = tempfile::tempdir().unwrap();
@@ -1297,7 +1326,7 @@ mod tests {
         handle.begin_shutdown_if_requested();
         tokio::time::timeout(std::time::Duration::from_secs(5), keeper)
             .await
-            .expect("shutdown 之後馬上停，🚫 不等 15 秒的下一輪")
+            .expect("shutdown 之後馬上停，不等 15 秒的下一輪")
             .unwrap();
 
         let settings = Settings {

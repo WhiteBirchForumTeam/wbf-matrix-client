@@ -69,6 +69,7 @@ pub mod matrix_media;
 pub mod media;
 pub mod media_kind;
 pub mod media_pool;
+pub mod message_content;
 pub mod protocol;
 pub mod room_keys;
 pub mod room_state;

@@ -622,7 +622,7 @@ async fn the_heartbeat_keeps_a_quiet_line_alive_against_the_real_server() {
 
 /// 一般 Matrix 帳號那條路（matrix-sdk 的 Client）只把 state 與 crypto 落地（維護者 2026-09-30，/docs/design/storage/local-cache-db.md §4.1）：
 /// wbfuwunel 也是一台標準 Matrix server，所以直接用 `MatrixBackend::login` 走得到（登入流程本身會探活走 wbf、碰不到這條）。
-/// 登入、同步、列房間都照常，store 目錄裡只有 `matrix-sdk-state` 與 `matrix-sdk-crypto` 兩個 sqlite，🚫 沒有 event cache 與 media。
+/// 登入、同步、列房間都照常，store 目錄裡只有 `matrix-sdk-state` 與 `matrix-sdk-crypto` 兩個 sqlite，**沒有** event cache 與 media。
 #[cfg(feature = "matrix")]
 #[tokio::test]
 #[ignore = "needs a running wbfuwunel; see file header"]
@@ -745,12 +745,12 @@ async fn a_traditional_upload_goes_into_plain_and_encrypted_rooms_and_downloads_
         .expect("upload");
         let content = matrix_file_message_content(&manifest, Some("e2e")).expect("content");
         let event_id = backend
-            .send_message_content(room, content)
+            .send_event_content(room, "m.room.message", content, None)
             .await
             .expect("send");
         // 歷史裡讀回來：標準附件、同一個 mxc、同一種格式（加密房是 matrix-sdk 解開自己送的那則）。
         let page = backend.history(room, None, 10).await.expect("history");
-        let messages = messages_from_incoming(room, &page.events);
+        let messages = messages_from_incoming(room, &session.user_id, &page.events);
         let sent = messages
             .iter()
             .find(|message| message.id == event_id)

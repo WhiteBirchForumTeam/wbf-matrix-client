@@ -59,7 +59,7 @@ fn file_message_needs_a_valid_block_else_unsupported() {
 
 #[test]
 /// 標準 Matrix 附件（/docs/design/rpc-specs/data-plane.md §7.1）：有 `file` 是加密的（kind 2）、只有 `url` 是明文的（kind 3）；
-/// `file` 不完整🚫 退成明文、🚫 當成一個檔；`filename` 跟 `body` 不一樣時 `body` 是說明。
+/// `file` 不完整**不**退成明文、**不**當成一個檔；`filename` 跟 `body` 不一樣時 `body` 是說明。
 fn standard_attachments_are_recognised_and_a_broken_encrypted_one_is_not_taken_as_plain() {
     use wbf_sdk::media_kind::MediaKind;
     let encrypted = json!({
@@ -122,7 +122,7 @@ fn standard_attachments_are_recognised_and_a_broken_encrypted_one_is_not_taken_a
     );
     assert!(attachment.file.is_none());
 
-    // `file` 少了 hash：🚫 退回外層的 `url` 當明文（那會把密文當明文給出去）。
+    // `file` 少了 hash：**不**退回外層的 `url` 當明文（那會把密文當明文給出去）。
     let mut broken = encrypted.clone();
     broken["content"]["file"]["hashes"] = json!({});
     broken["content"]["url"] = json!("mxc://matrix.org/AbC");
@@ -130,7 +130,7 @@ fn standard_attachments_are_recognised_and_a_broken_encrypted_one_is_not_taken_a
         message_from_json(&broken).kind,
         MessageKind::Unsupported { .. }
     ));
-    // 不是 mxc：🚫 當成檔。
+    // 不是 mxc：**不**當成檔。
     let mut not_mxc = plain.clone();
     not_mxc["content"]["url"] = json!("https://example.org/a.pdf");
     assert!(matches!(
@@ -183,6 +183,9 @@ fn missing_fields_become_unknown_not_empty() {
 
 use wbf_sdk::event_json::messages_from_json;
 
+/// 讀這一頁的帳號（算 `Reaction.mine`）。
+const READER: &str = "@b:localhost";
+
 fn relation(
     id: &str,
     sender: &str,
@@ -215,7 +218,7 @@ fn reactions_fold_into_target_and_disappear_as_events() {
             json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$a", "key": "❤" } }),
         ),
     ];
-    let messages = messages_from_json("!r:localhost", &page);
+    let messages = messages_from_json("!r:localhost", READER, &page);
     assert_eq!(messages.len(), 1, "reaction events are consumed");
     let reactions = &messages[0].reactions;
     assert_eq!(reactions.len(), 2);
@@ -225,9 +228,45 @@ fn reactions_fold_into_target_and_disappear_as_events() {
         .unwrap();
     assert_eq!(thumbs.by, vec!["@b:localhost", "@c:localhost"]);
     assert_eq!(
+        thumbs.mine.as_deref(),
+        Some("$r1"),
+        "the reader pressed 👍 as $r1"
+    );
+    assert_eq!(
         messages[0].conversation, "!r:localhost",
         "sync events have no room_id; the page fills it in"
     );
+}
+
+/// 同一個人對同一個 key 按了兩則：`by` 只算一次，`mine` 是最早的那則（頁是新到舊也一樣，/docs/design/messages/message-actions.md §5）。
+/// 別人按的不是 `mine`。
+#[test]
+fn the_same_person_pressing_twice_counts_once_and_mine_is_the_earliest() {
+    let pressed = |id: &str, sender: &str, ts: u64| {
+        let mut event = relation(
+            id,
+            sender,
+            "m.reaction",
+            json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$a", "key": "👍" } }),
+        );
+        event["origin_server_ts"] = json!(ts);
+        event
+    };
+    // 新到舊（`room.history` 的順序）。
+    let page = vec![
+        pressed("$late", READER, 30),
+        pressed("$other", "@c:localhost", 20),
+        pressed("$early", READER, 10),
+        text_event("$a", "hi"),
+    ];
+    let messages = messages_from_json("!r:localhost", READER, &page);
+    assert_eq!(messages.len(), 1);
+    let thumbs = &messages[0].reactions[0];
+    assert_eq!(thumbs.by, vec![READER, "@c:localhost"]);
+    assert_eq!(thumbs.mine.as_deref(), Some("$early"));
+
+    let messages = messages_from_json("!r:localhost", "@d:localhost", &page);
+    assert_eq!(messages[0].reactions[0].mine, None, "nobody else's is mine");
 }
 
 #[test]
@@ -245,7 +284,7 @@ fn edit_replaces_content_and_marks_editor() {
             }),
         ),
     ];
-    let messages = messages_from_json("!r:localhost", &page);
+    let messages = messages_from_json("!r:localhost", READER, &page);
     assert_eq!(messages.len(), 1);
     assert!(matches!(&messages[0].kind, MessageKind::Text { body, .. } if body == "second"));
     assert_eq!(messages[0].edited_by.as_deref(), Some("@a:localhost"));
@@ -262,7 +301,7 @@ fn redaction_marks_target_deleted() {
             json!({ "redacts": "$a", "reason": "typo" }),
         ),
     ];
-    let messages = messages_from_json("!r:localhost", &page);
+    let messages = messages_from_json("!r:localhost", READER, &page);
     assert_eq!(messages.len(), 1);
     assert!(
         matches!(&messages[0].kind, MessageKind::Deleted { reason: Some(reason) } if reason == "typo")
@@ -271,7 +310,7 @@ fn redaction_marks_target_deleted() {
     // room v11 之前 redacts 在頂層
     let mut old_style = relation("$d2", "@a:localhost", "m.room.redaction", json!({}));
     old_style["redacts"] = json!("$a");
-    let messages = messages_from_json("!r:localhost", &[text_event("$a", "x"), old_style]);
+    let messages = messages_from_json("!r:localhost", READER, &[text_event("$a", "x"), old_style]);
     assert!(matches!(messages[0].kind, MessageKind::Deleted { .. }));
 }
 
@@ -283,7 +322,7 @@ fn relation_whose_target_is_not_on_the_page_is_kept() {
         "m.reaction",
         json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": "$elsewhere", "key": "👍" } }),
     )];
-    let messages = messages_from_json("!r:localhost", &page);
+    let messages = messages_from_json("!r:localhost", READER, &page);
     assert_eq!(messages.len(), 1, "not dropped");
     assert!(
         matches!(&messages[0].kind, MessageKind::Unsupported { event_type, .. } if event_type == "m.reaction")
@@ -352,7 +391,7 @@ fn a_traditional_upload_is_sent_as_a_standard_attachment_that_reads_back_the_sam
     );
 }
 
-/// 帶回來的 manifest 說的跟它帶的對不上：🚫 送（加密房的檔沒 `file`、明文的帶了金鑰、`file` 指著另一個 mxc、`file` 不齊）。
+/// 帶回來的 manifest 說的跟它帶的對不上：**不**送（加密房的檔沒 `file`、明文的帶了金鑰、`file` 指著另一個 mxc、`file` 不齊）。
 #[test]
 fn a_traditional_manifest_that_contradicts_itself_is_not_sent() {
     use wbf_sdk::event_json::matrix_file_message_content;

@@ -7,7 +7,7 @@
 //!
 //! 流程：vault.create（**passphrase 模式**）→ account.add（鉤子在背景開五條線）→ account.whoami → server.ping（WS）
 //! → room.list（local 與 both，後者走橋的 JoinedRooms）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
-//! → account.del。每一步看 code，🚫 不看 msg。
+//! → account.del。每一步看 code，**不**看 msg。
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
 //! 對**真的 server** 也成立 —— 登入寫出來的 `session.sealed` 與 matrix store 都是用那把被 passphrase
@@ -31,7 +31,7 @@ const TOKEN: [u8; 256] = [7u8; 256];
 const PASSPHRASE_BASE64: &str = "aHVudGVyMg==";
 
 /// 一個跑著的 daemon。⚠️ 拿著 `task` 才停得掉它 —— 「重開」必須是**真的停掉再起**，
-/// 🚫 不是「再起一個」：兩個 daemon 同時開同一個資料目錄正是 /docs/design/overview/architecture-v2.md §0.2 禁止的事
+/// **不是**「再起一個」：兩個 daemon 同時開同一個資料目錄正是 /docs/design/overview/architecture-v2.md §0.2 禁止的事
 /// （PR #31 審查 cirno🔴）。
 struct Daemon {
     port: u16,
@@ -182,8 +182,8 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     let daemon = start_daemon(dir.path()).await;
     let mut client = Client::connect(daemon.port).await;
 
-    // fresh 資料目錄的起手式（/docs/design/rpc-specs/rpc-spec.md §3.1）：🚫 account.add 不替前端建 vault，
-    // 而「要不要 passphrase」就在**建的這一步**決定，🚫 不是登入之後再重包。
+    // fresh 資料目錄的起手式（/docs/design/rpc-specs/rpc-spec.md §3.1）：account.add **不**替前端建 vault，
+    // 而「要不要 passphrase」就在**建的這一步**決定，**不是**登入之後再重包。
     let reply = client
         .call(
             "vault.create",
@@ -212,7 +212,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     // 登入成功就觸發鉤子：五條線（misc、upload、download、rooms、keys）在背景開起來（/docs/design/daemon/link-pool.md §3.1）。
     wait_for_links(&mut client, 5).await;
 
-    // WS：Hello／Ping。走已經開著的 misc，🚫 不再開一條。
+    // WS：Hello／Ping。走已經開著的 misc，**不**再開一條。
     let reply = client.call("server.ping", json!({})).await;
     assert_eq!(reply["code"], 0, "ping: {reply}");
     assert!(reply["result"]["features"].is_array(), "{reply}");
@@ -234,7 +234,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "recent: {reply}");
     assert!(reply["result"]["caught_up"].is_boolean(), "{reply}");
 
-    // 備份還掛在 Client 上（/docs/design/daemon/account-session.md §6）：wbf 帳號明講拒絕（1100），🚫 不靜默失效。
+    // 備份還掛在 Client 上（/docs/design/daemon/account-session.md §6）：wbf 帳號明講拒絕（1100），**不**靜默失效。
     let reply = client.call("backup.status", json!({})).await;
     assert_eq!(
         reply["code"], 1100,
@@ -247,7 +247,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 
     // daemon 重開（真正的「鎖上」就是這條，/docs/design/rpc-specs/rpc-spec.md §3.1）。
     // ⚠️ **先停掉第一個**：`daemon.shutdown` → 關連線 → 等它收攤 → 確認舊 port 不收連線了。
-    // 🚫 不可以直接再起一個：兩個 daemon 同時開同一個資料目錄是 /docs/design/overview/architecture-v2.md §0.2 禁止的，而且那樣
+    // 禁止直接再起一個：兩個 daemon 同時開同一個資料目錄是 /docs/design/overview/architecture-v2.md §0.2 禁止的，而且那樣
     // 就算 shutdown 壞掉這條測試也會綠（PR #31 審查 cirno🔴）。
     stop_daemon(daemon, client).await;
     let daemon = start_daemon(dir.path()).await;
@@ -258,7 +258,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(info["result"]["key_mode"], "passphrase");
     // ⭐ 換了一個實例：instance 一定不同（port 會重用、pid 會回收，這個不會）。
     assert_ne!(info["result"]["instance"], before.as_str(), "{info}");
-    // 鎖著：帳號那些是 1001（有 local.key，所以🚫 不是 1002）。
+    // 鎖著：帳號那些是 1001（有 local.key，所以**不是** 1002）。
     let reply = client.call("account.whoami", json!({})).await;
     assert_eq!(reply["code"], 1001, "{reply}");
     // 錯的 passphrase 開不了。
@@ -305,14 +305,14 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
         "{reply}"
     );
 
-    // 收攤：第二個也照同一條路停掉，🚫 不留一個還開著資料目錄的 daemon 給 tempdir 收
+    // 收攤：第二個也照同一條路停掉，**不**留一個還開著資料目錄的 daemon 給 tempdir 收
     // （Windows 上那會讓刪除失敗，而且它掩蓋的正是「有東西還握著 store」這件事）。
     stop_daemon(daemon, client).await;
 }
 
 /// 🚨 **房間歷史往回翻，定位一律是 `event_id`**（wbfuwunel #51；維護者 2026-09-14）。
 ///
-/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗沒帶 `room_devices` 的送出被拒、🚫 不送明文——1100）。
+/// 額外要 `WBF_E2E_ROOM`：一個 `WBF_E2E_USER` 在裡面的房間（這條測試會往裡面送 7 則）；選填 `WBF_E2E_ENCRYPTED_ROOM`（一間加密房，驗沒帶 `room_devices` 的送出被拒、**不**送明文——1100）。
 ///
 /// ⭐ 原本刻意讓**兩條上游路線都被真的打到**；#61 起訂閱線常開、自己送的會被推回來寫進本地，`/context` 那條在這個流程裡到不了了
 /// （改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 單元測試守）：
@@ -324,7 +324,7 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
 /// | `sync=both` 兩頁 | wbf `Recent{rooms, before: g_seq}` | 第一頁寫進去了，第二頁的錨點本地查得到 |
 /// | `sync=local` | 本地 | 驗 `both` 真的寫進去了，而且本地也能拿 `event_id` 接著翻 |
 ///
-/// 📎 每一段都拿**自己剛送的 7 則**比對，🚫 不假設房間原本是空的。
+/// 📎 每一段都拿**自己剛送的 7 則**比對，**不**假設房間原本是空的。
 #[tokio::test]
 #[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_ROOM"]
 async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
@@ -377,7 +377,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         "room.get wrote what it fetched: {listed}"
     );
 
-    // 加密房沒帶 `room_devices` 要被拒（1100）、🚫 送明文：加不加密看的是剛拿到的房間（/docs/design/keys/e2ee-rpc.md §7）。
+    // 加密房沒帶 `room_devices` 要被拒（1100）、**不**送明文：加不加密看的是剛拿到的房間（/docs/design/keys/e2ee-rpc.md §7）。
     // 選填 `WBF_E2E_ENCRYPTED_ROOM`：一間 `WBF_E2E_USER` 在裡面的加密房。
     if let Ok(encrypted_room) = std::env::var("WBF_E2E_ENCRYPTED_ROOM") {
         let fetched = client
@@ -457,7 +457,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
         (ids, next)
     }
 
-    // ── 訂閱線（#61 起 account.add 之後 daemon 自己開）把剛送的 7 則推回來、寫進本地：等它們都到了再往下，🚫 不賭時序 ──
+    // ── 訂閱線（#61 起 account.add 之後 daemon 自己開）把剛送的 7 則推回來、寫進本地：等它們都到了再往下，**不**賭時序 ──
     let mut local_newest = Vec::new();
     for _ in 0..100 {
         let reply = client
@@ -530,7 +530,7 @@ async fn room_history_pages_back_by_event_id_over_both_upstream_paths() {
 /// |---|---|
 /// | 明文房：建檔 → PUT → 送附件（帶 manifest） | URL 是 `e-` 加密的、看不出 mxc；區塊是 `none`；附件宣告過得了 server 的歸屬檢查 |
 /// | 加密房：建檔 → PUT → 送附件（帶 `room_devices`） | 區塊有金鑰；送出去的是密文、附件在同一個請求宣告 |
-/// | 同一個 URL 傳完再 PUT 一次 | 🚫 不是 200：server 已經收掉這個上傳 |
+/// | 同一個 URL 傳完再 PUT 一次 | **不是** 200：server 已經收掉這個上傳 |
 /// | `media.export_to` 那份 manifest | 從 server 拉回來、解開、整檔驗過，跟 PUT 的 bytes 一樣 |
 /// | `room.files`（`both`） | 加密房那則解得開、認得出是檔案、mxc 對得上 |
 /// | 加密房串流（沒給大小） | 傳完拿到真的大小，送得出去 |
@@ -794,7 +794,7 @@ async fn an_attachment_goes_over_the_data_plane_into_plain_and_encrypted_rooms()
 /// | 同上，但上傳的密文翻一個 bit | `verified` 2、GET **412** 而 body 照給、匯出寫了檔而且回 **1501** |
 /// | `m.image` 只帶 `url` | `kind` 3、`verified` 0、GET 200 整檔一樣 |
 ///
-/// 送的那一方用原生 HTTP（同一個 alice 另登一台裝置），🚫 經過我們的程式碼：它就是「別人的 client」。
+/// 送的那一方用原生 HTTP（同一個 alice 另登一台裝置），**不**經過我們的程式碼：它就是「別人的 client」。
 #[tokio::test]
 #[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_ROOM"]
 async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_data_plane() {
@@ -872,7 +872,7 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
             ),
         "推播先 verifying、再 complete 帶 verified 1：{pushed:?}"
     );
-    // 同一個 mxc、另一把金鑰的事件（寫錯或偽造）：本地那一列說了算，回 1500、🚫 下載（/docs/design/media/media-download.md §5.3）。
+    // 同一個 mxc、另一把金鑰的事件（寫錯或偽造）：本地那一列說了算，回 1500、**不**下載（/docs/design/media/media-download.md §5.3）。
     let (_, mut forged_file) = encrypt_like_element(&body);
     forged_file["url"] = json!(mxc);
     let forged_event = other
@@ -902,7 +902,7 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
     let state = download_until_complete(&mut client, &by_event).await;
     assert_eq!(
         state["result"]["verified"], 2,
-        "驗不過也是完成、🚫 刪檔：{state}"
+        "驗不過也是完成、不刪檔：{state}"
     );
     let (status, head, whole) = get(daemon.data_port, &url, None).await;
     assert_eq!(status, 412, "沒驗過的傳統加密檔：412、body 照給：{head}");
@@ -980,7 +980,7 @@ async fn a_standard_matrix_attachment_downloads_over_http_and_reads_over_the_dat
 
 /// 房間動作（/docs/design/rooms/room-actions.md）：兩個帳號都登在**同一個 daemon**（共用 `cache.db`），一路看 server 怎麼答、本地的列怎麼跟著走。
 ///
-/// 額外要 `WBF_E2E_USER_B`／`WBF_E2E_PASSWORD_B_FILE`（另一個帳號，例 `@bob:localhost`）。每一步看 code 與 server 的 body，🚫 看 msg。
+/// 額外要 `WBF_E2E_USER_B`／`WBF_E2E_PASSWORD_B_FILE`（另一個帳號，例 `@bob:localhost`）。每一步看 code 與 server 的 body，**不**看 msg。
 ///
 /// | 步驟 | 驗什麼 |
 /// |---|---|
@@ -1178,7 +1178,7 @@ async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
     );
     assert!(
         state.iter().all(|event| event["type"] != "m.room.member"),
-        "成員事件🚫 放進 state"
+        "成員事件不放進 state"
     );
 
     let channel = client
@@ -1263,7 +1263,7 @@ async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
             json!({ "user": alice, "room": room, "event_id": event_id, "pinned": true }),
         )
         .await;
-    assert_eq!(again["result"], json!({}), "已經置頂：🚫 寫：{again}");
+    assert_eq!(again["result"], json!({}), "已經置頂：不寫：{again}");
     let fetched = client
         .call(
             "room.get",
@@ -1297,7 +1297,7 @@ async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
             json!({ "user": alice, "room": room, "body": "should not go out" }),
         )
         .await;
-    assert_eq!(plain["code"], 1100, "本地知道加密了：🚫 送明文：{plain}");
+    assert_eq!(plain["code"], 1100, "本地知道加密了：不送明文：{plain}");
     let refreshed = client
         .call(
             "room.refresh_devices",
@@ -1372,6 +1372,300 @@ async fn room_actions_walk_the_server_and_the_local_rows_of_two_accounts() {
     stop_daemon(daemon, client).await;
 }
 
+/// 訊息動作（/docs/design/messages/message-actions.md §7）：alice 回覆 bob、按表情、改字、收回表情、收回訊息，明文房與加密房各走一次；
+/// bob 從 `room.history` 看到折完的結果，alice 自己讀時 `mine` 有值、收回後沒有。兩個帳號登在同一個 daemon。
+///
+/// | 步驟 | 驗什麼 |
+/// |---|---|
+/// | alice `room.send_text { reply_to }` | bob 讀到 `reply_to`；server 上那則的 `m.relates_to` 在明文那層（加密房也是），明文房的 `m.mentions` 是 `[bob]` |
+/// | alice `room.react` 兩次 | 第二次回同一個 id（冪等）；bob 讀到 `by: [alice]`、沒有 `mine`；alice 讀到 `mine` |
+/// | alice `room.edit` 自己那則 | bob 讀到新的字、`edited_by: alice` |
+/// | alice `room.redact` 自己的表情（`mine`） | bob 讀到 `reactions` 空了；alice 的 `mine` 沒了 |
+/// | bob `room.redact` alice 那則 | 1400，`data` 是 server 的 403（private_chat 的 `redact` 門檻 50） |
+/// | alice `room.redact` 自己那則 | bob 讀到 `kind: deleted`、`reason` |
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_USER_B, WBF_E2E_PASSWORD_B_FILE"]
+async fn message_actions_reply_react_edit_and_redact_between_two_accounts() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let alice = std::env::var("WBF_E2E_USER").expect("WBF_E2E_USER");
+    let bob = std::env::var("WBF_E2E_USER_B").expect("WBF_E2E_USER_B");
+    let read_password = |name: &str| {
+        let text = std::fs::read_to_string(std::env::var(name).expect(name)).unwrap();
+        text.strip_suffix('\n').unwrap_or(&text).to_string()
+    };
+    let alice_password = read_password("WBF_E2E_PASSWORD_FILE");
+    let bob_password = read_password("WBF_E2E_PASSWORD_B_FILE");
+
+    let dir = tempfile::Builder::new()
+        .prefix("wd")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
+    let reply = client.call("vault.create", json!({})).await;
+    assert_eq!(reply["code"], 0, "vault.create: {reply}");
+    for (user, password) in [(&alice, &alice_password), (&bob, &bob_password)] {
+        let reply = client
+            .call(
+                "account.add",
+                json!({ "server": server, "user": user, "password": password, "device_name": "wbf-daemon message actions e2e" }),
+            )
+            .await;
+        assert_eq!(reply["code"], 0, "account.add {user}: {reply}");
+    }
+    wait_for_links(&mut client, 10).await;
+
+    for encrypted in [false, true] {
+        println!("── encrypted: {encrypted} ──");
+        let created = client
+            .call(
+                "room.create",
+                json!({ "user": alice, "encrypted": encrypted, "name": "message actions e2e", "preset": "private_chat" }),
+            )
+            .await;
+        assert_eq!(created["code"], 0, "{created}");
+        let room = created["result"]["room_id"].as_str().unwrap().to_string();
+        let invited = client
+            .call(
+                "room.invite",
+                json!({ "user": alice, "room": room, "user_id": bob }),
+            )
+            .await;
+        assert_eq!(invited["code"], 0, "{invited}");
+        let joined = client
+            .call("room.join", json!({ "user": bob, "room": room }))
+            .await;
+        assert_eq!(joined["code"], 0, "{joined}");
+        for user in [&alice, &bob] {
+            let fetched = client
+                .call(
+                    "room.get",
+                    json!({ "user": user, "room": room, "sync": "both" }),
+                )
+                .await;
+            assert_eq!(fetched["result"]["encrypted"], encrypted, "{fetched}");
+        }
+        // 加密房：兩邊都拿房間狀態（之後每一則都帶它；這一輪裡沒有人加裝置，號碼不會變）。
+        let mut devices = std::collections::BTreeMap::new();
+        for user in [&alice, &bob] {
+            let mut send = json!({ "user": user, "room": room });
+            if encrypted {
+                let refreshed = client
+                    .call(
+                        "room.refresh_devices",
+                        json!({ "user": user, "room": room }),
+                    )
+                    .await;
+                assert_eq!(refreshed["code"], 0, "{refreshed}");
+                send["room_devices"] = refreshed["result"].clone();
+            }
+            devices.insert(user.clone(), send);
+        }
+        let with = |user: &String, fields: Value| {
+            let mut params = devices[user].clone();
+            for (name, value) in fields.as_object().unwrap() {
+                params[name] = value.clone();
+            }
+            params
+        };
+
+        // ── bob 問、alice 回覆 ──
+        let asked = client
+            .call("room.send_text", with(&bob, json!({ "body": "要吃什麼" })))
+            .await;
+        assert_eq!(asked["code"], 0, "{asked}");
+        let asked = asked["result"]["event_id"].as_str().unwrap().to_string();
+        // 被回覆的人從 alice 的本地查：等 bob 那則進了 alice 的本地（加密房要等金鑰到、解得開）。
+        history_until(&mut client, &alice, &room, &asked, |message| {
+            message["kind"] == "text"
+        })
+        .await;
+        let answered = client
+            .call(
+                "room.send_text",
+                with(&alice, json!({ "body": "好", "reply_to": asked })),
+            )
+            .await;
+        println!("room.send_text (reply) ← {answered}");
+        assert_eq!(answered["code"], 0, "{answered}");
+        let answer = answered["result"]["event_id"].as_str().unwrap().to_string();
+        let seen = history_until(&mut client, &bob, &room, &answer, |message| {
+            message["kind"] == "text"
+        })
+        .await;
+        assert_eq!(seen["reply_to"], asked.as_str(), "{seen}");
+
+        // ── 表情：按兩次只有一則 ──
+        let reacted = client
+            .call(
+                "room.react",
+                with(&alice, json!({ "event_id": asked, "key": "👍" })),
+            )
+            .await;
+        println!("room.react ← {reacted}");
+        assert_eq!(reacted["code"], 0, "{reacted}");
+        let thumbs = reacted["result"]["event_id"].as_str().unwrap().to_string();
+        history_until(&mut client, &alice, &room, &asked, |message| {
+            message["reactions"][0]["mine"] == thumbs.as_str()
+        })
+        .await;
+        let again = client
+            .call(
+                "room.react",
+                with(&alice, json!({ "event_id": asked, "key": "👍" })),
+            )
+            .await;
+        assert_eq!(
+            again["result"]["event_id"],
+            thumbs.as_str(),
+            "冪等：{again}"
+        );
+        let seen = history_until(&mut client, &bob, &room, &asked, |message| {
+            message["reactions"].is_array()
+        })
+        .await;
+        assert_eq!(
+            seen["reactions"],
+            json!([{ "key": "👍", "by": [alice] }]),
+            "bob 沒按過：沒有 mine：{seen}"
+        );
+
+        // ── 改字 ──
+        let edited = client
+            .call(
+                "room.edit",
+                with(&alice, json!({ "event_id": answer, "body": "好，吃拉麵" })),
+            )
+            .await;
+        println!("room.edit ← {edited}");
+        assert_eq!(edited["code"], 0, "{edited}");
+        let edit = edited["result"]["event_id"].as_str().unwrap().to_string();
+        let seen = history_until(&mut client, &bob, &room, &answer, |message| {
+            message["body"] == "好，吃拉麵"
+        })
+        .await;
+        assert_eq!(seen["edited_by"], alice.as_str(), "{seen}");
+        assert_eq!(
+            seen["reply_to"],
+            asked.as_str(),
+            "回覆關係留在原訊息上：{seen}"
+        );
+
+        // ── server 上的原樣（別人的 client 看到的）：關係在明文那層 ──
+        // 所有加密的送出都在這之前：多登一台裝置會讓房間版本號變（之後的收回是明文、不受影響）。
+        let other = OtherClient::login(&server, &alice, &alice_password).await;
+        let raw_answer = other.event(&room, &answer).await;
+        assert_eq!(
+            raw_answer["content"]["m.relates_to"]["m.in_reply_to"]["event_id"],
+            asked.as_str(),
+            "{raw_answer}"
+        );
+        let raw_edit = other.event(&room, &edit).await;
+        assert_eq!(
+            raw_edit["content"]["m.relates_to"],
+            json!({ "rel_type": "m.replace", "event_id": answer }),
+            "{raw_edit}"
+        );
+        let raw_thumbs = other.event(&room, &thumbs).await;
+        if encrypted {
+            assert_eq!(raw_answer["type"], "m.room.encrypted", "{raw_answer}");
+            assert_eq!(raw_thumbs["type"], "m.room.encrypted", "{raw_thumbs}");
+        } else {
+            assert_eq!(
+                raw_answer["content"]["m.mentions"],
+                json!({ "user_ids": [bob] }),
+                "{raw_answer}"
+            );
+            assert_eq!(raw_thumbs["type"], "m.reaction", "{raw_thumbs}");
+        }
+        assert_eq!(
+            raw_thumbs["content"]["m.relates_to"],
+            json!({ "rel_type": "m.annotation", "event_id": asked, "key": "👍" }),
+            "{raw_thumbs}"
+        );
+        other.logout().await;
+
+        // ── 收回自己的表情（UI 拿 mine 叫 room.redact）──
+        let undone = client
+            .call(
+                "room.redact",
+                json!({ "user": alice, "room": room, "event_id": thumbs }),
+            )
+            .await;
+        println!("room.redact (reaction) ← {undone}");
+        assert_eq!(undone["code"], 0, "{undone}");
+        assert_ne!(
+            undone["result"]["event_id"],
+            thumbs.as_str(),
+            "回的是收回動作本身那則"
+        );
+        history_until(&mut client, &bob, &room, &asked, |message| {
+            message.get("reactions").is_none()
+        })
+        .await;
+        history_until(&mut client, &alice, &room, &asked, |message| {
+            message.get("reactions").is_none()
+        })
+        .await;
+
+        // ── 收回訊息：別人的要權限，自己的可以 ──
+        let refused = client
+            .call(
+                "room.redact",
+                json!({ "user": bob, "room": room, "event_id": answer }),
+            )
+            .await;
+        println!("room.redact (bob, not his) ← {refused}");
+        assert_eq!(refused["code"], 1400, "{refused}");
+        assert_eq!(refused["data"]["status"], 403, "{refused}");
+        let deleted = client
+            .call(
+                "room.redact",
+                json!({ "user": alice, "room": room, "event_id": answer, "reason": "改天" }),
+            )
+            .await;
+        assert_eq!(deleted["code"], 0, "{deleted}");
+        let seen = history_until(&mut client, &bob, &room, &answer, |message| {
+            message["kind"] == "deleted"
+        })
+        .await;
+        assert_eq!(seen["reason"], "改天", "{seen}");
+    }
+
+    stop_daemon(daemon, client).await;
+}
+
+/// `room.history sync=both` 一直問到 `event_id` 那則符合 `wanted` 為止（推播、金鑰都要時間；最多 10 秒），回那則。
+async fn history_until(
+    client: &mut Client,
+    user: &str,
+    room: &str,
+    event_id: &str,
+    wanted: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..50 {
+        let page = client
+            .call(
+                "room.history",
+                json!({ "user": user, "room": room, "limit": 20, "sync": "both" }),
+            )
+            .await;
+        assert_eq!(page["code"], 0, "room.history: {page}");
+        if let Some(found) = page["result"]["events"]
+            .as_array()
+            .and_then(|events| events.iter().find(|message| message["id"] == event_id))
+        {
+            last = found.clone();
+            if wanted(found) {
+                return last;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("{user} never saw {event_id} as wanted; last: {last}");
+}
+
 /// 上游的加密器（Element 這類 client 用的同一份）：回（密文、事件裡的 `file`，`url` 由呼叫者填）。
 fn encrypt_like_element(plain: &[u8]) -> (Vec<u8>, Value) {
     use std::io::Read;
@@ -1433,7 +1727,7 @@ async fn download_until_complete(client: &mut Client, by_event: &Value) -> Value
     panic!("the download never completed: {state}");
 }
 
-/// 「別人的 client」：原生的 Matrix HTTP，🚫 經過我們的程式碼。
+/// 「別人的 client」：原生的 Matrix HTTP，**不**經過我們的程式碼。
 struct OtherClient {
     http: reqwest::Client,
     server: String,

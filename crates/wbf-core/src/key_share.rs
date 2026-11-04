@@ -4,9 +4,9 @@
 //! - **送訊息只用已經分好的金鑰**（維護者 2026-10-06）：送出前問「房 R 的金鑰對房間版本號 V 就緒了沒」（[`Core::is_room_key_ready_within`]），
 //!   沒有就交給這裡準備（`Prepare`），最多等 `ROOM_KEY_WAIT`；等不到，那一則就不送。
 //! - 送出之後交 `AfterSend`：這把快到期就提早換、先分完，下一則拿到的就是就緒的。refresh、1506 之後交 `Prepare`：對新的 V 先分好。
-//! - 走 `Keys` 線、用 `reuse`，🚫 自己開線：線沒開就等，`init_keys` 開好線時叫醒它（[`KeyShareInbox::line_opened`]）。
+//! - 走 `Keys` 線、用 `reuse`，**不**自己開線：線沒開就等，`init_keys` 開好線時叫醒它（[`KeyShareInbox::line_opened`]）。
 //! - 失敗的留著，隔一段時間再試（`RETRY_FIRST` 起加倍到 `RETRY_MAX`），講一聲（`Note`）。
-//! - 🚫 存檔：待送的那一份在上游 crypto store 的 session 上，而沒拿到 Ack 的金鑰從來沒被拿來加密過，daemon 重開丟了也沒有訊息解不開；
+//! - **不**存檔：待送的那一份在上游 crypto store 的 session 上，而沒拿到 Ack 的金鑰從來沒被拿來加密過，daemon 重開丟了也沒有訊息解不開；
 //!   下一次 refresh 或送出會再交進來。自己的金鑰也一樣：上游記得還有沒上傳的，每次開線 `init_keys` 都會再傳。
 
 use std::collections::{BTreeMap, HashMap};
@@ -50,7 +50,7 @@ struct RoomKeyWant {
     room_version: u64,
     /// 那一份的 join 成員（含自己）, example: vec!["@alice:localhost".to_string()]
     members: Vec<String>,
-    /// 先丟掉現在那把再分（提早換）；丟過一次就清掉，重試🚫 再丟（不然剛分到一半的新金鑰又被丟掉）。
+    /// 先丟掉現在那把再分（提早換）；丟過一次就清掉，重試**不**再丟（不然剛分到一半的新金鑰又被丟掉）。
     discard_first: bool,
 }
 
@@ -127,7 +127,7 @@ impl Drop for KeyShareHandle {
     }
 }
 
-/// task 自己握著的東西——🚫 不握 `Core`、不握線（線在池裡，要用時 `reuse` 那一格）。
+/// task 自己握著的東西——**不**握 `Core`、不握線（線在池裡，要用時 `reuse` 那一格）。
 struct KeyShareTask {
     engine: Arc<OlmEngine>,
     pool: Arc<LinkPool>,
@@ -138,7 +138,7 @@ struct KeyShareTask {
 }
 
 impl Core {
-    /// 讓後台對這個房間版本號分好這個房的金鑰（refresh、1506 之後叫）；🚫 等它。
+    /// 讓後台對這個房間版本號分好這個房的金鑰（refresh、1506 之後叫）；**不**等它。
     /// 起不了後台（引擎開不起來、正在登出）只講一聲：送出時會再交一次，那時等不到就回「金鑰還沒準備好」。
     ///
     /// Args:
@@ -168,7 +168,7 @@ impl Core {
         .await;
     }
 
-    /// 剛送出一則加密訊息：交給後台看這把是不是快到期了，是就提早換、先分完；🚫 等它。
+    /// 剛送出一則加密訊息：交給後台看這把是不是快到期了，是就提早換、先分完；**不**等它。
     pub(crate) async fn room_key_used(
         &self,
         account: &AccountDir,
@@ -404,7 +404,7 @@ impl KeyShareTask {
             while let Ok(more) = work.try_recv() {
                 take_work(&mut rooms, &mut used, &mut upload_own_keys, Some(more));
             }
-            // 剛送出的：只讀本機，快到期才交去換（🚫 每則都上網）。
+            // 剛送出的：只讀本機，快到期才交去換（**不**每則都上網）。
             for (room, want) in std::mem::take(&mut used) {
                 self.check_after_send(&mut rooms, room, want).await;
             }
@@ -412,7 +412,7 @@ impl KeyShareTask {
                 retry_at = None;
                 continue;
             }
-            // 🚫 開線（/docs/design/keys/e2ee-rpc.md §3.1）：沒開就等下一件事、或開線那一聲。
+            // **不**開線（/docs/design/keys/e2ee-rpc.md §3.1）：沒開就等下一件事、或開線那一聲。
             let Some(mut line) = self.pool.reuse(LinkRole::Keys).await else {
                 retry_at = None;
                 continue;
@@ -507,7 +507,7 @@ impl KeyShareTask {
             want.discard_first = false;
         }
         // 房間自己設的換金鑰期限（/docs/design/keys/e2ee-rpc.md §3.1）：每次分之前只問 `m.room.encryption` 這一項。
-        // 問不到就這輪不分、留著重試（🚫 當成預設：房主設的可能比較短）；沒有這一項（404）才是預設。
+        // 問不到就這輪不分、留著重試（**不**當成預設：房主設的可能比較短）；沒有這一項（404）才是預設。
         let encryption = line.state_event(room, "m.room.encryption", "").await?;
         let rotation = RoomKeyRotation::of_encryption_content(encryption.as_ref());
         self.engine
@@ -609,6 +609,7 @@ mod tests {
                 members: [(ME.to_string(), format!("1-{hash}"))].into(),
             }),
             txn_id: Some(txn_id.to_string()),
+            ..SendOptions::default()
         }
     }
 
@@ -622,7 +623,7 @@ mod tests {
             .unwrap()
     }
 
-    /// 送訊息只用已經分好的金鑰（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：送的那一路（`Misc`）一個走橋的請求都🚫 收到，
+    /// 送訊息只用已經分好的金鑰（維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）：送的那一路（`Misc`）一個走橋的請求都**沒有**收到，
     /// 金鑰是後台在 `Keys` 線上建、送完才拿來加密；送出去的是密文、帶那個號碼。
     #[tokio::test]
     async fn an_encrypted_send_only_uses_a_key_the_background_prepared_on_the_keys_line() {
@@ -659,7 +660,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Keys` 線沒開：後台🚫 自己開線，送出最多等 `ROOM_KEY_WAIT`，等不到就 `RoomKeyNotReady`、訊息沒加密沒送、`data` 帶 `txn_id`。
+    /// `Keys` 線沒開：後台**不**自己開線，送出最多等 `ROOM_KEY_WAIT`，等不到就 `RoomKeyNotReady`、訊息沒加密沒送、`data` 帶 `txn_id`。
     /// 線開好那一聲（`init_keys` 叫的 `line_opened`）之後後台分好，同一個 `txn_id` 重送就過。
     #[tokio::test]
     async fn a_send_without_a_prepared_key_waits_then_fails_without_sending_and_goes_through_once_the_key_is_ready(
@@ -676,7 +677,7 @@ mod tests {
         assert_eq!(refused.data, Some(serde_json::json!({ "txn_id": "t-1" })));
         assert!(
             misc.sent_events.lock().unwrap().is_empty(),
-            "🚫 用沒分好的金鑰加密、🚫 送"
+            "不用沒分好的金鑰加密、不送"
         );
         let pool = core.pool_of_account(&account).unwrap();
         assert!(
@@ -704,7 +705,7 @@ mod tests {
     }
 
     /// 「就緒」以 UI 帶來的房間版本號為準：金鑰對 7 分好了，帶 8 送就要後台對 8 再跑一輪才送（成員或裝置可能變了，
-    /// 對 7 分好的那把未必送到了 8 的每一台），🚫 只看「有一把能用的金鑰」就送。
+    /// 對 7 分好的那把未必送到了 8 的每一台），**不**只看「有一把能用的金鑰」就送。
     #[tokio::test]
     async fn a_key_ready_for_an_older_room_version_is_prepared_again_for_the_new_one() {
         let dir = scratch("key-share-version");
@@ -753,7 +754,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 準備失敗的房隔一段時間（`RETRY_FIRST`）再試，在送出的等待時間內分好就照送；分好之後就停，🚫 一直重試。
+    /// 準備失敗的房隔一段時間（`RETRY_FIRST`）再試，在送出的等待時間內分好就照送；分好之後就停，**不**一直重試。
     #[tokio::test]
     async fn a_failed_prepare_is_retried_within_the_wait_and_stops_once_the_key_is_ready() {
         let dir = scratch("key-share-retry");
@@ -791,7 +792,7 @@ mod tests {
     }
 
     /// 快到期的金鑰（剩 `PRE_ROTATE_MESSAGES` 則以內）在送出之後由後台提早換一把、先分完：下一則用的是新的、就緒的那把，
-    /// 🚫 等它到期才在送的路上卡住。
+    /// **不**等它到期才在送的路上卡住。
     #[tokio::test]
     async fn a_key_close_to_expiry_is_replaced_after_a_send_before_the_next_one() {
         let dir = scratch("key-share-rotate");

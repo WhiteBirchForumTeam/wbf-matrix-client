@@ -1,7 +1,7 @@
 //! 進料：`watch`（等新事件）與 `recent`（跨房間把水位之後的事件拉回快取）。
 //!
 //! ⚠️ 這兩個都是**串流**：事件一則一則到，不是一次回一包。所以它們**邊做邊發
-//! [`crate::CoreEvent`]**，回傳值只是收尾的摘要——🚫 不要等全部收齊再回，
+//! [`crate::CoreEvent`]**，回傳值只是收尾的摘要——禁止等全部收齊再回，
 //! 那樣 `watch tail` 永遠不會回來。
 
 use serde::Serialize;
@@ -19,7 +19,7 @@ use crate::{Core, CoreEvent, Target};
 /// `watch` 要等多久、等到什麼為止。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchMode {
-    /// 一直等，🚫 不會自己回來。
+    /// 一直等，**不**會自己回來。
     Tail,
     /// 等這麼多秒就回來。
     Wait { seconds: u64 },
@@ -51,7 +51,7 @@ pub struct RecentSummary {
     pub cg_seq_before: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cg_seq_after: Option<i64>,
-    /// 存不了而被跳過的則數：沒帶 `room_id`（🚫 不猜房間：猜錯會落到查不到的地方，PR #13 審查 salvia🟢2）、
+    /// 存不了而被跳過的則數：沒帶 `room_id`（**不**猜房間：猜錯會落到查不到的地方，PR #13 審查 salvia🟢2）、
     /// 或沒帶 `event_id`／`sender`（`upsert_events` 不寫）。水位照推：它們不是洞，再拿一次還是同一則。
     pub skipped_without_room: usize,
 }
@@ -59,7 +59,7 @@ pub struct RecentSummary {
 impl Core {
     /// 等這個房間的新事件。**每一則發一個 [`CoreEvent::Message`]**。
     ///
-    /// 🚨 **每一則都是「進 queue，由寫入者 commit 之後才發事件」**，🚫 不是「先發、
+    /// 🚨 **每一則都是「進 queue，由寫入者 commit 之後才發事件」**，**不是**「先發、
     /// 最後再一次寫」（PR #32 審查 cirno🔴）。原本那樣有兩個洞：
     ///
     /// - 訂閱者收到通知馬上去讀本地 —— **讀不到那一則**（還沒寫）；寫失敗的話更是
@@ -76,7 +76,7 @@ impl Core {
         target: &Target,
     ) -> Result<WatchSummary, CoreError> {
         let account = self.account_or_current(target)?;
-        // wbf 帳號沒有 /sync 的迴圈：新訊息走 daemon 的訂閱＋推播（第 6 階段）。明講，🚫 不裝成連不上。
+        // wbf 帳號沒有 /sync 的迴圈：新訊息走 daemon 的訂閱＋推播（第 6 階段）。明講，**不**裝成連不上。
         if self.is_wbf_account(&account)? {
             return Err(crate::handles::no_matrix_client_error(
                 &account,
@@ -95,7 +95,7 @@ impl Core {
             }
         };
         let once = matches!(mode, WatchMode::Once { .. });
-        // ⚠️ 寫入者先拿到手：拿不到就**現在**失敗，🚫 不要一路 watch 完才發現一則都沒寫進去。
+        // ⚠️ 寫入者先拿到手：拿不到就**現在**失敗，禁止一路 watch 完才發現一則都沒寫進去。
         let (cache, _) = self.server_cache_and_me(&account)?;
         let mut seen = 0usize;
         let mut on_update = |update: Update| -> WatchControl {
@@ -110,7 +110,7 @@ impl Core {
                 return WatchControl::Continue;
             }
             // 通知給折好的訊息；庫裡存原樣（關係事件也存，/docs/design/messages/edits-and-redactions.md）。
-            let messages = messages_from_incoming(&conversation, &events);
+            let messages = messages_from_incoming(&conversation, &me, &events);
             // 自己送的也發出去（呼叫端自己濾），但 `once` 不把自己的算「第一則」。
             let any_from_others = messages.iter().any(|message| message.sender != me);
             seen += messages.len();
@@ -138,7 +138,7 @@ impl Core {
             }
         };
         let end = backend.watch(since, deadline, &mut on_update).await?;
-        // 空回執：等前面那些都 commit 完才回。🚫 不然單發命令會在寫完之前就結束程序。
+        // 空回執：等前面那些都 commit 完才回。不然單發命令會在寫完之前就結束程序。
         cache.run(|_| Ok(())).await?;
         Ok(WatchSummary {
             since: end.since,
@@ -237,7 +237,7 @@ pub(crate) async fn pull_recent(
      -> Result<(), wbf_sdk::SdkError> {
         batches += 1;
         pulled += raws.len();
-        // Recent 的事件自帶 `room_id`。🚫 沒帶的不猜、不寫——猜錯會落到 room
+        // Recent 的事件自帶 `room_id`。沒帶的**不**猜、**不**寫——猜錯會落到 room
         // "unknown"，之後查不到（PR #13 審查 salvia🟢2）。一個 Batch 寫一次 DB。
         let (with_room, without_room): (Vec<_>, Vec<_>) = raws.into_iter().partition(|raw| {
             raw.get("room_id")
@@ -292,7 +292,7 @@ pub(crate) async fn pull_recent(
         Ok(())
     };
     let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
-    // 回給 UI 之前把這一輪的密文解開、補存明文（🚫 不發 `room.message`：`Recent` 本來就不推，UI 拉完自己讀）。
+    // 回給 UI 之前把這一輪的密文解開、補存明文（**不**發 `room.message`：`Recent` 本來就不推，UI 拉完自己讀）。
     if let Some(engine) = engine {
         for (room, event_ids) in encrypted_by_room {
             let which = crate::room_crypto::StoredToDecrypt::EventIds(event_ids);
@@ -340,7 +340,7 @@ pub(crate) async fn pull_recent(
 
 /// `watch` 的模式字串 → [`WatchMode`]。
 ///
-/// 🚫 認不得的模式**報錯**，不落到某個預設：`watch` 會等很久，落錯模式的人要很久才發現。
+/// 認不得的模式**報錯**，**不**落到某個預設：`watch` 會等很久，落錯模式的人要很久才發現。
 pub fn watch_mode_from_name(
     mode: &str,
     seconds: Option<u64>,
@@ -375,7 +375,7 @@ mod tests {
             watch_mode_from_name("wait", Some(5), None).unwrap(),
             WatchMode::Wait { seconds: 5 }
         );
-        // `wait` 沒帶秒數是用法錯，🚫 不要自己挑一個數字。
+        // `wait` 沒帶秒數是用法錯，禁止自己挑一個數字。
         assert_eq!(
             watch_mode_from_name("wait", None, None).unwrap_err().kind,
             CoreErrorKind::Usage

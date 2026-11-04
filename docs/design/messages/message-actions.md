@@ -2,7 +2,8 @@
 
 > 這份講**送**的那半：UI 叫哪支 RPC、daemon 送出什麼 content、哪些在本地先擋。
 > **收**的那半（edit 怎麼折回目標、redact 怎麼打勾、reaction 怎麼聚合）早就做好了，權威在 /docs/design/messages/edits-and-redactions.md §4–§6，這份不重複。
-> 狀態：形狀已定、**還沒實作**（等維護者說開工）。實作之後 RPC 的權威表搬進 /docs/design/rpc-specs/rpc-spec.md §3.3，這份留理由與 content 的逐字形狀。
+> 狀態：已實作（2026-11-04）。RPC 的權威表在 /docs/design/rpc-specs/rpc-spec.md §3.3，這份留理由與 content 的逐字形狀。
+> 程式碼：content 怎麼組在 `crates/wbf-sdk/src/message_content.rs`（純函式），送出與本地的擋在 `crates/wbf-core/src/message_actions.rs`。
 
 ## 0. 一句話
 
@@ -30,7 +31,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 
 ## 2. RPC
 
-所有的都另帶 `user?`、`server?`，跟其他 RPC 一樣。JSON 是**示意**（還沒實作，跑不出來）。
+所有的都另帶 `user?`、`server?`，跟其他 RPC 一樣。
 
 | method | 參數 | 回應 |
 |---|---|---|
@@ -46,20 +47,26 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 - `room_devices`、`txn_id`、1401／1402 跟 `room.send_text` 同一套（/docs/design/keys/e2ee-rpc.md §3）：加密房必帶 `room_devices`；`txn_id` 沒帶 daemon 產一個；daemon NEVER 自動重送。
 - `room.redact` **沒有** `room_devices`：redaction 在 Matrix 上一律明文（§4.4）。
 
+例（本機 wbfuwunel 實跑，`crates/wbf-daemon/tests/real_server.rs` 的 `message_actions_reply_react_edit_and_redact_between_two_accounts`，明文房；房間與被回覆那則的 id 換成 `<…>`）：
+
 ```jsonc
-→ { "method": "room.send_text", "params": { "room": "!r:localhost", "body": "好", "reply_to": "$abc" } }
-← { "event_id": "$reply1" }
+→ { "method": "room.send_text", "params": { "user": "@alice:localhost", "room": "<room>", "body": "好", "reply_to": "<bob 問的那則>" } }
+← {"code":0,"id":80,"msg":"ok","result":{"event_id":"$7NQBXztO69txToJnpIW1_z6ZWYZxww7qTJBFcAueuqE"}}
 
-→ { "method": "room.edit",   "params": { "room": "!r:localhost", "event_id": "$abc", "body": "改過的字",
-                                        "room_devices": { … room.refresh_devices 回的那份 … } } }
-← { "event_id": "$edit1" }
+→ { "method": "room.react",  "params": { "user": "@alice:localhost", "room": "<room>", "event_id": "<bob 問的那則>", "key": "👍" } }
+← {"code":0,"id":82,"msg":"ok","result":{"event_id":"$mQ-ljzklaEH6IWE5j_n402-4QqZuFpAkn8L4OMvgdrw"}}
 
-→ { "method": "room.react",  "params": { "room": "!r:localhost", "event_id": "$abc", "key": "👍" } }
-← { "event_id": "$react1" }
+→ { "method": "room.edit",   "params": { "user": "@alice:localhost", "room": "<room>", "event_id": "$7NQBXztO69txToJnpIW1_z6ZWYZxww7qTJBFcAueuqE", "body": "好，吃拉麵" } }
+← {"code":0,"id":86,"msg":"ok","result":{"event_id":"$cZStIU2YScVG5egplQ0rdzbcG-YjCUQdEtUvYxTPKgo"}}
 
-→ { "method": "room.redact", "params": { "room": "!r:localhost", "event_id": "$react1" } }   // 收回自己的 👍
-← { "event_id": "$redaction1" }
+→ { "method": "room.redact", "params": { "user": "@alice:localhost", "room": "<room>", "event_id": "$mQ-ljzklaEH6IWE5j_n402-4QqZuFpAkn8L4OMvgdrw" } }   // 收回自己的 👍（`mine`）
+← {"code":0,"id":88,"msg":"ok","result":{"event_id":"$WipZvvwOHlSrVYVd-H7-J4DUVDSdpc4LCdIneMFUg_U"}}
+
+→ { "method": "room.redact", "params": { "user": "@bob:localhost", "room": "<room>", "event_id": "$7NQBXztO69txToJnpIW1_z6ZWYZxww7qTJBFcAueuqE" } }   // bob 收回 alice 的
+← {"code":1400,"data":{"code":"Forbidden","code_id":1302,"errcode":"M_FORBIDDEN","message":"M_FORBIDDEN: User cannot redact this event.","status":403},"id":91,"msg":"server Forbidden (1302): M_FORBIDDEN: User cannot redact this event.","result":null}
 ```
+
+加密房的每一支（`room.redact` 以外）再帶 `room_devices`（`room.refresh_devices` 回的那份），回應形狀一樣。
 
 錯誤：
 
@@ -102,8 +109,10 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 ### 3.3 編輯（`room.edit`）
 
 ```jsonc
+// 沒帶 mentions（`crates/wbf-sdk/src/message_content.rs` 的 `an_edit_without_mentions_notifies_nobody` 逐字釘住）
 { "msgtype": "m.text", "body": "* 改過的字",
-  "m.new_content": { "msgtype": "m.text", "body": "改過的字" },
+  "m.new_content": { "msgtype": "m.text", "body": "改過的字", "m.mentions": {} },
+  "m.mentions": {},
   "m.relates_to": { "rel_type": "m.replace", "event_id": "$abc" } }
 ```
 
@@ -147,7 +156,7 @@ UI 叫一支 RPC，daemon 照 Matrix 的格式包一則事件送出去、回 ser
 | 本身是一般訊息（`class` 是 `msg`），不是另一個 edit | 規格：edit 只能指向原始訊息 |
 | 還在（`is_redacted = 0`） | 已收回的目標，收的那半會丟掉它的 edit（/docs/design/messages/edits-and-redactions.md §5「寫入一個 edit 時」） |
 | 是 `m.room.message`、`msgtype` 是 `m.text` | 規格：edit 跟目標同一個 type；文字以外的這支不做（§1 第 4 條） |
-| 目標是加密的（`decrypted` 有值）→ 這次也要加密送 | 🚨 規格：加密訊息只能用加密的 edit 改 |
+| 目標是加密的（`decrypted` 有值）→ 這次也要加密送 | 🚨 規格：加密訊息只能用加密的 edit 改。wbf 帳號照本地的加密標記送，所以比一次；收到加密事件本來就會把標記往上升，這條是防線。一般 Matrix 帳號由 matrix-sdk 照房間加密 |
 
 ⭐ **為什麼 daemon 擋、不交給 server**：違反這幾條的 edit server 照收，但**每個 client 都會丟掉它**（/docs/design/messages/edits-and-redactions.md §5 最後那張表）。
 送出看起來成功，其實沒人看得到。這跟 `room.send_text`「本地不知道加不加密就報錯」是同一類：擋的是「送出去一定錯」的請求，**不是**替 UI 做選擇。
@@ -171,10 +180,10 @@ daemon **不**檢查目標是誰的、在不在本地：收回別人的訊息要
 
 | | wbf 帳號 | 一般 Matrix 帳號 |
 |---|---|---|
-| 回覆、編輯、表情 | **WS** `Event/Send`（明文房明文；加密房 Megolm、帶 `room_version`） | matrix-sdk：文字與表情 `Room::send_raw`（加密房它自己 Megolm）；附件 `AttachmentConfig` 的 `reply`／`mentions` |
+| 回覆、編輯、表情 | **WS** `Event/Send`（明文房明文；加密房 Megolm、帶 `room_version`） | matrix-sdk 的 `Room::send_raw`（加密房它自己 Megolm）：文字、編輯、表情、附件都是，content 跟 wbf 那條同一份（`message_content.rs` 組的） |
 | 收回 | 橋 `0x14 0x24` | HTTP `PUT …/redact/…` |
 
-📎 「原生 `Event/Send` 收 `m.reaction` 型別」只讀過 server 文件、沒實跑，實作時在 e2e 裡驗。
+📎 原生 `Event/Send` 收 `m.reaction`：2026-11-04 在 e2e 裡對本機 wbfuwunel 實跑過，明文房與加密房都收（加密房的 server 上是 `m.room.encrypted`，`m.relates_to` 在明文那層）。
 
 ### 4.6 送完不寫本地
 
@@ -183,16 +192,19 @@ daemon **不**檢查目標是誰的、在不在本地：收回別人的訊息要
 ## 5. `Reaction.mine`：收的那半要改的
 
 ```jsonc
-// room.history 回的一則訊息（示意）：alice 讀，她自己按過 👍
-"reactions": [ { "key": "👍", "by": ["@alice:localhost", "@bob:localhost"], "mine": "$react1" },
-               { "key": "🎉", "by": ["@bob:localhost"] } ]
+// room.history 回的一則訊息的 reactions（`crates/wbf-core/src/message_actions.rs` 的 `local_history_counts_a_person_once_and_marks_mine` 印出來的）：
+// @a 讀，她自己按過兩次 👍（$first、$again）、bob 按過一次
+"reactions": [ { "key": "👍", "by": ["@a:localhost", "@bob:localhost"], "mine": "$first" } ]
+// bob 讀同一則：沒有 mine（e2e 實跑）
+"reactions": [ { "key": "👍", "by": ["@alice:localhost"] } ]
 ```
 
 - `mine` ＝**讀的那個帳號**（RPC 的 `user`）自己按的那則反應的 `event_id`；沒按過就整欄不帶。
 - 跟 `by` 同一條可見性規則（/docs/design/messages/edits-and-redactions.md §8「讀取」）：還在、這個帳號同步過、沒 hide。
 - **`by` 照人去重**（順手修現在的 bug）：同一個人對同一個 key 有兩則（別的 client 送重了、或 §4.3 那個窗口），現在 `crates/wbf-sdk/src/cache.rs` 的 `list_reactions` 會把他算兩次。
-  去重之後 `mine` 取**最早**的那則（`ORDER BY x.id` 的第一則）。📎 兩則都在時，收回一則之後另一則還在、`mine` 換成它，UI 再點一次就收回它，照切換的規則一樣走得完。
-- 不寫庫的路（`sync=server`、watch 的通知，`event_json::messages_from_incoming`）也要算 `mine`，所以它要知道讀的帳號是誰。
+  去重之後 `mine` 取**最早**的那則：讀本地是寫進來的順序（`ORDER BY x.id` 的第一則）；不寫庫的那條照 `origin_server_ts`（一頁可能是新到舊）。📎 兩則都在時，收回一則之後另一則還在、`mine` 換成它，UI 再點一次就收回它，照切換的規則一樣走得完。
+- 不寫庫的路（`sync=server`、watch 與推播的通知，`event_json::messages_from_incoming`）也算 `mine`，所以它收讀的帳號。
+  這條路的關係事件照 `origin_server_ts` 舊到新套：順便讓同一頁裡有兩個 edit 時是**最新**的贏（以前照頁的順序套，新到舊的頁會讓最舊的贏）。
 
 ## 6. 不在這支
 
@@ -200,8 +212,13 @@ daemon **不**檢查目標是誰的、在不在本地：收回別人的訊息要
 - 已讀（/docs/design/messages/read-receipts.md）。
 - server 的關聯查詢 `0x14 0x26`–`0x29`：關係事件會跟著推播進來，現在用不到。
 
-## 7. 怎麼驗（實作時）
+## 7. 怎麼驗
 
-- **單元**：每支 RPC 用假 server 驗送出的 content **逐字**（§3 的每個例子各一條）；`room.edit` 的 §4.2 每一條拒絕各一條；`m.mentions` 那張表每一列一條；`room.react` 冪等一條；`list_reactions` 去重與 `mine` 各一條。
-- **真 server e2e**：alice 回覆、編輯、按表情、收回表情、收回訊息，明文房、加密房各走一次；bob 用 `room.history` 看到折完的結果——
-  `reply_to` 有值、`edited_by` 有值、`reactions` 先有後沒有、最後那則是 `deleted`；alice 自己讀時 `mine` 有值、收回後沒有。
+| 層 | 測試 | 驗什麼 |
+|---|---|---|
+| sdk（純函式） | `crates/wbf-sdk/src/message_content.rs` 的 tests | §3 的每個例子逐字；§3.2 那張表一列一條；編輯只通知新加的人 |
+| sdk（不寫庫的聚合） | `crates/wbf-sdk/tests/chat_mapping.rs` 的 `the_same_person_pressing_twice_counts_once_and_mine_is_the_earliest` | 新到舊的一頁：`by` 照人去重、`mine` 是最早的、別人讀沒有 `mine` |
+| core（假 server） | `crates/wbf-core/src/message_actions.rs` 的 tests | 回覆送出的 content 逐字；編輯逐字；§4.2 每一條拒絕且什麼都不送；表情冪等（別人的、收回過的不算）；收回走橋 `0x14 0x24`；本地讀的去重與 `mine` |
+| daemon（真 server） | `crates/wbf-daemon/tests/real_server.rs` 的 `message_actions_reply_react_edit_and_redact_between_two_accounts` | alice 回覆、按表情、編輯、收回表情、收回訊息，明文房與加密房各一次；bob 從 `room.history` 看到折完的結果；server 上的原樣關係在明文那層；bob 收回 alice 的是 1400 |
+
+📎 一般 Matrix 帳號那條（matrix-sdk 的 `send_raw`、HTTP 的 `REDACT`）對本機 wbfuwunel 走不到（登入一定走 wbf），只有編得過；`REDACT` 的 HTTP 路徑跟橋同一張表。

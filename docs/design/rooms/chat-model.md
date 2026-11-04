@@ -159,7 +159,7 @@ pub struct MatrixAttachment {
 }
 
 pub struct Edit { pub at: Timestamp, pub by: PeerId }
-pub struct Reaction { pub key: String, pub by: Vec<PeerId> }
+pub struct Reaction { pub key: String, pub by: Vec<PeerId>, pub mine: Option<MessageId> }  // by 一人一次；mine 是讀者自己那則（/docs/design/messages/message-actions.md §5）
 pub struct Formatted { pub html: String }          // 第一版只收不產：我們送純文字，收到別人的 HTML 就帶著
 pub enum SystemEvent { Joined(PeerId), Left(PeerId), Invited { who: PeerId, by: PeerId }, Kicked{..}, Banned{..},
                        NameChanged{..}, TopicChanged{..}, PowerLevelChanged{..}, EncryptionEnabled, Pinned{..}, Other(String) }
@@ -267,7 +267,7 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 | `Deleted` | 收：redacted 事件；送：`delete()` 發 redaction。**內容被清空是 server 行為**；本地快取已經存下的原文與密文不清，只標記（/docs/design/messages/edits-and-redactions.md §2、§6，維護者 2026-09-14） |
 | `Undecryptable` | `m.room.encrypted` 解不開（或這條路不解密）。跟 `Deleted` 一樣是 UI 直接渲染的記號，`decrypted: false`、原因在 `undecryptable_reason`（維護者 2026-09-14） |
 | `Outdated` | 本地快取裡這則目前的 edit，這個帳號還沒同步到（/docs/design/messages/edits-and-redactions.md §5）：手上的版本過時。UI 直接渲染的記號，原文與 edit 內容都**不**給；同步之後就是新版本（維護者 2026-09-14） |
-| `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>` |
+| `reactions` | `m.reaction` 事件，`m.annotation`；adapter 聚合成 `key → Vec<PeerId>`（照人去重），讀者自己按的那則放 `mine`（/docs/design/messages/message-actions.md §5） |
 | `System` | `m.room.member`、`m.room.name`、`m.room.topic`、`m.room.power_levels`、`m.room.encryption`、`m.room.pinned_events`… |
 | `Unsupported` | 其他所有 type。**不丟**，這是 fail-safe：至少讓人看到「這裡有東西」 |
 
@@ -395,7 +395,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
 - 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著。
 
-還沒做：送 edit／delete／reaction／reply（形狀已定：/docs/design/messages/message-actions.md）、已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
+送 edit／delete／reaction／reply 在 /docs/design/messages/message-actions.md。還沒做：已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
 
 ## 7. 還開著的（再議）
 

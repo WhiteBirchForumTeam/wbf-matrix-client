@@ -135,12 +135,18 @@ pub fn matrix_file_message_content(
 ///
 /// Args:
 ///     conversation: room_id，sync 的事件沒帶時補上
+///     reader: 讀的帳號（算 `Reaction.mine`）, example: "@alice:localhost"
 ///     raws: 事件 JSON，照 server 給的順序
 /// Return:
 ///     Vec<Message>  已折進去的 reaction／edit／redaction 事件不在裡面；目標不在這一頁的照原樣留著
-pub fn messages_from_json(conversation: &str, raws: &[serde_json::Value]) -> Vec<Message> {
+pub fn messages_from_json(
+    conversation: &str,
+    reader: &str,
+    raws: &[serde_json::Value],
+) -> Vec<Message> {
     aggregate(
         conversation,
+        reader,
         raws.iter()
             .map(|raw| (message_from_json(raw), relation_of(raw)))
             .collect(),
@@ -152,12 +158,18 @@ pub fn messages_from_json(conversation: &str, raws: &[serde_json::Value]) -> Vec
 ///
 /// Args:
 ///     conversation: room_id，sync 的事件沒帶時補上
+///     reader: 讀的帳號（算 `Reaction.mine`）, example: "@alice:localhost"
 ///     events: 上游那一頁
 /// Return:
 ///     Vec<Message>  沒解開的是 `Unsupported`、`decrypted: Some(false)` 帶原因；已折進去的關係事件不在裡面
-pub fn messages_from_incoming(conversation: &str, events: &[IncomingEvent]) -> Vec<Message> {
+pub fn messages_from_incoming(
+    conversation: &str,
+    reader: &str,
+    events: &[IncomingEvent],
+) -> Vec<Message> {
     aggregate(
         conversation,
+        reader,
         events
             .iter()
             .map(|incoming| {
@@ -298,7 +310,7 @@ pub(crate) fn kind_from_content(
                             caption: matrix_caption(content),
                             attachment,
                         },
-                        // 沒有 mxc、加密描述不完整：當成解不開的檔，顯示 body（🚫 猜成明文）。
+                        // 沒有 mxc、加密描述不完整：當成解不開的檔，顯示 body（**不**猜成明文）。
                         Err(reason) => MessageKind::Unsupported {
                             event_type: format!("{event_type}/{msgtype} ({reason})"),
                             body,
@@ -350,8 +362,8 @@ fn file_attachment(content: &serde_json::Value) -> Result<Attachment, String> {
 }
 
 /// 標準 Matrix 附件的 content（`m.file`／`m.image`…）→ `MatrixAttachment`（/docs/design/rpc-specs/data-plane.md §7.1）。
-/// 有 `file` 就是加密的（`kind` 2）：`file.url` 是 mxc，`v` 要是 `"v2"`，`key`、`iv`、`hashes.sha256` 都要在，少一個就🚫 當成一個檔；
-/// 只有 `url` 是明文的（`kind` 3）。有 `file` 去不完整，🚫 退回 `url` 當明文（那會把密文當明文給出去）。
+/// 有 `file` 就是加密的（`kind` 2）：`file.url` 是 mxc，`v` 要是 `"v2"`，`key`、`iv`、`hashes.sha256` 都要在，少一個就**不**當成一個檔；
+/// 只有 `url` 是明文的（`kind` 3）。有 `file` 去不完整，**不**退回 `url` 當明文（那會把密文當明文給出去）。
 ///
 /// Args:
 ///     msgtype: example: "m.image"
@@ -497,25 +509,34 @@ pub(crate) fn relation_of(raw: &serde_json::Value) -> Option<Relation> {
 
 /// 一頁裡的關係事件折進目標：`m.reaction` 聚合成 `reactions`、`m.replace` 覆蓋內容並標 `edited_by`、redaction 標 `Deleted`。
 /// 目標不在這一頁的關係事件照原樣留著（`Unsupported`），不丟。範圍只有這一頁（/docs/design/rooms/chat-model.md §3.4）。
+/// 關係事件照 `origin_server_ts` 舊到新套（同一個時間照頁裡的順序）：最新的 edit 贏，`mine` 是最早的那則（/docs/design/messages/message-actions.md §5）。
 pub(crate) fn aggregate(
     conversation: &str,
+    reader: &str,
     items: Vec<(Message, Option<Relation>)>,
 ) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::with_capacity(items.len());
-    let mut relations: Vec<(usize, Relation, String)> = Vec::new();
+    let mut relations: Vec<(usize, Relation)> = Vec::new();
     for (mut message, relation) in items {
         if message.conversation == "unknown" {
             message.conversation = conversation.to_string();
         }
-        let sender = message.sender.clone();
         let index = messages.len();
         messages.push(message);
         if let Some(relation) = relation {
-            relations.push((index, relation, sender));
+            relations.push((index, relation));
         }
     }
+    relations.sort_by_key(|(index, _)| messages.get(*index).map_or(0, |message| message.sent_at));
     let mut consumed = vec![false; messages.len()];
-    for (index, relation, sender) in relations {
+    for (index, relation) in relations {
+        // `index` 是上面 push 進 `messages` 時的位置：拿不到就跳過（到不了）。
+        let Some((sender, relation_event_id)) = messages
+            .get(index)
+            .map(|message| (message.sender.clone(), message.id.clone()))
+        else {
+            continue;
+        };
         let target = match &relation {
             Relation::Reaction { target, .. }
             | Relation::Replace { target, .. }
@@ -526,12 +547,22 @@ pub(crate) fn aggregate(
         };
         match relation {
             Relation::Reaction { key, .. } => {
+                let mine = (sender == reader).then_some(relation_event_id);
                 let reactions = &mut target_message.reactions;
                 match reactions.iter_mut().find(|reaction| reaction.key == key) {
-                    Some(reaction) => reaction.by.push(sender),
+                    Some(reaction) => {
+                        // 同一個人按了兩則只算一次；`mine` 留最早的那則。
+                        if !reaction.by.contains(&sender) {
+                            reaction.by.push(sender);
+                        }
+                        if reaction.mine.is_none() {
+                            reaction.mine = mine;
+                        }
+                    }
                     None => reactions.push(Reaction {
                         key,
                         by: vec![sender],
+                        mine,
                     }),
                 }
             }
@@ -544,7 +575,7 @@ pub(crate) fn aggregate(
                 target_message.kind = MessageKind::Deleted { reason };
             }
         }
-        // `index` 是上面 push 進 `messages` 時的位置，`consumed` 跟它等長：`None` 到不了，靜默跳過是設計。
+        // `consumed` 跟 `messages` 等長：`None` 到不了，靜默跳過是設計。
         if let Some(flag) = consumed.get_mut(index) {
             *flag = true;
         }
@@ -608,7 +639,7 @@ mod file_message_content_tests {
             content["body"],
             "file（WBF 分塊檔，需要 WBF client 才能開）"
         );
-        // 進不了事件的區塊（明文模式帶 key）→ Usage，🚫 不送出去。
+        // 進不了事件的區塊（明文模式帶 key）→ Usage，**不**送出去。
         let mut bad = plain_block(None);
         bad.key = Some([7u8; 32]);
         assert!(file_message_content(

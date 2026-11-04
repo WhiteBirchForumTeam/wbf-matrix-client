@@ -43,7 +43,7 @@
 | 文件 | 講什麼 |
 |---|---|
 | [`/docs/design/messages/edits-and-redactions.md`](messages/edits-and-redactions.md) | 原始事件永遠不動、最終內容另存：edit 與 redact 怎麼存、怎麼顯示 |
-| [`/docs/design/messages/message-actions.md`](messages/message-actions.md) | 送的那半：回覆、編輯、表情、收回各送什麼 content、本地先擋什麼；`Reaction.mine` 讓 UI 切換表情（形狀已定、還沒實作） |
+| [`/docs/design/messages/message-actions.md`](messages/message-actions.md) | 送的那半：回覆、編輯、表情、收回各送什麼 content、本地先擋什麼；`Reaction.mine` 讓 UI 切換表情 |
 | [`/docs/design/messages/read-receipts.md`](messages/read-receipts.md) | 已讀的三層：預設沒讀、UI 怎麼標、private／public 由 conf 決定 |
 
 ## `keys/`：E2EE 與金鑰

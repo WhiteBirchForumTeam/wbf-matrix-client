@@ -4,8 +4,8 @@
 //!
 //! - 池開線走一支通用的 [`Core::init_connection`]：hello 之後看角色。`Rooms` 就送 `Event/Subscribe`、起一個收推播的 task；`Keys` 是金鑰那半（`key_sync.rs`）。
 //!   線死了、重開時自然重訂（/docs/design/daemon/link-pool.md §3）。訂閱會話結束（server 送 `Error`）時 socket 可能還活著，池看不出來——
-//!   task 收攤時自己把那格關掉，「重開就重訂」在這條路才成立；🚫 關線不是重訂，重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
-//! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`。**🚫 不碰水位、不記洞、不補窗**。
+//!   task 收攤時自己把那格關掉，「重開就重訂」在這條路才成立；關線**不是**重訂，重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
+//! - **daemon 只管訂閱當下**：一包來寫一包、commit 之後發 `room.message`。**不碰水位、不記洞、不補窗**。
 //! - 水位（`cg_seq`）只由 UI 叫的 `sync.recent` 動；推播漏掉的（server 的 `gap`、本地丟包、一包解不開、寫失敗）**都不管**：
 //!   UI 下次叫 `Recent` 會從它自己決定的起點重拉那一段（冪等），UI 不叫就不補，永遠拿不到也不管。誰記有沒有漏是 UI 層的事。
 //!
@@ -51,7 +51,7 @@ impl Drop for RoomSyncHandle {
     }
 }
 
-/// task 自己握著的東西——🚫 不握 `Core`（task 是 `'static`），也不握線（線在池裡；訂閱是線上的一個會話，guard 放掉之後線照樣能用）。
+/// task 自己握著的東西——**不**握 `Core`（task 是 `'static`），也不握線（線在池裡；訂閱是線上的一個會話，guard 放掉之後線照樣能用）。
 struct RoomSyncTask {
     me: String,
     cache: Arc<ServerCache>,
@@ -273,7 +273,7 @@ impl RoomSyncTask {
             };
             let reason = format!("the room subscription ended: {why}");
             // 訂閱會話結束了 socket 可能還活著（server 送 Error，例如被另一台裝置接手），池的殞死偵測看不出來：
-            // 這裡把那格關掉、池發 closed；下次鉤子（link_keeper.rs）才重開、重訂（🚫 不在這裡重訂）。
+            // 這裡把那格關掉、池發 closed；下次鉤子（link_keeper.rs）才重開、重訂（**不**在這裡重訂）。
             // 線不在池裡（已經被別人關了）就只講一聲。
             if !self.pool.close(LinkRole::Rooms, &reason).await {
                 self.events.emit(CoreEvent::Link {
@@ -301,10 +301,10 @@ impl RoomSyncTask {
         .await;
     }
 
-    /// 一包（Ack 之前推來的也走這裡）：`gap` 只講一聲；寫進 cache（照房分組；加密的有金鑰就解）、commit 之後發 `room.message`。🚫 不碰水位（模組註解）。
+    /// 一包（Ack 之前推來的也走這裡）：`gap` 只講一聲；寫進 cache（照房分組；加密的有金鑰就解）、commit 之後發 `room.message`。**不**碰水位（模組註解）。
     ///
     /// 存不了的（沒 `room_id`：不猜房間；沒 `event_id`／`sender`：`upsert_events` 不寫）在分組時就擋掉——
-    /// 🚫 不進 `by_room`，所以不會替一則不在庫裡的事件發 `room.message`；數出來、講出來（`Note`）。規則只有一份：`storable_identity`。
+    /// **不**進 `by_room`，所以不會替一則不在庫裡的事件發 `room.message`；數出來、講出來（`Note`）。規則只有一份：`storable_identity`。
     async fn on_push(&self, meta: PushMeta, events: Vec<serde_json::Value>) {
         if meta.gap {
             self.events.progress(
@@ -334,7 +334,7 @@ impl RoomSyncTask {
         let notices: Vec<CoreEvent> = by_room
             .iter()
             .flat_map(|(room, events)| {
-                messages_from_incoming(room, events)
+                messages_from_incoming(room, &self.me, events)
                     .into_iter()
                     .map(|message| CoreEvent::Message {
                         user: self.me.clone(),
@@ -389,7 +389,7 @@ mod tests {
     use crate::test_support::*;
     use crate::{Core, CoreEvent, Target};
 
-    /// 模組註解的形狀：`init_connection` 訂了、🚫 沒叫 Recent → 推一包寫進去、`room.message` 在 commit 之後、**水位不動** →
+    /// 模組註解的形狀：`init_connection` 訂了、**沒有**叫 Recent → 推一包寫進去、`room.message` 在 commit 之後、**水位不動** →
     /// 帶 gap 的包、壞包（`bc` 對不上）、下一包都一樣：寫得了的寫、講一聲、水位還是不動 → UI 叫 `sync.recent`（帶 `since`）才動水位、才補回漏的 →
     /// 關訂閱線只關那一條。
     #[tokio::test]
@@ -415,7 +415,7 @@ mod tests {
         assert!(cached_ids(&core, &account)
             .await
             .contains(&"$4801".to_string()));
-        assert_eq!(cg_seq_of(&core, &account).await, None, "🚫 推播不碰水位");
+        assert_eq!(cg_seq_of(&core, &account).await, None, "推播不碰水位");
 
         // server 說有洞（4850 掉了）、一包壞掉、再一包正常：都寫得了的寫、水位還是不動。
         events
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(
             cg_seq_of(&core, &account).await,
             None,
-            "🚫 有洞、壞包、之後的包：水位一樣不動"
+            "有洞、壞包、之後的包：水位一樣不動"
         );
         let ids = cached_ids(&core, &account).await;
         assert!(!ids.contains(&"$4850".to_string()), "漏的 daemon 不補");
@@ -509,7 +509,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 存不了的事件（沒 `sender`）：寫得了的照寫、有 `Note`、🚫 不替它發 `room.message`。
+    /// 存不了的事件（沒 `sender`）：寫得了的照寫、有 `Note`、**不**替它發 `room.message`。
     #[tokio::test]
     async fn an_event_that_can_never_be_stored_is_reported_and_not_announced() {
         let dir = scratch("unstorable");
@@ -544,7 +544,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。task 自己🚫 不重連（重開是看線迴圈的事，/docs/design/daemon/link-pool.md §3.1）。
+    /// 線死了：task 結束、先發一次 `link.state: closed`（不等池下次取用才發現）、`is_room_syncing` 變 false。task 自己**不**重連（重開是看線迴圈的事，/docs/design/daemon/link-pool.md §3.1）。
     #[tokio::test]
     async fn a_dead_line_ends_the_task_and_says_so() {
         let dir = scratch("dead");
@@ -581,7 +581,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// server 收掉訂閱會話、socket 還活著（例如被另一台裝置接手的 `Error`）：task 把那格關掉（池發 `closed` 帶原因）、🚫 不自己重訂；
+    /// server 收掉訂閱會話、socket 還活著（例如被另一台裝置接手的 `Error`）：task 把那格關掉（池發 `closed` 帶原因）、**不**自己重訂；
     /// 下一次開這條線（鉤子的 `ensure_open`，底下是同一支 `acquire`）走 `open` → `init_connection` → 第二個 `Subscribe`、新訂閱收得到（PR #58 審查 rumia #655／cirno #658：
     /// 之前 task 只發事件不關線，池看 socket 還活著就把舊線交回去，永遠不再訂）。
     #[tokio::test]
@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(
             rooms_states,
             vec![LinkState::Opened, LinkState::Closed, LinkState::Opened],
-            "UI 看得到的就是 opened／closed 兩種，🚫 第三種"
+            "UI 看得到的就是 opened／closed 兩種，沒有第三種"
         );
         fake.task.abort();
         fake_again.task.abort();

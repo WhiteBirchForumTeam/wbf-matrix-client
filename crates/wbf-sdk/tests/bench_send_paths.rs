@@ -1,5 +1,5 @@
 //! 同一台 wbfuwunel、同一種加密房，比兩條送訊息的路：wbf（WS ＋ 橋，送出只用分好的金鑰）與 matrix-sdk 的 `Client`（HTTP）。
-//! 量的是每則的延遲與每則打了幾個請求（wbf 數 pack、HTTP 數請求行），🚫 斷言快慢——只印報表。平常 `#[ignore]`；要跑：
+//! 量的是每則的延遲與每則打了幾個請求（wbf 數 pack、HTTP 數請求行），**不**斷言快慢——只印報表。平常 `#[ignore]`；要跑：
 //!
 //! ```text
 //! WBF_E2E_SERVER=http://127.0.0.1:6167 WBF_E2E_USER=alice WBF_E2E_PASSWORD_FILE=<檔> \
@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use wbf_sdk::chat::ChatBackend;
 use wbf_sdk::crypto_engine::{OlmEngine, OutgoingRoomEvent, RoomKeyState, SendOutcome};
 use wbf_sdk::link::Subscription;
 use wbf_sdk::login::{login_with_password, logout, Session};
@@ -577,7 +576,12 @@ async fn compare_sending_over_wbf_and_over_the_matrix_sdk_client() {
         let before = ledger_len(&http_ledger);
         let started = Instant::now();
         matrix
-            .send_text(&matrix_room, &format!("matrix-sdk {index}"))
+            .send_event_content(
+                &matrix_room,
+                "m.room.message",
+                serde_json::json!({ "msgtype": "m.text", "body": format!("matrix-sdk {index}") }),
+                None,
+            )
             .await
             .expect("matrix-sdk send");
         let elapsed = started.elapsed();

@@ -3,11 +3,10 @@
 //! 對上游的依賴，逐條列（每個 PR 要寫的）：
 //! - `Client`（builder、sqlite store、`restore_session`、`sync_once`、`joined_rooms`）
 //! - `MatrixAuth::login_username`（登入拿 device 與 token）
-//! - `Room`（`messages`、`send`、`is_direct`、`power_levels`、`display_name`、`is_encrypted`、成員數）
+//! - `Room`（`messages`、`send_raw`、`is_direct`、`power_levels`、`display_name`、`is_encrypted`、成員數）
 //! - `TimelineEvent`（解密結果：解得開就給明文事件，解不開給原事件加原因）
-//! - ruma 的 `RoomMessageEventContent`／`MessageType::new`（組 `m.room.message`）
 //!
-//! 加密在這一版**完全在 matrix-sdk 裡**（`Room::send` 自己 Megolm、`TimelineEvent` 自己解）：我們沒有直接碰 `OlmMachine`，
+//! 加密在這一版**完全在 matrix-sdk 裡**（`Room::send_raw` 自己 Megolm、`TimelineEvent` 自己解）：我們沒有直接碰 `OlmMachine`，
 //! 這是一般 Matrix 帳號的路；wbf 帳號的 E2EE 引擎在 `crypto_engine.rs`（/docs/design/keys/e2ee-rpc.md）。
 
 use std::path::Path;
@@ -21,19 +20,15 @@ use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
 use matrix_sdk::encryption::recovery::RecoveryState;
 use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
 use matrix_sdk::room::MessagesOptions;
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
 use matrix_sdk::ruma::events::{MessageLikeEventType, StateEventType};
-use matrix_sdk::ruma::{OwnedRoomId, RoomId, UInt, UserId};
+use matrix_sdk::ruma::{OwnedRoomId, OwnedTransactionId, RoomId, UInt, UserId};
 use matrix_sdk::store::StoreConfig;
 use matrix_sdk::{Client, Room, RoomState, SessionMeta};
 use matrix_sdk::{SqliteCryptoStore, SqliteStateStore, SqliteStoreConfig};
 
-use crate::chat::{
-    Attachment, ChatBackend, Conversation, ConversationKind, Update, WatchControl, WatchEnd,
-};
+use crate::chat::{ChatBackend, Conversation, ConversationKind, Update, WatchControl, WatchEnd};
 use crate::error::SdkError;
-use crate::event_json::file_message_content;
 use crate::incoming::{EventPage, IncomingEvent};
 use crate::login::Session;
 use crate::login::SessionBackend;
@@ -66,7 +61,7 @@ impl MatrixBackend {
     /// Args:
     ///     server: example: "http://localhost:6167"
     ///     user: mxid 或 localpart
-    ///     password: 🚫 不印、不 log
+    ///     password: **不**印、**不** log
     ///     store_dir: example: "<data dir>/wbf-cli/matrix"
     ///     store_key: example: vault.matrix_store_key()
     /// Return:
@@ -158,7 +153,7 @@ impl MatrixBackend {
     /// Return:
     ///     Ok(bool)     true ＝ 加密房
     ///     Err(Usage)   不在這個房（或還沒同步到）
-    ///     Err(...)     問 server 失敗：🚫 猜成明文房
+    ///     Err(...)     問 server 失敗：**不**猜成明文房
     pub async fn is_room_encrypted(&self, id: &str) -> Result<bool, SdkError> {
         let state = self
             .room(id)?
@@ -168,20 +163,30 @@ impl MatrixBackend {
         Ok(state.is_encrypted())
     }
 
-    /// 送一則 `m.room.message`（加密房由 matrix-sdk 用 Megolm 加密）。內容由呼叫者組好、驗過（例 `event_json::matrix_file_message_content`）。
+    /// 送一則事件，content 原樣送（`Room::send_raw`；加密房由 matrix-sdk 用 Megolm 加密，`m.relates_to` 留在明文那層）。
+    /// 內容由呼叫者組好、驗過（例 `event_json::matrix_file_message_content`、`message_content::to_edit_content`），wbf 帳號的 `Event/Send` 送的是同一份。
     ///
+    /// Args:
+    ///     event_type: example: "m.room.message"
+    ///     content: example: json!({"msgtype":"m.text","body":"hi"})
+    ///     txn_id: 重送用同一個（server 冪等）；None 由 matrix-sdk 產一個, example: Some("wbf-1727600000-3")
     /// Return:
     ///     Ok(String)   event_id
-    ///     Err(Usage)   內容不是 `m.room.message` 認得的形狀、不在這個房
-    pub async fn send_message_content(
+    ///     Err(Usage)   不在這個房
+    pub async fn send_event_content(
         &self,
         id: &str,
+        event_type: &str,
         content: serde_json::Value,
+        txn_id: Option<&str>,
     ) -> Result<String, SdkError> {
         let room = self.room(id)?;
-        let content: RoomMessageEventContent = serde_json::from_value(content)
-            .map_err(|error| SdkError::Usage(format!("message content: {error}")))?;
-        let response = room.send(content).await.map_err(matrix_error)?;
+        let txn_id: Option<OwnedTransactionId> = txn_id.map(OwnedTransactionId::from);
+        let mut sending = room.send_raw(event_type, content);
+        if let Some(txn_id) = &txn_id {
+            sending = sending.with_transaction_id(txn_id);
+        }
+        let response = sending.await.map_err(matrix_error)?;
         Ok(response.response.event_id.to_string())
     }
 
@@ -229,7 +234,7 @@ impl MatrixBackend {
             my_power_level,
             can_send_message,
             direct_peer,
-            // Client 的 store 算的，🚫 拿整份狀態：`room.get` 另外問（wbf-core 的 rooms_ops.rs），列表就是 null（chat.rs）。
+            // Client 的 store 算的，**不**拿整份狀態：`room.get` 另外問（wbf-core 的 rooms_ops.rs），列表就是 null（chat.rs）。
             state: None,
         })
     }
@@ -291,7 +296,7 @@ impl MatrixBackend {
     /// Args:
     ///     room_ids: example: &["!r:localhost".to_string()]
     /// Return:
-    ///     HashMap<String, Membership>  store 裡沒有、或 id 解不開的🚫 列（呼叫端當 `leave`）
+    ///     HashMap<String, Membership>  store 裡沒有、或 id 解不開的**不**列（呼叫端當 `leave`）
     pub fn find_memberships(
         &self,
         room_ids: &[String],
@@ -342,7 +347,7 @@ impl ChatBackend for MatrixBackend {
         self.describe(&room).await
     }
 
-    /// ⚠️ `before` 是 **`event_id`**，🚫 不是 server 的翻頁 token（/docs/design/rooms/chat-model.md §4.3：`event_id` 是可攜的權威）。
+    /// ⚠️ `before` 是 **`event_id`**，**不是** server 的翻頁 token（/docs/design/rooms/chat-model.md §4.3：`event_id` 是可攜的權威）。
     /// 標準 Matrix 沒有「從某則事件往前翻」的 API，所以分兩步：
     ///
     /// 1. `/context/{event_id}` 拿到**那一則之前**的 token（`prev_batch_token`）；
@@ -350,7 +355,7 @@ impl ChatBackend for MatrixBackend {
     ///
     /// ⭐ 所以**不必暫存 token**：任何一則事件都拿得到它的位置，代價是每頁多一次請求。
     /// ⚠️ `/context` 的 `limit` 給 0，但有的 server 會把 0 當預設值、照樣回 `events_before` ——
-    /// 那些就是緊鄰錨點的更舊事件，🚫 不能丟，所以接在這一頁的最前面。
+    /// 那些就是緊鄰錨點的更舊事件，**不能**丟，所以接在這一頁的最前面。
     async fn history(
         &self,
         id: &str,
@@ -392,33 +397,6 @@ impl ChatBackend for MatrixBackend {
             timeline.extend(messages.chunk);
         }
         Ok(page_from_timeline(&timeline))
-    }
-
-    async fn send_text(&self, id: &str, body: &str) -> Result<String, SdkError> {
-        let room = self.room(id)?;
-        let response = room
-            .send(RoomMessageEventContent::text_plain(body))
-            .await
-            .map_err(matrix_error)?;
-        Ok(response.response.event_id.to_string())
-    }
-
-    /// ⚠️ 附件宣告（/docs/design/media/wbf-client-convention-for-chunk.md §5.2）這條路帶不出去：`Room::send` 不能加 header。
-    /// 所以 server 的媒體計數不會 +1，這則的附件過保護期會被清。呼叫者要知道這件事，CLI 會印警告。
-    /// wbf 帳號不走這裡：它走 `Event/Send` 宣告附件（wbf-core 的 `upload_ops.rs`）。
-    async fn send_file(
-        &self,
-        id: &str,
-        attachment: &Attachment,
-        caption: Option<&str>,
-    ) -> Result<String, SdkError> {
-        let room = self.room(id)?;
-        // content 跟 wbf 那條路（`Event/Send`）同一份：兩邊送出去的事件一模一樣，只有路不同。
-        let content: RoomMessageEventContent =
-            serde_json::from_value(file_message_content(attachment, caption)?)
-                .map_err(|error| SdkError::Usage(format!("file event content: {error}")))?;
-        let response = room.send(content).await.map_err(matrix_error)?;
-        Ok(response.response.event_id.to_string())
     }
 
     async fn watch(
@@ -500,7 +478,7 @@ impl ChatBackend for MatrixBackend {
 /// `key-backup recovery` 之前，server 上那份**換一台機器也解不開**（它防的是本機 crypto.db 壞掉，
 /// 不是換裝置）。這句話要出現在警告與 `logout` 的閘門裡。
 ///
-/// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，🚫 不一開機就全下載。
+/// `backup_download_strategy`：解不開某則訊息時才去 backup 拿那把金鑰，**不**一開機就全下載。
 ///
 /// Args:
 ///     server_backup: conf 的 `SERVER_BACKUP`（/docs/design/rpc-specs/wbf-cli-spec.md §10）, example: true
@@ -512,13 +490,13 @@ fn backup_encryption_settings(server_backup: bool) -> EncryptionSettings {
         // ⚠️ cross-signing 不跟著關：`SERVER_BACKUP=off` 說的是「不要上傳房間金鑰」，
         // 不是「不要驗裝置」。把兩件事綁在一起會讓關掉備份的人連裝置驗證都沒了。
         auto_enable_cross_signing: true,
-        // 🚫 下載策略也不跟著關：server 上**已經有**的 backup（之前開著時傳的、或別台傳的）
+        // 下載策略也**不**跟著關：server 上**已經有**的 backup（之前開著時傳的、或別台傳的）
         // 仍然該在解不開訊息時派上用場。關掉的是「往上傳」，不是「往下拿」。
         backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
     }
 }
 
-/// `key-backup status` 印的東西（/docs/design/rpc-specs/wbf-cli-spec.md §3.6）。🚫 不含任何金鑰內容。
+/// `key-backup status` 印的東西（/docs/design/rpc-specs/wbf-cli-spec.md §3.6）。**不**含任何金鑰內容。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackupStatus {
     /// server 上有沒有 backup version。
@@ -531,7 +509,7 @@ pub struct BackupStatus {
     /// ⚠️ **它不代表使用者手上真的有那串 recovery key**：跑過 `key-backup recovery`、
     /// 印出來、然後沒抄下來就關掉終端，這個欄位一樣是 true。技術上沒有辦法驗證那件事
     /// （維護者 2026-09-09 問到這點）。所以欄位叫 `recovery_enabled` 而不是
-    /// `has_recovery_key`——🚫 名字不要承諾我們驗不到的事。
+    /// `has_recovery_key`——名字禁止承諾我們驗不到的事。
     ///
     /// **只有 `Enabled` 算數**：`Unknown`、`Incomplete`、`Disabled` 一律當作沒有
     /// （fail closed，/docs/design/keys/room-key-backup.md §7 的閘門靠這個判斷）。
@@ -556,7 +534,7 @@ impl MatrixBackend {
         Ok(BackupStatus {
             exists_on_server,
             enabled_locally: backups.are_enabled().await,
-            // 🚫 不寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（/docs/design/keys/room-key-backup.md §7）。
+            // 禁止寫成「不是 Disabled 就算有」：新增一種狀態就會默默放行（/docs/design/keys/room-key-backup.md §7）。
             recovery_enabled: matches!(recovery_state, RecoveryState::Enabled),
             recovery_state: format!("{recovery_state:?}"),
         })
@@ -591,7 +569,7 @@ impl MatrixBackend {
     /// Args:
     ///     path: example: room_keys::snapshot_path(&account.dir)
     ///     temp_path: example: room_keys::snapshot_temp_path(&account.dir)
-    ///     passphrase: 🚫 不印、不 log, example: room_keys::snapshot_passphrase(&key)
+    ///     passphrase: **不**印、**不** log, example: room_keys::snapshot_passphrase(&key)
     /// Return:
     ///     Ok(u64)      快照有多少 byte
     ///     Err(Usage)   store 開不了、寫不進去
@@ -651,7 +629,7 @@ impl MatrixBackend {
     /// 跑完之後 `backup_download_strategy` 才有東西可以下載：解不開的訊息會自動去 backup 拿金鑰。
     ///
     /// Args:
-    ///     recovery_key: 🚫 不印、不 log
+    ///     recovery_key: **不**印、**不** log
     /// Return:
     ///     Ok(())        恢復了
     ///     Err(Network)  key 不對、或問不到 server
@@ -667,7 +645,7 @@ impl MatrixBackend {
     /// 產生 recovery key（`key-backup recovery`）。設好之後 server 上那份備份**換裝置也解得開**。
     ///
     /// Return:
-    ///     Ok(String)   recovery key，🚫 只印一次、不寫檔、不進 log
+    ///     Ok(String)   recovery key，只印一次、**不**寫檔、**不**進 log
     ///     Err(Network) server 不收
     pub async fn enable_recovery(&self) -> Result<String, SdkError> {
         self.client
@@ -688,7 +666,7 @@ async fn build_client(
     std::fs::create_dir_all(store_dir)?;
     // `key(...)` 走 `StoreCipher::open_with_key`：沒有 PBKDF2，密碼那一層在 Vault 做過了（/docs/design/storage/local-cache-db.md §4.3）。
     let sqlite_config = SqliteStoreConfig::new(store_dir).key(Some(store_key.as_bytes()));
-    // 🚫 不用 `sqlite_store_with_config_and_cache_path`：它四個 store 都開成 sqlite 檔。
+    // **不**用 `sqlite_store_with_config_and_cache_path`：它四個 store 都開成 sqlite 檔。
     // 我們只要 state（sync 位置、房間狀態）與 crypto（金鑰）落地；event cache 與 media 留在 `StoreConfig` 預設的記憶體版——
     // 聊天紀錄的權威是 cache.db、媒體在我們自己的池（維護者 2026-09-30，/docs/design/storage/local-cache-db.md §4.1）。
     let state_store = SqliteStateStore::open_with_config(&sqlite_config)
@@ -750,7 +728,7 @@ fn matrix_error(error: matrix_sdk::Error) -> SdkError {
             code: kind.errcode().to_string(),
             message: error.to_string(),
             meta: serde_json::json!({ "status": status }),
-            // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+            // **不是** wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
             code_id: None,
         };
     }
@@ -776,10 +754,10 @@ enum ContextPlan<T> {
 ///
 /// ⭐ **截掉的不會被跳過**：下一頁的錨是**這一頁最舊那則的 `event_id`**（`next_anchor_of`），
 /// 下一次會對它重新 `/context` —— 被截掉的那幾則比它舊，下一頁自然拿到。
-/// 🚫 所以截掉之後**不能**再從 `prev_batch_token` 接 `/messages`：那個 token 在**整串** `events_before` 之前，
+/// 所以截掉之後**不能**再從 `prev_batch_token` 接 `/messages`：那個 token 在**整串** `events_before` 之前，
 /// 接下去會跳過被截掉的那段。
 ///
-/// 🚨 沒有 token ＝ 那一則之前已經沒有東西（房間的開頭）：🚫 不再用 `from: None` 去問，那會拿到最新一頁、看起來像成功。
+/// 🚨 沒有 token ＝ 那一則之前已經沒有東西（房間的開頭）：**不**再用 `from: None` 去問，那會拿到最新一頁、看起來像成功。
 ///
 /// Args:
 ///     events_before: `/context` 回的緊鄰更舊事件，新到舊, example: vec![e9, e8, e7]
@@ -884,7 +862,7 @@ mod context_plan_tests {
         assert_eq!(
             plan_after_context(events_before, true, 1),
             ContextPlan::Done(vec![9]),
-            "最多 1 則，而且是最新（緊鄰錨點）的那則；🚫 不從 token 接，那會跳過被截掉的 8…0"
+            "最多 1 則，而且是最新（緊鄰錨點）的那則；不從 token 接，那會跳過被截掉的 8…0"
         );
     }
 
@@ -907,7 +885,7 @@ mod context_plan_tests {
         );
     }
 
-    /// 沒有 token ＝房間的開頭：🚫 不再問（`from: None` 會拿到最新一頁），也🚫 不超過 limit。
+    /// 沒有 token ＝房間的開頭：**不**再問（`from: None` 會拿到最新一頁），也**不**超過 limit。
     #[test]
     fn no_token_means_the_start_of_the_room_and_still_respects_the_limit() {
         assert_eq!(
