@@ -1,7 +1,7 @@
 # 已讀有三層（維護者 2026-09-13 給方向、2026-11-05 定形狀）
 
 > 這份講「已讀」怎麼分層、UI 怎麼標已讀與拿未讀數、送上游的回條是 private 還是 public、conf 怎麼重讀。從 /docs/design/daemon/daemon-runtime.md 拆出來。
-> 現況：形狀 2026-11-05 定，**還沒實作**（`room.read`、`room.get` 的 `unread`、`READ_RECEIPTS`、`daemon.reload_conf`）。`cache.rs` 已有 `read_positions` 表與 `set_read_position`／`get_read_position`，還沒有 RPC 叫它們。
+> 現況：形狀 2026-11-05 定，**還沒實作**（`room.read`、`room.get` 的 `unread`、`READ_RECEIPTS`、`daemon.reload_conf`）。`cache.rs` 已有 `read_positions` 表與 `set_read_position`／`get_read_position`，還沒有 RPC 叫它們；`set_read_position` 現在是直接蓋掉，還**不**是只往前（§2.2）。`events.is_state`（§2.1）也還沒加。
 
 「已讀」在這個系統裡指過三件**不同**的事，混在一起講是下一個 bug 的溫床：
 
@@ -35,7 +35,11 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 
 水位之後（照房間內的順序 `r_seq`）、而且同時是：
 
-- **訊息**：`class` 是 `msg`、**不**是狀態事件（有 `state_key` 的不算）。edit、表情、收回本身都不算（它們是改別則的關係事件）。
+- **訊息**：`class` 是 `msg`，或是 `general`（解不開的加密事件）。edit、表情、收回本身都不算（它們是改別則的關係事件）。
+  - **狀態事件也算**（改房名、成員進出……，`classify` 本來就把它們標成 `msg`）：它也是房間裡的一則，先方便為主，有需要再改（維護者 2026-11-05）。
+    為了「再改」只動查詢，`events` 先多存一欄 `is_state`（schema v12，`state_key` 有沒有出現）；這版的查詢**不**看它。
+  - **解不開的也算**（維護者 2026-11-05）：只看水位之後有幾則，**不**管那一則解開了沒。
+    ⚠️ 所以一則還沒解開的表情、edit、收回會先被算進去；解開之後它變成關係事件，就不再算，未讀數會少一。
 - **別人送的**：這個帳號自己送的不算（別台裝置送的也是自己）。
 - **還在**：已經被收回的不算。
 
@@ -43,7 +47,7 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 
 - 沒有水位那一列（從沒標過）→ 快取裡這間房所有該算的都是未讀（§1）。
 - ⚠️ **只數快取裡有的**：快取有洞時（`/docs/handover.md` §7 那個「`[last_ls, 舊水位)` 的永久洞」）未讀數會**偏少**。
-  **不**拿 `r_seq` 相減：`r_seq` 連狀態事件、表情、自己送的都編號，相減會**偏多**，而且多出來的那幾則 UI 點進去找不到。
+  **不**拿 `r_seq` 相減：`r_seq` 連表情、edit、自己送的都編號，相減會**偏多**，而且多出來的那幾則 UI 點進去找不到。
 - 未讀數是**算出來的**，**不**存、**不**是推播欄位。UI 收到 `room.message` 之後**重新讀一次**（本地讀，毫秒），
   禁止自己 +1 —— 自己加會在多裝置、多前端的情況下漂掉。
 
