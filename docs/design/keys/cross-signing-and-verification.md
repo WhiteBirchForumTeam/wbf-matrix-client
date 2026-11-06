@@ -1,6 +1,6 @@
 # 交叉簽章、裝置驗證、金鑰備份：wbf 帳號補齊（草稿）
 
-> 現況：**草稿**（2026-11-07），等維護者看過、說開工。§10 是要點頭的地方。
+> 現況：維護者 2026-11-07 核可（§10 五點照草稿）、開工；驗收項目在 §11。
 > 補的是 /docs/design/keys/e2ee-rpc.md §8 列的缺口：交叉簽章、wbf 帳號的金鑰備份、向自己其他裝置要金鑰；加上 /docs/handover.md §7 第 2 項剩下的裝置驗證。
 
 ## 0 範圍
@@ -59,7 +59,7 @@
 | RPC | wbf 帳號做什麼 |
 |---|---|
 | `backup.create_recovery_key` | `SecretStorageKey::new` → 寫 `m.secret_storage.key.<id>` 與 `m.secret_storage.default_key` → 把四個秘密（`m.cross_signing.master`／`self_signing`／`user_signing`、`m.megolm_backup.v1`）加密寫進 account data → 封進 `<data dir>/r/`（/docs/design/keys/room-key-backup.md §8）→ 回 `{ recovery_key }`，只回這一次 |
-| `backup.restore` | 拿 `r/` 封著的 key 打開 secret storage → `import_cross_signing_keys`（這台用 self-signing key 簽自己、上傳簽章 → **這台變成已驗證**）→ 存備份解密金鑰、`enable_backup_v1` → 下載全部備份、解密、`import_room_keys` → 走既有的「金鑰到了補解」（/docs/design/keys/e2ee-rpc.md §6），解開的發 `room.message` |
+| `backup.restore { recovery_key? }` | 拿 recovery key 打開 secret storage：有帶就用帶的（換機器時這台的 `r/` 沒有；用成功才封進 `r/`），沒帶就用 `r/` 封著的 → `import_cross_signing_keys`（這台用 self-signing key 簽自己、上傳簽章 → **這台變成已驗證**）→ 存備份解密金鑰、`enable_backup_v1` → 下載全部備份、解密、`import_room_keys` → 走既有的「金鑰到了補解」（/docs/design/keys/e2ee-rpc.md §6），解開的發 `room.message` |
 | `backup.status` | 欄位照舊；`recovery_state` 從「secret storage 有沒有、這台有沒有四個秘密」算 |
 | `backup.save`／`backup.import`（本地快照） | 上游 `export_room_keys`＋`encrypt_room_key_export` 有，接上同一個 `k/snapshot` |
 
@@ -132,7 +132,7 @@
 - QR 驗證（要開上游的 `qrcode` feature）、在房間裡驗證「別人這個人」。
 - recovery 的 passphrase 版、刪除 server 上的備份版本。
 
-## 10 要維護者點頭的
+## 10 維護者點頭的（2026-11-07 核可）
 
 1. **交叉簽章與備份版本：第一台裝置自動建**（§3、§4.1），跟一般帳號的 `auto_enable_*` 一致。
 2. **備份上傳：wbf 帳號由 `Keys` 線後台自動做**（§4.1），不再是命令觸發；`backup.upload` 變成「等追平」。
@@ -140,8 +140,39 @@
 4. **開 `automatic-room-key-forwarding`**（§7）。
 5. **RPC 形狀**：`verify.*` 六支、`verify.state` 推播、`devices.list`（§5.1、§6）。
 
-## 11 怎麼驗（計畫）
+## 11 驗收（維護者 2026-11-07：先寫進文件、寫完自主驗證）
 
-- sdk：端點表新列的前 4 bytes 逐 byte 釘；secret storage 那層對上游 `SecretStorageKey` 來回加解密。
-- core 假 server：bootstrap 送三個請求的順序、server 已有 master 時不建；備份上傳迴圈；restore 解密匯入後補解。
-- 真 server（本機 wbfuwunel）：alice 第一台登入 → 自動有交叉簽章與備份版本 → `backup.create_recovery_key` → 第二台登入、兩邊 `verify.*` 走完（測試比對兩邊表情一樣）→ 第二台 `devices.list` 看到自己已驗證、拿到備份金鑰；第三台登入 `backup.restore` → 讀得到登入前的加密訊息。
+每一條都要有一個測試對應；做完在 PR 裡逐條填「哪個測試、結果」。**真 server 那組才是驗收本體**，單元與假 server 的是讓壞掉時知道壞在哪一層。
+
+### 11.1 真 server（本機 wbfuwunel，daemon 的 `real_server.rs`，`--ignored`）
+
+同一個帳號開多台裝置＝多個 daemon handle、各自的資料目錄。
+
+| # | 情境 | 通過的條件 |
+|---|---|---|
+| V1 | alice 第一台（A1）登入、開線 | server 上 alice 有 master／self-signing／user-signing（另一個 client 的 `KeysQuery` 看得到）；有備份版本（`LATEST_BACKUP_INFO`）；A1 的 `devices.list(alice)` 裡 A1 是 `verified` |
+| V2 | A1 在跟 bob 的加密房送一則，`backup.upload` | 回來之後 server 那份備份的 `count` ≥ 1 |
+| V3 | A1 `backup.create_recovery_key` | 回一串 recovery key；account data 有 `m.secret_storage.default_key` 與它指的 key；四個秘密都在 |
+| V4 | alice 第二台（A2）登入 | A2 **不**建新的 master（server 上的 master 公鑰跟 V1 一樣）；A2 的 `devices.list(alice)` 裡 A2 **不是** `verified`；A2 讀 V2 那則是解不開的 |
+| V5 | A2 `verify.request`（自己）→ A1 收到 `verify.state requested` → A1 `verify.accept` → A2 `verify.start_sas` → A1 `verify.accept` | 兩邊都推 `keys_exchanged`，**兩邊的 7 個表情逐一相同** |
+| V6 | 兩邊 `verify.confirm` | 兩邊都推 `done`；A1 與 A2 的 `devices.list(alice)` 裡兩台都 `verified` |
+| V7 | V6 之後（不叫任何 RPC） | A2 自動拿到備份金鑰、還原：收到 V2 那則的 `room.message`（同一個 `event_id`、解開的） |
+| V8 | alice 第三台（A3）登入，`backup.restore { recovery_key }`（V3 那串） | A3 變成 `verified`；讀得到 V2 那則 |
+| V9 | A3 用**錯的** recovery key `backup.restore` | 回錯誤；A3 **仍然不是** `verified`、什麼都沒匯入（fail closed） |
+| V10 | bob 對 alice 的 A1 `verify.request { user_id: alice, device_id: A1 }`，兩邊走完 SAS | bob 的 `devices.list(alice)` 裡 A1 是 `verified`、`identity_verified` 是 `true` |
+| V11 | 向自己裝置要金鑰：另一個帳號（carol），兩台都是 conf `SERVER_BACKUP=off`（沒有備份可還原，只剩這條路）。C1 在加密房送一則 → C2 登入、跟 C1 自我驗證 → C2 讀那則 | C2 收到那則解開的 `room.message`（金鑰是 C1 轉過來的） |
+| V12 | `verify.cancel` 中途取消 | 兩邊都推 `cancelled`；之後那個 `flow_id` 的 `verify.confirm` 回錯誤 |
+
+### 11.2 單元與假 server
+
+| 層 | 驗什麼 |
+|---|---|
+| sdk | 端點表新列的前 4 bytes 逐 byte 釘；secret storage 那層：建 → 寫進 account data 的內容 → 用同一把 key 讀回四個秘密；錯的 key → 錯誤、**不**回任何秘密；沒有 `default_key` → 沒有 secret storage |
+| core 假 server | server 沒有 master → 送 `SIGNING_KEYS_UPLOAD` 再送 `SIGNATURES_UPLOAD`（順序）；已經有 → 什麼都不送；沒有備份版本 → 建；有版本但這台沒金鑰 → **不**建、**不**上傳；`SERVER_BACKUP=off` → 不建不傳；簽章回覆的 `failures` 不是空的 → 回錯誤 |
+| daemon | `verify.*`、`devices.list`、`backup.restore` 的壞參數是 102；`verify.state` 推播的形狀；`daemon.info` 之類既有的不受影響 |
+
+### 11.3 收尾
+
+- 全套測試、clippy（`-D warnings`）各一次；真 server e2e 整套（含舊的 20 條）。
+- 變異驗證（先 commit）：至少拿掉「server 有 master 就不建」、「錯的 recovery key 不匯入」、「`failures` 不是空的就錯」、「`SERVER_BACKUP=off` 不上傳」各一次，對應的測試要紅。
+- **沒驗到的老實寫**：一般 Matrix 帳號那條（本機 server 走不到 HTTP 的那幾個端點）。
