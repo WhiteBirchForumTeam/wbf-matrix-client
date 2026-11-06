@@ -16,7 +16,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 ## 0.1 兩個 binary 的名字（維護者 2026-09-10 定）
 
 ⚠️ 拆開之後**兩支 binary 都有命令列介面**，所以「CLI」這個詞從此不指任何一個——
-🚫 文件裡不要單獨寫 CLI，那會同時包含兩者。
+文件裡禁止單獨寫 CLI，那會同時包含兩者。
 
 | 角色 | 正式名稱 | 文件裡寫 |
 |---|---|---|
@@ -26,10 +26,10 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 📎 為什麼不叫 kernel（初稿的名字）：跟 Linux kernel 打架。
 📎 為什麼簡稱不縮成 `rpc`：RPC 是**協議**的名字（這一章、`/docs/design/rpc-specs/rpc-spec.md`、「走 RPC 還是 uniffi」），
 拿去當 binary 的名字之後，「RPC 掛了」就分不出是協議還是那支程式——正是這一節要根除的那種語病。
-📎 `server` 這個字在這個 repo 已經指過 homeserver 與 wbfuwunel，🚫 不要再拿它指這裡的任何東西。
+📎 `server` 這個字在這個 repo 已經指過 homeserver 與 wbfuwunel，禁止再拿它指這裡的任何東西。
 
 命令的「做什麼」全部在 `crates/wbf-core`。⚠️ `apps/wbf-cli`（binary 也叫 `wbf-cli`）現在是「解析參數 → 叫一個 core 方法 → 印 JSON」，
-還不是 rpc-cli；改走 RPC 的那一步才改名，🚫 先改名只會製造一次沒有內容的大 diff（§6）。
+還不是 rpc-cli；改走 RPC 的那一步才改名，禁止先改名：那只會製造一次沒有內容的大 diff（§6）。
 
 ## 0.2 daemon 的命令列就是 RPC 的內部入口（維護者 2026-09-12 定）
 
@@ -39,10 +39,10 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 |---|---|
 | `-s`（`--serve`） | **常駐**：開本地 RPC 的 WS（/docs/design/rpc-specs/local-interface.md）與資料平面，等前端來連。**大多數時候是這個** |
 | 沒有 `-s`、帶了一個命令（`daemon <命令> <參數>`） | **單發**：起一次、執行那一個命令、就死。**測試性質**（除錯、腳本、驗收），不是日常操作。還沒做：現在帶命令會印 not implemented、exit 1 |
-| **兩個都帶** | 🚫 **報錯** —— 它們是兩種不同的起法，不是「以某一邊為準」。使用者搞錯了，我們🚫 不替他猜 |
-| 兩個都沒帶 | 🚫 報錯（沒事可做） |
+| **兩個都帶** | **報錯** —— 它們是兩種不同的起法，不是「以某一邊為準」。使用者搞錯了，我們**不**替使用者猜 |
+| 兩個都沒帶 | 報錯（沒事可做） |
 
-⭐ 這條寫進型別裡（`StartMode`，`crates/wbf-daemon/src/main.rs`），🚫 不散在各處 `if cli.serve`：兩種起法的差別
+⭐ 這條寫進型別裡（`StartMode`，`crates/wbf-daemon/src/main.rs`），禁止散在各處寫 `if cli.serve`：兩種起法的差別
 **不只是要不要開 port**，還包括要不要拿寫權、要不要寫 `daemon.json`、要不要宣告 ready。
 
 **資料目錄的獨佔：OS 鎖＋寫權**（維護者 2026-09-13）。要寫資料目錄的程序（daemon、`apps/wbf-cli`）對 `<data dir>/daemon.lock` 拿一把 OS 層的鎖
@@ -64,29 +64,29 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 
 | 起法 | 什麼時候拿 |
 |---|---|
-| `-s` | **啟動的第一件事**（`-s` 就是「我要寫」的意思）。拿不到就不啟動 —— 🚫 不要起來之後才發現寫不了 |
-| 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（/docs/design/rpc-specs/rpc-spec.md §5.1），🚫 不重試、🚫 不降級成唯讀跑一半 |
-| `--version` 這類 | 🚫 **不拿**：它連讀都不用（clap 印完就結束，根本走不到資料目錄） |
+| `-s` | **啟動的第一件事**（`-s` 就是「我要寫」的意思）。拿不到就不啟動 —— 禁止起來之後才發現寫不了 |
+| 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（/docs/design/rpc-specs/rpc-spec.md §5.1），**不**重試、**不**降級成唯讀跑一半 |
+| `--version` 這類 | **不拿**：它連讀都不用（clap 印完就結束，根本走不到資料目錄） |
 
 **檢查點只有一個**：`Handle::call()` 進 dispatch 之前。判準是**反過來寫**的 ——
 只有「正面認得、確定只在記憶體裡動」的那幾個（`hello`、`daemon.info`／`set_encryption`／`shutdown`）
 算唯讀，**其餘一律要寫權**。⭐ 這樣新加一個 method 而忘了想它的人，得到的是「被要求拿鎖」，
-🚫 不是「靜靜地寫進別人的資料庫」。
+**不是**「靜靜地寫進別人的資料庫」。
 📎 名單短是刻意的：`account.list` 要開 vault 解目錄名、`room.list` 會讓 matrix-sdk 的 store 寫東西
 —— **看起來像唯讀的其實都會寫**。
 
 - 為什麼要鎖：`cache.db` 開在 WAL 模式（SQLite 本來就支援多程序併發）、port 預設隨機，沒有鎖的話
   兩個 daemon 可以同時開著同一個目錄互相踩（維護者 2026-09-13 指出）。
-- `-s` 起來時目錄已被別人（另一個 `-s`、或還沒死的單發）持有就拒絕啟動，🚫 不接手、不等待——
+- `-s` 起來時目錄已被別人（另一個 `-s`、或還沒死的單發）持有就拒絕啟動，**不**接手、**不**等待——
   兩個常駐同時活著比拒絕一次嚴重得多。
 - 🚨 所以 **`-s` 跑著的時候再叫單發**：要寫權的命令拿不到鎖 → 跳錯、exit 非 0、一個字都不做，
   訊息要講「daemon 已在常駐，改用 rpc-cli 或前端」；`--version`、`--help` 這類不碰資料目錄的照常。
   沒有 `-s` 在跑時，單發自己就是那一次的獨佔者，做完就放。
 - ⚠️ 唯讀工具拿共享鎖，在 daemon 跑著時會**被拒** —— 那個拒絕就是答案：**去走 RPC，不要動它的檔**。
   ⭐「一邊寫一邊有人讀」的併發不是這把鎖給的，是 `cache.db` 的 WAL 給的（逐筆交易的粒度，比一把長命鎖精確）。
-- ⚠️ 鎖是**勸告式**的：只擋有來問的程序，🚫 擋不住直接開 `cache.db` 亂寫的程式。
+- ⚠️ 鎖是**勸告式**的：只擋有來問的程序，擋**不**住直接開 `cache.db` 亂寫的程式。
 - 🚨 **資料目錄綁定 daemon，前端只能發 RPC 請 daemon 改**（維護者 2026-09-30）：「不拿 `daemon.lock` 卻寫資料是非法侵占。」
-  任何前端（UI、rpc-cli）🚫 不越過 daemon 直接碰資料目錄。
+  任何前端（UI、rpc-cli）禁止越過 daemon 直接碰資料目錄。
   現況：`apps/wbf-cli` 還是直接叫 core，但碰資料目錄任何東西之前先拿 `daemon.lock` 的排他鎖、拿不到就拒絕（`commands.rs` 的 `lock_data_dir`）：
   daemon 跑著時它整個被拒（連唯讀的命令也是），兩個 `wbf-cli` 也不能同時跑。
   還沒做：改成走 RPC（它就是 rpc-cli 的前身，§6），到時候才能跟 daemon 同時用。
@@ -94,7 +94,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
   會留下擋住下一次的殘留鎖；OS 的鎖由核心在程序結束時自動放手。
 
 ⭐ **兩種起法走同一條路**：命令列的參數**先轉成 RPC 格式的訊息**，再丟給內部的 handle 執行。
-🚫 不要有「命令列直接叫 core」與「RPC 叫 core」兩套分派——那是同一個問題的兩份實作，
+禁止有「命令列直接叫 core」與「RPC 叫 core」兩套分派——那是同一個問題的兩份實作，
 遲早漂移（全域 A4）。判準：單發的 `room.list --user a` 與 WS 上收到
 `{"method":"room.list","params":{"user":"a"}}` 進到 handle 的時候**長得一模一樣**。
 
@@ -104,13 +104,13 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 本地 WS 收到的 RPC 訊息 ──解密──┘
 ```
 
-**rpc-cli 為什麼送 RPC 訊息、🚫 不送命令列參數**：
+**rpc-cli 為什麼送 RPC 訊息、不送命令列參數**：
 
 - RPC 的 WS 才是**通用標準**——不是每個前端都跟著 daemon 的 binary 走（web、Android、Python 都不會），
   把「參數格式」當成介面，每個前端都要再包一次 daemon 的命令列，不優雅也不好管。
 - 統一走 RPC，之後**Rust 端要用 RPC 的時候接口直接重用**（例如 Desktop 若用 Rust 原生，或第二個 Rust 工具）。
 - 所以 rpc-cli 的定位收窄成：**真的從另一個程序丟 RPC 進來，測整條路有沒有通**。
-  它的命令列只是 RPC 訊息的薄封裝，🚫 不長自己的邏輯。
+  它的命令列只是 RPC 訊息的薄封裝，**不**長自己的邏輯。
 
 📎 日常操作是 `daemon -s` 加前端；rpc-cli 留著是因為「同程序內轉一圈」證明不了 WS、加密、token 那一段真的通。它可以很小。
 
@@ -178,9 +178,9 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 
 **daemon 不做**：
 
-- 🚫 **不管 UI 狀態**：哪個房間被選中、捲到哪、草稿——那是前端的事
-- 🚫 **不管顯示格式**：時間怎麼寫、名字怎麼縮、訊息怎麼排版
-- 🚫 **不代前端做決定**：要不要下載一個 2 GB 的檔、要不要接受一個裝置驗證，一律問過
+- **不管 UI 狀態**：哪個房間被選中、捲到哪、草稿——那是前端的事
+- **不管顯示格式**：時間怎麼寫、名字怎麼縮、訊息怎麼排版
+- **不代前端做決定**：要不要下載一個 2 GB 的檔、要不要接受一個裝置驗證，一律問過
 
 判準：**跨越這條界線的只有資料，不是政策**（全域 CLAUDE.md A4）。daemon 不需要知道前端是誰、長什麼樣。
 
@@ -230,10 +230,10 @@ daemon 的推播（/docs/design/rpc-specs/rpc-spec.md §4）不是憑空來的�
 
 - ⚠️ **「一組」不是「一條」**：對 wbfuwunel 是五條 WS（§5.1.1），對一般 homeserver 是一條
   HTTP 的 sync。所以三個帳號同時登入、都在 wbf server 上，就是 **15 條 WS**。
-- 帳號各自獨立：一個帳號的連線斷了、落後了、被登出了，🚫 不影響別的帳號。
+- 帳號各自獨立：一個帳號的連線斷了、落後了、被登出了，**不**影響別的帳號。
   推播因此**一定帶 `user`**（/docs/design/rpc-specs/rpc-spec.md §4）——前端要分得出這是誰的事件。
 - 📎 連線狀態的推播（`link.state`，/docs/design/rpc-specs/rpc-spec.md §4）講的是**那一個帳號**的某一條線，
-  🚫 不是「daemon 連上網了沒」。
+  **不是**「daemon 連上網了沒」。
 
 **用哪一種連線：預設 HTTP，wbf 專用的 homeserver 才走 WS**（維護者 2026-09-13 定）。
 
@@ -242,27 +242,27 @@ daemon 的推播（/docs/design/rpc-specs/rpc-spec.md §4）不是憑空來的�
 | 一般 Matrix（Synapse、Dendrite…） | **HTTP**（matrix-sdk 的 `/sync`） | 長輪詢 |
 | **wbfuwunel**（我們自己那套） | **五條 WS**（§5.1.1） | `Event/Push` 推送＋`Recent` 補洞 |
 
-- ⭐ 判準是**「這台 server 講不講 wbf-pack」**，🚫 不是網域名、🚫 不是使用者設定裡的一個勾。
+- ⭐ 判準是**「這台 server 講不講 wbf-pack」**，**不是**網域名、**不是**使用者設定裡的一個勾。
   問法：不帶 token 的 WS `Hello`，看回來的 `protocol` 認不認得（/docs/design/daemon/account-session.md §1）。
 - **不確定就落到 HTTP**：連不上 WS、`Hello` 不回、協議認不得 —— 一律當成一般 homeserver。
-  ⭐ 壞在「用了比較慢但一定能動的那條」，🚫 不壞在「以為對方懂我們的協議」。
+  ⭐ 壞在「用了比較慢但一定能動的那條」，**不**壞在「以為對方懂我們的協議」。
 - conf 的 `TRANSPORT`（/docs/design/rpc-specs/wbf-cli-spec.md §10）是**上限不是下限**：設成 `http` 就一律 HTTP、daemon 不開 WS 線（除錯用）；
   設成 `ws`（預設）仍然要探測，探不到照樣 HTTP。
 
 ### 5.1.1 對 wbfuwunel：一個帳號開**五條** WS，一條一個用途（維護者 2026-09-12 定、09-21 與 09-29 拆細）
 
-🚫 **不是一條線全包。** 理由是**佇列是每條連線一份的**：server 端每條連線有自己的送出
+**不是一條線全包。** 理由是**佇列是每條連線一份的**：server 端每條連線有自己的送出
 佇列（`wbf_ws_send_queue_len`），塞滿了就**丟推送並標 `gap`**。把一次 200 MiB 的媒體下載
 跟金鑰推送擺在同一條線上，那條佇列被媒體佔滿的時候，掉的是**金鑰**。
 
 五條是 `Misc`（一問一答）、`Upload`、`Download`、`Rooms`（房間事件的訂閱）、`Keys`（金鑰的訂閱與 `Fetch`／銷毀）；
 各自只做什麼、為什麼單獨一條、命令怎麼挑線，在 /docs/design/daemon/link-pool.md §1、§2。
 
-- ⭐ 分界線是**「誰會塞爆佇列」與「掉了救不救得回來」的交叉**，🚫 不是「照 kind 分類」——`Misc` 收的就是各種不同 kind。
+- ⭐ 分界線是**「誰會塞爆佇列」與「掉了救不救得回來」的交叉**，**不是**「照 kind 分類」——`Misc` 收的就是各種不同 kind。
   媒體最會塞爆佇列，所以它**只能塞爆自己**（上傳與下載再各一條，一邊塞爆不拖另一邊）；金鑰🚨 **掉了就沒了**，所以要一條安靜的線。
 - ⚠️ 這五條是**那一個帳號的**（§5.1）：兩個帳號登在同一台 wbf server 上也是各開各的，
-  🚫 不共用 —— 它們的 `access_token` 不同，連線本來就分得開，而共用會讓一個帳號的流量塞爆另一個的。
-- ⚠️ **`gap` 的意義因此是局部的**：房間那條標 `gap`，只表示房間事件漏了，🚫 不要當成整個 daemon 落後。
+  **不**共用 —— 它們的 `access_token` 不同，連線本來就分得開，而共用會讓一個帳號的流量塞爆另一個的。
+- ⚠️ **`gap` 的意義因此是局部的**：房間那條標 `gap`，只表示房間事件漏了，禁止當成整個 daemon 落後。
   各補各的：房間由 UI 叫 `sync.recent` 補（/docs/design/rooms/room-sync.md），金鑰由 daemon 從佇列頭 `Fetch`（/docs/design/keys/key-sync.md）。
 
 ### 5.2 一條連線上仍然會有好幾段會話——`seq` 屬於會話（wbfuwunel #42／#44 定）
@@ -273,12 +273,12 @@ daemon 的推播（/docs/design/rpc-specs/rpc-spec.md §4）不是憑空來的�
 
 > ⭐ **`id` 是一段會話的名字，`seq` 是那段會話裡的計數。** 換一個 `id` 就是新會話，`seq` 歸零。
 
-| 🚫 daemon 不能這樣寫 | 會壞成什麼 |
+| daemon 禁止這樣寫 | 會壞成什麼 |
 |---|---|
 | 連線層一個 `next_seq` | 同一條線上兩段會話互相看起來像對方漏號，`gap` 的判斷全毀 |
 | 每個 kind 一個 `next_seq` | 同 kind 兩段會話交錯（兩個上傳）就分不出哪包是誰的 |
 
-所以連線那一層收到的包先照 `id` 分派到會話，才輪到 `seq`（/docs/design/daemon/ws-receive-dispatch.md）。📎 `seq` 🚫 不是重送機制——
+所以連線那一層收到的包先照 `id` 分派到會話，才輪到 `seq`（/docs/design/daemon/ws-receive-dispatch.md）。📎 `seq` **不是**重送機制——
 WS 不會掉單一 frame，跳號只代表 server 故意丟了一包（佇列滿），補救是帶游標重新要。
 
 ## 6. 現有 crate 怎麼重組
@@ -306,7 +306,7 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
 - **`wbf-daemon` 同時是 library 與 binary**：Desktop 內嵌用 library，其他人 spawn binary。
 - ⚠️ **`wbf-core` 的公開介面不能假設「同程序」**：方法收 `&self`、參數與回傳用簡單型別、
   事件用 channel 而不是回呼引用、自己持有 tokio runtime 不要求宿主提供。
-  🚫 公開介面上不要出現複雜生命週期、trait object、`impl Trait`；回傳是可序列化的 DTO，錯誤是 `CoreError { kind, message }`。
+  公開介面上禁止出現複雜生命週期、trait object、`impl Trait`；回傳是可序列化的 DTO，錯誤是 `CoreError { kind, message }`。
   這樣它之後包 RPC 或包 uniffi 都不用改。⚠️ 往 core 加方法一樣要過這一條。
 
 ### 6.1 現在那支 CLI 的假設要重新檢視
@@ -319,7 +319,7 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
 
 ## 7. 還開著的
 
-編號固定（別的文件用「§7 第 N 點」引用），已經解決的第 1、2 點拿掉了，🚫 不重排。
+編號固定（別的文件用「§7 第 N 點」引用），已經解決的第 1、2 點拿掉了，禁止重排。
 
 - **第 3 點：fork 的 submodule**。`vendor/matrix-rust-sdk` 指向維護者建的
   [`WhiteBirchForumTeam/matrix-rust-sdk`](https://github.com/WhiteBirchForumTeam/matrix-rust-sdk)，
@@ -330,7 +330,7 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
 - **第 4 點：daemon 的生命週期**：誰負責關掉它、閒置多久自己結束、多個前端同時連著時誰說了算。
   兩個 daemon 搶同一個資料目錄已經有答案：§0.2 的排他鎖，後來的起不來。
   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。要等 Desktop 的實際使用模式出來再定。
-- ~~第 5 點：資料平面 token 的 TTL 與撤銷~~ 已定（維護者 2026-09-30）：🚫 沒有 TTL、🚫 沒有 token 表。URL 是用共享 token 加密的 access key，
+- ~~第 5 點：資料平面 token 的 TTL 與撤銷~~ 已定（維護者 2026-09-30）：**沒有** TTL、**沒有** token 表。URL 是用共享 token 加密的 access key，
   daemon 重開就全部失效，帳號登出之後 core 照樣拒（/docs/design/rpc-specs/data-plane.md §2）。
 - **第 6 點：縮圖的批次**：一次要 50 張縮圖時，50 次 `media.open` 太吵。是走 base64 進 RPC（/docs/design/rpc-specs/local-interface.md §8 的 1 MiB 規則），
   還是發一個涵蓋多個資源的 URL？後者違反「一個 URL 一個資源」，要想清楚再定。
