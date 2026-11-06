@@ -193,6 +193,20 @@
 - 變異驗證（先 commit）：至少拿掉「server 有 master 就不建」、「錯的 recovery key 不匯入」、「`failures` 不是空的就錯」、「`SERVER_BACKUP=off` 不上傳」各一次，對應的測試要紅。
 - **沒驗到的老實寫**：一般 Matrix 帳號那條（本機 server 走不到 HTTP 的那幾個端點）。
 
+### 11.4 結果（2026-11-07，本機 wbfuwunel）
+
+| # | 測試（daemon 的 `real_server.rs`） | 結果 |
+|---|---|---|
+| V1–V9、V12 | `cross_signing_backup_recovery_and_self_verification_across_three_devices` | ✅ |
+| V10 | `verifying_another_users_device_trusts_that_device_and_identity` | ✅ |
+| V11 | `a_new_device_gets_old_room_keys_from_a_verified_device_without_a_backup` | ✅ |
+
+- 單元與假 server：core `identity_ops.rs` 六條（§11.2 core 那一列全部，加 secret storage 的建、讀回、錯的 key）、sdk `verification.rs` 一條與 `tests/unit.rs` 的端點位元組、daemon 的 102 表與 `verify.state` 推播形狀。
+- 收尾：全套 998 條、clippy（`-D warnings`）乾淨；真 server e2e 整套 23 條全過（舊的 20 條裡 `login_ping_rooms_recent_and_logout_over_the_daemon` 原本釘著「wbf 帳號 `backup.status` 回 1100」，改成「走橋、server 上有備份」）。
+- 變異驗證，全紅：拿掉「server 上有 master 就不建」、簽章 `failures` 當成功、`SERVER_BACKUP=off` 照樣建、匯入前**不**重查送驗證請求的人（真 server 的 V10）。
+  「錯的 recovery key 不匯入」造不出有意義的變異：擋它的是上游 `from_account_data` 的 MAC 檢查，拿掉它錯的 key 也解不開秘密、缺一把就整個不匯——三層都是密碼學或「缺就不匯」，沒有一條分支改掉會變成匯了。
+- 已知限制：整份備份超過 2 MiB 時橋回 `TooLarge`（約幾千把金鑰），還原會失敗；要改成逐房下載（`0x17 0x39`）再另開一支。
+
 ## 12 實作時跟草稿不同的地方（2026-11-07，照預設做、寫在這裡給維護者審）
 
 | 草稿 | 實際 | 為什麼 |

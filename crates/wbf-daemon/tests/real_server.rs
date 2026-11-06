@@ -6,7 +6,7 @@
 //!   WBF_E2E_PASSWORD_FILE 整檔就是密碼（去掉結尾一個換行）
 //!
 //! 流程：vault.create（**passphrase 模式**）→ account.add（鉤子在背景開五條線）→ account.whoami → server.ping（WS）
-//! → room.list（local 與 both，後者走橋的 JoinedRooms）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
+//! → room.list（local 與 both，後者走橋的 JoinedRooms）→ sync.recent（WS）→ backup.status（wbf 帳號走橋）→ **daemon 重開 → vault.unlock → whoami**
 //! → account.del。每一步看 code，**不**看 msg。
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
@@ -238,12 +238,10 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "recent: {reply}");
     assert!(reply["result"]["caught_up"].is_boolean(), "{reply}");
 
-    // 備份還掛在 Client 上（/docs/design/daemon/account-session.md §6）：wbf 帳號明講拒絕（1100），**不**靜默失效。
+    // 備份對 wbf 帳號走橋（/docs/design/keys/cross-signing-and-verification.md §4）：金鑰線開好時就建了（`SERVER_BACKUP` 預設開）。
     let reply = client.call("backup.status", json!({})).await;
-    assert_eq!(
-        reply["code"], 1100,
-        "backup.status on a wbf account: {reply}"
-    );
+    assert_eq!(reply["code"], 0, "backup.status on a wbf account: {reply}");
+    assert_eq!(reply["result"]["server_backup_exists"], true, "{reply}");
     let before = info["result"]["instance"]
         .as_str()
         .expect("instance")

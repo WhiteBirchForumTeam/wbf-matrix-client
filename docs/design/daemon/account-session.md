@@ -36,7 +36,7 @@
 誰記得這個帳號走哪一邊：`Session::backend`（`matrix_sdk_client`／`wbf_sdk`，封在 `session.sealed` 裡）。登入時定、之後不再探：wbf 帳號的 `get_backend_kind` 直接回 `WbfSdk`（server 暫時不通時把它探成「一般 Matrix」會讓池那條路回「接錯線」而不是 `Network`）。
 `None`（舊版封的、`--token` 接的）：探活＋`store_dir`。消費端用 `Core::is_wbf_account` 問；`backend_of`（開 Client 的唯一入口）對 wbf 帳號一律拒（`no_matrix_client_error`）。
 
-🚫 wbf 帳號**不建 Client**：Client 與 `OlmEngine` 各開一次 `m/` 的 crypto store 就是兩台 OlmMachine，等於「我們自己存了一份」。只留她的 crypto 層與她的 DB，我們不存金鑰（`m/td.json` 只有水位與待銷毀清單）。
+禁止替 wbf 帳號建 Client：Client 與 `OlmEngine` 各開一次 `m/` 的 crypto store 就是兩台 OlmMachine，等於「我們自己存了一份」。只留她的 crypto 層與她的 DB，我們不存金鑰（`m/td.json` 只有水位與待銷毀清單）。
 📎 crypto 層自己就有備份（`BackupMachine`）、secret storage（`SecretStorageKey`）、驗證的機器；Client 只是 HTTP 與 /sync 的膠水。缺的是那幾支 HTTP 端點——走橋。
 
 ## 3. 登入（wbf）
@@ -49,7 +49,7 @@
 - 登入前**不准**起 WS 池：池要 session（`pool_of_account` 先 `session_of`）。
 - 拿回 `user_id`（權威拼法：目錄改名那段照舊）、`device_id`、`access_token`。沒要 refresh_token，token 沒有期限。
 - 順序：登入 → 目錄改成權威拼法 → **建 `m/`** → 封 session。🚨 **rollback 範圍＝拿到 token 之後到 session 封好**：這中間任一步失敗（正規目錄已存在、rename、建 `m/`、封檔）
-  都把那個 token 撤掉（best effort 的 HTTP `/logout`）、清這次自己建的 `m/`，再回原錯。🚫 不在 server 上留一台本地沒有 session 的裝置；
+  都把那個 token 撤掉（best effort 的 HTTP `/logout`）、清這次自己建的 `m/`，再回原錯。**不**在 server 上留一台本地沒有 session 的裝置；
   一般 Matrix 那條路同一個 rollback。
 - `m/` 由 `OlmEngine::open` 建（同一把 `matrix_store_key`）。登入這一步只建、不上傳；裝置金鑰的上傳（`send_outgoing_requests`）在開 `Keys` 線時做（/docs/design/keys/e2ee-rpc.md §5，同 §6 那張表）。
 - 「每個連線打一次登入 token，確保連線真的登入」＝ 池開線的 `hello`：Bearer 升級過了不算，Hello 回來才算。
@@ -61,11 +61,11 @@
 | 0 | 兩關閘門（歷史救得回來？見 /docs/design/keys/room-key-backup.md §7） | 拒絕，什麼都不動 |
 | 1 | **封池**：這個帳號標成「登出中」，`pool_of_account` 從此拒絕（`AccountBusy`），正在跑的命令不受影響 | — |
 | 2 | HTTP `/logout`（wbf：自己包的那支；一般 Matrix：Client 的）| **no-op**：解封，池照常收新封包，錯原樣回 |
-| 3 | 成了 → 先停房間與金鑰的 task、（wbf）線還開著就 `Device/Unsubscribe`（失敗只講一聲），再 `close_all`：等每一格的鎖、取出、關掉；遠端已經先關的就只是丟掉，🚫 不二次跳錯 | — |
+| 3 | 成了 → 先停房間與金鑰的 task、（wbf）線還開著就 `Device/Unsubscribe`（失敗只講一聲），再 `close_all`：等每一格的鎖、取出、關掉；遠端已經先關的就只是丟掉，**不**二次跳錯 | — |
 | 4 | 清本地：`session.sealed`、`m/`、快照、current、最後一個帳號時的 cache.db——原子清除 | 錯原樣回 |
 | 5 | 解封（session 已經沒了，之後 `session_of` 自己會回 NotLoggedIn；解封是為了重登入） | — |
 
-- 🚫 池裡不存「登出了沒」（理由見 /docs/design/daemon/link-pool.md §3）；「登出中」是**帳號**的狀態，記在 `Core`（跟生命週期鎖同一層），不是池的。
+- 池裡**不**存「登出了沒」（理由見 /docs/design/daemon/link-pool.md §3）；「登出中」是**帳號**的狀態，記在 `Core`（跟生命週期鎖同一層），不是池的。
 - WS 過期或被撤由 server 每個 message 重驗、關 1008；client 不特別處理，池下次取用看到 `is_closed` 就重開（開不起來就是 hello 被拒 → 錯原樣回）。
 
 ## 5. 五條線
@@ -78,14 +78,15 @@
 
 | 功能 | 一般 Matrix（走 Client） | wbf 帳號（不建 Client） |
 |---|---|---|
-| `room.list` 的 `server`／`both` | Client 的 /sync | 只問橋 `JoinedRooms`（0x13/0x28），一個請求；`both` 把差異寫進 `room_list`（新的只有 id、拿過的🚫 覆寫、本地是 `join` 而名單沒有的標 `leave`，/docs/design/rooms/room-actions.md §3）；`local` 不變。每一間的樣子🚫 在這裡問，是 UI 對看得到的房間叫 `room.get`（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1） |
+| `room.list` 的 `server`／`both` | Client 的 /sync | 只問橋 `JoinedRooms`（0x13/0x28），一個請求；`both` 把差異寫進 `room_list`（新的只有 id、拿過的**不**覆寫、本地是 `join` 而名單沒有的標 `leave`，/docs/design/rooms/room-actions.md §3）；`local` 不變。每一間的樣子**不**在這裡問，是 UI 對看得到的房間叫 `room.get`（維護者 2026-10-05，/docs/design/rooms/chat-model.md §2.1） |
 | `room.get` 的 `server`／`both` | Client 的 /sync | 這一間的 `GetState`（0x14/0x21）＋`m.direct`（`GetAccountData` 0x11/0x25）一起送、組 `Conversation`，`both` 寫進 `room_list`。狀態超過 2 MiB 的房 server 回 `TooLarge`，原樣回給 UI |
-| `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機）；加密與否**只看本地的 `rooms.encrypted`**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §7）：本地不知道（沒拿過這間房）就是 1100、請 UI 先拿房間，🚫 當成明文、🚫 為它上網；**加密房**：只用後台已經分好的房間金鑰（等它對 UI 給的 `room_devices.room_version` 就緒，最多 2 秒，等不到 1402）、加密、帶號碼送（/docs/design/keys/e2ee-rpc.md §3、§3.1）；沒帶 `room_devices` 是 1100 |
+| `room.send_text` | `Room::send`（含加密） | `Event/Send` 明文（`txn_id` 隨機）；加密與否**只看本地的 `rooms.encrypted`**（維護者 2026-10-05，/docs/design/keys/e2ee-rpc.md §7）：本地不知道（沒拿過這間房）就是 1100、請 UI 先拿房間，**不**當成明文、**不**為它上網；**加密房**：只用後台已經分好的房間金鑰（等它對 UI 給的 `room_devices.room_version` 就緒，最多 2 秒，等不到 1402）、加密、帶號碼送（/docs/design/keys/e2ee-rpc.md §3、§3.1）；沒帶 `room_devices` 是 1100 |
 | `room.send_file` 的送事件半段 | `Room::send`（`attachment_declared: false`） | `Event/Send` 帶 `attachments`（/docs/design/media/wbf-client-convention-for-chunk.md §5.2 的宣告，`attachment_declared: true`）；加密房要帶 `room_devices`，沒帶或 `cipher` 跟房間對不上都在**上傳之前**就拒（/docs/design/keys/e2ee-rpc.md §3）。兩邊的 content 同一份（`event_json::file_message_content`） |
 | `room.history` 錨點不在本地 | `/context` | 拒絕（1100）；`sync=both` 先把錨點寫進快取就翻得下去。還沒做：改用 wbfuwunel #64 的 `before_event_id` |
 | `watch`（CLI） | /sync 的迴圈 | 拒絕（1100）：daemon 的新訊息走訂閱＋推播（/docs/design/daemon/link-pool.md §6） |
-| `backup.*`、`recovery.*` | Client 的備份與 SSSS | **拒絕、回明確的錯**（1100，`backend_of` 擋；🚫 不靜默失效）；還沒做：搬到 crypto 層＋橋（`BackupMachine`、`SecretStorageKey`、橋的 `/room_keys`、account data） |
-| 登出閘門的「server 那份救得回來嗎」 | Client 問 backup status | 問不到 → 只認本機的 recovery key 或 `accept_history_loss`（fail closed，1021） |
+| `backup.*`、`recovery.*` | Client 的備份與 SSSS | crypto 層＋橋（2026-11-07：`BackupMachine`、`SecretStorageKey`、橋的 `/room_keys`、account data，/docs/design/keys/cross-signing-and-verification.md §4），RPC 形狀一樣 |
+| 交叉簽章、裝置驗證 | Client 的 encryption | crypto 層＋橋（同一份 §3、§5）。`verify.*`、`devices.list` 只有 wbf 帳號有 |
+| 登出閘門的「server 那份救得回來嗎」 | Client 問 backup status | 還沒接（問得出來了，同一份 §12）→ 只認本機的 recovery key 或 `accept_history_loss`（fail closed，1021） |
 | 裝置金鑰上傳（`/keys/upload`） | Client 登入就傳 | 開 `Keys` 線時上傳（裝置金鑰＋一次性金鑰＋fallback key），`CryptoState` 一到就補（/docs/design/keys/e2ee-rpc.md §5） |
 
 ## 7. 測試
@@ -94,8 +95,8 @@
   登出封鎖（封了 `pool_of_account` 拒、guard 丟掉就解封；HTTP 失敗 no-op；**HTTP 成功之後解封、重登入開得了池**——本機起一個回 200 的迷你 HTTP 當 `/logout`）。
   ⚠️ 沒有假的 wbf server：「接得上但版本不認得」那格沒測；`connect_anonymous` 走真的 tungstenite，記憶體對接驅動不了它。
 - 登入與路由：登入（探測結果直接記進註冊表、`/login` 由回 200 的迷你 HTTP 扮）→ session 記 `wbf_sdk`、`m/` 只有 crypto store、忘掉探測也還是 wbf；
-  路由（session 指向沒人聽的位址）：`room.list`／`get`／`send_text` 到開線才失敗（`Network`，🚫 不是「log in again」），`backup.status`／`watch`／錨點不在本地的 `history` 是 `Usage`、登出閘門是 `HistoryWouldBeLost`；
+  路由（session 指向沒人聽的位址）：`room.list`／`get`／`send_text`／`backup.status` 到開線才失敗（`Network`，**不**是「log in again」），`watch`／錨點不在本地的 `history` 是 `Usage`、登出閘門是 `HistoryWouldBeLost`；
   `room_state.rs`：Group／Direct（要 m.direct 且兩人）／Channel（門檻 100）、v12 建房者無限、字串型 power level、沒有 algorithm 的 encryption 不算加密、名字的後備順序；`file_message_content` 的形狀；
   登入的 rollback：迷你 HTTP 回的 `user_id` 跟打的不同、而那個正規目錄已經存在 → 登入回 `Usage`，迷你 HTTP 要收到第二個請求 `POST /logout`（token 撤了），打字算出來的目錄沒有 session 也沒有 `m/`；
-  真 server（daemon `real_server`）：`room.list sync=both` 走橋、列表只有 id、`room.get` 之後列表就帶著那間的樣子、`room.send_text` 走 `Event/Send`（照 UI 的順序先 `room.get` 把房間記進本地）、加密房沒帶 `room_devices` 的 `send_text` 1100（核對錯誤裡有 `room_devices`、🚫 是「不知道這間房」；選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 1100、`sync=server` 第二頁走 wbf（錨點由推播寫進本地；錨點不在本地的拒答改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
+  真 server（daemon `real_server`）：`room.list sync=both` 走橋、列表只有 id、`room.get` 之後列表就帶著那間的樣子、`room.send_text` 走 `Event/Send`（照 UI 的順序先 `room.get` 把房間記進本地）、加密房沒帶 `room_devices` 的 `send_text` 1100（核對錯誤裡有 `room_devices`、**不**是「不知道這間房」；選填 `WBF_E2E_ENCRYPTED_ROOM`）、`backup.status` 走橋、server 上有備份、`sync=server` 第二頁走 wbf（錨點由推播寫進本地；錨點不在本地的拒答改由 core 的 `an_anchor_that_is_not_in_the_local_cache_is_refused_not_answered_empty` 守）。
   ⚠️ 沒測的：`send_file` 走 `Event/Send`（沒有 daemon 的 e2e）、封 session 失敗那條 rollback（製造不出來：沒有可以讓 `seal_session` 失敗的接縫）、一般 Matrix 那條路的登入（沒有一台不講 wbf 的 server；它的程式沒動）。
