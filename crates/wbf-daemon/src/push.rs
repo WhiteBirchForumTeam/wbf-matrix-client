@@ -93,7 +93,7 @@ pub(crate) fn insert_field(params: &mut serde_json::Value, key: &str, value: ser
 /// core 的事件 → 推播。名字與欄位照 /docs/design/rpc-specs/rpc-spec.md §4。
 pub fn push_of(event: &CoreEvent) -> Push {
     match event {
-        // `id` 沒有就不帶（/docs/design/rpc-specs/rpc-spec.md §4 的 `id?`），🚫 不送 `null`（PR #53 審查 cirno 🟡2）。
+        // `id` 沒有就不帶（/docs/design/rpc-specs/rpc-spec.md §4 的 `id?`），**不**送 `null`（PR #53 審查 cirno 🟡2）。
         CoreEvent::Note { job, text } => {
             let mut params = json!({ "note": text });
             if let Some(job) = job {
@@ -225,6 +225,16 @@ pub fn push_of(event: &CoreEvent) -> Push {
                 job: None,
             }
         }
+        // verify.state（/docs/design/keys/cross-signing-and-verification.md §5.1）：流程的整份樣子攤平在 `user` 旁邊。
+        CoreEvent::Verify { user, state } => {
+            let mut params = json!(state);
+            insert_field(&mut params, "user", json!(user));
+            Push {
+                request: Request::push("verify.state", params),
+                user: Some(user.clone()),
+                job: None,
+            }
+        }
         CoreEvent::MediaDownload {
             user,
             mxc,
@@ -241,7 +251,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
                 "done": done,
                 "total": total,
             });
-            // `complete` 一律帶（/docs/design/media/media-download.md §12.3），其他狀態沒有就不在（🚫 送 null）。
+            // `complete` 一律帶（/docs/design/media/media-download.md §12.3），其他狀態沒有就不在（**不**送 null）。
             if let Some(verified) = verified {
                 insert_field(&mut params, "verified", json!(verified));
             }
@@ -276,7 +286,7 @@ pub fn push_of(event: &CoreEvent) -> Push {
     }
 }
 
-/// 這條連線漏掉了 `missed` 則（/docs/design/daemon/daemon-runtime.md §5.3）。🚫 不重播、🚫 不假裝沒事。
+/// 這條連線漏掉了 `missed` 則（/docs/design/daemon/daemon-runtime.md §5.3）。**不**重播、**不**假裝沒事。
 pub fn desync(missed: u64) -> Request {
     Request::push("desync", json!({ "missed": missed }))
 }
@@ -387,6 +397,31 @@ mod tests {
             stopped.request.params,
             json!({ "user": "@a:x", "state": "stopped", "reason": "taken over" })
         );
+        // verify.state（/docs/design/keys/cross-signing-and-verification.md §5.1）：流程攤平在 `user` 旁邊；表情與數字只在比對時帶、理由只在取消時帶。
+        let exchanged = push_of(&CoreEvent::Verify {
+            user: "@a:x".into(),
+            state: Box::new(wbf_core::VerifyState {
+                flow_id: "f1".into(),
+                other_user: "@b:x".into(),
+                other_device: Some("BDEV".into()),
+                we_started: false,
+                state: wbf_core::VerifyStage::KeysExchanged,
+                emoji: Some(vec![wbf_core::VerifyEmoji {
+                    symbol: "🐶".into(),
+                    description: "Dog".into(),
+                }]),
+                decimals: Some([1, 2, 3]),
+                reason: None,
+            }),
+        });
+        assert_eq!(exchanged.request.method, "verify.state");
+        assert_eq!(exchanged.user.as_deref(), Some("@a:x"));
+        assert_eq!(
+            exchanged.request.params,
+            json!({ "user": "@a:x", "flow_id": "f1", "other_user": "@b:x", "other_device": "BDEV",
+                    "we_started": false, "state": "keys_exchanged",
+                    "emoji": [{ "symbol": "🐶", "description": "Dog" }], "decimals": [1, 2, 3] })
+        );
         let progress = push_of(&CoreEvent::Progress {
             job: Some(7),
             done: 3,
@@ -439,7 +474,7 @@ mod tests {
             changed.request.params,
             json!({ "user": "@a:x", "changed_user": "@b:x", "device_version": "4-0a1b2c3d4e", "rooms": { "!r:x": 9 }, "gap": false })
         );
-        // room.membership（/docs/design/rooms/room-actions.md §3.3.4）：被邀請時帶 `invite`，其他🚫 帶；`gap` 一律帶。
+        // room.membership（/docs/design/rooms/room-actions.md §3.3.4）：被邀請時帶 `invite`，其他**不**帶；`gap` 一律帶。
         let invited = push_of(&CoreEvent::Membership {
             user: "@b:x".into(),
             room: "!r:x".into(),

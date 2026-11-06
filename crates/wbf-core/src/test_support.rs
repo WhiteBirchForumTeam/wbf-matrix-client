@@ -11,7 +11,7 @@ use wbf_sdk::login::{Session, SessionBackend};
 use wbf_sdk::protocol::{
     BridgedEndpoint, BRIDGE_ACCOUNT_DATA, BRIDGE_JOINED_ROOMS, BRIDGE_KEYS_CLAIM,
     BRIDGE_KEYS_QUERY, BRIDGE_KEYS_UPLOAD, BRIDGE_MEMBERS, BRIDGE_ROOM_STATE,
-    BRIDGE_SEND_TO_DEVICE, BRIDGE_STATE_EVENT,
+    BRIDGE_SEND_TO_DEVICE, BRIDGE_SIGNATURES_UPLOAD, BRIDGE_STATE_EVENT,
 };
 use wbf_sdk::transport::{memory_pair, FrameSink, FrameSource, MemoryEnd};
 use wbf_sdk::WsLink;
@@ -409,6 +409,15 @@ pub(crate) struct FakeRooms {
     pub(crate) account_data: std::collections::BTreeMap<String, Value>,
     /// 下一個房間動作回 403 `M_FORBIDDEN`（一次性）：測「server 拒了就**不**寫本地」。
     pub(crate) forbid_next: bool,
+    /// `SigningKeysUpload` 收下的整份 body（`master_key`／`self_signing_key`／`user_signing_key`）；
+    /// `KeysQuery` 問到自己時照它回。測試也可以自己放一份：造「別台裝置已經建過」。
+    pub(crate) signing_keys: Option<Value>,
+    /// `LatestBackupInfo` 回的（含 `version`）；None 是 404。`CreateBackupVersion` 寫這裡。
+    pub(crate) backup: Option<Value>,
+    /// `AddBackupKeys` 收下的 body，照順序。
+    pub(crate) backup_uploads: Vec<Value>,
+    /// 下一個 `SignaturesUpload` 回這份 `failures`（一次性）：測「個別簽不進去仍是 200」。
+    pub(crate) signature_failures: Option<Value>,
 }
 
 /// 假 server 建的房。
@@ -950,6 +959,73 @@ fn room_action_reply(pack: &Pack, rooms: &Arc<Mutex<FakeRooms>>) -> Option<Pack>
     if is(&endpoints::GET_ACCOUNT_DATA) {
         let event_type = meta["event_type"].as_str().unwrap_or_default();
         return rooms.account_data.get(event_type).cloned().map(ack);
+    }
+    // 交叉簽章與備份（/docs/design/keys/cross-signing-and-verification.md §2）：記下請求、回「形狀對」的答案。
+    let not_found = || Pack {
+        kind: Kind::Control,
+        subtype: control::ERROR,
+        flags: flags::IS_RESPONSE | flags::IS_BRIDGED,
+        id: pack.id,
+        seq: pack.seq,
+        meta: json!({ "code": "NotFound", "code_id": 1501, "errcode": "M_NOT_FOUND",
+                      "message": "M_NOT_FOUND", "status": 404 })
+        .to_string()
+        .into_bytes(),
+        data: json!({ "errcode": "M_NOT_FOUND", "error": "M_NOT_FOUND" })
+            .to_string()
+            .into_bytes(),
+    };
+    let is_bridged =
+        |endpoint: BridgedEndpoint| (pack.kind, pack.subtype) == (endpoint.kind, endpoint.subtype);
+    if is_bridged(BRIDGE_KEYS_QUERY) {
+        // 沒建過交叉簽章就交給 `bridged_reply`（問什麼都回空的）。
+        let keys = rooms.signing_keys.clone()?;
+        let device_keys: serde_json::Map<String, Value> = body["device_keys"]
+            .as_object()
+            .map(|users| users.keys().map(|user| (user.clone(), json!({}))).collect())
+            .unwrap_or_default();
+        return Some(ack(json!({
+            "device_keys": device_keys, "failures": {},
+            "master_keys": { ME: keys["master_key"] },
+            "self_signing_keys": { ME: keys["self_signing_key"] },
+            "user_signing_keys": { ME: keys["user_signing_key"] },
+        })));
+    }
+    if is_bridged(BRIDGE_SIGNATURES_UPLOAD) {
+        rooms
+            .requests
+            .push((pack.kind, pack.subtype, meta.clone(), body.clone()));
+        let failures = rooms.signature_failures.take().unwrap_or_else(|| json!({}));
+        return Some(ack(json!({ "failures": failures })));
+    }
+    if is(&endpoints::SIGNING_KEYS_UPLOAD) {
+        rooms
+            .requests
+            .push((pack.kind, pack.subtype, meta.clone(), body.clone()));
+        rooms.signing_keys = Some(body);
+        return Some(ack(json!({})));
+    }
+    if is(&endpoints::LATEST_BACKUP_INFO) {
+        return Some(rooms.backup.clone().map_or_else(not_found, ack));
+    }
+    if is(&endpoints::CREATE_BACKUP_VERSION) {
+        rooms
+            .requests
+            .push((pack.kind, pack.subtype, meta.clone(), body.clone()));
+        let mut created = body.clone();
+        created["version"] = json!("1");
+        created["count"] = json!(0);
+        created["etag"] = json!("0");
+        rooms.backup = Some(created);
+        return Some(ack(json!({ "version": "1" })));
+    }
+    if is(&endpoints::ADD_BACKUP_KEYS) {
+        rooms
+            .requests
+            .push((pack.kind, pack.subtype, meta.clone(), body.clone()));
+        rooms.backup_uploads.push(body);
+        let count = rooms.backup_uploads.len();
+        return Some(ack(json!({ "etag": count.to_string(), "count": count })));
     }
     let answered = [
         &endpoints::CREATE_ROOM,

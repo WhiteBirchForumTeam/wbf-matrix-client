@@ -21,6 +21,7 @@ mod local;
 mod media;
 mod room_actions;
 mod rooms;
+mod verify;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -182,9 +183,12 @@ pub struct Handle {
 impl Handle {
     pub fn new(data_dir: &Path, policy: EncryptionPolicy, settings: Settings) -> Arc<Handle> {
         let (shutdown, _) = watch::channel(false);
+        let core = Core::open(data_dir);
+        // 背景的備份（金鑰線開好時建、新金鑰上傳）照 conf 的 `SERVER_BACKUP`；core 不讀 conf。
+        core.set_server_backup_in_background(settings.server_backup);
         Arc::new(Handle {
             data_dir: data_dir.to_path_buf(),
-            core: RwLock::new(Arc::new(Core::open(data_dir))),
+            core: RwLock::new(Arc::new(core)),
             policy,
             settings: std::sync::RwLock::new(settings),
             started_at: Instant::now(),
@@ -375,7 +379,7 @@ impl Handle {
             "daemon.info" => Box::pin(self.daemon_info(core)),
             "daemon.set_encryption" => Box::pin(async { self.daemon_set_encryption(params) }),
             "daemon.shutdown" => Box::pin(async { self.daemon_shutdown() }),
-            "daemon.reload_conf" => Box::pin(async { self.daemon_reload_conf() }),
+            "daemon.reload_conf" => Box::pin(async { self.daemon_reload_conf(core) }),
             "vault.create" => Box::pin(async { local::vault_create(core, params) }),
             "vault.unlock" => Box::pin(async {
                 let unlocked = local::vault_unlock(core, params);
@@ -501,6 +505,13 @@ impl Handle {
             "backup.create_recovery_key" => {
                 Box::pin(backup::backup_create_recovery_key(self, core, params))
             }
+            "verify.request" => Box::pin(verify::verify_request(self, core, params)),
+            "verify.accept" => Box::pin(verify::verify_accept(self, core, params)),
+            "verify.start_sas" => Box::pin(verify::verify_start_sas(self, core, params)),
+            "verify.confirm" => Box::pin(verify::verify_confirm(self, core, params)),
+            "verify.cancel" => Box::pin(verify::verify_cancel(self, core, params)),
+            "verify.list" => Box::pin(verify::verify_list(self, core, params)),
+            "devices.list" => Box::pin(verify::devices_list(self, core, params)),
             other => {
                 return Err(Fail::Rpc(
                     code::UNKNOWN_METHOD,
@@ -595,9 +606,10 @@ impl Handle {
 
     /// 照啟動時那一份 conf 重讀（/docs/design/messages/read-receipts.md §6）：讀成功就整份換，讀失敗回 1100、全部照舊。
     /// 會影響連線的鍵（`TRANSPORT`）不換，列進 `needs_restart`。
-    fn daemon_reload_conf(&self) -> Outcome {
+    fn daemon_reload_conf(&self, core: &Core) -> Outcome {
         let reloaded = self.settings().reload(&self.data_dir)?;
         let warnings = reloaded.settings.warnings.clone();
+        core.set_server_backup_in_background(reloaded.settings.server_backup);
         *self
             .settings
             .write()
@@ -1285,6 +1297,18 @@ mod tests {
                 json!({ "room": "!r:localhost", "user_id": "@b:localhost" }),
             ),
             ("room.list", json!({ "membership": ["joined"] })),
+            // 驗證與信任（/docs/design/keys/cross-signing-and-verification.md §5.1、§6）：缺對方、缺 flow id、型別不對
+            ("verify.request", json!({})),
+            (
+                "verify.request",
+                json!({ "user_id": "@b:localhost", "device_id": 7 }),
+            ),
+            ("verify.accept", json!({ "user_id": "@b:localhost" })),
+            ("verify.start_sas", json!({ "flow_id": "f" })),
+            ("verify.confirm", json!({ "user_id": 7, "flow_id": "f" })),
+            ("verify.cancel", json!({})),
+            ("devices.list", json!({})),
+            ("backup.restore", json!({ "recovery_key": 7 })),
         ];
         for (method, params) in cases {
             let response = handle.call(request(method, params)).await;

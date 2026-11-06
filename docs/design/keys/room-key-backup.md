@@ -2,7 +2,8 @@
 
 > 這份講 **matrix-sdk 帳號**的房間金鑰備份：server 端的標準 Matrix key backup（§3、§6）、本地的 `k/` 快照（§4、§5）、
 > 誰刪什麼與 `logout` 的閘門（§7）、recovery key 的保管（§8）。實作：sdk `room_keys.rs`、`backend/matrix_sdk.rs`；core `backup_ops.rs`、`recovery.rs`、`session_ops.rs`（閘門）。
-> ⚠️ wbf 帳號沒有 matrix-sdk 的 `Client`，這一套都還沒接（`key-backup` 對它回錯；/docs/design/keys/e2ee-rpc.md §8），`logout` 閘門對它只看第二關（§7）。
+> ⚠️ wbf 帳號沒有 matrix-sdk 的 `Client`：同一組 RPC（`backup.*`、`recovery.*`）對它走 crypto 引擎上的橋，形狀一樣、做法在 /docs/design/keys/cross-signing-and-verification.md §4
+> （2026-11-07；備份由金鑰線後台自動上傳，不是 §6 的命令觸發）。`logout` 閘門對它仍只看第二關（§7）。
 
 ## 1 為什麼要有這一章
 

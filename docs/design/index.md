@@ -54,7 +54,7 @@
 | [`/docs/design/keys/key-sync.md`](keys/key-sync.md) | 金鑰的訂閱線：`Device/Subscribe`、上線追平、推來就匯 |
 | [`/docs/design/keys/to-device-client.md`](keys/to-device-client.md) | client 端怎麼接 `0x16 Device`（to-device：金鑰、驗證、SSSS） |
 | [`/docs/design/keys/room-key-backup.md`](keys/room-key-backup.md) | 房間金鑰的備份：server 一份、本地一份，recovery key 放哪、`logout` 的閘門 |
-| [`/docs/design/keys/cross-signing-and-verification.md`](keys/cross-signing-and-verification.md) | wbf 帳號補交叉簽章、裝置驗證（SAS）、金鑰備份與 recovery key、向自己裝置要金鑰（草稿，等開工） |
+| [`/docs/design/keys/cross-signing-and-verification.md`](keys/cross-signing-and-verification.md) | wbf 帳號補交叉簽章、裝置驗證（SAS）、金鑰備份與 recovery key、向自己裝置要金鑰；驗收 V1–V12 |
 | [`/docs/design/keys/e2ee-walkthrough.md`](keys/e2ee-walkthrough.md) | E2EE 從建房到退出每一步發生什麼（理解用，不是權威） |
 
 ## `storage/`：本地資料

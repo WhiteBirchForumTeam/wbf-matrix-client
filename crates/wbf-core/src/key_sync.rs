@@ -6,13 +6,13 @@
 //!   ——匯進 crypto store、水位與待銷毀清單落地、對 server 銷毀那一包。這裡不解封包、不碰 store，只把 items 交給它。
 //! - 金鑰自己一條線（`LinkRole::Keys`，維護者 2026-09-29）。`Device/Fetch`／`ItemsDestroy` 也走它（server：只有持有這台裝置佇列的連線能銷毀），所以 task 要用線時跟池拿同一格。
 //! - 訂閱結束（被另一台裝置接手的 1505、線死了）就停、發 `keys.state: stopped`、關掉這格線（跟房間那半同一個做法）；
-//!   🚫 不在這裡重訂（/docs/design/keys/to-device-client.md §5.1：兩台會互踢）。重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
+//!   禁止在這裡重訂（/docs/design/keys/to-device-client.md §5.1：兩台會互踢）。重開是 daemon 的鉤子（`link_keeper.rs`）在解鎖／登入時做的。
 //! - `keys.state` 留著（「有點多餘，但傾向保留——不然 RPC 無從知道」）。
 //! - 維護者 2026-09-29（/docs/design/keys/e2ee-rpc.md §2、§5）：開線時上傳自己的裝置金鑰與一次性金鑰；`CryptoState` 一到就把存量交給狀態機、它要補就補
 //!   （上游一律補到 50 把＋一把 fallback key，vodozemac 的上限）；每匯進一批帶新房間金鑰，就去 cache 找那把 session 還沒解的訊息立刻解、發 `room.message`。
 //!
 //! 🚨 **佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87）：server 的佇列沒有洞（每一則存到我們 `ItemsDestroy` 才刪），
-//! `Fetch` 🚫 不帶 `cd_seq`、讓 server 從最舊還沒銷毀的起給。所以沒有「client 的游標越過一則沒匯的」這種事：
+//! `Fetch` **不**帶 `cd_seq`、讓 server 從最舊還沒銷毀的起給。所以沒有「client 的游標越過一則沒匯的」這種事：
 //! 匯失敗、gap、壞包、收件匣滿、Ack 前推來的，全部沒銷掉的都還在佇列裡，從頭拉一次就回來（重複匯入無害）。
 //! 之前那套「不先匯、落後中、水位不越過」是在補自己挖的坑（PR #60 審查 rumia／cirno／salvia 三條 🔴），拿掉了。
 
@@ -53,7 +53,7 @@ impl Drop for KeySyncHandle {
     }
 }
 
-/// task 自己握著的東西——🚫 不握 `Core`、不握線：線在池裡，要用時 `reuse` 那一格（`Fetch`／`ItemsDestroy` 要走訂閱線）。
+/// task 自己握著的東西——**不**握 `Core`、不握線：線在池裡，要用時 `reuse` 那一格（`Fetch`／`ItemsDestroy` 要走訂閱線）。
 struct KeySyncTask {
     me: String,
     engine: Arc<OlmEngine>,
@@ -63,6 +63,10 @@ struct KeySyncTask {
     cache: Arc<ServerCache>,
     /// 補一次性金鑰失敗時交給金鑰線的後台重試（起不了就是 None）。
     key_share: Option<KeyShareInbox>,
+    /// conf 的 `SERVER_BACKUP`：開著才把匯進來的新房間金鑰傳進備份。
+    background_backup: Arc<crate::identity_ops::BackgroundBackup>,
+    /// 有人要跟這台驗證時，開始看那個流程、推 `verify.state`。
+    verify: crate::verify_ops::VerifyWatch,
 }
 
 impl Core {
@@ -70,14 +74,14 @@ impl Core {
     ///
     /// Return:
     ///     Ok(Arc<OlmEngine>)
-    ///     Err(Usage)          不是 wbf 帳號（matrix-sdk 帳號的金鑰在它自己的 Client 裡，🚫 不開第二台狀態機）
+    ///     Err(Usage)          不是 wbf 帳號（matrix-sdk 帳號的金鑰在它自己的 Client 裡，**不**開第二台狀態機）
     ///     Err(NotLoggedIn)    沒 session
     ///     Err(Io)             `m/` 開不起來
     pub(crate) async fn olm_engine_of(
         &self,
         account: &AccountDir,
     ) -> Result<Arc<OlmEngine>, CoreError> {
-        // 鎖持到開完、放進去：兩個同時進來的後到者等第一個開完就共用，🚫 不各開一次同一個 store。
+        // 鎖持到開完、放進去：兩個同時進來的後到者等第一個開完就共用，**不**各開一次同一個 store。
         let mut engines = self.crypto_engines.lock().await;
         if let Some(engine) = engines.get(&account.dir) {
             return Ok(engine.clone());
@@ -130,7 +134,7 @@ impl Core {
     ) -> Result<(), CoreError> {
         let session = self.session_of(account)?;
         // 不是 wbf 帳號：金鑰在 matrix-sdk 的 Client 裡，這裡不訂、講一聲，房間那半照常。
-        // 判準跟 `olm_engine_of` 同一條（session 的 backend），🚫 不靠錯誤種類分桶（PR #60 審查 cirno 🟡：`Usage` 桶裡還有真的開不起來）。
+        // 判準跟 `olm_engine_of` 同一條（session 的 backend），**不**靠錯誤種類分桶（PR #60 審查 cirno 🟡：`Usage` 桶裡還有真的開不起來）。
         if session.backend != Some(SessionBackend::WbfSdk) {
             self.events.progress(format!(
                 "keys: not subscribing for {}: its keys live in the matrix-sdk client, not here",
@@ -189,6 +193,34 @@ impl Core {
                 &error,
             );
         }
+        // 交叉簽章與備份就位（/docs/design/keys/cross-signing-and-verification.md §3、§4.1），再把追平那幾窗的後續做完（驗證請求、排好的回應、備份金鑰）。
+        // 失敗只講一聲：收金鑰比這些重要。
+        let server_backup = self.background_backup.is_on();
+        crate::identity_ops::set_up_identity_and_backup(
+            &engine,
+            client,
+            &self.events,
+            &account.label(),
+            server_backup,
+        )
+        .await;
+        let verify = self.verify_watch_of(engine.clone(), pool.clone(), &me);
+        for (sender, flow_id) in reports
+            .iter()
+            .flat_map(|report| report.verification_requests.iter())
+        {
+            verify.start(sender, flow_id);
+        }
+        crate::identity_ops::after_import(
+            &engine,
+            client,
+            &cache,
+            &self.events,
+            &me,
+            &reports,
+            server_backup,
+        )
+        .await;
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = KeySyncTask {
             me,
@@ -197,6 +229,8 @@ impl Core {
             pool,
             cache,
             key_share: key_share.clone(),
+            background_backup: self.background_backup.clone(),
+            verify,
         };
         let handle = KeySyncHandle {
             task: tokio::spawn(task.run(subscription, stopped)),
@@ -209,7 +243,7 @@ impl Core {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
         // 線沒開時沒送成的（含上次 daemon 留下的），現在再跑一輪。
-        // 它要等這格開好才拿得到線（`reuse` 排在開線的寫鎖後面），🚫 在這裡等它。
+        // 它要等這格開好才拿得到線（`reuse` 排在開線的寫鎖後面），禁止在這裡等它。
         if let Some(inbox) = &key_share {
             inbox.line_opened();
         }
@@ -279,7 +313,7 @@ impl KeySyncTask {
         mut stopped: tokio::sync::oneshot::Receiver<()>,
     ) {
         // 要拉一次：有東西可能還留在佇列裡沒進 store（gap、壞包、收件匣滿、匯失敗）。拉失敗就留著這個旗，
-        // 下一個事件或下一次閒置逸時（60 秒）再拉——🚫 不在原地狂試。佇列頭就是水位，所以中間照樣匯推來的包也不會越過什麼。
+        // 下一個事件或下一次閒置逸時（60 秒）再拉——**不**在原地狂試。佇列頭就是水位，所以中間照樣匯推來的包也不會越過什麼。
         let mut needs_pull = false;
         loop {
             // 本地收件匣滿過＝丟過推播：東西還在 server 佇列裡（沒銷毀前不會掉）。
@@ -330,7 +364,7 @@ impl KeySyncTask {
                 }
                 continue;
             };
-            // 🚫 不重訂（/docs/design/keys/to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）。
+            // **不**重訂（/docs/design/keys/to-device-client.md §5.1：對面也會被踢，兩台互踢到天荒地老）。
             // 關掉這格（跟房間那半一樣）：socket 可能還活著，不關的話鉤子看它活著就不會重開，金鑰就永遠沒人收。
             self.events.emit(CoreEvent::Keys {
                 user: self.me.clone(),
@@ -381,6 +415,7 @@ impl KeySyncTask {
                     &reports,
                 )
                 .await;
+                self.after_batch(&reports).await;
                 true
             }
             // 匯入或銷毀失敗：已落地的照樣有效（import_items 的順序鎖死）；沒銷掉的還在佇列裡，呼叫端從佇列頭拉回。
@@ -427,6 +462,30 @@ impl KeySyncTask {
         }
     }
 
+    /// 匯完一批之後（/docs/design/keys/cross-signing-and-verification.md §5、§7）：有人要跟這台驗證就開始看那個流程；
+    /// 再把狀態機排的請求送掉、備份金鑰拿來還原、新金鑰上傳（`identity_ops::after_import`）。線不在就等下一批。
+    async fn after_batch(&self, reports: &[ImportReport]) {
+        for (sender, flow_id) in reports
+            .iter()
+            .flat_map(|report| report.verification_requests.iter())
+        {
+            self.verify.start(sender, flow_id);
+        }
+        let Some(mut line) = self.pool.reuse(LinkRole::Keys).await else {
+            return;
+        };
+        crate::identity_ops::after_import(
+            &self.engine,
+            &mut line,
+            &self.cache,
+            &self.events,
+            &self.me,
+            reports,
+            self.background_backup.is_on(),
+        )
+        .await;
+    }
+
     /// 從佇列頭拉到追平（gap、本地丟包、壞包、匯失敗都走這裡）。
     ///
     /// Return:
@@ -450,6 +509,7 @@ impl KeySyncTask {
                     &reports,
                 )
                 .await;
+                self.after_batch(&reports).await;
                 true
             }
             Err(error) => {
@@ -645,7 +705,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 被另一台裝置接手（server 對金鑰訂閱送 Error）：task 停、發 `keys.state: stopped` 帶原因、關掉金鑰那格（發 `link.state: closed`）；🚫 不重訂。
+    /// 被另一台裝置接手（server 對金鑰訂閱送 Error）：task 停、發 `keys.state: stopped` 帶原因、關掉金鑰那格（發 `link.state: closed`）；**不**重訂。
     /// 關線是為了讓鉤子下次看得出它不在（socket 還活著的話池看不出來，金鑰就永遠沒人收）。
     #[tokio::test]
     async fn a_taken_over_key_subscription_stops_says_so_and_closes_its_line() {
@@ -710,7 +770,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 追平從佇列頭拉，🚫 不看 `td.json` 的記錄：就算記錄說「處理過到 99」（還有 Ack 前推來一包 3），佇列裡沒銷的 1、2、3 全部回來。
+    /// 追平從佇列頭拉，**不**看 `td.json` 的記錄：就算記錄說「處理過到 99」（還有 Ack 前推來一包 3），佇列裡沒銷的 1、2、3 全部回來。
     /// 帶游標的話 `Fetch{99}` 拉到空、三則永遠問不到（PR #60 審查 🔴1、wbfuwunel #87）。
     #[tokio::test]
     async fn an_early_push_does_not_let_the_catch_up_skip_older_queued_keys() {
@@ -832,7 +892,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 佇列頭就是水位（維護者 2026-09-26，wbfuwunel #87）：後到的推播匯成功，🚫 不會讓更早還在佇列裡的那則變得拉不到——
+    /// 佇列頭就是水位（維護者 2026-09-26，wbfuwunel #87）：後到的推播匯成功，**不**會讓更早還在佇列裡的那則變得拉不到——
     /// 之前帶 `cd_seq` 的 `Fetch` 會（游標一過就問不到）。拉失敗的留著「要拉」，下一個事件再拉；而且每一次 `Fetch` 都不帶游標。
     #[tokio::test]
     async fn a_later_push_never_makes_an_earlier_queued_key_unreachable_and_failed_pulls_are_retried(

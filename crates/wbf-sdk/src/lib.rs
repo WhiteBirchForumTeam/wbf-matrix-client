@@ -38,6 +38,8 @@
 //! - `to_device_state`：to-device 的 `cd_seq` 與待銷毀清單，落在 `m/`（/docs/design/keys/to-device-client.md §2、§4）。
 //! - `local_source`（feature `cache`）：這台機器上的原檔——UI 給的 `media.source_uri` 怎麼解、大小對得上才讀它（/docs/design/rpc-specs/data-plane.md §8.1）。
 //! - `crypto_engine`（feature `matrix`）：`OlmMachine` 只當狀態機用——to-device 推進去、`outgoing_requests` 走橋送出去、房間金鑰分給一群人（/docs/design/keys/e2ee-walkthrough.md §13）。
+//! - `cross_signing`、`key_backup`、`secret_storage`、`verification`（feature `matrix`）：wbf 帳號的交叉簽章、金鑰備份、recovery key、裝置驗證，
+//!   都是在同一台 `OlmMachine` 上走橋（/docs/design/keys/cross-signing-and-verification.md）。
 
 pub mod account_dir;
 pub mod backend;
@@ -50,6 +52,8 @@ pub mod chunk_crypto;
 pub mod cipher;
 pub mod client;
 #[cfg(feature = "matrix")]
+pub mod cross_signing;
+#[cfg(feature = "matrix")]
 pub mod crypto_engine;
 pub mod device_version;
 pub mod download;
@@ -57,6 +61,8 @@ pub mod error;
 pub mod error_code;
 pub mod event_json;
 pub mod incoming;
+#[cfg(feature = "matrix")]
+pub mod key_backup;
 pub mod link;
 #[cfg(feature = "cache")]
 pub mod local_source;
@@ -74,12 +80,16 @@ pub mod protocol;
 pub mod room_keys;
 pub mod room_state;
 pub mod room_state_edit;
+#[cfg(feature = "matrix")]
+pub mod secret_storage;
 pub mod seek_store;
 pub mod sessions;
 pub mod to_device_state;
 pub mod transport;
 pub mod upload;
 pub mod vault;
+#[cfg(feature = "matrix")]
+pub mod verification;
 
 pub use account_dir::{find_dir_name_plaintext, to_dir_name, DirScope};
 pub use channel::{Channel, PackChannel, Transport};

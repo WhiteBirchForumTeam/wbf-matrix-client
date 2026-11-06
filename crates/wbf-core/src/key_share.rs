@@ -133,6 +133,8 @@ struct KeyShareTask {
     pool: Arc<LinkPool>,
     events: EventSink,
     readiness: Arc<RoomKeyReadiness>,
+    /// conf 的 `SERVER_BACKUP`：開著才把剛建好的自己的房間金鑰傳進備份（/docs/design/keys/cross-signing-and-verification.md §4.1）。
+    background_backup: Arc<crate::identity_ops::BackgroundBackup>,
     #[cfg(test)]
     attempts: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -332,6 +334,7 @@ impl Core {
             pool,
             events: self.events.clone(),
             readiness: readiness.clone(),
+            background_backup: self.background_backup.clone(),
             #[cfg(test)]
             attempts: attempts.clone(),
         };
@@ -434,6 +437,7 @@ impl KeyShareTask {
                 }
             }
             let pending: Vec<String> = rooms.keys().cloned().collect();
+            let mut prepared_any = false;
             for room in pending {
                 let Some(want) = rooms.get_mut(&room) else {
                     continue;
@@ -444,6 +448,7 @@ impl KeyShareTask {
                 match self.prepare(&mut line, &room, want).await {
                     Ok(()) => {
                         rooms.remove(&room);
+                        prepared_any = true;
                     }
                     Err(error) => {
                         failed = true;
@@ -453,6 +458,16 @@ impl KeyShareTask {
                         ));
                     }
                 }
+            }
+            // 自己的房間金鑰也是一把要備份的金鑰：建好、送出去之後傳進備份（沒開備份就是什麼都不送）。
+            if prepared_any && self.background_backup.is_on() {
+                crate::identity_ops::upload_quietly(
+                    &self.engine,
+                    &mut line,
+                    &self.events,
+                    "room keys",
+                )
+                .await;
             }
             drop(line);
             if failed {

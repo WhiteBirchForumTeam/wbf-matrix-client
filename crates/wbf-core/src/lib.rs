@@ -62,6 +62,7 @@ mod download_queue;
 mod error;
 pub mod event;
 mod handles;
+mod identity_ops;
 mod invites;
 /// 「現在跑的是哪一個工作」——事件的歸屬（/docs/design/rpc-specs/rpc-spec.md §4）。
 pub mod job;
@@ -90,6 +91,7 @@ mod sync_ops;
 #[cfg(test)]
 mod test_support;
 mod upload_ops;
+mod verify_ops;
 mod wbf_rooms;
 
 use std::path::{Path, PathBuf};
@@ -125,6 +127,8 @@ pub use rooms_ops::{
 pub use session_ops::{DestroyResult, LogoutResult};
 pub use sync_ops::{watch_mode_from_name, RecentSummary, WatchMode, WatchSummary};
 pub use upload_ops::{SendFileResult, UploadRequest};
+pub use wbf_sdk::cross_signing::{DeviceTrust, UserTrust};
+pub use wbf_sdk::verification::{VerifyEmoji, VerifyStage, VerifyState};
 
 /// 幾乎每個操作都要回答的三件事。
 ///
@@ -245,6 +249,11 @@ pub struct Core {
     pub(crate) ensuring_links: std::sync::atomic::AtomicBool,
     /// 正在跑的 `room.invites` 那一輪裡，被推播碰過的房（`invites.rs`）：房間線的 task 記、那一輪補完時讀，只在記憶體。
     pub(crate) invite_rounds: std::sync::Arc<invites::InviteRounds>,
+    /// conf 的 `SERVER_BACKUP` 給背景用（金鑰線開好時建備份、新金鑰上傳，/docs/design/keys/cross-signing-and-verification.md §4.1）。
+    /// daemon 設（[`Core::set_server_backup_in_background`]）；沒設是關著。
+    pub(crate) background_backup: std::sync::Arc<identity_ops::BackgroundBackup>,
+    /// 正在看的裝置驗證流程（`verify_ops.rs`）：只在記憶體，跟上游的流程一樣 daemon 重開就沒了。
+    pub(crate) verify_watchers: std::sync::Arc<verify_ops::VerifyWatchers>,
 }
 
 impl Core {
@@ -274,7 +283,18 @@ impl Core {
             media_swept: std::sync::Mutex::new(std::collections::HashSet::new()),
             ensuring_links: std::sync::atomic::AtomicBool::new(false),
             invite_rounds: std::sync::Arc::default(),
+            background_backup: std::sync::Arc::default(),
+            verify_watchers: std::sync::Arc::default(),
         }
+    }
+
+    /// conf 的 `SERVER_BACKUP`，給背景用：開著才在金鑰線開好時建／接上備份、把新的房間金鑰傳上去（/docs/design/keys/cross-signing-and-verification.md §4.1）。
+    /// daemon 起來與 `daemon.reload_conf` 時設；core 不讀 conf（/docs/design/overview/architecture-v2.md §3）。
+    ///
+    /// Args:
+    ///     on: example: true
+    pub fn set_server_backup_in_background(&self, on: bool) {
+        self.background_backup.set(on);
     }
 
     pub fn data_dir(&self) -> &Path {

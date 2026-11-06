@@ -33,7 +33,10 @@ PR #1–#78 合併（main `6f25d7f`，2026-11-02；#76 房間動作、#78 收邀
   同一個 mxc 本地的 `media` 列說了算：描述不合一律 1500，**不**換掉列；只給 `mxc` 照列挑事件、從訊息點下載由那則建列；`media.delete_local` 清本地（先取消正在下載的）（`/docs/design/media/media-download.md` §5.3、§7.4，維護者 2026-10-07）。
   一個檔同時只有一個下載：同 server 的別的帳號再要就掛上去，進度與結果每個要過的帳號各推一則；`media.cancel` 誰叫都停（同一份 §5.1、§5.4、§5.5）。
 
-**還沒有**：UI；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；交叉簽章；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；
+**交叉簽章、裝置驗證、金鑰備份**（wbf 帳號，2026-11-07，`/docs/design/keys/cross-signing-and-verification.md`）：第一台裝置自動建交叉簽章與備份版本、新金鑰背景上傳；
+`verify.*`（to-device 的 SAS）與 `devices.list`；`backup.restore { recovery_key }` 換機器還原；自我驗證完自動還原；解不開時向自己已驗證的裝置要金鑰。真 server 驗過。
+
+**還沒有**：UI；換掉既有的交叉簽章（server 要密碼）、QR 驗證、房間裡驗證「別人這個人」；一般 Matrix 帳號的驗證（一般帳號的備份由 `Client` 做）；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；
 別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 📎 補解寫失敗那批的重試觸發點、CLI 送加密房：2026-10-07 照 §7 第 1 項的預設做了（`/docs/design/keys/e2ee-rpc.md` §3、§6），維護者可以在審查時改。
@@ -74,7 +77,7 @@ crates/wbf-sdk/src/
                          `send_outgoing_requests`（KeysUpload／Query／Claim／Signatures／發 to-device 全走橋）、`refresh_room_devices`（一支例行程序：
                          成員清單 → diff → 只重查變的人 → 雜湊對一次、不對再查、還不對就拒發；**不**碰房間金鑰）、`encrypt_and_send`（只用已經分好的金鑰加密、送，沒就緒回 `RoomKeyNotReady`）、
                          `room_key_state`（就緒了沒、快到期了沒；只讀本機）、`distribute_room_key`（建／換金鑰並走橋送出去，後台叫）、`discard_room_key`（提早換）、`decrypt_room_event`、`import_items`／`pull_to_device`（匯入 → 落地 → 銷毀鎖死；推來的一包與 Fetch 的一窗同一支）。
-                         分享策略 `room_key_share_settings()` 明確選 AllDevices，交叉簽章做好後換 IdentityBased 只改那裡
+                         分享策略 `room_key_share_settings()` 明確選 AllDevices（matrix-sdk 的預設，交叉簽章做好也不換）
   device_version.rs      裝置版本號（`序號-雜湊`）與房間版本號：成員清單怎麼讀（沒號碼是錯不是 0）、`diff_from`（誰要重查、誰離開）、
                          `compute_device_keys_hash`（照 server §3.4 重算，黃金向量 810b7c3be4；🚨 user_id 用 get 逐層查、不拼 JSON Pointer）。沒網路
   to_device_state.rs     to-device 的 `cd_seq` 與待銷毀清單 → `m/td.json`（原子寫；壞檔是錯不是從頭；Ack 不清清單，只清 ItemsDestroyed 回來的）
@@ -255,10 +258,9 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 
 | 洞 | 卡在哪 | 影響 |
 |---|---|---|
-| **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 沒排（§7「之後」） | 新裝置讀不到舊訊息（wbf 帳號的金鑰備份、向自己裝置要金鑰都沒接）；補解寫失敗那批要等 `room.history`／`sync.recent` 讀到才再試 |
+| **E2EE 還缺的**（`/docs/design/keys/e2ee-rpc.md` §8） | 沒排（§7「之後」） | 補解寫失敗那批要等 `room.history`／`sync.recent` 讀到才再試 |
 | 一般 Matrix 帳號沒有即時推播 | 沒有常駐的同步迴圈（只有要用時的 `sync_once`，/docs/design/rooms/room-actions.md §3.3.5）；要做是另一支 | 訊息與邀請都要 UI 叫了才有（`sync.recent`、`room.invites`） |
 | 分房間金鑰沒算被邀請的人 | 維護者 2026-10-07 在 server 那邊定了（wbfuwunel 的 /docs/design/keys/invite-key-scope.md），server 還沒實作；server 合併後 client 另開一支（/docs/design/rooms/room-actions.md §6.1） | 歷史可見性是 `shared`／`invited` 的房，被邀請期間的密文那個人加入後解不開 |
-| 交叉簽章沒 bootstrap | client 還沒接；server 的橋都有了（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`／`0x25`，驗證訊息走 to-device） | 分享策略只能 `AllDevices`；server 建議的 `IdentityBasedStrategy` 現在等於發給零台 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
 | 跳到訊息的錨點（PR #43 走橋 GetEvent，2026-09-16 關掉、沒合） | 等 wbfuwunel #64（`Recent` 收 `before_event_id`），合了再開一支 | 跳到訊息還是兩個來回 |
 | server 批 3、批 4 的新 kind 沒接（0x12／0x15／0x1C／0x1D、0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加；沒有破壞性改動、向量檔沒變 | 推播規則、搜尋、TURN 都還沒有（公開房間目錄 `0x13` `0x35`／`0x36` 隨房間動作接了）。做的時候先讀 #55 列的十個坑 |
@@ -272,11 +274,12 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 1. ~~**官方 Matrix 的傳統上傳與下載、E2EE 收尾**~~：2026-10-07 在分支 `feat/matrix-media-and-e2ee-finish` 做完（傳統格式下載與上傳、換金鑰期限、`room.history` 讀到未解的再試、
    路徑版 `room.send_file` 與 CLI 送加密房）。之後可以補：UI 主動命令重發金鑰；傳統上傳記 `source_uri`。
 2. **訊息功能**：~~房間動作（建房、邀請、改權限、置頂…）~~ 2026-10-07 在分支 `feat/room-actions` 做完（/docs/design/rooms/room-actions.md）；~~收邀請~~ 2026-10-14 在分支 `feat/invites` 做完（同一份 §3.3，issue #77）。
-   訊息動作（回覆、編輯、收回、表情）2026-11-04 做完：/docs/design/messages/message-actions.md。已讀三層 2026-11-06 做完：/docs/design/messages/read-receipts.md。剩：裝置驗證。
+   訊息動作（回覆、編輯、收回、表情）2026-11-04 做完：/docs/design/messages/message-actions.md。已讀三層 2026-11-06 做完：/docs/design/messages/read-receipts.md。裝置驗證（連同交叉簽章、wbf 帳號的金鑰備份）
+   2026-11-07 做完：/docs/design/keys/cross-signing-and-verification.md。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
-之後（還沒排）：wbf 帳號的金鑰備份與交叉簽章、裝置驗證（純 client：server 的橋都有了，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x24`–`0x25`、`0x30`–`0x3D`，secret storage 走 /docs/bridge-specs/0x11-account.md 的 account data）；「跳到訊息」等 wbfuwunel #64（#43 已關）；server 批 3／4 的功能（#55）；
+之後（還沒排）：換掉既有的交叉簽章（UIAA）、QR 驗證、登出閘門的第一關接上 wbf 帳號（/docs/design/keys/cross-signing-and-verification.md §9、§12）；「跳到訊息」等 wbfuwunel #64（#43 已關）；server 批 3／4 的功能（#55）；
 下載的暫停（只停主檔，**不**停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
 UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。

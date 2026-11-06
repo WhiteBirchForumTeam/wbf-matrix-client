@@ -1,12 +1,12 @@
 //! E2EE 引擎：把 `matrix-sdk-crypto` 的 `OlmMachine` **只當狀態機用**（/docs/design/keys/e2ee-walkthrough.md §13）——
 //! server 給的推進去（to-device、自己的 OTK 存量），它要送的拉出來（`outgoing_requests`）走我們的橋送，回應再交回去。
-//! 網路、水位、銷毀都在這個 crate 自己手上；🚫 沒有 `/sync`、🚫 沒有 matrix-sdk 的 `Client`。
+//! 網路、水位、銷毀都在這個 crate 自己手上；**沒有** `/sync`、**沒有** matrix-sdk 的 `Client`。
 //!
 //! 這是 wbf-sdk 裡**第二個**碰上游的地方（第一個是 `backend/matrix_sdk`）；兩者共用同一個 sqlite crypto store（`m/`），
 //! ⚠️ 同一時間只能有一個持有者（/docs/design/keys/e2ee-walkthrough.md §13 第 9 條）——過渡期由呼叫端保證不同時開。
 //!
 //! 涵蓋到哪：金鑰上傳／查詢／claim、收 to-device、建／換房間金鑰並送到每台裝置（`distribute_room_key`，後台叫）、
-//! 房間金鑰就緒了沒（`room_key_state`）、**只用已經分好的金鑰**加密帶房間版本號送出（`Event/Send`，🚫 產生金鑰、🚫 上網分金鑰）、
+//! 房間金鑰就緒了沒（`room_key_state`）、**只用已經分好的金鑰**加密帶房間版本號送出（`Event/Send`，**不**產生金鑰、**不**上網分金鑰）、
 //! 解密（WS 收到的密文 → 要寫進 cache 的樣子）。什麼時候準備金鑰、等它就緒、什麼時候換是呼叫端的事（daemon 的後台，/docs/design/keys/e2ee-rpc.md §3、§3.1）。
 
 use std::borrow::Cow;
@@ -62,10 +62,12 @@ pub struct ImportReport {
     pub imported: usize,
     /// 這一輪 server 說已經沒了的 count（含上次沒銷成、這次補送的）。
     pub destroyed: Vec<u64>,
-    /// 落地後的「處理過的最新 count」（紀錄，🚫 不是 `Fetch` 的游標）。
+    /// 落地後的「處理過的最新 count」（紀錄，**不是** `Fetch` 的游標）。
     pub cd_seq: Option<u64>,
     /// 還留在待銷毀清單上的（server 這輪沒回來的，下次再送）。
     pub still_to_destroy: usize,
+    /// 這一窗裡「有人要跟這台驗證」的 (對方, flow id)：狀態機已經吃進去了，呼叫者拿它開始看那個流程、推 `verify.state`。
+    pub verification_requests: Vec<(String, String)>,
 }
 
 /// `pull_to_device` 最多拉幾窗：一窗 1000 則、六十四窗就是六萬多則 to-device，到這個數還沒追平是不對勁，停下來報錯。
@@ -167,7 +169,7 @@ pub enum SendOutcome {
         /// 給人看的, example: "the room key expired"
         reason: String,
     },
-    /// server 說帶的 `room_version` 過期，訊息沒送。拿 `current_room_version` 只能知道自己過期，🚫 不能直接拿它重送：
+    /// server 說帶的 `room_version` 過期，訊息沒送。拿 `current_room_version` 只能知道自己過期，禁止直接拿它重送：
     /// 先 `refresh_room_devices`（拿新的快照）、讓後台對它分好金鑰，再帶那份快照的 `room_version` 重送（同一個 `txn_id`）。
     RoomDevicesChanged {
         current_room_version: Option<u64>,
@@ -205,6 +207,9 @@ pub struct OlmEngine {
     /// 各自拿到同一批「待查」的 `/keys/query` 去送、互相讓對方的回應過期，繞滿 `OUTGOING_ROUNDS_LIMIT` 圈就失敗
     /// （2026-10-07 CLI 新裝置第一個命令送加密房實測：35 個 `/keys/query`）。
     outgoing: tokio::sync::Mutex<()>,
+    /// 備份上傳一次只跑一個（`key_backup::upload_room_keys`）：上游的 `backup()` 在上一批還沒交回之前會回同一批，
+    /// 兩個同時跑就把同一批送兩次。
+    pub(crate) backup_upload: tokio::sync::Mutex<()>,
 }
 
 impl OlmEngine {
@@ -249,12 +254,13 @@ impl OlmEngine {
             store_dir: store_dir.to_path_buf(),
             last_keys_query: Mutex::new(BTreeMap::new()),
             outgoing: tokio::sync::Mutex::new(()),
+            backup_upload: tokio::sync::Mutex::new(()),
         })
     }
 
     /// UI 叫 `room.refresh_devices`（點進房間、收到 `devices.changed` 之後由 UI 決定）與被 1506 擋之後都叫這一支（/docs/design/keys/e2ee-rpc.md §2、§3）：
     /// 拿這一刻的成員清單與版本號 → 跟上一份比出誰變了 → 只重查那些人 → 雜湊對一次（不對再查一次，還不對就拒絕）。
-    /// 🚫 碰房間金鑰：建、換、送都是後台的事（呼叫端拿回來的 `versions` 交給 `distribute_room_key`）。
+    /// **不**碰房間金鑰：建、換、送都是後台的事（呼叫端拿回來的 `versions` 交給 `distribute_room_key`）。
     ///
     /// Args:
     ///     client: 要能走橋的連線
@@ -286,7 +292,7 @@ impl OlmEngine {
         self.send_outgoing_requests(client).await?;
         let rechecked = self.mismatched_device_hashes(&versions);
         if !rechecked.is_empty() {
-            // 查詢與清單之間可能有人換了金鑰：再查一次。還對不上就不是競態，是我們或 server 壞了，🚫 不帶著存疑的名單發金鑰。
+            // 查詢與清單之間可能有人換了金鑰：再查一次。還對不上就不是競態，是我們或 server 壞了，**不**帶著存疑的名單發金鑰。
             self.mark_users_changed(&rechecked).await?;
             self.send_outgoing_requests(client).await?;
             let still = self.mismatched_device_hashes(&versions);
@@ -304,7 +310,7 @@ impl OlmEngine {
         })
     }
 
-    /// 這個房的房間金鑰能不能拿來加密：只讀本機的 crypto store，🚫 建、🚫 換、🚫 上網。
+    /// 這個房的房間金鑰能不能拿來加密：只讀本機的 crypto store，**不**建、**不**換、**不**上網。
     ///
     /// Args:
     ///     room_id: example: "!r:localhost"
@@ -388,7 +394,7 @@ impl OlmEngine {
 
     /// **只用已經分好的房間金鑰**加密、帶房間版本號送出（`Event/Send`，維護者 2026-10-06，/docs/design/keys/e2ee-rpc.md §3）。
     ///
-    /// 🚨 這條路🚫 產生金鑰、🚫 換金鑰、🚫 任何金鑰的網路動作：先看 [`OlmEngine::room_key_state`]，不是 `Ready` 就不加密、回 `RoomKeyNotReady`，
+    /// 🚨 這條路**不**產生金鑰、**不**換金鑰、**沒有**任何金鑰的網路動作：先看 [`OlmEngine::room_key_state`]，不是 `Ready` 就不加密、回 `RoomKeyNotReady`，
     /// 由呼叫端讓後台（`distribute_room_key`）分完再送。所以每一則用的金鑰，排過的 to-device 都已經拿到 server 的 ACK。
     /// 上游的加密在「沒有 outbound session」與「session 過期」時是 **panic** 不是回錯：就緒檢查已經排除這兩條，
     /// 檢查到加密之間剛好跨過期限（或被後台換掉）的那一瞬間，用 `catch_unwind` 接住、回 `RoomKeyNotReady`（全域 P 條：失敗要有去處）。
@@ -414,7 +420,7 @@ impl OlmEngine {
     ) -> Result<SendOutcome, SdkError> {
         let owned_room_id: OwnedRoomId = RoomId::parse(room_id)
             .map_err(|error| SdkError::Usage(format!("bad room id {room_id:?}: {error}")))?;
-        // 1. 金鑰一定是分好的那把；🚫 在這裡建或換。
+        // 1. 金鑰一定是分好的那把；禁止在這裡建或換。
         if let RoomKeyState::NotReady { reason } = self.room_key_state(room_id).await? {
             return Ok(SendOutcome::RoomKeyNotReady { reason });
         }
@@ -567,6 +573,27 @@ impl OlmEngine {
         let mut state = ToDeviceState::load(&self.store_dir)?;
         let counts: Vec<u64> = items.iter().map(|(count, _)| *count).collect();
         let events: Vec<serde_json::Value> = items.into_iter().map(|(_, event)| event).collect();
+        let verification_requests: Vec<(String, String)> = events
+            .iter()
+            .filter_map(crate::verification::find_incoming_request)
+            .collect();
+        // 0. 有人要跟這台驗證：先重查他的裝置。上游收到請求時查不到對方那台的金鑰就**丟掉**請求，
+        //    標準 Matrix 靠 `/sync` 的 `device_lists.changed` 先讓它重查，我們沒有那條（新登入的自己的裝置就是這樣）。
+        //    沒追蹤過的人（沒有共同的房間）要先追蹤：上游的「變了」只對追蹤中的人有用。
+        //    查失敗照樣匯：金鑰比驗證重要；那個請求被丟掉時，看流程的那一邊會講出來（core 的 `verify_ops`）。
+        if !verification_requests.is_empty() {
+            let senders: Vec<String> = verification_requests
+                .iter()
+                .map(|(sender, _)| sender.clone())
+                .collect();
+            let marked = async {
+                self.track_users(&senders).await?;
+                self.mark_users_changed(&senders).await
+            };
+            if marked.await.is_ok() {
+                let _ = self.send_outgoing_requests(client).await;
+            }
+        }
         // 1. 匯入：Ok 就是 crypto store 的交易 commit 了（上游 receive_sync_changes 的最後兩行）。
         let room_keys = self.receive_to_device(events, None, None).await?;
         // 2. 落地：水位前進、這些 count 進待銷毀清單。
@@ -586,11 +613,12 @@ impl OlmEngine {
             destroyed,
             cd_seq: state.cd_seq,
             still_to_destroy: state.to_destroy.len(),
+            verification_requests,
         })
     }
 
     /// 從佇列最舊還沒銷毀的起一窗一窗拉到追平（/docs/design/keys/to-device-client.md §7）：上線時「主動拉一次」就是它，推播說 `gap`、匯失敗也是它。
-    /// 每一窗都走 `import_items`。🚫 不帶 `cd_seq`：佇列頭就是水位，`ItemsDestroy` 是唯一的「處理完了」（wbfuwunel #87）。
+    /// 每一窗都走 `import_items`。**不**帶 `cd_seq`：佇列頭就是水位，`ItemsDestroy` 是唯一的「處理完了」（wbfuwunel #87）。
     /// 空窗也走一次（把上次沒銷成的補送）。
     ///
     /// Args:
@@ -606,7 +634,7 @@ impl OlmEngine {
     ) -> Result<Vec<ImportReport>, SdkError> {
         let mut reports = Vec::new();
         for _ in 0..PULL_WINDOWS_LIMIT {
-            // 🚫 不帶 `cd_seq`（維護者 2026-09-26，wbfuwunel #87）：讓 server 從這台裝置佇列裡**最舊還沒銷毀的**起給。
+            // **不**帶 `cd_seq`（維護者 2026-09-26，wbfuwunel #87）：讓 server 從這台裝置佇列裡**最舊還沒銷毀的**起給。
             // 佇列本身就是沒有洞的（銷毀前不刪），洞只會是 client 自己的游標造出來的：游標跑到一則還沒進 store 的 item 前面，那則就再也問不到。
             // 這一窗匯完、銷掉的不會再回來，所以下一次不帶游標的 `Fetch` 自然是下一窗；銷不掉的會再回來一次（重複匯入無害）。
             let window = client
@@ -688,7 +716,7 @@ impl OlmEngine {
     ///
     /// Return:
     ///     Ok(usize)      送了幾個請求
-    ///     Err(Usage)     狀態機要送房間內的驗證訊息（`RoomMessage`）——WS 這條路還沒接，🚫 不靜默丟掉
+    ///     Err(Usage)     狀態機要送房間內的驗證訊息（`RoomMessage`）——WS 這條路還沒接，**不**靜默丟掉
     ///     Err(Server)    橋或 Matrix 端點拒絕（原樣往上，這一個請求下次 `outgoing_requests` 還會再出現）
     ///     Err(Protocol)  回應解不成 ruma 的型別、或繞了 OUTGOING_ROUNDS_LIMIT 圈還有東西
     pub async fn send_outgoing_requests<C: PackChannel>(
@@ -860,7 +888,7 @@ impl OlmEngine {
             .map_err(olm_error)
     }
 
-    async fn send_one<C: PackChannel>(
+    pub(crate) async fn send_one<C: PackChannel>(
         &self,
         client: &mut WbfClient<C>,
         request: &OutgoingRequest,
@@ -934,7 +962,7 @@ impl OlmEngine {
     }
 
     /// 一個 to-device 請求走橋（`0x16 0x25`），成功後交回狀態機（它才會把「這把金鑰發給過誰」記下來）。
-    async fn send_to_device_request<C: PackChannel>(
+    pub(crate) async fn send_to_device_request<C: PackChannel>(
         &self,
         client: &mut WbfClient<C>,
         request: &ToDeviceRequest,
@@ -950,6 +978,47 @@ impl OlmEngine {
             .await?;
         self.machine
             .mark_request_as_sent(&request.txn_id, &send_event_to_device::v3::Response::new())
+            .await
+            .map_err(olm_error)
+    }
+
+    /// 上傳一份簽章（交叉簽章初始化、驗證確認、簽自己這台）。
+    /// server 對個別簽不進去的仍回 200、列在 `failures`（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md `0x25`），所以這裡自己看：不是空的就是錯。
+    ///
+    /// Return:
+    ///     Ok(())
+    ///     Err(Server)     橋拒絕；或 `failures` 不是空的（`code` 是 `SignatureFailures`，`meta` 是那份 `failures`）
+    ///     Err(Protocol)   回應解不成 ruma 的型別
+    pub(crate) async fn send_signature_upload<C: PackChannel>(
+        &self,
+        client: &mut WbfClient<C>,
+        upload: upload_signatures::v3::Request,
+    ) -> Result<(), SdkError> {
+        let reply = self
+            .call_bridge_with(client, protocol::BRIDGE_SIGNATURES_UPLOAD, upload)
+            .await?;
+        let failures = reply
+            .json("SignaturesUpload")?
+            .get("failures")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let is_empty = match &failures {
+            serde_json::Value::Object(users) => users.is_empty(),
+            serde_json::Value::Null => true,
+            _ => false,
+        };
+        if !is_empty {
+            return Err(SdkError::Server {
+                code: "SignatureFailures".into(),
+                message: format!("the server did not accept some signatures: {failures}"),
+                meta: failures,
+                code_id: None,
+            });
+        }
+        let response =
+            parse_response::<upload_signatures::v3::Response>(&reply, "SignaturesUpload")?;
+        self.machine
+            .mark_request_as_sent(&ruma::TransactionId::new(), &response)
             .await
             .map_err(olm_error)
     }
@@ -973,11 +1042,11 @@ impl OlmEngine {
     }
 }
 
-/// 房間金鑰發給誰（/docs/design/keys/e2ee-walkthrough.md §13 第 8 條：要明確選，🚫 不默默用預設）。
+/// 房間金鑰發給誰（/docs/design/keys/e2ee-walkthrough.md §13 第 8 條：要明確選，**不**默默用預設）。
 ///
-/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置。wbfuwunel 的 /docs/design/wbf-room-device-version.md §1 建議的 `IdentityBasedStrategy`（只發給被擁有者交叉簽章過的裝置）
-/// 要每個帳號都 bootstrap 過交叉簽章才有意義——client 這邊還沒做（`SigningKeysUpload` 只有號碼），現在選它等於發給零台裝置。
-/// ✅ 交叉簽章做好之後要換成 `IdentityBasedStrategy`，這裡是唯一要改的地方。
+/// 選 `AllDevices`：發給成員每一台上傳過金鑰的裝置——matrix-sdk 的預設（上游 `CollectStrategy` 的 `#[default]`）。
+/// 交叉簽章做好之後也**不**換成 `IdentityBasedStrategy`：維護者 2026-09-17「Matrix 原本的金鑰分發不動」
+/// （wbfuwunel 的 /docs/design/keys/e2ee-over-channel.md §3；/docs/design/keys/cross-signing-and-verification.md §8）。
 /// 期限照房間自己設的（[`RoomKeyRotation`]）。
 pub fn room_key_share_settings(rotation: RoomKeyRotation) -> EncryptionSettings {
     EncryptionSettings {
@@ -1081,7 +1150,7 @@ mod tests {
         assert_eq!(RoomKeyRotation::of_encryption_content(Some(&odd)), default);
     }
 
-    /// 提早換的門檻跟著期限縮：預設的期限照舊（5 則、1 小時），很短的期限 🚫 每送一則就換。
+    /// 提早換的門檻跟著期限縮：預設的期限照舊（5 則、1 小時），很短的期限**不會**每送一則就換。
     #[test]
     fn the_early_rotation_margin_shrinks_with_a_short_period() {
         assert_eq!(pre_rotate_messages(100), 5);

@@ -324,6 +324,17 @@ impl Core {
                 false,
             )
             .await?;
+            if opened < undecrypted.len() {
+                // 解不開的那幾則，上游（`automatic-room-key-forwarding`）已經排好「向自己已驗證的裝置要金鑰」：送出去
+                // （/docs/design/keys/cross-signing-and-verification.md §7）。只用開著的金鑰線，沒開就跟下一批一起送。
+                if let Some(mut line) = self.pool_of_account(account)?.reuse(LinkRole::Keys).await {
+                    if let Err(error) = engine.send_outgoing_requests(&mut line).await {
+                        self.events.progress(format!(
+                            "room.history: asking this account's other devices for missing keys failed: {error}"
+                        ));
+                    }
+                }
+            }
             if opened == 0 {
                 return Ok::<_, CoreError>(Vec::new());
             }

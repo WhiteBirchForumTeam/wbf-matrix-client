@@ -205,9 +205,10 @@ daemon 自己**不**動作；UI 決定要不要對開著的房叫 `room.refresh_
 - **`devices.changed` 不觸發後台**：誰的裝置變了仍是 UI 決定要不要 refresh（§4，2026-09-29 定的）；refresh 之後才交給後台。
 - **daemon 重開之後的第一則要等**：就緒表只在記憶體裡，重開後每個房的第一則都要等後台對那個房間版本號跑一輪（金鑰都還在的話只是查一次、什麼都不用送）。UI 點進房就 refresh 的話，這一輪在使用者按送出前就做完了。
 - **上游升級會清掉自己的房間金鑰**：上游的 migration 清過兩次 `outbound_group_session`（格式變了就整張清、讓它換金鑰）。對我們無害：送出前會發現「這個房沒有金鑰」、等後台分一把新的；被清掉的那把沒送到的 to-device 從來沒被拿來加密過。
-- **新裝置讀不到舊訊息**：送出當下不存在的裝置沒分到金鑰。wbf 帳號的金鑰備份（server 端 backup）與「向自己其他裝置要金鑰」都還沒接。
+- ~~**新裝置讀不到舊訊息**~~：2026-11-07 接上了——wbf 帳號的金鑰備份與 recovery key、自我驗證後自動還原、向自己已驗證的裝置要金鑰（/docs/design/keys/cross-signing-and-verification.md §4、§5.2、§7）。
 - **建不起 Olm 通道的裝置也讀不到**：對方沒有 fallback key、一次性金鑰又被領光時，那台只收到 `m.no_olm`、房間照樣算就緒（§3 第 1 點）；它之後補到通道，下一次分金鑰才補給它（只從當下的位置）。禁止每送一則就重 claim（matrix-sdk 那樣）：只有不支援 fallback key 的舊 client 會遇到。
-- **交叉簽章**：分享策略仍是 `AllDevices`（`IdentityBasedStrategy` 要先 bootstrap，/docs/design/keys/e2ee-walkthrough.md §16）。
+- ~~**交叉簽章**~~：2026-11-07 接上了（第一台裝置自動建、裝置驗證，/docs/design/keys/cross-signing-and-verification.md §3、§5）。分享策略**維持** `AllDevices`：matrix-sdk 的預設，
+  維護者 2026-09-17「Matrix 原本的金鑰分發不動」（同一份 §8）。
 - **補解寫失敗的那批要等有人讀到才再試**：金鑰到了、解開了，但 cache 寫失敗——錯誤會講出來（帶則數），那幾則仍是密文；
   `room.history` 讀到那一頁、或 `sync.recent` 再拉到它們時才再解（§6，2026-10-07 照 /docs/handover.md §7 的預設做）。禁止背景自己掃整個 cache。
 

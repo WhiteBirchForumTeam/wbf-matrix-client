@@ -1,13 +1,16 @@
-# 交叉簽章、裝置驗證、金鑰備份：wbf 帳號補齊（草稿）
+# 交叉簽章、裝置驗證、金鑰備份：wbf 帳號補齊
 
-> 現況：維護者 2026-11-07 核可（§10 五點照草稿）、開工；驗收項目在 §11。
+> 現況：維護者 2026-11-07 核可（§10 五點照草稿）、同日實作；驗收項目與結果在 §11。實作時跟草稿不同的地方寫在 §12。
+> 程式：sdk 的 `cross_signing.rs`、`key_backup.rs`、`secret_storage.rs`、`verification.rs`；core 的 `identity_ops.rs`（金鑰線開好與每批匯完之後）、
+> `verify_ops.rs`（`verify.*`、`devices.list`）、`backup_ops.rs`（wbf 帳號那一半）；daemon 的 `handle/verify.rs`。
 > 補的是 /docs/design/keys/e2ee-rpc.md §8 列的缺口：交叉簽章、wbf 帳號的金鑰備份、向自己其他裝置要金鑰；加上 /docs/handover.md §7 第 2 項剩下的裝置驗證。
 
 ## 0 範圍
 
 - **只補 wbf 帳號。** 一般 Matrix 帳號有 matrix-sdk 的 `Client`，交叉簽章與備份由上游做（/docs/design/keys/room-key-backup.md §3）；wbf 帳號沒有 `Client`，直接開 `OlmMachine`（`crates/wbf-sdk/src/crypto_engine.rs` 的 `OlmEngine`），這四件都是空的。
 - **server 不用改。** 要用的端點都已經走橋：交叉簽章 `0x17 0x24`／`0x25`、備份 `0x17 0x30`–`0x3D`、account data `0x11 0x25`／`0x26`（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md、/docs/bridge-specs/0x11-account.md）；驗證訊息走原本的 to-device（wbfuwunel 的 /docs/design/keys/e2ee-over-channel.md §1：「不動」）。
-- **RPC 跟一般帳號同一組。** `backup.*`、`recovery.*` 照 /docs/design/rpc-specs/rpc-spec.md §3 原本的形狀，UI 不必分帳號種類；新加的 `verify.*`、`devices.list` 兩種帳號都接（一般帳號走 `Client` 的同名功能）。
+- **RPC 跟一般帳號同一組。** `backup.*`、`recovery.*` 照 /docs/design/rpc-specs/rpc-spec.md §3 原本的形狀，UI 不必分帳號種類。新加的 `verify.*`、`devices.list` **只有 wbf 帳號**：一般 Matrix 帳號沒有常駐的同步迴圈（/docs/handover.md §6），
+  收不到對方的驗證訊息，叫了回 `1100`（§12）。
 - **「Matrix 原本的金鑰分發不動」**（維護者 2026-09-17，wbfuwunel 的 /docs/design/keys/e2ee-over-channel.md §3）：分享策略、解密時的信任要求都照 matrix-sdk 的預設（§8）。
 
 ## 1 四件事，上游給了什麼、我們補什麼
@@ -33,7 +36,8 @@
 | `ADD_BACKUP_KEYS` | `0x17 0x35` | `PUT /room_keys/keys?version=` |
 | `GET_BACKUP_KEYS` | `0x17 0x38` | `GET /room_keys/keys?version=` |
 
-讀 account data 已經有（`protocol.rs` 的 `BRIDGE_ACCOUNT_DATA`），一併搬進端點表。刪除備份版本**不**加（/docs/design/keys/room-key-backup.md §9：不可逆，要刪去別的 client）。
+讀、寫 account data 已經在端點表裡（`GET_ACCOUNT_DATA`、`SET_ACCOUNT_DATA`，房間動作那支加的）；簽章上傳用 `protocol.rs` 既有的 `BRIDGE_SIGNATURES_UPLOAD`（ruma 的型別化請求）。
+這幾支只有 wbf 帳號會走（一般帳號由 `Client` 自己送），放進端點表是為了同一套變數檢查與回應解法。刪除備份版本**不**加（/docs/design/keys/room-key-backup.md §9：不可逆，要刪去別的 client）。
 
 ## 3 交叉簽章：什麼時候建
 
@@ -63,7 +67,7 @@
 | `backup.status` | 欄位照舊；`recovery_state` 從「secret storage 有沒有、這台有沒有四個秘密」算 |
 | `backup.save`／`backup.import`（本地快照） | 上游 `export_room_keys`＋`encrypt_room_key_export` 有，接上同一個 `k/snapshot` |
 
-- `account.del` 的閘門（/docs/design/keys/room-key-backup.md §7）：wbf 帳號現在只看第二關；有了這些之後第一關也問得出來，兩種帳號一致。
+- `account.del` 的閘門（/docs/design/keys/room-key-backup.md §7）：wbf 帳號**照舊只看第二關**（這台保管著 recovery key）。第一關（server 上有備份、secret storage 設好）現在問得出來了，但這支沒接（§12）。
 - recovery key 的格式是 secret storage 的 base58（跟 Element 的「安全金鑰」同一種），**不**收 passphrase 版（§9）。
 
 ## 5 裝置驗證（to-device 的 SAS）
@@ -79,14 +83,16 @@
 
 | method | params | 回 |
 |---|---|---|
-| `verify.request` | `{ user_id, device_id?, user?, server? }`：`user_id` 是自己時 `device_id` 可省（送給自己所有裝置） | `{ flow_id }` |
-| `verify.accept` | `{ flow_id, user_id, … }`：接受對方的請求、或對方開始的 SAS | `{ ok }` |
-| `verify.start_sas` | `{ flow_id, user_id, … }` | `{ ok }` |
-| `verify.confirm` | `{ flow_id, user_id, … }`：使用者說表情一樣 | `{ ok }` |
-| `verify.cancel` | `{ flow_id, user_id, … }` | `{ ok }` |
+| `verify.request` | `{ user_id, device_id?, user?, server? }`：`user_id` 是自己時 `device_id` 可省（送給自己所有被交叉簽章簽過的裝置） | `VerifyState`（`requested`，帶 `flow_id`） |
+| `verify.accept` | `{ flow_id, user_id, … }`：接受對方的請求、或對方開始的 SAS | `VerifyState` |
+| `verify.start_sas` | `{ flow_id, user_id, … }` | `VerifyState` |
+| `verify.confirm` | `{ flow_id, user_id, … }`：使用者說表情一樣 | `VerifyState` |
+| `verify.cancel` | `{ flow_id, user_id, … }` | `VerifyState` |
 | `verify.list` | `{ user?, server? }` | `{ flows: [VerifyState] }`：還在進行的 |
 
-推播 `verify.state`（示意）：
+每一支都回那個流程**做完這一步之後**的樣子（跟推播同一個形狀）；流程不在狀態機裡（從沒有過、已經結束、daemon 重開了）是 `1100`。
+
+推播 `verify.state`（示意；e2e 斷言的是同一組欄位）：
 
 ```json
 { "user": "@alice:localhost", "flow_id": "<…>", "other_user": "@alice:localhost", "other_device": "<…>",
@@ -95,11 +101,18 @@
 ```
 
 `state`：`requested` → `ready` → `started` → `keys_exchanged`（帶 `emoji`／`decimals`）→ `confirmed`（自己按了、等對方）→ `done`；任何一步都可能 `cancelled`（帶 `reason`）。
+推播要訂閱 `verify.state`（/docs/design/rpc-specs/rpc-spec.md §3.9）。
 
-### 5.2 確認之後
+### 5.2 收到請求、確認之後
 
+- **收到請求前先查對方的裝置**：上游收到請求時查不到對方那台的金鑰就**丟掉**請求。標準 Matrix 靠 `/sync` 的 `device_lists.changed` 先讓它重查，我們沒有那條，
+  所以金鑰線每匯一批之前，這批裡有驗證請求就先追蹤、重查送請求的人（`OlmEngine::import_items`）。剛登入的自己的裝置、沒有共同房間的別人都是這種情況（e2e 實測踩到）。
 - `confirm()` 回的簽章（自我驗證是 self-signing key 簽那台；別人是 user-signing key 簽那個人）**自己送**（`0x17 0x25`），回覆的 `failures` 不是空的就當失敗回給 UI（server 的 `0x25` 個別失敗仍是 200）。
-- **自我驗證**完：上游自動排「跟對方要缺的秘密」，由後台送出去。交叉簽章私鑰收到就被上游匯入；**備份解密金鑰**落在秘密收件匣，daemon 拿出來對過 server 的備份版本（`backup_key_matches`）才存、`enable_backup_v1`，然後**自動下載還原**（要點頭，§10 第 3 點），跟 `backup.restore` 後半段同一條路。
+- **自我驗證**完：上游自動排「跟對方要缺的秘密」，由後台送出去。交叉簽章私鑰收到就被上游匯入；**備份解密金鑰**落在秘密收件匣，daemon 拿出來對過 server 的備份版本（`backup_key_matches`）才存、`enable_backup_v1`，然後**自動下載還原**（§10 第 3 點），跟 `backup.restore` 後半段同一條路。
+- **完成就重查雙方的金鑰**（隔 3 秒再查一次）：剛上傳的簽章要回到 crypto store，`devices.list` 才看得到；對方的簽章可能比「完成」晚一步才上傳。
+- **金鑰線每匯完一批就把狀態機排的請求送掉**（`identity_ops::after_import`）：驗證的回應、別台要的秘密、轉給自己裝置的房間金鑰都是收的時候排好的，沒人送就永遠停在那裡。
+- ⚠️ **上游會把完成、取消的流程清出它的快取**（每次 `outgoing_requests` 的 `garbage_collect`），之後用 flow id 查不到。所以看流程的一律**先拿到上游的物件、一直握著**（sdk 的 `WatchedFlow`）：
+  觀察者每 250 毫秒看一次握著的那份、有變就推；做完一步要回狀態的 RPC 也是動手前先拿。e2e 實測踩到：只靠 flow id 重查，`done` 永遠推不出去。
 - ⚠️ **驗證流程只在記憶體裡**（上游的 `VerificationCache` 不存檔）：daemon 重開，進行中的全部消失、**不**發 `cancelled`。UI 收到 daemon 重開（RPC 連線重連，/docs/design/rooms/room-sync.md §3.1）就把畫面上的驗證當作沒了。上游自己 10 分鐘逾時。
 
 ## 6 給 UI 的信任資訊
@@ -111,15 +124,17 @@
   "devices": [{ "device_id": "<…>", "display_name": "<…>", "verified": true, "is_this_device": false }] }
 ```
 
-- `verified`：這台被它主人的交叉簽章簽過、而且（別人的話）那個人被我驗證過；或我本地手動驗證過。
-- 只讀 crypto store，**不**上網（裝置清單由既有的 `KeysQuery` 追蹤更新）。
+- `verified`：這台被它主人的交叉簽章簽過、而且那個人被我信任（自己：這台有自己的 master 私鑰）；別台的話，我本地手動信任過也算。
+  ⚠️ **這台自己只看交叉簽章**：上游把「自己這台」一律標成本地信任，用它的 `is_verified()` 會讓還沒被驗證的新裝置說自己是 verified（e2e 實測踩到）。
+- **先重查那個人的金鑰**（走金鑰線）再讀 crypto store：讀的才是 server 現在的簽章（§12）。
 
 ## 7 向自己其他裝置要金鑰
 
-- 開 `matrix-sdk-crypto` 的 `automatic-room-key-forwarding`（要點頭，§10 第 4 點）。matrix-sdk 的預設 feature 就有它（`vendor/matrix-rust-sdk/crates/matrix-sdk/Cargo.toml` 的 `default`），我們的依賴沒開；開了才是「Matrix 原本的樣子」：
+- 開 `matrix-sdk-crypto` 的 `automatic-room-key-forwarding`（§10 第 4 點）。matrix-sdk 的預設 feature 就有它（`vendor/matrix-rust-sdk/crates/matrix-sdk/Cargo.toml` 的 `default`），我們的依賴沒開；開了才是「Matrix 原本的樣子」：
   - 解不開時自動向自己的裝置要（上游只在「自己至少有一台已驗證的裝置」時才要）；
   - 回應別人的請求：自己已驗證的裝置給全部，別人只給當初分給他們的那一段。
-- 要來的金鑰走既有的「金鑰到了補解」（/docs/design/keys/e2ee-rpc.md §6）。⚠️ 實作時要確認轉發來的金鑰也出現在 `ImportReport.room_keys`。
+- 上游是在「解不開」那一刻把請求排進去，**沒人送**：`room.history` 補解之後還有解不開的，就把排好的送出去（只用開著的金鑰線）。
+  對方回的 `m.forwarded_room_key` 走既有的「金鑰到了補解」，下一次讀就是明文（V11 驗過：沒有備份、只靠自己的裝置）。
 
 ## 8 照 matrix-sdk 預設、不改的
 
@@ -146,12 +161,13 @@
 
 ### 11.1 真 server（本機 wbfuwunel，daemon 的 `real_server.rs`，`--ignored`）
 
-同一個帳號開多台裝置＝多個 daemon handle、各自的資料目錄。
+同一個帳號開多台裝置＝多個 daemon handle、各自的資料目錄。帳號是每次跑時**現註冊**的（要 `WBF_E2E_REGISTRATION_TOKEN`）：
+別的 e2e 也登入 alice、bob，她們早就有交叉簽章與備份了，「第一台裝置建」只有全新的帳號測得到。下表的 alice／bob／carol 指的是三個角色。
 
 | # | 情境 | 通過的條件 |
 |---|---|---|
 | V1 | alice 第一台（A1）登入、開線 | server 上 alice 有 master／self-signing／user-signing（另一個 client 的 `KeysQuery` 看得到）；有備份版本（`LATEST_BACKUP_INFO`）；A1 的 `devices.list(alice)` 裡 A1 是 `verified` |
-| V2 | A1 在跟 bob 的加密房送一則，`backup.upload` | 回來之後 server 那份備份的 `count` ≥ 1 |
+| V2 | A1 建一間加密房、送一則，`backup.upload` | 回來之後 server 那份備份的 `count` ≥ 1 |
 | V3 | A1 `backup.create_recovery_key` | 回一串 recovery key；account data 有 `m.secret_storage.default_key` 與它指的 key；四個秘密都在 |
 | V4 | alice 第二台（A2）登入 | A2 **不**建新的 master（server 上的 master 公鑰跟 V1 一樣）；A2 的 `devices.list(alice)` 裡 A2 **不是** `verified`；A2 讀 V2 那則是解不開的 |
 | V5 | A2 `verify.request`（自己）→ A1 收到 `verify.state requested` → A1 `verify.accept` → A2 `verify.start_sas` → A1 `verify.accept` | 兩邊都推 `keys_exchanged`，**兩邊的 7 個表情逐一相同** |
@@ -176,3 +192,15 @@
 - 全套測試、clippy（`-D warnings`）各一次；真 server e2e 整套（含舊的 20 條）。
 - 變異驗證（先 commit）：至少拿掉「server 有 master 就不建」、「錯的 recovery key 不匯入」、「`failures` 不是空的就錯」、「`SERVER_BACKUP=off` 不上傳」各一次，對應的測試要紅。
 - **沒驗到的老實寫**：一般 Matrix 帳號那條（本機 server 走不到 HTTP 的那幾個端點）。
+
+## 12 實作時跟草稿不同的地方（2026-11-07，照預設做、寫在這裡給維護者審）
+
+| 草稿 | 實際 | 為什麼 |
+|---|---|---|
+| `verify.*`、`devices.list` 兩種帳號都接 | **只有 wbf 帳號**，一般帳號回 `1100` | 一般帳號沒有常駐的同步迴圈，對方的驗證訊息收不到，接了也走不完 |
+| `verify.request` 回 `{ flow_id }`、其他回 `{ ok }` | 每一支都回 `VerifyState`（含 `flow_id`） | UI 不必等推播就知道做完這一步的樣子；跟推播同一個形狀 |
+| `devices.list` 只讀 crypto store | 先重查那個人的金鑰再讀 | 只讀本地，對方剛上傳的簽章看不到（驗證完「還不是 verified」） |
+| 自己這台的 `verified` 用上游的 `is_verified()` | 自己這台只看交叉簽章 | 上游把自己這台一律標成本地信任（§6） |
+| 登出閘門第一關兩種帳號一致 | wbf 帳號照舊只看第二關 | 不在這支的驗收裡；要接另開一支（第二關才是真的，/docs/design/keys/room-key-backup.md §7） |
+| （草稿沒寫） | 匯入前先追蹤、重查送驗證請求的人；每批匯完送掉排好的請求；握著 `WatchedFlow`；`room.history` 送出要金鑰的請求 | 都是 e2e 實測踩到的（§5.2、§7） |
+| §11.2 secret storage 在 sdk 單元測 | 在 core 的假 server 測（`identity_ops.rs`） | 要一台會存 account data 的 server；core 的假 server 已經有 |

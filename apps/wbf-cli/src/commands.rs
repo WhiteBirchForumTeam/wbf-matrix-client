@@ -206,7 +206,7 @@ fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
 }
 
-/// 拿資料目錄的排他鎖；有 daemon 在用這個目錄就拒絕，🚫 不越過它寫檔。
+/// 拿資料目錄的排他鎖；有 daemon 在用這個目錄就拒絕，**不**越過它寫檔。
 ///
 /// Args:
 ///     data_dir: example: "C:\\Users\\me\\AppData\\Roaming\\wbf-matrix-client"
@@ -214,7 +214,9 @@ fn on_off(value: bool) -> String {
 ///     Ok(DataDirLock)   拿到了；丟掉就放手
 ///     Err(Usage)        別的程序（多半是常駐的 daemon）握著這個目錄
 ///     Err(Io)           鎖檔開不了
-fn lock_data_dir(data_dir: &std::path::Path) -> Result<wbf_core::data_dir_lock::DataDirLock, CoreError> {
+fn lock_data_dir(
+    data_dir: &std::path::Path,
+) -> Result<wbf_core::data_dir_lock::DataDirLock, CoreError> {
     use wbf_core::data_dir_lock::{lock_for_writing, LockError};
     lock_for_writing(data_dir).map_err(|error| match error {
         LockError::HeldByAnother(_) => CoreError::new(
@@ -253,7 +255,7 @@ pub struct Context {
     pub server_backup: bool,
     /// `LOCAL_ROOM_KEYS`：本地全量快照開著嗎（同 /docs/design/rpc-specs/wbf-cli-spec.md §10.4）。同樣落到 `true`。
     pub local_room_keys: bool,
-    /// 這次實際生效的值，給自動生成用（/docs/design/rpc-specs/wbf-cli-spec.md §10.3）。🚫 裡面沒有秘密。
+    /// 這次實際生效的值，給自動生成用（/docs/design/rpc-specs/wbf-cli-spec.md §10.3）。裡面**沒有**秘密。
     effective: Vec<wbf_core::conf::Entry>,
     /// `--data-dir`／`WBF_DATA_DIR` 有給嗎——自動生成的三個條件之一。
     data_dir_was_given: bool,
@@ -319,7 +321,7 @@ impl Context {
                 eprintln!("{warning}");
             }
         }
-        // 這次實際生效的值。🚫 不放 token、password、passphrase 的檔案路徑（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）。
+        // 這次實際生效的值。**不**放 token、password、passphrase 的檔案路徑（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）。
         let effective = vec![
             Entry {
                 section: "general",
@@ -372,7 +374,7 @@ impl Context {
                     .or_else(|| conf.find("PASSPHRASE_FILE").map(PathBuf::from)),
             },
             server_override: server.clone(),
-            // 🚫 token 不從 conf 來（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
+            // token **不**從 conf 來（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
             token_override: cli.token.clone(),
             quiet: cli.quiet,
             transport,
@@ -486,7 +488,7 @@ impl Context {
     /// 自動生成 `wbf.conf`（/docs/design/rpc-specs/wbf-cli-spec.md §10.3）。三個條件都要成立，這裡管前兩個，
     /// 第三個（命令成功）由呼叫點決定——它在 `dispatch` 的結果是 `Ok` 之後才叫。
     ///
-    /// 🚫 已經存在的永遠不改寫，連補鍵都不做：那是使用者的檔，不是我們的狀態檔。
+    /// 已經存在的永遠**不**改寫，連補鍵都不做：那是使用者的檔，不是我們的狀態檔。
     fn write_conf_if_asked_for(&self) -> Result<(), CoreError> {
         if !self.data_dir_was_given {
             return Ok(());
@@ -505,7 +507,7 @@ impl Context {
     /// ⚠️ 一個命令只印一次：`rooms::backend` 在同一個命令裡可能被叫不只一次，
     /// 而重複三次的警告等於沒有警告。
     ///
-    /// 🚫 這不是「順便提醒」：關掉備份的後果是**歷史會消失**，而它是設定檔裡一行字造成的
+    /// 這**不是**「順便提醒」：關掉備份的後果是**歷史會消失**，而它是設定檔裡一行字造成的
     /// ——那行字可能是幾個月前寫的，也可能是別人寫的。
     pub fn warn_if_backups_are_off(&self) {
         if self.server_backup && self.local_room_keys {
@@ -514,7 +516,7 @@ impl Context {
         if self.warned_about_backups.set(()).is_err() {
             return;
         }
-        // 🚫 不去問 core 那個目錄在哪：這是一句警告，而為了印它去解鎖 vault
+        // **不**去問 core 那個目錄在哪：這是一句警告，而為了印它去解鎖 vault
         // 是本末倒置（使用者可能只是打了 `--help`）。
         let keys_live_here = || "<account dir>/k/".to_string();
         match (self.server_backup, self.local_room_keys) {
@@ -651,7 +653,7 @@ fn with_recovery_hint(error: CoreError) -> CoreError {
 
 /// `recovery <action>`：這台機器保管著誰的 recovery key（/docs/design/keys/room-key-backup.md §8）。
 ///
-/// 🚫 不連 server：這些檔案是本機的東西，`list` 連內容都不解（只解檔名）。
+/// **不**連 server：這些檔案是本機的東西，`list` 連內容都不解（只解檔名）。
 fn recovery_command(context: &Context, action: RecoveryAction) -> Result<(), CoreError> {
     match action {
         RecoveryAction::List => {
@@ -708,7 +710,7 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             print_value(&result)
         }
         KeyBackupAction::Save => {
-            // 🚫 明說要存卻被設定關掉：拒絕並說是誰關的，不要假裝存了。
+            // 明說要存卻被設定關掉：拒絕並說是誰關的，不要假裝存了。
             if !context.local_room_keys {
                 return Err(refuse_switched_off(
                     "LOCAL_ROOM_KEYS",
@@ -723,16 +725,16 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
             print_value(&result)
         }
         KeyBackupAction::Restore => {
-            let result =
-                core.restore_from_recovery_key(&target)
-                    .await
-                    .map_err(|error| match error.kind {
-                        wbf_core::CoreErrorKind::NoRecoveryKeyHere => CoreError::new(
-                            CoreErrorKind::Usage,
-                            format!("{error}; run `wbf-cli key-backup recovery` first"),
-                        ),
-                        _ => error,
-                    })?;
+            let result = core
+                .restore_from_recovery_key(&target, None)
+                .await
+                .map_err(|error| match error.kind {
+                    wbf_core::CoreErrorKind::NoRecoveryKeyHere => CoreError::new(
+                        CoreErrorKind::Usage,
+                        format!("{error}; run `wbf-cli key-backup recovery` first"),
+                    ),
+                    _ => error,
+                })?;
             let mut output = json_value_of(&result)?;
             set_field(&mut output, "ok", json!(true));
             print_json(&output)
@@ -753,8 +755,8 @@ async fn key_backup_command(context: &Context, action: KeyBackupAction) -> Resul
 
 /// 使用者明說要做的事，被 conf 的開關關掉了（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
 ///
-/// ⚠️ 🚫 不靜默跳過：命令是他打的，回一句「好了」卻什麼都沒做，比拒絕更糟。
-/// 訊息要說出**是哪個鍵**關的，不然他得自己翻檔案找。
+/// ⚠️ **不**靜默跳過：命令是使用者打的，回一句「好了」卻什麼都沒做，比拒絕更糟。
+/// 訊息要說出**是哪個鍵**關的，不然使用者得自己翻檔案找。
 fn refuse_switched_off(key: &str, what: &str) -> CoreError {
     CoreError::new(
         CoreErrorKind::Usage,
@@ -767,7 +769,7 @@ fn refuse_switched_off(key: &str, what: &str) -> CoreError {
 
 /// `account destroy <mxid>`：裝置層加資料層。
 ///
-/// rpc-cli 在這裡只做一件事：**問「你確定嗎」**。🚫 core 不做確認（/docs/design/overview/architecture-v2.md §3）。
+/// rpc-cli 在這裡只做一件事：**問「你確定嗎」**。core **不**做確認（/docs/design/overview/architecture-v2.md §3）。
 async fn destroy_account_command(
     context: &Context,
     user: &str,
@@ -862,7 +864,7 @@ async fn upload_command(context: &Context, args: &UploadArgs) -> Result<(), Core
     crate::rooms::emit_manifest(&manifest, args.manifest.as_deref())
 }
 
-/// manifest 是對方給的：它指的 server 要跟這次的 session 對得上，🚫 不然就是在對錯的
+/// manifest 是對方給的：它指的 server 要跟這次的 session 對得上，不然就是在對錯的
 /// 地方要東西。
 async fn read_manifest(context: &Context, path: &Path) -> Result<Manifest, CoreError> {
     let manifest = Manifest::from_json(&std::fs::read(path)?)?;
@@ -883,7 +885,7 @@ async fn read_manifest(context: &Context, path: &Path) -> Result<Manifest, CoreE
 }
 
 /// 沒給 `-o` 時用描述的 `name`：⚠️ 它是**對方寫的**，帶路徑分隔符或是 `..` 就不能當檔名。
-/// 🚫 不要自己「清理」那個名字——清出來的東西仍然是對方決定的，要求明給 `-o` 才安全。
+/// 禁止自己「清理」那個名字——清出來的東西仍然是對方決定的，要求明給 `-o` 才安全。
 fn output_path_from_name(name: Option<&str>) -> Result<PathBuf, CoreError> {
     let name = name
         .filter(|name| !name.is_empty())
@@ -909,7 +911,7 @@ async fn info_command(
         None => None,
     };
     // CLI 的 `info` 問的一直是「server 上那份長什麼樣」，所以它一律 `Server`
-    // ——⚠️ 🚫 不要偷偷改成 `Local`：那會變成另一個問題的答案。
+    // ——⚠️ 禁止偷偷改成 `Local`：那會變成另一個問題的答案。
     let info = context
         .core()?
         .media_info(
@@ -972,7 +974,7 @@ async fn download_with_raw_client(
     let report = match result {
         Ok(report) => report,
         Err(error) => {
-            // 🚫 半成品不留：下次會被當成完整的用（/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
+            // 半成品**不**留：下次會被當成完整的用（/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
             drop(file);
             let _ = std::fs::remove_file(out);
             return Err(error.into());
@@ -1017,7 +1019,7 @@ async fn seek_command(
     stdout.write_all(&result.bytes)?;
     stdout.flush()?;
     // ⚠️ 摘要是**結果**不是進度，所以 `--quiet` 也印（/docs/design/rpc-specs/wbf-cli-spec.md §3.3.1）。
-    // bytes 已經寫出去了；摘要印不出來就用 exit code 講，🚫 不假裝成功。
+    // bytes 已經寫出去了；摘要印不出來就用 exit code 講，**不**假裝成功。
     let summary = json_value_of(&result.summary(at, len))?;
     eprintln!("{summary}");
     Ok(())
@@ -1033,7 +1035,7 @@ fn print_json(value: &serde_json::Value) -> Result<(), CoreError> {
 mod conf_precedence_tests {
     //! 優先序（/docs/design/rpc-specs/wbf-cli-spec.md §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次。
     //!
-    //! 🚫 這裡不設環境變數：`std::env::set_var` 是行程全域的，跟同時跑的測試會互相汙染。
+    //! 這裡**不**設環境變數：`std::env::set_var` 是行程全域的，跟同時跑的測試會互相汙染。
     //! 環境變數那一格由 clap 負責（`env = "WBF_…"`），它把旗標與環境合成同一個 `Option`——
     //! 所以這裡測得到的是「**沒給**就落到 conf、conf 沒有就落到內建預設」那兩格。
 
@@ -1061,7 +1063,7 @@ mod conf_precedence_tests {
         dir
     }
 
-    /// 🚨 有 daemon 握著這個資料目錄時，命令列 🚫 不越過它寫檔：Context 都建不起來（維護者 2026-09-30）。
+    /// 🚨 有 daemon 握著這個資料目錄時，命令列**不**越過它寫檔：Context 都建不起來（維護者 2026-09-30）。
     #[test]
     fn a_command_is_refused_while_a_daemon_owns_the_data_dir() {
         let dir = scratch("daemon-owns");
@@ -1071,9 +1073,16 @@ mod conf_precedence_tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, CoreErrorKind::Usage);
-        assert!(error.message.contains("stop the daemon"), "{}", error.message);
+        assert!(
+            error.message.contains("stop the daemon"),
+            "{}",
+            error.message
+        );
         drop(daemon);
-        assert!(Context::from(&cli_with(&dir)).is_ok(), "daemon 放手之後照常");
+        assert!(
+            Context::from(&cli_with(&dir)).is_ok(),
+            "daemon 放手之後照常"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1082,7 +1091,10 @@ mod conf_precedence_tests {
     fn the_lock_is_held_for_the_whole_command_and_released_after() {
         let dir = scratch("held");
         let first = Context::from(&cli_with(&dir)).unwrap();
-        assert!(Context::from(&cli_with(&dir)).is_err(), "第一個還活著時第二個要被拒");
+        assert!(
+            Context::from(&cli_with(&dir)).is_err(),
+            "第一個還活著時第二個要被拒"
+        );
         drop(first);
         assert!(Context::from(&cli_with(&dir)).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1107,7 +1119,7 @@ mod conf_precedence_tests {
         );
         assert_eq!(context.transport, Transport::Http);
         assert!(!context.server_backup);
-        // 🚫 沒寫的鍵落到安全值，不是落到 false。
+        // 沒寫的鍵落到安全值，**不是**落到 false。
         assert!(context.local_room_keys);
         // 🪟 先放掉資料目錄的鎖（Context 活著時 daemon.lock 開著，Windows 刪不掉目錄）。
         drop(context);
@@ -1171,7 +1183,7 @@ PASSWORD_FILE=/tmp/from-conf
         .unwrap();
         let context = Context::from(&cli_with(&dir)).unwrap();
 
-        // 🚫 認得卻沒人讀 = 使用者寫了一行、login 照樣問密碼、一句話都不說
+        // 認得卻沒人讀 = 使用者寫了一行、login 照樣問密碼、一句話都不說
         //（PR #22 審查 rumia🔴1）。這一條就是在釘「有人讀」。
         assert_eq!(
             find_password_file(&login_args(None), &context.conf),
@@ -1226,7 +1238,7 @@ PASSWORD_FILE=/tmp/from-conf
         );
         assert!(written.contains("; flag or env"), "{written}");
         assert!(written.contains("SERVER_BACKUP=on"), "{written}");
-        // 🚫 秘密與「秘密在哪」的路徑都不寫（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）。
+        // 秘密與「秘密在哪」的路徑都**不**寫（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）。
         assert!(!written.contains("ACCESS_TOKEN") && !written.contains("PASSPHRASE_FILE"));
 
         // 讀回來就是同一組值。前一個命令先結束（放掉資料目錄的鎖），一個程序本來就只跑一個命令。
