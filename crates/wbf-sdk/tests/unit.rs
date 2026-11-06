@@ -302,7 +302,7 @@ fn event_recent_and_batch_match_server_vectors() {
     // ⚠️ 這一筆**比語意、不比 byte**：server 的向量是手寫的 JSON 字串，這筆的 key 順序是
     // `rooms, before, limit, batch`，而上面三筆是 `limit, cg_seq, before, batch` —— 一個 struct 的
     // 序列化順序只能有一種，兩邊不可能同時逐 byte 對上。server 用 JSON 解析、不看順序，所以
-    // 線上是相容的；🚫 但不要因此把上面三筆也改成比語意 —— 它們對得上，就該繼續逐 byte 釘住。
+    // 線上是相容的；但禁止因此把上面三筆也改成比語意 —— 它們對得上，就該繼續逐 byte 釘住。
     let vector = pack_named("recent_one_room_history");
     let ours = protocol::recent(
         &RecentRequest {
@@ -395,7 +395,7 @@ fn event_recent_and_batch_match_server_vectors() {
         }
     );
     assert!(events.is_empty());
-    // 🚨 沒有 `more` 的 Batch（舊 server）要當 `true`：不確定就再問一趟，🚫 不假設拿完了。
+    // 🚨 沒有 `more` 的 Batch（舊 server）要當 `true`：不確定就再問一趟，禁止假設拿完了。
     let without_more: BatchMeta =
         serde_json::from_str(r#"{"tc":0,"bc":0,"fs":0,"ls":0,"r":0}"#).unwrap();
     assert!(without_more.more, "缺欄位＝還有");
@@ -430,8 +430,8 @@ fn event_recent_and_batch_match_server_vectors() {
             "{name}：表上的號要跟 server 向量一樣"
         );
     }
-    // 🚫 `code_id: 0` 是「欄位漏了」的預設值（server 表：0 永遠不是合法的碼）：
-    // 🚫 不准變成 `Some(0)` —— 重送判斷那邊 `from_id(0)` 本來就認不得，但 log 會印出「(0)」，
+    // `code_id: 0` 是「欄位漏了」的預設值（server 表：0 永遠不是合法的碼）：
+    // 禁止變成 `Some(0)` —— 重送判斷那邊 `from_id(0)` 本來就認不得，但 log 會印出「(0)」，
     // 讀的人會以為 server 真的回了碼 0。字串、負數也一樣當沒有。
     for meta in [
         br#"{"code":"Corrupt","code_id":0,"message":"m"}"#.as_slice(),
@@ -767,7 +767,13 @@ fn bridged_endpoints_and_variables_follow_the_specs_index() {
         first_four_bytes(protocol::BRIDGE_SIGNATURES_UPLOAD),
         [0x01, 0x17, 0x25, 0x10]
     );
+    // wbfuwunel 的 /docs/bridge-specs/0x15-receipt.md：請求的前 4 bytes 一律是 `01 15 SS 10`。
+    assert_eq!(
+        first_four_bytes(wbf_sdk::matrix_endpoint::RECEIPT.bridge),
+        [0x01, 0x15, 0x22, 0x10]
+    );
     assert_eq!(Kind::from_byte(0x13), Some(Kind::Room));
+    assert_eq!(Kind::from_byte(0x15), Some(Kind::Receipt));
     assert_eq!(Kind::from_byte(0x17), Some(Kind::Keys));
 
     assert_eq!(serde_json::to_string(&NoVariables {}).unwrap(), "{}");
@@ -786,7 +792,7 @@ fn bridged_endpoints_and_variables_follow_the_specs_index() {
         })
         .unwrap(),
         r#"{"room_id":"!r:localhost"}"#,
-        "沒給的 query 變數整個省掉，🚫 不送空字串"
+        "沒給的 query 變數整個省掉，不送空字串"
     );
     assert_eq!(
         serde_json::to_string(&SendToDeviceVariables {
@@ -798,7 +804,7 @@ fn bridged_endpoints_and_variables_follow_the_specs_index() {
     );
 }
 
-/// 🚨 走橋的 Ack 沒帶 bit4、或狀態不是 2xx：🚫 不當成功（fail closed）。沒帶 bit4 的 **Error** 照樣是被拒（session 在橋之前被擋）。
+/// 🚨 走橋的 Ack 沒帶 bit4、或狀態不是 2xx：**不**當成功（fail closed）。沒帶 bit4 的 **Error** 照樣是被拒（session 在橋之前被擋）。
 #[test]
 fn a_bridge_reply_without_the_bridge_bit_or_a_2xx_is_not_success() {
     use wbf_sdk::protocol;
@@ -1263,7 +1269,7 @@ fn invite_packs_follow_the_server_shape() {
     );
     assert_eq!(subscribe.meta, b"{}");
     let fetch = protocol::invite_fetch(&protocol::InviteFetchRequest::default(), 9, 4).unwrap();
-    assert_eq!(fetch.meta, b"{}", "一輪從頭：🚫 帶 ci_seq");
+    assert_eq!(fetch.meta, b"{}", "一輪從頭：不帶 ci_seq");
     let resumed = protocol::invite_fetch(
         &protocol::InviteFetchRequest {
             ci_seq: Some(4711),
@@ -1320,7 +1326,7 @@ fn invite_packs_follow_the_server_shape() {
     assert_eq!(invite.inviter.as_deref(), Some("@alice:localhost"));
     assert_eq!(invite.reason.as_deref(), Some("來吃飯"));
     assert_eq!(invite.state.unwrap()[0]["type"], "m.room.member");
-    // 太大被降級：`sc: 0`、data 空 → state 是 None（🚫 當成「沒有狀態」）；缺 gap 當 true
+    // 太大被降級：`sc: 0`、data 空 → state 是 None（**不**當成「沒有狀態」）；缺 gap 當 true
     let degraded = reply(
         Kind::Invite,
         invite::PUSH,

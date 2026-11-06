@@ -55,6 +55,13 @@ const fn account(subtype: u8) -> BridgedEndpoint {
     }
 }
 
+const fn receipt(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Receipt,
+        subtype,
+    }
+}
+
 // ---- 0x13 Room（wbfuwunel 的 /docs/bridge-specs/0x13-room.md）----
 
 pub const CREATE_ROOM: MatrixEndpoint = MatrixEndpoint {
@@ -263,6 +270,18 @@ pub const REDACT: MatrixEndpoint = MatrixEndpoint {
     bridge: event(0x24),
     method: HttpMethod::Put,
     path: "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
+    query: &[],
+};
+
+// ---- 0x15 Receipt（wbfuwunel 的 /docs/bridge-specs/0x15-receipt.md）----
+
+/// 送一個已讀回條（/docs/design/messages/read-receipts.md §3）：`receipt_type` 是 `m.read`（同房間的人看得到）或 `m.read.private`。
+/// 回條是 EDU、不加密，加密房也一樣送。
+pub const RECEIPT: MatrixEndpoint = MatrixEndpoint {
+    name: "Receipt",
+    bridge: receipt(0x22),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
     query: &[],
 };
 

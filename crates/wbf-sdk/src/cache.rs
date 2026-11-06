@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::Serialize;
 
 use crate::chat::{Conversation, Membership, Message, MessageKind, Reaction, RoomListEntry};
 use crate::chunk_block::ChunkedBlock;
@@ -36,7 +37,8 @@ pub const CACHE_FILE_NAME: &str = "cache.db";
 /// v9：`media.kind`、`media.verified`；`file_size`、`chunk_size` 只有 `kind` 1 一定有（維護者 2026-10-06，/docs/design/media/media-download.md §12）。
 /// v10：`room_list.joined` 換成 `membership`（`join`／`invite`／`knock`／`leave`／`ban`，維護者 2026-10-07，/docs/design/rooms/room-actions.md §3）；`room_list.is_state_carried_over`（`state` 是上次留下來的）。
 /// v11：`room_list.invite_json`（被邀請的那一列的邀請內容，維護者 2026-10-14，/docs/design/rooms/room-actions.md §3.3.3）。
-const SCHEMA_VERSION: i64 = 11;
+/// v12：`events.is_state`（明文帶了 `state_key`，維護者 2026-11-05，/docs/design/messages/read-receipts.md §2.1）。
+const SCHEMA_VERSION: i64 = 12;
 
 /// 快取屬於哪個 server；不符就不是這份快取（/docs/design/storage/local-cache-db.md §5 `meta`）。帳號不在身份裡：同一個 server 的帳號共用。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,12 +108,38 @@ pub struct StoredTarget {
 }
 
 /// 本地閱讀位置（/docs/design/storage/local-cache-db.md §5 `read_positions`）：`event_id` 是權威，`r_seq` 給算術用。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// RPC 上的 `read_upto`（/docs/design/messages/read-receipts.md §3、§4）就是它。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReadPosition {
     pub event_id: String,
+    /// 一般 Matrix server 的房間沒有
     pub r_seq: Option<i64>,
-    pub ts: i64,
 }
+
+/// 標已讀時「讀到哪一則」（/docs/design/messages/read-receipts.md §3）：三種給法恰好一種。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadAt {
+    EventId(String),
+    GSeq(i64),
+    RSeq(i64),
+}
+
+/// 一間房的未讀數（/docs/design/messages/read-receipts.md §2.1、§4）：`room.get` 的 `unread`。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Unread {
+    pub count: u64,
+    /// `count` 裡提到自己（`m.mentions.user_ids` 有自己、或 `m.mentions.room` 是 `true`）的則數
+    pub mentions: u64,
+    /// 本地水位；從沒標過是 None
+    pub read_upto: Option<ReadPosition>,
+}
+
+/// 事件 `e` 在水位 `w` 之後嗎（/docs/design/messages/read-receipts.md §2.2）：兩則都有 `r_seq` 就比它；
+/// 少一個（一般 Matrix server 的房間沒有 `r_seq`）退到 `(origin_server_ts, id)`，跟讀歷史的排序同一個退法。
+/// 標已讀（只往前）與數未讀共用這一句，禁止各寫一份。
+const IS_AFTER_WATERMARK: &str =
+    "CASE WHEN e.r_seq IS NOT NULL AND w.r_seq IS NOT NULL THEN e.r_seq > w.r_seq
+     ELSE (e.origin_server_ts, e.id) > (w.origin_server_ts, w.id) END";
 
 /// `media` 的一列（/docs/design/storage/local-cache-db.md §5）：指向媒體池裡的檔（/docs/design/media/media-pool.md §4）與使用時間。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -990,8 +1018,8 @@ impl Cache {
             let inserted = transaction
                 .prepare_cached(
                     "INSERT INTO events (room, event_id, sender, r_seq, g_seq, origin_server_ts, decrypted, raw_event,
-                       event_type, content_json, is_processed, is_redacted, class, ref_event_id, modified_timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
+                       event_type, content_json, is_processed, is_redacted, class, ref_event_id, modified_timestamp, is_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0, ?15)
                      ON CONFLICT(room, event_id) DO NOTHING",
                 )
                 .map_err(db_error)?
@@ -1010,6 +1038,7 @@ impl Cache {
                     is_redacted_by_server as i64,
                     classified.class.to_column(),
                     classified.ref_event_id,
+                    classified.is_state as i64,
                 ])
                 .map_err(db_error)?
                 == 1;
@@ -1034,7 +1063,7 @@ impl Cache {
                     is_new_to_process = transaction
                         .prepare_cached(
                             "UPDATE events SET decrypted = ?2, event_type = ?3, content_json = ?4, class = ?5,
-                               ref_event_id = ?6, is_processed = ?7
+                               ref_event_id = ?6, is_processed = ?7, is_state = ?8
                              WHERE id = ?1 AND class = 'general'",
                         )
                         .map_err(db_error)?
@@ -1046,6 +1075,7 @@ impl Cache {
                             classified.class.to_column(),
                             classified.ref_event_id,
                             is_processed_on_arrival as i64,
+                            classified.is_state as i64,
                         ])
                         .map_err(db_error)?
                         == 1;
@@ -1710,32 +1740,101 @@ impl Cache {
 
     // ---- read position、delete for me ----
 
-    /// 已讀位置指向快取裡的事件列；那則還沒進快取就 `Err(Usage)`（先同步再標）。
+    /// 標已讀那一則在這個帳號的快取裡嗎（/docs/design/messages/read-receipts.md §3）：給 seq 的換成 `event_id`、`local`／`both` 先確認有這一則。
+    /// 只認這個帳號同步過的（`events_synced_log` 有列；自己藏起來的也算）。
+    ///
+    /// Args:
+    ///     at: example: &ReadAt::RSeq(95)
+    /// Return:
+    ///     Ok(Some(ReadPosition))   找到了
+    ///     Ok(None)                 這個帳號的快取裡沒有這一則
+    pub fn find_readable_event(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        at: &ReadAt,
+    ) -> Result<Option<ReadPosition>, SdkError> {
+        let (condition, value) = match at {
+            ReadAt::EventId(event_id) => (
+                "e.event_id = ?3",
+                rusqlite::types::Value::Text(event_id.clone()),
+            ),
+            ReadAt::GSeq(g_seq) => ("e.g_seq = ?3", rusqlite::types::Value::Integer(*g_seq)),
+            ReadAt::RSeq(r_seq) => ("e.r_seq = ?3", rusqlite::types::Value::Integer(*r_seq)),
+        };
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT e.event_id, e.r_seq FROM events e
+                       JOIN rooms r ON r.id = e.room
+                       JOIN events_synced_log l ON l.event = e.id
+                       JOIN users reader ON reader.id = l.user
+                     WHERE reader.mxid = ?1 AND r.room_id = ?2 AND {condition}
+                     LIMIT 1"
+                ),
+                params![user_id, room_id, value],
+                |row| {
+                    Ok(ReadPosition {
+                        event_id: row.get(0)?,
+                        r_seq: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+
+    /// 本地水位移到這一則，**只往前**（/docs/design/messages/read-receipts.md §2.2）：比現在的舊或一樣就不動。
+    ///
+    /// Args:
+    ///     event_id: example: "$abc"
+    /// Return:
+    ///     Ok(true)     水位移到這一則了（含原本沒有水位）
+    ///     Ok(false)    原本的水位比它新或就是它，沒動
+    ///     Err(Usage)   這一則不在這個帳號的快取裡（先同步再標）
     pub fn set_read_position(
         &mut self,
         user_id: &str,
         room_id: &str,
         event_id: &str,
-        ts: i64,
-    ) -> Result<(), SdkError> {
+    ) -> Result<bool, SdkError> {
         let transaction = self.connection.transaction().map_err(db_error)?;
         let user = user_row_id(&transaction, user_id)?;
         let room = room_row_id(&transaction, room_id)?;
-        let event = find_event_row_id(&transaction, room, event_id)?.ok_or_else(|| {
-            SdkError::Usage(format!(
-                "{event_id} is not in the cache; sync it before marking it read"
-            ))
-        })?;
-        transaction
-            .execute(
-                "INSERT INTO read_positions (room, user, event, ts) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(user, room) DO UPDATE SET event = excluded.event, ts = excluded.ts",
-                params![room, user, event, ts],
+        let event: Option<i64> = transaction
+            .query_row(
+                "SELECT e.id FROM events e JOIN events_synced_log l ON l.event = e.id
+                 WHERE e.room = ?1 AND e.event_id = ?2 AND l.user = ?3",
+                params![room, event_id, user],
+                |row| row.get(0),
             )
+            .optional()
             .map_err(db_error)?;
-        transaction.commit().map_err(db_error)
+        let Some(event) = event else {
+            return Err(SdkError::Usage(format!(
+                "{event_id} is not in the cache for {user_id}; sync it before marking it read"
+            )));
+        };
+        let moved = transaction
+            .execute(
+                &format!(
+                    "INSERT INTO read_positions (room, user, event, ts) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(user, room) DO UPDATE SET event = excluded.event, ts = excluded.ts
+                     WHERE EXISTS (SELECT 1 FROM events e, events w
+                                   WHERE e.id = excluded.event AND w.id = read_positions.event
+                                     AND {IS_AFTER_WATERMARK})"
+                ),
+                params![room, user, event, now_millis()],
+            )
+            .map_err(db_error)?
+            == 1;
+        transaction.commit().map_err(db_error)?;
+        Ok(moved)
     }
 
+    /// Return:
+    ///     Ok(Some(ReadPosition))   本地水位那一則
+    ///     Ok(None)                 從沒標過
     pub fn get_read_position(
         &self,
         user_id: &str,
@@ -1743,7 +1842,7 @@ impl Cache {
     ) -> Result<Option<ReadPosition>, SdkError> {
         self.connection
             .query_row(
-                "SELECT e.event_id, e.r_seq, p.ts FROM read_positions p
+                "SELECT e.event_id, e.r_seq FROM read_positions p
                  JOIN users u ON u.id = p.user JOIN rooms r ON r.id = p.room JOIN events e ON e.id = p.event
                  WHERE u.mxid = ?1 AND r.room_id = ?2",
                 params![user_id, room_id],
@@ -1751,12 +1850,47 @@ impl Cache {
                     Ok(ReadPosition {
                         event_id: row.get(0)?,
                         r_seq: row.get(1)?,
-                        ts: row.get(2)?,
                     })
                 },
             )
             .optional()
             .map_err(db_error)
+    }
+
+    /// 這個帳號在這間房的未讀數（/docs/design/messages/read-receipts.md §2.1）：水位之後、這個帳號看得到（同步過、沒藏）、
+    /// `class` 是 `msg` 或 `general`（解不開的也算）、別人送的、沒被收回的則數。只數快取裡有的。
+    ///
+    /// Return:
+    ///     Ok(Unread)   從沒標過就是快取裡全部該算的；這間房本地沒有是 0、`read_upto` null
+    pub fn get_unread(&self, user_id: &str, room_id: &str) -> Result<Unread, SdkError> {
+        let (count, mentions) = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(
+                       CASE WHEN json_extract(e.content_json, '$.\"m.mentions\".room') = 1
+                              OR EXISTS (SELECT 1 FROM json_each(e.content_json, '$.\"m.mentions\".user_ids')
+                                         WHERE json_each.value = reader.mxid)
+                            THEN 1 ELSE 0 END), 0)
+                     FROM events e
+                       JOIN rooms r ON r.id = e.room
+                       JOIN events_synced_log l ON l.event = e.id
+                       JOIN users reader ON reader.id = l.user
+                       LEFT JOIN read_positions p ON p.user = reader.id AND p.room = e.room
+                       LEFT JOIN events w ON w.id = p.event
+                     WHERE reader.mxid = ?1 AND r.room_id = ?2 AND l.hidden = 0
+                       AND e.class IN ('msg', 'general') AND e.is_redacted = 0 AND e.sender <> reader.id
+                       AND (w.id IS NULL OR {IS_AFTER_WATERMARK})"
+                ),
+                params![user_id, room_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(db_error)?;
+        Ok(Unread {
+            count: u64::try_from(count).unwrap_or(0),
+            mentions: u64::try_from(mentions).unwrap_or(0),
+            read_upto: self.get_read_position(user_id, room_id)?,
+        })
     }
 
     /// Delete for me（/docs/design/rooms/chat-model.md §5）：只對這個帳號藏；再同步同一則也不會跑回來（`hidden` 不被 sync 動）。
@@ -3043,7 +3177,8 @@ fn create_schema(connection: &Connection, identity: &CacheIdentity) -> Result<()
                is_redacted INTEGER NOT NULL DEFAULT 0 CHECK (is_redacted IN (0, 1)),
                class TEXT NOT NULL DEFAULT 'general' CHECK (class IN ('general', 'msg', 'edit', 'redact', 'reaction')),
                ref_event_id TEXT,
-               modified_timestamp INTEGER NOT NULL DEFAULT 0);
+               modified_timestamp INTEGER NOT NULL DEFAULT 0,
+               is_state INTEGER NOT NULL DEFAULT 0 CHECK (is_state IN (0, 1)));
              CREATE UNIQUE INDEX events_by_event_id ON events (room, event_id);
              CREATE UNIQUE INDEX events_by_seq ON events (room, r_seq) WHERE r_seq IS NOT NULL;
              CREATE INDEX events_by_time ON events (room, origin_server_ts);
@@ -3358,11 +3493,7 @@ mod tests {
         cache
             .upsert_conversations(ALICE, &[room("!r", false)])
             .unwrap();
-        assert_eq!(
-            column_encrypted(&cache, "!r"),
-            Some(true),
-            "禁止降回明文"
-        );
+        assert_eq!(column_encrypted(&cache, "!r"), Some(true), "禁止降回明文");
         assert_eq!(
             cache.list_room_entries(ALICE, &[Membership::Join]).unwrap()[0].encrypted,
             Some(true),
@@ -4518,17 +4649,204 @@ mod tests {
 
         put(&mut cache, ALICE, &[text("!r", "$1", Some(1), 5)]);
         assert_eq!(cache.get_read_position(ALICE, "!r").unwrap(), None);
-        assert!(cache.set_read_position(ALICE, "!r", "$missing", 5).is_err());
-        cache.set_read_position(ALICE, "!r", "$1", 5).unwrap();
+        assert!(cache.set_read_position(ALICE, "!r", "$missing").is_err());
+        assert!(cache.set_read_position(ALICE, "!r", "$1").unwrap());
         assert_eq!(
             cache.get_read_position(ALICE, "!r").unwrap(),
             Some(ReadPosition {
                 event_id: "$1".into(),
                 r_seq: Some(1),
-                ts: 5
             })
         );
         assert_eq!(cache.get_read_position(BOB, "!r").unwrap(), None);
+        // 🚨 BOB 沒同步過 $1：事件在快取裡，但 BOB 看不到，**不**能拿來當 BOB 的水位（逐則可見性）。
+        assert!(cache.set_read_position(BOB, "!r", "$1").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- /docs/design/messages/read-receipts.md：本地水位只往前、未讀數只數快取裡別人送的 ----
+
+    fn mentioning(room: &str, id: &str, r_seq: i64, mentions: serde_json::Value) -> Fixture {
+        plain(
+            room,
+            event_json(
+                room,
+                id,
+                CAROL,
+                Some(r_seq),
+                r_seq as u64,
+                serde_json::json!({ "msgtype": "m.text", "body": "hey", "m.mentions": mentions }),
+            ),
+        )
+    }
+
+    /// §2.1 每一條各一則：別人的訊息、狀態事件、解不開的算；自己送的、表情、收回本身、被收回的、自己藏起來的不算。
+    #[test]
+    fn unread_counts_only_what_others_sent_after_the_watermark() {
+        let (mut cache, dir) = open("unread");
+        let room = "!u";
+        let mut own = text(room, "$2", Some(2), 2);
+        if let IncomingEvent::Plain { event } = &mut own.event {
+            event["sender"] = serde_json::json!(ALICE);
+        }
+        let mut topic = text(room, "$3", Some(3), 3);
+        if let IncomingEvent::Plain { event } = &mut topic.event {
+            event["type"] = serde_json::json!("m.room.topic");
+            event["state_key"] = serde_json::json!("");
+            event["content"] = serde_json::json!({ "topic": "t" });
+        }
+        let mut reaction = reaction_of(room, "$5", CAROL, "$1", "👍");
+        if let IncomingEvent::Plain { event } = &mut reaction.event {
+            event["unsigned"] = serde_json::json!({ crate::protocol::R_SEQ_KEY: 5 });
+        }
+        let mut ciphertext = event_json(
+            room,
+            "$6",
+            CAROL,
+            Some(6),
+            6,
+            serde_json::json!({ "algorithm": "m.megolm.v1.aes-sha2", "session_id": "S", "ciphertext": "x" }),
+        );
+        ciphertext["type"] = serde_json::json!("m.room.encrypted");
+        let sealed = Fixture {
+            room: room.into(),
+            event: IncomingEvent::Undecrypted {
+                ciphertext,
+                reason: "no key".into(),
+            },
+        };
+        put(
+            &mut cache,
+            ALICE,
+            &[
+                text(room, "$1", Some(1), 1),
+                own,
+                topic,
+                mentioning(room, "$4", 4, serde_json::json!({ "user_ids": [ALICE] })),
+                reaction,
+                sealed,
+                text(room, "$7", Some(7), 7),
+                redaction_of(room, "$8", "$7"),
+                mentioning(room, "$9", 9, serde_json::json!({ "room": true })),
+                text(room, "$10", Some(10), 10),
+                // 提到的是別人：算一則、不算提到
+                mentioning(room, "$11", 11, serde_json::json!({ "user_ids": [BOB] })),
+            ],
+        );
+        assert!(cache.hide_message(ALICE, room, "$10").unwrap());
+        let is_state: Vec<String> = {
+            let mut statement = cache
+                .connection
+                .prepare("SELECT event_id FROM events WHERE is_state = 1")
+                .unwrap();
+            let rows = statement.query_map([], |row| row.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            is_state,
+            vec!["$3".to_string()],
+            "v12 的 is_state 只標狀態事件"
+        );
+
+        // 從沒標過：$1 $3 $4 $6 $9 $11，提到自己的是 $4（user_ids）與 $9（@room）
+        assert_eq!(
+            cache.get_unread(ALICE, room).unwrap(),
+            Unread {
+                count: 6,
+                mentions: 2,
+                read_upto: None
+            }
+        );
+        assert!(cache.set_read_position(ALICE, room, "$4").unwrap());
+        assert_eq!(
+            cache.get_unread(ALICE, room).unwrap(),
+            Unread {
+                count: 3,
+                mentions: 1,
+                read_upto: Some(ReadPosition {
+                    event_id: "$4".into(),
+                    r_seq: Some(4)
+                })
+            }
+        );
+        // §2.2 只往前：舊的與同一則都不動
+        assert!(!cache.set_read_position(ALICE, room, "$1").unwrap());
+        assert!(!cache.set_read_position(ALICE, room, "$4").unwrap());
+        assert_eq!(
+            cache.get_read_position(ALICE, room).unwrap(),
+            Some(ReadPosition {
+                event_id: "$4".into(),
+                r_seq: Some(4)
+            })
+        );
+        assert!(cache.set_read_position(ALICE, room, "$11").unwrap());
+        assert_eq!(cache.get_unread(ALICE, room).unwrap().count, 0);
+        // 沒同步過這間的帳號：0、沒有水位
+        assert_eq!(
+            cache.get_unread(BOB, room).unwrap(),
+            Unread {
+                count: 0,
+                mentions: 0,
+                read_upto: None
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §3 的三種給法換成同一則；只認這個帳號同步過的。
+    #[test]
+    fn a_read_target_is_found_by_event_id_or_either_seq() {
+        let (mut cache, dir) = open("read-target");
+        put(&mut cache, ALICE, &[text("!r", "$9", Some(9), 9)]);
+        let found = Some(ReadPosition {
+            event_id: "$9".into(),
+            r_seq: Some(9),
+        });
+        for at in [
+            ReadAt::EventId("$9".into()),
+            ReadAt::RSeq(9),
+            ReadAt::GSeq(90),
+        ] {
+            assert_eq!(
+                cache.find_readable_event(ALICE, "!r", &at).unwrap(),
+                found,
+                "{at:?}"
+            );
+            assert_eq!(
+                cache.find_readable_event(BOB, "!r", &at).unwrap(),
+                None,
+                "{at:?}"
+            );
+        }
+        assert_eq!(
+            cache
+                .find_readable_event(ALICE, "!r", &ReadAt::RSeq(8))
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一般 Matrix server 的房間沒有 `r_seq`：水位與未讀照 `(origin_server_ts, id)` 排（§2.2 的退法）。
+    #[test]
+    fn without_r_seq_the_watermark_falls_back_to_the_timestamp() {
+        let (mut cache, dir) = open("unread-no-seq");
+        put(
+            &mut cache,
+            ALICE,
+            &[
+                text("!m", "$a", None, 10),
+                text("!m", "$b", None, 20),
+                text("!m", "$c", None, 30),
+            ],
+        );
+        assert!(cache.set_read_position(ALICE, "!m", "$b").unwrap());
+        assert!(!cache.set_read_position(ALICE, "!m", "$a").unwrap());
+        let unread = cache.get_unread(ALICE, "!m").unwrap();
+        assert_eq!(
+            (unread.count, unread.read_upto.map(|at| at.event_id)),
+            (1, Some("$b".into()))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

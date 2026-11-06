@@ -966,6 +966,7 @@ fn room_action_reply(pack: &Pack, rooms: &Arc<Mutex<FakeRooms>>) -> Option<Pack>
         &endpoints::SET_ACCOUNT_DATA,
         &endpoints::SUMMARY,
         &endpoints::REDACT,
+        &endpoints::RECEIPT,
     ];
     if !answered.iter().any(|endpoint| is(endpoint)) {
         return None;

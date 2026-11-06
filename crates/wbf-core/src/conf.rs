@@ -10,13 +10,13 @@
 //! ```
 //!
 //! **鍵名就是環境變數去掉 `WBF_` 前綴**（`SERVER` ↔ `WBF_SERVER`）：兩邊不會漂移，
-//! 也不必另外背一套名字。區段只是給人看的分組，🚫 **不參與查找** —— 同一個鍵放在哪一段
+//! 也不必另外背一套名字。區段只是給人看的分組，**不**參與查找 —— 同一個鍵放在哪一段
 //! 都讀得到。這是刻意的：讓區段參與查找等於同一個鍵有兩個身分，而使用者搬一行就會壞。
 //!
 //! 優先序（/docs/design/rpc-specs/wbf-cli-spec.md §10.2）：**旗標 > 環境變數 > conf > 內建預設**，每個值各自比一次，
-//! 🚫 不是整份取代。環境變數優先於 conf 是維護者 2026-09-09 定的。
+//! **不**是整份取代。環境變數優先於 conf 是維護者 2026-09-09 定的。
 //!
-//! 🚫 這裡不放秘密（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：`ACCESS_TOKEN`、passphrase、password 一律不從 conf 來。
+//! 禁止在這裡放秘密（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：`ACCESS_TOKEN`、passphrase、password 一律不從 conf 來。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,18 +30,18 @@ pub const CONF_FILE_NAME: &str = "wbf.conf";
 pub struct Conf {
     /// 鍵名去掉 `WBF_` 前綴、大寫, example: "SERVER"
     values: BTreeMap<String, String>,
-    /// 讀的時候攢下來的警告，呼叫者印到 stderr（🚫 這一層不印：它不知道 `--quiet`）。
+    /// 讀的時候攢下來的警告，呼叫者印到 stderr（這一層**不**印：它不知道 `--quiet`）。
     warnings: Vec<String>,
 }
 
-/// 🚫 conf 不支援的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
+/// conf **不**支援的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.5）：秘密不落地在明文檔裡。
 /// ⚠️ 寫成「正面列出不准的」而不是「正面列出准的」——新鍵加進 CLI 時不必記得回來改這裡，
 /// 而漏掉的那個會被**允許**，所以這張表只放秘密，其餘認不得的鍵本來就只是警告加忽略（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
 const REFUSED_KEYS: &[&str] = &["ACCESS_TOKEN", "TOKEN", "PASSWORD", "PASSPHRASE"];
 
-/// 區段只是給人看的分組（🚫 不參與查找），但認不得的還是要說一聲——多半是打錯字，
+/// 區段只是給人看的分組（**不**參與查找），但認不得的還是要說一聲——多半是打錯字，
 /// 而那一段底下的鍵會安靜地不生效（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
-const KNOWN_SECTIONS: &[&str] = &["GENERAL", "BACKUP", "MEDIA", "RECENT"];
+const KNOWN_SECTIONS: &[&str] = &["GENERAL", "BACKUP", "MEDIA", "RECENT", "READ"];
 
 /// 找 conf 檔並讀進來（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
 ///
@@ -53,7 +53,7 @@ const KNOWN_SECTIONS: &[&str] = &["GENERAL", "BACKUP", "MEDIA", "RECENT"];
 ///     Err(Usage)   `--config` 明指的檔不在、或檔案語法壞了
 pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, CoreError> {
     if let Some(path) = explicit {
-        // 🚫 明指了就不 fallback：讀到別的檔比讀不到更糟（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
+        // 明指了就**不** fallback：讀到別的檔比讀不到更糟（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
         if !path.exists() {
             return Err(CoreError::new(
                 CoreErrorKind::Usage,
@@ -69,7 +69,7 @@ pub fn load(explicit: Option<&Path>, data_dir: &Path) -> Result<Conf, CoreError>
     Ok(Conf::default())
 }
 
-/// ⚠️ 讀壞掉的設定檔一律**報錯 exit**，🚫 不當作沒有這個檔：讀一半比讀不到危險（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
+/// ⚠️ 讀壞掉的設定檔一律**報錯 exit**，禁止當作沒有這個檔：讀一半比讀不到危險（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）。
 fn parse_file(path: &Path) -> Result<Conf, CoreError> {
     let text = std::fs::read_to_string(path).map_err(|error| {
         CoreError::new(
@@ -125,7 +125,7 @@ pub fn parse(text: &str, source: &str) -> Result<Conf, CoreError> {
                 format!("{source}:{line_number}: the key is empty"),
             ));
         }
-        // 空值當作沒寫，🚫 不是空字串（全域慣例：佔位值不用空字串）。
+        // 空值當作沒寫，**不**是空字串（全域慣例：佔位值不用空字串）。
         if value.is_empty() {
             continue;
         }
@@ -148,7 +148,7 @@ pub fn parse(text: &str, source: &str) -> Result<Conf, CoreError> {
 /// 裡的 `#` 是值的一部分（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）。
 ///
 /// ⚠️ 雙引號裡面的一律不算註解：`KEY="  # 這是值  "` 的引號就是為了保住它。
-/// 🚫 所以不能先剪註解再拆引號 —— 那樣剪到的是值本身（2026-09-10 寫測試時踩到）。
+/// 所以禁止先剪註解再拆引號 —— 那樣剪到的是值本身（2026-09-10 寫測試時踩到）。
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut in_quotes = false;
@@ -156,7 +156,7 @@ fn strip_comment(line: &str) -> &str {
     for (index, byte) in bytes.iter().enumerate() {
         match byte {
             b'"' => in_quotes = !in_quotes,
-            // `index` 停在 ASCII 的 `;`／`#` 上，一定是 char 邊界；萬一不是（到不了）就當整行是註解——少一個設定用預設值，🚫 不 panic。
+            // `index` 停在 ASCII 的 `;`／`#` 上，一定是 char 邊界；萬一不是（到不了）就當整行是註解——少一個設定用預設值，禁止 panic。
             b';' | b'#' if !in_quotes && previous_is_space => {
                 return line.get(..index).unwrap_or("")
             }
@@ -192,7 +192,7 @@ impl Conf {
 
     /// 開關型的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）：**只正面認得 `on` 與 `off`**（不分大小寫）。
     ///
-    /// ⚠️ 判斷寫成「**正面認得 `off` 才關**」，🚫 不寫成「不等於 `on` 就關」——
+    /// ⚠️ 判斷寫成「**正面認得 `off` 才關**」，禁止寫成「不等於 `on` 就關」——
     /// 壞掉的時候要壞在「備份還開著」那一邊，不是「以為開著、其實沒開」。
     /// 認不得的值（`true`、`1`、拼錯的 `of`）警告並落到 `safe`。
     ///
@@ -218,7 +218,7 @@ impl Conf {
         safe
     }
 
-    /// 數值型的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）：parse 不出來就警告並用內建預設，🚫 不用半套的值。
+    /// 數值型的鍵（/docs/design/rpc-specs/wbf-cli-spec.md §10.4）：parse 不出來就警告並用內建預設，禁止用半套的值。
     pub fn get_number<T: std::str::FromStr>(
         &self,
         key: &str,
@@ -257,7 +257,7 @@ impl Conf {
 
 /// 自動生成要寫的一行。
 pub struct Entry {
-    /// 只是給人看的分組（🚫 不參與查找）, example: "general"
+    /// 只是給人看的分組（**不**參與查找）, example: "general"
     pub section: &'static str,
     /// example: "SERVER"
     pub key: &'static str,
@@ -289,8 +289,8 @@ pub fn origin_of(from_flag_or_env: bool, from_conf: bool) -> &'static str {
 /// 三個條件都成立才寫：`--data-dir`／`WBF_DATA_DIR` 有給、那個目錄下還沒有 `wbf.conf`、
 /// 這次命令成功結束（呼叫點在成功之後）。
 ///
-/// 🚫 已經存在的**永遠不改寫**，連補鍵都不做：那是使用者的檔，不是我們的狀態檔。
-/// 🚫 不寫任何秘密：`ACCESS_TOKEN` 不寫，`PASSWORD_FILE`／`PASSPHRASE_FILE` 這種
+/// 已經存在的**永遠不改寫**，連補鍵都不做：那是使用者的檔，不是我們的狀態檔。
+/// 禁止寫任何秘密：`ACCESS_TOKEN` 不寫，`PASSWORD_FILE`／`PASSPHRASE_FILE` 這種
 /// 「秘密在哪」的路徑自動生成時也不寫 —— 要就手動加，讓它是使用者的決定。
 ///
 /// Args:
@@ -312,7 +312,7 @@ pub fn write_if_absent(data_dir: &Path, entries: &[Entry]) -> Result<bool, CoreE
 ",
         "; 每個值後面註明它這次是哪來的。改這個檔不影響已經登入的帳號。
 ",
-        "; 🚫 這裡不放秘密：token、password、passphrase 一律不從這裡讀。
+        "; 秘密不放這裡：token、password、passphrase 一律不從這裡讀。
 ",
         "; 已經存在的 wbf.conf 永遠不會被改寫——要重生成就先自己刪掉。
 ",
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn an_empty_value_counts_as_not_written() {
-        // 🚫 空字串不是佔位值：`KEY=` 就是沒寫，不是「設成空的」。
+        // 空字串**不**是佔位值：`KEY=` 就是沒寫，不是「設成空的」。
         let conf = parse("SERVER=\n", "t").unwrap();
         assert_eq!(conf.find("SERVER"), None);
     }
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn a_secret_key_is_refused_with_a_warning() {
         let conf = parse("ACCESS_TOKEN=syt_secret\n", "t").unwrap();
-        assert_eq!(conf.find("ACCESS_TOKEN"), None, "🚫 秘密不從 conf 來");
+        assert_eq!(conf.find("ACCESS_TOKEN"), None, "秘密不從 conf 來");
         assert_eq!(conf.warnings().len(), 1);
         assert!(
             !conf.warnings()[0].contains("syt_secret"),
@@ -424,7 +424,7 @@ mod tests {
         let conf = parse("A=off\nB=ON\nC=true\nD=of\n", "t").unwrap();
         assert!(!conf.is_on("A", true, &mut warnings));
         assert!(conf.is_on("B", true, &mut warnings));
-        // ⚠️ 認不得的值落到安全值（開著），🚫 不是「不等於 on 就關」。
+        // ⚠️ 認不得的值落到安全值（開著），**不**是「不等於 on 就關」。
         assert!(conf.is_on("C", true, &mut warnings));
         assert!(conf.is_on("D", true, &mut warnings));
         assert!(conf.is_on("MISSING", true, &mut warnings));
@@ -453,7 +453,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wbf-conf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 🚫 明指了就不 fallback。
+        // 明指了就**不** fallback。
         assert!(load(Some(&dir.join("nope.conf")), &dir).is_err());
         // 資料目錄裡沒有就是空的一份，不是錯。
         assert!(load(None, &dir).unwrap().find("SERVER").is_none());
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(conf.find("ACCOUNT"), Some("  #odd  "));
         assert_eq!(conf.find("TRANSPORT"), Some("\"quoted\""));
 
-        // 🚫 已經有一份就永遠不動它。
+        // 已經有一份就永遠不動它。
         assert!(!write_if_absent(&dir, &entries).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }

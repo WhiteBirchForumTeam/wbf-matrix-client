@@ -1,7 +1,9 @@
 # 已讀有三層（維護者 2026-09-13 給方向、2026-11-05 定形狀）
 
 > 這份講「已讀」怎麼分層、UI 怎麼標已讀與拿未讀數、送上游的回條是 private 還是 public、conf 怎麼重讀。從 /docs/design/daemon/daemon-runtime.md 拆出來。
-> 現況：形狀 2026-11-05 定，**還沒實作**（`room.read`、`room.get` 的 `unread`、`READ_RECEIPTS`、`daemon.reload_conf`）。`cache.rs` 已有 `read_positions` 表與 `set_read_position`／`get_read_position`，還沒有 RPC 叫它們；`set_read_position` 現在是直接蓋掉，還**不**是只往前（§2.2）。`events.is_state`（§2.1）也還沒加。
+> 現況：形狀 2026-11-05 定、2026-11-06 實作（`room.read`、`room.get` 的 `unread`、`READ_RECEIPTS`、`daemon.reload_conf`、`events.is_state`）。
+> 程式：水位與未讀數在 `crates/wbf-sdk/src/cache.rs`（`set_read_position`、`get_unread`、`find_readable_event`）、標已讀在 `crates/wbf-core/src/read_ops.rs`、
+> RPC 在 `crates/wbf-daemon/src/handle/rooms.rs`、conf 與重讀在 `crates/wbf-daemon/src/settings.rs`。
 
 「已讀」在這個系統裡指過三件**不同**的事，混在一起講是下一個 bug 的溫床：
 
@@ -42,6 +44,7 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
     ⚠️ 所以一則還沒解開的表情、edit、收回會先被算進去；解開之後它變成關係事件，就不再算，未讀數會少一。
 - **別人送的**：這個帳號自己送的不算（別台裝置送的也是自己）。
 - **還在**：已經被收回的不算。
+- **這個帳號看得到**：同步過（`events_synced_log` 有列）、而且沒有自己藏起來（delete for me，/docs/design/rooms/chat-model.md §5）。跟讀歷史同一個可見性。
 
 `mentions`＝上面那些裡，`m.mentions.user_ids` 有自己、或 `m.mentions.room` 是 `true` 的則數。
 
@@ -53,7 +56,11 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 
 ### 2.2 本地水位只往前
 
-`room.read` 給的位置比本地水位**舊**（`r_seq` 比較小）→ 本地**不動**，回的 `read_upto` 還是原本那則。
+`room.read` 給的位置比本地水位**舊**或就是它 → 本地**不動**，回的 `read_upto` 還是原本那則。
+
+- 「舊」怎麼比：兩則都有 `r_seq` 就比 `r_seq`；少一個（一般 Matrix server 的房間沒有 `r_seq`）退到 `origin_server_ts`，跟讀歷史的排序同一個退法。
+  標已讀與數未讀共用同一句比較（`cache.rs` 的 `IS_AFTER_WATERMARK`）。
+- 水位只能指**這個帳號同步過**的那一則：事件在快取裡、但只有別的帳號看過，一樣是 `1100`。
 
 - 為什麼：多個前端、多個視窗同時在標，晚到的舊位置不該把未讀數變多。
 - 「標成未讀」在 Matrix 是另一個東西（`m.marked_unread`），這版不做（§8）。
@@ -81,12 +88,14 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 | `server` | 只送上游的 read receipt，**不**寫本地（對帳用，跟 /docs/design/daemon/daemon-runtime.md §3.1 同一套語意） |
 | `both` | **先送上游、成功了再寫本地**。上游失敗 → 回錯誤、本地**不**寫，UI 用同一個呼叫重試就好 |
 
-回應（`local`／`both` 是寫完之後本地的樣子；`server` 是本地沒動的樣子）：
+回應（`local`／`both` 是寫完之後本地的樣子；`server` 是本地沒動的樣子）。2026-11-06 對本機 server 實跑（`crates/wbf-daemon/tests/real_server.rs` 的 `read_receipts_mark_local_and_upstream_and_count_unread`），bob 送兩則、alice 標到第一則：
 
 ```jsonc
-{ "read_upto": { "event_id": "$Zm9vYmFy", "r_seq": 95 },   // 從沒標過是 null
-  "unread": { "count": 3, "mentions": 1 },                    // §2.1
-  "sent": "m.read.private" }                                  // 送了哪一種；local 是 null
+{ "code": 0, "msg": "ok", "sync": "both",
+  "result": {
+    "read_upto": { "event_id": "$953Hbj4TFzynLHomjvViQELs_PDEXMGU44stNep2z6I", "r_seq": 10 },  // 從沒標過是 null
+    "unread": { "count": 1, "mentions": 1 },                                                     // §2.1：剩第二則，它提到 alice
+    "sent": "m.read.private" } }                                                                 // 送了哪一種；local 是 null
 ```
 
 拒絕（都是**什麼都不寫、什麼都不送**）：
@@ -96,6 +105,9 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 | 位置零個或兩個以上、`sync` 認不得 | `102` |
 | 給的是 seq、或 `sync` 是 `local`／`both`，而本地查不到那一則（要比順序、要換 `event_id`） | `1100` |
 | 上游拒了（`server`／`both`） | `1400` |
+
+📎 2026-11-06 實測 wbfuwunel：對不存在的事件、不在的房間都回 200，只拒認不得的 `receipt_type`（400 `M_INVALID_PARAM`）。
+所以拿 `server` 送一個本地沒有的 `event_id`，server 也會收；`1400` 這條路由 core 的單元測試（假 server 拒）驗。
 
 上游怎麼送：`crates/wbf-sdk/src/matrix_endpoint.rs` 的端點表加一列 `RECEIPT`（跟 `REDACT` 同一套）——
 wbf 帳號走橋 `0x15 0x22` Receipt（wbfuwunel 的 /docs/bridge-specs/0x15-receipt.md：meta `{"room_id","receipt_type","event_id"}`、data `{}`），
@@ -107,12 +119,13 @@ wbf 帳號走橋 `0x15 0x22` Receipt（wbfuwunel 的 /docs/bridge-specs/0x15-rec
 `room.list` 只回房間 id（維護者 2026-10-05），所以未讀數跟著**每間房的** `room.get` 回：
 
 ```jsonc
-{ "room": "!r:localhost", "name": "…", /* 其餘 Conversation 欄位不變 */
-  "unread": { "count": 3, "mentions": 1, "read_upto": { "event_id": "$Zm9vYmFy", "r_seq": 95 } } }
+// 2026-11-06 對本機 server 實跑（同 §3 那一條）：alice 還沒標過，快取裡 bob 的加入（狀態事件）＋兩則訊息，第二則提到 alice
+{ "id": "!…:localhost", "name": "read receipts e2e", /* 其餘 Conversation 欄位不變 */
+  "unread": { "count": 3, "mentions": 1, "read_upto": null } }
 ```
 
 - **不論 `sync` 是哪一種都從本地算**（§2.1）：`sync` 管的是房間狀態要不要問 server，未讀數只有本地有。
-- 跟 /docs/design/rooms/chat-model.md §2.5 的 `Unread` 同一個東西；那邊的 `local_offset` 改名 `read_upto`，兩邊用同一個名字。
+- 跟 /docs/design/rooms/chat-model.md §2.5 的 `Unread` 同一個東西；那邊原本叫 `local_offset`，2026-11-06 改成 `read_upto`，兩邊用同一個名字。
 
 ## 5 private 還是 public：呼叫可以指定，沒指定就照 conf 的預設（維護者 2026-09-30 定）
 
@@ -121,7 +134,8 @@ wbfuwunel 的橋兩種都收（/docs/bridge-specs/0x15-receipt.md `0x22`），�
 
 - `room.read` 的 `visible_to_others: bool`：有帶就照參數送；沒帶就照 `wbf.conf` 的 `READ_RECEIPTS`（`private`／`public`）；
   conf 也沒寫、或寫了認不得的值，一律 **private**（fail closed，認不得的值進 `warnings`）。只影響 `sync: "server"`／`"both"`（`local` 不送上游）。
-- 改預設：**UI 把設定寫進 `wbf.conf`**，然後叫 **`daemon.reload_conf`**（§6），之後沒帶參數的已讀照新預設。
+- 改預設：**UI 把設定寫進 `wbf.conf`**（區段寫 `[read]`；區段只是分組，放哪段都讀得到），然後叫 **`daemon.reload_conf`**（§6），之後沒帶參數的已讀照新預設。
+  現在生效的是哪一個：`daemon.info` 的 `read_receipts_setting`（`"private"`／`"public"`）。
 - ⭐ 為什麼沒帶參數時落到 conf、最後落到 private：**「要不要被看見」是使用者的長期偏好**。第一個忘了帶參數的地方
   不該把使用者曝光出去 —— 那種錯誤是**不可回收的**（別人已經看到了）。參數是給 UI 做「這一則例外」用的。
 

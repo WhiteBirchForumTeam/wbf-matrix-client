@@ -12,12 +12,14 @@ use wbf_core::{
     cipher_for_plaintext_room, Core, HistoryQuery, RoomDevices, SendOptions, SyncMode,
     UploadRequest,
 };
+use wbf_sdk::cache::ReadAt;
 use wbf_sdk::chat::Membership;
 use wbf_sdk::{Manifest, MatrixManifest, RecentPlan};
 
 use super::{
     invalid_params, parse_params, to_result, Handle, Outcome, TargetParams, TransportParam,
 };
+use crate::settings::ReadReceipts;
 
 #[derive(Deserialize)]
 struct RoomParams {
@@ -66,12 +68,68 @@ pub(super) async fn room_invites(handle: &Handle, core: &Core, params: Value) ->
     to_result(serde_json::json!({ "invites": invites }))
 }
 
+/// 房間本身，多帶 `unread`：不論 `sync` 是哪一種都從本地算（/docs/design/messages/read-receipts.md §4）。
 pub(super) async fn room_get(handle: &Handle, core: &Core, params: Value) -> Outcome {
     let params: RoomParams = parse_params(params)?;
-    to_result(
-        core.conversation(&params.room, params.sync, &handle.target(&params.target))
-            .await?,
-    )
+    let target = handle.target(&params.target);
+    let conversation = core
+        .conversation(&params.room, params.sync, &target)
+        .await?;
+    let unread = core.unread(&params.room, &target).await?;
+    let mut result = serde_json::to_value(conversation)?;
+    if let Some(fields) = result.as_object_mut() {
+        fields.insert("unread".to_string(), serde_json::to_value(unread)?);
+    }
+    Ok(result)
+}
+
+/// 標已讀（/docs/design/messages/read-receipts.md §3）：`event_id`／`g_seq`／`r_seq` 恰好給一個，否則 102。
+/// 沒帶 `visible_to_others` 就照 conf 的 `READ_RECEIPTS`（§5）。
+pub(super) async fn room_read(handle: &Handle, core: &Core, params: Value) -> Outcome {
+    #[derive(Deserialize)]
+    struct Params {
+        room: String,
+        #[serde(default)]
+        event_id: Option<String>,
+        #[serde(default)]
+        g_seq: Option<i64>,
+        #[serde(default)]
+        r_seq: Option<i64>,
+        #[serde(default)]
+        sync: SyncMode,
+        #[serde(default)]
+        visible_to_others: Option<bool>,
+        #[serde(flatten)]
+        target: TargetParams,
+    }
+    let params: Params = parse_params(params)?;
+    let at = match (params.event_id, params.g_seq, params.r_seq) {
+        (Some(event_id), None, None) => ReadAt::EventId(event_id),
+        (None, Some(g_seq), None) => ReadAt::GSeq(g_seq),
+        (None, None, Some(r_seq)) => ReadAt::RSeq(r_seq),
+        _ => {
+            return Err(invalid_params(
+                "room.read takes exactly one of event_id, g_seq, r_seq",
+            ))
+        }
+    };
+    let visible_to_others = params
+        .visible_to_others
+        .unwrap_or(handle.settings().read_receipts == ReadReceipts::Public);
+    let marked = core
+        .mark_read(
+            &params.room,
+            &at,
+            params.sync,
+            visible_to_others,
+            &handle.target(&params.target),
+        )
+        .await?;
+    Ok(json!({
+        "read_upto": marked.unread.read_upto,
+        "unread": { "count": marked.unread.count, "mentions": marked.unread.mentions },
+        "sent": marked.sent,
+    }))
 }
 
 /// 送出的 RPC 共用的參數（/docs/design/keys/e2ee-rpc.md §3、/docs/design/messages/message-actions.md §2）。

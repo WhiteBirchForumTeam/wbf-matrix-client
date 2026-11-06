@@ -1635,6 +1635,185 @@ async fn message_actions_reply_react_edit_and_redact_between_two_accounts() {
     stop_daemon(daemon, client).await;
 }
 
+/// /docs/design/messages/read-receipts.md：bob 送兩則（第二則提到 alice），alice 看未讀、標已讀（本地與上游）、換 conf 的預設。
+/// 私人的回條 bob 看不到、公開的看得到（server 上的事實，用另一個 client 的 /sync 看）。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_USER, WBF_E2E_PASSWORD_FILE, WBF_E2E_USER_B, WBF_E2E_PASSWORD_B_FILE"]
+async fn read_receipts_mark_local_and_upstream_and_count_unread() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let alice = std::env::var("WBF_E2E_USER").expect("WBF_E2E_USER");
+    let bob = std::env::var("WBF_E2E_USER_B").expect("WBF_E2E_USER_B");
+    let read_password = |name: &str| {
+        let text = std::fs::read_to_string(std::env::var(name).expect(name)).unwrap();
+        text.strip_suffix('\n').unwrap_or(&text).to_string()
+    };
+    let alice_password = read_password("WBF_E2E_PASSWORD_FILE");
+    let bob_password = read_password("WBF_E2E_PASSWORD_B_FILE");
+
+    let dir = tempfile::Builder::new()
+        .prefix("wd")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let daemon = start_daemon(dir.path()).await;
+    let mut client = Client::connect(daemon.port).await;
+    let reply = client.call("vault.create", json!({})).await;
+    assert_eq!(reply["code"], 0, "vault.create: {reply}");
+    for (user, password) in [(&alice, &alice_password), (&bob, &bob_password)] {
+        let reply = client
+            .call(
+                "account.add",
+                json!({ "server": server, "user": user, "password": password, "device_name": "wbf-daemon read receipts e2e" }),
+            )
+            .await;
+        assert_eq!(reply["code"], 0, "account.add {user}: {reply}");
+    }
+    wait_for_links(&mut client, 10).await;
+
+    let created = client
+        .call(
+            "room.create",
+            json!({ "user": alice, "encrypted": false, "name": "read receipts e2e", "preset": "private_chat" }),
+        )
+        .await;
+    assert_eq!(created["code"], 0, "{created}");
+    let room = created["result"]["room_id"].as_str().unwrap().to_string();
+    let invited = client
+        .call(
+            "room.invite",
+            json!({ "user": alice, "room": room, "user_id": bob }),
+        )
+        .await;
+    assert_eq!(invited["code"], 0, "{invited}");
+    let joined = client
+        .call("room.join", json!({ "user": bob, "room": room }))
+        .await;
+    assert_eq!(joined["code"], 0, "{joined}");
+    for user in [&alice, &bob] {
+        let fetched = client
+            .call(
+                "room.get",
+                json!({ "user": user, "room": room, "sync": "both" }),
+            )
+            .await;
+        assert_eq!(fetched["code"], 0, "{fetched}");
+    }
+
+    let mut sent = Vec::new();
+    for content in [
+        json!({ "body": "第一則" }),
+        json!({ "body": "第二則", "mentions": [alice] }),
+    ] {
+        let mut params = json!({ "user": bob, "room": room });
+        for (name, value) in content.as_object().unwrap() {
+            params[name] = value.clone();
+        }
+        let reply = client.call("room.send_text", params).await;
+        assert_eq!(reply["code"], 0, "{reply}");
+        sent.push(reply["result"]["event_id"].as_str().unwrap().to_string());
+    }
+    let (first, second) = (sent[0].clone(), sent[1].clone());
+    history_until(&mut client, &alice, &room, &second, |message| {
+        message["kind"] == "text"
+    })
+    .await;
+
+    // ── 從沒標過：快取裡 bob 送的都算（含 bob 的加入，那是狀態事件），提到 alice 的是第二則 ──
+    let fetched = client
+        .call("room.get", json!({ "user": alice, "room": room }))
+        .await;
+    println!("room.get (unread) ← {}", fetched["result"]["unread"]);
+    let unread = &fetched["result"]["unread"];
+    assert!(unread["count"].as_u64().unwrap() >= 2, "{fetched}");
+    assert_eq!(unread["mentions"], 1, "{fetched}");
+    assert_eq!(unread["read_upto"], Value::Null, "{fetched}");
+
+    // ── 標到第一則，兩邊都寫：沒帶 visible_to_others、conf 沒寫 → 私人 ──
+    let marked = client
+        .call(
+            "room.read",
+            json!({ "user": alice, "room": room, "event_id": first, "sync": "both" }),
+        )
+        .await;
+    println!("room.read (both, private) ← {marked}");
+    assert_eq!(marked["code"], 0, "{marked}");
+    assert_eq!(marked["sync"], "both", "{marked}");
+    assert_eq!(marked["result"]["sent"], "m.read.private", "{marked}");
+    assert_eq!(marked["result"]["read_upto"]["event_id"], first.as_str());
+    assert_eq!(
+        marked["result"]["unread"],
+        json!({ "count": 1, "mentions": 1 }),
+        "{marked}"
+    );
+
+    // ── 換 conf 的預設成公開，重讀；這次沒帶參數就送 m.read ──
+    std::fs::write(
+        dir.path().join("wbf.conf"),
+        "[read]\nREAD_RECEIPTS=public\n",
+    )
+    .unwrap();
+    let reloaded = client.call("daemon.reload_conf", json!({})).await;
+    println!("daemon.reload_conf ← {reloaded}");
+    assert_eq!(reloaded["code"], 0, "{reloaded}");
+    assert_eq!(reloaded["result"]["changed"], json!(["READ_RECEIPTS"]));
+    let marked = client
+        .call(
+            "room.read",
+            json!({ "user": alice, "room": room, "event_id": second, "sync": "both" }),
+        )
+        .await;
+    println!("room.read (both, public by conf) ← {marked}");
+    assert_eq!(marked["result"]["sent"], "m.read", "{marked}");
+    assert_eq!(
+        marked["result"]["unread"],
+        json!({ "count": 0, "mentions": 0 }),
+        "{marked}"
+    );
+
+    // ── 本地只往前：標回第一則不動 ──
+    let marked_back = client
+        .call(
+            "room.read",
+            json!({ "user": alice, "room": room, "event_id": first, "sync": "local" }),
+        )
+        .await;
+    assert_eq!(marked_back["code"], 0, "{marked_back}");
+    assert_eq!(marked_back["result"]["sent"], Value::Null);
+    assert_eq!(
+        marked_back["result"]["read_upto"]["event_id"],
+        second.as_str(),
+        "{marked_back}"
+    );
+    let fetched = client
+        .call("room.get", json!({ "user": alice, "room": room }))
+        .await;
+    assert_eq!(
+        fetched["result"]["unread"]["read_upto"]["event_id"],
+        second.as_str()
+    );
+
+    // 📎 上游拒絕（1400、本地不寫）在 core 的單元測試驗：這台 server 對不存在的事件、不在的房間都回 200，
+    // 只拒認不得的 `receipt_type`，而 daemon 只送 `m.read`／`m.read.private`（2026-11-06 實測）。
+
+    // ── server 上的事實：bob 看得到 alice 的公開回條（第二則），看不到私人的（第一則）──
+    let other = OtherClient::login(&server, &bob, &bob_password).await;
+    let receipts = other.receipts_of(&room, &alice, &second).await;
+    println!("bob's /sync m.receipt ← {receipts}");
+    assert!(
+        receipts[&second]["m.read"][&alice].is_object(),
+        "{receipts}"
+    );
+    assert!(
+        receipts
+            .get(&first)
+            .and_then(|by_type| by_type.get("m.read.private"))
+            .is_none(),
+        "私人的回條別人看不到：{receipts}"
+    );
+    other.logout().await;
+
+    stop_daemon(daemon, client).await;
+}
+
 /// `room.history sync=both` 一直問到 `event_id` 那則符合 `wanted` 為止（推播、金鑰都要時間；最多 10 秒），回那則。
 async fn history_until(
     client: &mut Client,
@@ -1827,6 +2006,34 @@ impl OtherClient {
             .json()
             .await
             .unwrap()
+    }
+
+    /// 這間房的 `m.receipt`（/sync 的 ephemeral）：輪詢到 `user` 對 `event_id` 的回條出現為止（最多 10 秒），回 content。
+    async fn receipts_of(&self, room: &str, user: &str, event_id: &str) -> Value {
+        let mut content = Value::Null;
+        for _ in 0..50 {
+            let reply: Value = self
+                .http
+                .get(format!("{}/_matrix/client/v3/sync?timeout=0", self.server))
+                .bearer_auth(&self.access_token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(receipt) = reply["rooms"]["join"][room]["ephemeral"]["events"]
+                .as_array()
+                .and_then(|events| events.iter().find(|event| event["type"] == "m.receipt"))
+            {
+                content = receipt["content"].clone();
+                if content[event_id]["m.read"][user].is_object() {
+                    return content;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        content
     }
 
     async fn logout(&self) {

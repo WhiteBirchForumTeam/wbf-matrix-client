@@ -114,11 +114,11 @@ impl IncomingEvent {
     }
 
     /// 存得進 `cache.db` 的最低條件：有 `event_id`（能被參照、能當游標）與 `sender`（能比對誰改了誰的訊息）。
-    /// 🚨 `upsert_events` 與進料口（推播、`Recent`）共用這一支：存不存得了只有一個答案，🚫 不在兩處各判一次。
+    /// 🚨 `upsert_events` 與進料口（推播、`Recent`）共用這一支：存不存得了只有一個答案，禁止在兩處各判一次。
     ///
     /// Return:
     ///     Some((event_id, sender))  存得了
-    ///     None                       存不了——呼叫端跳過、數出來、講出來；🚫 不替它發通知（它不會在庫裡）
+    ///     None                       存不了——呼叫端跳過、數出來、講出來；禁止替它發通知（它不會在庫裡）
     pub fn storable_identity(&self) -> Option<(&str, &str)> {
         let sender = self
             .envelope()
@@ -152,7 +152,7 @@ pub struct EventPage {
 
 impl EventPage {
     /// 🚨 **`next` 從上游的原始順序取**（PR #36 審查 rumia🔴）：原始順序裡最舊、有 `event_id` 的那則。
-    /// 🚫 不從折疊或讀回之後的結果推 —— 折疊會拿掉關係事件、讀回會濾掉 `hidden`，最後一則都可能比較新，
+    /// 禁止從折疊或讀回之後的結果推 —— 折疊會拿掉關係事件、讀回會濾掉 `hidden`，最後一則都可能比較新，
     /// 拿它往回問就會重複同一段。游標要的是「上游這一頁到哪裡」，不是「這一頁顯示了什麼」。
     ///
     /// Args:
@@ -218,11 +218,13 @@ pub struct Classified {
     pub content_json: Option<serde_json::Value>,
     /// edit／redact／reaction 指向的目標。
     pub ref_event_id: Option<String>,
+    /// 明文帶了 `state_key`（狀態事件）；沒解開的是 false。
+    pub is_state: bool,
 }
 
 /// 照明文分類（/docs/design/messages/edits-and-redactions.md §4）。
 ///
-/// ⚠️ 狀態事件（有 `state_key`）一律是 msg，🚫 不會被當成 edit —— spec 規定 edit 不能是狀態事件。
+/// ⚠️ 狀態事件（有 `state_key`）一律是 msg，**不**會被當成 edit —— spec 規定 edit 不能是狀態事件。
 /// ⚠️ 缺 `m.new_content` 的 `m.replace` 不是有效的 edit（spec），當 msg 顯示它自己的 `body`（fallback）。
 ///
 /// Args:
@@ -236,6 +238,7 @@ pub fn classify(incoming: &IncomingEvent) -> Classified {
             event_type: None,
             content_json: None,
             ref_event_id: None,
+            is_state: false,
         };
     };
     let event_type = cleartext
@@ -294,6 +297,7 @@ pub fn classify(incoming: &IncomingEvent) -> Classified {
         event_type: Some(event_type),
         content_json: Some(content_json),
         ref_event_id,
+        is_state,
     }
 }
 
@@ -347,7 +351,7 @@ pub fn check_replacement(
     Ok(())
 }
 
-/// 顯示一則被 edit 過的訊息時用的 content（讀取時算，🚫 不寫回任何一列）：`m.new_content` 整份取代，
+/// 顯示一則被 edit 過的訊息時用的 content（讀取時算，**不**寫回任何一列）：`m.new_content` 整份取代，
 /// 但 **`m.relates_to` 留目標原本的**（spec：`m.new_content` 裡的 `m.relates_to` 不算數）—— 否則回覆關係被 edit 洗掉。
 ///
 /// Args:
