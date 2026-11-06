@@ -1840,17 +1840,33 @@ impl Cache {
         user_id: &str,
         room_id: &str,
     ) -> Result<Option<ReadPosition>, SdkError> {
+        Ok(self
+            .find_watermark(user_id, room_id)?
+            .map(|(_, position)| position))
+    }
+
+    /// Return:
+    ///     Ok(Some((events.id, ReadPosition)))   本地水位那一則，連同它在快取裡的列號
+    ///     Ok(None)                              從沒標過
+    fn find_watermark(
+        &self,
+        user_id: &str,
+        room_id: &str,
+    ) -> Result<Option<(i64, ReadPosition)>, SdkError> {
         self.connection
             .query_row(
-                "SELECT e.event_id, e.r_seq FROM read_positions p
+                "SELECT e.id, e.event_id, e.r_seq FROM read_positions p
                  JOIN users u ON u.id = p.user JOIN rooms r ON r.id = p.room JOIN events e ON e.id = p.event
                  WHERE u.mxid = ?1 AND r.room_id = ?2",
                 params![user_id, room_id],
                 |row| {
-                    Ok(ReadPosition {
-                        event_id: row.get(0)?,
-                        r_seq: row.get(1)?,
-                    })
+                    Ok((
+                        row.get(0)?,
+                        ReadPosition {
+                            event_id: row.get(1)?,
+                            r_seq: row.get(2)?,
+                        },
+                    ))
                 },
             )
             .optional()
@@ -1861,8 +1877,12 @@ impl Cache {
     /// `class` 是 `msg` 或 `general`（解不開的也算）、別人送的、沒被收回的則數。只數快取裡有的。
     ///
     /// Return:
-    ///     Ok(Unread)   從沒標過就是快取裡全部該算的；這間房本地沒有是 0、`read_upto` null
+    ///     Ok(Unread)   `count`／`mentions` 一定是對回傳的那個 `read_upto` 數的（兩次查詢之間水位被別人往前標了也一樣）；
+    ///                  從沒標過就是快取裡全部該算的；這間房本地沒有是 0、`read_upto` null
     pub fn get_unread(&self, user_id: &str, room_id: &str) -> Result<Unread, SdkError> {
+        // 先讀水位，再用同一則去數：數的那句不自己重讀 read_positions，否則中間被往前標就會數少、跟 read_upto 對不上
+        let watermark = self.find_watermark(user_id, room_id)?;
+        let watermark_row_id = watermark.as_ref().map(|(row_id, _)| *row_id);
         let (count, mentions) = self
             .connection
             .query_row(
@@ -1876,20 +1896,19 @@ impl Cache {
                        JOIN rooms r ON r.id = e.room
                        JOIN events_synced_log l ON l.event = e.id
                        JOIN users reader ON reader.id = l.user
-                       LEFT JOIN read_positions p ON p.user = reader.id AND p.room = e.room
-                       LEFT JOIN events w ON w.id = p.event
+                       LEFT JOIN events w ON w.id = ?3
                      WHERE reader.mxid = ?1 AND r.room_id = ?2 AND l.hidden = 0
                        AND e.class IN ('msg', 'general') AND e.is_redacted = 0 AND e.sender <> reader.id
                        AND (w.id IS NULL OR {IS_AFTER_WATERMARK})"
                 ),
-                params![user_id, room_id],
+                params![user_id, room_id, watermark_row_id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(db_error)?;
         Ok(Unread {
             count: u64::try_from(count).unwrap_or(0),
             mentions: u64::try_from(mentions).unwrap_or(0),
-            read_upto: self.get_read_position(user_id, room_id)?,
+            read_upto: watermark.map(|(_, position)| position),
         })
     }
 
