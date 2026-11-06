@@ -91,6 +91,7 @@ fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
     const WITH_SYNC: &[&str] = &[
         "room.list",
         "room.get",
+        "room.read",
         "room.history",
         "room.files",
         "media.info",
@@ -159,7 +160,8 @@ pub struct Handle {
     /// 還是 `RwLock`：`vault.create`／`unlock` 會換掉裡面的狀態，而讀的人是每一個請求。
     core: RwLock<Arc<Core>>,
     policy: EncryptionPolicy,
-    settings: Settings,
+    /// `daemon.reload_conf` 整份換掉它（/docs/design/messages/read-receipts.md §6）；讀的人拿一份拷貝，不握著鎖。
+    settings: std::sync::RwLock<Settings>,
     started_at: Instant,
     /// `daemon.shutdown` 只設這個；真正廣播（[`Handle::begin_shutdown_if_requested`]）由 server 在**送完那則回應之後**叫。
     /// 不然 close 通知可能排在 `{ ok: true }` 前面（PR #30 審查 cirno🔴3）。
@@ -184,7 +186,7 @@ impl Handle {
             data_dir: data_dir.to_path_buf(),
             core: RwLock::new(Arc::new(Core::open(data_dir))),
             policy,
-            settings,
+            settings: std::sync::RwLock::new(settings),
             started_at: Instant::now(),
             shutdown_requested: AtomicBool::new(false),
             shutdown,
@@ -287,8 +289,12 @@ impl Handle {
         self.core.read().await.clone()
     }
 
-    pub fn settings(&self) -> &Settings {
-        &self.settings
+    /// 現在生效的那一份（拷貝）。鎖壞了（別的執行緒握著它 panic）也照讀：裡面是整份換上去的值，不會是換一半的。
+    pub fn settings(&self) -> Settings {
+        self.settings
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// `hello` 的 result（/docs/design/rpc-specs/rpc-spec.md §1.3）。connection 談完版本後由這裡填 daemon 的狀態。
@@ -369,6 +375,7 @@ impl Handle {
             "daemon.info" => Box::pin(self.daemon_info(core)),
             "daemon.set_encryption" => Box::pin(async { self.daemon_set_encryption(params) }),
             "daemon.shutdown" => Box::pin(async { self.daemon_shutdown() }),
+            "daemon.reload_conf" => Box::pin(async { self.daemon_reload_conf() }),
             "vault.create" => Box::pin(async { local::vault_create(core, params) }),
             "vault.unlock" => Box::pin(async {
                 let unlocked = local::vault_unlock(core, params);
@@ -403,6 +410,8 @@ impl Handle {
             "room.edit" => Box::pin(rooms::room_edit(self, core, params)),
             "room.react" => Box::pin(rooms::room_react(self, core, params)),
             "room.redact" => Box::pin(rooms::room_redact(self, core, params)),
+            // 已讀（/docs/design/messages/read-receipts.md §3）
+            "room.read" => Box::pin(rooms::room_read(self, core, params)),
             "room.refresh_devices" => Box::pin(rooms::room_refresh_devices(self, core, params)),
             "room.send_file" => Box::pin(rooms::room_send_file(self, core, params)),
             "room.send_attachment" => Box::pin(rooms::room_send_attachment(self, core, params)),
@@ -504,6 +513,7 @@ impl Handle {
 
     async fn daemon_info(&self, core: &Core) -> Outcome {
         let ports = *self.ports.read().await;
+        let settings = self.settings();
         Ok(json!({
             "version": format!("{DAEMON_NAME} {DAEMON_VERSION}"),
             // 所有帳號加起來現在開著幾條上游的線（/docs/design/daemon/link-pool.md）。
@@ -521,8 +531,9 @@ impl Handle {
             "connections": self.connection_count(),
             // 寫入者還有幾件在排隊（/docs/design/daemon/daemon-runtime.md §2.2）。⚠️ 一直漲＝寫得比收得慢。
             "cache_queue": core.cache_queue_len(),
-            "server_backup_setting": on_off(self.settings.server_backup),
-            "local_room_keys_setting": on_off(self.settings.local_room_keys),
+            "server_backup_setting": on_off(settings.server_backup),
+            "local_room_keys_setting": on_off(settings.local_room_keys),
+            "read_receipts_setting": settings.read_receipts.as_str(),
         }))
     }
 
@@ -541,7 +552,7 @@ impl Handle {
     /// conf 的 `TRANSPORT = http` 是上限（/docs/design/overview/architecture-v2.md §5.1）：一律 HTTP，**不**開 WS 線。正在關機也不叫（PR #61 審查 cirno 🟢4）。
     /// 已經有一輪在跑時，core 那邊自己跳過（`ensuring_links` 旗），這裡不必再擋。
     async fn start_ensuring_links(&self) {
-        if self.settings.transport == Transport::Http || self.is_shutting_down() {
+        if self.settings().transport == Transport::Http || self.is_shutting_down() {
             return;
         }
         let core = self.core().await;
@@ -555,7 +566,7 @@ impl Handle {
     /// 開不起來（server 不在）就拉長間隔（每次加倍，上限 [`KEEP_LINKS_MAX_INTERVAL`]），一輪全順就回到 [`KEEP_LINKS_INTERVAL`]：**不**對一台不在的 server 每 15 秒敲五次門。
     /// `daemon.shutdown` 一廣播就停。`TRANSPORT = http` 不開 WS 線，所以整個不跑。
     pub async fn keep_links_open(self: Arc<Handle>) {
-        if self.settings.transport == Transport::Http {
+        if self.settings().transport == Transport::Http {
             return;
         }
         let mut shutdown = self.shutdown_signal();
@@ -582,6 +593,23 @@ impl Handle {
         }
     }
 
+    /// 照啟動時那一份 conf 重讀（/docs/design/messages/read-receipts.md §6）：讀成功就整份換，讀失敗回 1100、全部照舊。
+    /// 會影響連線的鍵（`TRANSPORT`）不換，列進 `needs_restart`。
+    fn daemon_reload_conf(&self) -> Outcome {
+        let reloaded = self.settings().reload(&self.data_dir)?;
+        let warnings = reloaded.settings.warnings.clone();
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reloaded.settings;
+        Ok(json!({
+            "ok": true,
+            "changed": reloaded.changed,
+            "needs_restart": reloaded.needs_restart,
+            "warnings": warnings,
+        }))
+    }
+
     /// 只記下「要關了」；廣播等回應送出去之後（見 [`Handle::begin_shutdown_if_requested`]）。
     fn daemon_shutdown(&self) -> Outcome {
         self.shutdown_requested.store(true, Ordering::SeqCst);
@@ -593,14 +621,14 @@ impl Handle {
         Target {
             user: params.user.clone(),
             server: params.server.clone(),
-            server_backup: self.settings.server_backup,
+            server_backup: self.settings().server_backup,
         }
     }
 
     /// `transport` 欄位（/docs/design/rpc-specs/rpc-spec.md §2）：沒帶用 conf 的；帶了認不得 → `102`。
     fn transport(&self, params: &TransportParam) -> Result<Transport, Fail> {
         match &params.transport {
-            None => Ok(self.settings.transport),
+            None => Ok(self.settings().transport),
             Some(name) => Transport::from_name(name).ok_or_else(|| {
                 Fail::Rpc(
                     code::INVALID_PARAMS,
@@ -974,6 +1002,11 @@ mod tests {
                 "room.redact",
                 json!({ "room": "!r:localhost", "event_id": "$abc", "reason": "typo" }),
             ),
+            (
+                "room.read",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "sync": "both", "visible_to_others": true }),
+            ),
+            ("room.read", json!({ "room": "!r:localhost", "r_seq": 95 })),
             ("room.refresh_devices", json!({ "room": "!r:localhost" })),
             (
                 "room.send_attachment",
@@ -1190,6 +1223,20 @@ mod tests {
                 json!({ "room": "!r:localhost", "event_id": "$abc" }),
             ),
             ("room.redact", json!({ "room": "!r:localhost" })),
+            // room.read：位置恰好一個（/docs/design/messages/read-receipts.md §3）
+            ("room.read", json!({ "room": "!r:localhost" })),
+            (
+                "room.read",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "r_seq": 95 }),
+            ),
+            (
+                "room.read",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "sync": "elsewhere" }),
+            ),
+            (
+                "room.read",
+                json!({ "room": "!r:localhost", "event_id": "$abc", "visible_to_others": "yes" }),
+            ),
             (
                 "room.history",
                 json!({ "room": "!r:localhost", "limit": 10, "sync": "elsewhere" }),
@@ -1287,6 +1334,52 @@ mod tests {
         assert!(response.msg.contains("LOCAL_ROOM_KEYS=off"));
         let response = handle.call(request("daemon.info", Value::Null)).await;
         assert_eq!(response.result["server_backup_setting"], "off");
+    }
+
+    /// /docs/design/messages/read-receipts.md §6：讀成功整份換、`TRANSPORT` 不換而進 `needs_restart`；讀失敗回 1100、全部照舊。
+    #[tokio::test]
+    async fn reload_conf_swaps_what_it_can_and_keeps_everything_when_the_file_is_broken() {
+        use crate::settings::ReadReceipts;
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle(dir.path());
+        let conf_path = dir.path().join(wbf_core::conf::CONF_FILE_NAME);
+        std::fs::write(
+            &conf_path,
+            "[read]\nREAD_RECEIPTS=public\nSERVER_BACKUP=off\nTRANSPORT=http\nMYSTERY=1\n",
+        )
+        .unwrap();
+        let response = handle
+            .call(request("daemon.reload_conf", Value::Null))
+            .await;
+        assert_eq!(response.code, 0, "{}", response.msg);
+        assert_eq!(response.result["ok"], true);
+        assert_eq!(
+            response.result["changed"],
+            json!(["SERVER_BACKUP", "READ_RECEIPTS"])
+        );
+        assert_eq!(response.result["needs_restart"], json!(["TRANSPORT"]));
+        assert!(
+            response.result["warnings"].to_string().contains("MYSTERY"),
+            "{}",
+            response.result
+        );
+        let settings = handle.settings();
+        assert_eq!(settings.read_receipts, ReadReceipts::Public);
+        assert!(!settings.server_backup);
+        assert_eq!(settings.transport, Transport::WebSocket, "連線的鍵不重讀");
+        let info = handle.call(request("daemon.info", Value::Null)).await;
+        assert_eq!(info.result["read_receipts_setting"], "public");
+
+        std::fs::write(&conf_path, "READ_RECEIPTS=private\nthis is not a pair\n").unwrap();
+        let response = handle
+            .call(request("daemon.reload_conf", Value::Null))
+            .await;
+        assert_eq!(response.code, 1100, "{}", response.msg);
+        assert_eq!(
+            handle.settings().read_receipts,
+            ReadReceipts::Public,
+            "讀失敗：一個鍵都不換"
+        );
     }
 
     #[tokio::test]

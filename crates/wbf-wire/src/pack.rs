@@ -40,6 +40,8 @@ pub enum Kind {
     Room = 0x13,
     /// 房間事件的領域（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：`Recent`、`Send`、`Batch`。
     Event = 0x14,
+    /// 輸入中與已讀（wbfuwunel 的 /docs/bridge-specs/0x15-receipt.md）：沒有原生的 pack，全是走橋的 Matrix 端點（`Receipt` 等）。
+    Receipt = 0x15,
     /// to-device（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.2；/docs/design/keys/to-device-client.md）：`Fetch`、`Batch`、`ItemsDestroy`、`Subscribe`……client 這邊還沒接。
     Device = 0x16,
     /// E2EE 的金鑰（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 `/keys/*` 與 `/room_keys/*`（bridge-specs `0x17-keys.md`）。
@@ -63,6 +65,7 @@ impl Kind {
             0x11 => Some(Kind::Account),
             0x13 => Some(Kind::Room),
             0x14 => Some(Kind::Event),
+            0x15 => Some(Kind::Receipt),
             0x16 => Some(Kind::Device),
             0x17 => Some(Kind::Keys),
             _ => None,
@@ -95,7 +98,7 @@ pub mod id {
     ///     value: example: 20
     /// Return:
     ///     Some(u64)  `0x01_00000000000014`
-    ///     None       值超過 56 bit（拒絕，🚫 不截斷）
+    ///     None       值超過 56 bit（拒絕，**不**截斷）
     pub fn compose(id_type: u8, value: u64) -> Option<u64> {
         if value > MAX_VALUE {
             return None;
@@ -191,17 +194,17 @@ pub mod device {
     /// 只有 server → client：`ItemsDestroy` 的結果，meta `{ tc, bc }`。
     pub const ITEMS_DESTROYED: u8 = 0x07;
     /// 只有 server → client：自己的金鑰存量，meta `{ otk_counts, unused_fallback_key_types, gap }`；
-    /// 每個 `Subscribe` 之後一定跟一個，收包迴圈🚫 不能把它當成下一個請求的回覆。
+    /// 每個 `Subscribe` 之後一定跟一個，收包迴圈禁止把它當成下一個請求的回覆。
     pub const CRYPTO_STATE: u8 = 0x08;
 }
 
 /// `Kind::Invite` 的 subtype（wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §5）。編號跟 `Event`／`Device` 對齊、`0x03` 故意留空。
-/// ⭐ 每次連線一輪完整快照、🚫 跨連線的水位：`ci_seq` 只是同一輪之內的續傳游標（同一份 §3.3）。
+/// ⭐ 每次連線一輪完整快照、**沒有**跨連線的水位：`ci_seq` 只是同一輪之內的續傳游標（同一份 §3.3）。
 /// `Fetch`／`Subscribe`／`Unsubscribe` 的 `id` 是 client 會話號（[`id::SESSION`]）。
 pub mod invite {
-    /// 拉一輪待處理的邀請，meta `{ ci_seq?, batch? }`；回應是一串 `Batch`（🚫 `Ack`），**只走 WS**。
+    /// 拉一輪待處理的邀請，meta `{ ci_seq?, batch? }`；回應是一串 `Batch`（**沒有** `Ack`），**只走 WS**。
     pub const FETCH: u8 = 0x01;
-    /// 只有 server → client：`Fetch` 的一批，meta `{ tc, bc, os?, ns?, counts, r }`（`bc == 0` 時🚫 帶 `os`／`ns`）；
+    /// 只有 server → client：`Fetch` 的一批，meta `{ tc, bc, os?, ns?, counts, r }`（`bc == 0` 時**不**帶 `os`／`ns`）；
     /// data 是 `bc` 筆，每筆 u32 大端長度＋一間房的 JSON。**`r == 0` 才是補完**。
     pub const BATCH: u8 = 0x02;
     /// 訂閱自己的邀請；回 `{ latest_count }`，之後每個 `Push`、`Gone` 抄這個 `id`。
@@ -374,7 +377,7 @@ impl Pack {
         if bytes.len() < MIN_PACK_LEN {
             return Err(DecodeError::TooShort);
         }
-        // 長度已經驗過；這裡用 slice pattern 取標頭，🚫 不索引（索引越界是 panic，而這支程式不該有 panic 的路）。
+        // 長度已經驗過；這裡用 slice pattern 取標頭，禁止索引（索引越界是 panic，而這支程式不該有 panic 的路）。
         let [version, kind_byte, subtype, flags, ..] = bytes else {
             return Err(DecodeError::TooShort);
         };

@@ -243,10 +243,10 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（不�
 | method | params | result | core |
 |---|---|---|---|
 | `hello` | §1.3 | §1.3 | — |
-| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, links, cache_queue, server_backup_setting, local_room_keys_setting }`。`instance`／`pid` 同 §1.3；`links` ＝ 所有帳號加起來現在開著幾條上游的線（/docs/design/daemon/link-pool.md；一個 wbf 帳號五條都開好就是 5，daemon 的看線迴圈會把它補回去）；`cache_queue` ＝ cache 寫入者還有幾件在排隊（一直漲＝寫得比收得慢）；後兩個是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組 | `key_mode`、`is_unlocked` |
+| `daemon.info` | — | `{ version, instance, pid, data_dir, unlocked, key_mode, encryption_enforced, protocols: [int], rpc_port, data_port, uptime_seconds, connections, links, cache_queue, server_backup_setting, local_room_keys_setting, read_receipts_setting }`。`instance`／`pid` 同 §1.3；`links` ＝ 所有帳號加起來現在開著幾條上游的線（/docs/design/daemon/link-pool.md；一個 wbf 帳號五條都開好就是 5，daemon 的看線迴圈會把它補回去）；`cache_queue` ＝ cache 寫入者還有幾件在排隊（一直漲＝寫得比收得慢）；`server_backup_setting`、`local_room_keys_setting` 是 conf 的開關（`"on"`／`"off"`），跟 `backup.status` 回的同一組；`read_receipts_setting` 是現在生效的 `READ_RECEIPTS`（`"private"`／`"public"`，/docs/design/messages/read-receipts.md §5） | `key_mode`、`is_unlocked` |
 | `daemon.set_encryption` | `{ enforced: bool }`。本身必須走 `0x02` 送（§1.1） | `{ encryption_enforced }` | — 全局狀態，除錯用 |
 | `daemon.shutdown` | — | `{ ok: true }`；回完之後才關 | — ⚠️ 生命週期整體還沒定（/docs/design/overview/architecture-v2.md §7 第 4 點），這條只是「有人能把它關掉」的最低限度。關機之後進來的請求回 `107` |
-| `daemon.reload_conf` | — | `{ ok: true, changed: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：**不**斷上游會話、**不**掉連線）。⭐ 前端改設定（例如已讀要不要公開，/docs/design/messages/read-receipts.md §3）之後叫它，**不必**重開 daemon。還沒做 |
+| `daemon.reload_conf` | — | `{ ok: true, changed: [string], needs_restart: [string], warnings: [string] }` | — 重讀 `wbf.conf`（**graceful**：**不**斷上游會話、**不**掉連線；所以會影響連線的鍵（`TRANSPORT`）**不**重讀，值變了列進 `needs_restart`、完整重開才載入）。⭐ 前端改設定（例如已讀要不要公開，/docs/design/messages/read-receipts.md §5、§6）之後叫它，**不必**重開 daemon。讀失敗（`--config` 明指的不在、語法壞了）回 `1100`、全部照舊 |
 | `vault.create` | `{ passphrase_base64?: string }`。**fresh 資料目錄的起手式**：帶了就是 `passphrase` 模式，沒帶就是 `plain` | `{ ok: true, key_mode }` | `create_vault`。已經有 `local.key` → `1100`（**不**覆蓋：那會把既有帳號全鎖在門外）。建完就是**解鎖狀態** |
 | `vault.unlock` | `{ passphrase_base64?: string }`。`plain` 模式不帶（但一樣要叫：daemon 起來時一律未解鎖，/docs/design/rpc-specs/local-interface.md §5）；`passphrase` 模式帶**原始 bytes** 的 base64（/docs/design/storage/vault-and-keys.md §3） | `{ ok: true, key_mode }` | `unlock`。成功之後 daemon 在背景把每個登入的 wbf 帳號的五條線開起來（/docs/design/daemon/link-pool.md §3.1），**不**等它回應就先回；已經解鎖再叫一次也會觸發 |
 | `vault.set_passphrase` | `{ passphrase_base64: string }` | `{ ok: true, key_mode: "passphrase" }` | `set_passphrase(Some)` |
@@ -297,7 +297,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（不�
 | method | params | result | core |
 |---|---|---|---|
 | `room.list` | `{ membership?: ["join" \| "invite" \| "knock" \| "leave" \| "ban"], user?, server?, sync? }`。**有 `sync`**（§2）；`membership` 沒帶是 `["join"]` | `[RoomListEntry]`（/docs/design/rooms/chat-model.md §2.1）：這個帳號在那幾種身分裡的房，每列帶 `membership`；被邀請的列多帶 `invite`（下面 `room.invites` 的一間去掉 `room`）；本地知道多少給多少、不知道的是 `null`；`refreshed_at` 是 `null` ＝ 這間還沒 `room.get` 過 | `list_rooms`。上網只問「加入了哪些房」（wbf 帳號一個 `JoinedRooms`），`both` 把差異寫進本地（新的加列、拿過的**不**覆寫、本地是 `join` 而名單沒有的標 `leave`、**不**刪）再讀本地；`server` **不**寫庫，wbf 帳號只有 id、只答得出 `join`（維護者 2026-10-05）。別的身分由房間動作（§3.3.1）與邀請的推播／`room.invites` 寫（/docs/design/rooms/room-actions.md §3.3）；打上游只拿房間列表、沒有邀請，寫回時**不**動邀請的列（維護者 2026-10-14） |
-| `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation`：型別欄位＋ `state`（成員事件以外的每一項狀態事件原樣：權限的整份內容、置頂清單…，/docs/design/rooms/room-actions.md §5.1） | `conversation`。上網只問**這一間**（wbf 帳號是它的 `GetState` ＋ `m.direct`；一般 Matrix 帳號是 Client 算的欄位加一個 HTTP `GET /state`），`both` 寫進本地、下一次 `room.list` 就帶著。UI 對看得到、還沒名字的房間自己叫它 |
+| `room.get` | `{ room, user?, server?, sync? }`。**有 `sync`** | `Conversation`：型別欄位＋ `state`（成員事件以外的每一項狀態事件原樣：權限的整份內容、置頂清單…，/docs/design/rooms/room-actions.md §5.1）＋ `unread: { count, mentions, read_upto: { event_id, r_seq } \| null }`（不論 `sync` 都從本地算，/docs/design/messages/read-receipts.md §4） | `conversation`。上網只問**這一間**（wbf 帳號是它的 `GetState` ＋ `m.direct`；一般 Matrix 帳號是 Client 算的欄位加一個 HTTP `GET /state`），`both` 寫進本地、下一次 `room.list` 就帶著。UI 對看得到、還沒名字的房間自己叫它 |
 | `room.invites` | `{ user?, server? }`。**沒有** `sync`：本來就是去上游拿、寫進本地的（跟 `sync.recent` 一樣） | `{ invites: [{ room, inviter, is_direct, reason, state, is_from_this_server }] }`：補完之後本地所有待處理的邀請，照房間 id 排。`state` 是縮減狀態原樣（`null` ＝ server 太大沒送、本地也沒有）；🚨 `is_from_this_server` 是 `false` 時房名、頭像、topic 都是對方 server 說的，禁止當成已驗證的事實顯示 | `fetch_invites`。主動補一輪（我們自己加的補窗，維護者 2026-10-14）：wbf 帳號跑一輪 `Invite/Fetch` 到 `r == 0`；一般 Matrix 帳號跑一次 `/sync` 讀 store。補完整份取代本地的邀請（這一輪裡被推播碰過的房以推播為準）、有變的推 `room.membership`；中途斷了回錯、**不**寫任何一列。UI 首次啟動叫一次、看到 `room.membership` 帶 `gap: true` 再叫、收到 `link.state { role: "rooms", state: "opened" }`（斷了重開，/docs/design/rooms/room-sync.md §3.1）再叫、UI 自己的 RPC 連線重連時再叫；daemon **不**自己叫。一般 Matrix 帳號沒有推播，要 UI 自己再叫（/docs/design/rooms/room-actions.md §3.3） |
 | `room.send_text` | `{ room, body, reply_to?, mentions?, room_devices?, txn_id?, user?, server? }`。**加密房必帶 `room_devices`**：`room.refresh_devices` 回的那份（或上一次 1401 的 `data`）原樣帶回來；明文房不看它。`txn_id` 重送用同一個，沒帶 daemon 產一個（/docs/design/keys/e2ee-rpc.md §3）。`reply_to` 是被回覆那則的 `event_id`、`mentions` 是 mxid 的陣列：送出的 `m.mentions` 照 /docs/design/messages/message-actions.md §3.2 | `{ event_id }` | `send_text`。加不加密看本地記的（`room.get sync=both` 拿過的房間；只在 `room.list` 上、還沒拿過的是不知道）：wbf 帳號沒拿過這間房、或本地不知道它加不加密 → **1100**，請先拿房間（維護者 2026-10-05：daemon **不**為了送一則字再問 server）。加密房：**只用後台已經分好的房間金鑰**——等這個房的金鑰對 `room_devices.room_version` 就緒（最多 2 秒，等不到回 **1402**、訊息沒送）→ 加密、帶 `room_version` 送（/docs/design/keys/e2ee-rpc.md §3）；被 server 擋（號碼過期）→ daemon 自動重拿房間狀態，回 **1401** 帶 `data`（§5.3）；兩種都**不**自動重送 |
 | `room.edit` | `{ room, event_id, body, mentions?, room_devices?, txn_id?, user?, server? }`。`event_id` 是被改的那則；`mentions` 是新版本提到誰，沒帶＝改字不通知任何人；`body` 是空字串照送（Matrix 允許；要不要擋是 UI 的事）；加密、`txn_id` 同 `room.send_text` | `{ event_id }`：**edit 那則自己的** id | `edit_text`（/docs/design/messages/message-actions.md §3.3、§4.2）。目標要在這個帳號的本地、是自己送的、是原始訊息、還在、是 `m.text`；不合就 **1100**、不送（`msg` 寫哪一條）。帶了 `reply_to` 也是 1100 |
@@ -308,7 +308,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（不�
 | `room.send_attachment` | `{ room, manifest, caption?, reply_to?, mentions?, room_devices?, txn_id?, user?, server? }`。**資料平面版**的最後一步：UI 打 HTTP 傳完（`PUT` 回 manifest）之後，把那份 manifest 原樣帶回來（/docs/design/rpc-specs/data-plane.md §5）。加密房同 `room.send_text` 要 `room_devices` | `{ event_id, mxc, attachment_declared }` | `send_attachment`：核對 manifest 是這個帳號那台 server 的、區塊跟房間對得上；加密房被擋回 1401、金鑰沒準備好回 1402。manifest 沒有 `block`（一般 Matrix 帳號傳統上傳回的那種，/docs/design/rpc-specs/data-plane.md §7.2）走 `send_matrix_attachment`：標準附件、matrix-sdk 送（加密房它自己 Megolm）、`room_devices` 不看、`txn_id` 照帶上去（重送用同一個）、`attachment_declared` 是 `false`；加密房只收 `kind` 2、明文房只收 `kind` 3，對不上 1100 |
 | `room.history` | `{ room, limit?: 50, before?, types?, sender?, user?, server?, sync? }`。**有 `sync`** | `MessagePage`：`{ events: [Message], next? }` | 見下面的「往回翻：`before` 與 `next`」 |
 | `room.files` | `{ room, limit?: 50, before?, user?, server?, sync? }`。**有 `sync`** | `FilePage`：`{ files: [{ event_id, sender, ts, manifest }], next? }` | `files(save_to: None)`。⚠️ CLI 的 `--save` 是前端的事：拿到 manifest 自己寫檔 |
-| `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync? }`。**有 `sync`**：`local` 只寫本地、`server` 只送上游、`both` 兩邊 | `{ ok: true, event_id }` | ⚠️ core 沒有。已讀有三層、預設 private（read-receipts） |
+| `room.read` | `{ room, event_id? \| g_seq? \| r_seq?, user?, server?, sync?, visible_to_others? }`。位置**恰好給一個**（零個或兩個以上是 `102`）。**有 `sync`**（預設 `local`）：`local` 只寫本地、`server` 只送上游、`both` 先送上游、成功了再寫本地 | `{ read_upto: { event_id, r_seq } \| null, unread: { count, mentions }, sent: "m.read" \| "m.read.private" \| null }` | `mark_read`。本地水位只往前；給 seq 或要寫本地而本地沒有那一則是 `1100`、上游拒是 `1400`（都是什麼都不寫不送）。沒帶 `visible_to_others` 照 conf 的 `READ_RECEIPTS`，預設 private（/docs/design/messages/read-receipts.md §3、§5） |
 
 🚨 **往回翻：`before` 與 `next` 一律是 `event_id`**（`room.history`／`room.files`；維護者 2026-09-14）。
 
@@ -544,7 +544,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 
 ## 8. 跟 core 的差距
 
-原本這裡只有一項：一般 Matrix 帳號的傳統上傳，2026-10-07 接上了（/docs/design/rpc-specs/data-plane.md §7.2）。個別 method 還缺的寫在 §3 那一列（例 `room.read`）。
+原本這裡只有一項：一般 Matrix 帳號的傳統上傳，2026-10-07 接上了（/docs/design/rpc-specs/data-plane.md §7.2）。個別 method 還缺的寫在 §3 那一列。
 
 ## 9. 明確不做的
 
@@ -568,9 +568,10 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `cancel` | ❌（daemon 層） | — | ❌ |
 | `desync` 推播（§4） | ✅ daemon 層（broadcast `Lagged` → `desync`） | 本機 | ✅ |
 | `link.state`／`pack.received` 推播（§4） | ✅ `CoreEvent::Link`／`Received`（連線池，/docs/design/daemon/link-pool.md） | **WS** 五條線 | ✅ |
-| **`sync` 參數**（§2：`room.list`／`get`／`history`／`files`／`media.info`，以及 §3.3.1 寫本地的房間動作）＋回應回報用了哪一種 | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地；房間動作是 `WriteSync`（沒帶是 `both`、`local`／`null` 是 102、不回報） | 本機（`local`）／同下面那幾列 | ✅ |
-| `room.read`、`daemon.reload_conf` | ❌ | — | ❌ |
-| `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport` 填進 Target | ✅ daemon 層 | 本機 | ✅ |
+| **`sync` 參數**（§2：`room.list`／`get`／`read`／`history`／`files`／`media.info`，以及 §3.3.1 寫本地的房間動作）＋回應回報用了哪一種 | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地；房間動作是 `WriteSync`（沒帶是 `both`、`local`／`null` 是 102、不回報） | 本機（`local`）／同下面那幾列 | ✅ |
+| `room.read` | ✅ `read_ops`（/docs/design/messages/read-receipts.md） | 本機（`local`）／端點表的 `Receipt`：wbf 帳號 **WS** 的橋（Receipt `0x22`）、一般 Matrix 帳號照同一個 **HTTP** 端點送 | ✅ wbf（真 server 驗過） |
+| `daemon.reload_conf` | ✅ daemon 層（`settings.rs`） | 本機 | ✅ |
+| `daemon.set_encryption`、conf 的 `server_backup`／`local_room_keys`／`transport`／`read_receipts` 填進 Target 或 `room.read` | ✅ daemon 層 | 本機 | ✅ |
 | `vault.create`／`unlock`／`set_passphrase`／`remove_passphrase` | ✅ | 本機 | ✅ |
 | `account.add` | ✅ | 探活（WS Hello）→ wbf：標準 HTTP `/login`、不建 Client；一般 Matrix：matrix-sdk | ✅（維護者 2026-09-21 定：登入登出維持 HTTP 慣例，/docs/design/daemon/account-session.md §0） |
 | `account.list`／`switch` | ✅ | 本機 | ✅ |

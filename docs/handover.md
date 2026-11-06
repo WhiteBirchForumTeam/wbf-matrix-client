@@ -33,8 +33,8 @@ PR #1–#78 合併（main `6f25d7f`，2026-11-02；#76 房間動作、#78 收邀
   同一個 mxc 本地的 `media` 列說了算：描述不合一律 1500，**不**換掉列；只給 `mxc` 照列挑事件、從訊息點下載由那則建列；`media.delete_local` 清本地（先取消正在下載的）（`/docs/design/media/media-download.md` §5.3、§7.4，維護者 2026-10-07）。
   一個檔同時只有一個下載：同 server 的別的帳號再要就掛上去，進度與結果每個要過的帳號各推一則；`media.cancel` 誰叫都停（同一份 §5.1、§5.4、§5.5）。
 
-**還沒有**：UI；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；交叉簽章；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；訊息動作（回覆、編輯、收回、表情）；
-已讀（`/docs/design/messages/read-receipts.md` 是草案）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
+**還沒有**：UI；wbf 帳號的金鑰備份與向自己裝置要金鑰（新裝置讀不到舊訊息）；交叉簽章；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；
+別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
 📎 補解寫失敗那批的重試觸發點、CLI 送加密房：2026-10-07 照 §7 第 1 項的預設做了（`/docs/design/keys/e2ee-rpc.md` §3、§6），維護者可以在審查時改。
 
@@ -272,7 +272,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 1. ~~**官方 Matrix 的傳統上傳與下載、E2EE 收尾**~~：2026-10-07 在分支 `feat/matrix-media-and-e2ee-finish` 做完（傳統格式下載與上傳、換金鑰期限、`room.history` 讀到未解的再試、
    路徑版 `room.send_file` 與 CLI 送加密房）。之後可以補：UI 主動命令重發金鑰；傳統上傳記 `source_uri`。
 2. **訊息功能**：~~房間動作（建房、邀請、改權限、置頂…）~~ 2026-10-07 在分支 `feat/room-actions` 做完（/docs/design/rooms/room-actions.md）；~~收邀請~~ 2026-10-14 在分支 `feat/invites` 做完（同一份 §3.3，issue #77）。
-   訊息動作（回覆、編輯、收回、表情）2026-11-04 做完：/docs/design/messages/message-actions.md。剩：已讀三層（`/docs/design/messages/read-receipts.md`）、裝置驗證。
+   訊息動作（回覆、編輯、收回、表情）2026-11-04 做完：/docs/design/messages/message-actions.md。已讀三層 2026-11-06 做完：/docs/design/messages/read-receipts.md。剩：裝置驗證。
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 

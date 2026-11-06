@@ -193,11 +193,12 @@ JSON（實際跑 `event_json::message_from_json` 印出的 `kind`，金鑰換成
 ### 2.5 未讀
 
 ```rust
-pub struct Unread { pub count: u32, pub mentions: u32, pub local_offset: Option<MessageId> }
+pub struct Unread { pub count: u64, pub mentions: u64, pub read_upto: Option<ReadPosition> }   // ReadPosition { event_id, r_seq }
 ```
 
-`local_offset` 是自己看到哪，只在本地：`cache.db` 的 `read_positions`（/docs/design/storage/local-cache-db.md §5、/docs/design/messages/read-receipts.md）。
-`count` 是 `local_offset` 之後、不是自己發的、非 System 的訊息數；我們自己算，不信 server 的通知計數（各 server 算法不一）。
+`read_upto` 是自己看到哪，只在本地：`cache.db` 的 `read_positions`（/docs/design/storage/local-cache-db.md §5、/docs/design/messages/read-receipts.md §2）。
+`count` 是 `read_upto` 之後、別人送的、還在的則數（狀態事件與解不開的也算，細節在 /docs/design/messages/read-receipts.md §2.1）；我們自己算，不信 server 的通知計數（各 server 算法不一）。
+RPC 上它是 `room.get` 多帶的 `unread`（/docs/design/messages/read-receipts.md §4）。
 
 ### 2.6 動作（`Backend` trait 的一半）
 
@@ -212,7 +213,7 @@ pub trait Backend {
     async fn edit(&self, msg: &MessageId, body: &str) -> Result<MessageId>;
     async fn delete(&self, msg: &MessageId, reason: Option<&str>) -> Result<()>;
     async fn react(&self, msg: &MessageId, key: &str) -> Result<()>;
-    async fn send_read_receipt(&self, id: &ConversationId, upto: &MessageId, visible_to_others: bool) -> Result<()>;  // §3.5
+    async fn send_read_receipt(&self, id: &ConversationId, upto: &MessageId, visible_to_others: bool) -> Result<()>;  // §3.5；實作沒進 trait，是 Core::mark_read＋端點表的 RECEIPT（/docs/design/messages/read-receipts.md §3）
     async fn pin(&self, msg: &MessageId, pinned: bool) -> Result<()>;
     async fn create(&self, options: CreateOptions) -> Result<ConversationId>;   // name、invite、encrypted（§3.6）、channel 包裝（§3.2）
     async fn invite / leave / kick / ban / set_power_level ...
@@ -277,11 +278,11 @@ UI 要顯示 Owner／Admin／Member 自己對（100／≥ 50／其他），不�
 
 | | 放哪 | 誰看得到 | 怎麼送 |
 |---|---|---|---|
-| **本地 offset** | 本地（`cache.db` 的 `read_positions`） | 只有自己這台裝置 | 不送。UI 捲到哪就寫哪 |
-| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `send_read_receipt(visible_to_others)`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）；RPC 那層 `visible_to_others` 是選填，沒帶就照 `wbf.conf` 的預設（/docs/design/messages/read-receipts.md §3）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策 |
+| **本地水位** | 本地（`cache.db` 的 `read_positions`） | 只有自己這台裝置 | 不送。UI 叫 `room.read`（`sync` 是 `local` 或 `both`），只往前 |
+| **給遠端看的 read** | server（`m.read` 收據） | 房裡每個人（雙勾勾） | `room.read`（`sync` 是 `server` 或 `both`）帶 `visible_to_others`：true 送 `m.read`，false 送 `m.read.private`（只同步自己的裝置，對方看不到）；沒帶就照 `wbf.conf` 的預設（/docs/design/messages/read-receipts.md §5）。**要不要送、送哪種，是 UI 的 feature 設定**，不是 SDK 的政策 |
 
-`m.fully_read`：不用，本地 offset 取代它（它本來就只是「自己讀到哪」的 server 端副本）。`Unread` 從本地 offset 算。
-已讀的三層（快取水位／本地已讀／遠端已讀）與 `room.read` 的形狀在 /docs/design/messages/read-receipts.md。還沒做：寫本地已讀的 RPC、送 receipt。
+`m.fully_read`：不用，本地水位取代它（它本來就只是「自己讀到哪」的 server 端副本）。`Unread` 從本地水位算。
+已讀的三層（快取水位／本地已讀／遠端已讀）與 `room.read` 的形狀在 /docs/design/messages/read-receipts.md。
 
 ### 3.6 加密
 
@@ -385,7 +386,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 `wbf-sdk/src/chat.rs` 是 §2 的子集（檔頭也寫了）：
 
 - id 用 `String`，不包 newtype；對外仍是不透明字串。
-- `Conversation` 沒有 `avatar`、`last_message`、`unread`、`pinned`、`tags` 這幾欄；頭像與置頂在它帶的整份 `state` 裡（`m.room.avatar`、`m.room.pinned_events`），標籤叫 `room.get_tags`。`member_count` 是 `u64`。
+- `Conversation` 沒有 `avatar`、`last_message`、`unread`、`pinned`、`tags` 這幾欄；`unread` 是 `room.get` 另外帶的（從本地算，/docs/design/messages/read-receipts.md §4）；頭像與置頂在它帶的整份 `state` 裡（`m.room.avatar`、`m.room.pinned_events`），標籤叫 `room.get_tags`。`member_count` 是 `u64`。
 - `Message`：`edited` 是 `edited_by: Option<String>`（改的人）；多了 `r_seq`／`g_seq`（§4.3）；沒有 `mentions_me`。
 - `MessageKind`：`Text` 的 HTML 是 `formatted_html`；`Deleted` 只有 `reason`；`System` 是 `event_type` 加一行 `line`，不逐種列 enum；`Unsupported` 多帶 `body`。
 - `Attachment` 只有 `mxc` 與 `block`。
@@ -395,7 +396,7 @@ wbf 帳號沒有 watch：訂閱線的推播寫進快取後發 `room.message`（/
 - 沒有 `RoomCrypto` trait：空的 trait 是儀式，不先立（§3.6）。
 - 聚合：寫庫的路照 /docs/design/messages/edits-and-redactions.md，跨頁也折得到；不寫庫的路（`sync=server`、watch 的通知）用 `event_json::messages_from_incoming` 只折同一頁，目標不在頁裡的關係事件照原樣留著；折的規則跟寫庫那條一樣（收回贏、edit 過 `check_replacement` 才套，/docs/design/messages/message-actions.md §5）。
 
-送 edit／delete／reaction／reply 在 /docs/design/messages/message-actions.md。還沒做：已讀送出、裝置驗證、`Unread`、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
+送 edit／delete／reaction／reply 在 /docs/design/messages/message-actions.md。已讀與未讀在 /docs/design/messages/read-receipts.md。還沒做：裝置驗證、`DeviceTrust`。收邀請在 /docs/design/rooms/room-actions.md §3.3。房間動作（建房、成員、權限、置頂、標籤）在 /docs/design/rooms/room-actions.md。
 
 ## 7. 還開著的（再議）
 

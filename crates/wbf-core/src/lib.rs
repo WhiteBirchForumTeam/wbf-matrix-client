@@ -78,6 +78,7 @@ mod media_ops;
 mod media_stream;
 mod message_actions;
 mod misc_ops;
+mod read_ops;
 mod recovery;
 mod room_actions;
 mod room_crypto;
@@ -115,6 +116,7 @@ pub use media_ops::{
 };
 pub use media_stream::{MediaSource, MediaStream};
 pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
+pub use read_ops::MarkedRead;
 pub use room_actions::{EnterRoom, MemberAction, WriteSync};
 pub use room_crypto::{RoomDevices, SendOptions};
 pub use rooms_ops::{
