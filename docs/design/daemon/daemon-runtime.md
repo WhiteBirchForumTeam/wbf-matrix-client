@@ -220,6 +220,7 @@ matrix-sdk 的 store 是**每帳號一份**，而一個帳號只有一台 OlmMac
 | `room.history`、`room.files` | ✅ | 跟其他讀命令同一個 `sync`，**不**另外有 `source` 這種第二個名字講同一件事 |
 | `media.info` | ✅ | ⭐ **媒體不可變**：`file_size`／`chunk_size`／`mimetype` 上傳完就不會變，本地 `media` 表存的就是同一份事實 —— **沒**理由為這些跑一趟 server（維護者 2026-09-13）。⚠️ `total_len`／`truncated`／`description`／`verified` 只有問過 server 才有，`local` 時**讓它們不在**，**不**編造；反過來 `cached`（下載到哪了）是**上游答不出來**的 |
 | 讀已讀位置與未讀數 | — | 一律從本地算：`room.get` 帶的 `unread`（`read_positions`，/docs/design/messages/read-receipts.md §4） |
+| `room.read` | ✅ | 動作，但有本地與上游兩份：`local` 只寫本地水位、`server` 只送回條、`both` 兩個都做（/docs/design/messages/read-receipts.md §3） |
 | `account.list`、`recovery.list`／`show` | ❌ | **已登入的帳號 always local**：那是這台機器的檔案，不是快取，**沒有**「上游版本」可言 |
 | `sync.recent` | ❌ | 它**本身就是**上游拉。加 `sync=local` 沒有意義 |
 | `server.ping`、`backup.*` | ❌ | server 端狀態，本地沒有那份東西 |

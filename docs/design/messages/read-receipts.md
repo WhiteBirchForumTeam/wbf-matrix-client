@@ -58,7 +58,7 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 
 `room.read` 給的位置比本地水位**舊**或就是它 → 本地**不動**，回的 `read_upto` 還是原本那則。
 
-- 「舊」怎麼比：兩則都有 `r_seq` 就比 `r_seq`；少一個（一般 Matrix server 的房間沒有 `r_seq`）退到 `origin_server_ts`，跟讀歷史的排序同一個退法。
+- 「舊」怎麼比：兩則都有 `r_seq` 就比 `r_seq`；少一個（一般 Matrix server 的房間沒有 `r_seq`）退到 `(origin_server_ts, id)`：時間跟讀歷史的排序同一個退法，另外用快取的列號 `id` 分出同一毫秒的兩則（讀歷史的 `ORDER BY` 沒有這一層，同毫秒兩則的先後**不**保證）。
   標已讀與數未讀共用同一句比較（`cache.rs` 的 `IS_AFTER_WATERMARK`）。
 - 水位只能指**這個帳號同步過**的那一則：事件在快取裡、但只有別的帳號看過，一樣是 `1100`。
 
@@ -86,7 +86,7 @@ Matrix 的 read receipt 指著**一則** `event_id`，意思是「讀到這則�
 |---|---|
 | `local`（預設） | 只寫 `read_positions`。**本地已讀、遠端仍未讀** |
 | `server` | 只送上游的 read receipt，**不**寫本地（對帳用，跟 /docs/design/daemon/daemon-runtime.md §3.1 同一套語意） |
-| `both` | **先送上游、成功了再寫本地**。上游失敗 → 回錯誤、本地**不**寫，UI 用同一個呼叫重試就好 |
+| `both` | **先送上游、成功了再寫本地**。上游失敗 → 回錯誤、本地**不**寫，UI 用同一個呼叫重試就好。⚠️ 反過來**不**成立：上游成功之後寫本地仍可能失敗（寫入者收攤 1200、那一則剛好看不到了 1100），這時回錯誤但回條**已經**在 server 上 —— 錯誤**不**等於「沒送出去」。同一個呼叫重試一樣安全（同一則的回條重送不改變什麼、本地只往前） |
 
 回應（`local`／`both` 是寫完之後本地的樣子；`server` 是本地沒動的樣子）。2026-11-06 對本機 server 實跑（`crates/wbf-daemon/tests/real_server.rs` 的 `read_receipts_mark_local_and_upstream_and_count_unread`），bob 送兩則、alice 標到第一則：
 

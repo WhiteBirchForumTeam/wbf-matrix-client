@@ -213,7 +213,7 @@ pub trait Backend {
     async fn edit(&self, msg: &MessageId, body: &str) -> Result<MessageId>;
     async fn delete(&self, msg: &MessageId, reason: Option<&str>) -> Result<()>;
     async fn react(&self, msg: &MessageId, key: &str) -> Result<()>;
-    async fn send_read_receipt(&self, id: &ConversationId, upto: &MessageId, visible_to_others: bool) -> Result<()>;  // §3.5
+    async fn send_read_receipt(&self, id: &ConversationId, upto: &MessageId, visible_to_others: bool) -> Result<()>;  // §3.5；實作沒進 trait，是 Core::mark_read＋端點表的 RECEIPT（/docs/design/messages/read-receipts.md §3）
     async fn pin(&self, msg: &MessageId, pinned: bool) -> Result<()>;
     async fn create(&self, options: CreateOptions) -> Result<ConversationId>;   // name、invite、encrypted（§3.6）、channel 包裝（§3.2）
     async fn invite / leave / kick / ban / set_power_level ...
