@@ -222,7 +222,7 @@ ws ──┬── 這台不講 wbf ────────> matrix-sdk（不�
   兩種理由訊息分開講：**走 `http`** vs **對方不是 wbf**。⭐ 講出來比默默給一個空答案好。
 - 🚧 **「還沒有 ws」那一格**：程式裡每個呼叫點自己標 `MethodHome`（`crates/wbf-core/src/backend_choice.rs`；
   **不是**一串字串比對——名字跟實際走哪條會漂移）。`StillOnMatrixSdk` 現在沒有呼叫點；
-  wbf 帳號還做不到的（`backup.*` 回 1100、`account.whoami`／`del` 走 HTTP）看 §10 的「底層」欄與 /docs/design/daemon/account-session.md §6。
+  wbf 帳號還做不到的（`account.whoami`／`del` 走 HTTP）看 §10 的「底層」欄與 /docs/design/daemon/account-session.md §6。
   ⭐ server 端補上 ws 的定義就搬過去，**這一層一個字都不用改**。
 - **backend 怎麼探**：不帶 token 的 WS `Hello`，講得出協議版本就是 wbf（/docs/design/daemon/account-session.md §1）。
   ⭐ 連不上、不回、看不懂 → 一般 homeserver。**不**寫進設定檔：那是 server 那邊的事實，它會變。
@@ -391,18 +391,30 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 
 `seek` 沒有 method：`media.open` 的 URL 上發 `Range` 就是 seek（同一個語意，/docs/design/media/wbf-client-convention-for-chunk.md §7）。
 
-### 3.7 房間金鑰備份
+### 3.7 房間金鑰備份、交叉簽章與裝置驗證
+
+`backup.*` 兩種帳號同一組形狀：一般 Matrix 帳號走 matrix-sdk 的 `Client`，wbf 帳號在 crypto 引擎上走橋（/docs/design/keys/cross-signing-and-verification.md §4）。
+wbf 帳號的交叉簽章與備份版本在金鑰線開好時自動就位、新的房間金鑰在背景上傳（conf 的 `SERVER_BACKUP` 開著時，同一份 §3、§4.1）。
 
 | method | params | result | core |
 |---|---|---|---|
 | `backup.status` | `{ user?, server? }` | `BackupStatusReport` 加 conf 的兩個開關 `server_backup_setting`／`local_room_keys_setting`（daemon 從 conf 填） | `backup_status` |
-| `backup.upload` | `{ user?, server? }` | `UploadResult` | `upload_room_keys(also_save_snapshot = conf 的 LOCAL_ROOM_KEYS)` |
+| `backup.upload` | `{ user?, server? }` | `UploadResult` | `upload_room_keys(also_save_snapshot = conf 的 LOCAL_ROOM_KEYS)`。wbf 帳號：後台本來就在傳，這支是「等追平才回」；server 上的備份這台打不開 → `1100` |
 | `backup.save` | `{ user?, server? }` | `{ bytes }` | `save_room_key_snapshot` |
 | `backup.import` | `{ user?, server? }` | `ImportResult` | `import_room_key_snapshot` |
-| `backup.restore` | `{ user?, server? }` | `RecoveryStateReport` | `restore_from_recovery_key`。沒保管 → `1020` |
-| `backup.create_recovery_key` | `{ user?, server? }` | `{ recovery_key }` ⚠️ 秘密，只回這一次 | `create_recovery_key` |
+| `backup.restore` | `{ recovery_key?, user?, server? }`。`recovery_key`：使用者抄下來的那串（換機器時這台沒保管）；打開成功才封進 `r/` | `RecoveryStateReport` | `restore_from_recovery_key`。沒帶、這台也沒保管 → `1020`；打不開（錯的 key、server 上沒有 secret storage）→ `1100`、**什麼都不匯**。wbf 帳號：匯交叉簽章私鑰、簽自己這台、整份還原備份、補解 cache 裡的密文（解開的發 `room.message`）；簽完這台之後下載備份失敗**不**回錯（發 `progress`、再叫一次就是重試）。`recovery_enabled` 只認 `recovery_state: "Enabled"`（/docs/design/keys/cross-signing-and-verification.md §4.2） |
+| `backup.create_recovery_key` | `{ user?, server? }` | `{ recovery_key }` ⚠️ 秘密，只回這一次 | `create_recovery_key`。wbf 帳號：這台要有三把交叉簽章私鑰（沒有 → `1100`，先驗證或還原）；帳號已經有 recovery key → `1100`（換一把會讓抄下來的那串失效） |
 | `recovery.list` | — | `{ users: [mxid] }` | `list_recovery_key_users` |
 | `recovery.show` | `{ user }` | `{ user, recovery_key }` ⚠️ 秘密 | `find_recovery_key`。沒有 → `1020` |
+| `verify.request` | `{ user_id, device_id?, user?, server? }`。`user_id` 是自己時 `device_id` 可省（送給自己所有被交叉簽章簽過的裝置） | `VerifyState`：`{ flow_id, other_user, other_device, we_started, state, emoji?, decimals?, reason? }` | `verify_request`（/docs/design/keys/cross-signing-and-verification.md §5）。只有 wbf 帳號（一般帳號 → `1100`） |
+| `verify.accept` | `{ user_id, flow_id, user?, server? }`：接受對方的請求、或對方開始的比對 | `VerifyState` | `verify_accept`。沒有這個流程、沒東西可以接受 → `1100` |
+| `verify.start_sas` | `{ user_id, flow_id, … }` | `VerifyState` | `verify_start_sas` |
+| `verify.confirm` | `{ user_id, flow_id, … }`：使用者說表情一樣 | `VerifyState` | `verify_confirm`。簽章的 `failures` 不是空的 → `1400` |
+| `verify.cancel` | `{ user_id, flow_id, … }` | `VerifyState` | `verify_cancel` |
+| `verify.list` | `{ user?, server? }` | `{ flows: [VerifyState] }`（還在進行的；daemon 重開就沒了） | `verify_list` |
+| `devices.list` | `{ user_id, user?, server? }` | `{ user_id, identity_verified, devices: [{ device_id, display_name?, verified, is_this_device }] }` | `list_devices`：先重查那個人的金鑰再讀（同一份 §6） |
+
+要不要接受驗證、表情對不對，一律 UI 問使用者（/docs/design/overview/architecture-v2.md §3）；daemon 只照命令做、把每一步推成 `verify.state`（§4）。
 
 ### 3.8 server
 
@@ -437,6 +449,7 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 | `room.membership` | `{ user, room, membership, invite?, gap }`（/docs/design/rooms/room-actions.md §3.3.4）；`invite` 只在 `membership` 是 `invite` 時帶，形狀同 `room.invites` 的一間去掉 `room` | 這個帳號在一間房的身分因為邀請而變了：`Rooms` 線上 server 推來的 `Invite/Push`／`Gone` 每則一個（`gap` 原樣：`true` ＝ 這條流在這之前掉過推播，該叫 `room.invites` 補一輪了），`room.invites` 補完有變的列也各一個（`gap: false`）。寫進本地之後才發 |
 | `devices.changed` | `{ user, changed_user, device_version, rooms: { room: room_version }, gap }`（/docs/design/keys/e2ee-rpc.md §4） | `Rooms` 線上 server 推來「某人的裝置變了」，原樣轉。daemon 自己**不**動作；要不要對開著的房 `room.refresh_devices` 是 UI 的事（`gap: true` ＝ 前面有推送被丟，開著的房都 refresh 一次） |
 | `media.download` | `{ user, mxc, state: "queued"\|"downloading"\|"verifying"\|"complete"\|"cancelled"\|"failed", done, total, verified?, reason? }`（/docs/design/media/media-download.md §5.5、§12.3；`complete` 一律帶 `verified`：0 沒驗、1 正確、2 不正確） | 一個下載 job 的狀態改變時一則、拉的途中每個 job 最多每秒一則。**要過這個檔的每個帳號各一則**（`user` 是收件的那個；同 server 的 A、B 都要 X 時只有一個下載，兩個都收到，維護者 2026-10-07）。`done`／`total` 是塊數（`total` 還不知道是 0）；`reason` 只在 `failed` 帶（給人看） |
+| `verify.state` | `{ user, flow_id, other_user, other_device, we_started, state, emoji?, decimals?, reason? }`（/docs/design/keys/cross-signing-and-verification.md §5.1）；`state` 是 `requested`／`ready`／`started`／`keys_exchanged`／`confirmed`／`done`／`cancelled`，`emoji`（7 個 `{symbol, description}`）與 `decimals`（3 個數字）只在 `keys_exchanged`／`confirmed` 帶，`reason` 只在 `cancelled` 帶 | 這個帳號的一個裝置驗證流程變了：別人開的請求到了、對方接受了、表情出來了、完成、取消，每變一次一則（daemon 每 250 毫秒看一次）。只有 wbf 帳號 |
 | `keys.state` | `{ user, state: "caught_up"\|"stopped", imported?, room_keys?, reason? }`（/docs/design/keys/key-sync.md §2） | 這個帳號的金鑰訂閱：`caught_up`＝一批 to-device 匯完、銷毀完（`imported` 則、`room_keys` 把新房間金鑰——UI 拿它決定要不要重解密文）；`stopped`＝這條訂閱結束了（被同一裝置後來的連線接手、線死了）：金鑰那條線跟著關，daemon 的看線迴圈下一輪（最多 15 秒）重開、重訂，重訂完會再來一則 `caught_up`。維護者 2026-09-24：「有點多餘，但傾向保留——不然 RPC 無從知道」 |
 | `pack.received` | `{ user, role, kind: number, subtype: number, id: number, seq: number, route: "oneshot"\|"stream"\|"subscription"\|"unmatched" }` | 那條線收到一個 pack（只有標頭，**沒有** meta／data）。給除錯與狀態列；要內容的訂型別化的那些（`room.message`） |
 
@@ -594,10 +607,11 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `media.info` | ✅ | **WS** `Info` | ✅ |
 | `media.download`／`open`／`queue`／`cancel`／`delete_local`、`media.export_to`、`GET`／`HEAD /media`、`media.download` 推播 | ✅ `media_ops`／`download_queue`／`media_stream`（/docs/design/media/media-download.md） | 分塊檔：**WS** `Download` 線的 `Info`／`Read`＋媒體池＋seek 暫存檔。標準 Matrix 附件：**HTTP** `/_matrix/client/v1/media/download`＋同一個池（`matrix_download`，/docs/design/media/media-download.md §12），兩種帳號都是 | ✅ wbf（真 server 驗過）／標準附件 ✅（wbf 帳號真 server 驗過；一般 Matrix 帳號假 server） |
 | `media.stats`／`gc` | ✅ | 本機 | ✅ |
-| `backup.*` | ✅ | matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號 **1100**（沒有 Client，/docs/design/daemon/account-session.md §6） | 🔁 還沒做：搬到 crypto 層＋橋的 `/room_keys` |
+| `backup.*` | ✅ | 一般 Matrix 帳號：matrix-sdk（backup／SSSS 全是 HTTP）；wbf 帳號：**WS** `Keys` 線的橋（`0x17 0x24`–`0x25`、`0x30`–`0x38`、`0x11 0x25`–`0x26`），/docs/design/keys/cross-signing-and-verification.md | ✅ wbf（真 server 驗過）／🔁 一般 server |
+| `verify.*`、`devices.list`、`verify.state` 推播 | ✅ `verify_ops`（同一份 §5、§6） | **WS** `Keys` 線：驗證訊息是 to-device（發 `0x16 0x25`、收走金鑰訂閱）、簽章 `0x17 0x25`、重查 `0x17 0x21` | ✅ wbf（真 server 驗過）；一般 Matrix 帳號回 1100 |
 | `recovery.list`／`show` | ✅ | 本機（`<data dir>/r/`） | ✅ |
 | `server.ping` | ✅ | **WS** `Ping`（`Hello` 是開線那次的） | ✅ |
 | `sync.state`／`vault.state` 推播 | `sync.state` 的 variant 在、還沒人發（/docs/design/rooms/room-sync.md §3：追平與否是 UI 自己叫 `sync.recent` 的結果，線的開關看 `link.state`）；`vault.state` ❌ | — | ❌ |
 | `progress`／`note` 推播 | ✅ daemon 層（`push.rs`；請求的 `id` 就是 job，發那個請求的連線不用訂也收得到自己的 `progress`／`note`） | 本機 | ✅ |
 
-📎 讀法：🔁 剩下的是一般 Matrix 帳號那一半（本來就走 matrix-sdk），與 wbf 帳號的 `account.whoami`／`del`／`destroy`（HTTP）、`backup.*`。
+📎 讀法：🔁 剩下的是一般 Matrix 帳號那一半（本來就走 matrix-sdk），與 wbf 帳號的 `account.whoami`／`del`／`destroy`（HTTP）。

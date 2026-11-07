@@ -330,6 +330,18 @@ impl RoomSyncTask {
                 _ => unstorable += 1,
             }
         }
+        // 這包裡沒解開的：寫進 cache 之後再試一次（`retry_after_storing`）。
+        let mut undecrypted: Vec<(String, Vec<String>)> = Vec::new();
+        for (room, events) in &by_room {
+            let ids: Vec<String> = events
+                .iter()
+                .filter(|event| matches!(event, IncomingEvent::Undecrypted { .. }))
+                .filter_map(|event| event.storable_identity().map(|(id, _)| id.to_string()))
+                .collect();
+            if !ids.is_empty() {
+                undecrypted.push((room.clone(), ids));
+            }
+        }
         // 通知給折好的訊息（自己送的也發，收的人自己濾）；庫裡存原樣。
         let notices: Vec<CoreEvent> = by_room
             .iter()
@@ -365,11 +377,39 @@ impl RoomSyncTask {
                         "room sync: {dropped} pushed event(s) could not be stored (no room_id, event_id or sender) and are dropped"
                     ));
                 }
+                self.retry_after_storing(&undecrypted).await;
             }
             // 寫失敗只報不擋（快取壞了的代價是重拉：UI 的 sync.recent）；沒落地的就不通知。
             Err(error) => self
                 .events
                 .progress(format!("room sync: cache write failed (ignored): {error}")),
+        }
+    }
+
+    /// 剛寫進 cache 的密文再解一次，解開的發 `room.message`（/docs/design/keys/e2ee-rpc.md §6）。
+    /// 金鑰跟密文同時到時，這裡解的時候金鑰還沒進 store、金鑰線補解掃 cache 時密文還沒寫進來，兩邊都沒解到。
+    /// 金鑰線是先 commit 金鑰才掃，這裡是先寫進 cache 才再解：兩邊至少有一邊看得到對方。
+    async fn retry_after_storing(&self, undecrypted: &[(String, Vec<String>)]) {
+        let Some(engine) = self.engine.as_deref() else {
+            return;
+        };
+        for (room, ids) in undecrypted {
+            let which = room_crypto::StoredToDecrypt::EventIds(ids.clone());
+            if let Err(error) = room_crypto::decrypt_stored(
+                engine,
+                &self.cache,
+                &self.events,
+                &self.me,
+                room,
+                which,
+                true,
+            )
+            .await
+            {
+                self.events.progress(format!(
+                    "room sync: decrypting the stored messages of {room} again failed (the next room key or room.history retries): {error}"
+                ));
+            }
         }
     }
 }

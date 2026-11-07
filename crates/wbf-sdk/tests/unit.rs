@@ -772,6 +772,25 @@ fn bridged_endpoints_and_variables_follow_the_specs_index() {
         first_four_bytes(wbf_sdk::matrix_endpoint::RECEIPT.bridge),
         [0x01, 0x15, 0x22, 0x10]
     );
+    // 交叉簽章與備份（/docs/design/keys/cross-signing-and-verification.md §2，wbfuwunel 的 /docs/bridge-specs/0x17-keys.md、0x11-account.md）。
+    for (endpoint, subtype) in [
+        (wbf_sdk::matrix_endpoint::SIGNING_KEYS_UPLOAD, 0x24),
+        (wbf_sdk::matrix_endpoint::CREATE_BACKUP_VERSION, 0x30),
+        (wbf_sdk::matrix_endpoint::LATEST_BACKUP_INFO, 0x31),
+        (wbf_sdk::matrix_endpoint::ADD_BACKUP_KEYS, 0x35),
+        (wbf_sdk::matrix_endpoint::GET_BACKUP_KEYS, 0x38),
+    ] {
+        assert_eq!(
+            first_four_bytes(endpoint.bridge),
+            [0x01, 0x17, subtype, 0x10],
+            "{}",
+            endpoint.name
+        );
+    }
+    assert_eq!(
+        first_four_bytes(wbf_sdk::matrix_endpoint::SET_ACCOUNT_DATA.bridge),
+        [0x01, 0x11, 0x26, 0x10]
+    );
     assert_eq!(Kind::from_byte(0x13), Some(Kind::Room));
     assert_eq!(Kind::from_byte(0x15), Some(Kind::Receipt));
     assert_eq!(Kind::from_byte(0x17), Some(Kind::Keys));

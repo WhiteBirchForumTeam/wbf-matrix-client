@@ -337,10 +337,13 @@ mod tests {
             error.message
         );
 
-        // 還掛在 Client 上的：備份、watch——`Usage`，訊息講出是 wbf 帳號。
-        let error = core.backup_status(&target).await.expect_err("refused");
-        assert_eq!(error.kind, CoreErrorKind::Usage, "{error:?}");
-        assert!(error.message.contains("wbf server"), "{}", error.message);
+        // 備份也走 WS 了（/docs/design/keys/cross-signing-and-verification.md §4）：沒人在聽就是 `Network`，**不**再是「要 Client」的 `Usage`。
+        let error = core
+            .backup_status(&target)
+            .await
+            .expect_err("nobody is listening");
+        assert_eq!(error.kind, CoreErrorKind::Network, "{error:?}");
+        // 還掛在 Client 上的：watch——`Usage`，訊息講出是 wbf 帳號。
         let error = core
             .watch(
                 "!r:localhost",

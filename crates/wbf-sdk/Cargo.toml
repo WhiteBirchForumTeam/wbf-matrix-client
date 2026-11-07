@@ -30,7 +30,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "nat
 http = "1"
 matrix-sdk = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk", default-features = false, features = ["e2e-encryption", "bundled-sqlite"], optional = true }
 # E2EE 的狀態機（`OlmMachine`）：只當加解密的引用，網路自己走 WS（/docs/design/keys/e2ee-walkthrough.md §13）。跟 matrix-sdk 同一棵 vendor 樹，版本一定一致。
-matrix-sdk-crypto = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk-crypto", optional = true }
+# `automatic-room-key-forwarding`：解不開時向自己已驗證的裝置要金鑰、也回應它們的請求——matrix-sdk 的預設 feature 就開著它，開了才是「Matrix 原本的樣子」
+# （/docs/design/keys/cross-signing-and-verification.md §7，維護者 2026-11-07）。feature 在整個 workspace 統一，所以一般帳號的 Client 也一起開。
+matrix-sdk-crypto = { path = "../../vendor/matrix-rust-sdk/crates/matrix-sdk-crypto", features = ["automatic-room-key-forwarding"], optional = true }
 futures-core = { version = "0.3", optional = true }
 # cache.db（/docs/design/storage/local-cache-db.md §3）：SQLCipher，raw key 由 vault 導出。Windows 編 OpenSSL 要 Strawberry Perl（/docs/design/storage/local-cache-db.md §3 的建置需求）。
 rusqlite = { version = "0.40", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "limits", "cache"], optional = true }

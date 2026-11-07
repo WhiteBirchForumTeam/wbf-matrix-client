@@ -62,6 +62,13 @@ const fn receipt(subtype: u8) -> BridgedEndpoint {
     }
 }
 
+const fn keys(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Keys,
+        subtype,
+    }
+}
+
 // ---- 0x13 Room（wbfuwunel 的 /docs/bridge-specs/0x13-room.md）----
 
 pub const CREATE_ROOM: MatrixEndpoint = MatrixEndpoint {
@@ -283,6 +290,49 @@ pub const RECEIPT: MatrixEndpoint = MatrixEndpoint {
     method: HttpMethod::Post,
     path: "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
     query: &[],
+};
+
+// ---- 0x17 Keys 的交叉簽章與金鑰備份（wbfuwunel 的 /docs/bridge-specs/0x17-keys.md，/docs/design/keys/cross-signing-and-verification.md §2）----
+
+/// 第一次上傳、或重送一模一樣的**不**要密碼；換掉既有的第一輪是 401（UIAA）。
+pub const SIGNING_KEYS_UPLOAD: MatrixEndpoint = MatrixEndpoint {
+    name: "SigningKeysUpload",
+    bridge: protocol::BRIDGE_SIGNING_KEYS_UPLOAD,
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/keys/device_signing/upload",
+    query: &[],
+};
+/// 回 `{"version": "97"}`。
+pub const CREATE_BACKUP_VERSION: MatrixEndpoint = MatrixEndpoint {
+    name: "CreateBackupVersion",
+    bridge: keys(0x30),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/room_keys/version",
+    query: &[],
+};
+/// 沒有任何版本是 404。
+pub const LATEST_BACKUP_INFO: MatrixEndpoint = MatrixEndpoint {
+    name: "LatestBackupInfo",
+    bridge: keys(0x31),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/room_keys/version",
+    query: &[],
+};
+/// `version` 在這支是 query 變數。
+pub const ADD_BACKUP_KEYS: MatrixEndpoint = MatrixEndpoint {
+    name: "AddBackupKeys",
+    bridge: keys(0x35),
+    method: HttpMethod::Put,
+    path: "/_matrix/client/v3/room_keys/keys",
+    query: &["version"],
+};
+/// 整份備份一次回。⚠️ 超過 2 MiB 橋回 `TooLarge`（約幾千把金鑰）。
+pub const GET_BACKUP_KEYS: MatrixEndpoint = MatrixEndpoint {
+    name: "GetBackupKeys",
+    bridge: keys(0x38),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/room_keys/keys",
+    query: &["version"],
 };
 
 // ---- 0x11 Account 的帳號資料與標籤（wbfuwunel 的 /docs/bridge-specs/0x11-account.md）----

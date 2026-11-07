@@ -83,7 +83,7 @@ matrix-sdk 的 `room.send` 在裡面依序做：
 **我們**：
 - matrix-sdk 帳號：`MatrixBackend::send_text` → `room.send`，①–⑧ 全在 matrix-sdk 裡，送之前 `sync_once`。
 - wbf 帳號：sdk `encrypt_and_send` 只在本機做⑤的「建／換 session、排好要送的」、再加密、⑦ 是原生 `Event/Send`（`0x14/0x02`）帶 `room_version`；
-  ②③與⑤的「送出去」走橋、在後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1），送訊息🚫 等它（維護者 2026-10-05）；② 的「誰髒了」改成房間版本號（§16、/docs/design/keys/e2ee-rpc.md §3）。
+  ②③與⑤的「送出去」走橋、在後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1），送訊息**不**等它（維護者 2026-10-05）；② 的「誰髒了」改成房間版本號（§16、/docs/design/keys/e2ee-rpc.md §3）。
   加密房的附件走資料平面（/docs/design/rpc-specs/data-plane.md §5、§6）：附件宣告跟密文同一個 `Event/Send`。路徑版的 `room.send_file` 一樣帶 `room_devices` 進加密房（/docs/design/keys/e2ee-rpc.md §3）。
 
 ## 4. Bob 的 B1 收到並解開 Alice 的訊息
@@ -128,7 +128,7 @@ B2 讀得到什麼：
 
 - ✅ ④ 之後 Alice 送的。
 - ❌ **B2 登入前**的歷史：B2 沒有那段金鑰。補救三條：
-  - **金鑰備份**：B2 用 recovery key 打開 server 上的備份，拿回 B1 存進去的房間金鑰（matrix-sdk 帳號有 `key-backup`，/docs/design/keys/room-key-backup.md；wbf 帳號還沒接）。
+  - **金鑰備份**：B2 用 recovery key 打開 server 上的備份，拿回 B1 存進去的房間金鑰（matrix-sdk 帳號有 `key-backup`，/docs/design/keys/room-key-backup.md；wbf 帳號在 /docs/design/keys/cross-signing-and-verification.md §4）。
   - **向自己的其他裝置要**：B2 發 `m.room_key_request`，B1 **只在確認 B2 是 Bob 本人（交叉簽章驗證過）時**才轉 `m.forwarded_room_key`。
   - **邀請時一起給歷史金鑰**（MSC4268 的 room key bundle；vendor 的 `OlmMachine::share_room_key_bundle_data`）。
 
@@ -153,7 +153,7 @@ matrix-sdk 帳號：金鑰與訊息都在 matrix-sdk 的 `/sync` 裡（只有部
     解不開 → 只存密文、標成沒解；session_id 不另存欄位，補解時從 raw_event 的 content.session_id 查（cache.rs list_undecrypted_ciphertexts）
 ```
 
-⚠️ **必須用 `receive_sync_changes_msc4186`，🚫 不用 `receive_sync_changes`**：後者把「沒給 OTK 數量」當成 0
+⚠️ **必須用 `receive_sync_changes_msc4186`，禁止用 `receive_sync_changes`**：後者把「沒給 OTK 數量」當成 0
 （`update_key_counts(…, is_missing_count_zero: true)`），每收一次就以為金鑰用光、產生一批去上傳；前者把「沒給」當「不知道」。
 
 ## 8. 把 Carol 拉進來、Carol 說話
@@ -224,10 +224,10 @@ matrix-sdk 帳號：每一步都在 matrix-sdk 的 `Client` 裡走 HTTP。wbf �
 | 送訊息 | `/send` | `Event/Send`（加密訊息帶 `room_version`） | /docs/design/keys/e2ee-rpc.md §3 |
 | 收訊息 | timeline | `Recent`、Push、`room.history` 拉上游 | /docs/design/keys/e2ee-rpc.md §6 |
 | 建房、邀請、踢人、離開 | `/createRoom` 等 | 橋批 1 | 還沒做：沒有 RPC |
-| 金鑰備份 | `/room_keys/*` | 橋 `0x17 0x30`–`0x3D` | 還沒做：wbf 帳號沒接（/docs/design/keys/e2ee-rpc.md §8） |
-| 簽章上傳、交叉簽章金鑰 | `/keys/signatures/upload`、`/keys/device_signing/upload` | 橋 `0x17 0x25`、`0x24`（換金鑰要 UIAA） | 還沒做：交叉簽章（/docs/design/keys/e2ee-rpc.md §8） |
+| 金鑰備份 | `/room_keys/*` | 橋 `0x17 0x30`–`0x3D` | ✅ 2026-11-07（/docs/design/keys/cross-signing-and-verification.md §4） |
+| 簽章上傳、交叉簽章金鑰 | `/keys/signatures/upload`、`/keys/device_signing/upload` | 橋 `0x17 0x25`、`0x24`（換金鑰要 UIAA） | ✅ 2026-11-07（同一份 §3、§5；換金鑰那條還沒做） |
 
-還沒做的，照 /docs/design/keys/e2ee-rpc.md §8 列一次：wbf 帳號的金鑰備份與「向自己其他裝置要金鑰」；交叉簽章（分享策略仍是 `AllDevices`）。
+wbf 帳號的金鑰備份、「向自己其他裝置要金鑰」、交叉簽章與裝置驗證 2026-11-07 接上了（/docs/design/keys/cross-signing-and-verification.md）；還沒做的照 /docs/design/keys/e2ee-rpc.md §8。
 （2026-10-07 做完：路徑版送檔進加密房、房間自己設的換金鑰期限 `rotation_period_*`、`room.history` 讀到未解的再試一次、CLI 送加密房。）
 
 ## 13. server 補齊之後：只把 matrix-sdk-crypto 當狀態機用，行不行
@@ -240,12 +240,12 @@ Element 的行動版就是在自己的網路層上用它。wbf 帳號就是這�
 
 | 層 | 是什麼 | 我們用不用 |
 |---|---|---|
-| `vodozemac` | Olm／Megolm 的**演算法**（棘輪、加解密） | 🚫 不直接用：用它就得自己重寫下一層的全部規則 |
+| `vodozemac` | Olm／Megolm 的**演算法**（棘輪、加解密） | **不**直接用：用它就得自己重寫下一層的全部規則 |
 | **`matrix-sdk-crypto` 的 `OlmMachine`** | **狀態機**：裝置追蹤、session 管理、金鑰分享與輪換規則、驗證、備份（`BackupMachine`）、重播檢查、信任判斷 | ✅ **用這一層** |
 | `matrix-sdk-sqlite` | crypto store 的 SQLite 實作（就是 `m/`） | ✅ 照用 |
-| `matrix-sdk` 的 `Client`／`Room` | 高階 client：自己的 sync 迴圈、HTTP、`room.send` | wbf 帳號 🚫 不用（維護者定的耦合方向：上游 SDK 可以拆掉，crypto 只當引用）；matrix-sdk 帳號照用 |
+| `matrix-sdk` 的 `Client`／`Room` | 高階 client：自己的 sync 迴圈、HTTP、`room.send` | wbf 帳號**不**用（維護者定的耦合方向：上游 SDK 可以拆掉，crypto 只當引用）；matrix-sdk 帳號照用 |
 
-**狀態機替我們做的**（不用自己寫、也🚫 不該自己寫）：Olm／Megolm 加解密、「哪台裝置缺 Olm session」、「這次該不該輪換」、
+**狀態機替我們做的**（不用自己寫、也禁止自己寫）：Olm／Megolm 加解密、「哪台裝置缺 Olm session」、「這次該不該輪換」、
 OTK 該不該補、金鑰請求與轉發、交叉簽章與驗證狀態、重播檢查、`withheld` 的產生與解讀。
 
 **我們自己要寫的「細節邏輯」**（在 matrix-sdk 裡是 `Client` 做的）：
@@ -259,13 +259,13 @@ OTK 該不該補、金鑰請求與轉發、交叉簽章與驗證狀態、重播�
 | 5 | **送訊息前的準備**：收件人清單、`EncryptionSettings`（從房間的 `m.room.encryption` 狀態＋我們的信任策略）、補 session、分享金鑰 | `get_missing_sessions(users)` → 送 KeysClaim；`share_room_key(room, users, settings)` → 送 ToDevice |
 | 6 | **加密後送出** | `encrypt_room_event_raw(room, type, content)` → WS `Event/Send{ type: m.room.encrypted }` |
 | 7 | **解密與重解** | `decrypt_room_event(event, room, settings)`；匯入回傳的 `RoomKeyInfo` 決定重解哪一批 |
-| 8 | **信任策略**：只發給驗證過的裝置？身分金鑰變了怎麼辦？ | `EncryptionSettings` 的分享策略、`DecryptionSettings` 的 `sender_device_trust_requirement` —— 🚨 **要明確選，並照抄或刻意偏離 matrix-sdk 的預設**，🚫 不能默默用最寬的 |
+| 8 | **信任策略**：只發給驗證過的裝置？身分金鑰變了怎麼辦？ | `EncryptionSettings` 的分享策略、`DecryptionSettings` 的 `sender_device_trust_requirement` —— 🚨 **要明確選，並照抄或刻意偏離 matrix-sdk 的預設**，禁止默默用最寬的 |
 | 9 | **鎖**：同一時間只有一個 `get_missing_sessions`／`share_room_key`；crypto store 只有一個持有者 | daemon 裡一個帳號一份長活的 `OlmEngine`（/docs/design/keys/key-sync.md §1） |
-| 10 | **金鑰備份迴圈**：新 session 上傳到 server 備份 | `backup_machine()` 產生的請求 → 同 #2（還沒做） |
+| 10 | **金鑰備份迴圈**：新 session 上傳到 server 備份 | `backup_machine()` 產生的請求 → 自己送（它**不**從 `outgoing_requests()` 出來），金鑰線後台做（/docs/design/keys/cross-signing-and-verification.md §4.1） |
 
 ⚠️ 還要注意兩件事：
 
-- **一個 `m/` 只有一個持有者**：wbf 帳號沒有 `Client`，它的 `m/` 只有 `OlmEngine` 開；matrix-sdk 帳號的 `m/` 只有 `Client` 開。🚫 不要讓兩者同時開同一個 `m/`。
+- **一個 `m/` 只有一個持有者**：wbf 帳號沒有 `Client`，它的 `m/` 只有 `OlmEngine` 開；matrix-sdk 帳號的 `m/` 只有 `Client` 開。禁止讓兩者同時開同一個 `m/`。
 - **「算法現成」不等於「規則現成」**：#4、#5、#8 決定了「誰收得到金鑰」—— 那就是 E2EE 的安全邊界。這幾條每一條都要有測試，特別是第 9 步的輪換與第 6 步的新裝置。
 
 ## 14. 要向 server 要的（合成一個 issue）
@@ -281,7 +281,7 @@ OTK 該不該補、金鑰請求與轉發、交叉簽章與驗證狀態、重播�
 
 server 不再推「誰的裝置清單變了」那份清單，改成一個**可以在收訊息那一刻檢查的條件**：每個帳號一個裝置版本號 `序號-雜湊`、
 每個房間一個房間版本號（u64，client 當不透明的值、只比相不相等），有約定的 client 送加密訊息時帶房間版本號，過期就被 `1506 RoomDevicesChanged` 擋下，**訊息不會送出**。
-推播（`Event/DeviceChanged`）只是加速；全掉光也只是多被擋一次，🚫 不是正確性的來源。
+推播（`Event/DeviceChanged`）只是加速；全掉光也只是多被擋一次，**不**是正確性的來源。
 
 ### 16.1 四件事，client 端各落在哪
 
@@ -292,7 +292,7 @@ server 不再推「誰的裝置清單變了」那份清單，改成一個**可�
 | 3 | `Event/Send` meta 多 `room_version`；只查 `m.room.encrypted`；對不上回 1506，meta 帶目前的號碼 | `SendRequest::room_version`、`WbfErrorCode::RoomDevicesChanged`、`SdkError::current_room_version`；`encrypt_and_send` 帶 `room_version`，1506 回 `SendOutcome::RoomDevicesChanged`；重拿成員、重查是 `refresh_room_devices`，建通道、建／換金鑰、送出去是後台的 `distribute_room_key`（/docs/design/keys/e2ee-rpc.md §3.1），重送是再叫一次（同 `txn_id`，等金鑰就緒） |
 | 4 | `Event/DeviceChanged`（`0x14 0x07`）：`{user_id, device_version, rooms, gap}`，跟 `Push` 共用 `id`／`seq`／`gap` | `pack::event::DEVICE_CHANGED`、`protocol::DeviceChangedMeta`（缺 `gap` 當 true）；`Rooms` 線的收包迴圈原樣轉成 `devices.changed`（`room_sync.rs`，/docs/design/keys/e2ee-rpc.md §4） |
 
-順手一起的：`Device/CryptoState`（`0x16 0x08`）→ `pack::device::CRYPTO_STATE`、`protocol::CryptoStateMeta`（`unused_fallback_key_types` 缺欄位是錯，🚫 不補成空：
+順手一起的：`Device/CryptoState`（`0x16 0x08`）→ `pack::device::CRYPTO_STATE`、`protocol::CryptoStateMeta`（`unused_fallback_key_types` 缺欄位是錯，**不**補成空：
 `[]` 對 OlmMachine 是「都用掉了，該換」，「沒給」是「server 不支援」）。五條向量（`send_encrypted_with_room_version`、
 `error_room_devices_changed`、`event_device_changed`、`device_crypto_state`、`device_crypto_state_empty`）都有測試比對。
 
@@ -300,7 +300,7 @@ server 不再推「誰的裝置清單變了」那份清單，改成一個**可�
 
 ```
 送 Event/Send{ type: m.room.encrypted, room_version: V }  ──→  Error 1506 { room_version: V' }
-  ↓ 訊息沒送出；V' 只用來知道自己過期，🚫 不拿它直接重送（變了的裝置還沒有金鑰）
+  ↓ 訊息沒送出；V' 只用來知道自己過期，**不**拿它直接重送（變了的裝置還沒有金鑰）
 重拿 Members  → RoomDeviceVersions { room_version: V'', members }      ← 名單與號碼是同一刻的
   ↓ diff_from(上一份)
 changed（新加入、版本號變了的）→ 只對他們 /keys/query → 餵 OlmMachine（update_tracked_users／mark_user_as_changed）
@@ -332,7 +332,7 @@ left（不在了的）              → 換一把新的房間金鑰（OlmMachine
   `device_subscribe` 只等到 `CryptoState` 就放手，給一次走完的流程。
 - **`ItemsDestroyed` 只抄 `id`、`seq` 是 0**（`Ack` 才抄命令的 seq）；向量裡命令的 seq 剛好也是 0，靠向量看不出來。
 - ruma 組請求時對要 token 的端點一定要給 token：引擎給一個占位字串、只取 body，真的 `Authorization` 由橋在 server 那端填（client 蓋不掉）。
-- **訂閱之後推播隨時會來**：別人 claim 了我一把 OTK，server 立刻推 `CryptoState`（id 是訂閱的 id）。🚫 不假設「下一個收到的就是我的回覆」（維護者 2026-09-21：送一個等一個沒錯，錯的是這個假設）；
+- **訂閱之後推播隨時會來**：別人 claim 了我一把 OTK，server 立刻推 `CryptoState`（id 是訂閱的 id）。禁止假設「下一個收到的就是我的回覆」（維護者 2026-09-21：送一個等一個沒錯，錯的是這個假設）；
   每個 pack 由會話表依 id 交付（/docs/design/daemon/ws-receive-dispatch.md §2），訂閱的 id 底下的每一個（Ack、CryptoState、Push、Superseded）都進訂閱的 handle，順序無所謂。
 - **server 的 WS `Event/Send` 把 txn_id 去重鍵在帳號**（`wbf/send.rs` 傳 `sender_device: None`）：同一帳號另一台裝置、甚至另一個房重用 txn_id，會拿到上次那則的 event_id。
   測試要每輪唯一的 txn_id。HTTP 那條是以裝置為鍵的；這個差異要回報給 server。
@@ -351,7 +351,7 @@ server 那邊的設計（wbfuwunel 的 /docs/design/wbf-room-device-version.md �
 | 2 | **跟上次那份比**：誰新加入、誰的裝置版本號變了（要重查）、誰不在了（要換房間金鑰） | `RoomDeviceVersions::diff_from(&previous)` → `MembersDiff { changed, left }`。「上次那份」存在 UI（/docs/design/keys/e2ee-rpc.md §1），refresh 與送出時帶回來 |
 | 3 | **只重查變了的人的裝置**；哪台裝置新了／沒了由狀態機自己比 | `OlmEngine::mark_users_changed(diff.changed)` → `send_outgoing_requests`（KeysQuery 走橋 `0x17 0x21`）。上游 `OlmMachine` 對每台裝置逐台追蹤，回應進來自己算差 |
 | 4 | **自己驗雜湊**：查回來的金鑰照 wbfuwunel 的 /docs/design/wbf-room-device-version.md §3.4 重算 ＝ 清單上那個人的雜湊 → 看到的是同一組 | `OlmEngine::mismatched_device_hashes`（`refresh_room_devices` 裡：對不上再查一次，還不對就 `Protocol` 拒發；`unhashable` 與沒查過的不算） |
-| 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | 只在後台：`OlmEngine::distribute_room_key(client, room, users)` 缺 Olm session 先 claim → 上游 `share_room_key` 建／換、排好 → 逐一 `sendToDevice`（`Keys` 線的橋）；快到期先 `discard_room_key` 提早換；全部 Ack 後 `room_key_state` 是 `Ready` 才拿來加密（/docs/design/keys/e2ee-rpc.md §3、§3.1）。分享策略明確選 `AllDevices`（`crypto_engine::room_key_share_settings`；交叉簽章做好後換 `IdentityBased`，那是唯一要改的地方） |
+| 5 | **補發／輪換房間金鑰**：新裝置補發、有人離開換一把（上游的 sharing strategy 決定） | 只在後台：`OlmEngine::distribute_room_key(client, room, users)` 缺 Olm session 先 claim → 上游 `share_room_key` 建／換、排好 → 逐一 `sendToDevice`（`Keys` 線的橋）；快到期先 `discard_room_key` 提早換；全部 Ack 後 `room_key_state` 是 `Ready` 才拿來加密（/docs/design/keys/e2ee-rpc.md §3、§3.1）。分享策略明確選 `AllDevices`（`crypto_engine::room_key_share_settings`；matrix-sdk 的預設，交叉簽章做好之後也**不**換，/docs/design/keys/cross-signing-and-verification.md §8） |
 | 6 | **帶房間版本號送出**；對不上 1506 → daemon 自動重拿房間狀態（交給後台對新狀態分金鑰）、把新的房間狀態放進錯誤的 `data` 回給 UI；重送由 UI 決定（/docs/design/keys/e2ee-rpc.md §3） | `OlmEngine::encrypt_and_send`（金鑰沒就緒就不加密）→ `SendOutcome::{Sent, RoomKeyNotReady, RoomDevicesChanged}`；重拿是 `refresh_room_devices(previous)`；重送是再叫一次（同 `txn_id`）。RPC 是 `room.send_text`＋1401／1402 |
 | 7 | **上線主動確認一次**：to-device 追平；開著的房各拿一次成員清單 | `OlmEngine::pull_to_device`（/docs/design/keys/key-sync.md §1）；成員清單就是第 1 步，什麼時候叫由 UI 決定 |
 | 8 | **訂閱中也沒有空窗**：`DeviceChanged` 推來就更新號碼、標記重查；掉了有 `gap`；全掉光最壞被 1506 擋一次 | `DeviceChangedMeta`；daemon 原樣轉成 `devices.changed`，**要不要叫 refresh 是 UI 的事**（/docs/design/keys/e2ee-rpc.md §4）。正確性仍由第 6 步的 1506 守 |
@@ -362,7 +362,7 @@ server 那邊的設計（wbfuwunel 的 /docs/design/wbf-room-device-version.md �
 走的就是 server 設計的那條「版本號變了 → 看誰不一樣 → 只查那個人 → 狀態機比裝置 → 補發 → 帶號碼送 → 1506 回到第 1 步」的路。
 正確性放在 1506、不放在推播：推播全掉也只是慢一拍（被擋一次才知道要重查）。
 
-🚫 「上次那份成員清單」不在 SDK 層存，daemon 也🚫 不存：它**存在 UI**（維護者 2026-09-29，/docs/design/keys/e2ee-rpc.md §1，`RoomDevices`），送出與 refresh 時帶回來。「這輪金鑰發給誰」由 crypto store 裡上游自己記。
+「上次那份成員清單」**不**在 SDK 層存，daemon 也**不**存：它**存在 UI**（維護者 2026-09-29，/docs/design/keys/e2ee-rpc.md §1，`RoomDevices`），送出與 refresh 時帶回來。「這輪金鑰發給誰」由 crypto store 裡上游自己記。
 
 ### 16.6 誰呼叫：UI 與 daemon 的分界（維護者 2026-09-21 定、2026-09-29 精確化）
 
@@ -374,8 +374,8 @@ wbf-sdk 只提供方法，不在這兩者之間選邊。
 1506 其實是兩件事疊在一起，分開給：
 
 - **金鑰面**（daemon）：房間版本號過期 ＝ 現在的裝置集合裡有人沒拿到房間金鑰。修法是成員清單 → 比出誰變了 → 重查那個人 → 交給後台建通道、補發或輪換、送到，
-  然後把新的房間狀態放進錯誤的 `data` 交回 UI（🚫 等後台；UI 重送時才等金鑰就緒）。只有 daemon 做得到（OlmMachine 與 crypto store 在它手上），而且不管 UI 之後重不重送都該做——這是金鑰衛生，不是那則訊息的事。
-- **訊息面**（UI）：這則要不要再送、送幾次、畫面顯示傳送中還是失敗。daemon 🚫 不自動重送：使用者可能已經撤回或改了，daemon 不會知道；重試次數是每則訊息的政策，放 UI 才自然。
+  然後把新的房間狀態放進錯誤的 `data` 交回 UI（**不**等後台；UI 重送時才等金鑰就緒）。只有 daemon 做得到（OlmMachine 與 crypto store 在它手上），而且不管 UI 之後重不重送都該做——這是金鑰衛生，不是那則訊息的事。
+- **訊息面**（UI）：這則要不要再送、送幾次、畫面顯示傳送中還是失敗。daemon **不**自動重送：使用者可能已經撤回或改了，daemon 不會知道；重試次數是每則訊息的政策，放 UI 才自然。
 
 ⭐ **一支例行程序、兩種觸發**：`refresh_room_devices` 由 UI 叫（點進房間、收到 `devices.changed`、自己覺得號碼舊了），或由 daemon 在被 1506 擋時自動叫。內容一樣，只有「誰按下去」不同。
 UI 帶新狀態、同一個 `txn_id` 重送；之間版本號又變就再吃一次 1506，由 UI 的次數自然收斂，daemon 不幫忙。

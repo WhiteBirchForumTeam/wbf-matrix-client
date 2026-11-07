@@ -6,7 +6,7 @@
 //!   WBF_E2E_PASSWORD_FILE 整檔就是密碼（去掉結尾一個換行）
 //!
 //! 流程：vault.create（**passphrase 模式**）→ account.add（鉤子在背景開五條線）→ account.whoami → server.ping（WS）
-//! → room.list（local 與 both，後者走橋的 JoinedRooms）→ sync.recent（WS）→ backup.status（wbf 帳號拒）→ **daemon 重開 → vault.unlock → whoami**
+//! → room.list（local 與 both，後者走橋的 JoinedRooms）→ sync.recent（WS）→ backup.status（wbf 帳號走橋）→ **daemon 重開 → vault.unlock → whoami**
 //! → account.del。每一步看 code，**不**看 msg。
 //!
 //! ⭐ 這裡刻意走 passphrase 模式（plain 由單元測試涵蓋）：要驗的是「先建加密倉庫、再登入」這條路
@@ -41,8 +41,12 @@ struct Daemon {
 }
 
 async fn start_daemon(data_dir: &std::path::Path) -> Daemon {
+    start_daemon_with(data_dir, Settings::default()).await
+}
+
+async fn start_daemon_with(data_dir: &std::path::Path, settings: Settings) -> Daemon {
     let policy = EncryptionPolicy::enforced();
-    let handle = Handle::new(data_dir, policy.clone(), Settings::default());
+    let handle = Handle::new(data_dir, policy.clone(), settings);
     handle.set_access_keys(AccessKeys::from_token(&TOKEN));
     let rpc = RpcServer::bind(
         0,
@@ -234,12 +238,10 @@ async fn login_ping_rooms_recent_and_logout_over_the_daemon() {
     assert_eq!(reply["code"], 0, "recent: {reply}");
     assert!(reply["result"]["caught_up"].is_boolean(), "{reply}");
 
-    // 備份還掛在 Client 上（/docs/design/daemon/account-session.md §6）：wbf 帳號明講拒絕（1100），**不**靜默失效。
+    // 備份對 wbf 帳號走橋（/docs/design/keys/cross-signing-and-verification.md §4）：金鑰線開好時就建了（`SERVER_BACKUP` 預設開）。
     let reply = client.call("backup.status", json!({})).await;
-    assert_eq!(
-        reply["code"], 1100,
-        "backup.status on a wbf account: {reply}"
-    );
+    assert_eq!(reply["code"], 0, "backup.status on a wbf account: {reply}");
+    assert_eq!(reply["result"]["server_backup_exists"], true, "{reply}");
     let before = info["result"]["instance"]
         .as_str()
         .expect("instance")
@@ -1814,6 +1816,327 @@ async fn read_receipts_mark_local_and_upstream_and_count_unread() {
     stop_daemon(daemon, client).await;
 }
 
+/// 交叉簽章、金鑰備份、recovery key、自我驗證（/docs/design/keys/cross-signing-and-verification.md §11.1 的 V1–V9、V12）。
+/// 一台裝置＝一個 daemon（各自的資料目錄）；帳號是這次現註冊的（[`register_fresh_user`]）。
+///
+/// | 步驟 | 驗什麼 |
+/// |---|---|
+/// | V1 A1 登入 | server 上有三把交叉簽章公鑰、有備份版本；A1 在自己的 `devices.list` 裡是 verified |
+/// | V2 A1 在加密房送一則、`backup.upload` | 備份的 `count` ≥ 1 |
+/// | V3 `backup.create_recovery_key` | account data 有預設 key、四個秘密都用它加密 |
+/// | V4 A2 登入 | master 公鑰沒變；A2 不是 verified；A2 讀那則解不開 |
+/// | V5、V6 A2 對自己開驗證、A1 接受、比表情、雙方確認 | 兩邊 7 個表情一樣；雙方的 `devices.list` 都看到兩台 verified |
+/// | V7 不叫任何 RPC | A2 收到那則解開的 `room.message`（備份金鑰由 A1 送來、自動還原） |
+/// | V9 A3 用錯的 recovery key | 回錯誤、A3 仍然不是 verified |
+/// | V8 A3 用對的 | A3 verified、讀得到那則 |
+/// | V12 A1 開驗證又取消 | 兩邊推 `cancelled`；之後那個流程的 confirm 回錯 |
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_REGISTRATION_TOKEN"]
+async fn cross_signing_backup_recovery_and_self_verification_across_three_devices() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let (me, password) = register_fresh_user(&server, "xs").await;
+    let other = OtherClient::login(&server, &me, &password).await;
+    let account_data = |event_type: &str| {
+        format!(
+            "/_matrix/client/v3/user/{}/account_data/{event_type}",
+            me.replace('@', "%40").replace(':', "%3A")
+        )
+    };
+
+    // ── V1：第一台自動建交叉簽章與備份版本 ──
+    let mut a1 = Device::login(&server, &me, &password, Settings::default()).await;
+    // 金鑰線開好之後才建（`init_keys` 的最後一段），「五條線都開了」不保證已經建完：問到有為止。
+    let mut keys = other.query_keys(&me).await;
+    for _ in 0..50 {
+        if keys["user_signing_keys"][&me].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        keys = other.query_keys(&me).await;
+    }
+    for kind in ["master_keys", "self_signing_keys", "user_signing_keys"] {
+        assert!(keys[kind][&me].is_object(), "{kind} of {me}: {keys}");
+    }
+    let master = keys["master_keys"][&me].clone();
+    let (status, backup) = other.get_json("/_matrix/client/v3/room_keys/version").await;
+    assert_eq!(status, 200, "a backup version exists: {backup}");
+    let a1_id = a1.device_id.clone();
+    let trust = a1.devices_until_verified(&me, &a1_id).await;
+    assert!(
+        trust["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["device_id"] == a1_id.as_str() && device["is_this_device"] == true),
+        "{trust}"
+    );
+
+    // ── V2：送一則，備份裡有它的金鑰 ──
+    let created = a1
+        .call(
+            "room.create",
+            json!({ "encrypted": true, "name": "verification e2e", "preset": "private_chat" }),
+        )
+        .await;
+    assert_eq!(created["code"], 0, "{created}");
+    let room = created["result"]["room_id"].as_str().unwrap().to_string();
+    let fetched = a1
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    assert_eq!(fetched["code"], 0, "{fetched}");
+    let refreshed = a1
+        .call("room.refresh_devices", json!({ "room": room }))
+        .await;
+    assert_eq!(refreshed["code"], 0, "{refreshed}");
+    let sent = a1
+        .call(
+            "room.send_text",
+            json!({ "room": room, "body": "before the second device", "room_devices": refreshed["result"] }),
+        )
+        .await;
+    assert_eq!(sent["code"], 0, "{sent}");
+    let event_id = sent["result"]["event_id"].as_str().unwrap().to_string();
+    let uploaded = a1.call("backup.upload", json!({})).await;
+    assert_eq!(uploaded["code"], 0, "{uploaded}");
+    let (_, backup) = other.get_json("/_matrix/client/v3/room_keys/version").await;
+    assert!(backup["count"].as_u64().unwrap_or(0) >= 1, "{backup}");
+
+    // ── V3：recovery key 與 secret storage ──
+    let created_key = a1.call("backup.create_recovery_key", json!({})).await;
+    assert_eq!(created_key["code"], 0, "{created_key}");
+    let recovery_key = created_key["result"]["recovery_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, default_key) = other
+        .get_json(&account_data("m.secret_storage.default_key"))
+        .await;
+    assert_eq!(status, 200, "{default_key}");
+    let key_id = default_key["key"].as_str().unwrap().to_string();
+    let (status, key) = other
+        .get_json(&account_data(&format!("m.secret_storage.key.{key_id}")))
+        .await;
+    assert_eq!(status, 200, "{key}");
+    for secret in [
+        "m.cross_signing.master",
+        "m.cross_signing.self_signing",
+        "m.cross_signing.user_signing",
+        "m.megolm_backup.v1",
+    ] {
+        let (status, content) = other.get_json(&account_data(secret)).await;
+        assert_eq!(status, 200, "{secret}: {content}");
+        assert!(
+            content["encrypted"][&key_id].is_object(),
+            "{secret}: {content}"
+        );
+    }
+
+    // ── V4：第二台不建新的，也還不被信任、讀不到舊的 ──
+    let mut a2 = Device::login(&server, &me, &password, Settings::default()).await;
+    let a2_id = a2.device_id.clone();
+    let keys = other.query_keys(&me).await;
+    assert_eq!(
+        keys["master_keys"][&me], master,
+        "the second device keeps the master key"
+    );
+    let trust = a2.call("devices.list", json!({ "user_id": me })).await;
+    assert_eq!(trust["code"], 0, "{trust}");
+    let row = trust["result"]["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_id"] == a2_id.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("A2 lists itself: {trust}"));
+    assert_eq!(row["verified"], false, "{trust}");
+    let fetched = a2
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    assert_eq!(fetched["code"], 0, "{fetched}");
+    history_until(&mut a2.client, &me, &room, &event_id, |message| {
+        message["kind"] == "undecryptable"
+    })
+    .await;
+
+    // ── V5、V6：自我驗證 ──
+    let (on_a2, on_a1) = verify_with_sas(&mut a2, &mut a1, None).await;
+    assert_eq!(on_a2.as_array().map(Vec::len), Some(7), "{on_a2}");
+    assert_eq!(on_a2, on_a1, "both devices show the same emoji");
+    a1.devices_until_verified(&me, &a2_id).await;
+    a2.devices_until_verified(&me, &a1_id).await;
+    a2.devices_until_verified(&me, &a2_id).await;
+
+    // ── V7：A2 不叫任何 RPC，自動還原、補解那則 ──
+    let wanted = event_id.clone();
+    let opened = wait_for_push_within(&mut a2.client, 300, |push| {
+        push["method"] == "room.message"
+            && push["params"]["message"]["id"] == wanted.as_str()
+            && push["params"]["message"]["kind"] == "text"
+    })
+    .await;
+    assert_eq!(
+        opened["params"]["message"]["body"], "before the second device",
+        "{opened}"
+    );
+
+    // ── V9：錯的 recovery key 什麼都不匯 ──
+    let mut a3 = Device::login(&server, &me, &password, Settings::default()).await;
+    let a3_id = a3.device_id.clone();
+    let wrong = matrix_sdk_crypto::secret_storage::SecretStorageKey::new().to_base58();
+    let refused = a3
+        .call("backup.restore", json!({ "recovery_key": wrong }))
+        .await;
+    assert_ne!(
+        refused["code"], 0,
+        "a wrong recovery key is refused: {refused}"
+    );
+    let trust = a3.call("devices.list", json!({ "user_id": me })).await;
+    let row = trust["result"]["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_id"] == a3_id.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("A3 lists itself: {trust}"));
+    assert_eq!(row["verified"], false, "nothing was imported: {trust}");
+
+    // ── V8：對的 recovery key ──
+    let restored = a3
+        .call("backup.restore", json!({ "recovery_key": recovery_key }))
+        .await;
+    assert_eq!(restored["code"], 0, "{restored}");
+    a3.devices_until_verified(&me, &a3_id).await;
+    let fetched = a3
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    assert_eq!(fetched["code"], 0, "{fetched}");
+    history_until(&mut a3.client, &me, &room, &event_id, |message| {
+        message["kind"] == "text"
+    })
+    .await;
+
+    // ── V12：開了又取消 ──
+    let requested = a1.call("verify.request", json!({ "user_id": me })).await;
+    assert_eq!(requested["code"], 0, "{requested}");
+    let flow_id = requested["result"]["flow_id"].as_str().unwrap().to_string();
+    let seen = a2.wait_for_incoming_request(&me).await;
+    assert_eq!(seen, flow_id);
+    let cancelled = a1
+        .call(
+            "verify.cancel",
+            json!({ "user_id": me, "flow_id": flow_id }),
+        )
+        .await;
+    assert_eq!(cancelled["code"], 0, "{cancelled}");
+    a1.wait_for_verify(&flow_id, "cancelled").await;
+    a2.wait_for_verify(&flow_id, "cancelled").await;
+    let late = a1
+        .call(
+            "verify.confirm",
+            json!({ "user_id": me, "flow_id": flow_id }),
+        )
+        .await;
+    assert_ne!(
+        late["code"], 0,
+        "a cancelled flow cannot be confirmed: {late}"
+    );
+
+    other.logout().await;
+    for device in [a1, a2, a3] {
+        device.stop().await;
+    }
+}
+
+/// 驗別人的一台裝置（/docs/design/keys/cross-signing-and-verification.md §11.1 的 V10）：bob 對 alice 的那台開驗證、走完 SAS，
+/// bob 的 `devices.list(alice)` 裡那台被信任、alice 這個人也被信任（SAS 的 MAC 含 master key，bob 用 user-signing key 簽了它）。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_REGISTRATION_TOKEN"]
+async fn verifying_another_users_device_trusts_that_device_and_identity() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let (alice, alice_password) = register_fresh_user(&server, "va").await;
+    let (bob, bob_password) = register_fresh_user(&server, "vb").await;
+    let mut on_alice = Device::login(&server, &alice, &alice_password, Settings::default()).await;
+    let mut on_bob = Device::login(&server, &bob, &bob_password, Settings::default()).await;
+    let alice_device = on_alice.device_id.clone();
+
+    let (seen_by_bob, seen_by_alice) =
+        verify_with_sas(&mut on_bob, &mut on_alice, Some(&alice_device)).await;
+    assert_eq!(
+        seen_by_bob.as_array().map(Vec::len),
+        Some(7),
+        "{seen_by_bob}"
+    );
+    assert_eq!(seen_by_bob, seen_by_alice, "both sides show the same emoji");
+    let trust = on_bob.devices_until_verified(&alice, &alice_device).await;
+    assert_eq!(trust["identity_verified"], true, "{trust}");
+
+    on_alice.stop().await;
+    on_bob.stop().await;
+}
+
+/// 沒有備份時向自己的裝置要金鑰（/docs/design/keys/cross-signing-and-verification.md §11.1 的 V11）：兩台都 `SERVER_BACKUP=off`，
+/// C1 送的那則，C2 跟 C1 自我驗證之後再讀，金鑰是 C1 轉過來的（server 上沒有任何備份版本可還原）。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_REGISTRATION_TOKEN"]
+async fn a_new_device_gets_old_room_keys_from_a_verified_device_without_a_backup() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let (carol, password) = register_fresh_user(&server, "vc").await;
+    let backup_off = || Settings {
+        server_backup: false,
+        ..Settings::default()
+    };
+    let mut c1 = Device::login(&server, &carol, &password, backup_off()).await;
+    let created = c1
+        .call(
+            "room.create",
+            json!({ "encrypted": true, "name": "key forwarding e2e", "preset": "private_chat" }),
+        )
+        .await;
+    assert_eq!(created["code"], 0, "{created}");
+    let room = created["result"]["room_id"].as_str().unwrap().to_string();
+    let fetched = c1
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    assert_eq!(fetched["code"], 0, "{fetched}");
+    let refreshed = c1
+        .call("room.refresh_devices", json!({ "room": room }))
+        .await;
+    assert_eq!(refreshed["code"], 0, "{refreshed}");
+    let sent = c1
+        .call(
+            "room.send_text",
+            json!({ "room": room, "body": "forwarded, not backed up", "room_devices": refreshed["result"] }),
+        )
+        .await;
+    assert_eq!(sent["code"], 0, "{sent}");
+    let event_id = sent["result"]["event_id"].as_str().unwrap().to_string();
+
+    let mut c2 = Device::login(&server, &carol, &password, backup_off()).await;
+    let fetched = c2
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    assert_eq!(fetched["code"], 0, "{fetched}");
+    history_until(&mut c2.client, &carol, &room, &event_id, |message| {
+        message["kind"] == "undecryptable"
+    })
+    .await;
+    let (on_c2, on_c1) = verify_with_sas(&mut c2, &mut c1, None).await;
+    assert_eq!(on_c2, on_c1, "both devices show the same emoji");
+    // 每讀一次，解不開的那則就向自己的裝置要一次金鑰（`room.history` 補解時送出去）。
+    let opened = history_until(&mut c2.client, &carol, &room, &event_id, |message| {
+        message["kind"] == "text"
+    })
+    .await;
+    assert_eq!(opened["body"], "forwarded, not backed up", "{opened}");
+
+    let other = OtherClient::login(&server, &carol, &password).await;
+    let (status, backup) = other.get_json("/_matrix/client/v3/room_keys/version").await;
+    assert_eq!(status, 404, "there is no backup to restore from: {backup}");
+    other.logout().await;
+    c1.stop().await;
+    c2.stop().await;
+}
+
 /// `room.history sync=both` 一直問到 `event_id` 那則符合 `wanted` 為止（推播、金鑰都要時間；最多 10 秒），回那則。
 async fn history_until(
     client: &mut Client,
@@ -1883,7 +2206,16 @@ async fn call_once_seen(client: &mut Client, method: &str, params: &Value) -> Va
 
 /// 等到一則符合的推播（最多 10 秒）：推播只在等回應時收，所以拿 `daemon.info` 當輪詢。拿到的那則從佇列拿掉。
 async fn wait_for_push(client: &mut Client, wanted: impl Fn(&Value) -> bool) -> Value {
-    for _ in 0..100 {
+    wait_for_push_within(client, 100, wanted).await
+}
+
+/// 同 [`wait_for_push`]，最多等 `tries` × 100 毫秒。
+async fn wait_for_push_within(
+    client: &mut Client,
+    tries: u32,
+    wanted: impl Fn(&Value) -> bool,
+) -> Value {
+    for _ in 0..tries {
         if let Some(position) = client.pushes.iter().position(&wanted) {
             return client.pushes.remove(position);
         }
@@ -1891,6 +2223,190 @@ async fn wait_for_push(client: &mut Client, wanted: impl Fn(&Value) -> bool) -> 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("the push never came; seen: {:?}", client.pushes);
+}
+
+/// 註冊一個全新的帳號：別的測試也登入 alice、bob，她們早就有交叉簽章與備份了，「第一台裝置建」只有全新的帳號測得到。
+///
+/// Return:
+///     (String, String)   (mxid, 密碼)
+async fn register_fresh_user(server: &str, prefix: &str) -> (String, String) {
+    let token = std::env::var("WBF_E2E_REGISTRATION_TOKEN").expect("WBF_E2E_REGISTRATION_TOKEN");
+    let localpart = format!(
+        "{prefix}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..10]
+    );
+    let password = uuid::Uuid::new_v4().to_string();
+    let http = reqwest::Client::new();
+    let mut auth = json!({ "type": "m.login.registration_token", "token": token });
+    for _ in 0..2 {
+        let response = http
+            .post(format!("{server}/_matrix/client/v3/register"))
+            .json(&json!({ "username": localpart, "password": password, "auth": auth }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let reply: Value = response.json().await.unwrap();
+        if status == 200 {
+            return (reply["user_id"].as_str().unwrap().to_string(), password);
+        }
+        assert_eq!(status, 401, "register {localpart}: {reply}");
+        auth["session"] = reply["session"].clone();
+    }
+    panic!("register {localpart} never finished");
+}
+
+/// 一台裝置：自己的資料目錄、自己的 daemon、登入同一個帳號（/docs/design/keys/cross-signing-and-verification.md §11.1）。
+struct Device {
+    client: Client,
+    daemon: Daemon,
+    _dir: tempfile::TempDir,
+    user: String,
+    device_id: String,
+}
+
+impl Device {
+    /// 起一個 daemon、登入、等五條線開好（金鑰線開好時交叉簽章與備份已經就位）。
+    async fn login(server: &str, user: &str, password: &str, settings: Settings) -> Device {
+        let dir = tempfile::Builder::new()
+            .prefix("wd")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        let daemon = start_daemon_with(dir.path(), settings).await;
+        let mut client = Client::connect(daemon.port).await;
+        let subscribed = client
+            .call(
+                "subscribe",
+                // `note` 與 `keys.state`：背景的金鑰線出事時只講一聲，訂起來失敗時才看得到原因。
+                json!({ "events": ["verify.state", "room.message", "note", "keys.state"] }),
+            )
+            .await;
+        assert_eq!(subscribed["code"], 0, "subscribe: {subscribed}");
+        let reply = client.call("vault.create", json!({})).await;
+        assert_eq!(reply["code"], 0, "vault.create: {reply}");
+        let reply = client
+            .call(
+                "account.add",
+                json!({ "server": server, "user": user, "password": password, "device_name": "wbf-daemon verification e2e" }),
+            )
+            .await;
+        assert_eq!(reply["code"], 0, "account.add {user}: {reply}");
+        let device_id = reply["result"]["device_id"].as_str().unwrap().to_string();
+        wait_for_links(&mut client, 5).await;
+        Device {
+            client,
+            daemon,
+            _dir: dir,
+            user: user.to_string(),
+            device_id,
+        }
+    }
+
+    async fn call(&mut self, method: &str, mut params: Value) -> Value {
+        params["user"] = json!(self.user);
+        self.client.call(method, params).await
+    }
+
+    /// 這個流程推到 `state` 的那一則。
+    async fn wait_for_verify(&mut self, flow_id: &str, state: &str) -> Value {
+        let user = self.user.clone();
+        wait_for_push_within(&mut self.client, 200, |push| {
+            push["method"] == "verify.state"
+                && push["params"]["user"] == user.as_str()
+                && push["params"]["flow_id"] == flow_id
+                && push["params"]["state"] == state
+        })
+        .await["params"]
+            .clone()
+    }
+
+    /// 有人跟這台開了驗證（還沒看過的那一個）：回它的 flow id。
+    async fn wait_for_incoming_request(&mut self, from: &str) -> String {
+        let user = self.user.clone();
+        let push = wait_for_push_within(&mut self.client, 200, |push| {
+            push["method"] == "verify.state"
+                && push["params"]["user"] == user.as_str()
+                && push["params"]["other_user"] == from
+                && push["params"]["state"] == "requested"
+                && push["params"]["we_started"] == false
+        })
+        .await;
+        push["params"]["flow_id"].as_str().unwrap().to_string()
+    }
+
+    /// 輪詢 `devices.list` 到 `device_id` 被信任（最多 20 秒）。
+    async fn devices_until_verified(&mut self, user_id: &str, device_id: &str) -> Value {
+        let mut last = Value::Null;
+        for _ in 0..100 {
+            last = self
+                .call("devices.list", json!({ "user_id": user_id }))
+                .await;
+            assert_eq!(last["code"], 0, "devices.list: {last}");
+            let verified = last["result"]["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|device| device["device_id"] == device_id && device["verified"] == true);
+            if verified {
+                return last["result"].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!(
+            "{device_id} of {user_id} never became verified for {}: {last}",
+            self.user
+        );
+    }
+
+    async fn stop(self) {
+        stop_daemon(self.daemon, self.client).await;
+    }
+}
+
+/// `initiator` 對 `responder` 開驗證、走完 SAS（雙方接受、比表情、確認），回兩邊看到的表情（應該一樣）。
+///
+/// Args:
+///     target_device: `initiator` 要驗哪一台；自我驗證給 None（送給自己所有裝置）
+async fn verify_with_sas(
+    initiator: &mut Device,
+    responder: &mut Device,
+    target_device: Option<&str>,
+) -> (Value, Value) {
+    let mut params = json!({ "user_id": responder.user });
+    if let Some(device) = target_device {
+        params["device_id"] = json!(device);
+    }
+    let requested = initiator.call("verify.request", params).await;
+    assert_eq!(requested["code"], 0, "verify.request: {requested}");
+    assert_eq!(requested["result"]["state"], "requested", "{requested}");
+    let flow_id = requested["result"]["flow_id"].as_str().unwrap().to_string();
+    let seen = responder.wait_for_incoming_request(&initiator.user).await;
+    assert_eq!(seen, flow_id, "the responder sees the same flow");
+    let flow = |user: &str| json!({ "user_id": user, "flow_id": flow_id });
+    let accepted = responder.call("verify.accept", flow(&initiator.user)).await;
+    assert_eq!(accepted["code"], 0, "verify.accept (request): {accepted}");
+    initiator.wait_for_verify(&flow_id, "ready").await;
+    let started = initiator
+        .call("verify.start_sas", flow(&responder.user))
+        .await;
+    assert_eq!(started["code"], 0, "verify.start_sas: {started}");
+    responder.wait_for_verify(&flow_id, "started").await;
+    let accepted = responder.call("verify.accept", flow(&initiator.user)).await;
+    assert_eq!(accepted["code"], 0, "verify.accept (sas): {accepted}");
+    let on_initiator = initiator.wait_for_verify(&flow_id, "keys_exchanged").await;
+    let on_responder = responder.wait_for_verify(&flow_id, "keys_exchanged").await;
+    let responder_user = responder.user.clone();
+    let confirmed = initiator
+        .call("verify.confirm", flow(&responder_user))
+        .await;
+    assert_eq!(confirmed["code"], 0, "verify.confirm: {confirmed}");
+    let confirmed = responder
+        .call("verify.confirm", flow(&initiator.user))
+        .await;
+    assert_eq!(confirmed["code"], 0, "verify.confirm: {confirmed}");
+    initiator.wait_for_verify(&flow_id, "done").await;
+    responder.wait_for_verify(&flow_id, "done").await;
+    (on_initiator["emoji"].clone(), on_responder["emoji"].clone())
 }
 
 async fn download_until_complete(client: &mut Client, by_event: &Value) -> Value {
@@ -2034,6 +2550,34 @@ impl OtherClient {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         content
+    }
+
+    /// Return:
+    ///     (u16, Value)   (狀態碼, body)
+    async fn get_json(&self, path: &str) -> (u16, Value) {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.server))
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    /// 這個人在 server 上的交叉簽章公鑰與裝置（`POST /keys/query`）。
+    async fn query_keys(&self, user: &str) -> Value {
+        self.http
+            .post(format!("{}/_matrix/client/v3/keys/query", self.server))
+            .bearer_auth(&self.access_token)
+            .json(&json!({ "device_keys": { user: [] } }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn logout(&self) {

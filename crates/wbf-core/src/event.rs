@@ -4,7 +4,7 @@
 //! 另一個程序）或被 uniffi 包住（呼叫端在 JVM 裡）。跨那兩條邊界都沒有「借一個 closure
 //! 給你」這種東西，channel 有。
 //!
-//! 🚫 core **不印任何東西**。`eprintln!` 對 rpc-cli 是對的，對 daemon 是把訊息丟進虛空
+//! core **不印任何東西**。`eprintln!` 對 rpc-cli 是對的，對 daemon 是把訊息丟進虛空
 //! （沒有人在看那個 stderr），對 Android 更是。誰要顯示、顯示成什麼樣，是前端的事（/docs/design/overview/architecture-v2.md §3）。
 
 use tokio::sync::broadcast;
@@ -17,35 +17,35 @@ const EVENT_QUEUE: usize = 256;
 /// core 發生的事。
 ///
 /// ⚠️ 每個 variant 的欄位都要是**可序列化的簡單型別**：它們會變成 RPC 的推播訊息
-/// （/docs/design/rpc-specs/local-interface.md §6 的「沒有 `id` 的請求」）。🚫 不要在這裡放 handle、路徑以外的 `PathBuf`、
+/// （/docs/design/rpc-specs/local-interface.md §6 的「沒有 `id` 的請求」）。禁止在這裡放 handle、路徑以外的 `PathBuf`、
 /// 或任何帶秘密的東西。
 ///
 /// 📎 有 `Serialize`／`Deserialize`：daemon 那層要把它原樣送過 RPC，而**現在**補比
 /// 之後補便宜（PR #24 審查 rumia🟡2／salvia🟡2）。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CoreEvent {
-    /// 一句給人看的話。⚠️ 措辭是**給人看的**，🚫 前端不要拿它做邏輯判斷
+    /// 一句給人看的話。⚠️ 措辭是**給人看的**，前端禁止拿它做邏輯判斷
     /// （要判斷就看 [`CoreEvent::Progress`] 的數字，或 method 的回傳值）。
     Note {
         /// 哪一個工作發的（[`crate::job::run_as_job`] 標的）。`None` ＝ 不在任何工作裡。
         job: Option<u64>,
         text: String,
     },
-    /// 長工作的進度。⭐ 有數字，前端可以畫進度條，🚫 不必去 parse 一句話。
+    /// 長工作的進度。⭐ 有數字，前端可以畫進度條，**不**必去 parse 一句話。
     Progress {
         job: Option<u64>,
         /// 已經完成多少（單位由那個工作決定：塊、byte、事件…；`note` 講得出是什麼）。
         done: u64,
-        /// 總共多少。**串流的時候不知道，就是 `None`**，🚫 不要填 0 假裝知道。
+        /// 總共多少。**串流的時候不知道，就是 `None`**，禁止填 0 假裝知道。
         total: Option<u64>,
         /// 給人看的一句話，例如 "chunk 3/10"。
         text: String,
     },
     /// 收到一則訊息（`watch`、或 daemon 的上游會話，/docs/design/overview/architecture-v2.md §5.1）。
-    /// 串流的東西走事件，🚫 不等收齊再一次回 ——`watch tail` 永遠不會「收齊」。
+    /// 串流的東西走事件，**不**等收齊再一次回 ——`watch tail` 永遠不會「收齊」。
     Message {
         /// **哪個帳號的**。⚠️ 事件是每個帳號一組的（/docs/design/overview/architecture-v2.md §5.1），
-        /// 所以每個帳號相關的事件都要說得出是誰的，🚫 不能讓前端猜。
+        /// 所以每個帳號相關的事件都要說得出是誰的，禁止讓前端猜。
         user: String,
         message: Box<wbf_sdk::chat::Message>,
     },
@@ -65,7 +65,7 @@ pub enum CoreEvent {
         reason: Option<String>,
     },
     /// 房間那條線上 server 推來「某個人的裝置變了」（`Event/DeviceChanged`）：原樣轉給 UI，要不要 `room.refresh_devices` 是 UI 的事
-    /// （維護者 2026-09-29：房間版本號存在 UI；/docs/design/keys/e2ee-rpc.md §4）。daemon 自己🚫 不動作。
+    /// （維護者 2026-09-29：房間版本號存在 UI；/docs/design/keys/e2ee-rpc.md §4）。daemon 自己**不**動作。
     DeviceChanged {
         /// 收到這則的帳號
         user: String,
@@ -103,8 +103,14 @@ pub enum CoreEvent {
         /// 停的理由（`stopped` 才有）。
         reason: Option<String>,
     },
+    /// 這個帳號的一個裝置驗證流程變了（/docs/design/keys/cross-signing-and-verification.md §5.1）：開始、對方接受、表情出來、確認、完成、取消，每變一次一則。
+    /// 要不要接受、表情對不對都是 UI 問使用者，daemon 只轉送。
+    Verify {
+        user: String,
+        state: Box<wbf_sdk::verification::VerifyState>,
+    },
     /// 一個下載 job 怎麼了（/docs/design/media/media-download.md §5.5）：狀態改變時一則，拉的途中每個 job 最多每秒一則。
-    /// 🚫 不是每塊一則：那會把 `room.message` 擠掉（廣播佇列深度只有 256）。
+    /// **不是**每塊一則：那會把 `room.message` 擠掉（廣播佇列深度只有 256）。
     MediaDownload {
         user: String,
         /// example: "mxc://localhost/000000000000004d"
@@ -119,7 +125,7 @@ pub enum CoreEvent {
         /// `failed` 的理由（給人看的）；其他狀態是 `None`
         reason: Option<String>,
     },
-    /// 這條線收到一個 pack（`ReceivedHook` 的那一頭）。**只有標頭**，🚫 不帶 meta／data：它是 broadcast、每條 RPC 連線一份，
+    /// 這條線收到一個 pack（`ReceivedHook` 的那一頭）。**只有標頭**，**不**帶 meta／data：它是 broadcast、每條 RPC 連線一份，
     /// 而 data 可能是幾 MiB 的媒體塊或密文。要內容的由型別化的事件發（`Message` 那種）。
     Received {
         user: String,
@@ -158,7 +164,7 @@ pub enum DownloadState {
     Cancelled,
     /// 壞檔（驗不過）或帳號沒了：job 移除。
     Failed,
-    /// 本機有原檔（/docs/design/rpc-specs/data-plane.md §8.1）：🚫 不下載。只在 RPC 的回應裡，推播不會有。
+    /// 本機有原檔（/docs/design/rpc-specs/data-plane.md §8.1）：**不**下載。只在 RPC 的回應裡，推播不會有。
     LocalSource,
 }
 
@@ -180,13 +186,13 @@ pub enum SyncState {
     CatchingUp,
     /// 追平了：現在收到的都是新的。
     CaughtUp,
-    /// 斷了。⚠️ 這是**那一個帳號**的連線斷了，🚫 不代表 daemon 有問題。
+    /// 斷了。⚠️ 這是**那一個帳號**的連線斷了，**不**代表 daemon 有問題。
     Disconnected,
 }
 
 /// core 內部拿來發事件的那一端。
 ///
-/// 🚫 **crate 內部限定**：`progress` 收 `impl Into<String>`，而 /docs/design/overview/architecture-v2.md §6 明文說公開介面上
+/// **crate 內部限定**：`progress` 收 `impl Into<String>`，而 /docs/design/overview/architecture-v2.md §6 明文說公開介面上
 /// 不要有 `impl Trait`。前端要聽事件走 [`Core::subscribe`]，拿到的是 receiver
 /// ——那個形狀跨得過 RPC 與 uniffi（PR #24 審查 rumia🟡1／salvia🟡1）。
 ///
@@ -210,14 +216,14 @@ impl EventSink {
         self.sender.subscribe()
     }
 
-    /// 發一個事件。沒有訂閱者就是 no-op，🚫 不當成錯誤。
+    /// 發一個事件。沒有訂閱者就是 no-op，**不**當成錯誤。
     pub(crate) fn emit(&self, event: CoreEvent) {
         let _ = self.sender.send(event);
     }
 
     /// 發一句給人看的話。core 裡面最常發的就是這個。
     ///
-    /// ⚠️ `job` 是**自動**填的（[`crate::job::current`]）：呼叫端🚫 不用管，也不該管 ——
+    /// ⚠️ `job` 是**自動**填的（[`crate::job::current`]）：呼叫端**不**用管，也不該管 ——
     /// 它是「現在這個 async 工作是誰」的答案，而那個答案只有跑它的人（daemon）知道。
     pub(crate) fn progress(&self, message: impl Into<String>) {
         self.emit(CoreEvent::Note {
