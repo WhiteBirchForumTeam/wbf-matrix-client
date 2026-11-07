@@ -30,6 +30,8 @@ pub enum CrossSigningOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DeviceTrust {
     pub device_id: String,
+    /// 沒有顯示名時不出現（`rpc-spec` 的 `display_name?`）
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// 被它主人的交叉簽章簽過、而且那個人被我信任（自己的話：我有自己的私鑰）；或（別台才算）我本地手動信任過。
     /// ⚠️ 這台自己只看交叉簽章：上游把「自己這台」一律標成本地信任，那不代表別人信它。

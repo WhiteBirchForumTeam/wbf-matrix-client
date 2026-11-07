@@ -40,15 +40,23 @@ pub struct RestoredSecrets {
 
 /// 建一把新的 secret storage key，把這台的交叉簽章私鑰（與備份解密金鑰，有的話）放進去，設成預設。
 /// 預設那一筆**最後**才寫：讀的人看到預設 key 時，秘密一定已經在了。
+/// 已經有預設 key 就拒絕：換一把會讓使用者手上那串 recovery key 立刻失效（輪替不在這支，/docs/design/keys/cross-signing-and-verification.md §9）。
 ///
 /// Return:
 ///     Ok(Zeroizing<String>)  recovery key（base58，四個字一組）——秘密，只回這一次
-///     Err(Usage)             這台沒有三把交叉簽章私鑰（先自我驗證、或用 recovery key 還原）
+///     Err(Usage)             這個帳號已經有 secret storage；這台沒有三把交叉簽章私鑰（先自我驗證、或用 recovery key 還原）
 ///     Err(Server)／Err(Protocol)  account data 寫不進去
 pub async fn create_secret_storage<C: PackChannel>(
     engine: &OlmEngine,
     client: &mut WbfClient<C>,
 ) -> Result<Zeroizing<String>, SdkError> {
+    if has_secret_storage(engine, client).await? {
+        return Err(SdkError::Usage(
+            "this account already has a recovery key; a new one would make the one written down stop working \
+             (use backup.restore with it on a new device)"
+                .into(),
+        ));
+    }
     let machine = engine.machine();
     let export = machine
         .export_cross_signing_keys()

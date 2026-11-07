@@ -9,7 +9,7 @@ use wbf_sdk::channel::PackChannel;
 use wbf_sdk::client::WbfClient;
 use wbf_sdk::cross_signing::{self, CrossSigningOutcome};
 use wbf_sdk::crypto_engine::{ImportReport, OlmEngine};
-use wbf_sdk::key_backup::{self, BackupSetup};
+use wbf_sdk::key_backup::{self, BackupSetup, UploadOutcome};
 
 use crate::event::EventSink;
 use crate::room_crypto::{decrypt_stored, StoredToDecrypt};
@@ -134,10 +134,14 @@ pub(crate) async fn upload_quietly<C: PackChannel>(
     events: &EventSink,
     label: &str,
 ) {
-    if let Err(error) = key_backup::upload_room_keys(engine, client).await {
-        events.progress(format!(
+    match key_backup::upload_room_keys(engine, client).await {
+        Ok(UploadOutcome::CaughtUp { .. }) => {}
+        Ok(UploadOutcome::StoppedAtLimit { batches }) => events.progress(format!(
+            "keys: uploaded {batches} batch(es) of room keys to the server backup for {label}; more are left (continued with the next new key, or backup.upload)"
+        )),
+        Err(error) => events.progress(format!(
             "keys: uploading room keys to the server backup for {label} failed (tried again with the next new key): {error}"
-        ));
+        )),
     }
 }
 
@@ -332,8 +336,120 @@ mod tests {
             position_of(&fake, endpoints::CREATE_BACKUP_VERSION.bridge),
             None
         );
-        assert_eq!(batches, 0);
+        assert_eq!(batches, UploadOutcome::CaughtUp { batches: 0 });
         assert_eq!(position_of(&fake, endpoints::ADD_BACKUP_KEYS.bridge), None);
+    }
+
+    /// rumia／oliver（PR #84）：server 的版本被別台換掉之後，這台**不**再往舊版本傳。
+    #[tokio::test]
+    async fn a_backup_replaced_elsewhere_stops_this_device_uploading_to_the_old_one() {
+        let dir = scratch("backup-replaced");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let engine = core.olm_engine_of(&account).await.unwrap();
+        let (mut client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        let created = key_backup::ensure_backup(&engine, &mut client, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            created,
+            BackupSetup::Created {
+                version: "1".into()
+            }
+        );
+        assert!(engine.machine().backup_machine().enabled().await);
+
+        let mut replaced = serde_json::to_value(
+            matrix_sdk_crypto::store::types::BackupDecryptionKey::new().to_backup_info(),
+        )
+        .unwrap();
+        replaced["version"] = json!("2");
+        fake.rooms.lock().unwrap().backup = Some(replaced);
+        let setup = key_backup::ensure_backup(&engine, &mut client, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            setup,
+            BackupSetup::NoKeyHere {
+                version: "2".into()
+            }
+        );
+        assert!(
+            !engine.machine().backup_machine().enabled().await,
+            "uploading to version 1 stopped"
+        );
+    }
+
+    /// rumia／oliver（PR #84）：對上了、下載失敗（真 server 是 2 MiB 的 `TooLarge`）→ 金鑰已經存著、上傳開著，**不**跟著丟。
+    #[tokio::test]
+    async fn a_restore_whose_download_fails_keeps_the_backup_key() {
+        let dir = scratch("restore-download-fails");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let engine = core.olm_engine_of(&account).await.unwrap();
+        let (mut client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        key_backup::ensure_backup(&engine, &mut client, true)
+            .await
+            .unwrap();
+        let secret = key_backup::find_backup_secret(&engine)
+            .await
+            .unwrap()
+            .expect("the creating device holds the key");
+        let key =
+            matrix_sdk_crypto::store::types::BackupDecryptionKey::from_base64(&secret).unwrap();
+
+        let other_dir = scratch("restore-download-fails-other");
+        let (other_core, other_account) = core_with_wbf_account(&other_dir).await;
+        let other = other_core.olm_engine_of(&other_account).await.unwrap();
+        let (mut other_client, other_fake) =
+            memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        {
+            let mut target = other_fake.rooms.lock().unwrap();
+            target.backup = fake.rooms.lock().unwrap().backup.clone();
+            target.backup_download_fails = true;
+        }
+
+        let result = key_backup::restore_room_keys(&other, &mut other_client, key).await;
+
+        assert!(result.is_err(), "the download failed: {result:?}");
+        assert!(
+            key_backup::find_backup_secret(&other)
+                .await
+                .unwrap()
+                .is_some(),
+            "the key is kept"
+        );
+        assert!(other.machine().backup_machine().enabled().await);
+    }
+
+    /// rumia（PR #84）：第二次建 recovery key 被拒，第一串照樣打得開。
+    #[tokio::test]
+    async fn a_second_recovery_key_is_refused_and_the_first_still_opens() {
+        let dir = scratch("ssss-twice");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let engine = core.olm_engine_of(&account).await.unwrap();
+        let (mut client, fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        set_up_identity_and_backup(&engine, &mut client, &core.events, ME, true).await;
+        let first = secret_storage::create_secret_storage(&engine, &mut client)
+            .await
+            .unwrap();
+        let written = fake.rooms.lock().unwrap().account_data.clone();
+
+        let second = secret_storage::create_secret_storage(&engine, &mut client).await;
+
+        assert!(
+            matches!(second, Err(wbf_sdk::SdkError::Usage(_))),
+            "{second:?}"
+        );
+        assert_eq!(
+            fake.rooms.lock().unwrap().account_data,
+            written,
+            "nothing on the server changed"
+        );
+        assert!(
+            secret_storage::restore_secrets(&engine, &mut client, &first)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

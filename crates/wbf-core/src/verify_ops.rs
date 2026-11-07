@@ -61,6 +61,21 @@ impl VerifyWatchers {
     }
 }
 
+/// 觀察者 task 握著的清單位置：drop 時拿掉。
+struct WatcherSlot {
+    watchers: Arc<VerifyWatchers>,
+    me: String,
+    other_user: String,
+    flow_id: String,
+}
+
+impl Drop for WatcherSlot {
+    fn drop(&mut self) {
+        self.watchers
+            .remove(&self.me, &self.other_user, &self.flow_id);
+    }
+}
+
 /// 一個觀察者需要的東西（**不**握 `Core`）。
 #[derive(Clone)]
 pub(crate) struct VerifyWatch {
@@ -81,8 +96,14 @@ impl VerifyWatch {
         let other_user = other_user.to_string();
         let flow_id = flow_id.to_string();
         tokio::spawn(async move {
+            // task 不論怎麼結束（含 panic 收掉它）都把這個流程從清單拿掉，之後才看得到同一個 flow id。
+            let _leave_the_list = WatcherSlot {
+                watchers: watch.watchers.clone(),
+                me: watch.me.clone(),
+                other_user: other_user.clone(),
+                flow_id: flow_id.clone(),
+            };
             watch.run(&other_user, &flow_id).await;
-            watch.watchers.remove(&watch.me, &other_user, &flow_id);
         });
     }
 

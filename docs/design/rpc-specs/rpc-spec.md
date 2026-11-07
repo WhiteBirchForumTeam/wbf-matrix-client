@@ -402,8 +402,8 @@ wbf 帳號的交叉簽章與備份版本在金鑰線開好時自動就位、新�
 | `backup.upload` | `{ user?, server? }` | `UploadResult` | `upload_room_keys(also_save_snapshot = conf 的 LOCAL_ROOM_KEYS)`。wbf 帳號：後台本來就在傳，這支是「等追平才回」；server 上的備份這台打不開 → `1100` |
 | `backup.save` | `{ user?, server? }` | `{ bytes }` | `save_room_key_snapshot` |
 | `backup.import` | `{ user?, server? }` | `ImportResult` | `import_room_key_snapshot` |
-| `backup.restore` | `{ recovery_key?, user?, server? }`。`recovery_key`：使用者抄下來的那串（換機器時這台沒保管）；打開成功才封進 `r/` | `RecoveryStateReport` | `restore_from_recovery_key`。沒帶、這台也沒保管 → `1020`；打不開（錯的 key、server 上沒有 secret storage）→ `1100`、**什麼都不匯**。wbf 帳號：匯交叉簽章私鑰、簽自己這台、整份還原備份、補解 cache 裡的密文（解開的發 `room.message`） |
-| `backup.create_recovery_key` | `{ user?, server? }` | `{ recovery_key }` ⚠️ 秘密，只回這一次 | `create_recovery_key`。wbf 帳號：這台要有三把交叉簽章私鑰（沒有 → `1100`，先驗證或還原） |
+| `backup.restore` | `{ recovery_key?, user?, server? }`。`recovery_key`：使用者抄下來的那串（換機器時這台沒保管）；打開成功才封進 `r/` | `RecoveryStateReport` | `restore_from_recovery_key`。沒帶、這台也沒保管 → `1020`；打不開（錯的 key、server 上沒有 secret storage）→ `1100`、**什麼都不匯**。wbf 帳號：匯交叉簽章私鑰、簽自己這台、整份還原備份、補解 cache 裡的密文（解開的發 `room.message`）；簽完這台之後下載備份失敗**不**回錯（發 `progress`、再叫一次就是重試）。`recovery_enabled` 只認 `recovery_state: "Enabled"`（/docs/design/keys/cross-signing-and-verification.md §4.2） |
+| `backup.create_recovery_key` | `{ user?, server? }` | `{ recovery_key }` ⚠️ 秘密，只回這一次 | `create_recovery_key`。wbf 帳號：這台要有三把交叉簽章私鑰（沒有 → `1100`，先驗證或還原）；帳號已經有 recovery key → `1100`（換一把會讓抄下來的那串失效） |
 | `recovery.list` | — | `{ users: [mxid] }` | `list_recovery_key_users` |
 | `recovery.show` | `{ user }` | `{ user, recovery_key }` ⚠️ 秘密 | `find_recovery_key`。沒有 → `1020` |
 | `verify.request` | `{ user_id, device_id?, user?, server? }`。`user_id` 是自己時 `device_id` 可省（送給自己所有被交叉簽章簽過的裝置） | `VerifyState`：`{ flow_id, other_user, other_device, we_started, state, emoji?, decimals?, reason? }` | `verify_request`（/docs/design/keys/cross-signing-and-verification.md §5）。只有 wbf 帳號（一般帳號 → `1100`） |

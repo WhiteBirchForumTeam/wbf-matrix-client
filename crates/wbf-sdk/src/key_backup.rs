@@ -27,8 +27,17 @@ use crate::SdkError;
 /// 本地快照的 PBKDF2 輪數：跟 matrix-sdk 的 `export_room_keys` 同一個數（/docs/design/keys/room-key-backup.md §4）。
 const SNAPSHOT_ROUNDS: u32 = 500_000;
 
-/// 一次上傳最多繞幾批：上游一批最多 100 把，繞到這裡還有東西就停，下次再接著傳。
+/// 一次上傳最多繞幾批：上游一批最多 100 把，繞到這裡還有東西就停、回 [`UploadOutcome::StoppedAtLimit`]，下次再接著傳。
 const UPLOAD_ROUNDS_LIMIT: usize = 1_000;
+
+/// [`upload_room_keys`] 停在哪。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadOutcome {
+    /// 上游說沒有要傳的了
+    CaughtUp { batches: usize },
+    /// 繞滿 [`UPLOAD_ROUNDS_LIMIT`] 批還有：剩下的留給下一次
+    StoppedAtLimit { batches: usize },
+}
 
 /// [`ensure_backup`] 之後這台跟 server 那份備份的關係。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +105,7 @@ pub async fn find_latest_backup<C: PackChannel>(
 /// 讓這台跟 server 那份備份接上（/docs/design/keys/cross-signing-and-verification.md §4.1）：
 /// server 有、這台有對得上的解密金鑰 → 開上傳；server 沒有而 `create_if_missing` → 建一個新版本、開上傳；
 /// server 有、這台的金鑰對不上（或沒有）→ **不**建新的、**不**傳。
+/// 後兩種情況，上傳要是開著（上游開引擎時會把 store 存的舊版本自動接上）就關掉：server 的版本被別台換過了。
 ///
 /// Args:
 ///     create_if_missing: conf 的 `SERVER_BACKUP` 開著時是 true
@@ -120,7 +130,10 @@ pub async fn ensure_backup<C: PackChannel>(
                     enable_with(engine, key, &version).await?;
                     Ok(BackupSetup::Enabled { version })
                 }
-                _ => Ok(BackupSetup::NoKeyHere { version }),
+                _ => {
+                    disable_stale_backup(engine).await?;
+                    Ok(BackupSetup::NoKeyHere { version })
+                }
             }
         }
         None if create_if_missing => {
@@ -150,8 +163,20 @@ pub async fn ensure_backup<C: PackChannel>(
             enable_with(engine, key, &version).await?;
             Ok(BackupSetup::Created { version })
         }
-        None => Ok(BackupSetup::NoBackup),
+        None => {
+            disable_stale_backup(engine).await?;
+            Ok(BackupSetup::NoBackup)
+        }
     }
+}
+
+/// 上傳開著就關掉（存著的解密金鑰不刪）。
+async fn disable_stale_backup(engine: &OlmEngine) -> Result<(), SdkError> {
+    let backups = engine.machine().backup_machine();
+    if !backups.enabled().await {
+        return Ok(());
+    }
+    backups.disable_backup().await.map_err(crypto_store_error)
 }
 
 /// 存解密金鑰、開上傳。
@@ -176,13 +201,14 @@ async fn enable_with(
 /// 把還沒上傳的房間金鑰都傳上去（一批一批，直到上游說沒有了）。上傳沒開就什麼都不送。
 ///
 /// Return:
-///     Ok(usize)       傳了幾批
+///     Ok(CaughtUp { batches })        傳完了；上傳沒開是 `batches: 0`
+///     Ok(StoppedAtLimit { batches })  繞滿上限還有沒傳的
 ///     Err(Server)     server 拒（例：版本被別台刪了是 404）：這一批留著，下次再傳
 ///     Err(Protocol)   crypto store 壞了、回應解不開
 pub async fn upload_room_keys<C: PackChannel>(
     engine: &OlmEngine,
     client: &mut WbfClient<C>,
-) -> Result<usize, SdkError> {
+) -> Result<UploadOutcome, SdkError> {
     let _one_at_a_time = engine.backup_upload.lock().await;
     let machine = engine.machine();
     let mut batches = 0usize;
@@ -193,7 +219,7 @@ pub async fn upload_room_keys<C: PackChannel>(
             .await
             .map_err(crypto_store_error)?
         else {
-            return Ok(batches);
+            return Ok(UploadOutcome::CaughtUp { batches });
         };
         let mut variables = Map::new();
         variables.insert("version".into(), json!(request.version));
@@ -218,11 +244,12 @@ pub async fn upload_room_keys<C: PackChannel>(
             .map_err(|error| SdkError::Protocol(format!("crypto: {error}")))?;
         batches += 1;
     }
-    Ok(batches)
+    Ok(UploadOutcome::StoppedAtLimit { batches })
 }
 
-/// 用解密金鑰把 server 那份備份整份拉下來、解開、匯進 crypto store，並把這把金鑰存起來、開上傳。
-/// 單把解不開的跳過（跟上游一樣）；**金鑰對不上 server 現在的版本就什麼都不匯**（fail closed）。
+/// 用解密金鑰把 server 那份備份整份拉下來、解開、匯進 crypto store。對上 server 的版本就**先**把金鑰存起來、開上傳，
+/// 再下載：下載失敗時金鑰已經在 store 裡，不會跟著丟。
+/// 單把解不開的跳過（跟上游一樣）；**金鑰對不上 server 現在的版本就什麼都不存、不匯**（fail closed）。
 ///
 /// Args:
 ///     key: 備份的解密金鑰（recovery 打開的、或自我驗證時別台送來的）
@@ -230,7 +257,7 @@ pub async fn upload_room_keys<C: PackChannel>(
 ///     Ok(RestoreReport)
 ///     Ok(...) 的 `total` 是 0：備份是空的
 ///     Err(Usage)      server 上沒有備份、或這把金鑰不是它的
-///     Err(Server)     下載被拒（整份超過 2 MiB 是 `TooLarge`）
+///     Err(Server)     下載被拒（整份超過 2 MiB 是 `TooLarge`）：金鑰已存、上傳已開
 ///     Err(Protocol)   crypto store 寫不進去、回應解不開
 pub async fn restore_room_keys<C: PackChannel>(
     engine: &OlmEngine,
@@ -247,6 +274,17 @@ pub async fn restore_room_keys<C: PackChannel>(
             "this key does not open the server's backup (version {version})"
         )));
     }
+    enable_with(engine, key.clone(), &version).await?;
+    download_and_import(engine, client, &key, &version).await
+}
+
+/// 把 `version` 那份備份整份拉下來、用 `key` 解開、匯進 crypto store。呼叫者已經對過 `key` 是這個版本的。
+async fn download_and_import<C: PackChannel>(
+    engine: &OlmEngine,
+    client: &mut WbfClient<C>,
+    key: &BackupDecryptionKey,
+    version: &str,
+) -> Result<RestoreReport, SdkError> {
     let mut variables = Map::new();
     variables.insert("version".into(), json!(version));
     let body = client
@@ -274,10 +312,9 @@ pub async fn restore_room_keys<C: PackChannel>(
     let result = engine
         .machine()
         .store()
-        .import_room_keys(decrypted, Some(&version), |_, _| {})
+        .import_room_keys(decrypted, Some(version), |_, _| {})
         .await
         .map_err(crypto_store_error)?;
-    enable_with(engine, key, &version).await?;
     let sessions = result
         .keys
         .iter()
@@ -297,12 +334,13 @@ pub async fn restore_room_keys<C: PackChannel>(
 
 /// 自我驗證完，別台送來的備份解密金鑰落在上游的秘密收件匣（它**不**自動匯）：拿出來、對過 server 現在的版本才用，
 /// 用了就整份還原（/docs/design/keys/cross-signing-and-verification.md §5.2）。收件匣沒有就什麼都不做。
-/// 對不上的照樣從收件匣清掉（不是這份備份的金鑰，留著也沒用）。
+/// 收件匣在金鑰**存進 store 之後**才清：問不到 server、存不進去時留著，下一批 to-device 匯完再試。
+/// 對不上的照樣清掉（不是這份備份的金鑰，留著也沒用）。
 ///
 /// Return:
 ///     Ok(Some(RestoreReport))  拿到、對上、還原了
 ///     Ok(None)                 收件匣沒有、或對不上 server 的備份
-///     Err(...)                 同 [`restore_room_keys`]
+///     Err(...)                 同 [`restore_room_keys`]；下載那步失敗時金鑰已存、收件匣已清，要再拉一次是 `backup.restore`（要 recovery key）
 pub async fn adopt_backup_key_from_inbox<C: PackChannel>(
     engine: &OlmEngine,
     client: &mut WbfClient<C>,
@@ -315,7 +353,7 @@ pub async fn adopt_backup_key_from_inbox<C: PackChannel>(
     if secrets.is_empty() {
         return Ok(None);
     }
-    let Some((_, info)) = find_latest_backup(client).await? else {
+    let Some((version, info)) = find_latest_backup(client).await? else {
         return Ok(None);
     };
     let matching = secrets.iter().find_map(|secret| {
@@ -323,12 +361,17 @@ pub async fn adopt_backup_key_from_inbox<C: PackChannel>(
             .ok()
             .filter(|key| key.backup_key_matches(&info))
     });
+    if let Some(key) = &matching {
+        enable_with(engine, key.clone(), &version).await?;
+    }
     store
         .delete_secrets_from_inbox(&SecretName::RecoveryKey)
         .await
         .map_err(crypto_store_error)?;
     match matching {
-        Some(key) => Ok(Some(restore_room_keys(engine, client, key).await?)),
+        Some(key) => Ok(Some(
+            download_and_import(engine, client, &key, &version).await?,
+        )),
         None => Ok(None),
     }
 }

@@ -4,7 +4,7 @@
 > - `docs/design/wbf-wire-format.md` §3.2（`0x16` 的各列）、§4.1（`seq` 屬於會話）
 > - `docs/design/wbf-to-device.md`（整套設計與理由）
 >
-> 🚫 **這份不重複定義 meta 欄位與 byte 佈局**——同一個規則兩份文件一定會漂，而漂的那天
+> **這份不重複定義 meta 欄位與 byte 佈局**——同一個規則兩份文件一定會漂，而漂的那天
 > 沒有人會收到通知（全域 A4）。這裡只寫**三件那邊不會寫的事**：為什麼是這個形狀（§1、§2）、
 > **client 最容易寫錯的地方**（§3–§7）、以及實作在哪（§8）。core 怎麼接起來（訂閱線、收金鑰的 task、事件）在 /docs/design/keys/key-sync.md。
 
@@ -48,7 +48,7 @@ server 的 `add_to_device_event` 用的是 `globals.next_count()`——**跟 PDU
 | 房間事件 | client 的 `cg_seq` | 我快取到哪 | 追平那一窗（可重讀，錯了重拉） |
 | **to-device** | **server 的佇列頭**（最舊還沒銷毀的那則） | 我**已經處理完**到哪 | `ItemsDestroy` 成功（§4、§7） |
 
-client 另外在 `m/td.json` 記 `cd_seq`（匯進 crypto store 的最新 count）與待銷毀清單。`cd_seq` 🚫 只是紀錄、不當 `Fetch` 的游標（§7）。
+client 另外在 `m/td.json` 記 `cd_seq`（匯進 crypto store 的最新 count）與待銷毀清單。`cd_seq` 只是紀錄、**不**當 `Fetch` 的游標（§7）。
 
 ⚠️ **to-device 的 count 沒有地方放在事件裡**（它不是 PDU，存的就是 `{type, sender, content}`），
 所以每一則的 count 由 pack 的 meta 用 `counts` 陣列帶——這也是為什麼下一節那三件事很重要。
@@ -57,9 +57,9 @@ client 另外在 `m/td.json` 記 `cd_seq`（匯進 crypto store 的最新 count�
 
 ⭐ **跟房間金鑰同一個資料夾** —— 維護者的一句話就是判準：
 **「你同步到哪，就應該寫到哪。」** 落地是 `m/td.json`（`cd_seq` ＋ 待銷毀清單，`to_device_state.rs`）；
-`m/` 裡其他的是 matrix-sdk 自己的 store，🚫 不動它的 schema。
+`m/` 裡其他的是 matrix-sdk 自己的 store，禁止動它的 schema。
 
-🚫 **不進 `cache.db`**，理由是**失效模式要跟它描述的東西綁在一起**。`td.json` 說的是
+**不進 `cache.db`**，理由是**失效模式要跟它描述的東西綁在一起**。`td.json` 說的是
 「crypto store 已經收到哪、哪些可以刪」，而那個 store 就在 `m/`：
 
 | 發生什麼 | `m/`（含 `td.json`） | 後果 |
@@ -72,7 +72,7 @@ client 另外在 `m/td.json` 記 `cd_seq`（匯進 crypto store 的最新 count�
 `td.json` 卻還描述著一個已經不存在的 store——任何之後拿它做判斷的程式都會被騙，而那些是金鑰。
 
 ⭐ **fail closed 的形狀**：水位跟它保護的 store 同生共死。`m/` 沒了，水位就該沒了；
-而把它寫在 `m/` 裡面，那件事**不需要任何人記得去做**——🚫 不是「刪 store 時順手也刪水位」
+而把它寫在 `m/` 裡面，那件事**不需要任何人記得去做**——**不是**「刪 store 時順手也刪水位」
 那種散在各處的承諾（全域 A6：漏掉的那個不會 fail closed）。
 
 📎 `sync_state` 那張表是 `cg_seq` 的家，`cd_seq` 不進去；/docs/design/storage/local-cache-db.md §5 的 schema
@@ -92,7 +92,7 @@ client 另外在 `m/td.json` 記 `cd_seq`（匯進 crypto store 的最新 count�
 - **為什麼順序要反**：銷毀是**逐則推進**的，而 `m.key.verification.*`（SAS）的步驟**有序**——
   顛倒過來那個流程跑不動。
 - **為什麼不沿用 `fs`／`ls`**：那兩個名字的定義是語意的（「最新」「最舊」），不是位置的。
-  順序一翻，同一組名字會指到相反的東西。🚫 **不要混用**。
+  順序一翻，同一組名字會指到相反的東西。**禁止混用**。
 - **為什麼要 `counts`**：沒有它就只能**整批銷毀**——批次中間匯入失敗時，要嘛整批重來，
   要嘛冒險銷毀還沒處理好的。
 
@@ -101,7 +101,7 @@ client 另外在 `m/td.json` 記 `cd_seq`（匯進 crypto store 的最新 count�
 
 ## 4. 銷毀是**帶結果的命令**，不是回執（🚨 最容易寫錯的地方）
 
-🚫 不是「收到就等於刪掉」的回執，也不是前綴刪除：
+**不是**「收到就等於刪掉」的回執，也不是前綴刪除：
 
 ```
 client ──▶ Device/ItemsDestroy { tc } + data（tc × 8 byte，每個是一則的 count）
@@ -111,7 +111,7 @@ client ──▶ Device/ItemsDestroy { tc } + data（tc × 8 byte，每個是一
 
 client 端因此要守四條：
 
-1. 🚫 **收到 `Ack` 不要把待刪清單清掉**。`Ack` 只說「命令到了」。清掉的依據是
+1. **禁止收到 `Ack` 就把待刪清單清掉**。`Ack` 只說「命令到了」。清掉的依據是
    `ItemsDestroyed` 裡真的回來的那些 count。
 2. **送的是清單，不是水位**。我們 durable 存下來的那些 count，**未必是收到那串的前綴**
    （中間有一則匯入失敗就不是了）。
@@ -119,7 +119,7 @@ client 端因此要守四條：
    server 明文保證的——我們要的是「遠端沒有這把了」這個**狀態**，不是「這次是我刪的」這個事件。
 4. **`tc` 一定要跟 data 的長度對得上**，對不上 server 回 `InvalidRequest` 而且**一則都不刪**。
 
-⚠️ **所以本地要存的是待銷毀清單**（哪些可以刪），🚫 不是一個數字：把「我處理到哪」跟「可以刪哪些」綁成一件事，
+⚠️ **所以本地要存的是待銷毀清單**（哪些可以刪），**不是**一個數字：把「我處理到哪」跟「可以刪哪些」綁成一件事，
 正是 server 拒絕前綴刪除的理由。`cd_seq`（處理到哪）另外記著，只是紀錄（§2）。
 
 ## 5. 訂閱：`device_id` 是**明示意圖**，不是身分
@@ -130,7 +130,7 @@ client 端因此要守四條：
 📎 既然 session 已經知道，為什麼還要帶：讓**認錯自己裝置的 client 在這一步就知道**，
 而不是把別人的金鑰匯進自己的 store、再把它們銷毀掉。
 
-### 5.1 🚨 收到 `Superseded`(1505) 要當成「被接手」，🚫 不是斷線
+### 5.1 🚨 收到 `Superseded`(1505) 要當成「被接手」，**不是**斷線
 
 ⚠️ 一個裝置同時只有一條連線在收，而且**後來的接手先來的**（維護者 2026-09-12 定）。被接手的那條收到：
 
@@ -163,7 +163,7 @@ id = 它自己當初 Subscribe 用的 id
 媒體那條會把佇列塞爆是預期中的事，它只能塞爆自己。
 
 📎 這也讓 `gap` 的意思變乾淨：`Device/Push` 標 `gap`，就**只**表示 to-device 漏了，
-拿 `Device/Fetch` 補，🚫 跟房間那條的狀態無關。
+拿 `Device/Fetch` 補，跟房間那條的狀態**無關**。
 
 ### 6.1 但「一條線一段會話」仍然不成立
 
@@ -175,21 +175,21 @@ wbfuwunel PR #42／#44 定的規則，對我們是**直接的約束**：
 同時有兩段會話：常駐的 `Subscribe`（`Push` 抄它的 `id`）與補洞用的 `Fetch`（`Batch` 抄它的）——
 而且補洞期間推送不會停。
 
-| 🚫 錯誤的實作 | 會壞成什麼 |
+| 錯誤的實作（禁止） | 會壞成什麼 |
 |---|---|
 | 連線層一個 `next_seq` | `Push` 與 `Batch` 互相看起來像對方漏號，`gap` 那套判斷全毀 |
 | 每個 kind 一個 `next_seq` | 同 kind 兩段會話交錯（這裡就是 `Subscribe` 與 `Fetch`）分不出哪包是誰的 |
 
 📎 而 `seq` **不是重送機制**：WebSocket 不會掉單一 frame（掉了就是連線沒了），
 所以跳號只代表 server **故意**丟了一包（佇列滿），那件事 `gap` 已經明講。
-補救是「從佇列頭重新要」（`Fetch`，§7），🚫 不是「重送第幾號封包」。
+補救是「從佇列頭重新要」（`Fetch`，§7），**不是**「重送第幾號封包」。
 
 ## 7. 一次啟動的完整流程
 
 ```
 Session/Login
-  → Device/Subscribe { device_id }                    ← 先登記，再追平（🚫 不帶 cd_seq）
-  → Device/Fetch   { }                                 ← 🚫 不帶 cd_seq：server 從佇列最舊還沒銷毀的給
+  → Device/Subscribe { device_id }                    ← 先登記，再追平（不帶 cd_seq）
+  → Device/Fetch   { }                                 ← 不帶 cd_seq：server 從佇列最舊還沒銷毀的給
   → 逐則匯進 crypto store（OlmMachine::receive_sync_changes_msc4186，舊→新）
       匯成功：那些 count 進待銷毀清單（durable）；cd_seq 記一下處理到哪（只是紀錄）
   → Device/ItemsDestroy { tc } + counts
@@ -203,11 +203,11 @@ Session/Login
 - 🚨 **`Fetch` 不帶 `cd_seq`：佇列頭就是水位**（維護者 2026-09-26，wbfuwunel #87／#88）。client 的游標只要跑到一則還沒進 store 的 item 前面，
   那則就再也問不到：Ack 前推來的先匯、推播匯失敗後下一包成功、`CryptoState.gap` 沒接，三條都會。佇列本身沒有洞（銷毀前不刪），
   所以讓 server 從最舊還沒銷毀的給，`ItemsDestroy` 就是唯一的「處理完了」（也就是 ACK）。代價是「匯了但還沒銷成」的那幾則會再回來一次。
-- `OlmMachine::receive_sync_changes_msc4186` 是 matrix-sdk 的公開 API，吃的就是一串 to-device 事件（🚫 不用 `receive_sync_changes`：它把「沒給 OTK 數量」當 0，/docs/design/keys/e2ee-walkthrough.md §7）。
+- `OlmMachine::receive_sync_changes_msc4186` 是 matrix-sdk 的公開 API，吃的就是一串 to-device 事件（禁止用 `receive_sync_changes`：它把「沒給 OTK 數量」當 0，/docs/design/keys/e2ee-walkthrough.md §7）。
   📎 **server 對內容是瞎的**（只存 `type`／`sender`／`content`），這套不改變那件事。
 - ⚠️ **保留期是無窮 TTL**：沒被銷毀的永遠留著，`ItemsDestroy` 是唯一的刪除入口。
   所以「先不刪，之後再說」不會掉東西——但會讓佇列一直長大（server 端有
-  `!admin user to-device-queue` 看得到）。🚫 不要把「反正不會掉」當成不實作銷毀的理由。
+  `!admin user to-device-queue` 看得到）。禁止拿「反正不會掉」當理由省掉銷毀的實作。
 
 ## 8. client 端的實作在哪
 
@@ -215,13 +215,13 @@ Session/Login
 |---|---|---|
 | 1 | `Kind::Device = 0x16` 與八個 subtype 常數 | `crates/wbf-wire/src/pack.rs`（`pack::device`） |
 | 2 | meta 型別與 `counts`／`tc × 8 byte` 的編解碼（對 server 向量逐 byte） | `wbf-sdk/src/protocol.rs` 的 Device 段：`device_fetch`／`device_subscribe`／`device_unsubscribe`／`device_items_destroy`、`parse_device_batch`、`parse_items_destroyed`、`parse_subscribe_reply`、`CryptoStateMeta`、`DevicePushMeta`；連線上是 `WbfClient::device_fetch_window`／`device_subscription`／`device_items_destroy`／`device_unsubscribe` |
-| 3 | `cd_seq`（只是紀錄）與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），🚫 不進 `cache.db` |
+| 3 | `cd_seq`（只是紀錄）與待銷毀清單的落地 | `wbf-sdk/src/to_device_state.rs` → **`m/td.json`**（§2.1），**不**進 `cache.db` |
 | 4 | 訂閱／追平／匯入／銷毀的狀態機 | core `key_sync.rs`（/docs/design/keys/key-sync.md）：推來的與拉的都走 `OlmEngine::import_items`（維護者 2026-09-24：同一支）；gap／匯失敗／壞包就從佇列頭再拉 |
 | 5 | `Superseded`(1505)（§5.1） | 它的 id 是訂閱的 id，會話表把它交進訂閱的 handle 當終點；core 的 task 收到就停、發 `keys.state: stopped`、關掉金鑰那條線 |
 | 6 | 說出口的退出（§4）：下線前 `Unsubscribe` 解除持有 | `WbfClient::device_unsubscribe()`；core 登出前叫（`unsubscribe_keys_of`） |
 | 7 | 「匯入 → 落地 → 銷毀」鎖成一步，呼叫者拿不到錯的順序 | `crypto_engine::OlmEngine::import_items`（`Fetch` 的一窗、或推來的一包）／`pull_to_device` |
 
-⚠️ **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs` 回 `Forbidden`）：所以順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，跟 §7 一致；🚫 不能只 Fetch 不 Subscribe 就想銷毀。`Fetch`／`ItemsDestroy` 因此走金鑰那條線（/docs/design/keys/key-sync.md §1）。
+⚠️ **`ItemsDestroy` 只有持有這台裝置佇列的連線能做**（server `device.rs` 回 `Forbidden`）：所以順序是 `Subscribe` → `Fetch` → 匯入 → `ItemsDestroy`，跟 §7 一致；**不能**只 Fetch 不 Subscribe 就想銷毀。`Fetch`／`ItemsDestroy` 因此走金鑰那條線（/docs/design/keys/key-sync.md §1）。
 
 ## 9. 落地版跟原提案的不同
 

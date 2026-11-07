@@ -465,7 +465,7 @@ impl KeyShareTask {
                     &self.engine,
                     &mut line,
                     &self.events,
-                    "room keys",
+                    self.engine.machine().user_id().as_str(),
                 )
                 .await;
             }

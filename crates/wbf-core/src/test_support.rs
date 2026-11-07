@@ -416,6 +416,8 @@ pub(crate) struct FakeRooms {
     pub(crate) backup: Option<Value>,
     /// `AddBackupKeys` 收下的 body，照順序。
     pub(crate) backup_uploads: Vec<Value>,
+    /// `GetBackupKeys` 回錯：造「對上了、下載失敗」（真 server 整份超過 2 MiB 是 `TooLarge`）。沒設就回空的備份。
+    pub(crate) backup_download_fails: bool,
     /// 下一個 `SignaturesUpload` 回這份 `failures`（一次性）：測「個別簽不進去仍是 200」。
     pub(crate) signature_failures: Option<Value>,
 }
@@ -1026,6 +1028,12 @@ fn room_action_reply(pack: &Pack, rooms: &Arc<Mutex<FakeRooms>>) -> Option<Pack>
         rooms.backup_uploads.push(body);
         let count = rooms.backup_uploads.len();
         return Some(ack(json!({ "etag": count.to_string(), "count": count })));
+    }
+    if is(&endpoints::GET_BACKUP_KEYS) {
+        return Some(match rooms.backup_download_fails {
+            true => not_found(),
+            false => ack(json!({ "rooms": {} })),
+        });
     }
     let answered = [
         &endpoints::CREATE_ROOM,

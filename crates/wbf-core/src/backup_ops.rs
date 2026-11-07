@@ -255,8 +255,7 @@ impl Core {
         Ok((engine, client))
     }
 
-    /// wbf 帳號的 `backup.status`：server 有沒有備份、這台有沒有在上傳、secret storage 在不在、這台有沒有三把交叉簽章私鑰。
-    /// `recovery_state` 照上游 `RecoveryState` 的字：沒有 secret storage 是 `Disabled`；有而這台私鑰齊是 `Enabled`、不齊是 `Incomplete`。
+    /// wbf 帳號的 `backup.status`：server 有沒有備份、這台有沒有在上傳、recovery 的狀態（[`wbf_recovery_state`]）。
     async fn wbf_backup_status(
         &self,
         account: &AccountDir,
@@ -265,20 +264,14 @@ impl Core {
         let exists_on_server = key_backup::find_latest_backup(&mut client).await?.is_some();
         let has_secret_storage = secret_storage::has_secret_storage(&engine, &mut client).await?;
         drop(client);
-        let machine = engine.machine();
-        let uploading_locally = machine.backup_machine().enabled().await;
-        let keys = machine.cross_signing_status().await;
-        let recovery_state = match (has_secret_storage, keys.is_complete()) {
-            (false, _) => "Disabled",
-            (true, true) => "Enabled",
-            (true, false) => "Incomplete",
-        };
+        let uploading_locally = engine.machine().backup_machine().enabled().await;
+        let recovery = wbf_recovery_state(&engine, has_secret_storage, exists_on_server).await;
         let snapshot = room_keys::get_snapshot_status(&account.dir);
         Ok(BackupStatusReport {
             server_backup_exists: exists_on_server,
             uploading_locally,
-            recovery_enabled: has_secret_storage,
-            recovery_state: recovery_state.to_string(),
+            recovery_enabled: recovery.recovery_enabled,
+            recovery_state: recovery.recovery_state,
             local_snapshot: snapshot.exists,
             local_snapshot_bytes: snapshot.bytes,
             local_snapshot_saved_at: snapshot.saved_at,
@@ -308,9 +301,19 @@ impl Core {
         }
         self.events
             .progress("uploading room keys to the server backup...");
-        key_backup::upload_room_keys(&engine, &mut client).await?;
-        let recovery_enabled = secret_storage::has_secret_storage(&engine, &mut client).await?;
+        if let key_backup::UploadOutcome::StoppedAtLimit { batches } =
+            key_backup::upload_room_keys(&engine, &mut client).await?
+        {
+            self.events.progress(format!(
+                "{}: uploaded {batches} batch(es) of room keys; more are left, call backup.upload again",
+                account.label()
+            ));
+        }
+        let has_secret_storage = secret_storage::has_secret_storage(&engine, &mut client).await?;
         drop(client);
+        let recovery_enabled = wbf_recovery_state(&engine, has_secret_storage, true)
+            .await
+            .recovery_enabled;
         let local_snapshot_bytes = match also_save_snapshot {
             true => Some(self.wbf_save_snapshot(account, &engine).await?),
             false => None,
@@ -324,6 +327,8 @@ impl Core {
 
     /// wbf 帳號的 recovery：打開 secret storage、匯交叉簽章私鑰、簽自己這台（別人才信）、有備份金鑰就整份還原並補解 cache 裡的密文。
     /// recovery key 不對就在第一步停下、什麼都沒匯（fail closed，`secret_storage::restore_secrets`）。
+    /// 簽完這台之後的還原房間金鑰失敗只講一聲、**不**回錯：這台已經被信任、recovery key 是對的（呼叫者照樣封進 `r/`），
+    /// 再叫一次 `backup.restore` 就是重試。
     async fn wbf_restore(
         &self,
         account: &AccountDir,
@@ -332,27 +337,42 @@ impl Core {
         let (engine, mut client) = self.wbf_backup_parts(account).await?;
         let restored = secret_storage::restore_secrets(&engine, &mut client, recovery_key).await?;
         cross_signing::sign_this_device(&engine, &mut client).await?;
-        if let Some(backup_key) = restored.backup_key {
-            let report = key_backup::restore_room_keys(&engine, &mut client, backup_key).await?;
-            drop(client);
-            self.events.progress(format!(
-                "restored {} of {} room key(s) from the server backup",
-                report.imported, report.total
-            ));
-            let (cache, me) = self.server_cache_and_me(account)?;
-            crate::identity_ops::decrypt_restored(
-                &engine,
-                &cache,
-                &self.events,
-                &me,
-                &report.sessions,
-            )
-            .await;
-        }
-        Ok(RecoveryStateReport {
-            recovery_enabled: true,
-            recovery_state: "Enabled".to_string(),
-        })
+        let restored_sessions = match restored.backup_key {
+            Some(backup_key) => {
+                match key_backup::restore_room_keys(&engine, &mut client, backup_key).await {
+                    Ok(report) => {
+                        self.events.progress(format!(
+                            "restored {} of {} room key(s) from the server backup",
+                            report.imported, report.total
+                        ));
+                        report.sessions
+                    }
+                    Err(error) => {
+                        self.events.progress(format!(
+                            "{}: this device is verified, but restoring the room keys from the server backup failed (call backup.restore again): {error}",
+                            account.label()
+                        ));
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        // 問不到就當作有：少了備份金鑰時算成 `Incomplete`，不會多報 `Enabled`。
+        let exists_on_server = key_backup::find_latest_backup(&mut client)
+            .await
+            .map_or(true, |found| found.is_some());
+        drop(client);
+        let (cache, me) = self.server_cache_and_me(account)?;
+        crate::identity_ops::decrypt_restored(
+            &engine,
+            &cache,
+            &self.events,
+            &me,
+            &restored_sessions,
+        )
+        .await;
+        Ok(wbf_recovery_state(&engine, true, exists_on_server).await)
     }
 
     async fn wbf_save_snapshot(
@@ -383,5 +403,74 @@ impl Core {
                 &room_keys::snapshot_passphrase(&key),
             )
             .await?)
+    }
+}
+
+/// wbf 帳號的 recovery 狀態，照上游 `Recovery::check_recovery_state` 的算法（一般帳號那條就是它）：
+/// 沒有 secret storage 是 `Disabled`；有，而這台三把交叉簽章私鑰齊、且備份那半也齊（上傳開著，或 server 上根本沒有備份）是 `Enabled`；
+/// 其餘是 `Incomplete`。`recovery_enabled` 只認 `Enabled`。
+///
+/// Args:
+///     has_secret_storage: server 上有沒有預設的 secret storage key, example: true
+///     backup_on_server: server 上有沒有備份版本, example: true
+/// Return:
+///     RecoveryStateReport  `{ recovery_enabled: true, recovery_state: "Enabled" }`／`{ false, "Incomplete" }`／`{ false, "Disabled" }`
+async fn wbf_recovery_state(
+    engine: &OlmEngine,
+    has_secret_storage: bool,
+    backup_on_server: bool,
+) -> RecoveryStateReport {
+    let machine = engine.machine();
+    let cross_signing_complete = machine.cross_signing_status().await.is_complete();
+    let backup_complete = !backup_on_server || machine.backup_machine().enabled().await;
+    let recovery_state = match (
+        has_secret_storage,
+        cross_signing_complete && backup_complete,
+    ) {
+        (false, _) => "Disabled",
+        (true, true) => "Enabled",
+        (true, false) => "Incomplete",
+    };
+    RecoveryStateReport {
+        recovery_enabled: recovery_state == "Enabled",
+        recovery_state: recovery_state.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::test_support::{core_with_wbf_account, memory_client_with_hello, scratch, ME};
+
+    /// rumia（PR #84）：跟上游一樣，server 上有備份而這台沒有它的金鑰是 `Incomplete`，`recovery_enabled` 只認 `Enabled`。
+    #[tokio::test]
+    async fn the_recovery_state_counts_the_backup_key_like_upstream() {
+        let dir = scratch("recovery-state");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let engine = core.olm_engine_of(&account).await.unwrap();
+        let (mut client, _fake) = memory_client_with_hello(Arc::new(Mutex::new(Vec::new()))).await;
+        crate::identity_ops::set_up_identity_and_backup(
+            &engine,
+            &mut client,
+            &core.events,
+            ME,
+            false,
+        )
+        .await;
+        assert!(engine.machine().cross_signing_status().await.is_complete());
+
+        let state = |has_secret_storage, backup_on_server| {
+            let engine = engine.clone();
+            async move { wbf_recovery_state(&engine, has_secret_storage, backup_on_server).await }
+        };
+        let report = |enabled, state: &str| RecoveryStateReport {
+            recovery_enabled: enabled,
+            recovery_state: state.to_string(),
+        };
+        assert_eq!(state(false, true).await, report(false, "Disabled"));
+        assert_eq!(state(true, true).await, report(false, "Incomplete"));
+        assert_eq!(state(true, false).await, report(true, "Enabled"));
     }
 }
