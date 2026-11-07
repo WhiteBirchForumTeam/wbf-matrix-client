@@ -242,6 +242,7 @@
 | `display_name` 送 `null`（cirno） | 沒有就不出現 | §6 |
 | 觀察者 task panic 時清單不清（rumia） | 用 drop 時清的守衛 | `verify_ops.rs` |
 | `upload_quietly` 的帳號字寫成 `"room keys"`（rumia） | 傳帳號的 user id | `key_share.rs` |
+| （修完重跑 e2e 時踩到）core 的 `an_encrypted_conversation_survives_a_new_device_over_the_real_server` 連跑幾次都紅：金鑰與密文同時到，兩邊都沒解到 | 房間推播寫進 cache 之後再解一次 | /docs/design/keys/e2ee-rpc.md §6 |
 
 沒改的：只給 QR 的驗證請求照樣推 `requested`（rumia）——UI 該知道有人來問，`verify.start_sas` 會回錯；
 任何人送驗證請求就被追蹤（oliver）——有上限（上游 10 分鐘逾時），要擋另開一支；`count` 缺時當 0（salvia）——只是計數。

@@ -180,6 +180,10 @@ daemon 自己**不**動作；UI 決定要不要對開著的房叫 `room.refresh_
 - **金鑰到了**（`key_sync.rs` 每匯進一批，`ImportReport.room_keys` 是這批帶來的新房間金鑰）：對每一把，去 cache 找「這個房、用這把 session 加密、還沒解」的
   （`list_undecrypted_ciphertexts(BySession)`，`json_extract(raw_event, '$.content.session_id')`），解開、補存明文，
   **commit 之後照收訊息那條路發 `room.message`**（同一個 `event_id`，UI 當更新）。已經解了的不動、不再發。
+- **房間推播寫進 cache 之後再解一次**（2026-11-07，PR #84 的 e2e 踩到，`room_sync.rs` 的 `retry_after_storing`）：金鑰跟密文同時到時，
+  房間線解的時候金鑰還沒進 store、金鑰線補解掃 cache 的時候密文還沒寫進來，兩邊都沒解到，那則就停在密文直到下次 `room.history`。
+  金鑰線是先 commit 金鑰才掃 cache，房間線是先寫進 cache 才再解：兩邊至少有一邊看得到對方，不靠時序。兩邊都解到時同一則會發兩次解開的 `room.message`（UI 本來就當更新）。
+  📎 這個窗口從 #62 就在；PR #84 開了 `automatic-room-key-forwarding`（解不開時上游多寫一筆「要金鑰」進 store）之後，本機 e2e 連跑幾次都撞到（是不是它把窗口撐大是推測，沒有量）。
 - **`room.history` 讀到還沒解開的**（2026-10-07，`room_crypto.rs` 的 `retry_undecrypted_in_page`）：`sync` 是 `local`／`both` 時，這一頁裡還是密文的那幾則
   拿去再解一次（同一支 `decrypt_stored(… EventIds …)`），解開的補存、換掉頁裡那幾則，**不**發 `room.message`（UI 正在讀這一頁）。
   補的是「金鑰到了、解開了、但當時寫 cache 失敗」那一批：那把金鑰已經匯入，不會再有「金鑰到了」叫它們。再試失敗只發 `Note`、照原樣回頁（**不**讓讀歷史失敗）。
@@ -226,6 +230,7 @@ daemon 自己**不**動作；UI 決定要不要對開著的房叫 `room.refresh_
   - 明文房照舊；`room_devices` 形狀不對是 `Usage`；
   - 補解：cache 裡那把 session 的密文解開、補存、發 `room.message`（同 `event_id`、明文），第二次什麼都不做；
   - 房間線推來的密文存成解開的、`room.message` 帶明文；`DeviceChanged` 原樣轉成 `CoreEvent::DeviceChanged`；
+  - 「寫進 cache 之後再解一次」沒有單元測試：假 server 造不出「解的時候沒有、寫完就有」那個窗口。由下面真 server 那條守（沒有它時本機連跑幾次都紅）；
   - `sync.recent` 拉到的密文在回給 UI 之前解開、**不**發 `room.message`；
   - `to_incoming` 有引擎就解、沒引擎原樣。
 - core `key_share.rs`（一帳號兩條線各接一個假 server；測試裡重試間隔縮成 100–800 毫秒、`ROOM_KEY_WAIT` 縮成 500 毫秒）：
