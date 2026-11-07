@@ -18,6 +18,7 @@
 mod accounts;
 mod backup;
 mod local;
+mod matrix_relay;
 mod media;
 mod room_actions;
 mod rooms;
@@ -484,6 +485,49 @@ impl Handle {
             "room.set_direct" => Box::pin(room_actions::room_set_direct(self, core, params)),
             "account.get_data" => Box::pin(room_actions::account_get_data(self, core, params)),
             "account.set_data" => Box::pin(room_actions::account_set_data(self, core, params)),
+            // 批 3／批 4 其餘的端點（/docs/design/rpc-specs/matrix-relay.md §2）
+            "push.get_rules" => Box::pin(matrix_relay::push_get_rules(self, core, params)),
+            "push.get_global_rules" => {
+                Box::pin(matrix_relay::push_get_global_rules(self, core, params))
+            }
+            "push.get_rule" => Box::pin(matrix_relay::push_get_rule(self, core, params)),
+            "push.set_rule" => Box::pin(matrix_relay::push_set_rule(self, core, params)),
+            "push.delete_rule" => Box::pin(matrix_relay::push_delete_rule(self, core, params)),
+            "push.get_rule_enabled" => {
+                Box::pin(matrix_relay::push_get_rule_enabled(self, core, params))
+            }
+            "push.set_rule_enabled" => {
+                Box::pin(matrix_relay::push_set_rule_enabled(self, core, params))
+            }
+            "push.get_rule_actions" => {
+                Box::pin(matrix_relay::push_get_rule_actions(self, core, params))
+            }
+            "push.set_rule_actions" => {
+                Box::pin(matrix_relay::push_set_rule_actions(self, core, params))
+            }
+            "push.get_pushers" => Box::pin(matrix_relay::push_get_pushers(self, core, params)),
+            "push.set_pusher" => Box::pin(matrix_relay::push_set_pusher(self, core, params)),
+            "push.notifications" => Box::pin(matrix_relay::push_notifications(self, core, params)),
+            "search.events" => Box::pin(matrix_relay::search_events(self, core, params)),
+            "search.users" => Box::pin(matrix_relay::search_users(self, core, params)),
+            "room.relations" => Box::pin(matrix_relay::room_relations(self, core, params)),
+            "room.threads" => Box::pin(matrix_relay::room_threads(self, core, params)),
+            "room.timestamp_to_event" => {
+                Box::pin(matrix_relay::room_timestamp_to_event(self, core, params))
+            }
+            "presence.get" => Box::pin(matrix_relay::presence_get(self, core, params)),
+            "presence.set" => Box::pin(matrix_relay::presence_set(self, core, params)),
+            "filter.create" => Box::pin(matrix_relay::filter_create(self, core, params)),
+            "filter.get" => Box::pin(matrix_relay::filter_get(self, core, params)),
+            "report.event" => Box::pin(matrix_relay::report_event(self, core, params)),
+            "report.room" => Box::pin(matrix_relay::report_room(self, core, params)),
+            "report.user" => Box::pin(matrix_relay::report_user(self, core, params)),
+            "server.capabilities" => {
+                Box::pin(matrix_relay::server_capabilities(self, core, params))
+            }
+            "media.config" => Box::pin(matrix_relay::media_config(self, core, params)),
+            "media.preview_url" => Box::pin(matrix_relay::media_preview_url(self, core, params)),
+            "voip.turn_server" => Box::pin(matrix_relay::voip_turn_server(self, core, params)),
             "sync.recent" => Box::pin(rooms::sync_recent(self, core, params)),
             "upload.file" => Box::pin(media::upload_file(self, core, params)),
             "upload.status" => Box::pin(media::upload_status(self, core, params)),
@@ -1194,6 +1238,83 @@ mod tests {
                 "account.set_data",
                 json!({ "event_type": "x.y", "content": {} }),
             ),
+            // 批 3／批 4 其餘的端點（/docs/design/rpc-specs/matrix-relay.md §2）
+            ("push.get_rules", json!({})),
+            ("push.get_global_rules", json!({})),
+            (
+                "push.get_rule",
+                json!({ "kind": "override", "rule_id": ".m.rule.master" }),
+            ),
+            (
+                "push.set_rule",
+                json!({ "kind": "room", "rule_id": "!r:localhost", "after": "x", "actions": [] }),
+            ),
+            (
+                "push.delete_rule",
+                json!({ "kind": "room", "rule_id": "!r:localhost" }),
+            ),
+            (
+                "push.get_rule_enabled",
+                json!({ "kind": "room", "rule_id": "!r:localhost" }),
+            ),
+            (
+                "push.set_rule_enabled",
+                json!({ "kind": "room", "rule_id": "!r:localhost", "enabled": false }),
+            ),
+            (
+                "push.get_rule_actions",
+                json!({ "kind": "room", "rule_id": "!r:localhost" }),
+            ),
+            (
+                "push.set_rule_actions",
+                json!({ "kind": "room", "rule_id": "!r:localhost", "actions": ["notify"] }),
+            ),
+            ("push.get_pushers", json!({})),
+            (
+                "push.set_pusher",
+                json!({ "pushkey": "k", "app_id": "a", "kind": null }),
+            ),
+            (
+                "push.notifications",
+                json!({ "limit": 5, "only": "highlight" }),
+            ),
+            (
+                "search.events",
+                json!({ "search_categories": { "room_events": { "search_term": "x" } }, "next_batch": "n" }),
+            ),
+            ("search.users", json!({ "search_term": "bob", "limit": 5 })),
+            (
+                "room.relations",
+                json!({ "room": "!r:localhost", "event_id": "$e", "rel_type": "m.annotation", "dir": "b" }),
+            ),
+            (
+                "room.threads",
+                json!({ "room": "!r:localhost", "limit": 5 }),
+            ),
+            (
+                "room.timestamp_to_event",
+                json!({ "room": "!r:localhost", "ts": 1, "dir": "f" }),
+            ),
+            ("presence.get", json!({ "user_id": "@b:localhost" })),
+            (
+                "presence.set",
+                json!({ "presence": "online", "status_msg": "hi" }),
+            ),
+            ("filter.create", json!({ "filter": { "room": {} } })),
+            ("filter.get", json!({ "filter_id": "0" })),
+            (
+                "report.event",
+                json!({ "room": "!r:localhost", "event_id": "$e", "reason": "spam" }),
+            ),
+            ("report.room", json!({ "room": "!r:localhost" })),
+            (
+                "report.user",
+                json!({ "user_id": "@b:localhost", "reason": "spam" }),
+            ),
+            ("server.capabilities", json!({})),
+            ("media.config", json!({})),
+            ("media.preview_url", json!({ "url": "https://example.org" })),
+            ("voip.turn_server", json!({})),
         ];
         for (method, params) in cases {
             let response = handle.call(request(method, params)).await;
@@ -1309,6 +1430,54 @@ mod tests {
             ("verify.cancel", json!({})),
             ("devices.list", json!({})),
             ("backup.restore", json!({ "recovery_key": 7 })),
+            // 批 3／批 4 其餘的端點（/docs/design/rpc-specs/matrix-relay.md §2）：缺必填、型別不對、`event_type` 沒有 `rel_type`
+            ("push.get_rule", json!({ "kind": "room" })),
+            (
+                "push.set_rule",
+                json!({ "rule_id": "!r:localhost", "actions": [] }),
+            ),
+            (
+                "push.set_rule",
+                json!({ "kind": "room", "rule_id": "!r:localhost", "before": 7 }),
+            ),
+            (
+                "push.set_rule_enabled",
+                json!({ "kind": "room", "rule_id": "!r:localhost", "enabled": "no" }),
+            ),
+            (
+                "push.set_rule_actions",
+                json!({ "kind": "room", "rule_id": "!r:localhost", "actions": "notify" }),
+            ),
+            ("push.set_pusher", json!(["k"])),
+            ("push.notifications", json!({ "limit": "five" })),
+            ("search.events", json!({ "next_batch": "n" })),
+            ("search.users", json!({})),
+            (
+                "room.relations",
+                json!({ "room": "!r:localhost", "event_id": "$e", "event_type": "m.reaction" }),
+            ),
+            ("room.relations", json!({ "room": "!r:localhost" })),
+            ("room.threads", json!({})),
+            (
+                "room.timestamp_to_event",
+                json!({ "room": "!r:localhost", "ts": 1 }),
+            ),
+            (
+                "room.timestamp_to_event",
+                json!({ "room": "!r:localhost", "ts": "yesterday", "dir": "f" }),
+            ),
+            ("presence.get", json!({})),
+            ("presence.set", json!({ "status_msg": "hi" })),
+            ("filter.create", json!({ "filter": "room" })),
+            ("filter.get", json!({})),
+            ("report.event", json!({ "room": "!r:localhost" })),
+            ("report.room", json!({ "reason": "spam" })),
+            (
+                "report.user",
+                json!({ "user_id": "@b:localhost", "reason": 7 }),
+            ),
+            ("media.preview_url", json!({})),
+            ("voip.turn_server", json!({ "user": 7 })),
         ];
         for (method, params) in cases {
             let response = handle.call(request(method, params)).await;

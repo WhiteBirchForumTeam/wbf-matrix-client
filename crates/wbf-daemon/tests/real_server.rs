@@ -2137,6 +2137,330 @@ async fn a_new_device_gets_old_room_keys_from_a_verified_device_without_a_backup
     c2.stop().await;
 }
 
+/// 批 3／批 4 其餘的端點從 RPC 走一輪（/docs/design/rpc-specs/matrix-relay.md §7）：params 翻得對、自己的 mxid 由 daemon 填、404 的那幾支回 `null`。
+/// 兩條路回的一樣在 sdk 層驗（`crates/wbf-sdk/tests/e2e_local_server.rs`），這裡只驗 daemon 這一層。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel: WBF_E2E_SERVER, WBF_E2E_REGISTRATION_TOKEN"]
+async fn the_batch_3_and_4_rpcs_walk_the_server() {
+    let server = std::env::var("WBF_E2E_SERVER").expect("WBF_E2E_SERVER");
+    let (alice, password) = register_fresh_user(&server, "mr").await;
+    let (bob, _) = register_fresh_user(&server, "mrb").await;
+    let mut on_alice = Device::login(&server, &alice, &password, Settings::default()).await;
+    let ok = |reply: &Value, what: &str| {
+        assert_eq!(reply["code"], 0, "{what}: {reply}");
+        reply["result"].clone()
+    };
+
+    // 明文房、一則訊息、一個表情：給關聯、討論串、跳到某天、搜尋、檢舉
+    let created = on_alice
+        .call(
+            "room.create",
+            json!({ "encrypted": false, "name": "batch 3 and 4", "preset": "private_chat" }),
+        )
+        .await;
+    let room = ok(&created, "room.create")["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fetched = on_alice
+        .call("room.get", json!({ "room": room, "sync": "both" }))
+        .await;
+    ok(&fetched, "room.get");
+    let sent = on_alice
+        .call(
+            "room.send_text",
+            json!({ "room": room, "body": "a searchable needle" }),
+        )
+        .await;
+    let event_id = ok(&sent, "room.send_text")["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reacted = on_alice
+        .call(
+            "room.react",
+            json!({ "room": room, "event_id": event_id, "key": "👍" }),
+        )
+        .await;
+    ok(&reacted, "room.react");
+
+    let relations = on_alice
+        .call(
+            "room.relations",
+            json!({ "room": room, "event_id": event_id, "rel_type": "m.annotation", "event_type": "m.reaction" }),
+        )
+        .await;
+    let chunk = ok(&relations, "room.relations")["chunk"].clone();
+    assert!(
+        chunk
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["content"]["m.relates_to"]["key"] == "👍"),
+        "{chunk}"
+    );
+    let threads = on_alice
+        .call("room.threads", json!({ "room": room, "limit": 5 }))
+        .await;
+    assert!(ok(&threads, "room.threads")["chunk"].is_array());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let found = on_alice
+        .call(
+            "room.timestamp_to_event",
+            json!({ "room": room, "ts": now_ms + 60_000, "dir": "b" }),
+        )
+        .await;
+    assert!(ok(&found, "room.timestamp_to_event")["event_id"].is_string());
+    let searched = on_alice
+        .call(
+            "search.events",
+            json!({ "search_categories": { "room_events": { "search_term": "needle", "filter": { "rooms": [room] } } } }),
+        )
+        .await;
+    let room_events = ok(&searched, "search.events")["search_categories"]["room_events"].clone();
+    assert!(room_events["results"].is_array(), "{room_events}");
+    let users = on_alice
+        .call(
+            "search.users",
+            json!({ "search_term": alice.trim_start_matches('@').split(':').next().unwrap() }),
+        )
+        .await;
+    assert!(ok(&users, "search.users")["results"].is_array());
+
+    // 推播規則：寫、讀、開關、刪；刪了之後讀是 null
+    let rule = json!({ "kind": "room", "rule_id": room });
+    let mut set_rule = rule.clone();
+    set_rule["actions"] = json!([]);
+    ok(
+        &on_alice.call("push.set_rule", set_rule).await,
+        "push.set_rule",
+    );
+    // `after` 是 query 變數：daemon 漏轉的話，server 照樣 200、只是新規則排到最前面（規格的預設）——讀回順序才看得出來
+    let other_room = "!after-e2e:localhost";
+    ok(
+        &on_alice
+            .call(
+                "push.set_rule",
+                json!({ "kind": "room", "rule_id": other_room, "after": room, "actions": [] }),
+            )
+            .await,
+        "push.set_rule after",
+    );
+    let global = ok(
+        &on_alice.call("push.get_global_rules", json!({})).await,
+        "push.get_global_rules",
+    );
+    let order: Vec<&str> = global["room"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|rule| rule["rule_id"].as_str())
+        .collect();
+    let position = |id: &str| order.iter().position(|listed| *listed == id);
+    assert!(
+        position(&room) < position(other_room) && position(&room).is_some(),
+        "{order:?}"
+    );
+    ok(
+        &on_alice
+            .call(
+                "push.delete_rule",
+                json!({ "kind": "room", "rule_id": other_room }),
+            )
+            .await,
+        "push.delete_rule after",
+    );
+    let read = ok(
+        &on_alice.call("push.get_rule", rule.clone()).await,
+        "push.get_rule",
+    );
+    assert_eq!(read["actions"], json!([]), "{read}");
+    let mut disable = rule.clone();
+    disable["enabled"] = json!(false);
+    ok(
+        &on_alice.call("push.set_rule_enabled", disable).await,
+        "push.set_rule_enabled",
+    );
+    let enabled = ok(
+        &on_alice.call("push.get_rule_enabled", rule.clone()).await,
+        "push.get_rule_enabled",
+    );
+    assert_eq!(enabled, json!({ "enabled": false }));
+    let mut notify = rule.clone();
+    notify["actions"] = json!(["notify"]);
+    ok(
+        &on_alice.call("push.set_rule_actions", notify).await,
+        "push.set_rule_actions",
+    );
+    let actions = ok(
+        &on_alice.call("push.get_rule_actions", rule.clone()).await,
+        "push.get_rule_actions",
+    );
+    assert_eq!(actions, json!({ "actions": ["notify"] }));
+    ok(
+        &on_alice.call("push.delete_rule", rule.clone()).await,
+        "push.delete_rule",
+    );
+    let gone = ok(
+        &on_alice.call("push.get_rule", rule).await,
+        "push.get_rule after delete",
+    );
+    assert_eq!(gone, Value::Null);
+    let rules = ok(
+        &on_alice.call("push.get_rules", json!({})).await,
+        "push.get_rules",
+    );
+    assert!(rules["global"]["override"].is_array(), "{rules}");
+    let global = ok(
+        &on_alice.call("push.get_global_rules", json!({})).await,
+        "push.get_global_rules",
+    );
+    assert_eq!(global, rules["global"]);
+    ok(
+        &on_alice
+            .call(
+                "push.set_pusher",
+                json!({ "pushkey": "rpc-e2e", "app_id": "org.wbftw.e2e", "kind": "http", "app_display_name": "e2e",
+                        "device_display_name": "e2e", "lang": "en", "data": { "url": "https://push.example.org/_matrix/push/v1/notify" } }),
+            )
+            .await,
+        "push.set_pusher",
+    );
+    let pushers = ok(
+        &on_alice.call("push.get_pushers", json!({})).await,
+        "push.get_pushers",
+    );
+    assert!(
+        pushers["pushers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|one| one["pushkey"] == "rpc-e2e"),
+        "{pushers}"
+    );
+    ok(
+        &on_alice
+            .call(
+                "push.set_pusher",
+                json!({ "pushkey": "rpc-e2e", "app_id": "org.wbftw.e2e", "kind": null }),
+            )
+            .await,
+        "push.set_pusher kind null",
+    );
+    let pushers = ok(
+        &on_alice.call("push.get_pushers", json!({})).await,
+        "push.get_pushers",
+    );
+    assert!(
+        pushers["pushers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|one| one["pushkey"] != "rpc-e2e"),
+        "{pushers}"
+    );
+    let notifications = ok(
+        &on_alice
+            .call("push.notifications", json!({ "limit": 5 }))
+            .await,
+        "push.notifications",
+    );
+    assert!(notifications["notifications"].is_array(), "{notifications}");
+
+    // 在線狀態與過濾器：路徑的 user_id 是 daemon 填的自己
+    ok(
+        &on_alice
+            .call(
+                "presence.set",
+                json!({ "presence": "online", "status_msg": "rpc e2e" }),
+            )
+            .await,
+        "presence.set",
+    );
+    let presence = ok(
+        &on_alice
+            .call("presence.get", json!({ "user_id": alice }))
+            .await,
+        "presence.get",
+    );
+    assert_eq!(presence["status_msg"], "rpc e2e", "{presence}");
+    let filter = ok(
+        &on_alice
+            .call(
+                "filter.create",
+                json!({ "filter": { "room": { "timeline": { "limit": 3 } } } }),
+            )
+            .await,
+        "filter.create",
+    );
+    let filter_id = filter["filter_id"].as_str().unwrap().to_string();
+    let read = ok(
+        &on_alice
+            .call("filter.get", json!({ "filter_id": filter_id }))
+            .await,
+        "filter.get",
+    );
+    assert_eq!(read["room"]["timeline"]["limit"], 3, "{read}");
+    let missing = ok(
+        &on_alice
+            .call("filter.get", json!({ "filter_id": "99999999" }))
+            .await,
+        "filter.get missing",
+    );
+    assert_eq!(missing, Value::Null);
+
+    // 檢舉
+    ok(
+        &on_alice
+            .call(
+                "report.event",
+                json!({ "room": room, "event_id": event_id, "reason": "rpc e2e" }),
+            )
+            .await,
+        "report.event",
+    );
+    ok(
+        &on_alice
+            .call("report.room", json!({ "room": room, "reason": "rpc e2e" }))
+            .await,
+        "report.room",
+    );
+    ok(
+        &on_alice
+            .call(
+                "report.user",
+                json!({ "user_id": bob, "reason": "rpc e2e" }),
+            )
+            .await,
+        "report.user",
+    );
+
+    // server 的能力、媒體設定、TURN（沒設定是 null）；連結預覽可能被關（1400），兩種都算對
+    let capabilities = ok(
+        &on_alice.call("server.capabilities", json!({})).await,
+        "server.capabilities",
+    );
+    assert!(capabilities["capabilities"].is_object(), "{capabilities}");
+    ok(
+        &on_alice.call("media.config", json!({})).await,
+        "media.config",
+    );
+    let turn = ok(
+        &on_alice.call("voip.turn_server", json!({})).await,
+        "voip.turn_server",
+    );
+    assert!(turn.is_null() || turn["uris"].is_array(), "{turn}");
+    let preview = on_alice
+        .call("media.preview_url", json!({ "url": "http://127.0.0.1:9/" }))
+        .await;
+    assert!(preview["code"] == 0 || preview["code"] == 1400, "{preview}");
+
+    on_alice.stop().await;
+}
+
 /// `room.history sync=both` 一直問到 `event_id` 那則符合 `wanted` 為止（推播、金鑰都要時間；最多 10 秒），回那則。
 async fn history_until(
     client: &mut Client,
