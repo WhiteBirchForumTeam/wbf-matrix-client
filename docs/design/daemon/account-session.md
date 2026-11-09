@@ -24,7 +24,7 @@
   `WsChannel::connect_anonymous(server)` → `hello` → 看 `protocol` 認不認得 → 丟掉那條線。
 - 探測結果以 **server URL** 為鍵（`Core::backends`）：「這台 server 講不講 wbf」是 server 的事實；探活不帶 token，所以一個帳號的 token 壞了拖累不到別的帳號。
   探不到（連不上、Hello 不回）**只算這一次**、不寫進去，下次重探。
-- 探活在登入**之前**就做得到（§3 的順序需要）。什麼時候作廢：daemon 重開。還沒做：監督者重連時重探（`forget_backend_probe` 沒有正式呼叫點）。
+- 探活在登入**之前**就做得到（§3 的順序需要）。什麼時候作廢：daemon 重開。監督者重連時**不**重探（維護者 2026-11-10，/docs/design/daemon/task-supervision.md §3；`forget_backend_probe` 沒有正式呼叫點）。
 
 ## 2. 兩種 backend，一刀切在探活
 

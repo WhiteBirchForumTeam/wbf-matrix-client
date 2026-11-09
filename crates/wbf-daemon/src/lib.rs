@@ -33,11 +33,12 @@
 //! | `token` | `daemon.token` 的生命週期：權限、三遍覆蓋之後抹掉 |
 //! | `lock` | 資料目錄的獨佔：OS 層排他鎖，拿不到就不啟動 |
 //!
-//! 🚫 這個 crate 不印任何東西到 stdout／stderr（`main.rs` 例外）。
+//! 這個 crate **不**印任何東西到 stdout／stderr（`main.rs` 例外）。
 
 pub mod connection;
 pub mod data_plane;
 pub mod handle;
+pub mod in_flight;
 pub mod lock;
 pub mod message;
 pub mod pack;

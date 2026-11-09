@@ -22,6 +22,7 @@ use wbf_sdk::client::{InviteSubscription, RoomSubscription, WbfClient};
 use wbf_sdk::crypto_engine::OlmEngine;
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::protocol::{EventSubscribeReply, PushMeta};
+use wbf_sdk::task_stop::{StopSignal, StoppableTask};
 use wbf_sdk::IncomingEvent;
 
 use crate::accounts::AccountDir;
@@ -36,20 +37,6 @@ use crate::{Core, CoreEvent};
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// 訂閱 task 每次等推播最久多久：到了只是「這段時間沒事」，繼續等（心跳另外在線上跑）。
 const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// 關訂閱線時等 task 收攤最久多久；不肯就 abort。
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 一個帳號的收推播 task。丟掉就 abort（`Core` 丟掉、或線重開換新的一個）。
-pub(crate) struct RoomSyncHandle {
-    task: tokio::task::JoinHandle<()>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl Drop for RoomSyncHandle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
 
 /// task 自己握著的東西——**不**握 `Core`（task 是 `'static`），也不握線（線在池裡；訂閱是線上的一個會話，guard 放掉之後線照樣能用）。
 struct RoomSyncTask {
@@ -58,6 +45,8 @@ struct RoomSyncTask {
     events: EventSink,
     /// 這個帳號的池：只為了收攤時把訂閱那格關掉（模組註解）。
     pool: Arc<LinkPool>,
+    /// 這個 task 訂在哪一條線上：收攤時只關這一條（那格可能已經換成新的一條，`LinkPool::close_line`）。
+    connection_id: u64,
     /// 解密用；None ＝ 引擎開不起來（講過一聲），密文照存、之後金鑰那半補解。
     engine: Option<Arc<OlmEngine>>,
     /// 邀請推播要記在正在跑的那一輪 `room.invites` 裡（`invites.rs`）。
@@ -126,25 +115,32 @@ impl Core {
             }
             Err(error) => return Err(error.into()),
         };
-        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let Some(connection_id) = crate::link_pool::connection_id_of(client) else {
+            return Err(CoreError::new(
+                crate::error::CoreErrorKind::Usage,
+                "room sync: the rooms line is not a WebSocket line",
+            ));
+        };
         let task = RoomSyncTask {
             me,
             cache,
             events: self.events.clone(),
             pool,
+            connection_id,
             engine,
             invite_rounds: self.invite_rounds.clone(),
         };
-        let handle = RoomSyncHandle {
-            task: tokio::spawn(task.run(subscription, invites, stopped)),
-            stop: Some(stop),
-        };
-        // 舊的（線死了留下來的）在這裡被 Drop、abort。
-        let _previous = self
+        let handle = StoppableTask::spawn(|stop| task.run(subscription, invites, stop));
+        let previous = self
             .room_syncs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
+        // 舊的（線死了留下來的）：叫停、交給停止中的清單，登出與關機等它。禁止在這裡等：這時池握著那格的寫鎖，
+        // 舊 task 收攤時也要那把鎖（`close_line`），在這裡等會互相等。
+        if let Some(previous) = previous {
+            self.retire_task(account, "room sync", previous);
+        }
         Ok(())
     }
 
@@ -158,17 +154,12 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&account.dir);
-        let Some(mut handle) = handle else {
+        let Some(handle) = handle else {
             return false;
         };
-        if handle.task.is_finished() {
-            return false;
-        }
-        if let Some(stop) = handle.stop.take() {
-            let _ = stop.send(());
-        }
-        let _ = tokio::time::timeout(STOP_TIMEOUT, &mut handle.task).await;
-        true
+        let was_running = !handle.is_finished();
+        self.stop_and_wait(account, "room sync", handle).await;
+        was_running
     }
 
     /// Return:
@@ -179,16 +170,17 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&account.dir)
-            .is_some_and(|handle| !handle.task.is_finished())
+            .is_some_and(|handle| !handle.is_finished())
     }
 }
 
 impl RoomSyncTask {
+    /// 安全點是「等下一包」：一包寫進 cache、發完 `room.message`、補解完才看開關（/docs/design/daemon/task-supervision.md §2.1）。
     async fn run(
         self,
         mut subscription: RoomSubscription,
         mut invites: Option<InviteSubscription>,
-        mut stopped: tokio::sync::oneshot::Receiver<()>,
+        mut stop: StopSignal,
     ) {
         // Ack 之前就推來的：跟之後的一樣處理。
         let early: Vec<_> = subscription.early_pushes.drain(..).collect();
@@ -218,7 +210,7 @@ impl RoomSyncTask {
                 }
             };
             let next = tokio::select! {
-                _ = &mut stopped => return,
+                _ = stop.requested() => return,
                 next = subscription.next(PUSH_IDLE_TIMEOUT) => next,
                 invite = next_invite => {
                     match invite {
@@ -275,7 +267,11 @@ impl RoomSyncTask {
             // 訂閱會話結束了 socket 可能還活著（server 送 Error，例如被另一台裝置接手），池的殞死偵測看不出來：
             // 這裡把那格關掉、池發 closed；下次鉤子（link_keeper.rs）才重開、重訂（**不**在這裡重訂）。
             // 線不在池裡（已經被別人關了）就只講一聲。
-            if !self.pool.close(LinkRole::Rooms, &reason).await {
+            if !self
+                .pool
+                .close_line(LinkRole::Rooms, self.connection_id, &reason)
+                .await
+            {
                 self.events.emit(CoreEvent::Link {
                     user: self.me.clone(),
                     role: LinkRole::Rooms,
@@ -580,6 +576,37 @@ mod tests {
             matches!(event, CoreEvent::Note { text, .. } if text.contains("1 pushed event(s) could not be stored"))
         });
         assert!(reported, "存不了的要講出來");
+        fake.task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 關機（/docs/design/daemon/task-supervision.md §2.3）：收推播的 task 收到停止開關、**自己**結束（沒有「等不到」的那句）、
+    /// 線關掉、`cache.db` 寫完佇列關掉（註冊表空了）；之後再推來的不會被寫。
+    #[tokio::test]
+    async fn shutting_down_stops_the_task_on_its_own_and_closes_the_cache() {
+        let dir = scratch("shutdown");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let mut seen = core.subscribe();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (subscription_id, fake, pool) = subscribed(&core, &account, &events).await;
+        events.lock().unwrap().push(text_event(7));
+        fake.outbound
+            .send(push(subscription_id, 0, false, &[text_event(7)]))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut seen).await, "$7");
+
+        core.shutdown().await;
+        assert!(!core.is_room_syncing(&account));
+        assert_eq!(pool.open_count(), 0, "the line is closed");
+        assert!(
+            core.server_caches.lock().unwrap().is_empty(),
+            "cache.db was closed (queue written, writer joined)"
+        );
+        let timed_out = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
+            matches!(event, CoreEvent::Progress { ref text, .. } if text.contains("did not stop"))
+        });
+        assert!(!timed_out, "every task ended on its own");
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

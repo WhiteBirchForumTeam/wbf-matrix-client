@@ -15,7 +15,7 @@ use crate::link::{Heartbeat, Subscription, WsLink, LINE_SILENCE};
 use crate::sessions::ReceivedHook;
 
 /// HTTP 通道（與 matrix-sdk 的 HTTP）一個請求從送出到收到回應的上限：對方黑洞了就回錯，不讓 client 永遠掛著。
-/// WebSocket 🚫 用這個：線在好幾個 client 之間共用，逾時看的是整條線多久沒回應（`link::LINE_SILENCE`）。
+/// WebSocket **不**用這個：線在好幾個 client 之間共用，逾時看的是整條線多久沒回應（`link::LINE_SILENCE`）。
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// 通道的契約。實作只管 bytes 來回；回應是不是 Ack、id／seq 對不對，是 `protocol::expect_ack` 的事。
@@ -68,7 +68,7 @@ pub trait PackChannel {
         ))
     }
 
-    /// 線發的請求號（/docs/design/daemon/link-requests.md §7）：WebSocket 的線在好幾個 client 之間共用，號要由線發、🚫 各自數。
+    /// 線發的請求號（/docs/design/daemon/link-requests.md §7）：WebSocket 的線在好幾個 client 之間共用，號要由線發、禁止各自數。
     ///
     /// Return:
     ///     Some(seq)   線發的
@@ -86,7 +86,7 @@ pub trait PackChannel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
     /// 🚨 **預設**：沒指定就是這條（維護者 2026-09-13）。⭐ 這個 `Default` 是
-    /// 「沒帶 transport 要用什麼」的**唯一一份答案** —— 🚫 不要在別的層再寫一次，
+    /// 「沒帶 transport 要用什麼」的**唯一一份答案** —— 禁止在別的層再寫一次，
     /// 同一個預設有兩個地方決定，遲早只有一邊被改到。
     #[default]
     WebSocket,
@@ -117,7 +117,7 @@ pub enum Channel {
 impl Channel {
     /// Args:
     ///     server: homeserver base URL, example: "http://localhost:6167"
-    ///     access_token: 🚫 不印、不 log
+    ///     access_token: 禁止印出來、禁止寫進 log
     ///     transport: example: Transport::WebSocket
     /// Return:
     ///     Ok(Channel)
@@ -153,6 +153,23 @@ impl Channel {
         match self {
             Channel::WebSocket(channel) => channel.link().is_closed(),
             Channel::Http(_) => false,
+        }
+    }
+
+    /// 關掉、等這條線底下的 task 自己結束（/docs/design/daemon/task-supervision.md §2.1）。HTTP 沒有 task，直接回。
+    ///
+    /// Args:
+    ///     timeout: example: Duration::from_secs(5)
+    /// Return:
+    ///     Ok(())            結束了
+    ///     Err(StopTimedOut) 等不到；task 沒被 abort
+    pub async fn close_and_wait(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), crate::task_stop::StopTimedOut> {
+        match self {
+            Channel::WebSocket(channel) => channel.link().close_and_wait(timeout).await,
+            Channel::Http(_) => Ok(()),
         }
     }
 }
@@ -245,7 +262,7 @@ impl WsChannel {
     }
 
     /// **不帶 token** 的連線：只給探活（/docs/design/daemon/account-session.md §1）。server 允許未登入的升級，30 秒內只接受 `Hello`／`Ping`，
-    /// 之後自己關；所以拿到 `Hello` 的答案就把它丟掉。🚫 不要拿它做別的事。
+    /// 之後自己關；所以拿到 `Hello` 的答案就把它丟掉。禁止拿它做別的事。
     pub async fn connect_anonymous(server: &str) -> Result<WsChannel, SdkError> {
         WsChannel::connect_inner(server, None, crate::sessions::no_hook(), Heartbeat::OFF).await
     }
@@ -278,7 +295,7 @@ impl WsChannel {
                             code: "Unauthorized".into(),
                             message: "websocket upgrade refused: token invalid".into(),
                             meta: serde_json::Value::Null,
-                            // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+                            // **不是** wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
                             code_id: None,
                         }
                     }
@@ -302,7 +319,7 @@ impl WsChannel {
 }
 
 impl PackChannel for WsChannel {
-    /// 等到回覆為止，整條線沉默（`LINE_SILENCE`）才算逾時：同一條線上別的 client 的回覆還在流進來，就🚫 算這個請求沒人理。
+    /// 等到回覆為止，整條線沉默（`LINE_SILENCE`）才算逾時：同一條線上別的 client 的回覆還在流進來，就**不**算這個請求沒人理。
     async fn request(&mut self, pack: Pack) -> Result<Pack, SdkError> {
         self.link.request_until_silent(pack, LINE_SILENCE).await
     }
@@ -411,7 +428,7 @@ impl PackChannel for HttpChannel {
                 code: "Unauthorized".into(),
                 message: "http pack refused: token invalid".into(),
                 meta: serde_json::Value::Null,
-                // 🚫 不是 wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+                // **不是** wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
                 code_id: None,
             }),
             _ => Err(SdkError::Network(format!("http pack: status {status}"))),

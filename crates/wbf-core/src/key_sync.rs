@@ -24,6 +24,7 @@ use wbf_sdk::client::{DeviceSubscription, WbfClient};
 use wbf_sdk::crypto_engine::{ImportReport, OlmEngine};
 use wbf_sdk::login::SessionBackend;
 use wbf_sdk::protocol::{CryptoStateMeta, SubscribeReply};
+use wbf_sdk::task_stop::{StopSignal, StoppableTask};
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
@@ -38,20 +39,6 @@ use crate::{Core, CoreEvent};
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// task 每次等推播最久多久：到了只是「這段時間沒事」，繼續等（心跳另外在線上跑）。
 const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// 收 task 時等它收攤最久多久；不肯就 abort。
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 一個帳號的收金鑰 task。丟掉就 abort（`Core` 丟掉、或線重開換新的一個）。
-pub(crate) struct KeySyncHandle {
-    task: tokio::task::JoinHandle<()>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl Drop for KeySyncHandle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
 
 /// task 自己握著的東西——**不**握 `Core`、不握線：線在池裡，要用時 `reuse` 那一格（`Fetch`／`ItemsDestroy` 要走訂閱線）。
 struct KeySyncTask {
@@ -59,6 +46,8 @@ struct KeySyncTask {
     engine: Arc<OlmEngine>,
     events: EventSink,
     pool: Arc<LinkPool>,
+    /// 這個 task 訂在哪一條線上：收攤時只關這一條（`LinkPool::close_line`）。
+    connection_id: u64,
     /// 金鑰到了補解那些訊息用。
     cache: Arc<ServerCache>,
     /// 補一次性金鑰失敗時交給金鑰線的後台重試（起不了就是 None）。
@@ -221,27 +210,33 @@ impl Core {
             server_backup,
         )
         .await;
-        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let Some(connection_id) = crate::link_pool::connection_id_of(client) else {
+            return Err(CoreError::new(
+                CoreErrorKind::Usage,
+                "keys: the keys line is not a WebSocket line",
+            ));
+        };
         let task = KeySyncTask {
             me,
             engine,
             events: self.events.clone(),
             pool,
+            connection_id,
             cache,
             key_share: key_share.clone(),
             background_backup: self.background_backup.clone(),
             verify,
         };
-        let handle = KeySyncHandle {
-            task: tokio::spawn(task.run(subscription, stopped)),
-            stop: Some(stop),
-        };
-        // 舊的（線死了留下來的）在這裡被 Drop、abort。
-        let _previous = self
+        let handle = StoppableTask::spawn(|stop| task.run(subscription, stop));
+        let previous = self
             .key_syncs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(account.dir.clone(), handle);
+        // 舊的（線死了留下來的）：叫停、交給停止中的清單。禁止在這裡等（理由同 `init_rooms`：池握著那格的寫鎖）。
+        if let Some(previous) = previous {
+            self.retire_task(account, "key sync", previous);
+        }
         // 線沒開時沒送成的（含上次 daemon 留下的），現在再跑一輪。
         // 它要等這格開好才拿得到線（`reuse` 排在開線的寫鎖後面），禁止在這裡等它。
         if let Some(inbox) = &key_share {
@@ -260,17 +255,12 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&account.dir);
-        let Some(mut handle) = handle else {
+        let Some(handle) = handle else {
             return false;
         };
-        if handle.task.is_finished() {
-            return false;
-        }
-        if let Some(stop) = handle.stop.take() {
-            let _ = stop.send(());
-        }
-        let _ = tokio::time::timeout(STOP_TIMEOUT, &mut handle.task).await;
-        true
+        let was_running = !handle.is_finished();
+        self.stop_and_wait(account, "key sync", handle).await;
+        was_running
     }
 
     /// 說出口的退出（wbfuwunel 的 /docs/design/wbf-to-device.md §4）：下線前對訂閱線送 `Device/Unsubscribe`。線沒開就沒事；失敗只講一聲（token 之後也撤了）。
@@ -302,16 +292,13 @@ impl Core {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&account.dir)
-            .is_some_and(|handle| !handle.task.is_finished())
+            .is_some_and(|handle| !handle.is_finished())
     }
 }
 
 impl KeySyncTask {
-    async fn run(
-        self,
-        mut subscription: DeviceSubscription,
-        mut stopped: tokio::sync::oneshot::Receiver<()>,
-    ) {
+    /// 安全點是「等下一包」：一包匯進 crypto store、銷毀、補解、上傳備份都做完才看開關（/docs/design/daemon/task-supervision.md §2.1）。
+    async fn run(self, mut subscription: DeviceSubscription, mut stop: StopSignal) {
         // 要拉一次：有東西可能還留在佇列裡沒進 store（gap、壞包、收件匣滿、匯失敗）。拉失敗就留著這個旗，
         // 下一個事件或下一次閒置逸時（60 秒）再拉——**不**在原地狂試。佇列頭就是水位，所以中間照樣匯推來的包也不會越過什麼。
         let mut needs_pull = false;
@@ -321,7 +308,7 @@ impl KeySyncTask {
                 needs_pull = true;
             }
             let next = tokio::select! {
-                _ = &mut stopped => return,
+                _ = stop.requested() => return,
                 next = subscription.next(PUSH_IDLE_TIMEOUT) => next,
             };
             // 訂閱還活著的那幾種回 `None`；「訂閱結束了」回原因。
@@ -373,7 +360,11 @@ impl KeySyncTask {
                 room_keys: None,
                 reason: Some(why.clone()),
             });
-            if !self.pool.close(LinkRole::Keys, &why).await {
+            if !self
+                .pool
+                .close_line(LinkRole::Keys, self.connection_id, &why)
+                .await
+            {
                 self.events.emit(CoreEvent::Link {
                     user: self.me.clone(),
                     role: LinkRole::Keys,

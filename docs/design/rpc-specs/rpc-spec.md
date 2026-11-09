@@ -450,7 +450,10 @@ wbf 帳號的交叉簽章與備份版本在金鑰線開好時自動就位、新�
 - 訂閱是**每條連線一份**，連線關了就沒了。`user` 是這條連線的一個設定：後一次 `subscribe` 帶了就蓋掉前一次的，沒帶就不動。
 - **什麼都沒訂的連線連 `desync` 也不收**：它本來就收不到任何推播，漏了沒有東西可漏。
 - `cancel` 只對長工作有意義（`room.send_file`、`upload.file`、`media.export_to`、`sync.recent`）；
-  對已經回完的 `id` → `was_running: false`，不是錯誤。
+  對已經回完的 `id`、別的連線的 `id` → `was_running: false`，**不**是錯誤。
+- 取消是**合作式**的（/docs/design/daemon/daemon-runtime.md §8）：長工作在自己的安全點（上傳讀下一塊之前、`sync.recent` 一批寫完之後）看到才停，回 `105`。
+  短請求被取消時**照樣做完、回正常結果**，而 `cancel` 照樣回 `was_running: true`：前端要以那個請求自己的回應為準。
+- 前端關掉連線**不**算取消（§1.2）；`daemon.shutdown` 會先等在跑的請求最多 10 秒，還沒完的才送取消（/docs/design/daemon/task-supervision.md §2.3）。
 
 ## 4. 推播（沒有 `id` 的請求，daemon → 前端）
 
@@ -595,7 +598,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 |---|---|---|---|
 | `hello`、`daemon.info`／`set_encryption`／`shutdown` | ✅ daemon 層 | 本機 | ✅ |
 | `subscribe`／`unsubscribe` | ✅ daemon 層（每條連線一份集合，`server.rs`；/docs/design/daemon/link-pool.md §6） | 本機 | ✅ |
-| `cancel` | ❌（daemon 層） | — | ❌ |
+| `cancel` | ✅ daemon 層（`in_flight.rs`；安全點在 core 的 `job.rs`） | 本機 | ✅ |
 | `desync` 推播（§4） | ✅ daemon 層（broadcast `Lagged` → `desync`） | 本機 | ✅ |
 | `link.state`／`pack.received` 推播（§4） | ✅ `CoreEvent::Link`／`Received`（連線池，/docs/design/daemon/link-pool.md） | **WS** 五條線 | ✅ |
 | **`sync` 參數**（§2：`room.list`／`get`／`read`／`history`／`files`／`media.info`，以及 §3.3.1 寫本地的房間動作）＋回應回報用了哪一種 | ✅ `SyncMode`：`local` 讀 `cache.db`、`server` 不寫庫、`both` 寫完再讀本地；房間動作是 `WriteSync`（沒帶是 `both`、`local`／`null` 是 102、不回報） | 本機（`local`）／同下面那幾列 | ✅ |

@@ -19,7 +19,7 @@ use crate::{Core, Target};
 impl Core {
     /// 這個帳號封著的 session。
     ///
-    /// 🚫 **回傳值不准離開這個 crate**：`Session::access_token` 是秘密。要給外面看
+    /// **禁止讓回傳值離開這個 crate**：`Session::access_token` 是秘密。要給外面看
     /// 「我是誰」用 [`crate::WhoAmI`]。
     ///
     /// Return:
@@ -46,14 +46,14 @@ impl Core {
     /// Args:
     ///     server_backup: conf 的 `SERVER_BACKUP`（/docs/design/rpc-specs/wbf-cli-spec.md §10）, example: true
     ///
-    /// ⚠️ 這個旗標由**呼叫端**帶進來，🚫 core 自己不讀 conf——那是「代前端做決定」（/docs/design/overview/architecture-v2.md §3）。
+    /// ⚠️ 這個旗標由**呼叫端**帶進來，core 自己**不**讀 conf——那是「代前端做決定」（/docs/design/overview/architecture-v2.md §3）。
     pub(crate) async fn backend_of(
         &self,
         account: &AccountDir,
         server_backup: bool,
     ) -> Result<MatrixBackend, CoreError> {
         let session = self.session_of(account)?;
-        // wbf 帳號沒有 Client（/docs/design/daemon/account-session.md §2）：要用它的呼叫點就是還沒搬到 WS 上的那幾支，明講、🚫 不靜默失效。
+        // wbf 帳號沒有 Client（/docs/design/daemon/account-session.md §2）：要用它的呼叫點就是還沒搬到 WS 上的那幾支，明講、**不**靜默失效。
         if session.backend == Some(SessionBackend::WbfSdk) {
             return Err(no_matrix_client_error(account, "this call"));
         }
@@ -94,9 +94,9 @@ impl Core {
 
     /// 這個帳號所屬 server 的 `cache.db`（/docs/design/storage/local-cache-db.md §5，同 server 的帳號共用）。
     ///
-    /// 解不開、舊 schema 就重建（/docs/design/storage/local-cache-db.md §1）；既有的庫照它自己記的 server 開，host 不同就拒絕、🚫 不重建
+    /// 解不開、舊 schema 就重建（/docs/design/storage/local-cache-db.md §1）；既有的庫照它自己記的 server 開，host 不同就拒絕、**不**重建
     /// （[`Core::find_recorded_cache_identity`]）。重建時發一個 `Progress` 事件說一聲——
-    /// 🚫 不是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
+    /// **不**是 `eprintln!`：core 不印東西（`event` 模組的模組註解寫了為什麼）。
     /// 📌 只給測試：正式碼碰 `cache.db` 一律經 [`Core::server_cache_of`]（唯一寫入者）。
     #[cfg(test)]
     pub(crate) fn cache_of(&self, account: &AccountDir, server: &str) -> Result<Cache, CoreError> {
@@ -133,13 +133,13 @@ impl Core {
     /// ⭐ **一個 server dir 一份，開了就留著**：多個寫入者就沒有順序可言（水位會倒退），
     /// 而且每次重開都要付一次 SQLCipher 導金鑰。
     ///
-    /// ⚠️ **註冊表的鎖握滿「查、開、放進去」整段**，🚫 不是查完就放掉 —— 放掉的話兩個
+    /// ⚠️ **註冊表的鎖握滿「查、開、放進去」整段**，**不**是查完就放掉 —— 放掉的話兩個
     /// 呼叫端會同時看到 miss、同時 `Cache::open` 同一個檔（重建那條路會刪檔重造），
     /// 而且兩個寫入者是真的都起來了，只是後到的那個馬上被丟掉。⭐ **「一個 server dir
     /// 只有一個寫入者」要靠結構成立，不能靠時序恰好沒撞上**（PR #32 審查 cirno🔴）。
     ///
     /// 📎 代價是開庫期間別的呼叫端（含 `cache_queue_len`）會等 —— 那正是要的：
-    /// 它們等的就是同一份東西。🚫 這中間沒有 `await`，所以不會跨 await 持鎖。
+    /// 它們等的就是同一份東西。這中間**沒有** `await`，所以不會跨 await 持鎖。
     ///
     /// Args:
     ///     account: 哪個帳號（它決定 server dir）
@@ -161,16 +161,16 @@ impl Core {
             })
     }
 
-    /// 同 [`Core::server_cache_of`]，但 **`cache.db` 不在就不開**（🚫 不建一個空的）。
+    /// 同 [`Core::server_cache_of`]，但 **`cache.db` 不在就不開**（**不**建一個空的）。
     ///
     /// ⭐ 「在不在」跟「開」在**同一把註冊表的鎖裡**判斷（PR #40 審查 rumia🟡）：
-    /// 用在「只是要處理既有資料」的路徑（`destroy` 的忘掉鏈），🚫 不先 `exists()` 再另外呼叫開庫。
+    /// 用在「只是要處理既有資料」的路徑（`destroy` 的忘掉鏈），**不**先 `exists()` 再另外呼叫開庫。
     /// ⚠️ 還剩的窗口：`log_out` 的 `close_server_cache` 與刪檔之間沒有同一把鎖（既有行為，不在這裡）。
     ///
-    /// 🚨 **既有的庫照它自己記的 server 開，🚫 不拿 `server` 參數去比對**：參數可能是使用者打的 `--server`，
+    /// 🚨 **既有的庫照它自己記的 server 開，不拿 `server` 參數去比對**：參數可能是使用者打的 `--server`，
     /// 拼法（scheme、大小寫、結尾的 `/`）跟庫裡記的不同時，[`wbf_sdk::cache::Cache::open`] 會當成別台 server 的庫
     /// 整份刪掉重建——同 server 其他帳號的快取、只存在本機的已讀與隱藏標記一起沒了。
-    /// 目錄本來就是照正規化的 host 找到的；連 host 都對不上就拒絕（fail closed），🚫 不猜、🚫 不重建。
+    /// 目錄本來就是照正規化的 host 找到的；連 host 都對不上就拒絕（fail closed），**不**猜、**不**重建。
     ///
     /// Return:
     ///     Ok(Some(Arc<ServerCache>))  已經開著、或檔案在而開起來了
@@ -185,7 +185,7 @@ impl Core {
         self.open_server_cache(account, server, OpenWhen::FileExists)
     }
 
-    /// 開 `cache.db` 用哪個身分：**既有的庫照它自己 `meta` 記的**，🚫 不拿呼叫端的字串逐字比對。
+    /// 開 `cache.db` 用哪個身分：**既有的庫照它自己 `meta` 記的**，**不**拿呼叫端的字串逐字比對。
     /// 三條開庫的路（[`Core::cache_of`]、`OpenWhen::Always`、`OpenWhen::FileExists`）都在這裡決定，只有這一處。
     ///
     /// ⚠️ 為什麼：`session.server` 只去掉結尾的 `/`，scheme、大小寫照存；同一台 server 的兩個帳號拼法不同
@@ -199,7 +199,7 @@ impl Core {
     /// Return:
     ///     Ok(Some(CacheIdentity))  有可用的庫（檔在、解得開、schema 對），而且 host 跟 `server` 同一台
     ///     Ok(None)                 沒有可用的庫（沒檔、解不開、舊 schema）：要開的話照 `server` 建或重建
-    ///     Err(Usage)               庫記的 host 跟 `server` 不同：拒絕，🚫 不重建（fail closed）
+    ///     Err(Usage)               庫記的 host 跟 `server` 不同：拒絕，**不**重建（fail closed）
     fn find_recorded_cache_identity(
         &self,
         dir: &std::path::Path,
@@ -208,7 +208,9 @@ impl Core {
         let Some(recorded) = Cache::read_identity(dir, &self.vault()?.cache_key())? else {
             return Ok(None);
         };
-        if crate::accounts::server_host_of(&recorded.server) != crate::accounts::server_host_of(server) {
+        if crate::accounts::server_host_of(&recorded.server)
+            != crate::accounts::server_host_of(server)
+        {
             return Err(CoreError::new(
                 CoreErrorKind::Usage,
                 format!(
@@ -237,7 +239,7 @@ impl Core {
         }
         let identity = match (self.find_recorded_cache_identity(&dir, server)?, when) {
             (Some(recorded), _) => recorded,
-            // 只是要處理既有資料，而沒有可用的庫：🚫 不為了它建一個空的。
+            // 只是要處理既有資料，而沒有可用的庫：**不**為了它建一個空的。
             (None, OpenWhen::FileExists) => return Ok(None),
             (None, OpenWhen::Always) => CacheIdentity {
                 server: server.to_string(),
@@ -282,7 +284,7 @@ impl Core {
     /// Return:
     ///     Ok(true)    本來開著、現在關了
     ///     Ok(false)   本來就沒開
-    ///     Err(Io)     還有別的請求拿著它 —— 🚫 不從它們底下抽掉，登出重試一次就好（清理是冪等的）
+    ///     Err(Io)     還有別的請求拿著它 —— **不**從它們底下抽掉，登出重試一次就好（清理是冪等的）
     pub(crate) fn close_server_cache(
         &self,
         server_dir: &std::path::Path,
@@ -309,6 +311,27 @@ impl Core {
         }
     }
 
+    /// 關機：每個 `cache.db` 把佇列寫完、join 寫入執行緒才回（/docs/design/daemon/task-supervision.md §2.3 第 5 步）。
+    /// 光丟掉 `Core` 不夠：`ServerCache` 丟掉時寫入執行緒沒人 join，程序接著結束就可能寫到一半。
+    /// 還有人握著的（等不到結束的背景 task）關不了：講一聲，它的佇列只能交給程序結束前的那一刻。
+    pub(crate) fn close_all_server_caches(&self) {
+        let server_dirs: Vec<std::path::PathBuf> = self
+            .server_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for server_dir in server_dirs {
+            if let Err(error) = self.close_server_cache(&server_dir) {
+                self.events.progress(format!(
+                    "{} was not closed cleanly: {error}",
+                    server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).display()
+                ));
+            }
+        }
+    }
+
     /// 這個帳號所屬 server 的媒體儲存池（/docs/design/media/media-pool.md），跟 `cache.db` 同層。
     pub(crate) fn pool_of(&self, account: &AccountDir) -> Result<MediaPool, CoreError> {
         Ok(MediaPool::open(
@@ -330,7 +353,7 @@ enum OpenWhen {
 /// 每個 server dir 上 [`Core::cache_of`] 開過幾次**繞過唯一寫入者**的連線。
 ///
 /// 🚨 daemon 裡一台 server 只准一個寫入者（`ServerCache`，#32）；會刪東西的路徑（`destroy_account`）
-/// 🚫 不准走這條。按目錄計數，理由跟 `server_cache::WRITERS_STARTED` 一樣：並行的測試不會互相抬高。
+/// 禁止走這條。按目錄計數，理由跟 `server_cache::WRITERS_STARTED` 一樣：並行的測試不會互相抬高。
 /// 📎 只在測試編譯：正式 build 不付每次開庫加鎖的成本（PR #40 審查 cirno🟡2）。
 #[cfg(test)]
 static RAW_CACHE_OPENS: std::sync::LazyLock<
@@ -350,7 +373,7 @@ pub(crate) fn get_raw_cache_opens_for(server_dir: &std::path::Path) -> usize {
 }
 
 /// wbf 帳號不建 matrix-sdk 的 Client（/docs/design/daemon/account-session.md §2），所以還掛在 Client 上的那幾支對它是**關的**——
-/// 講清楚是哪一支、為什麼、去哪看清單（/docs/design/daemon/account-session.md §6），🚫 不靜默失效、不裝成「連不上」。
+/// 講清楚是哪一支、為什麼、去哪看清單（/docs/design/daemon/account-session.md §6），**不**靜默失效、不裝成「連不上」。
 ///
 /// Args:
 ///     account: 哪個帳號
@@ -410,7 +433,7 @@ mod tests {
 
         let cache = core.server_cache_of(&account, SERVER).unwrap();
         // ⚠️ 這件工作**故意慢**，寫完才立旗標。`close` 一回來就看旗標：有等寫入執行緒 → 一定立了；
-        // 沒等 → `close` 幾微秒就回來、工作還在睡。🚫 不靠「重新開庫讀讀看」——那要花的時間
+        // 沒等 → `close` 幾微秒就回來、工作還在睡。**不**靠「重新開庫讀讀看」——那要花的時間
         // 可能比睡的還久，舊執行緒照樣來得及寫完，測試就驗不到「close 會等」（變異驗證時抓到兩次）。
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let finished_in_job = finished.clone();
@@ -424,7 +447,7 @@ mod tests {
             Vec::new(),
         );
 
-        // 🚫 別人還拿著（這裡的 `cache`）：不准從它底下抽掉。
+        // 別人還拿著（這裡的 `cache`）：禁止從它底下抽掉。
         assert!(core.close_server_cache(&server_dir).is_err());
         assert!(is_registered(&core, &server_dir), "拒絕時要原樣放回去");
 
@@ -468,7 +491,7 @@ mod tests {
         drop(core.server_cache_of(&account, SERVER).unwrap());
         assert!(server_dir.join(wbf_sdk::cache::CACHE_FILE_NAME).exists());
 
-        // 🚫 不封 session：`is_logged_in()` 是 false，登出不必連網路就走到本地清理。
+        // **不**封 session：`is_logged_in()` 是 false，登出不必連網路就走到本地清理。
         core.log_out("@alice:localhost", None, true, false)
             .await
             .expect("最後一個帳號登出要成功");
@@ -495,7 +518,7 @@ mod tests {
     ///   八條同時第一次開同一個檔，建表那段是排他的，`busy_timeout` 也救不了。
     ///   ⭐ 所以那不只是「多一條孤兒寫入者」，是**開不起來**。
     ///
-    /// 🚫 光比 `Arc::ptr_eq` 抓不到多開這件事：輸家拿到的就是贏家那一份，位址本來就相等。
+    /// 光比 `Arc::ptr_eq` 抓**不**到多開這件事：輸家拿到的就是贏家那一份，位址本來就相等。
     #[test]
     fn eight_threads_asking_for_one_server_cache_start_exactly_one_writer() {
         let dir = scratch("one-writer");

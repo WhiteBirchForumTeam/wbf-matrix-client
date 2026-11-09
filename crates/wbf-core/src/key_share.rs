@@ -17,6 +17,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use wbf_sdk::crypto_engine::{OlmEngine, RoomKeyRotation, RoomKeyState};
+use wbf_sdk::task_stop::{StopSignal, StoppableTask};
 
 use crate::accounts::AccountDir;
 use crate::error::CoreError;
@@ -34,8 +35,6 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 const RETRY_FIRST: Duration = Duration::from_millis(100);
 #[cfg(test)]
 const RETRY_MAX: Duration = Duration::from_millis(800);
-/// 收 task 時等它結束最久多久（abort 之後通常下一次 poll 就放手）。
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 送出等房間金鑰就緒最久多久（維護者 2026-10-06：2 秒），等不到那一則就回「金鑰還沒準備好」。
 #[cfg(not(test))]
 pub(crate) const ROOM_KEY_WAIT: Duration = Duration::from_secs(2);
@@ -111,19 +110,20 @@ impl KeyShareInbox {
     }
 }
 
-/// 一個帳號的後台。丟掉就 abort（登出、`Core` 丟掉）。
+/// 一個帳號的後台。登出、關機用 `stop_room_key_share_of` 叫停並等它結束；丟掉只送停止開關（`StoppableTask`）。
 pub(crate) struct KeyShareHandle {
     inbox: KeyShareInbox,
     readiness: Arc<RoomKeyReadiness>,
-    task: tokio::task::JoinHandle<()>,
+    task: StoppableTask,
     /// 試過幾次（分一個房、或重傳一次自己的金鑰；只給測試：做成之後再試不會走橋，從假 server 看不出來有沒有停）。
     #[cfg(test)]
     attempts: Arc<std::sync::atomic::AtomicU32>,
 }
 
-impl Drop for KeyShareHandle {
-    fn drop(&mut self) {
-        self.task.abort();
+impl KeyShareHandle {
+    /// 關機：只要那個 task（叫停、等它）。
+    pub(crate) fn into_task(self) -> StoppableTask {
+        self.task
     }
 }
 
@@ -259,28 +259,19 @@ impl Core {
         Ok(self.key_share_parts(account).await?.0)
     }
 
-    /// 收掉這個帳號的後台（登出用），**等它真的結束**才回：task 握著引擎（`m/` 的 sqlite），
-    /// 只 abort 不等的話它要等下一次被 poll 才放手，而登出接著就要刪 `m/`（Windows 上開著刪不掉；單執行緒的 runtime 上刪檔的重試還會擋住它被 poll）。
+    /// 收掉這個帳號的後台（登出、關機用），**等它自己結束**才回：手上那一輪分完、記好「已送」才停（/docs/design/daemon/task-supervision.md §2.1）。
+    /// task 握著引擎（`m/` 的 sqlite），登出接著就要刪 `m/`（Windows 上開著刪不掉），所以一定要等。
     pub(crate) async fn stop_room_key_share_of(&self, account: &AccountDir) {
         let handle = self
             .key_shares
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&account.dir);
-        let Some(mut handle) = handle else {
+        let Some(handle) = handle else {
             return;
         };
-        handle.task.abort();
-        if tokio::time::timeout(STOP_TIMEOUT, &mut handle.task)
-            .await
-            .is_err()
-        {
-            self.events.progress(format!(
-                "room keys: the background key sender for {} did not stop within {}s",
-                account.label(),
-                STOP_TIMEOUT.as_secs()
-            ));
-        }
+        self.stop_and_wait(account, "the background key sender", handle.task)
+            .await;
     }
 
     /// 交一件房間金鑰的事給後台；起不了就講一聲。
@@ -343,7 +334,7 @@ impl Core {
             KeyShareHandle {
                 inbox: inbox.clone(),
                 readiness: readiness.clone(),
-                task: tokio::spawn(task.run(receiver)),
+                task: StoppableTask::spawn(|stop| task.run(receiver, stop)),
                 #[cfg(test)]
                 attempts,
             },
@@ -381,7 +372,8 @@ impl Core {
 }
 
 impl KeyShareTask {
-    async fn run(self, mut work: UnboundedReceiver<KeyShareWork>) {
+    /// 安全點是「等下一件事」：手上那一輪（上傳自己的金鑰、分完每間房、記好就緒）做完才看開關（/docs/design/daemon/task-supervision.md §2.1）。
+    async fn run(self, mut work: UnboundedReceiver<KeyShareWork>, mut stop: StopSignal) {
         // 要分的房（同一個房只留一件，要的取最新）；剛送出、要看該不該提早換的房。
         let mut rooms: BTreeMap<String, RoomKeyWant> = BTreeMap::new();
         let mut used: BTreeMap<String, RoomKeyWant> = BTreeMap::new();
@@ -389,19 +381,20 @@ impl KeyShareTask {
         let mut retry_in = RETRY_FIRST;
         let mut retry_at: Option<Instant> = None;
         loop {
-            // 等下一件事；有事在等重試就最多等到那一刻。收的那頭沒人了（`Core` 丟掉）就結束。
-            let next = match retry_at {
-                Some(at) => tokio::select! {
-                    next = work.recv() => match next {
-                        Some(next) => Some(next),
-                        None => return,
-                    },
-                    () = tokio::time::sleep_until(at) => None,
-                },
-                None => match work.recv().await {
+            // 等下一件事；有事在等重試就最多等到那一刻。叫停了、或收的那頭沒人了（`Core` 丟掉）就結束。
+            let retry_wait = async {
+                match retry_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let next = tokio::select! {
+                _ = stop.requested() => return,
+                next = work.recv() => match next {
                     Some(next) => Some(next),
                     None => return,
                 },
+                () = retry_wait => None,
             };
             take_work(&mut rooms, &mut used, &mut upload_own_keys, next);
             while let Ok(more) = work.try_recv() {

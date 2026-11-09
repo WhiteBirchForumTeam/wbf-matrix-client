@@ -113,7 +113,7 @@ pub enum AccountAction {
 /// 它跟帳號目錄分開放，所以 `logout` 不會刪掉——那正是它存在的意義。
 #[derive(Subcommand)]
 pub enum RecoveryAction {
-    /// 列出這台機器保管著誰的 recovery key（只解檔名，🚫 不印金鑰本身）
+    /// 列出這台機器保管著誰的 recovery key（只解檔名，不印金鑰本身）
     List,
     /// 印出某個帳號的 recovery key。⚠️ 這會把秘密印到 stdout
     Show {
@@ -351,7 +351,7 @@ const MAIN_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    // 執行緒或 runtime 起不來就沒有這支程式（「必須要開」的層級）——但停也要講清楚、給 exit code，🚫 不 panic。
+    // 執行緒或 runtime 起不來就沒有這支程式（「必須要開」的層級）——但停也要講清楚、給 exit code，禁止 panic。
     let spawned = std::thread::Builder::new()
         .name("wbf-cli-main".into())
         .stack_size(MAIN_THREAD_STACK_BYTES)
@@ -396,11 +396,11 @@ fn main() -> ExitCode {
 /// Args:
 ///     error: example: CoreError::new(CoreErrorKind::Integrity, "...")
 /// Return:
-///     u8  1 用法／IO、2 server 拒絕或不講協議、3 完整性、4 網路、5 逾時
+///     u8  1 用法／IO、2 server 拒絕或不講協議、3 完整性、4 網路、5 逾時、130 被取消
 fn exit_code(error: &CoreError) -> u8 {
     use CoreErrorKind::*;
     match error.kind {
-        // 🚫 「還沒解鎖」「要 passphrase」這些都是用法問題，跟打錯字同一級。
+        // 「還沒解鎖」「要 passphrase」這些都是用法問題，跟打錯字同一級。
         Usage | Io | Locked | NoKeyFile | NeedPassphrase | UnexpectedPassphrase
         | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | AccountBusy
         | ServerPendingRemoval | NoRecoveryKeyHere | HistoryWouldBeLost => 1,
@@ -410,5 +410,7 @@ fn exit_code(error: &CoreError) -> u8 {
         Network => 4,
         // 房間金鑰在等待時間內沒分好：等過了、沒等到，跟逾時同一級（重送就好）。
         Timeout | RoomKeyNotReady => 5,
+        // 工作被取消：跟 Ctrl-C 同一個慣例（/docs/design/rpc-specs/rpc-spec.md §5 的 `105`）。
+        Cancelled => 130,
     }
 }

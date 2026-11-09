@@ -100,7 +100,7 @@ async fn a_reply_that_arrives_before_anyone_waits_is_unmatched_not_delivered_to_
         .unwrap();
     assert_eq!(orphan.seq, 1);
     assert_eq!(link.unmatched(), 1);
-    // 之後才發 seq 1 的請求：🚫 不能拿剛才那個回覆，要等新的。
+    // 之後才發 seq 1 的請求：禁止拿剛才那個回覆，要等新的。
     let request = tokio::spawn({
         let link_ping = ping(1);
         async move { link_ping }
@@ -443,6 +443,24 @@ async fn close_stops_both_tasks_and_nothing_goes_out_afterwards() {
     assert!(matches!(peer_saw, Ok(None)), "{peer_saw:?}");
 }
 
+/// `close_and_wait`（/docs/design/daemon/task-supervision.md §2.1）：讀、寫、心跳三個 task 收到停止開關**自己**結束，它等得到（不是 abort）；
+/// 對面看到的是「對方關了」；再叫一次也立刻回來。
+#[tokio::test]
+async fn close_and_wait_returns_once_the_tasks_have_ended_on_their_own() {
+    let (link, mut peer) = connect();
+    assert_eq!(
+        link.close_and_wait(LONG).await,
+        Ok(()),
+        "all three tasks ended"
+    );
+    assert!(link.is_closed());
+    let peer_saw = tokio::time::timeout(LONG, peer.end.source.receive())
+        .await
+        .expect("the peer learns the link closed within bounded time");
+    assert!(matches!(peer_saw, Ok(None)), "{peer_saw:?}");
+    assert_eq!(link.close_and_wait(LONG).await, Ok(()), "twice is fine");
+}
+
 /// 同一個 id 兩代會話：舊 handle 晚一點才 drop，不能把新會話從表裡拿掉。
 #[tokio::test]
 async fn a_late_drop_of_an_old_handle_does_not_remove_the_new_session_with_the_same_id() {
@@ -637,7 +655,7 @@ async fn an_unanswered_heartbeat_closes_the_link_and_fails_the_waiters() {
     assert!(link.is_closed());
 }
 
-/// 一問一答等到整條線沉默才逾時（/docs/design/daemon/link-requests.md §4）：線上別的回應還在流進來，這個請求🚫 逾時——
+/// 一問一答等到整條線沉默才逾時（/docs/design/daemon/link-requests.md §4）：線上別的回應還在流進來，這個請求**不**逾時——
 /// 同一條線在好幾個 client 之間共用，別人的回覆排在前面很正常。
 #[tokio::test]
 async fn a_request_keeps_waiting_while_the_line_keeps_answering() {
@@ -660,7 +678,7 @@ async fn a_request_keeps_waiting_while_the_line_keeps_answering() {
     waiting.await.unwrap().unwrap();
 }
 
-/// 只有心跳的 `Pong` 在流：🚫 算線在回應——不然 server 只回心跳、不回請求時，等的人永遠不逾時。
+/// 只有心跳的 `Pong` 在流：**不**算線在回應——不然 server 只回心跳、不回請求時，等的人永遠不逾時。
 #[tokio::test]
 async fn pongs_alone_do_not_keep_a_request_waiting() {
     let (link, mut peer) = connect();
@@ -672,7 +690,7 @@ async fn pongs_alone_do_not_keep_a_request_waiting() {
         })
     };
     let _asked = peer.receive().await;
-    // `Pong` 一直流（最多 2 秒）；請求要在它們還在流的時候就逾時（沉默時限 200 ms），🚫 等到 `Pong` 停了才逾時。
+    // `Pong` 一直流（最多 2 秒）；請求要在它們還在流的時候就逾時（沉默時限 200 ms），**不**等到 `Pong` 停了才逾時。
     let mut pongs_sent = 0;
     while !waiting.is_finished() && pongs_sent < 40 {
         peer.send(pack(Kind::Control, control::PONG, flags::IS_RESPONSE, 0, 7))

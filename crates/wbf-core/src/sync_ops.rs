@@ -229,6 +229,8 @@ pub(crate) async fn pull_recent(
     let mut written = 0usize;
     let mut batches = 0u32;
     let mut skipped_without_room = 0usize;
+    // 被 `cancel` 了（/docs/design/daemon/task-supervision.md §2.2）：安全點是「一批寫完」，水位最後才推，所以停下來水位不動。
+    let mut cancelled = false;
     // 這一輪寫進去的密文（房 → event_id）：收批回呼是同步的、不能等解密，拉完再一起解（room_crypto.rs）。
     let mut encrypted_by_room: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -289,9 +291,22 @@ pub(crate) async fn pull_recent(
             "recent: batch {batches}: {} events (window {}, {} left, g_seq {}..{})",
             meta.bc, meta.tc, meta.r, meta.fs, meta.ls
         ));
+        if crate::job::check_cancelled().is_err() {
+            cancelled = true;
+            return Err(wbf_sdk::SdkError::Usage("cancelled".into()));
+        }
         Ok(())
     };
-    let summary = client.recent_sync(cg_seq, plan, &mut on_batch).await?;
+    let pulled_or_stopped = client.recent_sync(cg_seq, plan, &mut on_batch).await;
+    if cancelled {
+        return Err(CoreError::new(
+            crate::error::CoreErrorKind::Cancelled,
+            format!(
+                "recent: cancelled after {batches} batch(es); the cached watermark did not move"
+            ),
+        ));
+    }
+    let summary = pulled_or_stopped?;
     // 回給 UI 之前把這一輪的密文解開、補存明文（**不**發 `room.message`：`Recent` 本來就不推，UI 拉完自己讀）。
     if let Some(engine) = engine {
         for (room, event_ids) in encrypted_by_room {

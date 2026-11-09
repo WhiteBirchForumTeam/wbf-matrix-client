@@ -2,7 +2,7 @@
 //!
 //! 池只管 socket：哪條線開了、關了、要不要重開。**怎麼開**是呼叫端交進來的（`acquire` 的 `open` 閉包，/docs/design/daemon/link-pool.md §7 的接縫）——
 //! 正式的在 `Core::open_link`（session → `Channel::connect` → `hello`），測試的用記憶體對接。
-//! 池自己🚫 不在背景做事：定時看線、重開是 `link_keeper.rs` 的鉤子（daemon 叫）；🚫 不知道訂閱的內容（那是用線的人的事）。
+//! 池自己**不**在背景做事：定時看線、重開是 `link_keeper.rs` 的鉤子（daemon 叫）；**不**知道訂閱的內容（那是用線的人的事）。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -18,7 +18,7 @@ use wbf_sdk::sessions::Received;
 use crate::error::CoreError;
 use crate::event::{CoreEvent, EventSink, LinkState};
 
-/// 五條線的角色（/docs/design/daemon/link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，🚫 不是照 kind。
+/// 五條線的角色（/docs/design/daemon/link-pool.md §1）。分界是「誰會塞爆佇列」與「掉了救不救得回來」，**不**是照 kind。
 /// 📌 房間與金鑰的訂閱 2026-09-29 起各自一條（維護者定；server #85 把每台裝置的 WS 上限放到 8）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,8 +63,8 @@ struct Slot {
     /// 開線的那個 client（線的擁有者，丟掉它就關線），`None` ＝ 沒開（Idle）。
     /// **用**線拿讀鎖，很多命令同時用同一條線；**開、重開、關**拿寫鎖——關線等手上還在用它的命令都做完（維護者 2026-09-21）。
     line: Arc<RwLock<Option<WbfClient<Channel>>>>,
-    /// 同時發現沒開的命令只有一個去開，其他的在這裡等它開好、再回頭拿讀鎖（🚫 各開一條）。
-    /// 🚫 讓它們排寫鎖：寫鎖要等所有手上有這條線的命令都做完，第二個就變成等第一個**做完**、不是等它**開好**。
+    /// 同時發現沒開的命令只有一個去開，其他的在這裡等它開好、再回頭拿讀鎖（**不**各開一條）。
+    /// **不**讓它們排寫鎖：寫鎖要等所有手上有這條線的命令都做完，第二個就變成等第一個**做完**、不是等它**開好**。
     opening: tokio::sync::Mutex<()>,
 }
 
@@ -75,8 +75,18 @@ pub struct LinkPool {
     slots: Mutex<HashMap<LinkRole, Arc<Slot>>>,
 }
 
-/// 開著的線上再發一個 client：同一條 `WsLink` 的分身、帶開線時 hello 的結果（🚫 再 hello，/docs/design/daemon/link-requests.md §7）。
-/// 號由線發，所以同時發出去的好幾個 client 🚫 撞號。
+/// Return:
+///     Some(u64)  WebSocket 那條線的號
+///     None       HTTP（池裡不放，到不了）
+pub(crate) fn connection_id_of(client: &WbfClient<Channel>) -> Option<u64> {
+    match client.channel() {
+        Channel::WebSocket(channel) => Some(channel.link().connection_id()),
+        Channel::Http(_) => None,
+    }
+}
+
+/// 開著的線上再發一個 client：同一條 `WsLink` 的分身、帶開線時 hello 的結果（**不**再 hello，/docs/design/daemon/link-requests.md §7）。
+/// 號由線發，所以同時發出去的好幾個 client **不**撞號。
 ///
 /// Return:
 ///     Some(WbfClient)   開著的 WebSocket 線
@@ -124,7 +134,7 @@ impl LinkPool {
     ///     open: 怎麼開一條這個角色的線, example: || core.open_link(&account, role)
     /// Return:
     ///     Ok(PooledClient)   開著的線上的一個 client；丟掉它就是用完了（線本身還開著）
-    ///     Err(...)           `open` 的錯原樣（沒 session 是 Usage、連不上是 Network）；池裡那格維持沒開，🚫 不發事件
+    ///     Err(...)           `open` 的錯原樣（沒 session 是 Usage、連不上是 Network）；池裡那格維持沒開，**不**發事件
     ///
     /// 📌 登出跟這裡的競賽由 server 決定，不由池猜（/docs/design/daemon/link-pool.md §3）：登出先撤 token 再 `close_all`，之後才開的線在 hello 就被 server 拒；
     /// 正在開的那一條由 `close_all` 等它的寫鎖、開完，再等用它的命令做完才收。
@@ -158,7 +168,7 @@ impl LinkPool {
             *writer = Some(open().await?);
             self.emit_link(role, LinkState::Opened, None);
         }
-        // 剛開好：降成讀鎖交出去，🚫 握著寫鎖擋住別的命令。
+        // 剛開好：降成讀鎖交出去，**不**握著寫鎖擋住別的命令。
         pooled_if_alive(writer.downgrade()).ok_or_else(|| {
             CoreError::new(
                 crate::CoreErrorKind::Network,
@@ -167,7 +177,7 @@ impl LinkPool {
         })
     }
 
-    /// 拿那條線來用，**但只在它已經開著的時候**：沒開、或死了，就回 `None`——🚫 不開、🚫 不發事件。
+    /// 拿那條線來用，**但只在它已經開著的時候**：沒開、或死了，就回 `None`——**不**開、**不**發事件。
     /// 給背景 task 用（`key_sync.rs`）：它握得到池，但「開線」是 `open_link` 的事（會再跑一次 `init_connection`、換掉 task 自己），task 不該從裡面觸發。
     ///
     /// Args:
@@ -179,16 +189,16 @@ impl LinkPool {
         pooled_if_alive(self.slot(role).line.clone().read_owned().await)
     }
 
-    /// 那條線底下的 `WsLink` 分身（/docs/design/daemon/link-requests.md §2）：開著、而且是 WebSocket 才有。同 `reuse`，🚫 不開、🚫 不發事件。
-    /// 拿到之後🚫 不握那格的鎖：送收都走分身；線被關了，分身上的請求一樣回 `Network`。
+    /// 那條線底下的 `WsLink` 分身（/docs/design/daemon/link-requests.md §2）：開著、而且是 WebSocket 才有。同 `reuse`，**不**開、**不**發事件。
+    /// 拿到之後**不**握那格的鎖：送收都走分身；線被關了，分身上的請求一樣回 `Network`。
     ///
     /// Args:
     ///     role: example: LinkRole::Download
     /// Return:
-    ///     Some(WsLink)  開著的那條線的分身（丟掉🚫 不關線）
+    ///     Some(WsLink)  開著的那條線的分身（丟掉**不**關線）
     ///     None          那格沒開、線死了、正被別人握著（等一下再要）、或不是 WebSocket
     pub async fn find_ws_link(&self, role: LinkRole) -> Option<WsLink> {
-        // 那格正在開或關（寫鎖在別人手上）就當這次沒有，🚫 排在它後面等：發送端一秒後再看。
+        // 那格正在開或關（寫鎖在別人手上）就當這次沒有，**不**排在它後面等：發送端一秒後再看。
         let guard = self.slot(role).line.clone().try_read_owned().ok()?;
         let client = guard.as_ref()?;
         if client.channel().is_closed() {
@@ -201,7 +211,7 @@ impl LinkPool {
     }
 
     /// 確保那條線開著（`link_keeper.rs` 的鉤子用）：開著就不動、沒開或死了就開一條。
-    /// 寫鎖在別人手上（正在開、或正在關）就當它開著：🚫 排在它後面等；正在關的那種，下一輪再看。
+    /// 寫鎖在別人手上（正在開、或正在關）就當它開著：**不**排在它後面等；正在關的那種，下一輪再看。
     ///
     /// Args:
     ///     role: example: LinkRole::Rooms
@@ -246,12 +256,29 @@ impl LinkPool {
         for (role, slot) in slots {
             let mut guard = slot.line.write().await;
             if let Some(client) = guard.take() {
-                drop(client);
+                self.close_and_wait(role, client).await;
                 closed += 1;
                 self.emit_link(role, LinkState::Closed, Some(reason.to_string()));
             }
         }
         closed
+    }
+
+    /// 關一條線、等它底下的 task 自己結束（/docs/design/daemon/task-supervision.md §2.1）；等不到就講一聲、往下走（**不** abort）。
+    async fn close_and_wait(&self, role: LinkRole, client: WbfClient<Channel>) {
+        if client
+            .channel()
+            .close_and_wait(wbf_sdk::task_stop::STOP_TIMEOUT)
+            .await
+            .is_err()
+        {
+            self.events.progress(format!(
+                "links: the {} line of {} did not stop within {}s",
+                role.name(),
+                self.user,
+                wbf_sdk::task_stop::STOP_TIMEOUT.as_secs()
+            ));
+        }
     }
 
     /// 關一條（等正在用它的命令做完）；那一格回到 Idle，下次要用再開。
@@ -266,7 +293,32 @@ impl LinkPool {
         let mut guard = slot.line.write().await;
         match guard.take() {
             Some(client) => {
-                drop(client);
+                self.close_and_wait(role, client).await;
+                self.emit_link(role, LinkState::Closed, Some(reason.to_string()));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 只在那一格**還是同一條線**時關（等正在用它的命令做完）：訂閱 task 收攤時關自己那條用的。
+    /// 線已經被換成新的（看線迴圈重開了），舊 task 收攤時禁止關到新的那條——`close(role)` 關的是「現在在那格的」，就會關錯。
+    ///
+    /// Args:
+    ///     role: example: LinkRole::Rooms
+    ///     connection_id: 開線時那條的號（`WsLink::connection_id`）, example: 3
+    ///     reason: example: "the room subscription ended"
+    /// Return:
+    ///     bool  true ＝ 那格還是這條、關了；false ＝ 那格空的或已經是別條，沒動
+    pub async fn close_line(&self, role: LinkRole, connection_id: u64, reason: &str) -> bool {
+        let slot = self.slot(role);
+        let mut guard = slot.line.write().await;
+        if guard.as_ref().and_then(connection_id_of) != Some(connection_id) {
+            return false;
+        }
+        match guard.take() {
+            Some(client) => {
+                self.close_and_wait(role, client).await;
                 self.emit_link(role, LinkState::Closed, Some(reason.to_string()));
                 true
             }
@@ -306,7 +358,7 @@ impl LinkPool {
     }
 }
 
-/// `ReceivedHook` 的那一頭（/docs/design/daemon/link-pool.md §4）：每個收到的 pack 變一則 `CoreEvent::Received`，**只有標頭**、🚫 不帶 meta／data。
+/// `ReceivedHook` 的那一頭（/docs/design/daemon/link-pool.md §4）：每個收到的 pack 變一則 `CoreEvent::Received`，**只有標頭**、**不**帶 meta／data。
 /// 讀取 task 上叫的，表鎖之外；`EventSink::emit` 是 broadcast 的 try_send，不擋。
 pub(crate) fn received_hook(
     events: EventSink,
@@ -341,7 +393,7 @@ impl Drop for LoggingOutGuard<'_> {
 /// 池裡拿出來的一條線上的一個 client。丟掉就是用完了（線不關）。
 pub enum PooledClient {
     /// 池裡那條線上新發的 client（同一條 `WsLink` 的分身）。很多命令可以同時各拿一個；
-    /// 讀鎖跟著它：關線（寫鎖）等它被丟掉才關，命令做到一半🚫 被收。
+    /// 讀鎖跟著它：關線（寫鎖）等它被丟掉才關，命令做到一半**不**被收。
     Pooled {
         client: WbfClient<Channel>,
         _in_use: OwnedRwLockReadGuard<Option<WbfClient<Channel>>>,
@@ -472,7 +524,7 @@ impl crate::Core {
         }
     }
 
-    /// 登出的封池：放進去之後 `pool_of_account` 一律 `AccountBusy`。🚫 生產路徑用 [`Core::logging_out_guard`]，不要手動配對。
+    /// 登出的封池：放進去之後 `pool_of_account` 一律 `AccountBusy`。生產路徑用 [`Core::logging_out_guard`]，禁止手動配對。
     pub(crate) fn begin_logging_out(&self, account: &crate::accounts::AccountDir) {
         self.logging_out
             .lock()
@@ -504,8 +556,8 @@ impl crate::Core {
         account: &crate::accounts::AccountDir,
         reason: &str,
     ) -> usize {
-        // 下載處理端借的就是這個池的線：先收它（開著的檔 fsync 留著），🚫 不讓它拿舊 session 的池一直空等。
-        self.stop_downloader_of(account);
+        // 下載處理端借的就是這個池的線：先收它（開著的檔 fsync 留著），**不**讓它拿舊 session 的池一直空等。
+        self.stop_downloader_of(account).await;
         let pool = self
             .link_pools
             .lock()
@@ -530,7 +582,7 @@ impl crate::Core {
         pools.iter().map(|pool| pool.open_count()).sum()
     }
 
-    /// 從外面塞一則事件進 core 的廣播。**測試用**（daemon 的推播測試要一則可控的事件）；正式程式碼🚫 不叫它——
+    /// 從外面塞一則事件進 core 的廣播。**測試用**（daemon 的推播測試要一則可控的事件）；正式程式碼禁止叫它——
     /// 事件是 core 發生的事，不是別人替它說的。
     #[doc(hidden)]
     pub fn emit_event(&self, event: CoreEvent) {
@@ -608,7 +660,36 @@ mod tests {
         );
     }
 
-    /// 對方關了線：下一次要用才發現，發 Closed、重開、發 Opened；中間🚫 沒有人在背景做事。
+    /// 舊的訂閱 task 收攤時只關**自己那條**（/docs/design/daemon/task-supervision.md §2.1）：那格已經換成新的一條，號對不上就不動；
+    /// 號對得上才關，而且關的時候等那條線的讀、寫、心跳自己結束（關完那條線的 `is_closed` 是真的）。
+    #[tokio::test]
+    async fn close_line_closes_only_the_line_it_names() {
+        let events = EventSink::new();
+        let pool = LinkPool::new("@alice:localhost", events);
+        let (client, _peer) = memory_client(wbf_sdk::no_hook());
+        let current = connection_id_of(
+            &pool
+                .acquire(LinkRole::Rooms, || async move { Ok(client) })
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !pool
+                .close_line(LinkRole::Rooms, current + 1000, "an old task")
+                .await,
+            "another line's number leaves this one open"
+        );
+        assert_eq!(pool.open_count(), 1);
+        let shared = pool.find_ws_link(LinkRole::Rooms).await.expect("open");
+        assert!(pool.close_line(LinkRole::Rooms, current, "its own").await);
+        assert_eq!(pool.open_count(), 0);
+        assert!(
+            shared.is_closed(),
+            "the line itself is closed, not just taken out"
+        );
+    }
+
+    /// 對方關了線：下一次要用才發現，發 Closed、重開、發 Opened；中間**沒有**人在背景做事。
     #[tokio::test]
     async fn a_dead_line_is_reopened_the_next_time_it_is_needed() {
         let events = EventSink::new();
@@ -659,7 +740,7 @@ mod tests {
         assert_eq!(declared, vec![LinkRole::Misc, LinkRole::Rooms]);
     }
 
-    /// `ensure_open`（鉤子用）：沒開的開、開著的不動、有命令正在用的當開著（🚫 不等它）、死了的重開。
+    /// `ensure_open`（鉤子用）：沒開的開、開著的不動、有命令正在用的當開著（**不**等它）、死了的重開。
     #[tokio::test]
     async fn ensure_open_opens_only_what_is_missing_or_dead() {
         let pool = LinkPool::new("@alice:localhost", EventSink::new());
@@ -716,7 +797,7 @@ mod tests {
         assert_eq!(pool.open_count(), 3);
     }
 
-    /// 開不起來（沒 session、連不上）：錯原樣回、那格維持沒開、🚫 不發事件；下一次再試。
+    /// 開不起來（沒 session、連不上）：錯原樣回、那格維持沒開、**不**發事件；下一次再試。
     #[tokio::test]
     async fn a_failed_open_leaves_the_slot_empty_and_emits_nothing() {
         let events = EventSink::new();
@@ -927,8 +1008,8 @@ mod tests {
         pings
     }
 
-    /// 同一條線上兩個命令同時在用（/docs/design/daemon/link-pool.md §5）：第二個🚫 等第一個用完；兩個請求都送出去了才收得到回覆，
-    /// 而且號由線發、🚫 撞號（兩個 client 各自從 1 數的話，第二個請求會在登記時被拒）。
+    /// 同一條線上兩個命令同時在用（/docs/design/daemon/link-pool.md §5）：第二個**不**等第一個用完；兩個請求都送出去了才收得到回覆，
+    /// 而且號由線發、**不**撞號（兩個 client 各自從 1 數的話，第二個請求會在登記時被拒）。
     #[tokio::test]
     async fn two_commands_use_one_line_at_the_same_time_with_their_own_numbers() {
         let pool = LinkPool::new("@alice:localhost", EventSink::new());
@@ -958,7 +1039,7 @@ mod tests {
         );
     }
 
-    /// 線還沒開時同時到的兩個命令（UI 解鎖後一次送 10 則）：一個開，另一個等它**開好**就用，🚫 等它**做完**、🚫 各開一條。
+    /// 線還沒開時同時到的兩個命令（UI 解鎖後一次送 10 則）：一個開，另一個等它**開好**就用，**不**等它**做完**、**不**各開一條。
     /// 先握住寫鎖，讓兩個都在那格還空著時通過第一次檢查（PR #72 審查 cirno／salvia 指出的那個時刻）。
     #[tokio::test]
     async fn commands_arriving_together_on_an_unopened_line_wait_for_it_to_open_not_for_each_other()

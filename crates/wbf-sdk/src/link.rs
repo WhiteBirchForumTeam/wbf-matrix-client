@@ -1,8 +1,9 @@
 //! 一條連線：一個讀取 task ＋ 一個送出 task ＋ 一張會話表（/docs/design/daemon/ws-receive-dispatch.md §0、§5–§7）。
 //!
 //! 送與收是兩件事：`send` 只等佇列有位子，永遠不等回覆；回覆由讀取 task 查表交付。
-//! 兩個 task 哪一個死了、或呼叫端 `close()`，都走同一條路 `shut_down`：`closed` → `fail_all` → 兩個 task 都 abort。
-//! 這層🚫 不重連（第 8 階段監督者的事）：關了之後每個請求立刻回錯。
+//! 兩個 task 哪一個死了、或呼叫端 `close()`，都走同一條路 `shut_down`：`closed` → `fail_all` → 送停止開關，讀、寫、心跳三個 task 在各自的安全點自己結束
+//! （/docs/design/daemon/task-supervision.md §2.1：**不** abort）。要等它們真的結束用 [`WsLink::close_and_wait`]。
+//! 這層**不**重連（重開是連線池的事）：關了之後每個請求立刻回錯。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,9 +18,10 @@ use crate::sessions::{
     take_end_reason, OneshotSink, PackSink, Received, ReceivedHook, SessionGeneration, SessionKey,
     SessionTable, StreamSink, SubscriptionSink,
 };
+use crate::task_stop::{StopSignal, StopSwitch, StopTimedOut};
 use crate::transport::{FrameSink, FrameSource};
 
-/// 送出佇列最多積幾個 pack；滿了 `send` 就等（背壓），🚫 不丟。
+/// 送出佇列最多積幾個 pack；滿了 `send` 就等（背壓），**不**丟。
 pub const SEND_QUEUE_PACKS: usize = 16;
 /// 連續幾個 frame 解不開就關線（跟 server 的 `wbf_ws_corrupt_budget` 同一個想法：一個壞 frame 不值得斷線，一連串就是這條線只剩壞的）。
 pub const CORRUPT_FRAME_BUDGET: u32 = 8;
@@ -28,7 +30,7 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 心跳（/docs/design/daemon/ws-receive-dispatch.md §5.1）：每條線自己一個，**每 `interval` 一定送一個 `Ping`**、等 `Pong`；
 /// 送出之後 `reply_timeout` 內**什麼都沒收到**才當這條線死了（`shut_down`）——server 照順序回，`Pong` 會排在已經在途的回覆後面，
-/// 回覆還在流進來就是活的（維護者 2026-10-02：逾時是沒收到回應）。🚫 因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`（wbfuwunel #103，2026-10-02）
+/// 回覆還在流進來就是活的（維護者 2026-10-02：逾時是沒收到回應）。禁止因為「最近有通訊」就跳過（維護者 2026-10-02）：server 的 `wbf_ws_idle_timeout`（wbfuwunel #103，2026-10-02）
 /// 是 60 秒、只看 client 送了什麼——只收推播的線（`Rooms`／`Keys`）一直在收，可是 server 看到的是一條 60 秒沒請求的線，會把它關掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
@@ -77,16 +79,17 @@ impl AckPolicy {
     }
 }
 
-/// 兩個 task 與每個 handle 共用的那一份：表、關了沒、兩個 task 的把手、鉤子。
+/// 三個 task 與每個 handle 共用的那一份：表、關了沒、停止開關、三個 task 的把手（只為了等它們結束）、鉤子。
 struct Shared {
     connection_id: u64,
     table: Mutex<SessionTable>,
     closed: AtomicBool,
+    stop: StopSwitch,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     hook: ReceivedHook,
     /// 讀取 task 至今解出幾個 pack：心跳拿它判斷「等 `Pong` 的這段時間有沒有收到任何東西」。
     received: AtomicU64,
-    /// 同上，但🚫 算 `Pong`：請求拿它判斷「整條線有沒有在回應」。算了 `Pong` 的話，server 只回心跳、不回請求，等的人就永遠不會逾時。
+    /// 同上，但**不**算 `Pong`：請求拿它判斷「整條線有沒有在回應」。算了 `Pong` 的話，server 只回心跳、不回請求，等的人就永遠不會逾時。
     answered: AtomicU64,
     /// 下一個請求號（`WsLink::next_seq`）
     next_seq: AtomicU32,
@@ -106,28 +109,20 @@ impl Shared {
     }
 
     /// 唯一的關線路徑（/docs/design/daemon/ws-receive-dispatch.md §7）：第一個叫到的人做事，之後的都是 no-op。
-    /// 順序是先 `fail_all` 再 abort：在等的人先拿到錯，task 才停（abort 自己那個 task 也可以：它在下一個 await 點才停）。
+    /// 順序是先 `fail_all` 再送停止開關：在等的人先拿到錯，三個 task 在各自的安全點自己結束（叫到它的若是其中一個 task，它接著就 return）。
     fn shut_down(&self, reason: &str) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
         self.table().fail_all(reason);
-        let tasks: Vec<JoinHandle<()>> = self
-            .tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect();
-        for task in tasks {
-            task.abort();
-        }
+        self.stop.request_stop();
     }
 }
 
 pub struct WsLink {
     shared: Arc<Shared>,
     outgoing: mpsc::Sender<Vec<u8>>,
-    /// 只有交給呼叫端的那一份是 true：它被丟掉才是「不要這條線了」。心跳 task 手上那份分身是 false，被 abort 時 drop 不關線。
+    /// 只有交給呼叫端的那一份是 true：它被丟掉才是「不要這條線了」。心跳 task 手上那份分身是 false，它結束時 drop 不關線。
     owner: bool,
 }
 
@@ -145,10 +140,12 @@ impl WsLink {
         heartbeat: Heartbeat,
     ) -> WsLink {
         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed) + 1;
+        let (stop, stop_signal) = StopSwitch::new();
         let shared = Arc::new(Shared {
             connection_id,
             table: Mutex::new(SessionTable::new(connection_id)),
             closed: AtomicBool::new(false),
+            stop,
             tasks: Mutex::new(Vec::new()),
             hook,
             received: AtomicU64::new(0),
@@ -158,8 +155,18 @@ impl WsLink {
         });
         let (outgoing, queued) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_PACKS);
 
-        let writer = tokio::spawn(write_queued(sink, queued, shared.clone()));
-        let reader = tokio::spawn(read_and_dispatch(source, shared.clone()));
+        // 某個 task 在把手登記進去之前就叫了 shut_down 也沒關係：開關是 watch，之後才看的也看得到。
+        let writer = tokio::spawn(write_queued(
+            sink,
+            queued,
+            shared.clone(),
+            stop_signal.clone(),
+        ));
+        let reader = tokio::spawn(read_and_dispatch(
+            source,
+            shared.clone(),
+            stop_signal.clone(),
+        ));
         let pulse = tokio::spawn(beat(
             WsLink {
                 shared: shared.clone(),
@@ -167,23 +174,13 @@ impl WsLink {
                 owner: false,
             },
             heartbeat,
+            stop_signal,
         ));
         shared
             .tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend([writer, reader, pulse]);
-        // 某個 task 在把手登記進去之前就死了（多執行緒 runtime 做得到）：它叫的 shut_down 沒東西可 abort，這裡補上。
-        if shared.is_closed() {
-            for task in shared
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .drain(..)
-            {
-                task.abort();
-            }
-        }
         WsLink {
             shared,
             outgoing,
@@ -298,7 +295,7 @@ impl WsLink {
         }
     }
 
-    /// 一問一答，但**送出就回來**：登記 `Reply { id, seq }` → 送 → 回一個之後再等的把手（/docs/design/daemon/link-requests.md §2：發送端🚫 不等回覆）。
+    /// 一問一答，但**送出就回來**：登記 `Reply { id, seq }` → 送 → 回一個之後再等的把手（/docs/design/daemon/link-requests.md §2：發送端**不**等回覆）。
     ///
     /// Return:
     ///     Ok(PendingReply)  進佇列了；`wait` 拿回覆，丟掉就從表裡拿掉
@@ -320,7 +317,7 @@ impl WsLink {
     }
 
     /// 這條線的下一個請求號（/docs/design/daemon/link-requests.md §7：seq 由線發）。同一條線上所有送請求的（共用的 client、`RequestLine`、心跳）都從這裡拿，
-    /// 🚫 自己數——兩個各自數的人同時用一條線就會撞號。從 2^31 起、繞回也留在上半：下半是上傳的塊號。
+    /// 禁止自己數——兩個各自數的人同時用一條線就會撞號。從 2^31 起、繞回也留在上半：下半是上傳的塊號。
     ///
     /// Return:
     ///     u32  example: 2147483648
@@ -328,7 +325,7 @@ impl WsLink {
         self.shared.next_seq.fetch_add(1, Ordering::Relaxed) | FIRST_LINE_SEQ
     }
 
-    /// 這條線的下一個具名會話的號（`Recent`、`Device/*` 的會話 id 的值部分；型別 byte 是呼叫端加的）。同上，線發、🚫 自己數。
+    /// 這條線的下一個具名會話的號（`Recent`、`Device/*` 的會話 id 的值部分；型別 byte 是呼叫端加的）。同上，線發、禁止自己數。
     ///
     /// Return:
     ///     u64  從 1 起、永遠不是 0、不超過 `pack::id::MAX_VALUE`, example: 1
@@ -346,8 +343,8 @@ impl WsLink {
         }
     }
 
-    /// 一問一答，等到回覆為止；這個請求在等、而整條線 `silence` 內一個回應都沒收到（心跳的 `Pong` 🚫 算）才算逾時（/docs/design/daemon/link-requests.md §4）。
-    /// 線上別人的回覆還在流進來就是活的：🚫 每個請求從送出各自計時（線很忙時會誤判）。
+    /// 一問一答，等到回覆為止；這個請求在等、而整條線 `silence` 內一個回應都沒收到（心跳的 `Pong` **不**算）才算逾時（/docs/design/daemon/link-requests.md §4）。
+    /// 線上別人的回覆還在流進來就是活的：禁止每個請求從送出各自計時（線很忙時會誤判）。
     ///
     /// Return:
     ///     Ok(Pack)        回來的那個（可能是 Error pack，這裡不解讀）
@@ -374,7 +371,7 @@ impl WsLink {
         }
     }
 
-    /// 同一條線的分身：送、收都一樣，但丟掉它🚫 不關線（只有原本那一份能關）。給「線在連線池裡、送請求的在別的 task」用（/docs/design/daemon/link-requests.md §2）。
+    /// 同一條線的分身：送、收都一樣，但丟掉它**不**關線（只有原本那一份能關）。給「線在連線池裡、送請求的在別的 task」用（/docs/design/daemon/link-requests.md §2）。
     pub fn share(&self) -> WsLink {
         WsLink {
             shared: self.shared.clone(),
@@ -436,9 +433,35 @@ impl WsLink {
         Ok(generation)
     }
 
-    /// 主動關：兩個 task 停、表清空、之後 `send` 立刻回錯。
+    /// 主動關：表清空、之後 `send` 立刻回錯、三個 task 收到停止開關（**不**等它們；要等用 [`WsLink::close_and_wait`]）。
     pub fn close(&self) {
         self.shared.shut_down("closed by this side");
+    }
+
+    /// 關線，等讀、寫、心跳三個 task 自己結束（/docs/design/daemon/task-supervision.md §2.1）。連線池關線、daemon 關機用。
+    ///
+    /// Args:
+    ///     timeout: 三個加起來最多等多久, example: Duration::from_secs(5)
+    /// Return:
+    ///     Ok(())            都結束了（含別人已經等過的）
+    ///     Err(StopTimedOut) 等不到；task **沒有**被 abort
+    pub async fn close_and_wait(&self, timeout: Duration) -> Result<(), StopTimedOut> {
+        self.close();
+        let tasks: Vec<JoinHandle<()>> = self
+            .shared
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        let all_done = async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        };
+        tokio::time::timeout(timeout, all_done)
+            .await
+            .map_err(|_| StopTimedOut)
     }
 }
 
@@ -460,13 +483,22 @@ fn named_key(connection_id: u64, pack: &Pack) -> Result<SessionKey, SdkError> {
     Ok(SessionKey::Session(pack.id))
 }
 
-/// 送出 task。sink 寫不進去就是連線死了：走 `shut_down`，🚫 不能只是自己停下來（PR #52 審查 rumia／cirno／salvia 🔴）。
+/// 送出 task。sink 寫不進去就是連線死了：走 `shut_down`，禁止只是自己停下來（PR #52 審查 rumia／cirno／salvia 🔴）。
+/// 安全點是「等佇列的下一個」：送到一半的 frame 送完才看開關。
 async fn write_queued<K: FrameSink>(
     mut sink: K,
     mut queued: mpsc::Receiver<Vec<u8>>,
     shared: Arc<Shared>,
+    mut stop: StopSignal,
 ) {
-    while let Some(bytes) = queued.recv().await {
+    loop {
+        let bytes = tokio::select! {
+            _ = stop.requested() => return,
+            next = queued.recv() => match next {
+                Some(bytes) => bytes,
+                None => return,
+            },
+        };
         if let Err(error) = sink.send(bytes).await {
             shared.shut_down(&format!("send failed: {error}"));
             return;
@@ -475,12 +507,15 @@ async fn write_queued<K: FrameSink>(
 }
 
 /// 心跳 task（`Heartbeat`）。拿一份 `WsLink` 的分身（同一個 `Shared`，`owner: false`）送 `Ping`：走的是一般的 `request`，所以 `Pong` 也經會話表、也過鉤子。
-async fn beat(link: WsLink, heartbeat: Heartbeat) {
+async fn beat(link: WsLink, heartbeat: Heartbeat, mut stop: StopSignal) {
     if heartbeat.interval == Duration::MAX {
         return;
     }
     loop {
-        tokio::time::sleep(heartbeat.interval).await;
+        tokio::select! {
+            _ = stop.requested() => return,
+            _ = tokio::time::sleep(heartbeat.interval) => {}
+        }
         if link.shared.is_closed() {
             return;
         }
@@ -506,7 +541,11 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
         let mut pong = Box::pin(pending.wait());
         loop {
             let heard_before = link.shared.received.load(Ordering::Relaxed);
-            match tokio::time::timeout(heartbeat.reply_timeout, &mut pong).await {
+            let waited = tokio::select! {
+                _ = stop.requested() => return,
+                waited = tokio::time::timeout(heartbeat.reply_timeout, &mut pong) => waited,
+            };
+            match waited {
                 Ok(Ok(_pong)) => break,
                 Ok(Err(error)) => {
                     link.shared.shut_down(&format!("heartbeat: {error}"));
@@ -527,10 +566,19 @@ async fn beat(link: WsLink, heartbeat: Heartbeat) {
 }
 
 /// 讀取 task：收 → decode → 查表（鎖內）→ 鉤子（鎖外）→ 交付（鎖內）。
-async fn read_and_dispatch<S: FrameSource>(mut source: S, shared: Arc<Shared>) {
+/// 安全點是「等下一個 frame」：解到一半、交付到一半的這個做完才看開關。
+async fn read_and_dispatch<S: FrameSource>(
+    mut source: S,
+    shared: Arc<Shared>,
+    mut stop: StopSignal,
+) {
     let mut undecodable_in_a_row = 0u32;
     let reason = loop {
-        match source.receive().await {
+        let received = tokio::select! {
+            _ = stop.requested() => break "closed by this side".to_string(),
+            received = source.receive() => received,
+        };
+        match received {
             Ok(Some(bytes)) => match Pack::decode(&bytes) {
                 Ok(pack) => {
                     undecodable_in_a_row = 0;
@@ -611,7 +659,7 @@ pub struct PendingReply {
 }
 
 impl PendingReply {
-    /// 等到回覆、或連線關了。🚫 自己限時：「多久算沒回應」看的是整條線多久沒收到回應，由用線的那一層決定（/docs/design/daemon/link-requests.md §4）；
+    /// 等到回覆、或連線關了。**不**自己限時：「多久算沒回應」看的是整條線多久沒收到回應，由用線的那一層決定（/docs/design/daemon/link-requests.md §4）；
     /// 不要了就丟掉它。
     ///
     /// Return:
@@ -661,7 +709,7 @@ pub struct Subscription {
 
 impl Subscription {
     /// Return:
-    ///     Ok(Some(pack))   下一個（Ack、CryptoState、Push、DeviceChanged、Superseded 都從這裡來，🚫 這裡不解讀）
+    ///     Ok(Some(pack))   下一個（Ack、CryptoState、Push、DeviceChanged、Superseded 都從這裡來，這裡**不**解讀）
     ///     Ok(None)         訂閱結束了（`Control/Error` 已經交付過）
     ///     Err(Timeout)     連線還活著、只是這段時間沒推
     ///     Err(Network)     連線沒了

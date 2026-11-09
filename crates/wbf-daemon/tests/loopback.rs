@@ -407,7 +407,7 @@ async fn a_subscription_scoped_to_a_user_drops_other_users_events() {
     assert_eq!(second["params"]["user"], "@alice:localhost");
 }
 
-/// 讀太慢被覆蓋掉：第一包是 `desync { missed }`，🚫 不假裝沒事。
+/// 讀太慢被覆蓋掉：第一包是 `desync { missed }`，**不**假裝沒事。
 /// 📎 `#[tokio::test]` 是單執行緒的 runtime：這個迴圈同步地發 400 則，推播 task 一則都還沒讀，佇列深度 256 → 一定 Lagged。
 #[tokio::test]
 async fn falling_behind_the_broadcast_is_reported_as_desync() {
@@ -509,4 +509,87 @@ async fn daemon_info_reports_the_number_of_open_links() {
     .await;
     let (_, reply) = receive(&mut socket, &keys).await;
     assert_eq!(reply["result"]["links"], 0, "{reply}");
+}
+
+/// `cancel { id }`（/docs/design/rpc-specs/rpc-spec.md §3.9）是這條連線的事：已經回完、不認得的 `id` 是 `was_running: false`（**不是**錯誤）；
+/// 沒帶 `id` 是 102。真的在跑的請求怎麼停（合作式開關、回 105）由 `in_flight.rs` 與 `wbf_core::job` 的測試釘。
+#[tokio::test]
+async fn cancel_answers_on_its_own_connection() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.info", "id": 5 }),
+    )
+    .await;
+    let (_, done) = receive(&mut socket, &keys).await;
+    assert_eq!(done["id"], 5);
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "cancel", "params": { "id": 5 }, "id": 6 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["code"], 0, "{reply}");
+    assert_eq!(reply["id"], 6);
+    assert_eq!(reply["result"], json!({ "ok": true, "was_running": false }));
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "cancel", "params": {}, "id": 7 }),
+    )
+    .await;
+    let (_, reply) = receive(&mut socket, &keys).await;
+    assert_eq!(reply["code"], 102, "{reply}");
+    drop(daemon.handle);
+}
+
+/// 關機等在跑的請求做完（/docs/design/daemon/task-supervision.md §2.3 第 2 步）：`daemon.shutdown` 送出時還在跑的請求，
+/// 它的回應排在關閉通知**之前**，而且是正常結果（短請求**不**被取消）。
+/// 慢的那個是帶 passphrase 的 `vault.create`（要跑金鑰衍生）；多執行緒，讓它跑的時候連線還收得到下一則。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_the_requests_still_running() {
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let mut socket = connect(daemon.port).await;
+    send(&mut socket, &keys, PackType::Cipher, hello()).await;
+    receive(&mut socket, &keys).await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "vault.create", "params": { "passphrase_base64": "c2xvdyBwYXNzcGhyYXNl" }, "id": 1 }),
+    )
+    .await;
+    send(
+        &mut socket,
+        &keys,
+        PackType::Cipher,
+        json!({ "method": "daemon.shutdown", "id": 2 }),
+    )
+    .await;
+    let mut replies = Vec::new();
+    loop {
+        let (pack_type, json) = receive(&mut socket, &keys).await;
+        if pack_type == PackType::Plain {
+            assert_eq!(json["code"], 9006, "{json}");
+            break;
+        }
+        replies.push(json);
+    }
+    let created = replies
+        .iter()
+        .find(|reply| reply["id"] == 1)
+        .unwrap_or_else(|| panic!("vault.create's reply came after the close notice: {replies:?}"));
+    assert_eq!(created["code"], 0, "{created}");
+    assert!(replies.iter().any(|reply| reply["id"] == 2), "{replies:?}");
+    assert_eq!(expect_close(&mut socket).await, 1001);
 }

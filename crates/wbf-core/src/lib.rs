@@ -87,6 +87,7 @@ mod room_sync;
 mod rooms_ops;
 mod server_cache;
 mod session_ops;
+mod shutdown;
 mod sync_ops;
 #[cfg(test)]
 mod test_support;
@@ -222,10 +223,10 @@ pub struct Core {
     /// 正在跟上游的帳號（`room_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Event/Push` 寫進 cache。
     /// 登出、`stop_room_sync`、`Core` 丟掉都收。key 跟池一樣是帳號目錄。
     pub(crate) room_syncs:
-        std::sync::Mutex<std::collections::HashMap<PathBuf, room_sync::RoomSyncHandle>>,
+        std::sync::Mutex<std::collections::HashMap<PathBuf, wbf_sdk::task_stop::StoppableTask>>,
     /// 正在收金鑰的帳號（`key_sync.rs`）：一個帳號一個背景 task，讀訂閱線上的 `Device/Push` 匯進 crypto store。收法跟 `room_syncs` 一樣。
     pub(crate) key_syncs:
-        std::sync::Mutex<std::collections::HashMap<PathBuf, key_sync::KeySyncHandle>>,
+        std::sync::Mutex<std::collections::HashMap<PathBuf, wbf_sdk::task_stop::StoppableTask>>,
     /// 金鑰線的後台（`key_share.rs`，/docs/design/keys/e2ee-rpc.md §3.1）：一個帳號一個 task，建、換、送房間金鑰、記哪個房對哪個房間版本號就緒；
     /// `Keys` 線開好或第一次要用時起，登出收。
     pub(crate) key_shares:
@@ -254,6 +255,8 @@ pub struct Core {
     pub(crate) background_backup: std::sync::Arc<identity_ops::BackgroundBackup>,
     /// 正在看的裝置驗證流程（`verify_ops.rs`）：只在記憶體，跟上游的流程一樣 daemon 重開就沒了。
     pub(crate) verify_watchers: std::sync::Arc<verify_ops::VerifyWatchers>,
+    /// 換線時被換下來、已經叫停、還沒確認結束的 task（`shutdown.rs`）：登出與關機等它們。
+    pub(crate) retiring: std::sync::Mutex<Vec<shutdown::RetiringTask>>,
 }
 
 impl Core {
@@ -285,6 +288,7 @@ impl Core {
             invite_rounds: std::sync::Arc::default(),
             background_backup: std::sync::Arc::default(),
             verify_watchers: std::sync::Arc::default(),
+            retiring: std::sync::Mutex::new(Vec::new()),
         }
     }
 

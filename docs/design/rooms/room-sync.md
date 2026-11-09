@@ -3,9 +3,9 @@
 > 維護者 2026-09-22／23 定，原話在 §0。實作：sdk `protocol.rs`／`client.rs` 的 `Event/Subscribe`／`Unsubscribe`／`Push` codec 與
 > `room_subscription`；core `room_sync.rs`（`init_connection`、收推播的 task）；`sync.recent` 的 `since`（daemon `handle/rooms.rs`、core `sync_ops.rs`）。
 > server 的語意在 wbfuwunel 的 /docs/design/wbf-event-push.md（推送）與 wbfuwunel 的 /docs/design/room-seq-and-recent.md（`Recent`）。
-> 🚫 這支**不接開／關訂閱線的 RPC**：daemon 的訂閱（/docs/design/rpc-specs/rpc-spec.md §3.9，每條 RPC 連線想收什麼）與 daemon 跟上游是兩件事（中繼），先純一點。
+> 這支**不接開／關訂閱線的 RPC**：daemon 的訂閱（/docs/design/rpc-specs/rpc-spec.md §3.9，每條 RPC 連線想收什麼）與 daemon 跟上游是兩件事（中繼），先純一點。
 > 維護者 2026-09-29 定：訂閱線**總是由 daemon 搞定**——`vault.unlock`／`account.add` 之後開、常駐時背景迴圈看著、被關掉的重開（/docs/design/daemon/link-pool.md §3.1）；
-> 房間與金鑰各自一條線（`LinkRole::Rooms`／`Keys`）。UI 要不要收推播是 RPC 的 `subscribe`，🚫 沒有 `sync.open`／`sync.close`。
+> 房間與金鑰各自一條線（`LinkRole::Rooms`／`Keys`）。UI 要不要收推播是 RPC 的 `subscribe`，**沒有** `sync.open`／`sync.close`。
 
 ## 0. 規矩（維護者原話）
 
@@ -30,16 +30,16 @@
                                                  ├─ Keys：金鑰那半（/docs/design/keys/key-sync.md）
                                                  └─ 其他角色：不做事
 收推播的 task（一帳號一個；線在池裡、task 只握訂閱的會話）
-  Push{events} → 原樣 upsert（照房分組；存不了的擋掉、數出來）→ commit 之後發 room.message。🚫 不碰水位。
-  Invite/Push、Gone → 寫那一列的身分與邀請內容 → 發 room.membership（gap 原樣）。🚫 補一輪（那是 UI 叫的 room.invites）。
-  gap／本地丟包／壞包／寫失敗 → 講一聲（Note），繼續收。🚫 不記洞、不補。
-  線死了 / server 送 Error → task 把訂閱那格線關掉（socket 活著也一樣）、池發 link.state: closed（帶原因）、task 結束；🚫 task 不重訂（daemon 的看線迴圈下一輪重開就重訂，/docs/design/daemon/link-pool.md §3.1）
+  Push{events} → 原樣 upsert（照房分組；存不了的擋掉、數出來）→ commit 之後發 room.message。不碰水位。
+  Invite/Push、Gone → 寫那一列的身分與邀請內容 → 發 room.membership（gap 原樣）。不補一輪（那是 UI 叫的 room.invites）。
+  gap／本地丟包／壞包／寫失敗 → 講一聲（Note），繼續收。不記洞、不補。
+  線死了 / server 送 Error → task 把自己那條訂閱線關掉（按線的號；socket 活著也一樣）、池發 link.state: closed（帶原因）、task 結束；task 不重訂（daemon 的看線迴圈下一輪重開就重訂，/docs/design/daemon/link-pool.md §3.1）
 UI
   起來時 sync.recent（全局、g_seq 游標）：帶 since（它自己記的起點：上次的 cg_seq_after、或手上最後一則 room.message 的 g_seq），
   沒帶就用 daemon 存的上一次 Recent 的水位；回應 caught_up 是 false 就再叫。補不補、補到哪，全是 UI 的事。
   收到 link.state { role: "rooms", state: "opened" }（第一次開、斷了重開都發）：當成剛起來，再叫一次 sync.recent ＋ room.invites（§3.1，issue #79）。
-  UI 自己的 RPC 連線重連時也一樣（link.state 🚫 重播，斷著那段的 opened 收不到）。
-  daemon 🚫 自己叫——這是 UI 的規則，跟 room.membership 的 gap: true 一樣。
+  UI 自己的 RPC 連線重連時也一樣（link.state 不重播，斷著那段的 opened 收不到）。
+  daemon 不自己叫——這是 UI 的規則，跟 room.membership 的 gap: true 一樣。
   點進房間 room.history（單房）：本地翻頁用 r_seq；sync=both 打上游 Recent{rooms:[這房], before: 這房最舊那則的 g_seq}（跟訂閱線無關）。
 誰開這條線：Core::ensure_links（link_keeper.rs）——daemon 在 vault.unlock／account.add 之後、與常駐的看線迴圈每一輪叫它；開的時候就訂了
 ```
@@ -48,18 +48,18 @@ UI
   但**不推水位**——所以下次 UI 叫 Recent（沒帶 `since`）會從上次 Recent 的水位重拉，推播已經寫過的那段重寫一次（冪等）；推播漏掉的那段自然補回。
   UI 想省這一趟就帶 `since`＝它手上最後一則的 `g_seq`，代價是漏掉的不補——維護者：永遠拿不到也不管。
 - **daemon 沒有洞的概念**：server 的 `gap`、本地收件匣滿、一包解不開、cache 寫失敗、存不了的事件——都只講一聲（`Note`）、繼續收。
-  維護者 2026-09-23 定：🚫 daemon 不凍結水位、不判「什麼算洞」——誰記有沒有漏是 UI 的事。
+  維護者 2026-09-23 定：daemon **不**凍結水位、不判「什麼算洞」——誰記有沒有漏是 UI 的事。
 - **跟官方 Matrix 同形**：`Push` 是 `/sync` 迴圈只追加 server 給的、`sync.recent` 是 client 決定何時往回補的 `/messages`。
 - **`Subscribe` 不帶 `cg_seq`**：server 的補窗有上限、截斷只給一個 gap bit；反正補窗是 UI 的事，daemon 不要它。
 - **訂閱是純的**：一包來寫一包，`seq` 跳號不管。
 - **訂閱會話結束＝那條線作廢**：server 送 `Error`（例如被另一台裝置接手的 1505）時 socket 可能還活著，池的殞死偵測（`is_closed`）看不出來——
   task 收攤時自己 `LinkPool::close(Rooms, "the room subscription ended: …")`，`link.state: closed` 由池發、UI 不必等；看線迴圈下一輪看到那格是空的才會重開、重訂。
-  理由：只發事件不關線的話，池會把活著的舊線交回去、永遠不再訂。🚫 task 自己不重訂：重開的只有看線迴圈這一條路。
+  理由：只發事件不關線的話，池會把活著的舊線交回去、永遠不再訂。task 自己**不**重訂：重開的只有看線迴圈這一條路。
 
 ## 2. 存不了的事件
 
 缺 `room_id`、`event_id` 或 `sender` 的事件 `cache.db` 放不進去（server 給的完整 Pdu 一定有，這是防禦）。存不存得了只有一支在判：
-`IncomingEvent::storable_identity`，`upsert_events` 與進料口共用。推播那條在分組時就擋掉——🚫 不替一則不在庫裡的事件發 `room.message`；
+`IncomingEvent::storable_identity`，`upsert_events` 與進料口共用。推播那條在分組時就擋掉——**不**替一則不在庫裡的事件發 `room.message`；
 `upsert_events_counted` 回不寫了幾則，Push 與 Recent 都用 `Note` 講出來（`RecentSummary.skipped_without_room` 也含它們）。
 
 ## 3. 事件
@@ -71,18 +71,18 @@ UI
 | 漏包（gap／丟包／壞包／寫失敗／存不了） | 一則 `Note`，只是講一聲 |
 | 線開／關 | 池的 `link.state`（`rooms`）；task 因訂閱結束而關線時 `closed` 帶「the room subscription ended: …」。`opened` 是 UI 再叫一次 `sync.recent`＋`room.invites` 的訊號（§3.1） |
 
-🚫 不發 `sync.state`（追平與否是 UI 自己叫 `sync.recent` 的結果；variant 留著，還沒人發）。
+**不**發 `sync.state`（追平與否是 UI 自己叫 `sync.recent` 的結果；variant 留著，還沒人發）。
 
 ### 3.1 線重開：UI 收到 `opened` 就當成剛起來（issue #79，維護者 2026-11-02）
 
 > 維護者 2026-11-02：「link.state 就用這個吧」「reopened 不加。就 close 和 open 兩種差不多，不須第三種」「斷線重連應該當第一次去叫 recent」。
 
 **為什麼要有這條**：房間線死了到被發現之間（心跳最多約 34 秒，再等看線迴圈一輪，/docs/design/daemon/link-pool.md §3.1），server 推給舊線的
-`Push`／`Invite/Push`／`Gone` 都丟了；重開後的訂閱是一段新會話（`seq` 從 0、`gap: false`），server 🚫 替舊會話留東西、🚫 留跨連線的水位
+`Push`／`Invite/Push`／`Gone` 都丟了；重開後的訂閱是一段新會話（`seq` 從 0、`gap: false`），server **不**替舊會話留東西、**不**留跨連線的水位
 （wbfuwunel 的 /docs/design/events/invites-on-the-wire.md §3.3）。編號也看不出漏了什麼：`seq` 每段各自數、`is`／`g_seq` 本來就跳號、漏掉的 `Gone` 沒有東西可比。
 所以唯一可靠的訊號就是「這條線又開了」這件事本身——它只有 daemon 知道。
 
-**規則（UI 的，daemon 🚫 自己叫）**：收到 `link.state { user, role: "rooms", state: "opened" }`，對那個帳號（示意，`id` 是 UI 自己挑的）
+**規則（UI 的，daemon 不自己叫）**：收到 `link.state { user, role: "rooms", state: "opened" }`，對那個帳號（示意，`id` 是 UI 自己挑的）
 
 ```
 → { "method": "sync.recent",  "params": { "user": "@bob:localhost" }, "id": 41 }
@@ -90,13 +90,13 @@ UI
 ```
 
 - 訊息：跟剛起來一樣叫（不帶 `since` 就從 daemon 存的上一次 Recent 的水位起；要帶就帶**收到 `closed` 之前**手上最後一則的 `g_seq`）。
-  ⚠️ 🚫 帶 `opened` 之後才推來的那則的 `g_seq`：那會跳過斷線那段。
+  ⚠️ 禁止帶 `opened` 之後才推來的那則的 `g_seq`：那會跳過斷線那段。
 - 邀請：`room.invites` 一輪快照整份取代，斷線期間新來的補上、被收回的標 `leave`（/docs/design/rooms/room-actions.md §3.3.3）。
-- 裝置變動（`devices.changed`）：漏掉的 🚫 另外補。UI 手上的 `room_version` 舊了，送出時會被 server 擋、daemon 自動重拿、回 1401 帶新的那份（/docs/design/keys/e2ee-rpc.md §3）；
+- 裝置變動（`devices.changed`）：漏掉的**不**另外補。UI 手上的 `room_version` 舊了，送出時會被 server 擋、daemon 自動重拿、回 1401 帶新的那份（/docs/design/keys/e2ee-rpc.md §3）；
   UI 想提早就對開著的房 `room.refresh_devices`。
-- 第一次開線也發 `opened`，所以 UI 起來時會跟它自己那一次各叫一次：結果一樣，只多一輪。🚫 為了省這一輪加 `reopened` 之類的第三種狀態（維護者）。
-- UI 自己那條 RPC 連線重連時，也當成剛起來、叫同一組：`link.state` 是推播、🚫 重播（只送給當下連著的 RPC 連線），
-  RPC 斷著的時候房間線剛好重開，那個 `opened` 就收不到，而 daemon 🚫 自己補。多條 RPC 連線會各叫一輪，重複無害、只多一次抓取。
+- 第一次開線也發 `opened`，所以 UI 起來時會跟它自己那一次各叫一次：結果一樣，只多一輪。禁止為了省這一輪加 `reopened` 之類的第三種狀態（維護者）。
+- UI 自己那條 RPC 連線重連時，也當成剛起來、叫同一組：`link.state` 是推播、**不**重播（只送給當下連著的 RPC 連線），
+  RPC 斷著的時候房間線剛好重開，那個 `opened` 就收不到，而 daemon **不**自己補。多條 RPC 連線會各叫一輪，重複無害、只多一次抓取。
 
 **這條成立的前提**：`opened` 一定在 `Event/Subscribe` 拿到 Ack、`Invite/Subscribe` 拿到 Ack 或被舊 server 明說不認得**之後**才發——UI 叫的補拿跟訂閱之間才沒有一段沒人收
 （先訂再拿：訂之前的在快照／Recent 裡，訂之後的推過來，重疊的那段 `is`／`g_seq` 冪等）。
@@ -105,15 +105,16 @@ UI
 
 ## 4. 生命週期
 
-- 一個帳號一個 task（`Core::room_syncs`）；線重開時 `init_connection` 換掉舊的（舊的線已經死了）。
-- 登出：`stop_room_sync_of` 先收 task，再 `close_links`。`Core` 丟掉：handle 的 `Drop` abort task。
-- task 🚫 不握 `Core`、不握線：握 `Arc<ServerCache>`、`EventSink`、訂閱的會話、池的 `Arc`（只為了收攤時關那格）。
+- 一個帳號一個 task（`Core::room_syncs`，`StoppableTask`）；線重開時 `init_connection` 換掉舊的（舊的線已經死了）：舊的叫停、放進停止中的清單，**不**在當場等（開線的人握著那格的寫鎖，/docs/design/daemon/task-supervision.md §4.1）。
+- 收攤時只關自己那條線（`LinkPool::close_line`，按線的號）：那格已經換成新線的話不動它。
+- 登出：`stop_background_of` 叫停、等它自己結束（連同停止中的），再 `close_links`。關機：`Core::shutdown`。`Drop` 只送停止開關，**不** abort。
+- task **不**握 `Core`、不握線：握 `Arc<ServerCache>`、`EventSink`、訂閱的會話、池的 `Arc`（只為了收攤時關那格）。
   金鑰的 `Device/Subscribe` 在自己那條線（`Keys`）上，跟這個 task 無關。
 - `Event/Unsubscribe` 的 codec 與 `room_unsubscribe` 在 sdk 裡（對著向量），core 不用它：關訂閱線就是關線，server 斷線自動退訂。
 
 ## 5. 不在這支
 
-- RPC（開／關訂閱線的命令）：🚫 不做（維護者 2026-09-29：訂閱線總是由 daemon 搞定）。開線走 `ensure_links`。
+- RPC（開／關訂閱線的命令）：**不**做（維護者 2026-09-29：訂閱線總是由 daemon 搞定）。開線走 `ensure_links`。
 - 金鑰訂閱（`Device/Subscribe`、`pull_to_device`）：/docs/design/keys/key-sync.md。
 - 背景重開：/docs/design/daemon/link-pool.md §3.1。
 - 密文解密：`room_crypto.rs`（task 寫庫前叫它）。推來的有金鑰就解，密文明文一起存；沒金鑰只存密文，金鑰到了由金鑰那半補解（/docs/design/keys/e2ee-rpc.md §6）。
@@ -131,7 +132,7 @@ UI
   `an_ended_subscription_closes_the_line_so_the_next_open_subscribes_again`（server 送 Error、socket 活著 → 那格關了、`closed` 帶原因 → 下次 `acquire` 走 `open` → 第二個 `Subscribe`、新訂閱收得到）；
   `a_gap_in_a_push_before_the_ack_is_reported_too`（假 server 在 Ack 之前先推一包帶 gap 的）；
   `the_rooms_line_says_opened_only_after_both_subscriptions_are_acknowledged`（§3.1 的前提：第一次開與訂閱結束後重開，開線閉包跑完 `init_connection` 時都還沒有 `opened`、
-  假 server 各收到一個 `Event/Subscribe` 與 `Invite/Subscribe`；`rooms` 的 `link.state` 依序是 opened、closed、opened，🚫 第三種）。
+  假 server 各收到一個 `Event/Subscribe` 與 `Invite/Subscribe`；`rooms` 的 `link.state` 依序是 opened、closed、opened，**沒有**第三種）。
   ⚠️ 它照 `open_link` 的順序自己組開線閉包（記憶體對接開不了真的 WS），所以守的是池「閉包回來才發 `Opened`」與 `init_connection` 兩個都訂；
   `open_link` 本身把 `init_connection` 放在閉包裡這一步，只有真 server 的 e2e 走得到。
 - 真 server（`--ignored`，`WBF_E2E_*`）：alice 登入、`ensure_links`（五條都開起來）；bob（另一個 Core）`Event/Send` 送一則；alice 的 `room.message` 在時限內到、

@@ -1,20 +1,22 @@
 //! 一條線上的請求：送收分開、動作封在請求裡（/docs/design/daemon/link-requests.md）。
 //!
 //! [`RequestLine`] 是一條線的**發送 queue ＋ 發送端**：請求（就是它的動作，[`LineRequest`]）放進 queue，發送端一個一個取出、配 seq、
-//! 交給 `WsLink` 送出，🚫 不等回覆。每個回覆（或逾時、斷線）連同它的動作交回擁有者的收件匣（[`LineReply`]），由擁有者的處理端照到達順序執行。
+//! 交給 `WsLink` 送出，**不**等回覆。每個回覆（或逾時、斷線）連同它的動作交回擁有者的收件匣（[`LineReply`]），由擁有者的處理端照到達順序執行。
 //!
-//! - 線從連線池借**分身**（`LinkPool::find_ws_link`），🚫 不握池那格的鎖。沒開或死了就停一下再看，queue 留著（§2 最後一條）：開線是 `link_keeper` 的事。
+//! - 線從連線池借**分身**（`LinkPool::find_ws_link`），**不**握池那格的鎖。沒開或死了就停一下再看，queue 留著（§2 最後一條）：開線是 `link_keeper` 的事。
 //! - 發送端一次只交一個給 `WsLink`、交完才取下一個，所以插到最前面的請求就是下一個送出去的（§2）。
-//! - 逾時看整條線：有請求在等、而一段時間內一個回應都沒收到才算（§4）；線還在回應，排得再後面也🚫 逾時。
-//! - 失敗怎麼處置🚫 不在這裡決定（§4）：擁有者收到 `Network`／`Timeout` 自己決定要不要 `push_front` 重送。
+//! - 逾時看整條線：有請求在等、而一段時間內一個回應都沒收到才算（§4）；線還在回應，排得再後面也**不**逾時。
+//! - 失敗怎麼處置**不**在這裡決定（§4）：擁有者收到 `Network`／`Timeout` 自己決定要不要 `push_front` 重送。
+//! - 發送端與等回覆的小 task 都有停止開關（/docs/design/daemon/task-supervision.md §2.1）：擁有者 [`RequestLine::stop`] 叫停並等它們結束，**不** abort。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Notify};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use wbf_sdk::link::WsLink;
+use wbf_sdk::task_stop::{StopSignal, StopSwitch, StopTimedOut, StoppableTask};
 use wbf_sdk::{protocol, SdkError};
 use wbf_wire::Pack;
 
@@ -52,16 +54,11 @@ impl<A> LineQueue<A> {
     }
 }
 
-/// 一條線的發送 queue ＋ 發送端。丟掉就停發送端，送出去還沒回的也一起丟（回覆變無主）。
+/// 一條線的發送 queue ＋ 發送端。擁有者收攤時 [`RequestLine::stop`]：發送端停、送出去還沒回的不再等（回覆變無主）。
+/// 丟掉只送停止開關（`StoppableTask`）。
 pub(crate) struct RequestLine<A> {
     queue: Arc<LineQueue<A>>,
-    sender: JoinHandle<()>,
-}
-
-impl<A> Drop for RequestLine<A> {
-    fn drop(&mut self) {
-        self.sender.abort();
-    }
+    sender: Option<StoppableTask>,
 }
 
 impl<A: LineRequest> RequestLine<A> {
@@ -82,14 +79,28 @@ impl<A: LineRequest> RequestLine<A> {
             queued: Mutex::new(VecDeque::new()),
             wake: Notify::new(),
         });
-        let sender = tokio::spawn(send_queued(
-            queue.clone(),
-            links,
-            role,
-            silence_timeout,
-            replies,
-        ));
-        RequestLine { queue, sender }
+        let sender_queue = queue.clone();
+        let sender = StoppableTask::spawn(|stop| {
+            send_queued(sender_queue, links, role, silence_timeout, replies, stop)
+        });
+        RequestLine {
+            queue,
+            sender: Some(sender),
+        }
+    }
+
+    /// 叫停發送端、等它（連同等回覆的小 task）自己結束。第二次叫是 no-op。
+    ///
+    /// Args:
+    ///     timeout: example: STOP_TIMEOUT
+    /// Return:
+    ///     Ok(())            停了
+    ///     Err(StopTimedOut) 等不到；沒有 abort
+    pub(crate) async fn stop(&mut self, timeout: Duration) -> Result<(), StopTimedOut> {
+        match self.sender.take() {
+            Some(sender) => sender.stop(timeout).await,
+            None => Ok(()),
+        }
     }
 
     /// 排在尾巴（一般的請求）。
@@ -99,7 +110,7 @@ impl<A: LineRequest> RequestLine<A> {
     }
 
     /// 插到最前面：下一個送出去的就是它（seek，/docs/design/media/media-download.md §6.2；或重送，/docs/design/daemon/link-requests.md §4）。
-    /// 送了第幾次🚫 記在這裡：那是擁有者的事（它決定要不要重送）。
+    /// 送了第幾次**不**記在這裡：那是擁有者的事（它決定要不要重送）。
     pub(crate) fn push_front(&self, action: A) {
         self.queue.queued().push_front(action);
         self.queue.wake.notify_one();
@@ -133,15 +144,17 @@ fn lock<A>(on_wire: &SharedOnWire<A>) -> MutexGuard<'_, OnWire<A>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 發送端：取出 → 配 seq → 登記並送出（`WsLink::send_request`）→ 回覆交給一個小 task 等，🚫 這裡不等。
+/// 發送端：取出 → 配 seq → 登記並送出（`WsLink::send_request`）→ 回覆交給一個小 task 等，這裡**不**等。
 /// 逾時看的是**整條線**（/docs/design/daemon/link-requests.md §4）：有請求在等、而 `silence_timeout` 內一個回應都沒收到，在途的全部交回 `Timeout`；
-/// 線還在回應，就🚫 有人逾時。
+/// 線還在回應，就**沒有**人逾時。
+/// 安全點是「等下一件」與「等線開」：一個請求登記、送出去之後才看開關。停之前叫停等回覆的小 task、等它們結束。
 async fn send_queued<A: LineRequest>(
     queue: Arc<LineQueue<A>>,
     links: Arc<LinkPool>,
     role: LinkRole,
     silence_timeout: Duration,
     replies: mpsc::UnboundedSender<LineReply<A>>,
+    mut stop: StopSignal,
 ) {
     let mut link: Option<WsLink> = None;
     let on_wire: SharedOnWire<A> = Arc::new(Mutex::new(OnWire {
@@ -150,14 +163,22 @@ async fn send_queued<A: LineRequest>(
     }));
     let check_every =
         (silence_timeout / 10).clamp(Duration::from_millis(10), Duration::from_secs(5));
-    // 等回覆的小 task 都在這裡：發送端停了（擁有者丟掉 `RequestLine`），它們跟著停。
+    // 等回覆的小 task 都在這裡。它們看兩個開關：發送端的（擁有者叫停）與 `give_up`（線整段沒回應、在途的已經交回 `Timeout`）。
     let mut waiting = JoinSet::new();
+    let (mut give_up, mut give_up_signal) = StopSwitch::new();
     loop {
         while waiting.try_join_next().is_some() {}
-        time_out_if_silent(&on_wire, silence_timeout, &replies, &mut waiting);
+        if time_out_if_silent(&on_wire, silence_timeout, &replies) {
+            give_up.request_stop();
+            (give_up, give_up_signal) = StopSwitch::new();
+        }
+        if stop.is_requested() {
+            break;
+        }
         let next = queue.queued().pop_front();
         let Some(action) = next else {
             tokio::select! {
+                _ = stop.requested() => break,
                 _ = queue.wake.notified() => {}
                 _ = tokio::time::sleep(check_every) => {}
             }
@@ -170,10 +191,13 @@ async fn send_queued<A: LineRequest>(
         let Some(current) = current else {
             // 線沒開：放回去，進度停在原地，等一下再看（/docs/design/daemon/link-requests.md §2）。
             queue.queued().push_front(action);
-            tokio::time::sleep(LINK_RETRY).await;
+            tokio::select! {
+                _ = stop.requested() => break,
+                _ = tokio::time::sleep(LINK_RETRY) => {}
+            }
             continue;
         };
-        // seq 由線發（/docs/design/daemon/link-requests.md §7）：同一條線上共用的 client、心跳都從同一個計數器拿，🚫 撞號。
+        // seq 由線發（/docs/design/daemon/link-requests.md §7）：同一條線上共用的 client、心跳都從同一個計數器拿，**不**撞號。
         let seq = current.next_seq();
         let pack = action.to_pack(seq);
         match current.send_request(pack.clone()).await {
@@ -186,11 +210,14 @@ async fn send_queued<A: LineRequest>(
                     wire.requests.insert(seq, action);
                 }
                 let (on_wire, replies) = (on_wire.clone(), replies.clone());
+                let (mut stopping, mut giving_up) = (stop.clone(), give_up_signal.clone());
                 waiting.spawn(async move {
-                    let result = pending
-                        .wait()
-                        .await
-                        .and_then(|response| protocol::expect_ack(&pack, response));
+                    let waited = tokio::select! {
+                        _ = stopping.requested() => return,
+                        _ = giving_up.requested() => return,
+                        waited = pending.wait() => waited,
+                    };
+                    let result = waited.and_then(|response| protocol::expect_ack(&pack, response));
                     let answered = {
                         let mut wire = lock(&on_wire);
                         wire.heard_at = Instant::now();
@@ -212,23 +239,27 @@ async fn send_queued<A: LineRequest>(
         }
         link = Some(current);
     }
+    // 叫停了：等回覆的小 task 也看同一個開關，等它們自己結束（禁止丟掉 JoinSet：那會 abort 它們）。
+    while waiting.join_next().await.is_some() {}
 }
 
-/// 有請求在等、而線 `silence_timeout` 內沒有任何回應：在途的全部交回 `Timeout`，等它們的小 task 停掉（晚到的回覆變無主）。
+/// 有請求在等、而線 `silence_timeout` 內沒有任何回應：在途的全部交回 `Timeout`（晚到的回覆變無主）。
+/// 等它們的小 task 由呼叫端送 `give_up` 開關讓它們自己結束。
+///
+/// Return:
+///     bool  true ＝ 線沉默、在途的已經交回；false ＝ 沒事
 fn time_out_if_silent<A>(
     on_wire: &SharedOnWire<A>,
     silence_timeout: Duration,
     replies: &mpsc::UnboundedSender<LineReply<A>>,
-    waiting: &mut JoinSet<()>,
-) {
+) -> bool {
     let silent: Vec<A> = {
         let mut wire = lock(on_wire);
         if wire.requests.is_empty() || wire.heard_at.elapsed() < silence_timeout {
-            return;
+            return false;
         }
         wire.requests.drain().map(|(_, action)| action).collect()
     };
-    waiting.abort_all();
     for action in silent {
         let _ = replies.send(LineReply {
             action,
@@ -237,6 +268,7 @@ fn time_out_if_silent<A>(
             ))),
         });
     }
+    true
 }
 
 #[cfg(test)]
@@ -330,7 +362,7 @@ mod tests {
         line.push_back(Named("A"));
         line.push_back(Named("B"));
         line.push_back(Named("C"));
-        // 三個都送出去了，一個回覆都還沒有：發送端🚫 不等回覆。
+        // 三個都送出去了，一個回覆都還沒有：發送端**不**等回覆。
         let mut sent = Vec::new();
         for _ in 0..3 {
             sent.push(requests.recv().await.unwrap());
@@ -358,6 +390,32 @@ mod tests {
             got.push(reply.action.0);
         }
         assert_eq!(got, vec!["C", "B", "A"]);
+    }
+
+    /// 擁有者收攤（/docs/design/daemon/task-supervision.md §2.1）：一個請求送出去了、回覆永遠不來，`stop` 也馬上回來——
+    /// 發送端與等回覆的小 task 都看開關、自己結束（不是被 abort）；那個請求**不**交回 `Timeout`（擁有者不在了）。
+    #[tokio::test]
+    async fn stopping_the_line_ends_the_sender_and_the_reply_waiters_on_their_own() {
+        let (pool, mut requests, _answers) = pool_with_link().await;
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let mut line = RequestLine::start(
+            pool,
+            LinkRole::Download,
+            Duration::from_secs(30),
+            replies_tx,
+        );
+        line.push_back(Named("never answered"));
+        let _sent = requests.recv().await.unwrap();
+        let stopped = line.stop(Duration::from_secs(2)).await;
+        assert!(stopped.is_ok(), "stopped without waiting for the reply");
+        assert!(
+            replies.try_recv().is_err(),
+            "nothing is handed back after the owner stopped the line"
+        );
+        assert!(
+            line.stop(Duration::from_secs(2)).await.is_ok(),
+            "twice is fine"
+        );
     }
 
     #[tokio::test]
@@ -444,7 +502,7 @@ mod tests {
             requests.recv().await.unwrap(),
             requests.recv().await.unwrap(),
         ];
-        // 每 200 ms 回一個：C 從送出到回覆超過 600 ms，可是線一直在回應，誰都🚫 逾時。
+        // 每 200 ms 回一個：C 從送出到回覆超過 600 ms，可是線一直在回應，誰都**不**逾時。
         for pack in &sent {
             tokio::time::sleep(Duration::from_millis(200)).await;
             answers.send(ack_for(pack)).unwrap();
@@ -487,7 +545,7 @@ mod tests {
         }
         timed_out.sort();
         assert_eq!(timed_out, vec!["A", "B"]);
-        // 晚到的回覆🚫 再交一次。
+        // 晚到的回覆**不**再交一次。
         answers.send(ack_for(&first)).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(200), replies.recv())

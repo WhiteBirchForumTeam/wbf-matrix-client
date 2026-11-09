@@ -211,12 +211,14 @@ impl Core {
         transport: Transport,
     ) -> Result<Manifest, CoreError> {
         let path = request.file.as_path();
-        let mut source = std::fs::File::open(path)
+        let file = std::fs::File::open(path)
             .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?;
-        let file_size = source
+        let file_size = file
             .metadata()
             .map_err(|error| CoreError::new(CoreErrorKind::Io, format!("{error}")))?
             .len();
+        // 取消的安全點是「上一塊送完、下一塊還沒讀」：取消之後讀不下去，狀態檔留著可續（/docs/design/daemon/task-supervision.md §2.2）。
+        let mut source = crate::job::ReadUntilCancelled::new(file);
         let session = self.session_of(account)?;
         let mut client = self
             .client_of(account, transport, MethodHome::WbfSdkOnly, LinkRole::Upload)
@@ -283,7 +285,7 @@ impl Core {
             Err(error) => return Err(CoreError::new(CoreErrorKind::Io, format!("{error}"))),
         };
 
-        let summary = client
+        let sent = client
             .send_chunks(
                 &state,
                 &mut source,
@@ -294,7 +296,17 @@ impl Core {
                     None => self.events.progress(format!("chunk {done}")),
                 },
             )
-            .await?;
+            .await;
+        if sent.is_err() && crate::job::check_cancelled().is_err() {
+            return Err(CoreError::new(
+                CoreErrorKind::Cancelled,
+                format!(
+                    "upload cancelled; {} stays, so uploading the same file again resumes",
+                    state_path.display()
+                ),
+            ));
+        }
+        let summary = sent?;
         let mut final_block = state.block.clone();
         final_block.sha256 = summary.sha256;
         let manifest = client.seal_upload(&state, &final_block).await?;

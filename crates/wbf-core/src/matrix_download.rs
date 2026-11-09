@@ -3,7 +3,7 @@
 //! 一個檔一個 task：它是這個檔主檔（池格式 v2）唯一的寫入者，GET 要還在下載的明文也問它。下載本身（HTTP、解密）在 sdk 的
 //! `matrix_media::stream_matrix_media`，明文經一個有界 channel 進來，這個 task 寫進池、回答 GET；讀完自動驗、記結果。
 //! 跟 wbf 分塊的下載處理端（`download_queue.rs`）分開：那邊是 `Download` 線上一塊一塊的請求，這邊是一個 HTTP 從頭讀到尾，
-//! 🚫 seek、🚫 續傳（§12.4）；共用的只有池、`cache.db` 的列與推播 `media.download`。
+//! **沒有** seek、**沒有**續傳（§12.4）；共用的只有池、`cache.db` 的列與推播 `media.download`。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -49,12 +49,15 @@ enum Command {
 /// 一個正在下載的傳統檔。
 pub(crate) struct MatrixTransfer {
     account_dir: PathBuf,
-    /// 這個 task 照哪一份描述（金鑰、hash、大小）在下載：另一份描述🚫 掛上來
+    /// 這個 task 照哪一份描述（金鑰、hash、大小）在下載：另一份描述**不**掛上來
     description: MediaDescription,
     pending_name: String,
+    /// 這個 task 的終止接口是 `Command::Cancel`（/docs/design/daemon/task-supervision.md §2.1）
     commands: mpsc::UnboundedSender<Command>,
     /// 要過這個檔的帳號：進度與結果每個各推一則（/docs/design/media/media-download.md §12.1，維護者 2026-10-07）。跟 task 共用
     listeners: Listeners,
+    /// task 本身：登出、關機送 `Cancel` 之後等它自己結束（起了才放進來）
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// 要過一個檔的帳號（mxid）。
@@ -221,16 +224,15 @@ impl Core {
             let _ = commands.send(Command::Wait(waiter));
         }
         let listeners: Listeners = Arc::new(Mutex::new(BTreeSet::from([me.clone()])));
-        files.insert(
-            key.clone(),
-            Arc::new(MatrixTransfer {
-                account_dir: account.dir.clone(),
-                description: description.clone(),
-                pending_name: pending_name.clone(),
-                commands,
-                listeners: listeners.clone(),
-            }),
-        );
+        let transfer = Arc::new(MatrixTransfer {
+            account_dir: account.dir.clone(),
+            description: description.clone(),
+            pending_name: pending_name.clone(),
+            commands,
+            listeners: listeners.clone(),
+            task: Mutex::new(None),
+        });
+        files.insert(key.clone(), transfer.clone());
         drop(files);
         let task = TransferTask {
             key,
@@ -249,7 +251,10 @@ impl Core {
             reads: Vec::new(),
             waiters: Vec::new(),
         };
-        tokio::spawn(task.run());
+        *transfer
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tokio::spawn(task.run()));
         Ok(downloading)
     }
 
@@ -264,17 +269,49 @@ impl Core {
         }
     }
 
-    /// 登出、換 session：這個帳號起的傳統下載全部停（🚫 續傳，半成品刪掉，§12.4）。
-    pub(crate) fn stop_matrix_downloads_of(&self, account: &AccountDir) {
+    /// 登出、換 session、關機：這個帳號起的傳統下載全部停（**不**續傳，半成品刪掉，§12.4）。
+    /// 送 `Cancel`（它們的終止接口）、等它們自己結束（/docs/design/daemon/task-supervision.md §2.1）；等不到就講一聲、**不** abort。
+    pub(crate) async fn stop_matrix_downloads_of(&self, account: &AccountDir) {
+        self.stop_matrix_downloads_where(|dir| dir == account.dir, &account.label())
+            .await;
+    }
+
+    /// 關機：每個帳號的傳統下載都停（同 [`Core::stop_matrix_downloads_of`]）。
+    pub(crate) async fn stop_all_matrix_downloads(&self) {
+        self.stop_matrix_downloads_where(|_| true, "this daemon")
+            .await;
+    }
+
+    /// Args:
+    ///     is_theirs: 哪些帳號目錄的要停, example: |dir| dir == account.dir
+    ///     whose: 給人看的, example: "alice@localhost"
+    async fn stop_matrix_downloads_where(&self, is_theirs: impl Fn(&Path) -> bool, whose: &str) {
         let theirs: Vec<Arc<MatrixTransfer>> = self
             .matrix_transfers
             .files()
             .values()
-            .filter(|transfer| transfer.account_dir == account.dir)
+            .filter(|transfer| is_theirs(&transfer.account_dir))
             .cloned()
             .collect();
-        for transfer in theirs {
+        for transfer in &theirs {
             let _ = transfer.commands.send(Command::Cancel);
+        }
+        for transfer in theirs {
+            let task = transfer
+                .task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(task) = task else { continue };
+            if tokio::time::timeout(wbf_sdk::task_stop::STOP_TIMEOUT, task)
+                .await
+                .is_err()
+            {
+                self.events.progress(format!(
+                    "a standard Matrix download of {whose} did not stop within {}s",
+                    wbf_sdk::task_stop::STOP_TIMEOUT.as_secs()
+                ));
+            }
         }
     }
 }
@@ -318,10 +355,10 @@ impl TransferTask {
             Err(error) => Outcome::Failed(error),
         };
         if !matches!(outcome, Outcome::Complete(_)) {
-            // 🚫 續傳（§12.4）：半成品刪掉、列回到「還沒下載」。
+            // **不**續傳（§12.4）：半成品刪掉、列回到「還沒下載」。
             let _ = self.pool.discard_pending(&self.pending_name);
             let (mxc, own_name) = (self.key.1.clone(), self.pending_name.clone());
-            // 列已經被刪掉、或刪了又由別則事件重建（`media.delete_local`）：🚫 去清別人的列。
+            // 列已經被刪掉、或刪了又由別則事件重建（`media.delete_local`）：**不**去清別人的列。
             self.cache.post(
                 move |cache| match cache.media_pending_name(&mxc)? {
                     Some(name) if name == own_name => cache.media_reset(&mxc),
@@ -373,7 +410,7 @@ impl TransferTask {
         let mxc = self.key.1.clone();
         let total = self.total;
         // 起 task 之前看到的列可能已經舊了：上一個 task 在那之後剛收尾、從登記表拿掉，這裡才補上（PR #75 審查 salvia 1）。
-        // 開頭再問一次列：已經完整就直接收尾、🚫 重下；列被刪了或換了就🚫 下載。
+        // 開頭再問一次列：已經完整就直接收尾、**不**重下；列被刪了或換了就**不**下載。
         let own = MediaDescription::of_matrix_attachment(&self.attachment);
         let recorded = self.cache.read().await.find_media(&mxc)?;
         let Some(entry) = recorded.filter(|entry| media::is_same_matrix_file(entry, &own)) else {
@@ -386,7 +423,7 @@ impl TransferTask {
             self.push(DownloadState::Complete, total, Some(entry.verified), None);
             return Ok(Some(pool_file));
         }
-        // 🚫 續傳（§12.4）：之前留下的半成品（daemon 重開、取消）丟掉，從頭來。
+        // **不**續傳（§12.4）：之前留下的半成品（daemon 重開、取消）丟掉，從頭來。
         let _ = self.pool.discard_pending(&self.pending_name);
         let mut writer = self.pool.create_pending(&self.pending_name, &mxc)?;
         self.push(DownloadState::Downloading, 0, None, None);
@@ -422,7 +459,9 @@ impl TransferTask {
                     }
                     Some(Command::Wait(waiter)) => self.waiters.push(waiter),
                     Some(Command::Cancel) | None => {
-                        fetch.abort();
+                        // 下載那頭的終止接口是收的這頭：關掉，它下一次交一段時看到、自己回來（/docs/design/daemon/task-supervision.md §2.1，禁止 abort）。
+                        pieces.close();
+                        let _ = tokio::time::timeout(wbf_sdk::task_stop::STOP_TIMEOUT, fetch).await;
                         return Ok(None);
                     }
                 },
@@ -439,7 +478,7 @@ impl TransferTask {
         if self.attachment.kind == MediaKind::MatrixEncrypted {
             self.push(DownloadState::Verifying, total, None, None);
         }
-        // 收尾前再問一次列：下載途中列被刪了（`media.delete_local`）、或刪了又由別則事件重建，這份結果🚫 記到它上面。走失敗的路：半成品丟掉。
+        // 收尾前再問一次列：下載途中列被刪了（`media.delete_local`）、或刪了又由別則事件重建，這份結果**不**記到它上面。走失敗的路：半成品丟掉。
         let (recorded, recorded_name) = {
             let reader = self.cache.read().await;
             (reader.find_media(&mxc)?, reader.media_pending_name(&mxc)?)
@@ -781,7 +820,7 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), plain);
     }
 
-    /// 翻一個密文 bit（維護者 2026-10-06）：🚫 刪檔、記 verified 2；GET 照給但不可信（412）；匯出照寫、回 1501、data 是那份結果。
+    /// 翻一個密文 bit（維護者 2026-10-06）：**不**刪檔、記 verified 2；GET 照給但不可信（412）；匯出照寫、回 1501、data 是那份結果。
     #[tokio::test]
     async fn a_tampered_matrix_attachment_is_kept_untrusted_and_exports_as_1501() {
         let mxc = "mxc://localhost/EncBad";
@@ -880,7 +919,7 @@ mod tests {
         let _ = account;
     }
 
-    /// 明文的傳統檔（kind 3）：沒有 hash 可比，🚫 verifying、完成時 verified 0；可信（GET 2xx）。一般 Matrix 帳號也下載得了。
+    /// 明文的傳統檔（kind 3）：沒有 hash 可比，**沒有** verifying、完成時 verified 0；可信（GET 2xx）。一般 Matrix 帳號也下載得了。
     #[tokio::test]
     async fn a_plain_matrix_attachment_has_nothing_to_verify_and_works_for_a_general_account() {
         let mxc = "mxc://localhost/Plain";
@@ -915,8 +954,8 @@ mod tests {
     }
 
     /// 同一個 mxc、兩則事件給不同的 `file`（/docs/design/media/media-download.md §5.3、§12.1，維護者 2026-10-07）：
-    /// 先到的是偽造的（列照它建）→ 從真的那則下載回 1500、🚫 下載、列🚫 動；`media.delete_local` 之後從真的那則下載成功、列換成真的；
-    /// 之後偽造那則再來回錯；只給 mxc 時挑的是跟列一致的那則（偽造那則的事件比較早，但🚫 挑它）。
+    /// 先到的是偽造的（列照它建）→ 從真的那則下載回 1500、**不**下載、列**不**動；`media.delete_local` 之後從真的那則下載成功、列換成真的；
+    /// 之後偽造那則再來回錯；只給 mxc 時挑的是跟列一致的那則（偽造那則的事件比較早，但**不**挑它）。
     #[tokio::test]
     async fn a_forged_description_that_came_first_is_refused_until_the_local_copy_is_deleted() {
         let mxc = "mxc://localhost/Twice";
@@ -1014,7 +1053,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, CoreErrorKind::Integrity, "{error:?}");
-        // 偽造那則現在也連在這一列上（從它點過），而且比真的那則早寫進來：只給 mxc 時🚫 挑它。
+        // 偽造那則現在也連在這一列上（從它點過），而且比真的那則早寫進來：只給 mxc 時**不**挑它。
         assert_eq!(
             cache
                 .read()
@@ -1035,7 +1074,7 @@ mod tests {
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
     }
 
-    /// 只給 mxc、列還沒下載（/docs/design/media/media-download.md §5.3）：用的是跟列一致的那則的金鑰，🚫 最早寫進來的那則。
+    /// 只給 mxc、列還沒下載（/docs/design/media/media-download.md §5.3）：用的是跟列一致的那則的金鑰，**不**是最早寫進來的那則。
     #[tokio::test]
     async fn an_mxc_alone_downloads_with_the_key_of_the_event_that_matches_the_record() {
         let mxc = "mxc://localhost/Pick";
@@ -1121,7 +1160,7 @@ mod tests {
         let pool = core.pool_of(&account).unwrap();
         assert!(pool.list_pending().unwrap().is_empty());
         let (cache, _) = core.server_cache_and_me(&account).unwrap();
-        // 被取消的 task 收尾時🚫 去清（或重建）列。
+        // 被取消的 task 收尾時**不**去清（或重建）列。
         cache.run(|_| Ok(())).await.unwrap();
         assert!(cache.read().await.find_media(mxc).unwrap().is_none());
         let error = core
@@ -1149,7 +1188,7 @@ mod tests {
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
     }
 
-    /// PR #75 審查 salvia 1：起 task 之前讀的列已經舊了（上一個 task 剛收尾）——task 開頭再問一次列，完整就直接收尾、🚫 重下。
+    /// PR #75 審查 salvia 1：起 task 之前讀的列已經舊了（上一個 task 剛收尾）——task 開頭再問一次列，完整就直接收尾、**不**重下。
     /// 這裡直接起一個 task 對著已經完整的列，server 是一個連不上的位址：真的去下載就會失敗。
     #[tokio::test]
     async fn a_task_started_after_the_file_completed_finishes_without_downloading() {
@@ -1193,6 +1232,7 @@ mod tests {
                 pending_name: pending_name.clone(),
                 commands,
                 listeners: listeners.clone(),
+                task: std::sync::Mutex::new(None),
             }),
         );
         let task = TransferTask {
@@ -1232,7 +1272,7 @@ mod tests {
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
     }
 
-    /// 正照一份描述在下載時，另一份描述來要同一個 mxc：跟列對不上、回錯（🚫 掛上去，會拿到別把金鑰解的資料）；正在下載的照常完成。
+    /// 正照一份描述在下載時，另一份描述來要同一個 mxc：跟列對不上、回錯（**不**掛上去，會拿到別把金鑰解的資料）；正在下載的照常完成。
     #[tokio::test]
     async fn another_description_cannot_join_a_download_in_progress() {
         let mxc = "mxc://localhost/Busy";
@@ -1286,7 +1326,7 @@ mod tests {
             Some((DownloadState::Complete, Some(Verification::Matched)))
         );
         assert_eq!(read_whole(&core, mxc).await, (true, plain));
-        // 結果記在真的那份描述上：被拒的那份🚫 換掉列的描述。
+        // 結果記在真的那份描述上：被拒的那份**不**換掉列的描述。
         let (cache, _) = core.server_cache_and_me(&account).unwrap();
         let entry = cache.read().await.find_media(mxc).unwrap().unwrap();
         assert_eq!(
@@ -1295,7 +1335,7 @@ mod tests {
         );
     }
 
-    /// 取消（/docs/design/media/media-download.md §12.4）：🚫 續傳，半成品刪掉、列回到沒下載、推播 cancelled；再要一次從頭來。
+    /// 取消（/docs/design/media/media-download.md §12.4）：**不**續傳，半成品刪掉、列回到沒下載、推播 cancelled；再要一次從頭來。
     #[tokio::test]
     async fn a_cancelled_matrix_download_leaves_nothing_and_starts_over_next_time() {
         let mxc = "mxc://localhost/Cancel";
@@ -1345,7 +1385,7 @@ mod tests {
         );
     }
 
-    /// 維護者 2026-10-07：一個檔只有一個下載。同一台 server 的 B 也要 A 正在下載的傳統檔 → 掛到同一個 task 上（🚫 再起一個）；
+    /// 維護者 2026-10-07：一個檔只有一個下載。同一台 server 的 B 也要 A 正在下載的傳統檔 → 掛到同一個 task 上（**不**再起一個）；
     /// 進度與結果兩個帳號都收到。
     #[tokio::test]
     async fn two_accounts_share_one_matrix_download_and_both_hear_its_end() {

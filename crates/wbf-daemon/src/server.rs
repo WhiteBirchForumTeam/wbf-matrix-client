@@ -13,6 +13,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::task::TaskTracker;
+use wbf_sdk::task_stop::{StopSignal, StopSwitch, STOP_TIMEOUT};
 
 use crate::connection::{Connection, EncryptionPolicy, Inbound};
 use crate::handle::Handle;
@@ -48,16 +50,17 @@ impl RpcServer {
         self.listener.local_addr()
     }
 
-    /// 一直 accept，直到 `daemon.shutdown`。常駐的這段期間，背景還有一個看線的迴圈（`Handle::keep_links_open`），跟著一起停。
+    /// 一直 accept，直到 `daemon.shutdown`。常駐的這段期間，背景還有一個看線的迴圈（`Handle::keep_links_open`），跟著一起停：
+    /// 它自己看 shutdown 廣播，這裡等它把手上那一輪做完才回（最多 `STOP_TIMEOUT`；禁止 abort，/docs/design/daemon/task-supervision.md §2.1）。
+    /// 每條連線交給 `InFlight`：關機時 `main` 等它們把自己的請求回完、送出關閉通知（`InFlight::finish_connections`）。
     pub async fn run(self) {
         let mut shutdown = self.handle.shutdown_signal();
         let keeper = tokio::spawn(self.handle.clone().keep_links_open());
-        let _stop_keeper_on_return = AbortOnDrop(keeper);
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
-                    tokio::spawn(serve_connection(
+                    self.handle.in_flight().spawn_connection(serve_connection(
                         stream,
                         self.keys.clone(),
                         self.policy.clone(),
@@ -66,20 +69,17 @@ impl RpcServer {
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        return;
+                        break;
                     }
                 }
             }
         }
-    }
-}
-
-/// 丟掉就 abort 那個 task：`run` 不管怎麼結束（shutdown、或整個 future 被丟掉），看線的迴圈都跟著停，🚫 不留一個握著 `Handle` 的孤兒。
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
+        if tokio::time::timeout(STOP_TIMEOUT, keeper).await.is_err() {
+            eprintln!(
+                "the line keeper did not finish its round within {}s; it stops at its next check",
+                STOP_TIMEOUT.as_secs()
+            );
+        }
     }
 }
 
@@ -99,6 +99,7 @@ async fn serve_connection(
         return;
     };
     let _counted = handle.connection_opened();
+    let connection_number = handle.in_flight().next_connection_number();
     let (mut sink, mut source) = websocket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Outgoing>(64);
     let mut shutdown = handle.shutdown_signal();
@@ -128,21 +129,28 @@ async fn serve_connection(
     // `Connection` 由這個 task 獨佔；handle 的呼叫各自 spawn，回應經 channel 回來再由這裡封包。
     let connection = Arc::new(tokio::sync::Mutex::new(Connection::new(keys, policy)));
     // 這條連線訂了什麼、現在有哪些請求在跑（/docs/design/rpc-specs/rpc-spec.md §3.9、§4：`progress` 不用訂，發那個請求的連線自己收得到）。
-    // ⚠️ std 的 Mutex：只在同步的一小段裡拿，🚫 不跨 await。
+    // ⚠️ std 的 Mutex：只在同步的一小段裡拿，**不**跨 await。
     let subscriptions = Arc::new(std::sync::Mutex::new(Subscriptions::default()));
     let in_flight = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    // 這條連線自己的請求：關機時先等它們回完，才送關閉通知（/docs/design/daemon/task-supervision.md §2.3）。
+    let my_requests = TaskTracker::new();
+    let (push_stop, push_stop_signal) = StopSwitch::new();
     let push_task = tokio::spawn(forward_pushes(
         handle.clone(),
         connection.clone(),
         outgoing_tx.clone(),
         subscriptions.clone(),
         in_flight.clone(),
+        push_stop_signal,
     ));
     loop {
         let message = tokio::select! {
             next = source.next() => next,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    // 自己的請求先回完（`InFlight::finish_requests` 等不到的會送取消，它們回 `105`），關閉通知排在它們後面。
+                    my_requests.close();
+                    my_requests.wait().await;
                     let notice = Response::close(None, CloseReason::ShuttingDown, "the daemon is shutting down");
                     if let Some(bytes) = sealed_or_log(connection.lock().await.seal_close(&notice), "the close notice") {
                         let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, CloseReason::ShuttingDown)).await;
@@ -210,11 +218,20 @@ async fn serve_connection(
                 }
             }
             Inbound::Request(request) => {
-                // 訂閱是**這條連線**的事，不碰 core：在這裡就回，🚫 不進 handle。
-                if request.method == "subscribe" || request.method == "unsubscribe" {
-                    let response = subscription_response(&subscriptions, &request);
+                // 正在關機就回 `107`：在讀到的當下問，照線上的順序（`daemon.shutdown` 之前到的照常做）。
+                // 訂閱與取消是**這條連線**的事，不碰 core：在這裡就回，**不**進 handle。
+                let local = handle.find_shutdown_refusal(&request).or_else(|| {
+                    match request.method.as_str() {
+                        "subscribe" | "unsubscribe" => {
+                            Some(subscription_response(&subscriptions, &request))
+                        }
+                        "cancel" => Some(cancel_response(&handle, connection_number, &request)),
+                        _ => None,
+                    }
+                });
+                if let Some(response) = local {
                     let sealed = connection.lock().await.seal_response(&response);
-                    let Some(bytes) = sealed_or_log(sealed, "a subscribe reply") else {
+                    let Some(bytes) = sealed_or_log(sealed, "a local reply") else {
                         continue;
                     };
                     if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
@@ -222,44 +239,73 @@ async fn serve_connection(
                     }
                     continue;
                 }
-                let handle = handle.clone();
+                let handle_here = handle.clone();
                 let connection = connection.clone();
                 let outgoing_tx = outgoing_tx.clone();
                 let in_flight = in_flight.clone();
-                tokio::spawn(async move {
-                    let response = match request.id {
-                        // 請求的 `id` 就是它的 job：core 在這個工作裡發的 `progress` 都帶這個號，推播那邊拿它對回「是這條連線發的」。
-                        Some(id) => {
-                            in_flight
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .insert(id);
-                            let response =
-                                wbf_core::job::run_as_job(id, handle.call(request)).await;
-                            in_flight
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .remove(&id);
-                            response
-                        }
-                        None => handle.call(request).await,
-                    };
-                    let sealed = connection.lock().await.seal_response(&response);
-                    if let Some(bytes) = sealed_or_log(sealed, "a response") {
-                        let _ = outgoing_tx.send(Outgoing::Frame(bytes)).await;
-                    }
-                    // 回應已經排進 writer 了，這時才廣播 shutdown：close 通知一定排在它後面。
-                    handle.begin_shutdown_if_requested();
-                });
+                let id = request.id;
+                let tracked = my_requests.clone();
+                handle
+                    .in_flight()
+                    .spawn_request(connection_number, id, move |cancel| {
+                        tracked.track_future(async move {
+                            let handle = handle_here;
+                            let response = match id {
+                                // 請求的 `id` 就是它的 job：core 在這個工作裡發的 `progress` 都帶這個號，推播那邊拿它對回「是這條連線發的」。
+                                // 取消開關也跟著它走（`wbf_core::job::check_cancelled`）。
+                                Some(id) => {
+                                    in_flight
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .insert(id);
+                                    let response =
+                                        wbf_core::job::run_as_job(id, cancel, handle.call(request))
+                                            .await;
+                                    in_flight
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .remove(&id);
+                                    handle.in_flight().finish_request(connection_number, id);
+                                    response
+                                }
+                                None => handle.call(request).await,
+                            };
+                            let sealed = connection.lock().await.seal_response(&response);
+                            if let Some(bytes) = sealed_or_log(sealed, "a response") {
+                                let _ = outgoing_tx.send(Outgoing::Frame(bytes)).await;
+                            }
+                            // 回應已經排進 writer 了，這時才廣播 shutdown：close 通知一定排在它後面。
+                            handle.begin_shutdown_if_requested();
+                        })
+                    });
             }
         }
     }
-    push_task.abort();
+    // 推播 task：叫停、等它結束（禁止 abort）。
+    push_stop.request_stop();
+    let _ = tokio::time::timeout(STOP_TIMEOUT, push_task).await;
     drop(outgoing_tx);
     let _ = writer.await;
 }
 
-/// 封不起來（序列化不了、OS 給不出 nonce；理論上到不了）就講一聲、回 `None`：呼叫端當作沒東西可送，🚫 不炸掉這條連線。
+/// `cancel { id }`（/docs/design/rpc-specs/rpc-spec.md §3.9）：送取消開關給**這條連線**上那個還在跑的請求；它自己在安全點收攤、回 `105`。
+fn cancel_response(handle: &Handle, connection_number: u64, request: &Request) -> Response {
+    let params = crate::connection::params_or_empty_object(&request.params);
+    let Some(target) = params.get("id").and_then(serde_json::Value::as_u64) else {
+        return Response::error(
+            request.id,
+            code::INVALID_PARAMS,
+            "cancel needs `id`: the id of the request to cancel",
+        );
+    };
+    let was_running = handle.in_flight().cancel_request(connection_number, target);
+    Response::ok(
+        request.id,
+        serde_json::json!({ "ok": true, "was_running": was_running }),
+    )
+}
+
+/// 封不起來（序列化不了、OS 給不出 nonce；理論上到不了）就講一聲、回 `None`：呼叫端當作沒東西可送，**不**炸掉這條連線。
 ///
 /// Args:
 ///     what: 封的是什麼，給人看, example: "a push"
@@ -284,11 +330,17 @@ async fn forward_pushes(
     outgoing_tx: mpsc::Sender<Outgoing>,
     subscriptions: Arc<std::sync::Mutex<Subscriptions>>,
     in_flight: Arc<std::sync::Mutex<HashSet<u64>>>,
+    mut stop: StopSignal,
 ) {
     let core = handle.core().await;
     let mut events = core.subscribe();
     loop {
-        let request = match events.recv().await {
+        // 安全點是「等下一則」：這則封好、排進 writer 才看開關。
+        let next = tokio::select! {
+            _ = stop.requested() => return,
+            next = events.recv() => next,
+        };
+        let request = match next {
             Ok(event) => {
                 let push = push::push_of(&event);
                 let is_my_job = push.job.is_some_and(|job| {
@@ -306,7 +358,7 @@ async fn forward_pushes(
                 }
                 push.request
             }
-            // 什麼都沒訂的連線本來就收不到推播，漏了也沒有東西可漏：🚫 不發 `desync`（推播要先 subscribe，這則也不例外；PR #53 審查 rumia 🔴2）。
+            // 什麼都沒訂的連線本來就收不到推播，漏了也沒有東西可漏：**不**發 `desync`（推播要先 subscribe，這則也不例外；PR #53 審查 rumia 🔴2）。
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 let is_subscribed = !subscriptions
                     .lock()

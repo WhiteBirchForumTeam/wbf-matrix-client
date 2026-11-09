@@ -348,6 +348,7 @@ wbf-cli --data-dir ~/.wbf account switch @bob:localhost    # 跟這個不是同�
 | 3 | **完整性失敗**：CRC、AEAD 標籤、長度、sha256、事件與 `Info` 對不上。半成品已刪 |
 | 4 | 網路：連不上、斷線且續傳次數用完 |
 | 5 | 等逾時：`watch once --timeout` 到了還沒有事件；加密房的房間金鑰在等待時間內沒準備好（core 的 `RoomKeyNotReady`，RPC 1402），訊息沒送、重送就好 |
+| 130 | 工作被取消（core 的 `Cancelled`，RPC 105；跟 Ctrl-C 同一個慣例）。CLI 自己現在不會取消；之後走 RPC（/docs/design/daemon/task-supervision.md §3 的 A-2）才會收到 |
 
 ⚠️ **SDK 認 wbf 的錯誤碼只看 `code_id`，不看 `code` 名字**（wbfuwunel 的 `/docs/design/wbf-wire-format.md` §3.4；issue #29 第 2 項）。
 `code` 那個字串同時裝著 Matrix 的 `errcode`（`M_FORBIDDEN`）與我們自己合成的（HTTP 401 的 `Unauthorized`），

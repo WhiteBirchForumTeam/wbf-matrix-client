@@ -1,4 +1,4 @@
-# 收攤：每個 task 都有終止接口、正常結束（草稿，等維護者點頭）
+# 收攤：每個 task 都有終止接口、正常結束（維護者 2026-11-10 核可、已實作）
 
 > 這份回答：daemon 裡每個背景 task 怎麼被叫停、關機時誰先停誰後停、UI 的 `cancel` 怎麼讓一個請求停下來。
 > 對應 /docs/handover.md §7 第 3 點（daemon 穩健性）、/docs/design/daemon/daemon-runtime.md §8（取消）與 §10 的第 5、8 階段；本 repo issue #26 的 daemon 那半也在這裡。
@@ -111,14 +111,30 @@ impl XxxHandle {
 | `apps/wbf-cli` 改走 RPC | 量大（CLI 2357 行全部直接用 `Core`），而且要先有一個 RPC 客戶端（加密、hello、`daemon.json`）。另開一支（A-2）；issue #26 的 CLI 那半在那支收掉 |
 | 接住 task 的 panic | §0 第 4 點 |
 
-## 4. 要維護者決定的
+## 4. 維護者定的（2026-11-10，四點都同意）
 
 1. **切法**：這份（A-1：終止接口、關機、`cancel`）一支 PR，CLI 改走 RPC（A-2）下一支。
-2. **重探 backend 不做**：同意的話，link-pool.md、account-session.md、daemon-runtime.md §10 裡「還沒做：重探」改成「不做」。
-3. **等多久、等不到怎麼辦**：請求 10 秒、每個背景 task 5 秒（現有的 `STOP_TIMEOUT`）。等不到時我的提案是講一聲（note）、**不**再 abort、往下一步走——關機最後 runtime 被丟掉時它才停。要不要改？
-4. **`cancel` 從「drop 掉 future」改成合作式開關**（§2.2 的 ⚠️）：短請求被 `cancel` 時照樣做完、回正常結果，`cancel` 回 `was_running: true`。
+2. **重探 backend 不做**：link-pool.md、account-session.md、daemon-runtime.md §10 裡「還沒做：重探」改成「不做」。
+3. **等多久、等不到怎麼辦**：請求 10 秒（`wbf_daemon::in_flight::REQUEST_GRACE`）、每個背景 task 5 秒（`wbf_sdk::task_stop::STOP_TIMEOUT`）。等不到就講一聲、**不**再 abort、往下一步走。
+4. **`cancel` 改成合作式開關**（§2.2 的 ⚠️）：短請求被 `cancel` 時照樣做完、回正常結果，`cancel` 回 `was_running: true`。
 
-## 5. 驗收（點頭之後照這張做）
+### 4.1 實作時跟上面不同的（照預設做）
+
+- **換線時的舊 task 不在當場等**（§2.1 表上寫的是「先 `stop()` 舊的再起新的」）：`init_rooms`／`init_keys` 是在池握著那格寫鎖時跑的，
+  而舊 task 收攤時也要關那一格（要同一把鎖），當場等會互相等。改成：叫停、放進「停止中」的清單（`Core::retire_task`），登出與關機等清單裡的。
+- **舊 task 只關自己那條線**（`LinkPool::close_line`，按線的號）：原本的 `close(role)` 關的是「現在在那格的」，舊 task 收攤時那格已經換成新線的話會關錯。
+  這個洞以前也在，只是舊 task 都被 abort 掉所以沒出事。
+- **下載線的等回覆小 task** 也有開關：線整段沒回應時（原本 `abort_all`）送 `give_up` 開關，發送端停時等它們結束（禁止丟掉 `JoinSet`：那會 abort）。
+- **傳統格式下載的 HTTP 拉流**：終止接口是「關掉收的那頭」，它下一次交一段時看到、自己回來（原本 `fetch.abort()`）。
+- **取消的安全點**：`sync.recent` 是「一批寫完」（水位最後才推，所以不動）；上傳與匯出是「讀下一塊／下一段之前」（`wbf_core::job::ReadUntilCancelled`：
+  讀的那一頭取消之後回錯，工作走它本來的錯誤路收攤；`send_chunks` 的進度回呼不能中斷，改它的簽名要動 13 個呼叫點）。
+  `room.send_file` 的上傳那半跟 `upload.file` 同一條。
+- **Ctrl+C**：跟 `daemon.shutdown` 同一條路（`Handle::request_shutdown`），只是沒有「那則回應先送出去」要等；Unix 另外聽 SIGTERM。
+- **「關機之後進來的回 `107`」改在連線讀到請求的當下判斷**（`Handle::find_shutdown_refusal`，原本在 `Handle::call` 開頭）：原本是 task 開始跑才問，
+  於是一個比 `daemon.shutdown` 早到、但 task 還沒排到的請求也會拿到 `107`——跟 /docs/design/rpc-specs/rpc-spec.md §5 的「之後進來的」不符。
+  loopback 的 `shutdown_waits_for_the_requests_still_running` 是這樣抓到的（約四次紅一次）。
+
+## 5. 驗收
 
 - 每個 §2.1 表上的 task：`stop()` 之後它**自己 return**（`JoinHandle` 回 `Ok`、不是 cancelled），而且手上那一件做完了（例：下載處理端手上那一包寫進檔案、金鑰後台手上那間房的 to-device 送完而且記了「已送」）。
 - `Drop` 不再 abort：持有者丟掉之後 task 照樣把手上的做完才結束。

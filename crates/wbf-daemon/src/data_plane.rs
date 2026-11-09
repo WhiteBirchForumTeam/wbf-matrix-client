@@ -5,8 +5,8 @@
 //! | URL 與 meta（[`AccessKeys`]）：URL 裡那段是共享 token 加密的「用途 ‖ mxc」，上傳狀態在 `Wbf-Upload-Meta` header | `media.create`／`media.open` 鑄（`handle/media.rs`） |
 //! | HTTP listener（[`DataServer`]）：路徑、Host、Range、狀態碼、把 body 交給 core、把 core 給的明文串流出去 | 怎麼切塊、加密、上傳（`Core::receive_upload`）；從哪讀（`Core::find_media_source`） |
 //!
-//! 🚫 沒有 token 表、沒有 TTL（維護者 2026-09-30）：URL 與 header 帶著上傳的一切，daemon 解得開就是它發的；
-//! 能活多久、要不要拒，是 server 的事。唯一的表是「正在收的上傳」，只活在那條連線的期間。🚫 這裡不印東西。
+//! **沒有** token 表、沒有 TTL（維護者 2026-09-30）：URL 與 header 帶著上傳的一切，daemon 解得開就是它發的；
+//! 能活多久、要不要拒，是 server 的事。唯一的表是「正在收的上傳」，只活在那條連線的期間。這裡**不**印東西。
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -66,7 +66,7 @@ const PURPOSE_MEDIA: u8 = 0x02;
 /// `Wbf-Upload-Meta` 裡封的東西：上傳狀態，加上 UI 給的原檔位置（/docs/design/rpc-specs/data-plane.md §8.1）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadMeta {
-    /// `Core::create_media_upload` 回的：wbf 分塊（含檔案金鑰）或傳統上傳（🚫 金鑰）
+    /// `Core::create_media_upload` 回的：wbf 分塊（含檔案金鑰）或傳統上傳（**沒有**金鑰）
     pub upload: CreatedUpload,
     /// `media.create` 的 `source_uri`，原樣；daemon 不解它，傳完記進 `media` 列。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,7 +100,7 @@ impl AccessKeys {
         self.to_url_key(PURPOSE_UPLOAD, mxc, encrypted)
     }
 
-    /// 讀的 URL 裡 `/media/mxc/` 後面那段：用途 ‖ mxc，🚫 不帶帳號（/docs/design/rpc-specs/data-plane.md §8）。
+    /// 讀的 URL 裡 `/media/mxc/` 後面那段：用途 ‖ mxc，**不**帶帳號（/docs/design/rpc-specs/data-plane.md §8）。
     ///
     /// Args:
     ///     mxc: example: "mxc://localhost/000000000000004d"
@@ -284,7 +284,7 @@ impl UploadsReceiving {
     }
 }
 
-/// 🚨 丟掉就解除登記——PUT 怎麼結束都一樣（回了、失敗、連線斷了、future 被 hyper 丟掉），🚫 不留一個永遠 409 的上傳。
+/// 🚨 丟掉就解除登記——PUT 怎麼結束都一樣（回了、失敗、連線斷了、future 被 hyper 丟掉），**不**留一個永遠 409 的上傳。
 struct ReceivingGuard {
     receiving: Arc<UploadsReceiving>,
     key: (String, String),
@@ -328,7 +328,7 @@ impl DataServer {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
-                    tokio::spawn(serve_connection(stream, self.handle.clone(), self.receiving.clone()));
+                    self.handle.in_flight().spawn_connection(serve_connection(stream, self.handle.clone(), self.receiving.clone()));
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -344,19 +344,35 @@ impl DataServer {
 type ReplyBody = UnsyncBoxBody<Bytes, std::io::Error>;
 type Reply = Response<ReplyBody>;
 
+/// 關機時 graceful：不收新請求、手上那個回完才關（/docs/design/daemon/task-supervision.md §2.3 第 6 步）；`main` 等它（`InFlight::finish_connections`）。
 async fn serve_connection(
     stream: TcpStream,
     handle: Arc<Handle>,
     receiving: Arc<UploadsReceiving>,
 ) {
+    let mut shutdown = handle.shutdown_signal();
     let service = service_fn(move |request| {
         let (handle, receiving) = (handle.clone(), receiving.clone());
         async move { Ok::<Reply, Infallible>(route(handle, receiving, request).await) }
     });
-    // 連線層的錯（對方亂送、半路斷）只影響這一條，🚫 不往上丟。
-    let _ = http1::Builder::new()
-        .serve_connection(TokioIo::new(stream), service)
-        .await;
+    // 連線層的錯（對方亂送、半路斷）只影響這一條，**不**往上丟。
+    let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    if *shutdown.borrow_and_update() {
+        connection.as_mut().graceful_shutdown();
+    }
+    loop {
+        tokio::select! {
+            _ = connection.as_mut() => return,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    connection.as_mut().graceful_shutdown();
+                    let _ = connection.as_mut().await;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// /docs/design/rpc-specs/data-plane.md §3 的路徑表。
@@ -421,7 +437,7 @@ async fn route_upload(
             ),
         );
     };
-    // 開不開得了、是不是這個 URL 的：都不是就跟不認得的 URL 一樣 404（🚫 不分辨原因）。
+    // 開不開得了、是不是這個 URL 的：都不是就跟不認得的 URL 一樣 404（**不**分辨原因）。
     let Some(meta) = keys.open_upload_meta(meta, &mxc, enforced) else {
         return not_found();
     };
@@ -517,7 +533,7 @@ async fn get_media(
     if let Ok(value) = header::HeaderValue::from_str(&content_type) {
         headers.insert(header::CONTENT_TYPE, value);
     }
-    // 型別是寄件者填的：前端可能是瀏覽器，`text/html`、`image/svg+xml` 的附件被當頁面打開時🚫 讓它跑腳本、🚫 猜型別。
+    // 型別是寄件者填的：前端可能是瀏覽器，`text/html`、`image/svg+xml` 的附件被當頁面打開時**不**讓它跑腳本、**不**猜型別。
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -602,7 +618,7 @@ fn parse_range(value: Option<&str>, size: u64) -> RangeAsked {
     RangeAsked::Part(start, end)
 }
 
-/// 把 core 給的明文一段一段吐出去。拿不到下一段就讓 body 出錯：hyper 斷線，播放器知道沒收完（🚫 不假裝結束）。
+/// 把 core 給的明文一段一段吐出去。拿不到下一段就讓 body 出錯：hyper 斷線，播放器知道沒收完（**不**假裝結束）。
 fn stream_body(stream: MediaStream) -> ReplyBody {
     let frames = futures_util::stream::unfold(Some(stream), |state| async move {
         let mut stream = state?;

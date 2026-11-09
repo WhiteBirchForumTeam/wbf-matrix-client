@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
     about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端"
 )]
 struct Cli {
-    /// 常駐：開本地 RPC 的 WS，等前端來連（🚫 長旗標不叫 `--server`：那個字只指 homeserver，/docs/design/overview/architecture-v2.md §0.1）
+    /// 常駐：開本地 RPC 的 WS，等前端來連（長旗標**不**叫 `--server`：那個字只指 homeserver，/docs/design/overview/architecture-v2.md §0.1）
     #[arg(short = 's', long = "serve")]
     serve: bool,
     /// 資料目錄
@@ -68,7 +68,7 @@ struct Cli {
 /// **啟動路徑只有兩種**（維護者 2026-09-13）：常駐，或單發。
 ///
 /// ⭐ 它們是兩種**不同的起法**，不是一個旗標加一個選項 —— 所以兩個都帶不是「以某一邊為準」，
-/// 是使用者搞錯了，🚫 我們不替他猜（A5：不確定就拒絕）。
+/// 是使用者搞錯了，我們**不**替他猜（A5：不確定就拒絕）。
 #[derive(Debug)]
 enum StartMode {
     /// `-s`：常駐、開 RPC、**會寫**（所以啟動時就要拿寫權）。
@@ -116,7 +116,7 @@ fn main() -> ExitCode {
     let token_path = cli
         .token_file
         .unwrap_or_else(|| cli.data_dir.join("daemon.token"));
-    // Unix 上別人讀得到就拒絕跑：token ＝ 整個 RPC 的憑證，fail closed（🚫 不只印警告）。
+    // Unix 上別人讀得到就拒絕跑：token ＝ 整個 RPC 的憑證，fail closed（**不**只印警告）。
     match wbf_daemon::token::is_private(&token_path) {
         Ok(true) => {}
         Ok(false) => {
@@ -160,7 +160,7 @@ fn main() -> ExitCode {
     drop(token);
 
     let ready_path = cli.data_dir.join("daemon.json");
-    // 沒有 runtime 就沒有這支 daemon（維護者的規矩裡「必須要開」的那個層級）——但停也要講清楚、給 exit code，🚫 不 panic。
+    // 沒有 runtime 就沒有這支 daemon（維護者的規矩裡「必須要開」的那個層級）——但停也要講清楚、給 exit code，**不** panic。
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -168,7 +168,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    runtime.block_on(async move {
+    let exit = runtime.block_on(async move {
         let settings = match Settings::load(cli.config.as_deref(), &cli.data_dir) {
             Ok(settings) => settings,
             Err(error) => {
@@ -184,7 +184,7 @@ fn main() -> ExitCode {
         handle.set_access_keys(access_keys);
 
         // 🚨 **`-s` 的第一件事：拿寫權**（/docs/design/overview/architecture-v2.md §0.2）。`-s` 就是「我要寫」的意思，
-        // 所以🚫 不等到第一個寫請求才拿 —— 拿不到就不該啟動（fail closed）。
+        // 所以**不**等到第一個寫請求才拿 —— 拿不到就不該啟動（fail closed）。
         // ⚠️ 寫權活在 `handle` 裡，所以它要一路拿到程序結束。
         if let Err(error) = handle.grant_write_access() {
             eprintln!("{error}");
@@ -228,14 +228,14 @@ fn main() -> ExitCode {
             "pid": std::process::id(),
             "instance": handle.instance(),
         });
-        // temp＋rename：前端可能正在 watch 這個檔，🚫 不讓它讀到寫一半的。
+        // temp＋rename：前端可能正在 watch 這個檔，**不**讓它讀到寫一半的。
         if let Err(error) = wbf_sdk::vault::write_private(&ready_path, info.to_string().as_bytes())
         {
             eprintln!("cannot write daemon.json: {error}");
             return ExitCode::from(1);
         }
         // 第 3 步的 ready 訊號。stdout 一行 JSON 給 spawn 我們的那個程序（它拿得到 pipe，
-        // 不必去 watch 檔案）；stderr 那行是給人看的。🚫 stdout 只有這一行，別的都走 stderr。
+        // 不必去 watch 檔案）；stderr 那行是給人看的。stdout **只有**這一行，別的都走 stderr。
         println!(
             "{}",
             serde_json::json!({
@@ -251,10 +251,55 @@ fn main() -> ExitCode {
             "ready; now shred {} (the daemon will not read it again)",
             token_path.display()
         );
+        // Ctrl+C（Windows 的 console 事件、Unix 的 SIGINT）與 SIGTERM 走同一條路：等於 `daemon.shutdown`。
+        tokio::spawn(shutdown_on_signal(handle.clone()));
         tokio::join!(server.run(), data_server.run());
+        // 關機（/docs/design/daemon/task-supervision.md §2.3）：每一步等完才下一步，等不到講一聲、往下走；禁止直接丟掉 runtime。
+        handle.in_flight().finish_requests().await;
+        handle.in_flight().finish_connections().await;
+        handle.in_flight().finish_background().await;
+        handle.core().await.shutdown().await;
         let _ = std::fs::remove_file(&ready_path);
         ExitCode::SUCCESS
-    })
+    });
+    // 到這裡該停的都停了；還沒停的（等不到、已經講過）給它們最後一段時間，之後才結束程序。
+    runtime.shutdown_timeout(wbf_sdk::task_stop::STOP_TIMEOUT);
+    exit
+}
+
+/// 收到 Ctrl+C／SIGTERM 就開始關機（跟 `daemon.shutdown` 同一條路，只是沒有回應要先送）。收訊號的接口開不起來就講一聲，照樣跑（`daemon.shutdown` 還在）。
+/// 已經在關（`daemon.shutdown` 先來）就自己結束。
+async fn shutdown_on_signal(handle: std::sync::Arc<Handle>) {
+    let mut shutdown = handle.shutdown_signal();
+    let already_shutting_down = async {
+        let _ = shutdown.wait_for(|shutting_down| *shutting_down).await;
+    };
+    #[cfg(unix)]
+    let terminated = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(error) => {
+                eprintln!("cannot listen for SIGTERM ({error}); use daemon.shutdown or Ctrl+C");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminated = std::future::pending::<()>();
+    tokio::select! {
+        interrupted = tokio::signal::ctrl_c() => {
+            if let Err(error) = interrupted {
+                eprintln!("cannot listen for Ctrl+C ({error}); use daemon.shutdown");
+                return;
+            }
+        }
+        () = terminated => {}
+        () = already_shutting_down => return,
+    }
+    eprintln!("shutting down (signal)");
+    handle.request_shutdown();
 }
 
 #[cfg(test)]
@@ -269,7 +314,7 @@ mod tests {
             Ok(StartMode::OneShot(command)) => assert_eq!(command, ["account", "list"]),
             other => panic!("沒有 -s 就是單發：{}", describe(&other)),
         }
-        // 🚫 兩個都帶不猜：那是使用者搞錯了。
+        // 兩個都帶**不**猜：那是使用者搞錯了。
         let both = start_mode(true, vec!["account".to_string()]);
         assert!(both.is_err(), "-s 加命令應該報錯");
         assert!(

@@ -465,27 +465,23 @@ daemon 的 `Settings` **不**自己寫死一份 —— ⭐ 同一個預設有兩
 
 ## 8. 取消
 
-還沒做（§10 第 5 階段）；下面是定下的形狀。
+`cancel { id }` 叫停的是**這條連線上**那個還在跑的請求。取消是**合作式**的：每個請求有一個開關（`wbf_daemon::in_flight`），
+長工作在自己的安全點看它（`wbf_core::job::check_cancelled`），看到了就收攤、回 `105`（`CoreErrorKind::Cancelled`）。
+完整的形狀與為什麼這樣做在 /docs/design/daemon/task-supervision.md §2.2。
 
-`cancel { id }` 停掉的是**這條連線上**那個還在跑的請求。
-
-```rust
-let response = tokio::select! {
-    response = handle.call(request) => response,
-    _ = cancelled => Response::error(id, code::CANCELLED, "cancelled"),
-};
-```
-
-- ⭐ 用 `select!` 而不是 `JoinHandle::abort()`：取消之後**還要回一則 `105`**，而被 abort 的
-  task 講不出話。`select!` 落選的那一邊會被 drop —— 對 async 來說那就是真的停下來。
-- **已經回完的 `id` → `{ ok: true, was_running: false }`**，**不**是錯誤。
+- ⭐ 禁止 drop 請求的 future、禁止 `JoinHandle::abort()`（維護者 2026-11-09）：兩者都會讓工作停在任意一個 `.await`，
+  而那個點不一定是安全的（寫到一半的檔、送出去還沒記「已送」的金鑰）。
+- **短請求被取消時照樣做完、回正常結果**；`cancel` 本身照樣回 `was_running: true`（送出時它確實還在跑）。
+- **已經回完的 `id` → `{ ok: true, was_running: false }`**，**不**是錯誤。別的連線的 `id` 一樣是 `false`。
+- 前端關掉連線**不**算取消：請求自己握著開關的一份，它照樣跑完（§9）。
 - ⚠️ 取消留下的東西，各自不同：
 
-  | 工作 | 取消之後 |
-  |---|---|
-  | 上傳 | 狀態檔還在（/docs/design/rpc-specs/wbf-cli-spec.md §6），可續傳；**不**自動去 `abort` server 那邊 |
-  | 下載 | 媒體池的段是可續的；`no_cache` 的直接下載刪掉半個檔 |
-  | `sync.recent` | 水位只在整批寫完之後前進，所以**不**會留下「假裝拉過」的洞 |
+  | 工作 | 安全點 | 取消之後 |
+  |---|---|---|
+  | 上傳（`upload.file`、`room.send_file` 的上傳那半） | 讀下一塊之前 | 狀態檔還在（/docs/design/rpc-specs/wbf-cli-spec.md §6），可續傳；**不**自動去 `abort` server 那邊 |
+  | 匯出（`media.export_to` 的寫出那半） | 讀下一段之前 | 寫一半的目標檔刪掉 |
+  | 下載 | 有自己的 `media.cancel` | 媒體池的段是可續的；`no_cache` 的直接下載刪掉半個檔 |
+  | `sync.recent` | 一批寫完之後 | 水位只在整次做完之後前進，所以**不**會留下「假裝拉過」的洞 |
 
 ## 9. 失敗與邊界
 
@@ -496,7 +492,7 @@ let response = tokio::select! {
 | 上游斷線，但有請求正在跑 | 那個請求照它自己的錯誤路徑失敗（`1300`），**不**掛在那裡等重連 |
 | 前端關掉連線 | 訂閱沒了；**它發起的長工作繼續跑**（/docs/design/rpc-specs/rpc-spec.md §1.2），進度沒人收就沒人收 |
 | `cache.db` 寫失敗 | 推播那包：講一聲、**不**發 `room.message`、不重試（水位不歸推播管，UI 下次 `sync.recent` 重拉，§4.3）。`sync.recent` 的一批：整次回錯、水位不推進，下次從舊水位重拉 |
-| daemon 關閉 | 先停上游會話 → 等在跑的請求收攤 → 關 listener |
+| daemon 關閉（`daemon.shutdown`、Ctrl+C、Unix 的 SIGTERM） | 停收新連線 → 等在跑的請求（最多 10 秒，之後送取消再等 5 秒）→ 每條連線送關閉通知 → 停背景 task、關線、`cache.db` 寫完佇列再關 → 刪 `daemon.json`；等不到的講一聲、**不** abort（/docs/design/daemon/task-supervision.md §2.3） |
 
 ## 10. 分階段
 
@@ -506,10 +502,10 @@ let response = tokio::select! {
 | 2 | **`cache.db` 的單一寫入者**（`wbf_core::server_cache`）：一個 server 一個寫入**執行緒** ＋無上限 queue ＋`post`／`run` 兩個入口（§2.3）＋讀連線重用，含併發測試（§2.5） | ✅ 媒體也走它（§2.3.1） |
 | 3 | **`sync` 參數**（§3）：`room.list`／`get`／`history`／`files`／`media.info`，預設 `local`，**回應回報這次用了哪一種** | ✅ |
 | 4 | daemon 的訂閱、推播封裝、`progress` 自動路由、**`desync`**（§5.3）；SDK 的收包分派（/docs/design/daemon/ws-receive-dispatch.md）；daemon 那半在 /docs/design/daemon/link-pool.md §6 | ✅ 還沒做：兩條佇列分開＋進度節流（§5.4 定了先不做） |
-| 5 | `cancel`（§8） | 還沒做 |
+| 5 | `cancel`（§8） | ✅ 合作式（/docs/design/daemon/task-supervision.md §2.2） |
 | 6 | sdk 的 `Event/Subscribe`（`0x04`）／`Unsubscribe`（`0x05`）／`Push`（`0x06`）與 core 的 `room_sync.rs`（/docs/design/rooms/room-sync.md） | ✅ |
 | 7 | 上游會話：探測、收事件迴圈、寫庫、發事件 | ✅ wbf 帳號（連線池 /docs/design/daemon/link-pool.md、收推播寫快取再發 `room.message`）。還沒做：一般 Matrix 帳號的收事件迴圈（§5.5） |
-| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | 線的那半有了（/docs/design/daemon/link-pool.md §3.1）。還沒做：task panic 收攤、重連時重探 backend |
+| 8 | 監督者：跟著解鎖／登入／登出起停，退避重連 | ✅ 線的那半（/docs/design/daemon/link-pool.md §3.1）；每個背景 task 有終止接口、關機照順序收（/docs/design/daemon/task-supervision.md）。**不做**：接住 task 的 panic、重連時重探 backend（同一份 §3） |
 | 9 | **已讀三層**（/docs/design/messages/read-receipts.md）：`room.read`、`room.get` 的 `unread`、`READ_RECEIPTS` conf 鍵、`daemon.reload_conf` | ✅ |
 
 ## 11. 明確不做的

@@ -4,7 +4,7 @@
 //! `Debug`，序列化不了。而 core 的公開面之後要被 RPC 包住，/docs/design/rpc-specs/local-interface.md §6 定的回應形狀是
 //! `code` ＋ `msg`——所以錯誤必須是**結構化、可序列化**的東西，不能是一句人話。
 //!
-//! # 🚫 這裡刻意**沒有**號碼
+//! # 這裡刻意**沒有**號碼
 //!
 //! /docs/design/rpc-specs/local-interface.md §6：「`code` 是穩定的整數，一個意思一個號碼、**定了就不改**」，而那張表的權威位置是
 //! `/docs/design/rpc-specs/rpc-spec.md`（還沒寫）。在規格還沒寫的時候先配號碼，等於現在就兌現一個「不能改」的
@@ -12,14 +12,14 @@
 //!（維護者 2026-09-11 定）。
 //!
 //! ⚠️ 加新 variant 時：種類是給**程式**判斷的，`message` 是給**人**看的。
-//! 🚫 前端不要拿 `message` 做邏輯——那句話會改，`kind` 不會。
+//! 禁止前端拿 `message` 做邏輯——那句話會改，`kind` 不會。
 
 use std::fmt;
 
 use serde::Serialize;
 use wbf_sdk::SdkError;
 
-/// 錯誤的種類。⚠️ 判斷用這個，🚫 不要用 `message`。
+/// 錯誤的種類。⚠️ 判斷用這個，禁止用 `message`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoreErrorKind {
@@ -30,33 +30,33 @@ pub enum CoreErrorKind {
     /// `local.key` 是 passphrase 模式，但沒給 passphrase。
     /// ⚠️ 跟 [`CoreErrorKind::WrongPassphrase`] **分開**：前端要問使用者 vs 要說「打錯了」。
     NeedPassphrase,
-    /// `local.key` 是 plain 模式，卻給了 passphrase。🚫 不靜默忽略。
+    /// `local.key` 是 plain 模式，卻給了 passphrase。**不**靜默忽略。
     UnexpectedPassphrase,
     /// passphrase 不對。
     WrongPassphrase,
     /// 找不到這個帳號。
     NoSuchAccount,
     /// 這串指到不只一個帳號（同名 localpart 在多個 server、或只差大小寫的有好幾個）。
-    /// 🚫 core 不挑一個——fail closed。
+    /// core **不**挑一個——fail closed。
     AmbiguousAccount,
     /// 這個帳號沒登入（`session.sealed` 不在）。
     NotLoggedIn,
-    /// 另一個登入／登出／摧毀正在進行（`account.lock` 被握著）。前端可以稍後再試，🚫 core 不排隊。
+    /// 另一個登入／登出／摧毀正在進行（`account.lock` 被握著）。前端可以稍後再試，core **不**排隊。
     AccountBusy,
     /// 這台 server 的目錄正在被刪（`s/<b58>/to_be_deleted.lock` 在）：登入這台 server 一律拒絕。
-    /// 🚫 core 不自己收拾（維護者 2026-09-15）：訊息說出要手動刪的目錄。
+    /// core **不**自己收拾（維護者 2026-09-15）：訊息說出要手動刪的目錄。
     ServerPendingRemoval,
     /// 這台機器沒保管這個帳號的 recovery key（`key-backup restore` 要它）。
     NoRecoveryKeyHere,
     /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（/docs/design/keys/room-key-backup.md §7）。
     ///
-    /// ⚠️ core 的訊息只說**條件**，🚫 不提命令名字——前端看到這個 kind 再補上自己那句
+    /// ⚠️ core 的訊息只說**條件**，**不**提命令名字——前端看到這個 kind 再補上自己那句
     /// （rpc-cli 說 `wbf-cli key-backup recovery`，Desktop 可能是一個按鈕）。
     HistoryWouldBeLost,
     /// 使用者用錯了，還沒細分到上面任何一種。
     ///
     /// ⚠️ 這是**過渡**的桶子：底下的 `SdkError::Usage` 還很多樣。每次有前端需要分辨的
-    /// 情況，就從這裡拆一個新的 variant 出去，🚫 不要讓前端去 match `message`。
+    /// 情況，就從這裡拆一個新的 variant 出去，禁止讓前端去 match `message`。
     Usage,
     Io,
     Network,
@@ -72,15 +72,18 @@ pub enum CoreErrorKind {
     /// 完整性檢查不過（CRC、AEAD 標籤）。
     Integrity,
     /// **事情做了、資料照給，但它沒驗過或驗不過**（維護者 2026-10-06 的約定，/docs/design/rpc-specs/data-plane.md §8.2；跟 GET 的 412 同一件事）。
-    /// [`CoreError::data`] 是成功時會給的那份結果。🚫 重試：不是「沒做」。
+    /// [`CoreError::data`] 是成功時會給的那份結果。禁止重試：不是「沒做」。
     Unverified,
     Timeout,
+    /// 這個請求被 `cancel` 掉了（或 daemon 關機時等不到它）：長工作在安全點看到取消開關、收攤回來。
+    /// 留下什麼看工作（/docs/design/daemon/daemon-runtime.md §8 的表）。
+    Cancelled,
 }
 
 impl CoreErrorKind {
     /// RPC 的 `code`（/docs/design/rpc-specs/rpc-spec.md §5.2）。**號碼定了就不改**；同族留了縫給之後拆出來的 variant。
     ///
-    /// ⚠️ 這張表只能在這裡：daemon 那層🚫 不要另外維護一份對照——兩份就會漂。
+    /// ⚠️ 這張表只能在這裡：daemon 那層禁止另外維護一份對照——兩份就會漂。
     ///
     /// Return:
     ///     u32  example: `Locked` → 1001、`Server` → 1400
@@ -107,6 +110,8 @@ impl CoreErrorKind {
             CoreErrorKind::Integrity => 1500,
             CoreErrorKind::Unverified => 1501,
             CoreErrorKind::Timeout => 1600,
+            // 取消是 RPC 層的 105（/docs/design/rpc-specs/rpc-spec.md §5.1）：core 回這個 kind 的那一刻就是那個請求被取消了。
+            CoreErrorKind::Cancelled => 105,
         }
     }
 }
@@ -150,7 +155,7 @@ impl CoreError {
 
 impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // 🚫 不印 kind：使用者看的是那句話，種類是給程式的。
+        // **不**印 kind：使用者看的是那句話，種類是給程式的。
         formatter.write_str(&self.message)
     }
 }
@@ -160,7 +165,7 @@ impl std::error::Error for CoreError {}
 /// 還沒細分的一律從 `SdkError` 抬上來，種類照它原本的分類走。
 ///
 /// ⚠️ `SdkError::Usage` 會落到 [`CoreErrorKind::Usage`] 這個過渡桶子——想分辨得更細的
-/// 路徑要在 core 裡**明確**造一個有種類的 `CoreError`，🚫 不要靠 `From` 猜。
+/// 路徑要在 core 裡**明確**造一個有種類的 `CoreError`，禁止靠 `From` 猜。
 impl From<SdkError> for CoreError {
     fn from(error: SdkError) -> CoreError {
         let kind = match &error {
@@ -192,7 +197,7 @@ mod tests {
         let json = serde_json::to_value(&error).unwrap();
         // kind 是給程式判斷的，序列化成一個穩定的字串。
         assert_eq!(json["kind"], "need_passphrase");
-        // Display 只給人話，🚫 不夾 kind。
+        // Display 只給人話，**不**夾 kind。
         assert_eq!(format!("{error}"), "this key file needs one");
     }
 
