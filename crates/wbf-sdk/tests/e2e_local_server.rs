@@ -637,26 +637,31 @@ async fn the_batch_3_and_4_endpoints_answer_the_same_over_http_and_over_the_brid
         .expect("hello");
     let none = Map::new();
 
-    // 能力、媒體設定、推播規則、pusher、通知、TURN：純讀，兩條路一樣
+    // 能力、媒體設定、推播規則、pusher：純讀，契約是**成功**，兩條路一樣，而且長得像規格（兩條路一起失敗也要紅，PR #86 rumia）
+    let mut read_both_ways = Vec::new();
     for endpoint in [
         &endpoints::CAPABILITIES,
         &endpoints::MEDIA_CONFIG,
         &endpoints::GET_PUSH_RULES,
         &endpoints::GET_GLOBAL_PUSH_RULES,
         &endpoints::GET_PUSHERS,
-        &endpoints::TURN_SERVER,
     ] {
         let outcome = call_both_ways(&session, &mut bridge, endpoint, &none, None).await;
-        assert_same_outcome(endpoint.name, outcome).ok();
+        read_both_ways.push(assert_same_outcome(endpoint.name, outcome).expect(endpoint.name));
     }
-    let capabilities = call_over_http(server, token, &endpoints::CAPABILITIES, &none, None)
-        .await
-        .expect("Capabilities");
+    let [capabilities, media_config, rules, global_rules, pushers] = &read_both_ways[..] else {
+        panic!("five reads");
+    };
     assert!(capabilities["capabilities"].is_object(), "{capabilities}");
-    let rules = call_over_http(server, token, &endpoints::GET_PUSH_RULES, &none, None)
-        .await
-        .expect("GetPushRules");
+    assert!(media_config["m.upload.size"].is_u64(), "{media_config}");
     assert!(rules["global"]["override"].is_array(), "{rules}");
+    assert_eq!(global_rules, &rules["global"]);
+    assert!(pushers["pushers"].is_array(), "{pushers}");
+    // TURN：這台沒設定是 404，兩條路一起 404 才是對的
+    let outcome = call_both_ways(&session, &mut bridge, &endpoints::TURN_SERVER, &none, None).await;
+    if let Err(error) = assert_same_outcome("TurnServer", outcome) {
+        assert!(error.is_not_found(), "{error:?}");
+    }
     let notifications = vars(json!({ "limit": 5 }));
     let outcome = call_both_ways(
         &session,

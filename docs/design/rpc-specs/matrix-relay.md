@@ -99,6 +99,9 @@ wbf 帳號走橋，一般 Matrix 帳號照同一個 HTTP 端點送（`crates/wbf
 
 - `media.preview_url` 的 403（`1400`）是「這台不給預覽」：整個關掉，或這個網址不准（例：內網位址，§2.8），**不是**連結壞了。`ts` 這台 server 收下後忽略。
 - `voip.turn_server` 的 404 是 MSC4166 的「沒設定 TURN」，讀成「通話只能直連」，所以回 `null`。憑證有 `ttl`（秒），過期要重拿。
+- ⚠️ **加密房裡的連結預設不要叫 `media.preview_url`**：網址會以 query 明文送到 homeserver，server 還會替你去抓那個網址——等於把密文裡的內容交給 server。
+  Matrix 規格在這支端點上有同樣的提醒，主流 client 的預設也是加密房不做預覽；要開就讓使用者自己選。
+  daemon 這一層不知道網址是從哪間房來的（params 只有 `url`、`ts`），擋不了，**只能靠 UI**（PR #86 審查）。
 
 ### 2.8 跑出來的回應（2026-11-08，本機 wbfuwunel）
 
@@ -126,6 +129,7 @@ result 就是 server 的 body（走 HTTP 與走橋一樣，§7）。房間 id、
 2. `SetPusher` 的 `kind: null` 是移除；`pushkey`＋`app_id` 是身分，同一組再送是覆蓋。daemon 原樣送，**不**把 `null` 拿掉。
 3. `SearchEvents` 的 `next_batch` 一個名字兩個位置（§2.2）。
 4. **搜尋在加密房搜不到內容**：server 看到的是密文。UI 要講清楚，別讓使用者以為「搜不到＝沒有」。
+   反過來，**連結預覽會把加密房的網址明文交給 server**（§2.7）：加密房預設不叫 `media.preview_url`。
 5. 讀規則時，一條規則都沒有的那類鍵**整個不出現**，不是空陣列：全新帳號只看得到 `override` 與 `underride`。
 6. 連結預覽關掉是 403；TURN 沒設定是 404（§2.7）。
 7. 房間摘要攤平、`MutualRooms` 的 `user_id` 在 query：房間動作那支已經照做（/docs/design/rooms/room-actions.md §2.1）。

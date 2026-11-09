@@ -370,6 +370,7 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 
 - `push.get_rule`、`filter.get`、`voip.turn_server` 沒有是 `result: null`（server 的 404），**不是**錯誤；其他的 server 拒了是 `1400`。
 - 路徑要「自己的 mxid」的（`presence.set`、`filter.*`）daemon 填，UI **不**給。
+- ⚠️ 加密房裡的連結預設**不**叫 `media.preview_url`：網址會明文送到 server（/docs/design/rpc-specs/matrix-relay.md §2.7）。daemon 不知道網址是哪間房的，只能靠 UI。
 
 ### 3.4 同步
 
