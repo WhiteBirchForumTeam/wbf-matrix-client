@@ -603,9 +603,17 @@ mod tests {
             core.server_caches.lock().unwrap().is_empty(),
             "cache.db was closed (queue written, writer joined)"
         );
-        let timed_out = std::iter::from_fn(|| seen.try_recv().ok()).any(|event| {
-            matches!(event, CoreEvent::Progress { ref text, .. } if text.contains("did not stop"))
-        });
+        // 「等不到」那句是 `EventSink::progress` 發的，它是 `CoreEvent::Note`（不是有數字的 `Progress`）；落後的那段跳過、讀到空為止。
+        let mut timed_out = false;
+        loop {
+            match seen.try_recv() {
+                Ok(CoreEvent::Note { text, .. }) if text.contains("did not stop") => {
+                    timed_out = true
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
         assert!(!timed_out, "every task ended on its own");
         fake.task.abort();
         let _ = std::fs::remove_dir_all(&dir);
