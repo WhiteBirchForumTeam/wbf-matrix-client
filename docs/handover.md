@@ -36,6 +36,9 @@ PR #1–#78 合併（main `6f25d7f`，2026-11-02；#76 房間動作、#78 收邀
 **交叉簽章、裝置驗證、金鑰備份**（wbf 帳號，2026-11-07，`/docs/design/keys/cross-signing-and-verification.md`）：第一台裝置自動建交叉簽章與備份版本、新金鑰背景上傳；
 `verify.*`（to-device 的 SAS）與 `devices.list`；`backup.restore { recovery_key }` 換機器還原；自我驗證完自動還原；解不開時向自己已驗證的裝置要金鑰。真 server 驗過。
 
+**批 3／批 4 其餘的 Matrix 端點**（2026-11-08，`/docs/design/rpc-specs/matrix-relay.md`，本 repo issue #50、#55）：推播規則與 pusher、通知列表、訊息搜尋與使用者目錄、關聯與討論串、跳到某天、在線狀態、過濾器、檢舉、server 的能力、媒體設定、連結預覽、TURN，
+跟房間動作同一張端點表、同一套中轉（參數與結果照 Matrix、本地不存）。真 server 驗過。
+
 **還沒有**：UI；換掉既有的交叉簽章（server 要密碼）、QR 驗證、房間裡驗證「別人這個人」；一般 Matrix 帳號的驗證（一般帳號的備份由 `Client` 做）；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；
 別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
 
@@ -263,7 +266,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 | 分房間金鑰沒算被邀請的人 | 維護者 2026-10-07 在 server 那邊定了（wbfuwunel 的 /docs/design/keys/invite-key-scope.md），server 還沒實作；server 合併後 client 另開一支（/docs/design/rooms/room-actions.md §6.1） | 歷史可見性是 `shared`／`invited` 的房，被邀請期間的密文那個人加入後解不開 |
 | 一般 Matrix 帳號送檔案沒宣告附件（`/docs/design/media/wbf-client-convention-for-chunk.md` §5.2） | matrix-sdk 的 `Room::send` 不能加 header | server 端媒體計數 0，過保護期（≥ 7 天）被清，CLI 送檔會印警告。wbf 帳號走 `Event/Send`，沒有這個洞 |
 | 跳到訊息的錨點（PR #43 走橋 GetEvent，2026-09-16 關掉、沒合） | 等 wbfuwunel #64（`Recent` 收 `before_event_id`），合了再開一支 | 跳到訊息還是兩個來回 |
-| server 批 3、批 4 的新 kind 沒接（0x12／0x15／0x1C／0x1D、0x18 Push／0x19 Media／0x1A Search／0x1B Voip，本 repo issue #55） | 用到才加；沒有破壞性改動、向量檔沒變 | 推播規則、搜尋、TURN 都還沒有（公開房間目錄 `0x13` `0x35`／`0x36` 隨房間動作接了）。做的時候先讀 #55 列的十個坑 |
+| 批 1／批 2 還沒接的端點（profile、裝置清單與改名、Typing、要 UIAA 的改密碼／停用／刪裝置／註冊） | 列在 /docs/design/rpc-specs/matrix-relay.md §5；接法跟批 3／批 4 一樣，UIAA 的形狀要另外定 | UI 還沒有改個人資料、管裝置的路 |
+| 加密房的關聯、討論串、通知列表是密文 | daemon 原樣回（/docs/design/rpc-specs/matrix-relay.md §4 第 1 點，等維護者定） | UI 在加密房只看得到「有幾則、誰送的、什麼關聯」 |
 | 斷線後 `recent` 不自動續 | 命令 exit，下次從水位重來；server 不記狀態、寫入冪等 | 多拉一輪 |
 | core 層測「成功路徑」的假 wbf server 還不全 | core 的 `test_support` 會答訂閱、Device、橋的 Members／GetStateEvent／Keys*／SendToDevice、`Event/Send`，以及房間動作的橋（記請求、狀態與帳號資料可寫可讀） | 探測成功、`watch`、`log_in` 的探測接點只有 `--ignored` 的真 server 測試走得到 |
 
@@ -279,7 +283,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
-之後（還沒排）：換掉既有的交叉簽章（UIAA）、QR 驗證、登出閘門的第一關接上 wbf 帳號（/docs/design/keys/cross-signing-and-verification.md §9、§12）；「跳到訊息」等 wbfuwunel #64（#43 已關）；server 批 3／4 的功能（#55）；
+之後（還沒排）：換掉既有的交叉簽章（UIAA）、QR 驗證、登出閘門的第一關接上 wbf 帳號（/docs/design/keys/cross-signing-and-verification.md §9、§12）；「跳到訊息」等 wbfuwunel #64（#43 已關）；~~server 批 3／4 的功能（#50、#55）~~ 2026-11-08 做完（/docs/design/rpc-specs/matrix-relay.md）；
 下載的暫停（只停主檔，**不**停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
 UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。

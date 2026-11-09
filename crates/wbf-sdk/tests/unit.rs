@@ -791,9 +791,202 @@ fn bridged_endpoints_and_variables_follow_the_specs_index() {
         first_four_bytes(wbf_sdk::matrix_endpoint::SET_ACCOUNT_DATA.bridge),
         [0x01, 0x11, 0x26, 0x10]
     );
+    // 批 3／批 4 其餘的 30 支（/docs/design/rpc-specs/matrix-relay.md §2）：號碼照 wbfuwunel 的 /docs/bridge-specs/index.md §2 逐列抄，**不**引用正式碼的常數。
+    {
+        use wbf_sdk::matrix_endpoint as e;
+        for (endpoint, kind, subtype) in [
+            (e::GET_FILTER, 0x12, 0x20),
+            (e::CREATE_FILTER, 0x12, 0x21),
+            (e::RELATIONS, 0x14, 0x26),
+            (e::RELATIONS_BY_REL_TYPE, 0x14, 0x27),
+            (e::RELATIONS_BY_REL_TYPE_AND_EVENT_TYPE, 0x14, 0x28),
+            (e::THREADS, 0x14, 0x29),
+            (e::TIMESTAMP_TO_EVENT, 0x14, 0x2A),
+            (e::GET_PRESENCE, 0x15, 0x23),
+            (e::SET_PRESENCE, 0x15, 0x24),
+            (e::GET_PUSH_RULES, 0x18, 0x20),
+            (e::GET_GLOBAL_PUSH_RULES, 0x18, 0x21),
+            (e::GET_PUSH_RULE, 0x18, 0x22),
+            (e::SET_PUSH_RULE, 0x18, 0x23),
+            (e::DELETE_PUSH_RULE, 0x18, 0x24),
+            (e::GET_PUSH_RULE_ENABLED, 0x18, 0x25),
+            (e::SET_PUSH_RULE_ENABLED, 0x18, 0x26),
+            (e::GET_PUSH_RULE_ACTIONS, 0x18, 0x27),
+            (e::SET_PUSH_RULE_ACTIONS, 0x18, 0x28),
+            (e::GET_PUSHERS, 0x18, 0x29),
+            (e::SET_PUSHER, 0x18, 0x2A),
+            (e::NOTIFICATIONS, 0x18, 0x2B),
+            (e::MEDIA_CONFIG, 0x19, 0x20),
+            (e::MEDIA_PREVIEW, 0x19, 0x21),
+            (e::SEARCH_EVENTS, 0x1A, 0x20),
+            (e::SEARCH_USERS, 0x1A, 0x21),
+            (e::TURN_SERVER, 0x1B, 0x20),
+            (e::CAPABILITIES, 0x1C, 0x20),
+            (e::REPORT_EVENT, 0x1D, 0x20),
+            (e::REPORT_ROOM, 0x1D, 0x21),
+            (e::REPORT_USER, 0x1D, 0x22),
+        ] {
+            assert_eq!(
+                first_four_bytes(endpoint.bridge),
+                [0x01, kind, subtype, 0x10],
+                "{}",
+                endpoint.name
+            );
+        }
+    }
     assert_eq!(Kind::from_byte(0x13), Some(Kind::Room));
     assert_eq!(Kind::from_byte(0x15), Some(Kind::Receipt));
     assert_eq!(Kind::from_byte(0x17), Some(Kind::Keys));
+    for (byte, kind) in [
+        (0x12, Kind::Sync),
+        (0x18, Kind::Push),
+        (0x19, Kind::Media),
+        (0x1A, Kind::Search),
+        (0x1B, Kind::Voip),
+        (0x1C, Kind::Misc),
+        (0x1D, Kind::Report),
+    ] {
+        assert_eq!(Kind::from_byte(byte), Some(kind), "{byte:#04x}");
+        assert_eq!(kind as u8, byte);
+    }
+    assert_eq!(Kind::from_byte(0x1E), None);
+    // 路徑與 query 變數也照總表逐列抄：少一個 query 變數（例 SetPushRule 的 `after`）時，帶它的請求在兩條路上都被 check_variables 拒，
+    // 而「走到 core」的參數表測試看到的是 1100、照樣綠（wbfuwunel 的 bridge.rs 寫過同一個教訓）。
+    {
+        use wbf_sdk::matrix_endpoint as e;
+        let rows: &[(e::MatrixEndpoint, &str, &[&str])] = &[
+            (
+                e::GET_FILTER,
+                "/_matrix/client/v3/user/{user_id}/filter/{filter_id}",
+                &[],
+            ),
+            (
+                e::CREATE_FILTER,
+                "/_matrix/client/v3/user/{user_id}/filter",
+                &[],
+            ),
+            (
+                e::RELATIONS,
+                "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}",
+                &["from", "to", "dir", "limit", "recurse"],
+            ),
+            (
+                e::RELATIONS_BY_REL_TYPE,
+                "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}",
+                &["from", "to", "dir", "limit", "recurse"],
+            ),
+            (
+                e::RELATIONS_BY_REL_TYPE_AND_EVENT_TYPE,
+                "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
+                &["from", "to", "dir", "limit", "recurse"],
+            ),
+            (
+                e::THREADS,
+                "/_matrix/client/v1/rooms/{room_id}/threads",
+                &["from", "include", "limit"],
+            ),
+            (
+                e::TIMESTAMP_TO_EVENT,
+                "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
+                &["ts", "dir"],
+            ),
+            (
+                e::GET_PRESENCE,
+                "/_matrix/client/v3/presence/{user_id}/status",
+                &[],
+            ),
+            (
+                e::SET_PRESENCE,
+                "/_matrix/client/v3/presence/{user_id}/status",
+                &[],
+            ),
+            (e::GET_PUSH_RULES, "/_matrix/client/v3/pushrules/", &[]),
+            (
+                e::GET_GLOBAL_PUSH_RULES,
+                "/_matrix/client/v3/pushrules/global/",
+                &[],
+            ),
+            (
+                e::GET_PUSH_RULE,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}",
+                &[],
+            ),
+            (
+                e::SET_PUSH_RULE,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}",
+                &["before", "after"],
+            ),
+            (
+                e::DELETE_PUSH_RULE,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}",
+                &[],
+            ),
+            (
+                e::GET_PUSH_RULE_ENABLED,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/enabled",
+                &[],
+            ),
+            (
+                e::SET_PUSH_RULE_ENABLED,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/enabled",
+                &[],
+            ),
+            (
+                e::GET_PUSH_RULE_ACTIONS,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/actions",
+                &[],
+            ),
+            (
+                e::SET_PUSH_RULE_ACTIONS,
+                "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/actions",
+                &[],
+            ),
+            (e::GET_PUSHERS, "/_matrix/client/v3/pushers", &[]),
+            (e::SET_PUSHER, "/_matrix/client/v3/pushers/set", &[]),
+            (
+                e::NOTIFICATIONS,
+                "/_matrix/client/v3/notifications",
+                &["from", "limit", "only"],
+            ),
+            (e::MEDIA_CONFIG, "/_matrix/client/v1/media/config", &[]),
+            (
+                e::MEDIA_PREVIEW,
+                "/_matrix/client/v1/media/preview_url",
+                &["url", "ts"],
+            ),
+            (
+                e::SEARCH_EVENTS,
+                "/_matrix/client/v3/search",
+                &["next_batch"],
+            ),
+            (
+                e::SEARCH_USERS,
+                "/_matrix/client/v3/user_directory/search",
+                &[],
+            ),
+            (e::TURN_SERVER, "/_matrix/client/v3/voip/turnServer", &[]),
+            (e::CAPABILITIES, "/_matrix/client/v3/capabilities", &[]),
+            (
+                e::REPORT_EVENT,
+                "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
+                &[],
+            ),
+            (
+                e::REPORT_ROOM,
+                "/_matrix/client/v3/rooms/{room_id}/report",
+                &[],
+            ),
+            (
+                e::REPORT_USER,
+                "/_matrix/client/v3/users/{user_id}/report",
+                &[],
+            ),
+        ];
+        for &(endpoint, path, query) in rows {
+            assert_eq!(endpoint.path, path, "{}", endpoint.name);
+            assert_eq!(endpoint.query, query, "{}", endpoint.name);
+        }
+    }
 
     assert_eq!(serde_json::to_string(&NoVariables {}).unwrap(), "{}");
     assert_eq!(

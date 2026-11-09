@@ -36,6 +36,8 @@ pub enum Kind {
     Session = 0x10,
     /// 帳號（bridge-specs `0x11-account.md`）：沒有原生的 pack，全是走橋的 Matrix 端點（profile、account data）。
     Account = 0x11,
+    /// 過濾器（wbfuwunel 的 /docs/bridge-specs/0x12-sync.md）：`/sync` 本身**不**走橋，這個 kind 只有走橋的過濾器讀寫（批 3）。
+    Sync = 0x12,
     /// 房間（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 Matrix 端點（`Members` 等，bridge-specs `0x13-room.md`）。
     Room = 0x13,
     /// 房間事件的領域（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：`Recent`、`Send`、`Batch`。
@@ -46,6 +48,18 @@ pub enum Kind {
     Device = 0x16,
     /// E2EE 的金鑰（wbfuwunel 的 /docs/design/wbf-wire-format.md §3.3）：沒有原生的 pack，全是走橋的 `/keys/*` 與 `/room_keys/*`（bridge-specs `0x17-keys.md`）。
     Keys = 0x17,
+    /// 推播規則、pusher、通知列表（bridge-specs `0x18-push.md`，批 4）：沒有原生的 pack。
+    Push = 0x18,
+    /// 媒體設定與連結預覽（bridge-specs `0x19-media.md`，批 4）：**不是**分塊的媒體通道（那是 `Upload`／`Download`）。沒有原生的 pack。
+    Media = 0x19,
+    /// 訊息搜尋與使用者目錄（bridge-specs `0x1A-search.md`，批 4）：沒有原生的 pack。
+    Search = 0x1A,
+    /// TURN 憑證（bridge-specs `0x1B-voip.md`，批 4）：沒有原生的 pack。
+    Voip = 0x1B,
+    /// 其餘（bridge-specs `0x1C-misc.md`）：目前只有走橋的 capabilities（批 3）。
+    Misc = 0x1C,
+    /// 檢舉事件、房間、使用者（bridge-specs `0x1D-report.md`，批 3）：沒有原生的 pack。
+    Report = 0x1D,
 }
 
 impl Kind {
@@ -63,11 +77,18 @@ impl Kind {
             0x05 => Some(Kind::Invite),
             0x10 => Some(Kind::Session),
             0x11 => Some(Kind::Account),
+            0x12 => Some(Kind::Sync),
             0x13 => Some(Kind::Room),
             0x14 => Some(Kind::Event),
             0x15 => Some(Kind::Receipt),
             0x16 => Some(Kind::Device),
             0x17 => Some(Kind::Keys),
+            0x18 => Some(Kind::Push),
+            0x19 => Some(Kind::Media),
+            0x1A => Some(Kind::Search),
+            0x1B => Some(Kind::Voip),
+            0x1C => Some(Kind::Misc),
+            0x1D => Some(Kind::Report),
             _ => None,
         }
     }

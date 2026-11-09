@@ -1,4 +1,4 @@
-//! 房間相關的 Matrix 端點怎麼叫（/docs/design/rooms/room-actions.md §2）：**一張表，兩條路**。
+//! 走橋的 Matrix 端點怎麼叫（房間動作 /docs/design/rooms/room-actions.md §2、其餘的 /docs/design/rpc-specs/matrix-relay.md §2）：**一張表，兩條路**。
 //! wbf 帳號走橋（[`crate::WbfClient::call_matrix_endpoint`]）、一般 Matrix 帳號照同一個 HTTP 端點送（[`call_over_http`]）；
 //! 兩條路吃同一份變數、同一份 body，回同一份 Matrix 的 body（server 的 e2e 釘過「走橋與走 HTTP 回的一樣」，本 repo issue #55）。
 //!
@@ -65,6 +65,55 @@ const fn receipt(subtype: u8) -> BridgedEndpoint {
 const fn keys(subtype: u8) -> BridgedEndpoint {
     BridgedEndpoint {
         kind: Kind::Keys,
+        subtype,
+    }
+}
+
+const fn sync(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Sync,
+        subtype,
+    }
+}
+
+const fn push(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Push,
+        subtype,
+    }
+}
+
+const fn media(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Media,
+        subtype,
+    }
+}
+
+const fn search(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Search,
+        subtype,
+    }
+}
+
+const fn voip(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Voip,
+        subtype,
+    }
+}
+
+const fn misc(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Misc,
+        subtype,
+    }
+}
+
+const fn report(subtype: u8) -> BridgedEndpoint {
+    BridgedEndpoint {
+        kind: Kind::Report,
         subtype,
     }
 }
@@ -280,6 +329,47 @@ pub const REDACT: MatrixEndpoint = MatrixEndpoint {
     query: &[],
 };
 
+// ---- 0x14 Event 的關聯、討論串、跳到某天（批 3、批 4，/docs/design/rpc-specs/matrix-relay.md §2.3）----
+
+const RELATIONS_QUERY: &[&str] = &["from", "to", "dir", "limit", "recurse"];
+
+pub const RELATIONS: MatrixEndpoint = MatrixEndpoint {
+    name: "Relations",
+    bridge: event(0x26),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}",
+    query: RELATIONS_QUERY,
+};
+pub const RELATIONS_BY_REL_TYPE: MatrixEndpoint = MatrixEndpoint {
+    name: "RelationsByRelType",
+    bridge: event(0x27),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}",
+    query: RELATIONS_QUERY,
+};
+pub const RELATIONS_BY_REL_TYPE_AND_EVENT_TYPE: MatrixEndpoint = MatrixEndpoint {
+    name: "RelationsByRelTypeAndEventType",
+    bridge: event(0x28),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
+    query: RELATIONS_QUERY,
+};
+pub const THREADS: MatrixEndpoint = MatrixEndpoint {
+    name: "Threads",
+    bridge: event(0x29),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/rooms/{room_id}/threads",
+    query: &["from", "include", "limit"],
+};
+/// `ts` 是毫秒、`dir` 是 `"f"`／`"b"`，Matrix 兩個都必填。
+pub const TIMESTAMP_TO_EVENT: MatrixEndpoint = MatrixEndpoint {
+    name: "TimestampToEvent",
+    bridge: event(0x2A),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
+    query: &["ts", "dir"],
+};
+
 // ---- 0x15 Receipt（wbfuwunel 的 /docs/bridge-specs/0x15-receipt.md）----
 
 /// 送一個已讀回條（/docs/design/messages/read-receipts.md §3）：`receipt_type` 是 `m.read`（同房間的人看得到）或 `m.read.private`。
@@ -289,6 +379,21 @@ pub const RECEIPT: MatrixEndpoint = MatrixEndpoint {
     bridge: receipt(0x22),
     method: HttpMethod::Post,
     path: "/_matrix/client/v3/rooms/{room_id}/receipt/{receipt_type}/{event_id}",
+    query: &[],
+};
+pub const GET_PRESENCE: MatrixEndpoint = MatrixEndpoint {
+    name: "GetPresence",
+    bridge: receipt(0x23),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/presence/{user_id}/status",
+    query: &[],
+};
+/// `user_id` 只能是自己。
+pub const SET_PRESENCE: MatrixEndpoint = MatrixEndpoint {
+    name: "SetPresence",
+    bridge: receipt(0x24),
+    method: HttpMethod::Put,
+    path: "/_matrix/client/v3/presence/{user_id}/status",
     query: &[],
 };
 
@@ -385,6 +490,187 @@ pub const DELETE_TAG: MatrixEndpoint = MatrixEndpoint {
     bridge: account(0x2B),
     method: HttpMethod::Delete,
     path: "/_matrix/client/v3/user/{user_id}/rooms/{room_id}/tags/{tag}",
+    query: &[],
+};
+
+// ---- 0x12 Sync 的過濾器（批 3，wbfuwunel 的 /docs/bridge-specs/0x12-sync.md）----
+
+/// ⚠️ 端點讀的是 token 的主人：`user_id` 拿別人的是 404 不是 403（本 repo issue #50 坑 1）。
+pub const GET_FILTER: MatrixEndpoint = MatrixEndpoint {
+    name: "GetFilter",
+    bridge: sync(0x20),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/user/{user_id}/filter/{filter_id}",
+    query: &[],
+};
+pub const CREATE_FILTER: MatrixEndpoint = MatrixEndpoint {
+    name: "CreateFilter",
+    bridge: sync(0x21),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/user/{user_id}/filter",
+    query: &[],
+};
+
+// ---- 0x18 Push（批 4，wbfuwunel 的 /docs/bridge-specs/0x18-push.md）----
+// `kind` 是規則種類（`override`…），**不是** pack 的 kind；`scope` **不是**變數，路徑固定 `global`。
+
+/// ⚠️ 路徑結尾的 `/` 是規格的一部分（最後一段是空的）。
+pub const GET_PUSH_RULES: MatrixEndpoint = MatrixEndpoint {
+    name: "GetPushRules",
+    bridge: push(0x20),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/pushrules/",
+    query: &[],
+};
+pub const GET_GLOBAL_PUSH_RULES: MatrixEndpoint = MatrixEndpoint {
+    name: "GetGlobalPushRules",
+    bridge: push(0x21),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/pushrules/global/",
+    query: &[],
+};
+/// `kind` 打錯是 404，跟「規則不存在」分不出來（本 repo issue #55 坑 4）。
+pub const GET_PUSH_RULE: MatrixEndpoint = MatrixEndpoint {
+    name: "GetPushRule",
+    bridge: push(0x22),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}",
+    query: &[],
+};
+pub const SET_PUSH_RULE: MatrixEndpoint = MatrixEndpoint {
+    name: "SetPushRule",
+    bridge: push(0x23),
+    method: HttpMethod::Put,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}",
+    query: &["before", "after"],
+};
+pub const DELETE_PUSH_RULE: MatrixEndpoint = MatrixEndpoint {
+    name: "DeletePushRule",
+    bridge: push(0x24),
+    method: HttpMethod::Delete,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}",
+    query: &[],
+};
+pub const GET_PUSH_RULE_ENABLED: MatrixEndpoint = MatrixEndpoint {
+    name: "GetPushRuleEnabled",
+    bridge: push(0x25),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/enabled",
+    query: &[],
+};
+pub const SET_PUSH_RULE_ENABLED: MatrixEndpoint = MatrixEndpoint {
+    name: "SetPushRuleEnabled",
+    bridge: push(0x26),
+    method: HttpMethod::Put,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/enabled",
+    query: &[],
+};
+pub const GET_PUSH_RULE_ACTIONS: MatrixEndpoint = MatrixEndpoint {
+    name: "GetPushRuleActions",
+    bridge: push(0x27),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/actions",
+    query: &[],
+};
+pub const SET_PUSH_RULE_ACTIONS: MatrixEndpoint = MatrixEndpoint {
+    name: "SetPushRuleActions",
+    bridge: push(0x28),
+    method: HttpMethod::Put,
+    path: "/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/actions",
+    query: &[],
+};
+pub const GET_PUSHERS: MatrixEndpoint = MatrixEndpoint {
+    name: "GetPushers",
+    bridge: push(0x29),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/pushers",
+    query: &[],
+};
+/// body 的 `kind: null` 是**移除**；`pushkey`＋`app_id` 是身分，同一組再送是覆蓋。
+pub const SET_PUSHER: MatrixEndpoint = MatrixEndpoint {
+    name: "SetPusher",
+    bridge: push(0x2A),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/pushers/set",
+    query: &[],
+};
+pub const NOTIFICATIONS: MatrixEndpoint = MatrixEndpoint {
+    name: "Notifications",
+    bridge: push(0x2B),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/notifications",
+    query: &["from", "limit", "only"],
+};
+
+// ---- 0x19 Media、0x1A Search、0x1B Voip（批 4）、0x1C Misc（批 3）----
+
+pub const MEDIA_CONFIG: MatrixEndpoint = MatrixEndpoint {
+    name: "MediaConfig",
+    bridge: media(0x20),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/media/config",
+    query: &[],
+};
+/// 被 server 關掉是 403；`ts` 這台 server 收下後忽略。
+pub const MEDIA_PREVIEW: MatrixEndpoint = MatrixEndpoint {
+    name: "MediaPreview",
+    bridge: media(0x21),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v1/media/preview_url",
+    query: &["url", "ts"],
+};
+/// ⚠️ `next_batch` 在請求是 query 變數、在回覆是 body 欄位（本 repo issue #55 坑 2）。
+pub const SEARCH_EVENTS: MatrixEndpoint = MatrixEndpoint {
+    name: "SearchEvents",
+    bridge: search(0x20),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/search",
+    query: &["next_batch"],
+};
+pub const SEARCH_USERS: MatrixEndpoint = MatrixEndpoint {
+    name: "SearchUsers",
+    bridge: search(0x21),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/user_directory/search",
+    query: &[],
+};
+/// 沒設定 TURN 是 404（MSC4166）。
+pub const TURN_SERVER: MatrixEndpoint = MatrixEndpoint {
+    name: "TurnServer",
+    bridge: voip(0x20),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/voip/turnServer",
+    query: &[],
+};
+pub const CAPABILITIES: MatrixEndpoint = MatrixEndpoint {
+    name: "Capabilities",
+    bridge: misc(0x20),
+    method: HttpMethod::Get,
+    path: "/_matrix/client/v3/capabilities",
+    query: &[],
+};
+
+// ---- 0x1D Report（批 3，wbfuwunel 的 /docs/bridge-specs/0x1D-report.md）----
+
+pub const REPORT_EVENT: MatrixEndpoint = MatrixEndpoint {
+    name: "ReportEvent",
+    bridge: report(0x20),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
+    query: &[],
+};
+pub const REPORT_ROOM: MatrixEndpoint = MatrixEndpoint {
+    name: "ReportRoom",
+    bridge: report(0x21),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/rooms/{room_id}/report",
+    query: &[],
+};
+pub const REPORT_USER: MatrixEndpoint = MatrixEndpoint {
+    name: "ReportUser",
+    bridge: report(0x22),
+    method: HttpMethod::Post,
+    path: "/_matrix/client/v3/users/{user_id}/report",
     query: &[],
 };
 
@@ -779,6 +1065,57 @@ mod tests {
                 "{vanishing:?} → {filled:?}"
             );
         }
+    }
+
+    /// 批 3／批 4 的路徑（/docs/design/rpc-specs/matrix-relay.md §2）：`/pushrules/` 結尾的斜線要留著、`scope` 固定 `global`、關聯是 v1、`next_batch` 是 query。
+    #[test]
+    fn the_batch_3_and_4_paths_fill_like_the_spec() {
+        let url = to_url("http://localhost:6167", &GET_PUSH_RULES, &Map::new()).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:6167/_matrix/client/v3/pushrules/"
+        );
+        let url = to_url(
+            "http://localhost:6167",
+            &SET_PUSH_RULE_ACTIONS,
+            &vars(json!({ "kind": "room", "rule_id": "!r:localhost" })),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:6167/_matrix/client/v3/pushrules/global/room/!r:localhost/actions"
+        );
+        let url = to_url(
+            "http://localhost:6167",
+            &RELATIONS_BY_REL_TYPE_AND_EVENT_TYPE,
+            &vars(
+                json!({ "room_id": "!r:localhost", "event_id": "$e/1", "rel_type": "m.annotation",
+                          "event_type": "m.reaction", "dir": "b", "limit": 5 }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:6167/_matrix/client/v1/rooms/!r:localhost/relations/$e%2F1/m.annotation/m.reaction?dir=b&limit=5"
+        );
+        let url = to_url(
+            "http://localhost:6167",
+            &SEARCH_EVENTS,
+            &vars(json!({ "next_batch": "abc" })),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:6167/_matrix/client/v3/search?next_batch=abc"
+        );
+        // 推播規則沒有 `scope` 這個變數：給了是表上沒有的變數
+        assert!(matches!(
+            check_variables(
+                &GET_PUSH_RULE,
+                &vars(json!({ "scope": "global", "kind": "room", "rule_id": "!r:x" }))
+            ),
+            Err(SdkError::Usage(_))
+        ));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! 房間動作的 RPC（/docs/design/rooms/room-actions.md §2）：參數照 Matrix 的名字與格式、結果是 server 回的 body 原樣。
 //! 這一層只把 params 翻成 core 的參數（型別不對是 `102`）；做什麼在 `wbf_core::room_actions`。
+//! 中轉用的幾個函式（`pass_through`、`find_through`、`to_variables`…）跟 `matrix_relay.rs` 共用（/docs/design/rpc-specs/matrix-relay.md）。
 //!
 //! ⚠️ `user`／`server` 已經是「哪個帳號」（/docs/design/rpc-specs/rpc-spec.md §2），所以被動到的那個人叫 `user_id`（Matrix body 的名字），
 //! 公開目錄問哪一台叫 `directory_server`。
@@ -12,18 +13,18 @@ use wbf_sdk::matrix_endpoint::{self, MatrixEndpoint};
 use super::{invalid_params, parse_params, Handle, Outcome, TargetParams};
 
 /// 變數表：給了的才放（query 變數沒給就整個省掉，wbfuwunel 的 /docs/bridge-specs/index.md §1.3）。
-fn to_variables(pairs: Vec<(&str, Option<Value>)>) -> Map<String, Value> {
+pub(super) fn to_variables(pairs: Vec<(&str, Option<Value>)>) -> Map<String, Value> {
     pairs
         .into_iter()
         .filter_map(|(name, value)| Some((name.to_string(), value?)))
         .collect()
 }
 
-fn to_json<T: serde::Serialize>(value: Option<T>) -> Option<Value> {
+pub(super) fn to_json<T: serde::Serialize>(value: Option<T>) -> Option<Value> {
     value.and_then(|value| serde_json::to_value(value).ok())
 }
 
-async fn pass_through(
+pub(super) async fn pass_through(
     handle: &Handle,
     core: &Core,
     endpoint: &MatrixEndpoint,
@@ -37,7 +38,7 @@ async fn pass_through(
 }
 
 /// 沒有這一項／沒寫過是 `null`。
-async fn find_through(
+pub(super) async fn find_through(
     handle: &Handle,
     core: &Core,
     endpoint: &MatrixEndpoint,
@@ -50,14 +51,17 @@ async fn find_through(
         .unwrap_or(Value::Null))
 }
 
-type JsonObject = Map<String, Value>;
+pub(super) type JsonObject = Map<String, Value>;
 
 /// params 的物件拆成：daemon 自己的欄位（`sync`、`user`、`server`、`room`…）之外剩下的，原樣交給 Matrix。
 ///
 /// Return:
 ///     Ok((剩下的, 拿出來的))   拿出來的是 `taken` 列的那幾個（沒有就不在裡面）
 ///     Err(102)                params 不是物件
-fn split_object(params: Value, taken: &[&str]) -> Result<(JsonObject, JsonObject), super::Fail> {
+pub(super) fn split_object(
+    params: Value,
+    taken: &[&str],
+) -> Result<(JsonObject, JsonObject), super::Fail> {
     let Value::Object(mut rest) = params else {
         return Err(invalid_params("params must be an object"));
     };
@@ -843,7 +847,7 @@ pub(super) async fn room_pin(handle: &Handle, core: &Core, params: Value) -> Out
         .await?)
 }
 
-// ---- 標籤與帳號資料（§2.3）：本地沒存，🚫 帶 `sync` ----
+// ---- 標籤與帳號資料（§2.3）：本地沒存，**不**帶 `sync` ----
 
 /// 自己的 mxid 與這間房：標籤、房間的帳號資料的路徑都要。
 fn me_and_room(

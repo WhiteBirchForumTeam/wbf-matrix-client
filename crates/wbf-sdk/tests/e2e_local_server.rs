@@ -563,6 +563,437 @@ async fn the_matrix_endpoint_table_answers_the_same_over_http_and_over_the_bridg
     logout(&session).await.expect("logout");
 }
 
+/// 同一支端點、同一份變數與 body，走 HTTP 一次、走橋一次。
+async fn call_both_ways(
+    session: &wbf_sdk::login::Session,
+    bridge: &mut WbfClient<Channel>,
+    endpoint: &wbf_sdk::matrix_endpoint::MatrixEndpoint,
+    variables: &serde_json::Map<String, serde_json::Value>,
+    body: Option<&serde_json::Value>,
+) -> (
+    Result<serde_json::Value, SdkError>,
+    Result<serde_json::Value, SdkError>,
+) {
+    let over_http = wbf_sdk::matrix_endpoint::call_over_http(
+        &session.server,
+        &session.access_token,
+        endpoint,
+        variables,
+        body,
+    )
+    .await;
+    let over_bridge = bridge.call_matrix_endpoint(endpoint, variables, body).await;
+    (over_http, over_bridge)
+}
+
+/// 兩條路的結果一樣：都成功就 body 一樣，都失敗就 HTTP 狀態一樣。回 HTTP 那份。
+fn assert_same_outcome(
+    name: &str,
+    (over_http, over_bridge): (
+        Result<serde_json::Value, SdkError>,
+        Result<serde_json::Value, SdkError>,
+    ),
+) -> Result<serde_json::Value, SdkError> {
+    match (&over_http, &over_bridge) {
+        (Ok(http), Ok(bridge)) => assert_eq!(http, bridge, "{name}"),
+        (Err(http), Err(bridge)) => assert_eq!(
+            http.matrix_status(),
+            bridge.matrix_status(),
+            "{name}: {http:?} / {bridge:?}"
+        ),
+        _ => panic!("{name}: http {over_http:?} but bridge {over_bridge:?}"),
+    }
+    over_http
+}
+
+/// 批 3／批 4 其餘的 30 支端點（/docs/design/rpc-specs/matrix-relay.md §2）對真 server：**走 HTTP 與走橋回的一樣**，寫的那幾支一條路寫、另一條路讀回來。
+/// 時間會動的欄位（在線狀態的 `last_active_ago`）只比不會動的那幾個。
+#[tokio::test]
+#[ignore = "needs a running wbfuwunel; see file header"]
+async fn the_batch_3_and_4_endpoints_answer_the_same_over_http_and_over_the_bridge() {
+    use serde_json::{json, Map, Value};
+    use wbf_sdk::matrix_endpoint::{self as endpoints, call_over_http};
+    let Some(target) = target() else {
+        eprintln!("WBF_E2E_* not set; skipping");
+        return;
+    };
+    let session = login_with_password(
+        &target.server,
+        &target.user,
+        &target.password,
+        "wbf-sdk e2e batch 3 and 4",
+    )
+    .await
+    .expect("login");
+    let (server, token) = (session.server.as_str(), session.access_token.as_str());
+    let vars = |value: Value| -> Map<String, Value> { value.as_object().unwrap().clone() };
+    let channel = Channel::connect(server, token, Transport::WebSocket)
+        .await
+        .expect("ws");
+    let mut bridge = WbfClient::new(channel);
+    bridge
+        .hello("wbf-sdk e2e batch 3 and 4", &[])
+        .await
+        .expect("hello");
+    let none = Map::new();
+
+    // 能力、媒體設定、推播規則、pusher：純讀，契約是**成功**，兩條路一樣，而且長得像規格（兩條路一起失敗也要紅，PR #86 rumia）
+    let mut read_both_ways = Vec::new();
+    for endpoint in [
+        &endpoints::CAPABILITIES,
+        &endpoints::MEDIA_CONFIG,
+        &endpoints::GET_PUSH_RULES,
+        &endpoints::GET_GLOBAL_PUSH_RULES,
+        &endpoints::GET_PUSHERS,
+    ] {
+        let outcome = call_both_ways(&session, &mut bridge, endpoint, &none, None).await;
+        read_both_ways.push(assert_same_outcome(endpoint.name, outcome).expect(endpoint.name));
+    }
+    let [capabilities, media_config, rules, global_rules, pushers] = &read_both_ways[..] else {
+        panic!("five reads");
+    };
+    assert!(capabilities["capabilities"].is_object(), "{capabilities}");
+    assert!(media_config["m.upload.size"].is_u64(), "{media_config}");
+    assert!(rules["global"]["override"].is_array(), "{rules}");
+    assert_eq!(global_rules, &rules["global"]);
+    assert!(pushers["pushers"].is_array(), "{pushers}");
+    // TURN：這台沒設定是 404，兩條路一起 404 才是對的
+    let outcome = call_both_ways(&session, &mut bridge, &endpoints::TURN_SERVER, &none, None).await;
+    if let Err(error) = assert_same_outcome("TurnServer", outcome) {
+        assert!(error.is_not_found(), "{error:?}");
+    }
+    let notifications = vars(json!({ "limit": 5 }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::NOTIFICATIONS,
+        &notifications,
+        None,
+    )
+    .await;
+    assert!(
+        assert_same_outcome("Notifications", outcome).expect("Notifications")["notifications"]
+            .is_array()
+    );
+
+    // 一間房、一則狀態事件，給關聯、討論串、跳到某天、檢舉用
+    let created = call_over_http(
+        server,
+        token,
+        &endpoints::CREATE_ROOM,
+        &none,
+        Some(&json!({ "name": "batch 3 and 4", "preset": "private_chat" })),
+    )
+    .await
+    .expect("CreateRoom");
+    let room = created["room_id"].as_str().expect("room_id").to_string();
+    let topic = call_over_http(
+        server,
+        token,
+        &endpoints::SET_STATE_EVENT,
+        &vars(json!({ "room_id": room, "event_type": "m.room.topic", "state_key": "" })),
+        Some(&json!({ "topic": "relations" })),
+    )
+    .await
+    .expect("SetStateEvent");
+    let event_id = topic["event_id"].as_str().expect("event_id").to_string();
+
+    // 推播規則：HTTP 寫、橋讀；橋改、HTTP 讀；刪了兩條路都是 404
+    let rule = vars(json!({ "kind": "room", "rule_id": room }));
+    call_over_http(
+        server,
+        token,
+        &endpoints::SET_PUSH_RULE,
+        &rule,
+        Some(&json!({ "actions": [] })),
+    )
+    .await
+    .expect("SetPushRule over http");
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::GET_PUSH_RULE,
+        &rule,
+        None,
+    )
+    .await;
+    let read = assert_same_outcome("GetPushRule", outcome).expect("GetPushRule");
+    assert_eq!(read["rule_id"], room.as_str(), "{read}");
+    assert_eq!(read["actions"], json!([]), "{read}");
+    bridge
+        .call_matrix_endpoint(
+            &endpoints::SET_PUSH_RULE_ENABLED,
+            &rule,
+            Some(&json!({ "enabled": false })),
+        )
+        .await
+        .expect("SetPushRuleEnabled over the bridge");
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::GET_PUSH_RULE_ENABLED,
+        &rule,
+        None,
+    )
+    .await;
+    assert_eq!(
+        assert_same_outcome("GetPushRuleEnabled", outcome).expect("GetPushRuleEnabled"),
+        json!({ "enabled": false })
+    );
+    bridge
+        .call_matrix_endpoint(
+            &endpoints::SET_PUSH_RULE_ACTIONS,
+            &rule,
+            Some(&json!({ "actions": ["notify"] })),
+        )
+        .await
+        .expect("SetPushRuleActions over the bridge");
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::GET_PUSH_RULE_ACTIONS,
+        &rule,
+        None,
+    )
+    .await;
+    assert_eq!(
+        assert_same_outcome("GetPushRuleActions", outcome).expect("GetPushRuleActions"),
+        json!({ "actions": ["notify"] })
+    );
+    bridge
+        .call_matrix_endpoint(&endpoints::DELETE_PUSH_RULE, &rule, None)
+        .await
+        .expect("DeletePushRule over the bridge");
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::GET_PUSH_RULE,
+        &rule,
+        None,
+    )
+    .await;
+    let gone = assert_same_outcome("GetPushRule after delete", outcome).unwrap_err();
+    assert!(gone.is_not_found(), "{gone:?}");
+
+    // pusher：HTTP 加、橋看得到；`kind: null` 移除
+    let pusher = json!({
+        "pushkey": "e2e-pushkey", "app_id": "org.wbftw.e2e", "kind": "http",
+        "app_display_name": "e2e", "device_display_name": "e2e", "lang": "en",
+        "data": { "url": "https://push.example.org/_matrix/push/v1/notify" }
+    });
+    call_over_http(server, token, &endpoints::SET_PUSHER, &none, Some(&pusher))
+        .await
+        .expect("SetPusher over http");
+    let listed = bridge
+        .call_matrix_endpoint(&endpoints::GET_PUSHERS, &none, None)
+        .await
+        .expect("GetPushers over the bridge");
+    assert!(
+        listed["pushers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|one| one["pushkey"] == "e2e-pushkey"),
+        "{listed}"
+    );
+    bridge
+        .call_matrix_endpoint(
+            &endpoints::SET_PUSHER,
+            &none,
+            Some(&json!({ "pushkey": "e2e-pushkey", "app_id": "org.wbftw.e2e", "kind": null })),
+        )
+        .await
+        .expect("SetPusher kind null over the bridge");
+    let listed = call_over_http(server, token, &endpoints::GET_PUSHERS, &none, None)
+        .await
+        .expect("GetPushers over http");
+    assert!(
+        listed["pushers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|one| one["pushkey"] != "e2e-pushkey"),
+        "{listed}"
+    );
+
+    // 過濾器：路徑的 user_id 是自己；HTTP 建、兩條路讀回一樣
+    let me = vars(json!({ "user_id": session.user_id }));
+    let filter = call_over_http(
+        server,
+        token,
+        &endpoints::CREATE_FILTER,
+        &me,
+        Some(&json!({ "room": { "timeline": { "limit": 7 } } })),
+    )
+    .await
+    .expect("CreateFilter");
+    let filter_id = filter["filter_id"].as_str().expect("filter_id").to_string();
+    let filter_vars = vars(json!({ "user_id": session.user_id, "filter_id": filter_id }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::GET_FILTER,
+        &filter_vars,
+        None,
+    )
+    .await;
+    let read = assert_same_outcome("GetFilter", outcome).expect("GetFilter");
+    assert_eq!(read["room"]["timeline"]["limit"], 7, "{read}");
+
+    // 在線狀態：橋寫、兩條路讀（`last_active_ago` 會動，只比 presence 與 status_msg）
+    bridge
+        .call_matrix_endpoint(
+            &endpoints::SET_PRESENCE,
+            &me,
+            Some(&json!({ "presence": "online", "status_msg": "e2e" })),
+        )
+        .await
+        .expect("SetPresence over the bridge");
+    let (over_http, over_bridge) =
+        call_both_ways(&session, &mut bridge, &endpoints::GET_PRESENCE, &me, None).await;
+    let (over_http, over_bridge) = (
+        over_http.expect("GetPresence over http"),
+        over_bridge.expect("GetPresence over the bridge"),
+    );
+    for field in ["presence", "status_msg"] {
+        assert_eq!(over_http[field], over_bridge[field], "{field}");
+    }
+    assert_eq!(over_http["status_msg"], "e2e", "{over_http}");
+
+    // 關聯、討論串、跳到某天、搜尋
+    let relations = vars(json!({ "room_id": room, "event_id": event_id, "dir": "b", "limit": 5 }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::RELATIONS,
+        &relations,
+        None,
+    )
+    .await;
+    assert!(assert_same_outcome("Relations", outcome).expect("Relations")["chunk"].is_array());
+    let by_type =
+        vars(json!({ "room_id": room, "event_id": event_id, "rel_type": "m.annotation" }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::RELATIONS_BY_REL_TYPE,
+        &by_type,
+        None,
+    )
+    .await;
+    assert_same_outcome("RelationsByRelType", outcome).expect("RelationsByRelType");
+    let by_both = vars(
+        json!({ "room_id": room, "event_id": event_id, "rel_type": "m.annotation", "event_type": "m.reaction" }),
+    );
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::RELATIONS_BY_REL_TYPE_AND_EVENT_TYPE,
+        &by_both,
+        None,
+    )
+    .await;
+    assert_same_outcome("RelationsByRelTypeAndEventType", outcome)
+        .expect("RelationsByRelTypeAndEventType");
+    let threads = vars(json!({ "room_id": room, "limit": 5 }));
+    let outcome = call_both_ways(&session, &mut bridge, &endpoints::THREADS, &threads, None).await;
+    assert!(assert_same_outcome("Threads", outcome).expect("Threads")["chunk"].is_array());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let at = vars(json!({ "room_id": room, "ts": now_ms + 60_000, "dir": "b" }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::TIMESTAMP_TO_EVENT,
+        &at,
+        None,
+    )
+    .await;
+    let found = assert_same_outcome("TimestampToEvent", outcome).expect("TimestampToEvent");
+    assert!(found["event_id"].is_string(), "{found}");
+    let localpart = session
+        .user_id
+        .trim_start_matches('@')
+        .split(':')
+        .next()
+        .unwrap()
+        .to_string();
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::SEARCH_USERS,
+        &none,
+        Some(&json!({ "search_term": localpart, "limit": 5 })),
+    )
+    .await;
+    assert!(
+        assert_same_outcome("SearchUsers", outcome).expect("SearchUsers")["results"].is_array()
+    );
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::SEARCH_EVENTS,
+        &none,
+        Some(&json!({ "search_categories": { "room_events": { "search_term": "relations", "filter": { "rooms": [room] } } } })),
+    )
+    .await;
+    assert_same_outcome("SearchEvents", outcome).expect("SearchEvents");
+
+    // 連結預覽：這台可能關著（403）或連不出去；兩條路要給同一個結果
+    let preview = vars(json!({ "url": "http://127.0.0.1:9/" }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::MEDIA_PREVIEW,
+        &preview,
+        None,
+    )
+    .await;
+    assert_same_outcome("MediaPreview", outcome).ok();
+
+    // 檢舉：兩條路各送一次，結果一樣
+    let event = vars(json!({ "room_id": room, "event_id": event_id }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::REPORT_EVENT,
+        &event,
+        Some(&json!({ "reason": "e2e" })),
+    )
+    .await;
+    assert_same_outcome("ReportEvent", outcome).expect("ReportEvent");
+    let room_only = vars(json!({ "room_id": room }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::REPORT_ROOM,
+        &room_only,
+        Some(&json!({ "reason": "e2e" })),
+    )
+    .await;
+    assert_same_outcome("ReportRoom", outcome).expect("ReportRoom");
+    let nobody = vars(json!({ "user_id": "@nobody-e2e:localhost" }));
+    let outcome = call_both_ways(
+        &session,
+        &mut bridge,
+        &endpoints::REPORT_USER,
+        &nobody,
+        Some(&json!({ "reason": "e2e" })),
+    )
+    .await;
+    assert_same_outcome("ReportUser", outcome).ok();
+
+    call_over_http(server, token, &endpoints::LEAVE, &room_only, None)
+        .await
+        .expect("Leave");
+    call_over_http(server, token, &endpoints::FORGET, &room_only, None)
+        .await
+        .expect("Forget");
+    logout(&session).await.expect("logout");
+}
+
 /// 心跳對真 server（/docs/design/daemon/ws-receive-dispatch.md §5.1）：安靜的線每秒跳一次，Pong 經會話表回來、也過鉤子；三秒內至少兩個 Pong、線還開著、沒有無主。
 /// 📎 server 的 60 秒 idle（wbfuwunel #103，2026-10-02）不在這裡驗（太久）；這條驗的是「Ping 送得出去、Pong 對得回來」那條路在真 server 上通。
 #[tokio::test]

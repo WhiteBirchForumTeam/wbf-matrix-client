@@ -355,6 +355,23 @@ daemon 是中轉站：**params 照 Matrix 的名字與格式，result 是 server
 - 讀一項、一份帳號資料（`room.get_state`、`room.get_account_data`、`account.get_data`）沒有是 `result: null`，**不是**錯誤。
 - server 拒了是 `1400`，`data` 是 server 給的 Matrix 錯誤（§5.3）。
 
+### 3.3.2 其餘的 Matrix 端點（權威在 /docs/design/rpc-specs/matrix-relay.md §2）
+
+跟 §3.3.1 同一套：**params 照 Matrix 的名字與格式，result 是 server 回的 body 原樣**；本地**不**存，所以都**不**帶 `sync`。每支的 params、result 在那份文件。
+
+| 哪一組 | method |
+|---|---|
+| 推播規則、pusher、通知 | `push.get_rules`、`push.get_global_rules`、`push.get_rule`、`push.set_rule`、`push.delete_rule`、`push.get_rule_enabled`、`push.set_rule_enabled`、`push.get_rule_actions`、`push.set_rule_actions`、`push.get_pushers`、`push.set_pusher`、`push.notifications` |
+| 搜尋 | `search.events`、`search.users` |
+| 關聯、討論串、跳到某天 | `room.relations`、`room.threads`、`room.timestamp_to_event` |
+| 在線狀態、過濾器 | `presence.get`、`presence.set`、`filter.create`、`filter.get` |
+| 檢舉 | `report.event`、`report.room`、`report.user` |
+| server 的能力、媒體設定、連結預覽、TURN | `server.capabilities`、`media.config`、`media.preview_url`、`voip.turn_server` |
+
+- `push.get_rule`、`filter.get`、`voip.turn_server` 沒有是 `result: null`（server 的 404），**不是**錯誤；其他的 server 拒了是 `1400`。
+- 路徑要「自己的 mxid」的（`presence.set`、`filter.*`）daemon 填，UI **不**給。
+- ⚠️ 加密房裡的連結預設**不**叫 `media.preview_url`：網址會明文送到 server（/docs/design/rpc-specs/matrix-relay.md §2.7）。daemon 不知道網址是哪間房的，只能靠 UI。
+
 ### 3.4 同步
 
 | method | params | result | core |
@@ -592,6 +609,7 @@ RPC 只傳媒體**訊息**的 JSON（`media.create` 拿 URL、`room.send_attachm
 | `account.del`／`destroy` | ✅ | HTTP `/logout` ＋ 本機 | ✅（維護者 2026-09-30 定：登出跟登入一樣走 HTTP） |
 | `room.list`／`get` | ✅ | wbf 帳號：**WS** 橋，列表 `JoinedRooms`、單一房間 `GetState`＋`m.direct`；一般 Matrix：matrix-sdk `/sync` | ✅ wbf／🔁 一般 server（/docs/design/daemon/account-session.md §6） |
 | 房間動作（§3.3.1） | ✅ `room_actions`（/docs/design/rooms/room-actions.md） | 一張端點表兩條路（`wbf_sdk::matrix_endpoint`）：wbf 帳號 **WS** 的橋（Room `0x20`–`0x37`、Event `0x21`–`0x23`、Account `0x25`–`0x2B`）；一般 Matrix 帳號照同一個 **HTTP** 端點送 | ✅ wbf（真 server 驗過）／✅ 一般 server（sdk 層對真 server 驗過 HTTP 與橋回的一樣；daemon 對本機 server 走不到 HTTP 那條） |
+| 其餘的 Matrix 端點（§3.3.2） | ✅ 不加 core 方法：`Core::call_matrix_endpoint`／`find_via_matrix_endpoint`（/docs/design/rpc-specs/matrix-relay.md） | 同一張端點表：wbf 帳號 **WS** 的橋（Sync `0x20`–`0x21`、Event `0x26`–`0x2A`、Receipt `0x23`–`0x24`、Push `0x20`–`0x2B`、Media／Search `0x20`–`0x21`、Voip／Misc `0x20`、Report `0x20`–`0x22`）；一般 Matrix 帳號照同一個 **HTTP** 端點送 | ✅ wbf（真 server 驗過）／✅ 一般 server（sdk 層對真 server 驗過 HTTP 與橋回的一樣） |
 | `room.invites`、`room.membership` 推播 | ✅ `fetch_invites`／`CoreEvent::Membership`（`invites.rs`） | wbf 帳號：**WS** `Invite`（kind `0x05`），訂閱在 `Rooms` 線、一輪 `Fetch` 在 `Misc` 線；一般 Matrix：matrix-sdk `/sync` 的 `rooms.invite`（沒有推播） | ✅ wbf（真 server 驗過）／🔁 一般 server（只有編得過、沒對真 server 跑） |
 | `room.send_text` | ✅ | wbf 帳號：**WS** `Event/Send`（明文房明文；加密房只用後台分好的房間金鑰、加密、帶 `room_version`，/docs/design/keys/e2ee-rpc.md §3、§3.1）；一般 Matrix：`Room::send_raw` | ✅ wbf（含加密，真 server 驗過）／🔁 一般 server |
 | `room.refresh_devices` | ✅ `refresh_room_devices` | **WS** `Keys` 線的橋 `Members`＋`/keys/query`；建通道（`/keys/claim`）與 `sendToDevice` 不在這個命令裡，是後台在同一條線上做（/docs/design/keys/e2ee-rpc.md §3.1） | ✅（真 server 驗過） |

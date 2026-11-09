@@ -104,7 +104,8 @@ UI 放的那則 `m.room.encryption` 要是 server 會當成加密的那種（`st
 ### 2.4 太細、先不加的（維護者看過再說）
 
 - **訊息層的**（Event `0x20` GetEvent、`0x24` Redact、`0x25` Context、`0x26`–`0x29` Relations／Threads、`0x2A` TimestampToEvent）：排在「訊息動作」那一支（§0 的範圍）；Context 是「跳到訊息」，等 wbfuwunel #64。
-- **已讀、輸入中**（Receipt kind）：排在「已讀」那一支。
+  Redact 已由訊息動作那支接上（/docs/design/messages/message-actions.md §3.5）；Relations／Threads／TimestampToEvent 2026-11-08 接上（`room.relations`、`room.threads`、`room.timestamp_to_event`，/docs/design/rpc-specs/matrix-relay.md §2.3）。
+- **已讀、輸入中**（Receipt kind）：排在「已讀」那一支。在線狀態（`0x23`–`0x24`）2026-11-08 接上（/docs/design/rpc-specs/matrix-relay.md §2.4）。
 - **帳號本身**（profile、改密碼、停用帳號）：不是房間的事。
 - `m.room.server_acl`（擋哪些 server 的事件）、`m.room.tombstone`（手動寫墓碑；升級由 `room.upgrade` 自己寫）：聯邦還沒開，現在用不到；要的話 `room.set_state` 寫得出來。
 
