@@ -109,10 +109,10 @@ wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一
   - /docs/design/rpc-specs/wbf-cli-spec.md 改寫成 rpc-cli 的規格（§3 命令、§4 exit code、§8 驗收、§10 conf）。
   - /docs/design/overview/architecture-v2.md §0.2、§4、§6、§6.1 改現況。
   - `scripts/acceptance.sh` 改用新命令。
-- **規格逐支核對**：順便把 /docs/design/rpc-specs/rpc-spec.md 每支 method 的參數與預設值對一次實作。盤點時已經看到 UI 會踩的落差：
-  - `room.list`／`room.history`／`media.info` 的 `sync` 預設是 `local`，舊 CLI 用的是 `both`／`server`；
-  - `room.files` 不收 `save`。
-  規格沒寫清楚的補上。
+- **規格逐支核對**：順便把 /docs/design/rpc-specs/rpc-spec.md 每支 method 的參數與預設值對一次實作，規格沒寫清楚的補上。
+  - 📎 `room.list`／`room.history`／`media.info` 的 `sync` 預設是 `local` 是**刻意的**：UI 先拿本地的立刻顯示、再 `both` 補一次，刷新兩次（/docs/design/daemon/daemon-runtime.md §3.4）。
+    舊 CLI 每次都帶 `both`／`server`，只因為它是從零開始的單發工具、沒有「先顯示一次」那一步；rpc-cli 的 `call` 照 RPC 的預設，要哪一種由使用者在 params 帶。
+  - `room.files` 不收 `save`：存檔是前端的事，規格上寫明。
 
 ## 5. issue #26（登入時偶發 panic）
 
