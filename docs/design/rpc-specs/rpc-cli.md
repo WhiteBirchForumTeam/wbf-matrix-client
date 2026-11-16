@@ -27,7 +27,7 @@
 
 | 選項 | 做法 | 評估 |
 |---|---|---|
-| **甲**（建議） | **一次執行＝一支 daemon**：產生 token → spawn `daemon -s --token-file` → 等 ready → 抹掉 token 檔 → `hello` → `vault.unlock` → 命令 → `daemon.shutdown` → 等它結束。第二列照現在一樣拒絕，訊息講清楚「別的前端起的 daemon 在跑，請用那個前端或先關掉它」 | 完全照 /docs/design/rpc-specs/local-interface.md §3 的五步，不新增任何信任面。代價見下 |
+| **甲**（建議） | **一次執行＝一支 daemon**：產生 token → 用環境變數交給它、spawn `daemon -s`（§1.1）→ 等 ready → `hello` → `vault.unlock` → 命令 → `daemon.shutdown` → 等它結束。第二列照現在一樣拒絕，訊息講清楚「別的前端起的 daemon 在跑，請用那個前端或先關掉它」 | 照 /docs/design/rpc-specs/local-interface.md §3「前端產生 token、只活在兩個程序的記憶體裡」，不新增任何信任面。代價見下 |
 | 乙 | rpc-cli 起一支常駐的、把 token 存檔給之後的 rpc-cli 用 | 推翻 /docs/design/rpc-specs/local-interface.md §3 第 5 步（token 不落地）。不建議 |
 | 丙 | daemon 加「第二個前端附掛」的機制（另一把 token、或 OS 層的認證） | 這是 /docs/design/overview/architecture-v2.md §7 第 4 點（daemon 的生命週期、多個前端誰說了算），那裡寫明「等 Desktop 的實際使用模式出來再定」。不在這支做 |
 
@@ -36,6 +36,25 @@
 - 批次模式（§2.1 的 `--stdin`）讓一串命令共用一次起動，腳本與驗收主要走這條。
 - 📎 考慮過「rpc-cli 起的 daemon 不在背景開線」的旗標，**這支不做**：收金鑰的 `Keys` 線與收房間推播的 `Rooms` 線沒有命令會用，只有背景開線會開（/docs/design/daemon/link-pool.md §3 的「訂閱線」），
   關掉它們，別台裝置分來的房間金鑰就收不到，讀加密房會看到解不開的訊息。先量實際的起動時間，嫌慢再談。
+
+### 1.1 token 改用環境變數交，拿掉 token 檔（維護者 2026-11-17）
+
+現在是前端寫一個 256 byte 的檔（Unix 0600）、`daemon -s --token-file <路徑>`、daemon 讀完、前端收到 ready 之後照規定的三遍抹掉（/docs/design/rpc-specs/local-interface.md §3 的五步）。改成：
+
+| 步 | 誰 | 做什麼 |
+|---|---|---|
+| 1 | 前端 | 產生 256 byte 隨機 token，base64 之後放進子程序的環境變數 `WBF_DAEMON_TOKEN`，spawn `daemon -s`（禁止用命令列參數傳：那會進 `ps` 的輸出） |
+| 2 | daemon | 在起 runtime、開任何執行緒**之前**讀它、**從自己的環境裡清掉**（之後它起的子程序不會繼承到）、導出金鑰、開 port、宣告 ready |
+| 3 | — | token 只活在兩個程序的記憶體裡，**從頭到尾不落地** |
+
+- **`--token-file` 拿掉**（維護者 2026-11-17）：兩條路做同一件事遲早漂移；環境變數在每個會 spawn daemon 的前端都設得了。
+  跟著拿掉的：token 檔的權限檢查（Unix 上 group／other 可讀就拒絕啟動）、`wbf_daemon::token::shred` 的三遍抹寫（沒有別的呼叫點就刪）。
+- **安全邊界不變**：同一個 OS 帳號的程序讀得到別的程序的環境變數（Linux 的 `/proc/<pid>/environ`，Windows 也做得到），跟 0600 的檔擋的是同一層。
+  差別是少了「在磁碟上那幾秒」，連帶 /docs/design/rpc-specs/local-interface.md §3 那段「覆蓋是盡力不是保證」也不用了。
+- **fail closed**：值解不開 base64、或長度不是 256 byte → 拒絕啟動、講清楚。
+- **沒帶 `WBF_DAEMON_TOKEN`**：維護者 2026-11-17 定的方向是 daemon 自己產生一把（給它自己送出的 web 網頁用）。
+  網頁怎麼拿到那把 token 是下一支（web 樣板的接法）的事；**這支先維持「沒帶就拒絕啟動」**，免得起出一支誰都連不上的 daemon。
+- 📎 Android 的 JNI 是同一個程序裡的函式呼叫，不是 spawn：/docs/design/overview/architecture-v2.md §4 的 `daemon_start(data_dir, token_path)` 改成直接收 token 的 bytes。
 
 ## 2. 命令面：一個通用的 `call`，加上只有前端做得到的幾件事
 
@@ -107,7 +126,8 @@ wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一
 - **core 裡只剩 CLI 在用的方法**（`download_direct`、`upload_stream`、`seek_read`、`watch` 等）：實作時逐支查，沒有別的呼叫點就刪。
 - **文件**：
   - /docs/design/rpc-specs/wbf-cli-spec.md 改寫成 rpc-cli 的規格（§3 命令、§4 exit code、§8 驗收、§10 conf）。
-  - /docs/design/overview/architecture-v2.md §0.2、§4、§6、§6.1 改現況。
+  - /docs/design/overview/architecture-v2.md §0.2、§4（含 Android JNI 的 `daemon_start` 直接收 token）、§6、§6.1 改現況。
+  - /docs/design/rpc-specs/local-interface.md §3：五步改成 §1.1 的三步，token 檔、權限檢查、抹寫那幾段拿掉。
   - `scripts/acceptance.sh` 改用新命令。
 - **規格逐支核對**：順便把 /docs/design/rpc-specs/rpc-spec.md 每支 method 的參數與預設值對一次實作，規格沒寫清楚的補上。
   - 📎 `room.list`／`room.history`／`media.info` 的 `sync` 預設是 `local` 是**刻意的**：UI 先拿本地的立刻顯示、再 `both` 補一次，刷新兩次（/docs/design/daemon/daemon-runtime.md §3.4）。
@@ -128,12 +148,16 @@ wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一
 3. **client 放哪**：`wbf_daemon::client`，測試的三份換成它。建議放這裡。
 4. **daemon 的單發模式**：改成不做。建議不做。
 
+已定（2026-11-17）：token 改用環境變數 `WBF_DAEMON_TOKEN` 交、拿掉 `--token-file`（§1.1）。
+
 ## 7. 驗收
 
 - 對真 server 用 rpc-cli 走一輪：`account add` → `call room.list` → `call room.send_text` → 另一個帳號的 `watch room.message` 收到 → `put` ＋ `call room.send_attachment` → `get` 拿回來跟原檔 `cmp` → `get --range` 跟 `dd` 切的同一段 `cmp`。
 - `scripts/acceptance.sh` 改寫後照原本的七條跑過（200 MiB、三種 cipher、`put -` 從 stdin）。
 - 別的 daemon 佔著資料目錄時：rpc-cli 拒絕、exit 1、訊息講清楚、資料目錄沒有多出任何東西。
-- **token 檔不留**：每次執行完（含 daemon 起不來、rpc-cli 被 Ctrl+C）資料目錄裡都沒有 token 檔。
+- **token 不落地**：每次執行完（含 daemon 起不來、rpc-cli 被 Ctrl+C）資料目錄與暫存目錄裡都沒有 token。
+- **daemon 讀完就清掉環境變數**：讀 token 的那支函數回來之後，同一個程序的 `WBF_DAEMON_TOKEN` 已經不在（單元測試）；
+  沒帶、base64 壞掉、長度不對都拒絕啟動、exit 非 0（`crates/wbf-daemon/tests/process.rs`，真的 spawn 一次）。
 - **daemon 不留**：每次執行完 daemon 程序都結束了（含 `watch` 時按 Ctrl+C：rpc-cli 送 `daemon.shutdown` 再走）。
 - 測試的三份 client 換成 `wbf_daemon::client` 之後，loopback／process／real_server 全綠。
 - 規格核對：/docs/design/rpc-specs/rpc-spec.md §10 的每一列對過 dispatch 表。
