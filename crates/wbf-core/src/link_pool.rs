@@ -475,13 +475,18 @@ impl crate::Core {
             ));
         }
         let user = self.session_of(account)?.user_id;
-        Ok(self
+        let mut pools = self
             .link_pools
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(account.dir.clone())
-            .or_insert_with(|| Arc::new(LinkPool::new(&user, self.events.clone())))
-            .clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pool) = pools.get(&account.dir) {
+            return Ok(pool.clone());
+        }
+        // 關機收掉池之後不再建（`Core::check_not_shutting_down`）。
+        self.check_not_shutting_down("a new link pool")?;
+        let pool = Arc::new(LinkPool::new(&user, self.events.clone()));
+        pools.insert(account.dir.clone(), pool.clone());
+        Ok(pool)
     }
 
     /// 正式的「開一條線」（/docs/design/daemon/link-pool.md §3、§7）：session → `Channel::connect`（Bearer 升級，這就是登入）→ `hello`。
@@ -496,6 +501,7 @@ impl crate::Core {
         account: &crate::accounts::AccountDir,
         role: LinkRole,
     ) -> Result<WbfClient<Channel>, CoreError> {
+        self.check_not_shutting_down("a new link")?;
         let session = self.session_of(account)?;
         let hook = received_hook(self.events.clone(), session.user_id.clone(), role);
         let channel = wbf_sdk::channel::WsChannel::connect_with_hook(
@@ -506,6 +512,8 @@ impl crate::Core {
         .await?;
         let mut client = WbfClient::new(Channel::WebSocket(Box::new(channel)));
         client.hello(LINK_CLIENT_NAME, features_of(role)).await?;
+        // 連線可能要幾秒：這中間開始關機的話，不訂、不起收推播的 task（client 丟掉就關線）。
+        self.check_not_shutting_down("a new link")?;
         // 通用的初始化（維護者 2026-09-22）：看角色決定開完線還要做什麼——訂閱線就是在這裡訂的（/docs/design/rooms/room-sync.md）。
         self.init_connection(account, role, &mut client).await?;
         Ok(client)

@@ -319,22 +319,13 @@ impl DataServer {
 
     /// 一直 accept，直到 `daemon.shutdown`。
     pub async fn run(self) {
-        let mut shutdown = self.handle.shutdown_signal();
-        // ⚠️ 訂閱之前就關了的話 `changed()` 永遠等不到：先看一次現在的值。
-        if *shutdown.borrow_and_update() {
-            return;
-        }
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let Ok((stream, _)) = accepted else { continue };
                     self.handle.in_flight().spawn_connection(serve_connection(stream, self.handle.clone(), self.receiving.clone()));
                 }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                }
+                _ = self.handle.wait_until_shutting_down() => return,
             }
         }
     }
@@ -350,7 +341,8 @@ async fn serve_connection(
     handle: Arc<Handle>,
     receiving: Arc<UploadsReceiving>,
 ) {
-    let mut shutdown = handle.shutdown_signal();
+    // 在下面把 `handle` 搬進服務之前訂閱；已經在關就馬上回（`Handle::wait_until_shutting_down`）。
+    let shutting_down = handle.wait_until_shutting_down();
     let service = service_fn(move |request| {
         let (handle, receiving) = (handle.clone(), receiving.clone());
         async move { Ok::<Reply, Infallible>(route(handle, receiving, request).await) }
@@ -358,19 +350,11 @@ async fn serve_connection(
     // 連線層的錯（對方亂送、半路斷）只影響這一條，**不**往上丟。
     let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
-    if *shutdown.borrow_and_update() {
-        connection.as_mut().graceful_shutdown();
-    }
-    loop {
-        tokio::select! {
-            _ = connection.as_mut() => return,
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    connection.as_mut().graceful_shutdown();
-                    let _ = connection.as_mut().await;
-                    return;
-                }
-            }
+    tokio::select! {
+        _ = connection.as_mut() => {}
+        _ = shutting_down => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.as_mut().await;
         }
     }
 }

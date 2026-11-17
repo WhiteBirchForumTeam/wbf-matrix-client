@@ -624,8 +624,13 @@ impl Downloader {
     /// 從表裡拿掉還不夠：串流中的 GET 握著另一個 `Arc`，只等 drop 的話舊處理端會一直活著——它的線已經關了，GET 要的塊永遠等不到；
     /// 它開著的檔也不在掃描的保護名單上。收掉之後 GET 立刻拿到錯、斷線，播放器重要時找到新的處理端。
     ///
+    /// ⚠️ 只有**第一個**呼叫者真的等：handle 被它拿走，之後（含同時）的呼叫馬上回 `Ok`，就算處理端還在收（PR #87 審查 rumia 🟢3）。
+    /// 現在的兩個入口（`close_links`、`Core::shutdown`）排在同一條收攤路上，不會同時叫。
+    /// ⚠️ 兩層用同一個 [`STOP_TIMEOUT`]：處理端收攤時自己還要等它的發送端（`RequestLine::stop`）。裡面那層真的卡滿 5 秒時，這裡也剛好逾時回 `Err`，
+    /// 分不出處理端本身停好了沒（PR #87 審查 cirno 🟡1）。誰把 `STOP_TIMEOUT` 調小，這裡會先出事。
+    ///
     /// Return:
-    ///     Ok(())            停了（含別人已經停過）
+    ///     Ok(())            停了（或別人已經拿走 handle，見上）
     ///     Err(StopTimedOut) 等不到；沒有 abort
     pub(crate) async fn stop(&self) -> Result<(), StopTimedOut> {
         self.shared.stopped.store(true, Ordering::SeqCst);

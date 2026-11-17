@@ -442,8 +442,10 @@ impl WsLink {
     ///
     /// Args:
     ///     timeout: 三個加起來最多等多久, example: Duration::from_secs(5)
+    /// ⚠️ 只有**第一個**呼叫者真的等：三個 handle 被它拿走，之後（含同時）的呼叫馬上回 `Ok`，就算 task 還在收（PR #87 審查 rumia 🟢3）。
+    ///
     /// Return:
-    ///     Ok(())            都結束了（含別人已經等過的）
+    ///     Ok(())            都結束了（或別人已經拿走 handle，見上）
     ///     Err(StopTimedOut) 等不到；task **沒有**被 abort
     pub async fn close_and_wait(&self, timeout: Duration) -> Result<(), StopTimedOut> {
         self.close();

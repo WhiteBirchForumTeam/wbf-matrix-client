@@ -270,10 +270,7 @@ fn main() -> ExitCode {
 /// 收到 Ctrl+C／SIGTERM 就開始關機（跟 `daemon.shutdown` 同一條路，只是沒有回應要先送）。收訊號的接口開不起來就講一聲，照樣跑（`daemon.shutdown` 還在）。
 /// 已經在關（`daemon.shutdown` 先來）就自己結束。
 async fn shutdown_on_signal(handle: std::sync::Arc<Handle>) {
-    let mut shutdown = handle.shutdown_signal();
-    let already_shutting_down = async {
-        let _ = shutdown.wait_for(|shutting_down| *shutting_down).await;
-    };
+    let already_shutting_down = handle.wait_until_shutting_down();
     #[cfg(unix)]
     let terminated = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {

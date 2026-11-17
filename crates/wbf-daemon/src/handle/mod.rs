@@ -267,9 +267,22 @@ impl Handle {
         self.policy.is_enforced()
     }
 
-    /// `daemon.shutdown` 之後變 `true`。server 用它停止 accept 並送 `SHUTTING_DOWN`。
-    pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
+    /// `daemon.shutdown` 之後變 `true`。只給測試看「廣播了沒」；正式碼要**等**關機一律用 [`Handle::wait_until_shutting_down`]。
+    #[cfg(test)]
+    fn shutdown_signal(&self) -> watch::Receiver<bool> {
         self.shutdown.subscribe()
+    }
+
+    /// 等到開始關機；**已經在關就馬上回**。呼叫的當下就訂閱，回傳的 future 不借 `self`。
+    /// 每個要「看到關機就收」的地方一律用它：只等 `changed()` 的接收端，在它訂閱**之前**就廣播的話永遠等不到（PR #87 審查 rumia 🟡1）。
+    pub fn wait_until_shutting_down(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut shutdown = self.shutdown.subscribe();
+        async move {
+            // 送出端不在了也算：沒有人能再叫它開，fail closed。
+            let _ = shutdown.wait_for(|shutting_down| *shutting_down).await;
+        }
     }
 
     /// 要不要拒絕新請求：`daemon.shutdown` 一回完就拒，不等廣播。
@@ -648,17 +661,11 @@ impl Handle {
         if self.settings().transport == Transport::Http {
             return;
         }
-        let mut shutdown = self.shutdown_signal();
         let mut interval = KEEP_LINKS_INTERVAL;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
+                _ = self.wait_until_shutting_down() => return,
             }
             if self.is_shutting_down() {
                 return;

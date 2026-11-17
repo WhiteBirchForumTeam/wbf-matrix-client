@@ -404,6 +404,8 @@ fn exit_code(error: &CoreError) -> u8 {
         Usage | Io | Locked | NoKeyFile | NeedPassphrase | UnexpectedPassphrase
         | WrongPassphrase | NoSuchAccount | AmbiguousAccount | NotLoggedIn | AccountBusy
         | ServerPendingRemoval | NoRecoveryKeyHere | HistoryWouldBeLost => 1,
+        // 關機中（RPC 層的 107）：RPC 層的錯一律是用法那一級（/docs/design/rpc-specs/rpc-spec.md §5）。
+        ShuttingDown => 1,
         Server | RoomDevicesChanged => 2,
         // 匯出了、但它沒驗過或驗不過（/docs/design/rpc-specs/data-plane.md §8.2）：跟完整性同一級。
         Integrity | Unverified => 3,

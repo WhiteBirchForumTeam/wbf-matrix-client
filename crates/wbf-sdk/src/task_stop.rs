@@ -146,29 +146,36 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    /// 叫停之後 task 把手上那一件做完才回來：「做完」與「回來」都看得到。
+    /// 叫停之後 task 把手上那一件做完才回來：**開始了的每一件都做完了**，而且回來的時候已經做完。
+    /// task 開始做一件時先報一聲，測試等到那一聲才叫停——確定叫停時它至少開始過一件（第一版用睡 15 毫秒猜，機器忙時會猜錯而紅）。
     #[tokio::test]
     async fn stop_waits_for_the_task_to_finish_what_it_is_doing() {
+        let started_items = Arc::new(AtomicU32::new(0));
         let finished_items = Arc::new(AtomicU32::new(0));
-        let counted = finished_items.clone();
+        let (started, finished) = (started_items.clone(), finished_items.clone());
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let task = StoppableTask::spawn(|mut stop| async move {
             loop {
                 tokio::select! {
                     _ = stop.requested() => return,
                     _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
                         // 一件事：中間有 await，叫停也不能停在這裡
                         tokio::time::sleep(Duration::from_millis(30)).await;
-                        counted.fetch_add(1, Ordering::SeqCst);
+                        finished.fetch_add(1, Ordering::SeqCst);
                     }
                 }
             }
         });
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let started = finished_items.load(Ordering::SeqCst);
+        started_rx.recv().await.expect("the task started an item");
         assert_eq!(task.stop(Duration::from_secs(2)).await, Ok(()));
-        assert!(
-            finished_items.load(Ordering::SeqCst) > started,
-            "the item in hand finished before the task returned"
+        let started = started_items.load(Ordering::SeqCst);
+        assert!(started >= 1);
+        assert_eq!(
+            finished_items.load(Ordering::SeqCst),
+            started,
+            "every item that was started finished before the task returned"
         );
     }
 
@@ -186,8 +193,7 @@ mod tests {
             task.stop(Duration::from_millis(10)).await,
             Err(StopTimedOut)
         );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(ended.load(Ordering::SeqCst), 1, "not aborted");
+        assert!(ends_within_two_seconds(&ended).await, "not aborted");
     }
 
     /// 丟掉只送開關：task 收到、自己收攤（不是被 abort 掉在半路）。
@@ -201,8 +207,18 @@ mod tests {
             marked.fetch_add(1, Ordering::SeqCst);
         });
         drop(task);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(ended.load(Ordering::SeqCst), 1);
+        assert!(ends_within_two_seconds(&ended).await);
+    }
+
+    /// 等 task 自己結束（計數變 1），最多 2 秒：一到就回，機器忙的時候也不會因為睡不夠而紅。
+    async fn ends_within_two_seconds(ended: &AtomicU32) -> bool {
+        for _ in 0..200 {
+            if ended.load(Ordering::SeqCst) == 1 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 
     #[tokio::test]

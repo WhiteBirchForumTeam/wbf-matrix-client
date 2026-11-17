@@ -257,6 +257,8 @@ pub struct Core {
     pub(crate) verify_watchers: std::sync::Arc<verify_ops::VerifyWatchers>,
     /// 換線時被換下來、已經叫停、還沒確認結束的 task（`shutdown.rs`）：登出與關機等它們。
     pub(crate) retiring: std::sync::Mutex<Vec<shutdown::RetiringTask>>,
+    /// [`Core::shutdown`] 開始了：之後不再建新的池、不再開新線、不再開新的 `cache.db`（`Core::check_not_shutting_down`）。只會從 false 變 true。
+    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Core {
@@ -289,6 +291,7 @@ impl Core {
             background_backup: std::sync::Arc::default(),
             verify_watchers: std::sync::Arc::default(),
             retiring: std::sync::Mutex::new(Vec::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

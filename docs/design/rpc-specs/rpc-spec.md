@@ -491,12 +491,12 @@ wbf 帳號的交叉簽章與備份版本在金鑰線開好時自動就位、新�
 
 | code | 名字 | 什麼時候 |
 |---|---|---|
-| 100 | `bad_request` | 解出來不是 JSON 物件、沒有 `method`、`id` 不是整數 |
+| 100 | `bad_request` | 解出來不是 JSON 物件、沒有 `method`、`id` 不是整數、`id` 跟這條連線上**還在跑**的請求重複（這則不做；那個還在跑的照常回它自己的回應，所以前端會收到兩則同 `id` 的） |
 | 101 | `unknown_method` | 沒這個 method |
 | 102 | `invalid_params` | 缺必填、型別不對、base64 解不開、路徑不是絕對路徑 |
 | 105 | `cancelled` | 這個請求被 `cancel` 掉了 |
 | 106 | `busy` | 同一個帳號已經有一個同種的長工作在跑（例如兩個 `sync.recent`）。**不**排隊，讓前端決定 |
-| 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求 |
+| 107 | `daemon_shutting_down` | `daemon.shutdown` 之後進來的任何請求（連線讀到它的當下判斷）；以及關機開始之後還想開新線、開新的 `cache.db` 的工作（core 的 `ShuttingDown`） |
 | 108 | `internal` | daemon 自己組不出回應（它的 bug，例如 result 序列化失敗）。**不是**前端的錯，所以**不**關連線 |
 | 109 | `no_write_access` | 這個 daemon **沒有寫這個資料目錄的權**：別人握著排他鎖（/docs/design/overview/architecture-v2.md §0.2）。⚠️ 跟 `1001`（vault 鎖著）不是同一件事 —— 那是「還沒解鎖」，這是「這個目錄現在是別人的」。前端該做的是去連**那一個** daemon，**不是**重試 |
 

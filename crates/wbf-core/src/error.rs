@@ -78,6 +78,8 @@ pub enum CoreErrorKind {
     /// 這個請求被 `cancel` 掉了（或 daemon 關機時等不到它）：長工作在安全點看到取消開關、收攤回來。
     /// 留下什麼看工作（/docs/design/daemon/daemon-runtime.md §8 的表）。
     Cancelled,
+    /// daemon 正在關機（[`crate::Core::shutdown`] 開始了）：不再開新線、不再開新的 `cache.db`。跟 RPC 層關機之後進來的請求同一件事。
+    ShuttingDown,
 }
 
 impl CoreErrorKind {
@@ -112,6 +114,8 @@ impl CoreErrorKind {
             CoreErrorKind::Timeout => 1600,
             // 取消是 RPC 層的 105（/docs/design/rpc-specs/rpc-spec.md §5.1）：core 回這個 kind 的那一刻就是那個請求被取消了。
             CoreErrorKind::Cancelled => 105,
+            // 跟「關機之後進來的請求」同一個 RPC 層的 107（/docs/design/rpc-specs/rpc-spec.md §5.1）。
+            CoreErrorKind::ShuttingDown => 107,
         }
     }
 }
@@ -236,6 +240,9 @@ mod tests {
         codes.dedup();
         assert_eq!(codes.len(), table.len());
         assert!(codes.iter().all(|code| (1000..2000).contains(code)));
+        // 兩個借用 RPC 層號碼的（§5.1）：它們講的就是那個請求本身的命運，不是 core 裡的一種失敗。
+        assert_eq!(CoreErrorKind::Cancelled.rpc_code(), 105);
+        assert_eq!(CoreErrorKind::ShuttingDown.rpc_code(), 107);
     }
 
     #[test]

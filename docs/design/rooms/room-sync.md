@@ -53,7 +53,7 @@ UI
 - **`Subscribe` 不帶 `cg_seq`**：server 的補窗有上限、截斷只給一個 gap bit；反正補窗是 UI 的事，daemon 不要它。
 - **訂閱是純的**：一包來寫一包，`seq` 跳號不管。
 - **訂閱會話結束＝那條線作廢**：server 送 `Error`（例如被另一台裝置接手的 1505）時 socket 可能還活著，池的殞死偵測（`is_closed`）看不出來——
-  task 收攤時自己 `LinkPool::close(Rooms, "the room subscription ended: …")`，`link.state: closed` 由池發、UI 不必等；看線迴圈下一輪看到那格是空的才會重開、重訂。
+  task 收攤時自己 `LinkPool::close_line(Rooms, <這條線的號>, "the room subscription ended: …")`（只關自己那條，那格已經換成新線的話不動它，§4），`link.state: closed` 由池發、UI 不必等；看線迴圈下一輪看到那格是空的才會重開、重訂。
   理由：只發事件不關線的話，池會把活著的舊線交回去、永遠不再訂。task 自己**不**重訂：重開的只有看線迴圈這一條路。
 
 ## 2. 存不了的事件

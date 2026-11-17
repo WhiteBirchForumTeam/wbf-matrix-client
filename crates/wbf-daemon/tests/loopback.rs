@@ -593,3 +593,33 @@ async fn shutdown_waits_for_the_requests_still_running() {
     assert!(replies.iter().any(|reply| reply["id"] == 2), "{replies:?}");
     assert_eq!(expect_close(&mut socket).await, 1001);
 }
+
+/// 關機廣播**之後**才完成 WebSocket 交握的連線，照樣收到關閉通知、被關掉，而不是掛到 5 秒後被 runtime 切掉（PR #87 審查 rumia 🟡1）。
+/// 先只開 TCP，讓 server accept 進來（accept 之後才交握、才訂閱關機），再廣播，最後才交握。
+#[tokio::test]
+async fn a_connection_whose_handshake_finishes_after_the_shutdown_broadcast_still_gets_the_notice()
+{
+    let daemon = start_daemon().await;
+    let keys = RpcKeys::from_token(&TOKEN);
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", daemon.port))
+        .await
+        .unwrap();
+    // 等 server 的 accept 迴圈把它收進來：廣播之後 accept 迴圈就停了，沒收進來的連線根本不會被服務。
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    daemon.handle.request_shutdown();
+    let (mut socket, _) = tokio_tungstenite::client_async(
+        format!("ws://127.0.0.1:{}", daemon.port),
+        tokio_tungstenite::MaybeTlsStream::Plain(stream),
+    )
+    .await
+    .unwrap();
+    let (pack_type, notice) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        receive(&mut socket, &keys),
+    )
+    .await
+    .expect("the close notice arrives instead of the connection hanging");
+    assert_eq!(pack_type, PackType::Plain);
+    assert_eq!(notice["code"], 9006, "{notice}");
+    assert_eq!(expect_close(&mut socket).await, 1001);
+}

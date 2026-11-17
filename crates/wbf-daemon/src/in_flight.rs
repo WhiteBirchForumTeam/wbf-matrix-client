@@ -19,6 +19,10 @@ pub const REQUEST_GRACE: Duration = Duration::from_secs(10);
 /// 一個請求的鍵：(這條連線的號, 請求的 `id`)。
 type RequestKey = (u64, u64);
 
+/// 這條連線上這個 `id` 的請求還在跑（[`InFlight::spawn_request`] 沒起新的）。
+#[derive(Debug, PartialEq, Eq)]
+pub struct RequestIdInUse;
+
 #[derive(Default)]
 pub struct InFlight {
     next_connection: AtomicU64,
@@ -41,19 +45,32 @@ impl InFlight {
     }
 
     /// 起一個請求的 task：有 `id` 的登記取消開關；關機時等得到它。
+    /// 同一條連線上**還在跑**的請求已經用了這個 `id` 就不起（PR #87 審查 salvia 🟡1：登記會被蓋掉，之後 `cancel` 停錯、做完時刪錯）。
     ///
     /// Args:
     ///     connection: [`InFlight::next_connection_number`] 給的, example: 3
     ///     id: 請求的 `id`；None ＝ 不要回應的請求，取消不到, example: Some(7)
     ///     work: 收取消開關、回 task 本體
-    pub fn spawn_request<F, Fut>(&self, connection: u64, id: Option<u64>, work: F)
+    /// Return:
+    ///     Ok(())               起了
+    ///     Err(RequestIdInUse)  這條連線上這個 `id` 還在跑：沒起、`work` 沒被呼叫
+    pub fn spawn_request<F, Fut>(
+        &self,
+        connection: u64,
+        id: Option<u64>,
+        work: F,
+    ) -> Result<(), RequestIdInUse>
     where
         F: FnOnce(StopSignal) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let (switch, signal) = StopSwitch::new();
         if let Some(id) = id {
-            self.switches().insert((connection, id), switch.clone());
+            let mut switches = self.switches();
+            if switches.contains_key(&(connection, id)) {
+                return Err(RequestIdInUse);
+            }
+            switches.insert((connection, id), switch.clone());
         }
         // 開關的另一頭跟著 task 走：連線關了、登記表裡那份被拿掉，也**不**算取消（前端關掉連線，它發起的長工作繼續跑，/docs/design/daemon/daemon-runtime.md §9）。
         let work = work(signal);
@@ -61,6 +78,7 @@ impl InFlight {
             let _keep_the_switch = switch;
             work.await;
         });
+        Ok(())
     }
 
     /// 請求做完了：拿掉它的取消開關（之後 `cancel` 它是 `was_running: false`）。
@@ -181,10 +199,12 @@ mod tests {
         );
         let saw_cancel = Arc::new(AtomicBool::new(false));
         let seen = saw_cancel.clone();
-        in_flight.spawn_request(mine, Some(7), |mut cancel| async move {
-            cancel.requested().await;
-            seen.store(true, Ordering::SeqCst);
-        });
+        in_flight
+            .spawn_request(mine, Some(7), |mut cancel| async move {
+                cancel.requested().await;
+                seen.store(true, Ordering::SeqCst);
+            })
+            .unwrap();
         assert!(!in_flight.cancel_request(other, 7), "another connection");
         assert!(in_flight.cancel_request(mine, 7));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -200,10 +220,12 @@ mod tests {
         let connection = in_flight.next_connection_number();
         let cancelled = Arc::new(AtomicBool::new(false));
         let marked = cancelled.clone();
-        in_flight.spawn_request(connection, Some(1), |cancel| async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            marked.store(cancel.is_requested(), Ordering::SeqCst);
-        });
+        in_flight
+            .spawn_request(connection, Some(1), |cancel| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                marked.store(cancel.is_requested(), Ordering::SeqCst);
+            })
+            .unwrap();
         in_flight.finish_request(connection, 1);
         assert!(in_flight.finish_requests().await);
         assert!(!cancelled.load(Ordering::SeqCst));
@@ -216,12 +238,53 @@ mod tests {
         let connection = in_flight.next_connection_number();
         let finished = Arc::new(AtomicBool::new(false));
         let marked = finished.clone();
-        in_flight.spawn_request(connection, Some(1), |cancel| async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            marked.store(!cancel.is_requested(), Ordering::SeqCst);
-        });
+        in_flight
+            .spawn_request(connection, Some(1), |cancel| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                marked.store(!cancel.is_requested(), Ordering::SeqCst);
+            })
+            .unwrap();
         assert!(in_flight.finish_requests().await);
         assert!(finished.load(Ordering::SeqCst), "finished, not cancelled");
         assert_eq!(in_flight.running_requests(), 0);
+    }
+
+    /// 同一條連線重用還在跑的 `id`：第二個不起、第一個的登記不被蓋掉（`cancel` 停得到它）；別條連線的同一個 `id` 照起；做完之後又可以用。
+    #[tokio::test]
+    async fn an_id_still_running_on_the_same_connection_is_refused() {
+        let in_flight = InFlight::default();
+        let (mine, other) = (
+            in_flight.next_connection_number(),
+            in_flight.next_connection_number(),
+        );
+        let first_cancelled = Arc::new(AtomicBool::new(false));
+        let marked = first_cancelled.clone();
+        in_flight
+            .spawn_request(mine, Some(4), |mut cancel| async move {
+                cancel.requested().await;
+                marked.store(true, Ordering::SeqCst);
+            })
+            .unwrap();
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let ran = second_ran.clone();
+        let refused = in_flight.spawn_request(mine, Some(4), |_| async move {
+            ran.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(refused, Err(RequestIdInUse));
+        assert!(in_flight
+            .spawn_request(other, Some(4), |_| async {})
+            .is_ok());
+        assert!(in_flight.cancel_request(mine, 4));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            first_cancelled.load(Ordering::SeqCst),
+            "the first one is still the registered one"
+        );
+        assert!(
+            !second_ran.load(Ordering::SeqCst),
+            "the refused one never ran"
+        );
+        in_flight.finish_request(mine, 4);
+        assert!(in_flight.spawn_request(mine, Some(4), |_| async {}).is_ok());
     }
 }

@@ -237,6 +237,8 @@ impl Core {
         if let Some(existing) = registry.get(&dir) {
             return Ok(Some(existing.clone()));
         }
+        // 關機收掉 `cache.db` 之後不再開新的：晚到的寫入拿到錯，**不**把它重新開起來（`Core::check_not_shutting_down`）。
+        self.check_not_shutting_down("cache.db")?;
         let identity = match (self.find_recorded_cache_identity(&dir, server)?, when) {
             (Some(recorded), _) => recorded,
             // 只是要處理既有資料，而沒有可用的庫：**不**為了它建一個空的。

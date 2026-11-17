@@ -54,7 +54,6 @@ impl RpcServer {
     /// 它自己看 shutdown 廣播，這裡等它把手上那一輪做完才回（最多 `STOP_TIMEOUT`；禁止 abort，/docs/design/daemon/task-supervision.md §2.1）。
     /// 每條連線交給 `InFlight`：關機時 `main` 等它們把自己的請求回完、送出關閉通知（`InFlight::finish_connections`）。
     pub async fn run(self) {
-        let mut shutdown = self.handle.shutdown_signal();
         let keeper = tokio::spawn(self.handle.clone().keep_links_open());
         loop {
             tokio::select! {
@@ -67,11 +66,7 @@ impl RpcServer {
                         self.handle.clone(),
                     ));
                 }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break;
-                    }
-                }
+                _ = self.handle.wait_until_shutting_down() => break,
             }
         }
         if tokio::time::timeout(STOP_TIMEOUT, keeper).await.is_err() {
@@ -102,7 +97,6 @@ async fn serve_connection(
     let connection_number = handle.in_flight().next_connection_number();
     let (mut sink, mut source) = websocket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Outgoing>(64);
-    let mut shutdown = handle.shutdown_signal();
 
     let writer = tokio::spawn(async move {
         while let Some(outgoing) = outgoing_rx.recv().await {
@@ -146,18 +140,16 @@ async fn serve_connection(
     loop {
         let message = tokio::select! {
             next = source.next() => next,
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    // 自己的請求先回完（`InFlight::finish_requests` 等不到的會送取消，它們回 `105`），關閉通知排在它們後面。
-                    my_requests.close();
-                    my_requests.wait().await;
-                    let notice = Response::close(None, CloseReason::ShuttingDown, "the daemon is shutting down");
-                    if let Some(bytes) = sealed_or_log(connection.lock().await.seal_close(&notice), "the close notice") {
-                        let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, CloseReason::ShuttingDown)).await;
-                    }
-                    break;
+            // 交握比關機廣播晚完成的連線也看得到（它先看當下的值，`Handle::wait_until_shutting_down`）。
+            _ = handle.wait_until_shutting_down() => {
+                // 自己的請求先回完（`InFlight::finish_requests` 等不到的會送取消，它們回 `105`），關閉通知排在它們後面。
+                my_requests.close();
+                my_requests.wait().await;
+                let notice = Response::close(None, CloseReason::ShuttingDown, "the daemon is shutting down");
+                if let Some(bytes) = sealed_or_log(connection.lock().await.seal_close(&notice), "the close notice") {
+                    let _ = outgoing_tx.send(Outgoing::CloseAfter(bytes, CloseReason::ShuttingDown)).await;
                 }
-                continue;
+                break;
             }
         };
         let Some(Ok(message)) = message else { break };
@@ -240,44 +232,63 @@ async fn serve_connection(
                     continue;
                 }
                 let handle_here = handle.clone();
-                let connection = connection.clone();
-                let outgoing_tx = outgoing_tx.clone();
+                let connection_here = connection.clone();
+                let outgoing_here = outgoing_tx.clone();
                 let in_flight = in_flight.clone();
                 let id = request.id;
                 let tracked = my_requests.clone();
-                handle
-                    .in_flight()
-                    .spawn_request(connection_number, id, move |cancel| {
-                        tracked.track_future(async move {
-                            let handle = handle_here;
-                            let response = match id {
-                                // 請求的 `id` 就是它的 job：core 在這個工作裡發的 `progress` 都帶這個號，推播那邊拿它對回「是這條連線發的」。
-                                // 取消開關也跟著它走（`wbf_core::job::check_cancelled`）。
-                                Some(id) => {
-                                    in_flight
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .insert(id);
-                                    let response =
-                                        wbf_core::job::run_as_job(id, cancel, handle.call(request))
-                                            .await;
-                                    in_flight
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .remove(&id);
-                                    handle.in_flight().finish_request(connection_number, id);
-                                    response
+                let spawned =
+                    handle
+                        .in_flight()
+                        .spawn_request(connection_number, id, move |cancel| {
+                            tracked.track_future(async move {
+                                let handle = handle_here;
+                                let response = match id {
+                                    // 請求的 `id` 就是它的 job：core 在這個工作裡發的 `progress` 都帶這個號，推播那邊拿它對回「是這條連線發的」。
+                                    // 取消開關也跟著它走（`wbf_core::job::check_cancelled`）。
+                                    Some(id) => {
+                                        in_flight
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .insert(id);
+                                        let response = wbf_core::job::run_as_job(
+                                            id,
+                                            cancel,
+                                            handle.call(request),
+                                        )
+                                        .await;
+                                        in_flight
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .remove(&id);
+                                        handle.in_flight().finish_request(connection_number, id);
+                                        response
+                                    }
+                                    None => handle.call(request).await,
+                                };
+                                let sealed = connection_here.lock().await.seal_response(&response);
+                                if let Some(bytes) = sealed_or_log(sealed, "a response") {
+                                    let _ = outgoing_here.send(Outgoing::Frame(bytes)).await;
                                 }
-                                None => handle.call(request).await,
-                            };
-                            let sealed = connection.lock().await.seal_response(&response);
-                            if let Some(bytes) = sealed_or_log(sealed, "a response") {
-                                let _ = outgoing_tx.send(Outgoing::Frame(bytes)).await;
-                            }
-                            // 回應已經排進 writer 了，這時才廣播 shutdown：close 通知一定排在它後面。
-                            handle.begin_shutdown_if_requested();
-                        })
-                    });
+                                // 回應已經排進 writer 了，這時才廣播 shutdown：close 通知一定排在它後面。
+                                handle.begin_shutdown_if_requested();
+                            })
+                        });
+                if spawned.is_err() {
+                    // 這條連線上同一個 `id` 還在跑：這則不做、回 100（PR #87 審查 salvia 🟡1；/docs/design/rpc-specs/rpc-spec.md §5.1）。
+                    let refused = Response::error(
+                        id,
+                        code::BAD_REQUEST,
+                        "this id belongs to a request still running on this connection; use a new id",
+                    );
+                    let sealed = connection.lock().await.seal_response(&refused);
+                    let Some(bytes) = sealed_or_log(sealed, "a refusal") else {
+                        continue;
+                    };
+                    if outgoing_tx.send(Outgoing::Frame(bytes)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     }

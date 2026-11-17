@@ -92,15 +92,21 @@ impl XxxHandle {
 
 `daemon.shutdown`（或 Ctrl+C：Windows 的 console 事件、Unix 的 SIGINT／SIGTERM）之後：
 
-1. 新請求一律 `107`、兩個 accept 迴圈停（已經有）。
-2. 等正在跑的 RPC 請求做完，最多 10 秒；到了還沒完的，送取消開關，再等它們回 `105`。
-3. 看線迴圈停（等它這一輪做完）。
-4. `Core::shutdown()`：每個帳號照登出的順序停背景（收推播兩條、金鑰後台、下載處理端、傳統下載、驗證觀察者），再 `close_all` 每個池。**不**登出、**不**刪任何東西。
-5. 每個 `cache.db` `close()`：佇列寫完、join 寫入執行緒。
-6. 資料平面 graceful shutdown、RPC 連線送完關閉通知。
-7. `main` 回來；runtime 最後才丟（到這時已經沒有在跑的 task）。
+照 `crates/wbf-daemon/src/main.rs` 實際的呼叫順序（PR #87 審查 rumia 🟡3：這裡第一版把第 4、5 步寫在第 3 步前面，跟實作相反）：
 
+1. 新請求一律 `107`（連線**讀到請求的當下**判斷，§4.1）、兩個 accept 迴圈停、看線迴圈停（`RpcServer::run` 等它這一輪做完，最多 5 秒）。
+2. 等正在跑的 RPC 請求做完，最多 10 秒；到了還沒完的，送取消開關，再等它們回 `105`（`InFlight::finish_requests`）。
+3. 每條 RPC 連線等**自己的**請求回完，才送關閉通知；資料平面的連線 graceful shutdown（`InFlight::finish_connections`）。
+4. 背景的一次性工作（開線那一輪）做完（`InFlight::finish_background`）。
+5. `Core::shutdown()`：先立「關機中」的旗子（之後不再建新的池、線、`cache.db`，§4.1），每個帳號照登出的順序停背景（收推播兩條、金鑰後台、下載處理端、傳統下載、驗證觀察者、停止中的），
+   再 `close_all` 每個池，最後每個 `cache.db` `close()`（佇列寫完、join 寫入執行緒）。**不**登出、**不**刪任何東西。
+6. 刪 `daemon.json`。
+7. `main` 回來；runtime 最後才丟（`shutdown_timeout`，正常情況下這時已經沒有在跑的 task）。
+
+- ⭐ **為什麼連線排在 `Core::shutdown` 前面**：資料平面的 GET／PUT 與 RPC 的回應都要靠還活著的 `Core` 才收得完；先關池、關 `cache.db` 再等連線，正在跑的上傳下載會當場壞掉。
 - 每一步有上限（§4 第 3 點），超過就講一聲、往下一步走，**不**卡住關機。
+- ⚠️ **等不到的 task 寫 `cache.db` 是盡力**：一個 task 在上限內沒停下來，它之後才做的寫入碰到的是已經關掉的 `cache.db`，「關機中」的旗子讓它拿到錯、**不**把庫重新開起來；
+  它手上那件就沒寫進去（PR #87 審查 cirno 🟡2）。等不到本身就是 bug 的訊號，會講一聲。
 
 ## 3. 這支不做（理由）
 
@@ -133,6 +139,12 @@ impl XxxHandle {
 - **「關機之後進來的回 `107`」改在連線讀到請求的當下判斷**（`Handle::find_shutdown_refusal`，原本在 `Handle::call` 開頭）：原本是 task 開始跑才問，
   於是一個比 `daemon.shutdown` 早到、但 task 還沒排到的請求也會拿到 `107`——跟 /docs/design/rpc-specs/rpc-spec.md §5 的「之後進來的」不符。
   loopback 的 `shutdown_waits_for_the_requests_still_running` 是這樣抓到的（約四次紅一次）。
+- **「看到關機」一律用 `Handle::wait_until_shutting_down`**（PR #87 審查 rumia 🟡1）：它先看當下的值。只等 `watch` 的 `changed()` 的接收端，
+  在訂閱**之前**就廣播的話永遠等不到——RPC 連線是交握完才訂閱的，交握比廣播晚的那條會掛著，收不到關閉通知、5 秒後被 runtime 切掉。
+- **`Core` 有「關機中」的旗子**（`Core::check_not_shutting_down`，PR #87 審查 rumia 🟡2）：`Core::shutdown` 第一步就立起來，之後建新的池（`pool_of_account`）、開新線（`open_link`，連線前與 hello 之後各看一次）、
+  開新的 `cache.db`（`open_server_cache`）一律回 `ShuttingDown`（RPC 107）。已經存在的照常給，收尾中的 task 還要用。
+  理由：等不到 5 秒就往下走的那一輪看線，原本會在 `Core::shutdown` 收掉之後把池、線、`cache.db` 重新建出來。
+- **同一條連線重用還在跑的請求 `id` 回 `100`**（`InFlight::spawn_request`，PR #87 審查 salvia 🟡1）：原本登記會被蓋掉，之後 `cancel` 停到的是新的、舊的做完時還會刪掉新的登記。
 
 ## 5. 驗收
 
