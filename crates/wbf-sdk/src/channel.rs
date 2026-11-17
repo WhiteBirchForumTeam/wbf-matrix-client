@@ -488,8 +488,16 @@ mod tests {
     async fn a_server_that_never_answers_the_upgrade_times_out() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let connected =
-            super::WsChannel::connect_anonymous(&format!("http://127.0.0.1:{port}")).await;
+        let started = tokio::time::Instant::now();
+        // 外面再包一小時：連線根本沒有逾時的話，這裡會紅（而不是整條測試卡住）。
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            super::WsChannel::connect_anonymous(&format!("http://127.0.0.1:{port}")),
+        )
+        .await
+        .expect("the connect gave up by itself, well within an hour");
+        // 暫停時間下這是虛擬時間：放棄的時間點就是 `LINE_SILENCE`，不是別的數字。
+        assert_eq!(started.elapsed().as_secs(), super::LINE_SILENCE.as_secs());
         match connected {
             Err(super::SdkError::Network(message)) => {
                 assert!(message.contains("no answer"), "{message}")
