@@ -145,6 +145,14 @@ impl XxxHandle {
   開新的 `cache.db`（`open_server_cache`）一律回 `ShuttingDown`（RPC 107）。已經存在的照常給，收尾中的 task 還要用。
   理由：等不到 5 秒就往下走的那一輪看線，原本會在 `Core::shutdown` 收掉之後把池、線、`cache.db` 重新建出來。
 - **同一條連線重用還在跑的請求 `id` 回 `100`**（`InFlight::spawn_request`，PR #87 審查 salvia 🟡1）：原本登記會被蓋掉，之後 `cancel` 停到的是新的、舊的做完時還會刪掉新的登記。
+- **關池每一格有上限**（`LinkPool::close_all_within`，PR #87 審查 oliver／salvia 🔴）：看線那一輪開線時握著那格的寫鎖去連線，連一台 TCP 通了、升級不回的 server 會一直等；
+  `Core::shutdown` 關池要那把寫鎖，原本沒有上限，關機就跟著卡死（`daemon.json` 不刪、再按 Ctrl+C 也沒用）。現在每一格最多等 5 秒，等不到就講一聲、往下一格；
+  那條開線之後連回來會撞到「關機中」，自己丟掉連線。⚠️ **登出照舊用 `close_all`、等到底**：登出要等正在用線的命令做完（維護者 2026-09-21），之後還要刪 store。
+- **WebSocket 連線本身有逾時**（`WsChannel::connect_inner`，同一則審查）：跟「整條線沒回應」同一個數字 `LINE_SILENCE`（60 秒），回 `Network`。
+  這條讓登出那邊同樣的卡法也有上限，而且看線迴圈不會被一台半死的 server 卡住一整輪。
+- **新的背景 task 在表的鎖裡看「關機中」**（`Core::insert_task_unless_shutting_down`、`key_share_parts`，PR #87 審查 oliver／salvia 🟡）：開線途中開始關機時，
+  `init_rooms`／`init_keys` 要等完訂閱的 Ack、追平才把 task 插進表，原本插在 `Core::shutdown` 清空表之後、沒人叫停——金鑰後台會一路跑到 runtime 把它 abort。
+  現在 `Core::shutdown` 先立旗子、再在同一把鎖裡清空，所以插得進去的一定會被清到，插不進去的就叫停、回 `ShuttingDown`；金鑰後台連起都不起。
 
 ## 5. 驗收
 

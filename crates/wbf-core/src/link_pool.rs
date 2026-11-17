@@ -246,6 +246,25 @@ impl LinkPool {
     /// Return:
     ///     usize   關掉了幾條開著的
     pub async fn close_all(&self, reason: &str) -> usize {
+        self.close_slots(reason, None).await
+    }
+
+    /// 關機用的 [`LinkPool::close_all`]：每一格的寫鎖最多等 `limit`，等不到就講一聲、往下一格（PR #87 審查 oliver／salvia 🔴）。
+    /// 握著寫鎖的可能是一個還在連線的開線（連一台不回應的 server），關機不能被它卡住。被放手的那一格：
+    /// 開線的人連回來之後撞到「關機中」（`Core::check_not_shutting_down`）自己丟掉 client；正在用線的命令做完時，那格跟著池一起丟掉、關線。
+    /// ⚠️ 登出**不**用這支：登出要等正在用線的命令做完（維護者 2026-09-21），之後還要刪 store。
+    ///
+    /// Args:
+    ///     reason: example: "the daemon is shutting down"
+    ///     limit: 每一格最多等多久, example: Duration::from_secs(5)
+    /// Return:
+    ///     usize   關掉了幾條開著的（等不到的那幾格不算）
+    pub async fn close_all_within(&self, reason: &str, limit: std::time::Duration) -> usize {
+        self.close_slots(reason, Some(limit)).await
+    }
+
+    /// `close_all` 與 `close_all_within` 共用的那一段：`slot_wait` 是 None 就等到底。
+    async fn close_slots(&self, reason: &str, slot_wait: Option<std::time::Duration>) -> usize {
         let slots: Vec<(LinkRole, Arc<Slot>)> = self
             .slots
             .lock()
@@ -254,7 +273,21 @@ impl LinkPool {
             .collect();
         let mut closed = 0;
         for (role, slot) in slots {
-            let mut guard = slot.line.write().await;
+            let mut guard = match slot_wait {
+                None => slot.line.write().await,
+                Some(limit) => match tokio::time::timeout(limit, slot.line.write()).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        self.events.progress(format!(
+                            "links: the {} line of {} is still being opened or used after {}s; it is left to close on its own",
+                            role.name(),
+                            self.user,
+                            limit.as_secs()
+                        ));
+                        continue;
+                    }
+                },
+            };
             if let Some(client) = guard.take() {
                 self.close_and_wait(role, client).await;
                 closed += 1;

@@ -284,23 +284,29 @@ impl WsChannel {
             })?;
             request.headers_mut().insert(AUTHORIZATION, bearer);
         }
-        let (socket, _response) =
-            tokio_tungstenite::connect_async(request)
+        // 連線（TCP＋升級）也有上限，跟「整條線沒回應」同一個數字（`LINE_SILENCE`）：TCP 通了而升級不回的 server，
+        // 原本會讓開線的人永遠等下去，而它握著池那一格的寫鎖，登出跟著被卡住（PR #87 審查 oliver／salvia 🔴）。
+        let connected =
+            tokio::time::timeout(LINE_SILENCE, tokio_tungstenite::connect_async(request))
                 .await
-                .map_err(|error| match error {
-                    tokio_tungstenite::tungstenite::Error::Http(response)
-                        if response.status() == 401 =>
-                    {
-                        SdkError::Server {
-                            code: "Unauthorized".into(),
-                            message: "websocket upgrade refused: token invalid".into(),
-                            meta: serde_json::Value::Null,
-                            // **不是** wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
-                            code_id: None,
-                        }
-                    }
-                    other => SdkError::Network(format!("websocket connect {url}: {other}")),
+                .map_err(|_| {
+                    SdkError::Network(format!(
+                        "websocket connect {url}: no answer within {}s",
+                        LINE_SILENCE.as_secs()
+                    ))
                 })?;
+        let (socket, _response) = connected.map_err(|error| match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401 => {
+                SdkError::Server {
+                    code: "Unauthorized".into(),
+                    message: "websocket upgrade refused: token invalid".into(),
+                    meta: serde_json::Value::Null,
+                    // **不是** wbf `Error` pack 來的：沒有 `code_id`（`wbf_code()` 因此是 None）。
+                    code_id: None,
+                }
+            }
+            other => SdkError::Network(format!("websocket connect {url}: {other}")),
+        })?;
         let (source, sink) = crate::transport::split_socket(socket);
         Ok(WsChannel {
             link: WsLink::start_with_heartbeat(source, sink, hook, heartbeat),
@@ -474,5 +480,23 @@ mod tests {
         );
         assert!(ws_url("localhost:6167").is_err());
         assert!(ws_url("ftp://x").is_err());
+    }
+
+    /// TCP 收下、升級永遠不回的 server：連線最多等 `LINE_SILENCE` 就回 `Network`，不永遠等下去（PR #87 審查 oliver／salvia 🔴）。
+    /// 時間是暫停的：runtime 閒著時時鐘直接往前撥，不真的等 60 秒。listener 從頭到尾不 accept，核心照樣完成 TCP 交握、收下升級請求。
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_never_answers_the_upgrade_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connected =
+            super::WsChannel::connect_anonymous(&format!("http://127.0.0.1:{port}")).await;
+        match connected {
+            Err(super::SdkError::Network(message)) => {
+                assert!(message.contains("no answer"), "{message}")
+            }
+            Err(other) => panic!("expected the connect timeout, got {other}"),
+            Ok(_) => panic!("expected the connect timeout, got a channel"),
+        }
+        drop(listener);
     }
 }

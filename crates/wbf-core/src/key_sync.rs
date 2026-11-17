@@ -228,11 +228,12 @@ impl Core {
             verify,
         };
         let handle = StoppableTask::spawn(|stop| task.run(subscription, stop));
-        let previous = self
-            .key_syncs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(account.dir.clone(), handle);
+        let previous = self.insert_task_unless_shutting_down(
+            &self.key_syncs,
+            account,
+            "a new key sync task",
+            handle,
+        )?;
         // 舊的（線死了留下來的）：叫停、交給停止中的清單。禁止在這裡等（理由同 `init_rooms`：池握著那格的寫鎖）。
         if let Some(previous) = previous {
             self.retire_task(account, "key sync", previous);
