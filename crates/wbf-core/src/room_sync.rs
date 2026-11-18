@@ -22,7 +22,7 @@ use wbf_sdk::client::{InviteSubscription, RoomSubscription, WbfClient};
 use wbf_sdk::crypto_engine::OlmEngine;
 use wbf_sdk::event_json::messages_from_incoming;
 use wbf_sdk::protocol::{EventSubscribeReply, PushMeta};
-use wbf_sdk::task_stop::{StopSignal, StoppableTask};
+use wbf_sdk::task_stop::StopSignal;
 use wbf_sdk::IncomingEvent;
 
 use crate::accounts::AccountDir;
@@ -130,13 +130,15 @@ impl Core {
             engine,
             invite_rounds: self.invite_rounds.clone(),
         };
-        let handle = StoppableTask::spawn(|stop| task.run(subscription, invites, stop));
-        let previous = self.insert_task_unless_shutting_down(
-            &self.room_syncs,
-            account,
-            "a new room sync task",
-            handle,
-        )?;
+        // 走閘門：關機開始之後不起（`BackgroundGate::spawn`）；在那之前起的，就算來不及放進表，關機最後也會被叫停。
+        let handle = self
+            .background
+            .spawn("room sync", |stop| task.run(subscription, invites, stop))?;
+        let previous = self
+            .room_syncs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(account.dir.clone(), handle);
         // 舊的（線死了留下來的）：叫停、交給停止中的清單，登出與關機等它。禁止在這裡等：這時池握著那格的寫鎖，
         // 舊 task 收攤時也要那把鎖（`close_line`），在這裡等會互相等。
         if let Some(previous) = previous {

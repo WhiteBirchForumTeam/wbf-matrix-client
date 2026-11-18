@@ -74,7 +74,8 @@
   **池裡不存「登出了沒」**：那件事的真相只有兩份——server 的 token 表與本地的 `session.sealed`——池再存一份就是第三份（維護者 2026-09-21：「這個改法有點髯」）。
   登出與一般命令的競賽因此由 server 裁決：`/logout` 之後任何新開的線都拿不到授權（hello 就是第一個 message），之前開的由 `close_all` 收。
 - **destroy**：同上（共用同一段）。**重登入**（session 換了）：封好新 session 之後 `close_all` 舊池（舊 token 沒撤、但那些線不該再用）。**daemon 關**：`Core::shutdown` 先停背景 task、再每個池 `close_all_within`——跟 `close_all` 一樣，只是每一格最多等 5 秒（還在連線的開線握著寫鎖時不卡住關機，/docs/design/daemon/task-supervision.md §2.3、§4.1）。
-  登出照舊 `close_all`、等到底。WebSocket 的連線（TCP＋升級）最多等 `LINE_SILENCE`（60 秒），所以登出那邊的等待也有上限。
+  登出照舊 `close_all`、等到底。那邊的等待怎麼封頂看是誰握著那格：**還在開線的**，WebSocket 的連線（TCP＋升級）最多等 `LINE_SILENCE`（60 秒）；
+  **正在用線的命令**，上限是那個請求自己的回覆逾時（整條線沉默 `LINE_SILENCE`，/docs/design/daemon/link-requests.md §4）（PR #87 審查 salvia／oliver 🟢）。
 - 背景重開見 §3.1：它用的就是這裡的 `acquire`（經 `ensure_open`），**不**另開一套。
 - 📎 重開時**不重探** backend：wbf 帳號的 backend 登入時就記在 session（`session.backend`，/docs/design/daemon/account-session.md §2），跟這條線死沒死無關。登出也不忘掉探測結果（探測以 server 為鍵、不帶 token）；`forget_backend_probe` 沒有正式呼叫點，監督者重連時也**不**重探（維護者 2026-11-10，/docs/design/daemon/task-supervision.md §3）。
 

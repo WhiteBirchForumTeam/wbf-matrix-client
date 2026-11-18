@@ -80,6 +80,8 @@ impl<A: LineRequest> RequestLine<A> {
             wake: Notify::new(),
         });
         let sender_queue = queue.clone();
+        // 子 task，不走閘門：它屬於下載處理端（閘門起的那個），處理端結束前 `RequestLine::stop` 等它（/docs/design/daemon/task-supervision.md §2.4）。
+        #[allow(clippy::disallowed_methods)]
         let sender = StoppableTask::spawn(|stop| {
             send_queued(sender_queue, links, role, silence_timeout, replies, stop)
         });
@@ -211,6 +213,8 @@ async fn send_queued<A: LineRequest>(
                 }
                 let (on_wire, replies) = (on_wire.clone(), replies.clone());
                 let (mut stopping, mut giving_up) = (stop.clone(), give_up_signal.clone());
+                // 子 task，不走閘門：屬於這個發送端，發送端結束前 `join_next` 等完它們（禁止丟掉 `JoinSet`：那會 abort）。
+                #[allow(clippy::disallowed_methods)]
                 waiting.spawn(async move {
                     let waited = tokio::select! {
                         _ = stopping.requested() => return,

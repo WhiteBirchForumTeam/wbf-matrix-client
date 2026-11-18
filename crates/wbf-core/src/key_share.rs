@@ -312,8 +312,6 @@ impl Core {
                 return Ok((handle.inbox.clone(), handle.readiness.clone()));
             }
         }
-        // 在表的鎖裡看「關機中」、看完才起：`Core::shutdown` 清空這張表之後不會再有新的後台（`Core::insert_task_unless_shutting_down` 同一個理由）。
-        self.check_not_shutting_down("a new background key sender")?;
         let (sender, receiver) = unbounded_channel();
         let inbox = KeyShareInbox(sender);
         let readiness = Arc::new(RoomKeyReadiness {
@@ -331,12 +329,16 @@ impl Core {
             #[cfg(test)]
             attempts: attempts.clone(),
         };
+        // 走閘門：關機開始之後不起（`BackgroundGate::spawn`）。
+        let task = self
+            .background
+            .spawn("the background key sender", |stop| task.run(receiver, stop))?;
         shares.insert(
             account.dir.clone(),
             KeyShareHandle {
                 inbox: inbox.clone(),
                 readiness: readiness.clone(),
-                task: StoppableTask::spawn(|stop| task.run(receiver, stop)),
+                task,
                 #[cfg(test)]
                 attempts,
             },

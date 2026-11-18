@@ -17,6 +17,7 @@ use wbf_sdk::chat::MatrixAttachment;
 use wbf_sdk::media;
 use wbf_sdk::media_kind::{MediaKind, Verification};
 use wbf_sdk::media_pool::{MediaPool, PoolWriter, SEGMENT_SIZE};
+use wbf_sdk::task_stop::{StopSignal, StoppableTask};
 use zeroize::Zeroizing;
 
 use crate::accounts::AccountDir;
@@ -52,12 +53,12 @@ pub(crate) struct MatrixTransfer {
     /// 這個 task 照哪一份描述（金鑰、hash、大小）在下載：另一份描述**不**掛上來
     description: MediaDescription,
     pending_name: String,
-    /// 這個 task 的終止接口是 `Command::Cancel`（/docs/design/daemon/task-supervision.md §2.1）
+    /// 這個 task 的終止接口是 `Command::Cancel`（/docs/design/daemon/task-supervision.md §2.1）；它走閘門起，閘門的停止開關也當成 `Cancel`
     commands: mpsc::UnboundedSender<Command>,
     /// 要過這個檔的帳號：進度與結果每個各推一則（/docs/design/media/media-download.md §12.1，維護者 2026-10-07）。跟 task 共用
     listeners: Listeners,
     /// task 本身：登出、關機送 `Cancel` 之後等它自己結束（起了才放進來）
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: Mutex<Option<StoppableTask>>,
 }
 
 /// 要過一個檔的帳號（mxid）。
@@ -234,27 +235,44 @@ impl Core {
         });
         files.insert(key.clone(), transfer.clone());
         drop(files);
-        let task = TransferTask {
-            key,
-            transfers: self.matrix_transfers.clone(),
-            attachment,
-            total,
-            server: session.server,
-            access_token: session.access_token,
-            user: me,
-            listeners,
-            cache,
-            pool,
-            events: self.events.clone(),
-            pending_name,
-            inbox,
-            reads: Vec::new(),
-            waiters: Vec::new(),
+        let transfer_key = key.clone();
+        let transfers = self.matrix_transfers.clone();
+        let events = self.events.clone();
+        let started = self
+            .background
+            .spawn("a standard Matrix download", move |stop| {
+                TransferTask {
+                    key,
+                    transfers,
+                    attachment,
+                    total,
+                    server: session.server,
+                    access_token: session.access_token,
+                    user: me,
+                    listeners,
+                    cache,
+                    pool,
+                    events,
+                    pending_name,
+                    inbox,
+                    stop,
+                    reads: Vec::new(),
+                    waiters: Vec::new(),
+                }
+                .run()
+            });
+        let task = match started {
+            Ok(task) => task,
+            Err(error) => {
+                // 關機開始了：登記表那一項拿掉，之後的 GET 不會掛到一個不會起的 task 上。
+                self.matrix_transfers.files().remove(&transfer_key);
+                return Err(error);
+            }
         };
         *transfer
             .task
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tokio::spawn(task.run()));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
         Ok(downloading)
     }
 
@@ -303,10 +321,7 @@ impl Core {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
             let Some(task) = task else { continue };
-            if tokio::time::timeout(wbf_sdk::task_stop::STOP_TIMEOUT, task)
-                .await
-                .is_err()
-            {
+            if task.stop(wbf_sdk::task_stop::STOP_TIMEOUT).await.is_err() {
                 self.events.progress(format!(
                     "a standard Matrix download of {whose} did not stop within {}s",
                     wbf_sdk::task_stop::STOP_TIMEOUT.as_secs()
@@ -334,6 +349,8 @@ struct TransferTask {
     events: EventSink,
     pending_name: String,
     inbox: mpsc::UnboundedReceiver<Command>,
+    /// 閘門的停止開關（關機最後那次掃）：跟 `Command::Cancel` 走同一條路
+    stop: StopSignal,
     /// 還沒寫到的 GET
     reads: Vec<(u64, PieceReply)>,
     waiters: Vec<Waiter>,
@@ -433,6 +450,9 @@ impl TransferTask {
             self.access_token.clone(),
             self.attachment.clone(),
         );
+        // 子 task，不走閘門：它屬於這個下載 task（閘門起的那個）。正常結束與取消時等它；出錯提早回時收的那頭跟著丟掉，
+        // 它下一次交一段時看到、自己結束（/docs/design/daemon/task-supervision.md §2.4）。
+        #[allow(clippy::disallowed_methods)]
         let fetch = tokio::spawn(async move {
             wbf_sdk::matrix_media::stream_matrix_media(&server, &token, &attachment, &sink).await
         });
@@ -465,6 +485,12 @@ impl TransferTask {
                         return Ok(None);
                     }
                 },
+                // 閘門叫停（關機最後那次掃）：跟 `Cancel` 同一條路。
+                _ = self.stop.requested() => {
+                    pieces.close();
+                    let _ = tokio::time::timeout(wbf_sdk::task_stop::STOP_TIMEOUT, fetch).await;
+                    return Ok(None);
+                }
             }
         }
         let end = fetch.await.map_err(|error| {
@@ -1249,6 +1275,7 @@ mod tests {
             events: core.events.clone(),
             pending_name,
             inbox,
+            stop: wbf_sdk::task_stop::StopSignal::never(),
             reads: Vec::new(),
             waiters: Vec::new(),
         };
