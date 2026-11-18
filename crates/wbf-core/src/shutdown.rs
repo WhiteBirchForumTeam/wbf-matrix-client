@@ -41,8 +41,9 @@ impl BackgroundGate {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 起一個背景 task。關機開始之後拒絕：判斷與登記在同一把鎖裡，跟 [`BackgroundGate::close`] 不會交錯。
-    /// task 自己起的子 task（例：下載處理端的發送端）不走這裡，由父 task 結束前等完。
+    /// 起一個背景 task。關機開始之後拒絕：判斷、`work(stop)`、起、登記都在同一把鎖裡，跟 [`BackgroundGate::close`] 不會交錯。
+    /// task 自己起的子 task（例：下載處理端的發送端）不走這裡，**在 `work` 裡起**：這樣閘門關了它就根本不起（PR #88 審查 cirno／rumia 🔴），父 task 結束前等完。
+    /// ⚠️ `work` 是持鎖時同步呼叫的：只能建 future（與它的子 task），**禁止**在裡面再碰這個閘門（std 的鎖不可重入，會鎖死；PR #88 審查 oliver 🟢）。
     ///
     /// Args:
     ///     what: 給人看的名字, example: "room sync"

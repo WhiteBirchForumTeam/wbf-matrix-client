@@ -409,11 +409,12 @@ pub(crate) struct DownloaderParts {
 
 impl Downloader {
     /// 起處理端與 `Download` 線的發送端。⚠️ 要在 tokio runtime 裡叫。
-    /// 處理端走閘門（`BackgroundGate::spawn`）；發送端是它的子 task，處理端結束前等它。
+    /// 處理端走閘門（`BackgroundGate::spawn`）；發送端是它的子 task，**在閘門的工廠裡**起（閘門持鎖時呼叫），
+    /// 所以「發送端起了」跟「閘門接受了處理端」是同一個不可分割的區間：閘門關了就連發送端都不起（PR #88 審查 cirno／rumia 🔴）。處理端結束前等它。
     ///
     /// Return:
     ///     Ok(Downloader)       起了
-    ///     Err(ShuttingDown)    關機開始了，沒起（先起的發送端跟著被丟掉、自己停）
+    ///     Err(ShuttingDown)    關機開始了，處理端與發送端都沒起
     pub(crate) fn start(
         parts: DownloaderParts,
         gate: &crate::shutdown::BackgroundGate,
@@ -429,30 +430,39 @@ impl Downloader {
             .new_holder(&parts.user, Arc::downgrade(&shared));
         let (seeks, seek_inbox) = mpsc::unbounded_channel();
         let (replies_tx, replies) = mpsc::unbounded_channel();
-        let line = RequestLine::start(
-            parts.links,
-            LinkRole::Download,
-            parts.line_silence,
-            replies_tx,
+        let (handler_shared, handler_holder) = (shared.clone(), holder.clone());
+        let (server_dir, events, claims) = (
+            parts.server_dir.clone(),
+            parts.events.clone(),
+            parts.claims.clone(),
         );
-        let handler = DownloadHandler {
-            shared: shared.clone(),
-            seeks: seek_inbox,
-            replies,
-            line,
-            holder: holder.clone(),
-            server_dir: parts.server_dir.clone(),
-            media_pool: parts.media_pool,
-            cache: parts.cache,
-            events: parts.events.clone(),
-            claims: parts.claims.clone(),
-            open: HashMap::new(),
-            seek_only: HashMap::new(),
-            opening: HashSet::new(),
-            in_flight: HashMap::new(),
-            timers: HashMap::new(),
-        };
-        let task = gate.spawn("the downloader", |stop| handler.run(stop))?;
+        let (links, line_silence, media_pool, cache) = (
+            parts.links,
+            parts.line_silence,
+            parts.media_pool,
+            parts.cache,
+        );
+        let task = gate.spawn("the downloader", move |stop| {
+            let line = RequestLine::start(links, LinkRole::Download, line_silence, replies_tx);
+            DownloadHandler {
+                shared: handler_shared,
+                seeks: seek_inbox,
+                replies,
+                line,
+                holder: handler_holder,
+                server_dir,
+                media_pool,
+                cache,
+                events,
+                claims,
+                open: HashMap::new(),
+                seek_only: HashMap::new(),
+                opening: HashSet::new(),
+                in_flight: HashMap::new(),
+                timers: HashMap::new(),
+            }
+            .run(stop)
+        })?;
         Ok(Downloader {
             shared,
             seeks,
@@ -3514,5 +3524,39 @@ mod tests {
             claims.find_other_downloader(&dir, mxc, &bob).is_none(),
             "a handler that is gone takes no jobs"
         );
+    }
+
+    /// 閘門關了：`Downloader::start` 回 `ShuttingDown`，而且**連發送端都沒起**（PR #88 審查 cirno／rumia 🔴：原本先起發送端、才問閘門）。
+    /// 探針是這個 runtime 裡活著的 task 數：每個 `#[tokio::test]` 有自己的單執行緒 runtime，中間沒有 await，起了任何一支都看得到。
+    /// 只斷言「最後它自己停了」抓不到這個缺口：那支發送端一起來就看到停止、幾微秒就結束。
+    #[tokio::test]
+    async fn a_closed_gate_starts_neither_the_downloader_nor_its_sender() {
+        let dir = scratch("download-gate-closed");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let (cache, me) = core.server_cache_and_me(&account).unwrap();
+        let parts = DownloaderParts {
+            user: me,
+            server_dir: account.server_dir(),
+            links: core.pool_of_account(&account).unwrap(),
+            media_pool: core.pool_of(&account).unwrap(),
+            cache,
+            events: core.events.clone(),
+            claims: core.media_claims.clone(),
+            line_silence: LINE_SILENCE,
+        };
+        core.background.close();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let before = metrics.num_alive_tasks();
+        let started = Downloader::start(parts, &core.background).map(|_| ());
+        assert_eq!(
+            started.map_err(|error| error.kind),
+            Err(CoreErrorKind::ShuttingDown)
+        );
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            before,
+            "no task was spawned, not even the request line's sender"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

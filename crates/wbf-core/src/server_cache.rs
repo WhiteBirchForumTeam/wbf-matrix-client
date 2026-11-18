@@ -11,9 +11,9 @@
 //!
 //! 1. 🚨 **等的時候是同步阻塞**：`upsert_*` 是 blocking 呼叫，卡在 async task 裡就是
 //!    **卡住一條 tokio 工作執行緒**，最壞 5 秒。所以寫入者跑在**自己的 OS 執行緒**上，
-//!    🚫 不在 runtime 的工作執行緒上。
+//!    **不**在 runtime 的工作執行緒上。
 //! 2. 🚨 **順序**：兩批事件誰先 commit 決定水位（`cg_seq`）落在哪。搶鎖的順序 ≠ 收到的順序，
-//!    水位可能**倒退**。一條 queue 從根本解決，🚫 不必在每個寫入點做 `max()` 防禦。
+//!    水位可能**倒退**。一條 queue 從根本解決，**不**必在每個寫入點做 `max()` 防禦。
 //! 3. **成本**：每次操作都 `Cache::open` 要付一次 SQLCipher 導金鑰（PBKDF2）。連線留著重用。
 //!
 //! 📎 而 5 秒真的用完時仍然會失敗 —— 單一寫入者連那個尾巴也一起消掉了。
@@ -33,8 +33,8 @@
 //!   （`daemon.info`）。
 //! - **兩個入口**：[`ServerCache::post`]（丟進去就走）與 [`ServerCache::run`]（等它 commit）。
 //!   ⭐ 規則一句話：**回應的內容取決於這次寫入的，就 `run`**；其餘 `post`。
-//! - **事件由寫入者發**：`post` 帶著「commit 成功之後要發什麼」。🚫 呼叫端自己在 `post` 之後發
-//!   會跑在 commit 前面 —— 前端收到推播去查，查到的是還沒有那筆的資料庫。
+//! - **事件由寫入者發**：`post` 帶著「commit 成功之後要發什麼」。禁止呼叫端自己在 `post` 之後發：
+//!   那會跑在 commit 前面 —— 前端收到推播去查，查到的是還沒有那筆的資料庫。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,8 +47,8 @@ use wbf_sdk::{Key32, SdkError};
 use crate::event::EventSink;
 use crate::{CoreError, CoreEvent};
 
-/// 排隊超過這麼多件就發一則 `Note` 講出來（/docs/design/daemon/daemon-runtime.md §2.2）。🚫 不是上限：一件都不丟，只是要看得見。
-/// 只在「剛好漲到這個數」的那一次發（邊緣觸發）：退回去再漲上來會再發一次，🚫 不會每寫一件就吵一次。
+/// 排隊超過這麼多件就發一則 `Note` 講出來（/docs/design/daemon/daemon-runtime.md §2.2）。**不**是上限：一件都不丟，只是要看得見。
+/// 只在「剛好漲到這個數」的那一次發（邊緣觸發）：退回去再漲上來會再發一次，**不**會每寫一件就吵一次。
 pub(crate) const QUEUE_WARN_AT: usize = 10_000;
 
 /// 寫入 task 收到的一件事。事件與回執都包在閉包裡，所以這個型別不必有泛型。
@@ -62,21 +62,21 @@ pub(crate) struct ServerCache {
     /// 排隊太長時發 `Note` 用（寫入 task 那一份在它自己的執行緒上）。
     events: EventSink,
     /// 讀用的第二條連線。⚠️ WAL 允許一寫多讀，但**開一條連線要付 SQLCipher 導金鑰的成本**，
-    /// 所以留著重用；🚫 不要每個請求開一次。
+    /// 所以留著重用；禁止每個請求開一次。
     /// 📎 用 `Mutex` 是因為 `Connection` 不是 `Sync`：讀因此是排隊的，
     /// 而我們的讀都是短查詢。哪天出現慢查詢再換成連線池。
     reader: Mutex<Cache>,
     /// 寫入執行緒。留著是為了 [`ServerCache::close`] 能**等它真的結束**：
-    /// 🚫 光丟掉送出端不夠 —— 執行緒還在把 queue 裡剩的寫完、還握著寫連線的時候就刪檔，
+    /// 光丟掉送出端**不**夠 —— 執行緒還在把 queue 裡剩的寫完、還握著寫連線的時候就刪檔，
     /// Windows 刪不掉，Linux 刪得掉但它接著寫進一個已經不存在的檔（房間歷史那支的真 server 測試抓到，2026-09-14）。
     writer: std::thread::JoinHandle<()>,
 }
 
 /// 哪個 server dir 起過幾條寫入執行緒。⭐ 只為了讓「一個 server dir 只有一個寫入者」
-/// **驗得出來** —— 🚫 比 `Arc` 的位址證明不了：多開一份再丟掉的話，兩邊拿到的還是
+/// **驗得出來** —— 比 `Arc` 的位址**證明不了**：多開一份再丟掉的話，兩邊拿到的還是
 /// 同一個 `Arc`，位址照樣相等（PR #32 審查 cirno🔴）。
 ///
-/// ⚠️ 按目錄分開記，🚫 不是一個總數：同一個 test binary 裡別的測試也在開快取，
+/// ⚠️ 按目錄分開記，**不**是一個總數：同一個 test binary 裡別的測試也在開快取，
 /// 總數會被他們抬高，那種測試會隨機紅。
 // ⚠️ 這裡的 `Mutex` 寫全名：這個檔導進來的 `Mutex` 是 **tokio** 的（要 `.await`）。
 static WRITERS_STARTED: std::sync::LazyLock<
@@ -103,13 +103,13 @@ impl ServerCache {
     /// Args:
     ///     server_dir: `<data dir>/s/<加密的 server 名>`
     ///     key: vault 的第三把子金鑰
-    ///     identity: 這個庫是哪個 server 的；呼叫端（`Core::open_server_cache`）已經照庫自己記的身分決定好，🚫 不傳使用者打的字串
+    ///     identity: 這個庫是哪個 server 的；呼叫端（`Core::open_server_cache`）已經照庫自己記的身分決定好，**不**傳使用者打的字串
     ///     events: commit 之後發事件用
     /// Return:
     ///     Ok(ServerCache)
     ///     Err(...)   開不了（磁碟、金鑰、目錄）
     ///
-    /// 📎 🚫 **不需要 tokio runtime**：寫入者是一條自己的 OS 執行緒（見模組註解第 1 點），
+    /// 📎 **不需要 tokio runtime**：寫入者是一條自己的 OS 執行緒（見模組註解第 1 點），
     /// 所以 CLI 那種「一個命令一個程序」的用法也照樣能開。
     pub(crate) fn open(
         server_dir: &Path,
@@ -117,7 +117,7 @@ impl ServerCache {
         identity: &CacheIdentity,
         events: EventSink,
     ) -> Result<(ServerCache, OpenOutcome), CoreError> {
-        // 寫連線先開：它可能要建檔或重建，🚫 不要讓兩條連線同時做那件事。
+        // 寫連線先開：它可能要建檔或重建，禁止讓兩條連線同時做那件事。
         let (writing, outcome) = Cache::open(server_dir, key, identity)?;
         let (reading, _) = Cache::open(server_dir, key, identity)?;
 
@@ -125,8 +125,11 @@ impl ServerCache {
         let queued = Arc::new(AtomicUsize::new(0));
         let warn_events = events.clone();
         let counter = queued.clone();
-        // 🚨 自己的 OS 執行緒，🚫 不是 `tokio::spawn`：SQLite 的寫是**同步阻塞**的
+        // 🚨 自己的 OS 執行緒，**不**是 `tokio::spawn`：SQLite 的寫是**同步阻塞**的
         // （拿不到鎖會等，最壞 5 秒），擺在 runtime 的工作執行緒上就是卡住別人的 future。
+        // 不走閘門：它跟著這個 `cache.db` 活，`ServerCache::close` join 它；關機時 `Core::close_all_server_caches` 收全部，
+        // 而關機開始之後 `Core::open_server_cache` 就不再開新的庫（`Core::check_not_shutting_down`），所以也不會再起新的寫入執行緒。
+        #[allow(clippy::disallowed_methods)]
         let writer = std::thread::Builder::new()
             .name("wbf-cache-writer".to_string())
             .spawn(move || {
@@ -164,7 +167,7 @@ impl ServerCache {
     ///
     /// ⭐ 回來之後這個 `cache.db` 就沒有任何 handle 了 —— 刪檔（最後一個帳號登出）要排在這之後。
     /// ⚠️ 收 `self`：只有**唯一的擁有者**關得了（呼叫端先 `Arc::try_unwrap`），
-    /// 🚫 不能在別的請求還拿著它的時候從底下抽掉。
+    /// 禁止在別的請求還拿著它的時候從底下抽掉。
     pub(crate) fn close(self) {
         let ServerCache {
             to_writer,
@@ -184,7 +187,7 @@ impl ServerCache {
         self.queued.load(Ordering::SeqCst)
     }
 
-    /// 讀。⚠️ 拿著這個 guard 的期間別的讀要等，所以🚫 不要抓著它做網路。
+    /// 讀。⚠️ 拿著這個 guard 的期間別的讀要等，所以禁止抓著它做網路。
     pub(crate) async fn read(&self) -> MutexGuard<'_, Cache> {
         self.reader.lock().await
     }
@@ -237,10 +240,10 @@ impl ServerCache {
 
     /// 同步脈絡裡的 `run`：**擋住當前執行緒**直到 commit。
     ///
-    /// ⚠️ 只給「回呼是同步的」那些地方用（`recent` 的每批回呼就是），🚫 async 裡請用 [`Self::run`]。
+    /// ⚠️ 只給「回呼是同步的」那些地方用（`recent` 的每批回呼就是），async 裡請用 [`Self::run`]。
     /// 📎 用 `std` 的 channel 而不是 `oneshot::blocking_recv`：後者在 tokio runtime 裡會 panic。
     /// ⭐ 這跟改成寫入者之前的行為一樣（本來就是在那個 task 上同步寫），
-    /// 🚫 沒有變得更慢，只是換成排在同一條 queue 上。
+    /// **沒有**變得更慢，只是換成排在同一條 queue 上。
     pub(crate) fn run_blocking<F, T>(&self, work: F) -> Result<T, CoreError>
     where
         F: FnOnce(&mut Cache) -> Result<T, SdkError> + Send + 'static,
@@ -268,7 +271,7 @@ impl ServerCache {
             ));
         }
         if self.to_writer.send(job).is_err() {
-            // 寫入 task 沒了（收攤中）。計數要退回去，🚫 不然 `queued` 會永遠掛在那個數字。
+            // 寫入 task 沒了（收攤中）。計數要退回去，不然 `queued` 會永遠掛在那個數字。
             self.queued.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -384,7 +387,7 @@ mod tests {
     ///
     /// ⭐ 事件本體只有一份（`events` 表），「誰看得到」是各自一份（`events_synced_log`）——
     /// 所以兩個帳號寫的是**同一批列**，正是最會撞的情況。
-    /// 🚫 不能出現 `database is locked`，而且兩邊都要讀得到全部。
+    /// **不能**出現 `database is locked`，而且兩邊都要讀得到全部。
     #[tokio::test]
     async fn two_accounts_in_one_room_write_the_same_events_at_once_without_locking() {
         let dir = scratch("race");
@@ -417,7 +420,7 @@ mod tests {
             writer.await.unwrap();
         }
 
-        // 🚫 一則「cache write failed」都不該有。
+        // 一則「cache write failed」都**不**該有。
         while let Ok(event) = complaints.try_recv() {
             if let CoreEvent::Note { text, .. } = event {
                 assert!(!text.contains("failed"), "{text}");

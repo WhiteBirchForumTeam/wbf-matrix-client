@@ -438,10 +438,11 @@ mod tests {
     use crate::error::CoreErrorKind;
     use crate::test_support::{core_with_wbf_account, scratch};
 
-    /// 閘門關了之後，從**已經在跑的工作裡**觸發的新工作也起不來（PR #87 審查 oliver 🟡：驗證觀察者是收金鑰的 task 在追平時起的）。
-    /// 觀察者沒起，「正在看」的清單也不留一筆死項（不然同一個流程之後再也起不來）；金鑰後台一樣起不來。
+    /// 閘門關了之後，驗證觀察者與金鑰後台都起不來（PR #87 審查 oliver 🟡）。這裡直接叫 `VerifyWatch::start`——
+    /// 收金鑰的 task 在追平時呼叫的就是它，走的是同一條拒絕路（PR #88 審查 oliver 🟢：第一版的名字說成「從在跑的工作裡觸發」，比它實際測的多）。
+    /// 觀察者沒起，「正在看」的清單也不留一筆死項（不然同一個流程之後再也起不來）。
     #[tokio::test]
-    async fn once_the_gate_is_closed_work_started_from_inside_running_work_is_refused() {
+    async fn once_the_gate_is_closed_a_verification_watcher_and_a_key_sender_are_refused() {
         let dir = scratch("verify-gate-closed");
         let (core, account) = core_with_wbf_account(&dir).await;
         let watch = VerifyWatch {

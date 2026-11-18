@@ -1000,6 +1000,8 @@ async fn export_blocking<R: std::io::Read + Send + 'static>(
 ) -> Result<u64, CoreError> {
     let to = to.to_path_buf();
     let source = crate::job::ReadUntilCancelled::new(source);
+    // 不是背景工作：阻塞的寫檔搬到阻塞執行緒、這個請求**當場等它**（取消在它讀下一段之前生效），所以不走閘門。
+    #[allow(clippy::disallowed_methods)]
     let exported =
         tokio::task::spawn_blocking(move || media::export_to_path(source, &to, &expected))
             .await

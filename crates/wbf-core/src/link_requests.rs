@@ -213,6 +213,8 @@ async fn send_queued<A: LineRequest>(
                 }
                 let (on_wire, replies) = (on_wire.clone(), replies.clone());
                 let (mut stopping, mut giving_up) = (stop.clone(), give_up_signal.clone());
+                // 子 task，不走閘門：屬於這個發送端，發送端結束前 `join_next` 等完它們（禁止丟掉 `JoinSet`：那會 abort）。
+                #[allow(clippy::disallowed_methods)]
                 waiting.spawn(async move {
                     let waited = tokio::select! {
                         _ = stopping.requested() => return,

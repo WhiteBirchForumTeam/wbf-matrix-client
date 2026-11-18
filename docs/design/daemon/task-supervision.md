@@ -119,8 +119,9 @@ impl XxxHandle {
 | 唯一入口 | core 的背景 task 一律從 `BackgroundGate::spawn`（`crates/wbf-core/src/shutdown.rs`）起。它在**一把鎖**裡看「關了沒」、沒關才起、起了就登記（開關＋`TaskTracker`）。 |
 | 關 | `Core::shutdown` 第一步 `BackgroundGate::close`：同一把鎖，之後 `spawn` 一律回 `ShuttingDown`（RPC 107）。 |
 | 掃 | `Core::shutdown` 照順序收完各張表之後、關池與 `cache.db` 之前，`BackgroundGate::stop_all`：叫停並等閘門起過、還沒結束的**全部**。 |
-| 繞路編譯不過 | `crates/wbf-core/clippy.toml` 把 `tokio::spawn`、`tokio::task::spawn`、`StoppableTask::spawn` 列為禁用，crate 根 `deny(clippy::disallowed_methods)`（測試建置放行）。 |
-| 子 task | task 自己起的子 task（下載處理端的發送端、傳統下載的拉流）不走閘門，就地 `#[allow]` 寫明理由：父 task 結束前等它（或收的那頭丟掉、它自己結束）。 |
+| 繞路編譯不過 | `crates/wbf-core/clippy.toml` 把起 task／執行緒的寫法全列為禁用（`tokio::spawn`、`tokio::task::spawn`、`spawn_blocking`、`Handle::spawn`、`JoinSet::spawn`、`TaskTracker::spawn`、`StoppableTask::spawn`、`std::thread::spawn`、`thread::Builder::spawn`；PR #88 審查 oliver 🟡：第一版只列了三種），crate 根 `deny(clippy::disallowed_methods)`（測試建置放行）。 |
+| 子 task | task 自己起的子 task 不走閘門，**在閘門的工廠（`work`）裡起**：閘門是持鎖時呼叫 `work` 的，所以閘門關了就連子 task 都不起（PR #88 審查 cirno／rumia 🔴：第一版下載處理端先起發送端、才問閘門）。就地 `#[allow]` 寫明理由：父 task 結束前等它（或收的那頭丟掉、它自己結束）。⚠️ `work` 只建 future 與它的子 task，禁止在裡面再碰閘門（不可重入的鎖）。 |
+| 其他就地放行的 | `media.export_to` 的寫檔（`spawn_blocking`，請求當場等它）、`cache.db` 的寫入執行緒（`ServerCache::close` join 它；關機後不再開新的庫，就不再起新的執行緒）。 |
 
 - ⭐ **為什麼要「掃」**：閘門關之前起的 task，可能在各表清空之後才被插進表（開線途中開始關機），也可能根本不在任何表裡。掃的對象是閘門的登記，不是各張表，所以不管呼叫端有沒有記得放進表、記得收，都漏不掉。
 - ⭐ **為什麼要編譯擋**：#87 三輪審查各抓到一個「起工作卻沒看旗子」的地方（池重建 → 表插入 → 驗證觀察者）——同一個洞換了地方出現，靠每個人記得看就會再漏（全域 A4：一個閘門，不是多處各做一次）。
