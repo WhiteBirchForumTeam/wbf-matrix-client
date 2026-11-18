@@ -359,6 +359,29 @@ mod tests {
         drop(orphan);
     }
 
+    /// `Core::shutdown` 真的會掃：閘門起過、沒放進任何表的 task，關機回來時已經結束（不靠呼叫端記得收）。
+    #[tokio::test]
+    async fn core_shutdown_stops_a_task_that_no_table_holds() {
+        let dir = scratch("shutdown-sweeps");
+        let (core, _account) = core_with_wbf_account(&dir).await;
+        let ended = Arc::new(AtomicBool::new(false));
+        let marked = ended.clone();
+        let orphan = core
+            .background
+            .spawn("an orphan", |mut stop| async move {
+                stop.requested().await;
+                marked.store(true, Ordering::SeqCst);
+            })
+            .unwrap();
+        core.shutdown().await;
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the shutdown sweep stopped it"
+        );
+        drop(orphan);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 關機之後「建新的」一律 `ShuttingDown`：池、`cache.db` 都**不**被重新建出來（PR #87 審查 rumia 🟡2）。
     /// 關機之前同一個帳號建得出來（不然這條測的只是「本來就建不出來」）。
     #[tokio::test]
