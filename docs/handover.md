@@ -40,7 +40,10 @@ PR #1–#78 合併（main `6f25d7f`，2026-11-02；#76 房間動作、#78 收邀
 跟房間動作同一張端點表、同一套中轉（參數與結果照 Matrix、本地不存）。真 server 驗過。
 
 **還沒有**：UI；換掉既有的交叉簽章（server 要密碼）、QR 驗證、房間裡驗證「別人這個人」；一般 Matrix 帳號的驗證（一般帳號的備份由 `Client` 做）；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；
-別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；RPC 的 `cancel`（下載有自己的 `media.cancel`）；下載的暫停；daemon 的單發命令列；監督者的 task panic 收攤與重探 backend。
+別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；下載的暫停；daemon 的單發命令列。
+**不做**：接住 task 的 panic、重連時重探 backend（`/docs/design/daemon/task-supervision.md` §3）。
+
+**daemon 穩健性**（2026-11-10）：每個背景 task 有終止接口、關機（`daemon.shutdown`、Ctrl+C）照順序收、等不到講一聲不 abort；RPC 的 `cancel` 是合作式的（`/docs/design/daemon/task-supervision.md`）。
 
 📎 補解寫失敗那批的重試觸發點、CLI 送加密房：2026-10-07 照 §7 第 1 項的預設做了（`/docs/design/keys/e2ee-rpc.md` §3、§6），維護者可以在審查時改。
 
@@ -93,7 +96,7 @@ crates/wbf-sdk/src/
   link.rs                `WsLink`：讀取 task（收→decode→鎖內 classify→鎖外叫鉤子→鎖內 dispatch；連續 8 個壞 frame 就關）＋送出 task（有界佇列 16，單一 task 寫 sink 保序）＋表；
                          `request`／`request_with_policy(AckPolicy)`（預設不重送）／`request_until_silent`（整條線沉默才逾時，`Pong` 不算）／`open_stream`／`subscribe`；
                          `next_seq`／`next_session_number`：**號由線發**（2³¹ 起往上，同一條線上的 client、`RequestLine`、心跳共用，/docs/design/daemon/link-requests.md §7）；關線只有一條路 `shut_down`（讀取 task 結束、送出 task 寫失敗、`close()` 三個入口都走它：
-                         closed → fail_all → 兩個 task 都 abort）；逾時分 `Timeout`（連線活著）與 `Network`（連線沒了）；handle 的 Drop 只拿自己那一代（世代號）。**不**重連
+                         closed → fail_all → 送停止開關，讀取、送出、心跳三個 task 自己結束；`close_and_wait` 等它們，**不** abort）；逾時分 `Timeout`（連線活著）與 `Network`（連線沒了）；handle 的 Drop 只拿自己那一代（世代號）。**不**重連
                          **心跳**（`Heartbeat`，維護者 2026-09-21 照 WireGuard）：每條線自己一個 task，每 24 秒一定送一個 Ping（10-02 起**不再**因為最近有通訊就跳過：server 的 idle 是 60 秒（wbfuwunel #103，2026-10-02）、只看 client 送的）、送出 Ping 之後 10 秒什麼都沒收到才 shut_down（Pong 排在別的回覆後面不算死）；
                          請求號也是線發的；`Heartbeat::OFF`／`start_with_heartbeat` 給測試
 crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
@@ -280,7 +283,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 2. **訊息功能**：~~房間動作（建房、邀請、改權限、置頂…）~~ 2026-10-07 在分支 `feat/room-actions` 做完（/docs/design/rooms/room-actions.md）；~~收邀請~~ 2026-10-14 在分支 `feat/invites` 做完（同一份 §3.3，issue #77）。
    訊息動作（回覆、編輯、收回、表情）2026-11-04 做完：/docs/design/messages/message-actions.md。已讀三層 2026-11-06 做完：/docs/design/messages/read-receipts.md。裝置驗證（連同交叉簽章、wbf 帳號的金鑰備份）
    2026-11-07 做完：/docs/design/keys/cross-signing-and-verification.md。
-3. **daemon 穩健性**：task panic 收攤、重連時重探 backend、`cancel`、進度節流（`/docs/design/daemon/daemon-runtime.md` §10）；
+3. **daemon 穩健性**：~~終止接口、關機、`cancel`~~ 2026-11-10 在分支 `feat/daemon-robustness` 做完（`/docs/design/daemon/task-supervision.md`；接住 panic 與重探 backend 定了不做）。
+   剩進度節流（`/docs/design/daemon/daemon-runtime.md` §5.4 定了先不做）；
    `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
 
 之後（還沒排）：換掉既有的交叉簽章（UIAA）、QR 驗證、登出閘門的第一關接上 wbf 帳號（/docs/design/keys/cross-signing-and-verification.md §9、§12）；「跳到訊息」等 wbfuwunel #64（#43 已關）；~~server 批 3／4 的功能（#50、#55）~~ 2026-11-08 做完（/docs/design/rpc-specs/matrix-relay.md）；

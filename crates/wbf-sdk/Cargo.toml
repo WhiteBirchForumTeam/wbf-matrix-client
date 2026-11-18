@@ -46,3 +46,5 @@ matrix = ["dep:matrix-sdk", "dep:matrix-sdk-crypto", "dep:futures-core"]
 cache = ["dep:rusqlite"]
 
 [dev-dependencies]
+# 暫停時間（`#[tokio::test(start_paused = true)]`）：驗 60 秒的連線逾時不用真的等（`channel.rs` 的測試）。resolver 2 下只進測試建置。
+tokio = { version = "1", features = ["test-util"] }

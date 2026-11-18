@@ -84,6 +84,7 @@ pub mod room_state_edit;
 pub mod secret_storage;
 pub mod seek_store;
 pub mod sessions;
+pub mod task_stop;
 pub mod to_device_state;
 pub mod transport;
 pub mod upload;
