@@ -108,6 +108,25 @@ impl XxxHandle {
 - ⚠️ **等不到的 task 寫 `cache.db` 是盡力**：一個 task 在上限內沒停下來，它之後才做的寫入碰到的是已經關掉的 `cache.db`，「關機中」的旗子讓它拿到錯、**不**把庫重新開起來；
   它手上那件就沒寫進去（PR #87 審查 cirno 🟡2）。等不到本身就是 bug 的訊號，會講一聲。
 
+### 2.4 起：一個閘門（維護者 2026-11-18）
+
+> 維護者：「如果已經關了，應該是原子標記關機中，不應該再收到訊息再起 work，不接受任何收發。」
+
+**關機開始之後不起任何新工作；已經在手上的，做完那一件就停。** 「手上那一件」可能要寫（金鑰後台送完要記「已送」、`cache.db` 把佇列寫完），那是收尾，不是新工作。
+
+| | 怎麼做 |
+|---|---|
+| 唯一入口 | core 的背景 task 一律從 `BackgroundGate::spawn`（`crates/wbf-core/src/shutdown.rs`）起。它在**一把鎖**裡看「關了沒」、沒關才起、起了就登記（開關＋`TaskTracker`）。 |
+| 關 | `Core::shutdown` 第一步 `BackgroundGate::close`：同一把鎖，之後 `spawn` 一律回 `ShuttingDown`（RPC 107）。 |
+| 掃 | `Core::shutdown` 照順序收完各張表之後、關池與 `cache.db` 之前，`BackgroundGate::stop_all`：叫停並等閘門起過、還沒結束的**全部**。 |
+| 繞路編譯不過 | `crates/wbf-core/clippy.toml` 把 `tokio::spawn`、`tokio::task::spawn`、`StoppableTask::spawn` 列為禁用，crate 根 `deny(clippy::disallowed_methods)`（測試建置放行）。 |
+| 子 task | task 自己起的子 task（下載處理端的發送端、傳統下載的拉流）不走閘門，就地 `#[allow]` 寫明理由：父 task 結束前等它（或收的那頭丟掉、它自己結束）。 |
+
+- ⭐ **為什麼要「掃」**：閘門關之前起的 task，可能在各表清空之後才被插進表（開線途中開始關機），也可能根本不在任何表裡。掃的對象是閘門的登記，不是各張表，所以不管呼叫端有沒有記得放進表、記得收，都漏不掉。
+- ⭐ **為什麼要編譯擋**：#87 三輪審查各抓到一個「起工作卻沒看旗子」的地方（池重建 → 表插入 → 驗證觀察者）——同一個洞換了地方出現，靠每個人記得看就會再漏（全域 A4：一個閘門，不是多處各做一次）。
+- 「建資源」（新的池、線、`cache.db`）的那幾道檢查（`Core::check_not_shutting_down`）看的是同一個閘門關了沒，跟「起工作」是兩件事，所以分開兩支。
+- daemon 那層不在這裡：RPC 請求在連線讀到的當下回 107（§4.1），一次性的背景工作與連線由 `InFlight` 收（§2.3）。
+
 ## 3. 這支不做（理由）
 
 | 項目 | 為什麼 |
@@ -150,9 +169,8 @@ impl XxxHandle {
   那條開線之後連回來會撞到「關機中」，自己丟掉連線。⚠️ **登出照舊用 `close_all`、等到底**：登出要等正在用線的命令做完（維護者 2026-09-21），之後還要刪 store。
 - **WebSocket 連線本身有逾時**（`WsChannel::connect_inner`，同一則審查）：跟「整條線沒回應」同一個數字 `LINE_SILENCE`（60 秒），回 `Network`。
   這條讓登出那邊同樣的卡法也有上限，而且看線迴圈不會被一台半死的 server 卡住一整輪。
-- **新的背景 task 在表的鎖裡看「關機中」**（`Core::insert_task_unless_shutting_down`、`key_share_parts`，PR #87 審查 oliver／salvia 🟡）：開線途中開始關機時，
-  `init_rooms`／`init_keys` 要等完訂閱的 Ack、追平才把 task 插進表，原本插在 `Core::shutdown` 清空表之後、沒人叫停——金鑰後台會一路跑到 runtime 把它 abort。
-  現在 `Core::shutdown` 先立旗子、再在同一把鎖裡清空，所以插得進去的一定會被清到，插不進去的就叫停、回 `ShuttingDown`；金鑰後台連起都不起。
+- **開線途中開始關機時才插進表的 task**（PR #87 審查 oliver／salvia 🟡）：`init_rooms`／`init_keys` 要等完訂閱的 Ack、追平才把 task 插進表，原本插在 `Core::shutdown` 清空表之後、沒人叫停。
+  #87 先在每張表的插入點各看一次旗子；三審 oliver 又找到第四個（驗證觀察者）。之後收成 §2.4 的**單一閘門**，各表的那幾道檢查拿掉。
 
 ## 5. 驗收
 

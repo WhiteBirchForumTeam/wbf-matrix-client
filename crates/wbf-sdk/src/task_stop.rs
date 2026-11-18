@@ -74,6 +74,12 @@ impl StopSwitch {
             _keep_open: None,
         }
     }
+
+    /// Return:
+    ///     bool  true ＝ 還有 task 握著這個開關的訊號；false ＝ 握著的都結束了（登記表拿它清掉已結束的）
+    pub fn is_listened_to(&self) -> bool {
+        !self.sender.is_closed()
+    }
 }
 
 /// 等不到 task 自己結束：這是 bug 的訊號，呼叫端講一聲、往下走（**不**再 abort，task 照樣會在它的下一個安全點停）。
@@ -106,6 +112,11 @@ impl StoppableTask {
 
     pub fn request_stop(&self) {
         self.switch.request_stop();
+    }
+
+    /// 這個 task 的開關（複本）：給「關機時叫停全部」的登記表握一份。
+    pub fn switch(&self) -> StopSwitch {
+        self.switch.clone()
     }
 
     /// Return:

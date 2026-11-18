@@ -409,7 +409,15 @@ pub(crate) struct DownloaderParts {
 
 impl Downloader {
     /// 起處理端與 `Download` 線的發送端。⚠️ 要在 tokio runtime 裡叫。
-    pub(crate) fn start(parts: DownloaderParts) -> Downloader {
+    /// 處理端走閘門（`BackgroundGate::spawn`）；發送端是它的子 task，處理端結束前等它。
+    ///
+    /// Return:
+    ///     Ok(Downloader)       起了
+    ///     Err(ShuttingDown)    關機開始了，沒起（先起的發送端跟著被丟掉、自己停）
+    pub(crate) fn start(
+        parts: DownloaderParts,
+        gate: &crate::shutdown::BackgroundGate,
+    ) -> Result<Downloader, CoreError> {
         let shared = Arc::new(Shared {
             user: parts.user.clone(),
             state: Mutex::new(QueueState::default()),
@@ -444,15 +452,16 @@ impl Downloader {
             in_flight: HashMap::new(),
             timers: HashMap::new(),
         };
-        Downloader {
+        let task = gate.spawn("the downloader", |stop| handler.run(stop))?;
+        Ok(Downloader {
             shared,
             seeks,
-            task: Mutex::new(Some(StoppableTask::spawn(|stop| handler.run(stop)))),
+            task: Mutex::new(Some(task)),
             events: parts.events,
             claims: parts.claims,
             server_dir: parts.server_dir,
             holder,
-        }
+        })
     }
 
     /// 交一個「下載這個檔」的 job（/docs/design/media/media-download.md §5.3）：已經在跑、在收件 queue 或在準備就不重複。
@@ -2704,16 +2713,20 @@ mod tests {
         hold_reads(&server).await;
         // 自己起一個線上沉默時限很短的處理端（正式是 60 秒）。
         let (cache, me) = core.server_cache_and_me(&account).unwrap();
-        let downloader = Downloader::start(DownloaderParts {
-            user: me,
-            server_dir: account.server_dir(),
-            links: core.pool_of_account(&account).unwrap(),
-            media_pool: core.pool_of(&account).unwrap(),
-            cache,
-            events: core.events.clone(),
-            claims: core.media_claims.clone(),
-            line_silence: Duration::from_millis(500),
-        });
+        let downloader = Downloader::start(
+            DownloaderParts {
+                user: me,
+                server_dir: account.server_dir(),
+                links: core.pool_of_account(&account).unwrap(),
+                media_pool: core.pool_of(&account).unwrap(),
+                cache,
+                events: core.events.clone(),
+                claims: core.media_claims.clone(),
+                line_silence: Duration::from_millis(500),
+            },
+            &core.background,
+        )
+        .unwrap();
         downloader.enqueue(Arc::new(manifest.clone()), None);
         // 第 0 塊卡在 server：線整段沒回應 → 逾時一次、重送。
         tokio::time::sleep(Duration::from_millis(750)).await;
@@ -3188,16 +3201,20 @@ mod tests {
                 .unwrap(),
         );
         let (cache, _) = core.server_cache_and_me(account).unwrap();
-        let downloader = Downloader::start(DownloaderParts {
-            user: user.to_string(),
-            server_dir: account.server_dir(),
-            links,
-            media_pool: core.pool_of(account).unwrap(),
-            cache,
-            events: core.events.clone(),
-            claims: core.media_claims.clone(),
-            line_silence: LINE_SILENCE,
-        });
+        let downloader = Downloader::start(
+            DownloaderParts {
+                user: user.to_string(),
+                server_dir: account.server_dir(),
+                links,
+                media_pool: core.pool_of(account).unwrap(),
+                cache,
+                events: core.events.clone(),
+                claims: core.media_claims.clone(),
+                line_silence: LINE_SILENCE,
+            },
+            &core.background,
+        )
+        .unwrap();
         (downloader, other_server)
     }
 

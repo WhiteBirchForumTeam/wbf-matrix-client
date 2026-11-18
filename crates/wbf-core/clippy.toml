@@ -1,0 +1,8 @@
+# 只管 wbf-core（clippy 從 crate 目錄往上找第一份 clippy.toml）。
+# 維護者 2026-11-18：背景 task 一律從閘門起（`src/shutdown.rs` 的 `BackgroundGate::spawn`），關機開始之後不起任何新工作。
+# 直接呼叫下面這些就是繞過閘門；crate 根的 `deny(clippy::disallowed_methods)` 讓它編譯不過（測試建置放行）。
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "背景 task 走 BackgroundGate::spawn（/docs/design/daemon/task-supervision.md §2.4）" },
+    { path = "tokio::task::spawn", reason = "背景 task 走 BackgroundGate::spawn（/docs/design/daemon/task-supervision.md §2.4）" },
+    { path = "wbf_sdk::task_stop::StoppableTask::spawn", reason = "背景 task 走 BackgroundGate::spawn（/docs/design/daemon/task-supervision.md §2.4）" },
+]

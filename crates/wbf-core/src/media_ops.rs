@@ -824,7 +824,7 @@ impl Core {
         if let Some(existing) = downloaders.get(&account.dir) {
             return Ok(existing.clone());
         }
-        let downloader = Arc::new(Downloader::start(parts));
+        let downloader = Arc::new(Downloader::start(parts, &self.background)?);
         downloaders.insert(account.dir.clone(), downloader.clone());
         Ok(downloader)
     }

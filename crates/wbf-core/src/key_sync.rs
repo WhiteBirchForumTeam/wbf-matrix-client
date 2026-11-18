@@ -24,7 +24,7 @@ use wbf_sdk::client::{DeviceSubscription, WbfClient};
 use wbf_sdk::crypto_engine::{ImportReport, OlmEngine};
 use wbf_sdk::login::SessionBackend;
 use wbf_sdk::protocol::{CryptoStateMeta, SubscribeReply};
-use wbf_sdk::task_stop::{StopSignal, StoppableTask};
+use wbf_sdk::task_stop::StopSignal;
 
 use crate::accounts::AccountDir;
 use crate::error::{CoreError, CoreErrorKind};
@@ -227,13 +227,15 @@ impl Core {
             background_backup: self.background_backup.clone(),
             verify,
         };
-        let handle = StoppableTask::spawn(|stop| task.run(subscription, stop));
-        let previous = self.insert_task_unless_shutting_down(
-            &self.key_syncs,
-            account,
-            "a new key sync task",
-            handle,
-        )?;
+        // 走閘門（理由同 `init_rooms`）。
+        let handle = self
+            .background
+            .spawn("key sync", |stop| task.run(subscription, stop))?;
+        let previous = self
+            .key_syncs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(account.dir.clone(), handle);
         // 舊的（線死了留下來的）：叫停、交給停止中的清單。禁止在這裡等（理由同 `init_rooms`：池握著那格的寫鎖）。
         if let Some(previous) = previous {
             self.retire_task(account, "key sync", previous);

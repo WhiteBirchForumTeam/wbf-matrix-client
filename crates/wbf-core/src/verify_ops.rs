@@ -10,10 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
 use wbf_sdk::cross_signing::{self, UserTrust};
 use wbf_sdk::crypto_engine::OlmEngine;
-use wbf_sdk::task_stop::{StopSignal, StopSwitch, StopTimedOut};
+use wbf_sdk::task_stop::{StopSignal, StopTimedOut, StoppableTask};
 use wbf_sdk::verification::{self, VerifyStage, VerifyState, WatchedFlow};
 use wbf_sdk::Transport;
 
@@ -21,6 +20,7 @@ use crate::backend_choice::MethodHome;
 use crate::error::CoreError;
 use crate::event::EventSink;
 use crate::link_pool::{LinkPool, LinkRole};
+use crate::shutdown::BackgroundGate;
 use crate::{Core, CoreEvent, Target};
 
 /// 觀察者多久看一次。
@@ -31,49 +31,51 @@ const WATCH_AT_MOST: Duration = Duration::from_secs(15 * 60);
 const REQUERY_AFTER_DONE: Duration = Duration::from_secs(3);
 
 /// 正在看的流程：(這個帳號, 對方, flow id)。同一個流程只起一個觀察者（同一則請求可能被匯兩次：銷毀沒回來時佇列會再給）。
-/// 另外記每個帳號的停止開關與觀察者 task，叫停的人等得到它們。
-#[derive(Debug, Default)]
-pub(crate) struct VerifyWatchers {
-    flows: Mutex<HashSet<(String, String, String)>>,
-    running: Mutex<HashMap<String, AccountWatchers>>,
-}
-
-/// 一個帳號的觀察者：一個停止開關、一串 task。
+/// 另外記每個帳號的觀察者 task，叫停的人等得到它們。觀察者從收金鑰的 task 裡起（不是從 `Core`），所以自己握一份閘門。
 #[derive(Debug)]
-struct AccountWatchers {
-    switch: StopSwitch,
-    tasks: Vec<JoinHandle<()>>,
+pub(crate) struct VerifyWatchers {
+    gate: Arc<BackgroundGate>,
+    flows: Mutex<HashSet<(String, String, String)>>,
+    running: Mutex<HashMap<String, Vec<StoppableTask>>>,
 }
 
 impl VerifyWatchers {
+    pub(crate) fn new(gate: Arc<BackgroundGate>) -> VerifyWatchers {
+        VerifyWatchers {
+            gate,
+            flows: Mutex::default(),
+            running: Mutex::default(),
+        }
+    }
+
     fn flows(&self) -> std::sync::MutexGuard<'_, HashSet<(String, String, String)>> {
         self.flows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<String, AccountWatchers>> {
+    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<StoppableTask>>> {
         self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 起一個觀察者，換到這個帳號的開關；已經結束的順手清掉。
-    fn spawn<F, Fut>(&self, me: &str, work: F)
+    /// 走閘門起一個觀察者、記在這個帳號下；已經結束的順手清掉（PR #87 審查 oliver 🟡：原本直接 `tokio::spawn`，關機清空之後還起得來）。
+    ///
+    /// Return:
+    ///     Ok(())               起了
+    ///     Err(ShuttingDown)    關機開始了，沒起
+    fn spawn<F, Fut>(&self, me: &str, work: F) -> Result<(), CoreError>
     where
         F: FnOnce(StopSignal) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        let task = self.gate.spawn("a verification watcher", work)?;
         let mut running = self.running();
-        let account = running
-            .entry(me.to_string())
-            .or_insert_with(|| AccountWatchers {
-                switch: StopSwitch::new().0,
-                tasks: Vec::new(),
-            });
-        account.tasks.retain(|task| !task.is_finished());
-        let task = tokio::spawn(work(account.switch.signal()));
-        account.tasks.push(task);
+        let tasks = running.entry(me.to_string()).or_default();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+        Ok(())
     }
 
     /// 叫停這個帳號的觀察者、等它們自己結束（登出用）。
@@ -82,24 +84,21 @@ impl VerifyWatchers {
     ///     Ok(())            都停了（含本來就沒有）
     ///     Err(StopTimedOut) 等不到；沒有 abort
     pub(crate) async fn stop_of(&self, me: &str) -> Result<(), StopTimedOut> {
-        let account = self.running().remove(me);
-        match account {
-            Some(account) => stop_and_join(account).await,
+        let tasks = self.running().remove(me);
+        match tasks {
+            Some(tasks) => stop_and_join(tasks).await,
             None => Ok(()),
         }
     }
 
     /// 叫停每個帳號的觀察者、等它們結束（關機用）。
     pub(crate) async fn stop_all(&self) -> Result<(), StopTimedOut> {
-        let accounts: Vec<AccountWatchers> =
-            self.running().drain().map(|(_, account)| account).collect();
-        let mut outcome = Ok(());
-        for account in accounts {
-            if stop_and_join(account).await.is_err() {
-                outcome = Err(StopTimedOut);
-            }
-        }
-        outcome
+        let tasks: Vec<StoppableTask> = self
+            .running()
+            .drain()
+            .flat_map(|(_, tasks)| tasks)
+            .collect();
+        stop_and_join(tasks).await
     }
 
     /// Return:
@@ -125,17 +124,20 @@ impl VerifyWatchers {
     }
 }
 
-/// 叫停一個帳號的觀察者，等全部結束（加起來最多 `STOP_TIMEOUT`）。
-async fn stop_and_join(account: AccountWatchers) -> Result<(), StopTimedOut> {
-    account.switch.request_stop();
-    let all_done = async {
-        for task in account.tasks {
-            let _ = task.await;
+/// 叫停一串觀察者，等全部結束（加起來最多 `STOP_TIMEOUT`：先全部叫停，再一個一個等剩下的時間）。
+async fn stop_and_join(tasks: Vec<StoppableTask>) -> Result<(), StopTimedOut> {
+    for task in &tasks {
+        task.request_stop();
+    }
+    let deadline = tokio::time::Instant::now() + wbf_sdk::task_stop::STOP_TIMEOUT;
+    let mut outcome = Ok(());
+    for task in tasks {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if task.stop(left).await.is_err() {
+            outcome = Err(StopTimedOut);
         }
-    };
-    tokio::time::timeout(wbf_sdk::task_stop::STOP_TIMEOUT, all_done)
-        .await
-        .map_err(|_| StopTimedOut)
+    }
+    outcome
 }
 
 /// 觀察者 task 握著的清單位置：drop 時拿掉。
@@ -170,18 +172,21 @@ impl VerifyWatch {
             return;
         }
         let watch = self.clone();
-        let other_user = other_user.to_string();
-        let flow_id = flow_id.to_string();
-        self.watchers.spawn(&self.me, |stop| async move {
+        let (other, flow) = (other_user.to_string(), flow_id.to_string());
+        let started = self.watchers.spawn(&self.me, |stop| async move {
             // task 不論怎麼結束都把這個流程從清單拿掉，之後才看得到同一個 flow id。
             let _leave_the_list = WatcherSlot {
                 watchers: watch.watchers.clone(),
                 me: watch.me.clone(),
-                other_user: other_user.clone(),
-                flow_id: flow_id.clone(),
+                other_user: other.clone(),
+                flow_id: flow.clone(),
             };
-            watch.run(&other_user, &flow_id, stop).await;
+            watch.run(&other, &flow, stop).await;
         });
+        if started.is_err() {
+            // 關機開始了、沒起：清單那一項由這裡拿掉（task 沒起，就沒有它的 `WatcherSlot` 來拿）。
+            self.watchers.remove(&self.me, other_user, flow_id);
+        }
     }
 
     /// 安全點是「兩次看之間」：發完推播、重查完才看開關（/docs/design/daemon/task-supervision.md §2.1）。
@@ -425,4 +430,46 @@ fn held_flow(watch: &VerifyWatch, user_id: &str, flow_id: &str) -> Result<Watche
             format!("there is no verification {flow_id} with {user_id}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VerifyWatch;
+    use crate::error::CoreErrorKind;
+    use crate::test_support::{core_with_wbf_account, scratch};
+
+    /// 閘門關了之後，從**已經在跑的工作裡**觸發的新工作也起不來（PR #87 審查 oliver 🟡：驗證觀察者是收金鑰的 task 在追平時起的）。
+    /// 觀察者沒起，「正在看」的清單也不留一筆死項（不然同一個流程之後再也起不來）；金鑰後台一樣起不來。
+    #[tokio::test]
+    async fn once_the_gate_is_closed_work_started_from_inside_running_work_is_refused() {
+        let dir = scratch("verify-gate-closed");
+        let (core, account) = core_with_wbf_account(&dir).await;
+        let watch = VerifyWatch {
+            watchers: core.verify_watchers.clone(),
+            engine: core.olm_engine_of(&account).await.unwrap(),
+            pool: core.pool_of_account(&account).unwrap(),
+            events: core.events.clone(),
+            me: core.session_of(&account).unwrap().user_id,
+        };
+        core.background.close();
+
+        watch.start("@someone:localhost", "flow-1");
+        assert!(
+            core.verify_watchers.list_of(&watch.me).is_empty(),
+            "no dead entry left"
+        );
+        assert!(
+            core.verify_watchers.running().is_empty(),
+            "no watcher started"
+        );
+
+        let share = core.key_share_inbox(&account).await.map(|_| ());
+        assert_eq!(
+            share.map_err(|error| error.kind),
+            Err(CoreErrorKind::ShuttingDown)
+        );
+        assert!(core.key_shares.lock().unwrap().is_empty());
+        core.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -9,9 +9,14 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
-        clippy::string_slice
+        clippy::string_slice,
+        // 維護者 2026-11-18：背景 task 一律從閘門起（`shutdown::BackgroundGate::spawn`），關機中不起任何新工作。
+        // 哪些方法算「直接起」寫在 `crates/wbf-core/clippy.toml`；子 task 的那兩處就地標明理由放行。
+        clippy::disallowed_methods
     )
 )]
+// 測試自己起 task 是對的（測試要的就是那個 task）。
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 //! `wbf-core`：常駐狀態。解鎖一次的 vault、資料目錄的佈局、多帳號。
 //!
 //! 這一層在 [`/docs/design/overview/architecture-v2.md`](../../../docs/design/overview/architecture-v2.md) §6 的位置：
@@ -257,8 +262,9 @@ pub struct Core {
     pub(crate) verify_watchers: std::sync::Arc<verify_ops::VerifyWatchers>,
     /// 換線時被換下來、已經叫停、還沒確認結束的 task（`shutdown.rs`）：登出與關機等它們。
     pub(crate) retiring: std::sync::Mutex<Vec<shutdown::RetiringTask>>,
-    /// [`Core::shutdown`] 開始了：之後不再建新的池、不再開新線、不再開新的 `cache.db`（`Core::check_not_shutting_down`）。只會從 false 變 true。
-    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
+    /// 所有背景 task 的唯一入口（`shutdown.rs`）：[`Core::shutdown`] 第一步關上，之後不起任何新的 task、不建新的池、線、`cache.db`；
+    /// 最後叫停並等它起過的全部。驗證觀察者也握一份（它們從收金鑰的 task 裡起）。
+    pub(crate) background: std::sync::Arc<shutdown::BackgroundGate>,
 }
 
 impl Core {
@@ -270,6 +276,7 @@ impl Core {
     /// Args:
     ///     data_dir: example: "<data dir>"
     pub fn open(data_dir: &Path) -> Core {
+        let background = std::sync::Arc::new(shutdown::BackgroundGate::default());
         Core {
             data_dir: data_dir.to_path_buf(),
             vault: OnceLock::new(),
@@ -289,9 +296,11 @@ impl Core {
             ensuring_links: std::sync::atomic::AtomicBool::new(false),
             invite_rounds: std::sync::Arc::default(),
             background_backup: std::sync::Arc::default(),
-            verify_watchers: std::sync::Arc::default(),
+            verify_watchers: std::sync::Arc::new(verify_ops::VerifyWatchers::new(
+                background.clone(),
+            )),
             retiring: std::sync::Mutex::new(Vec::new()),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            background,
         }
     }
 
