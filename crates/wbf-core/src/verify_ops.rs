@@ -2,15 +2,18 @@
 //! 要不要接受、表情對不對，一律由 UI 問使用者（/docs/design/overview/architecture-v2.md §3）；daemon 只照命令做、把變化推出去。
 //!
 //! 每個流程一個觀察者：每 [`WATCH_EVERY`] 看一次狀態，有變就發 `verify.state`，結束（完成、取消、狀態機裡沒了）或過了 [`WATCH_AT_MOST`] 就停。
+//! 同一個帳號的觀察者共用一個停止開關：登出、關機叫停並等它們結束（/docs/design/daemon/task-supervision.md §2.1），不再握著引擎。
 //! 用看的而**不**接上游的 `changes()` 串流：請求轉成比對時要換一條串流接，看狀態的寫法一支函數就說完了，代價只是最多慢 250 毫秒。
 //! 只有 wbf 帳號（一般 Matrix 帳號沒有常駐的同步迴圈，收不到對方的驗證訊息，§0）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
 use wbf_sdk::cross_signing::{self, UserTrust};
 use wbf_sdk::crypto_engine::OlmEngine;
+use wbf_sdk::task_stop::{StopSignal, StopSwitch, StopTimedOut};
 use wbf_sdk::verification::{self, VerifyStage, VerifyState, WatchedFlow};
 use wbf_sdk::Transport;
 
@@ -28,14 +31,75 @@ const WATCH_AT_MOST: Duration = Duration::from_secs(15 * 60);
 const REQUERY_AFTER_DONE: Duration = Duration::from_secs(3);
 
 /// 正在看的流程：(這個帳號, 對方, flow id)。同一個流程只起一個觀察者（同一則請求可能被匯兩次：銷毀沒回來時佇列會再給）。
+/// 另外記每個帳號的停止開關與觀察者 task，叫停的人等得到它們。
 #[derive(Debug, Default)]
-pub(crate) struct VerifyWatchers(Mutex<HashSet<(String, String, String)>>);
+pub(crate) struct VerifyWatchers {
+    flows: Mutex<HashSet<(String, String, String)>>,
+    running: Mutex<HashMap<String, AccountWatchers>>,
+}
+
+/// 一個帳號的觀察者：一個停止開關、一串 task。
+#[derive(Debug)]
+struct AccountWatchers {
+    switch: StopSwitch,
+    tasks: Vec<JoinHandle<()>>,
+}
 
 impl VerifyWatchers {
     fn flows(&self) -> std::sync::MutexGuard<'_, HashSet<(String, String, String)>> {
-        self.0
+        self.flows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn running(&self) -> std::sync::MutexGuard<'_, HashMap<String, AccountWatchers>> {
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 起一個觀察者，換到這個帳號的開關；已經結束的順手清掉。
+    fn spawn<F, Fut>(&self, me: &str, work: F)
+    where
+        F: FnOnce(StopSignal) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut running = self.running();
+        let account = running
+            .entry(me.to_string())
+            .or_insert_with(|| AccountWatchers {
+                switch: StopSwitch::new().0,
+                tasks: Vec::new(),
+            });
+        account.tasks.retain(|task| !task.is_finished());
+        let task = tokio::spawn(work(account.switch.signal()));
+        account.tasks.push(task);
+    }
+
+    /// 叫停這個帳號的觀察者、等它們自己結束（登出用）。
+    ///
+    /// Return:
+    ///     Ok(())            都停了（含本來就沒有）
+    ///     Err(StopTimedOut) 等不到；沒有 abort
+    pub(crate) async fn stop_of(&self, me: &str) -> Result<(), StopTimedOut> {
+        let account = self.running().remove(me);
+        match account {
+            Some(account) => stop_and_join(account).await,
+            None => Ok(()),
+        }
+    }
+
+    /// 叫停每個帳號的觀察者、等它們結束（關機用）。
+    pub(crate) async fn stop_all(&self) -> Result<(), StopTimedOut> {
+        let accounts: Vec<AccountWatchers> =
+            self.running().drain().map(|(_, account)| account).collect();
+        let mut outcome = Ok(());
+        for account in accounts {
+            if stop_and_join(account).await.is_err() {
+                outcome = Err(StopTimedOut);
+            }
+        }
+        outcome
     }
 
     /// Return:
@@ -59,6 +123,19 @@ impl VerifyWatchers {
             .map(|(_, other, flow)| (other.clone(), flow.clone()))
             .collect()
     }
+}
+
+/// 叫停一個帳號的觀察者，等全部結束（加起來最多 `STOP_TIMEOUT`）。
+async fn stop_and_join(account: AccountWatchers) -> Result<(), StopTimedOut> {
+    account.switch.request_stop();
+    let all_done = async {
+        for task in account.tasks {
+            let _ = task.await;
+        }
+    };
+    tokio::time::timeout(wbf_sdk::task_stop::STOP_TIMEOUT, all_done)
+        .await
+        .map_err(|_| StopTimedOut)
 }
 
 /// 觀察者 task 握著的清單位置：drop 時拿掉。
@@ -95,19 +172,20 @@ impl VerifyWatch {
         let watch = self.clone();
         let other_user = other_user.to_string();
         let flow_id = flow_id.to_string();
-        tokio::spawn(async move {
-            // task 不論怎麼結束（含 panic 收掉它）都把這個流程從清單拿掉，之後才看得到同一個 flow id。
+        self.watchers.spawn(&self.me, |stop| async move {
+            // task 不論怎麼結束都把這個流程從清單拿掉，之後才看得到同一個 flow id。
             let _leave_the_list = WatcherSlot {
                 watchers: watch.watchers.clone(),
                 me: watch.me.clone(),
                 other_user: other_user.clone(),
                 flow_id: flow_id.clone(),
             };
-            watch.run(&other_user, &flow_id).await;
+            watch.run(&other_user, &flow_id, stop).await;
         });
     }
 
-    async fn run(&self, other_user: &str, flow_id: &str) {
+    /// 安全點是「兩次看之間」：發完推播、重查完才看開關（/docs/design/daemon/task-supervision.md §2.1）。
+    async fn run(&self, other_user: &str, flow_id: &str, mut stop: StopSignal) {
         // 一開始就握住上游的物件：完成、取消的流程會被上游清出快取，每次重查就看不到最後那一步（`WatchedFlow`）。
         let Ok(Some(mut flow)) = WatchedFlow::find(&self.engine, other_user, flow_id) else {
             // 上游沒收這個請求（太舊、查不到對方那台的金鑰…）：講一聲，沒東西可看。
@@ -126,23 +204,30 @@ impl VerifyWatch {
                     state: Box::new(now.clone()),
                 });
                 if now.state == VerifyStage::Done {
-                    self.requery_after_done(other_user).await;
+                    self.requery_after_done(other_user, &mut stop).await;
                 }
             }
             if matches!(now.state, VerifyStage::Done | VerifyStage::Cancelled) {
                 return;
             }
             last = Some(now);
-            tokio::time::sleep(WATCH_EVERY).await;
+            tokio::select! {
+                _ = stop.requested() => return,
+                _ = tokio::time::sleep(WATCH_EVERY) => {}
+            }
         }
     }
 
     /// 驗證完：重查雙方的金鑰（剛上傳的簽章才回得到 store 裡、`devices.list` 看得到），並送掉狀態機排的請求
     /// （自我驗證完要跟對方要的秘密）。隔一下再查一次：對方的簽章可能晚一步才上傳。
-    async fn requery_after_done(&self, other_user: &str) {
+    /// 叫停了就不再等第二次（登出、關機）。
+    async fn requery_after_done(&self, other_user: &str, stop: &mut StopSignal) {
         let users = [self.me.clone(), other_user.to_string()];
         for wait in [Duration::ZERO, REQUERY_AFTER_DONE] {
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = stop.requested() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
             let Some(mut line) = self.pool.reuse(LinkRole::Keys).await else {
                 self.events.progress(
                     "verification: the keys line is gone; the verified keys are re-read when it reopens",

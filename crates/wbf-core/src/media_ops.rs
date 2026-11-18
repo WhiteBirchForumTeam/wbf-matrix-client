@@ -325,7 +325,7 @@ impl Core {
     }
 
     /// 這台 server 上所有正在下載（或排著）這個 mxc 的都交取消：傳統的 task（登記表以 server 為鍵）與每個帳號已經起了的分塊處理端。
-    /// 全部都交（🚫 第一個取消成功就停）：job 可能轉到別的帳號的處理端去了；🚫 為了取消新起一個處理端。
+    /// 全部都交（**不**是第一個取消成功就停）：job 可能轉到別的帳號的處理端去了；**不**為了取消新起一個處理端。
     ///
     /// Return:
     ///     bool   true ＝至少一個接了取消
@@ -339,7 +339,7 @@ impl Core {
 
     /// 匯出（`media.export_to`，/docs/design/media/media-download.md §7.3）：**解密寫到 `to`**。
     /// 本機原檔能驗（區塊帶 sha256）就從它匯出、整檔比 sha256（原檔在池外、沒有保護）；不能驗、或驗不過，就從池匯出——池裡沒有就排進下載、等它完成。
-    /// 從池匯出🚫 再算 hash、只核大小（維護者 2026-10-06）：每段讀出時過了池的 AEAD，整檔 hash 下載完已經驗過、記在 `verified`。
+    /// 從池匯出**不**再算 hash、只核大小（維護者 2026-10-06）：每段讀出時過了池的 AEAD，整檔 hash 下載完已經驗過、記在 `verified`。
     /// 傳統加密的檔（`kind` 2）沒驗過或驗不過：**照匯**、回 `Unverified`（1501），`data` 是成功時會給的那份（/docs/design/rpc-specs/data-plane.md §8.2 的約定）。
     ///
     /// ⚠️ 這裡明文落地是**使用者要的**（使用者指定了 `to`），不是我們偷偷做的——這條界線要守住（/docs/design/rpc-specs/local-interface.md §8）。
@@ -350,7 +350,7 @@ impl Core {
     /// Return:
     ///     Ok(ExportedMedia)
     ///     Err(Usage)       同 [`Core::media_download`]；或下載被取消
-    ///     Err(Integrity)   檔壞了（池裡那份大小對不上：池檔一起丟掉，下次重下）；`to` 🚫 被動過
+    ///     Err(Integrity)   檔壞了（池裡那份大小對不上：池檔一起丟掉，下次重下）；`to` **沒有**被動過
     ///     Err(Unverified)  寫到 `to` 了，但它是沒驗過或驗不過的傳統加密檔；`data` 是 ExportedMedia
     ///     Err(Io)          寫不了 `to`
     pub async fn export_media_to(
@@ -409,7 +409,7 @@ impl Core {
                 format!("{mxc} is not complete in the pool"),
             )
         })?;
-        // 🚫 再算 hash，只核大小（維護者 2026-10-06，/docs/design/media/media-download.md §7.3）。
+        // **不**再算 hash，只核大小（維護者 2026-10-06，/docs/design/media/media-download.md §7.3）。
         let expected = media::ExpectedContent {
             file_size: reader.plain_len(),
             sha256_hex: None,
@@ -487,7 +487,7 @@ impl Core {
             sha256_hex: Some(sha256_hex),
         };
         match export_blocking(file, to, expected).await {
-            // 這台機器自己傳的原檔、剛剛整檔比過 sha256：可信，🚫 看 `verified`（/docs/design/rpc-specs/data-plane.md §8.2）。
+            // 這台機器自己傳的原檔、剛剛整檔比過 sha256：可信，**不**看 `verified`（/docs/design/rpc-specs/data-plane.md §8.2）。
             Ok(bytes) => Ok(Some(ExportedMedia {
                 bytes,
                 source: "local_source".to_string(),
@@ -509,7 +509,7 @@ impl Core {
 
     /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.export_to` 走 [`Core::export_media_to`]）。
     ///
-    /// 🚫 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
+    /// ⚠️ 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
     /// （/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
     pub async fn download_direct(
         &self,
@@ -678,7 +678,7 @@ impl Core {
     }
 
     /// 本地已經有了就回那個狀態；沒有就排進佇列（/docs/design/media/media-download.md §5.3 的表）。
-    /// 列說的跟這次的區塊對不上（大小、塊大小、sha256）一律回錯、列🚫 動（維護者 2026-10-07）：要換描述先 `media.delete_local`。
+    /// 列說的跟這次的區塊對不上（大小、塊大小、sha256）一律回錯、列**不**動（維護者 2026-10-07）：要換描述先 `media.delete_local`。
     ///
     /// Args:
     ///     waiter: 要等它結束的話給一個；`complete`／`local_source` 時直接丟掉（呼叫者看 `state` 就知道不用等）
@@ -820,7 +820,7 @@ impl Core {
             .downloaders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // 起之前再看一次：兩個同時進來的，後到的用先到的那個（🚫 一個帳號兩個處理端）。
+        // 起之前再看一次：兩個同時進來的，後到的用先到的那個（**沒有**一個帳號兩個處理端）。
         if let Some(existing) = downloaders.get(&account.dir) {
             return Ok(existing.clone());
         }
@@ -829,21 +829,47 @@ impl Core {
         Ok(downloader)
     }
 
-    /// 登出、換 session：收掉這個帳號的下載處理端（開著的檔 fsync 留著，下次接著拉）。
-    pub(crate) fn stop_downloader_of(&self, account: &AccountDir) {
+    /// 登出、換 session、關機：收掉這個帳號的下載處理端（叫停、等它把手上那一包寫完；開著的檔 fsync 留著，下次接著拉）。
+    pub(crate) async fn stop_downloader_of(&self, account: &AccountDir) {
         let removed = self
             .downloaders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&account.dir);
         if let Some(downloader) = removed {
-            downloader.stop();
+            if downloader.stop().await.is_err() {
+                self.events.progress(format!(
+                    "downloads of {} did not stop within {}s; the downloader stops at its next safe point",
+                    account.label(),
+                    wbf_sdk::task_stop::STOP_TIMEOUT.as_secs()
+                ));
+            }
         }
         // 傳統格式的下載也是這個帳號的 token 在拉：一起收（/docs/design/media/media-download.md §12.4）。
-        self.stop_matrix_downloads_of(account);
+        self.stop_matrix_downloads_of(account).await;
     }
 
-    /// 這台 server 上每個帳號已經起了的下載處理端（🚫 為了問而新起一個）。
+    /// 關機：每個帳號的下載處理端與傳統下載都叫停、等它們結束（/docs/design/daemon/task-supervision.md §2.3）。
+    pub(crate) async fn stop_all_downloads(&self) {
+        let downloaders: Vec<(std::path::PathBuf, Arc<Downloader>)> = self
+            .downloaders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect();
+        for (dir, downloader) in downloaders {
+            if downloader.stop().await.is_err() {
+                self.events.progress(format!(
+                    "downloads of {} did not stop within {}s",
+                    dir.display(),
+                    wbf_sdk::task_stop::STOP_TIMEOUT.as_secs()
+                ));
+            }
+        }
+        self.stop_all_matrix_downloads().await;
+    }
+
+    /// 這台 server 上每個帳號已經起了的下載處理端（**不**為了問而新起一個）。
     fn list_downloaders_on(&self, server_dir: &Path) -> Vec<Arc<Downloader>> {
         self.downloaders
             .lock()
@@ -871,7 +897,7 @@ impl Core {
     ///     mxc: example: "mxc://localhost/000000000000004d"
     /// Return:
     ///     Ok(DeletedMedia)   `removed` false ＝ 本地本來就沒有這一列
-    ///     Err(Usage)         取消了，但等不到寫入者放手（例如 GET 還在讀分塊下載中的檔）：什麼都🚫 刪，晚點再來
+    ///     Err(Usage)         取消了，但等不到寫入者放手（例如 GET 還在讀分塊下載中的檔）：什麼都**沒**刪，晚點再來
     ///     Err(...)           DB、檔案動不了
     pub async fn del_local_media(
         &self,
@@ -883,7 +909,7 @@ impl Core {
         let (cache, _me) = self.server_cache_and_me(&account)?;
         let pool = self.pool_of(&account)?;
         let cancelled = self.cancel_downloads_on_server(&account, mxc);
-        // 分塊的取消會把半成品留著續傳（/docs/design/media/media-download.md §5.4）：處理端關掉它之前🚫 刪。
+        // 分塊的取消會把半成品留著續傳（/docs/design/media/media-download.md §5.4）：處理端關掉它之前**不**刪。
         let pending_name = cache.read().await.media_pending_name(mxc)?;
         if let Some(pending_name) = pending_name {
             let started = std::time::Instant::now();
@@ -949,7 +975,7 @@ fn list_names_in_use(
 /// `media.delete_local` 取消下載之後，最多等寫入者放手這麼久（分塊的處理端等在途的那一塊落地才停）。
 pub(crate) const DELETE_WAITS_FOR_WRITER: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 同一個 mxc，這次的描述跟本地那一列說的不是同一個檔（/docs/design/media/media-download.md §5.3、§12.1）：拒這次、列🚫 動。
+/// 同一個 mxc，這次的描述跟本地那一列說的不是同一個檔（/docs/design/media/media-download.md §5.3、§12.1）：拒這次、列**不**動。
 /// 先記下的那份說了算：寫錯或偽造的事件先到，真的那則也會被拒，UI 拿到這個錯就是警告；要換成這次的先 `media.delete_local`（維護者 2026-10-07）。
 pub(crate) fn other_description_error(
     mxc: &str,
@@ -966,18 +992,27 @@ pub(crate) fn other_description_error(
 }
 
 /// `media::export_to_path` 放到 blocking 執行緒上做（大檔會讀很久）。
+/// 取消的安全點是「讀下一段之前」：取消之後讀不下去，`export_to_path` 照它的錯誤路刪掉半成品（/docs/design/daemon/task-supervision.md §2.2）。
 async fn export_blocking<R: std::io::Read + Send + 'static>(
     source: R,
     to: &Path,
     expected: media::ExpectedContent,
 ) -> Result<u64, CoreError> {
     let to = to.to_path_buf();
-    tokio::task::spawn_blocking(move || media::export_to_path(source, &to, &expected))
-        .await
-        .map_err(|error| {
-            CoreError::new(CoreErrorKind::Io, format!("the export task died: {error}"))
-        })?
-        .map_err(CoreError::from)
+    let source = crate::job::ReadUntilCancelled::new(source);
+    let exported =
+        tokio::task::spawn_blocking(move || media::export_to_path(source, &to, &expected))
+            .await
+            .map_err(|error| {
+                CoreError::new(CoreErrorKind::Io, format!("the export task died: {error}"))
+            })?;
+    if exported.is_err() && crate::job::check_cancelled().is_err() {
+        return Err(CoreError::new(
+            CoreErrorKind::Cancelled,
+            "export cancelled; the partial file was removed",
+        ));
+    }
+    exported.map_err(CoreError::from)
 }
 
 fn now_millis() -> i64 {

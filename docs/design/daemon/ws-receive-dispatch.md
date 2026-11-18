@@ -16,7 +16,7 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
 
 ## 1. 三層，各回答一個問題
 
-| 層 | 檔案 | 只回答 | 🚫 不做 |
+| 層 | 檔案 | 只回答 | **不**做 |
 |---|---|---|---|
 | **傳輸** | `transport.rs` | bytes 怎麼進出：`FrameSource`（收一個 binary frame）、`FrameSink`（送一個）。tungstenite 一組實作、記憶體對接一組實作（測試用） | 任何協議邏輯。它不知道什麼是 pack |
 | **會話表** | `sessions.rs` | 這個 pack 是誰的：`SessionKey` → `PackSink`；分派規則；無主計數；鉤子 | 網路。它是純資料結構，同步、可單元測試 |
@@ -47,12 +47,12 @@ server 的實作是 `api/client/wbf/ws.rs` 的接收迴圈與 `service/streams/`
 ```
 
 - 📌 `unmatched` 是**診斷數字不是錯**：呼叫端在 `request_stream` 裡喊停之後（handle 丟掉、表項拿掉），server 那端的會話還在、後面的 Batch 照送，那些就算在這裡。
-  🚫 不要拿它當連線壞了的訊號。
+  禁止拿它當連線壞了的訊號。
 
-- ⭐ **活著的會話擁有它 `id` 底下的每一個 pack**（第 1 條排最前）。所以🚫 不要拿一段活著的會話的 id 去發一問一答的請求（`request`，登記 `Reply`）
+- ⭐ **活著的會話擁有它 `id` 底下的每一個 pack**（第 1 條排最前）。所以禁止拿一段活著的會話的 id 去發一問一答的請求（`request`，登記 `Reply`）
   ——那個回覆會進會話的收件匣，`Reply` 那格永遠等不到。
   `Event/Unsubscribe` 就是刻意用訂閱的 id 送：`send_only`、不登記，Ack 從訂閱的 handle 收（`WbfClient::room_unsubscribe`）。其他命令都發新的會話 id。
-- 🚨 **fail closed**：無主的 pack 🚫 永遠不交給「剛好在等」的人。第 4 條之前沒有任何「猜」。
+- 🚨 **fail closed**：無主的 pack **永遠不**交給「剛好在等」的人。第 4 條之前沒有任何「猜」。
 - 🚨 **登記一定在送出之前**。回覆比登記早到就變無主——server 那邊補窗曾因「先收窗再註冊」漏事件（wbfuwunel 的 /docs/design/wbf-event-push.md §7），同型的錯。
 
 ### 2.2 為什麼是 `Reply { id, seq }` 而不是 `Unordered(seq)`
@@ -81,7 +81,7 @@ pub trait PackSink: Send {
 - 將來有特規的 spec，寫一個新的 `PackSink` 登記進表，讀取 task 與表一個字不改。
 - 每個 handle 帶 `connection_id`（程序內遞增），錯誤與 log 能說「第 3 條連線關了，2 個會話收到錯」。
 - **世代號**：`register` 每次發一個 `SessionGeneration`，handle 的 Drop 只拿自己那一代（`remove_if`）。同一個 id 先後兩段會話（`IS_LAST` 收掉舊的、同 id 再開新的）時，
-  舊 handle 晚一點才 drop 🚫 不能把新會話從表裡拿掉。
+  舊 handle 晚一點才 drop **不能**把新會話從表裡拿掉。
 - 📎 為什麼串流不擋讀取 task：擋住的話同一條線上的訂閱跟著停；而且會有死鎖的形狀——串流的消費端如果在等同一條線上的另一個回覆，
   讀取 task 卡在交付、回覆永遠進不來。讓它失敗比讓它掛著好，而且失敗是可見的。
 
@@ -100,7 +100,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 - `WsLink::start` 帶一個 `ReceivedHook`，預設是空函數。讀取 task 每 decode 一個 pack：**鎖內查表**（`classify`，不動表）→ **放鎖叫鉤子** → **鎖內交付**（`dispatch`）；
   不管有沒有人在等，無主的也叫，`route = Unmatched`。
 - 鉤子在表鎖**之外**（`std::sync::Mutex` 不可重入，鎖內叫鉤子的話鉤子裡摸回同一條 link 就自死鎖）：
-  鉤子裡可以讀同一條 link 的同步狀態（`unmatched()`、`is_closed()`）；🚫 不能在裡面 block 等這條 link 的回覆，那是等自己。
+  鉤子裡可以讀同一條 link 的同步狀態（`unmatched()`、`is_closed()`）；禁止在裡面 block 等這條 link 的回覆，那是等自己。
   `Received.session`／`route` 是查表那一刻的答案；交付在放鎖之後，中間項目被拿掉的話交付會算成無主（差一個 pack、只影響計數）。
 - **要不要送到 UI 是鉤子那頭決定的**（daemon 的推播函數，/docs/design/daemon/link-pool.md §6）。link 只有呼叫，沒有過濾。
 - 鉤子是同步、不可等待的：要做慢事（寫庫、推 RPC）就自己丟進自己的佇列，讀取 task 不被它拖住。
@@ -109,23 +109,23 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 
 ## 5. 送出：一條佇列、一個 task、天然保序
 
-- `WsLink::send(pack)`：encode → 進有界 mpsc（`SEND_QUEUE_PACKS`）→ 送出 task 逐一寫進 sink。佇列滿就等（背壓），🚫 不丟。
+- `WsLink::send(pack)`：encode → 進有界 mpsc（`SEND_QUEUE_PACKS`）→ 送出 task 逐一寫進 sink。佇列滿就等（背壓），**不**丟。
   有序類（`Chunk`）由呼叫端按 `seq` 送，單一 task 寫 sink 所以順序不會亂。
-- 送出 task 寫 sink 失敗 → 直接走 §7 的 `shut_down`（🚫 不是只有自己停：讀取 task 那邊 socket 可能還活著，看不出異狀）；之後每個 `send` 立刻回 `Network`。
+- 送出 task 寫 sink 失敗 → 直接走 §7 的 `shut_down`（**不**是只有自己停：讀取 task 那邊 socket 可能還活著，看不出異狀）；之後每個 `send` 立刻回 `Network`。
 
 ### 5.1 心跳：每條線自己一個，每 24 秒一定跳（維護者 2026-10-02）
 
 `WsLink` 多一個心跳 task（`Heartbeat`）：
 
 - 每 `interval`（**24 秒**）**一定**送一個 `Control/Ping`（`WANT_ACK`，走一般的 `request`，所以 `Pong` 也經會話表、也過鉤子）。
-  🚫 因為「最近有通訊」就跳過：server 的 idle 只看 **client 送了什麼**，一條一直在收推播的訂閱線（`Rooms`、`Keys`）
+  **不**因為「最近有通訊」就跳過：server 的 idle 只看 **client 送了什麼**，一條一直在收推播的訂閱線（`Rooms`、`Keys`）
   在 client 這邊看起來很忙，在 server 那邊卻是一條沒有請求的線。
 - 送出 `Ping` 之後 `reply_timeout`（10 秒）內**什麼都沒收到** → 這條線死了：走 §7 的 `shut_down("heartbeat: …")`。在等的人立刻收到 `Network`，連線池下一次取用會重開。
   還在收別的東西就接著等（維護者 2026-10-02：逾時是沒收到回應）：server 照順序回，`Pong` 會排在已經在途的回覆後面——很多檔一起下載、網路又慢時，它可能晚於 10 秒才到。
 - 為什麼要它：server 的 `wbf_ws_idle_timeout` 是 **60 秒**（wbfuwunel PR #103，2026-10-02），沒請求就關線；而且沒有心跳，
   對方悄悄不在了（NAT 換手、筆電睡醒）要到下一個命令才發現。24 秒在 60 秒之內還能錯過一次，也讓「線死了」在 34 秒內可見。
 - 心跳的請求號跟這條線上其他請求一樣由線發（`WsLink::next_seq`，2³¹ 起往上，/docs/design/daemon/link-requests.md §7）；真的撞到（`register` 回 Usage）就跳過這次。
-- 請求等回覆也看「整條線有沒有在回應」（`WsLink::request_until_silent`，/docs/design/daemon/link-requests.md §4）：那個計數🚫 算 `Pong`——
+- 請求等回覆也看「整條線有沒有在回應」（`WsLink::request_until_silent`，/docs/design/daemon/link-requests.md §4）：那個計數**不**算 `Pong`——
   不然 server 只回心跳、不回請求時，等的人永遠不逾時。心跳自己判死看的是收到任何東西（含別人的 `Pong`）。
 - `Heartbeat::OFF` 不跳（測試別的事情時用）；`start_with_heartbeat` 可以給短的間隔（測試用）。
 - 📎 這不是監督者：它只**發現**線死了，不重連（重開見 /docs/design/daemon/link-pool.md §3、§3.1）。
@@ -156,7 +156,8 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 
 1. `closed` 設 true（之後 `send` 開頭就回 `Network`，不進佇列）。
 2. `SessionTable::fail_all(reason)`：每一項 `fail(Network(reason))`，在等的請求全部回錯、串流與訂閱的 channel 關掉。
-3. 兩個 task 都 abort（自己那個也可以：在下一個 await 點停）；送出 task 停了 sink 就丟了，對方看到的是「對方關了」、不是任何 bytes。
+3. 送停止開關（`Shared::stop`，/docs/design/daemon/task-supervision.md §2.1）：讀取、送出、心跳三個 task 都在等下一件事的 `select!` 裡看到、自己結束，**不** abort；
+   送出 task 停了 sink 就丟了，對方看到的是「對方關了」、不是任何 bytes。要確定它們結束了的（關機、登出）用 `close_and_wait`。
 
 重連不在這層。
 
@@ -170,7 +171,7 @@ pub type ReceivedHook = Arc<dyn Fn(&Received) + Send + Sync>;
 
 ## 9. 拿掉的東西
 
-🚫 不靠 subtype 猜「這是不是推播」、🚫 沒有「推播型且 id 不符就丟」：分類只由會話表做（§2.1）。
+**不**靠 subtype 猜「這是不是推播」、**沒有**「推播型且 id 不符就丟」：分類只由會話表做（§2.1）。
 
 ## 10. 之後
 

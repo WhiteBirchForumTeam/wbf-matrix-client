@@ -3,7 +3,7 @@
 //! ⚠️ 這一家是**會刪檔**的，所以 fail closed 的規矩最多；每一條的理由都在
 //! /docs/design/keys/room-key-backup.md §7 與 /docs/design/storage/local-cache-db.md §5。
 //!
-//! 🚫 這裡的訊息**不提任何命令名字**（`wbf-cli key-backup recovery` 那種）：core 不知道
+//! 這裡的訊息**不提任何命令名字**（`wbf-cli key-backup recovery` 那種）：core 不知道
 //! 呼叫它的是 rpc-cli、Desktop 還是 Android（/docs/design/overview/architecture-v2.md §3）。它只說**條件**，前端照
 //! [`CoreErrorKind::HistoryWouldBeLost`] 補上自己的那句話。
 
@@ -48,7 +48,7 @@ impl Core {
     /// ⚠️ `m/` 不能留：Matrix 的 logout 讓裝置失效，下次 `login` 是新裝置，舊的 crypto
     /// store 會擋登入（"account in the store doesn't match"，2026-09-07 實跑踩到）。
     ///
-    /// 🚫 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（/docs/design/keys/room-key-backup.md §8）。
+    /// 這裡**不刪 `r/` 的 recovery key**：它正是清完之後唯一回得去的路（/docs/design/keys/room-key-backup.md §8）。
     ///
     /// Args:
     ///     user: 完整 mxid, example: "@bob:matrix.org"
@@ -73,7 +73,7 @@ impl Core {
     ///
     /// 順序是這支的重點：
     ///
-    /// 1. **閘門先**（`refuse_if_history_would_be_lost`）：之後每一步都會刪東西，🚫 不准刪到一半才被擋。
+    /// 1. **閘門先**（`refuse_if_history_would_be_lost`）：之後每一步都會刪東西，禁止刪到一半才被擋。
     /// 2. **忘掉鏈趁 `cache.db` 還在時跑**，而且走這台 server 的**唯一寫入者**（`ServerCache`）。
     ///    ⚠️ 以前放在登出之後：最後一個帳號登出時 `cache.db` 已經被刪，忘掉鏈又開出一個**空的**
     ///    （`events_removed: 0`、多留一個殘骸）；而且它用 `cache_of` 另開寫入連線，繞過唯一寫入者。
@@ -84,7 +84,7 @@ impl Core {
     ///    ⭐ 放最後是 fail closed：前面任何一步失敗，目錄還在，`account status` 看得到殘留、重跑 destroy 能接著清。
     ///
     /// ⚠️ 這個命令**連 recovery key 一起摧毀**，所以之後 server 上那份備份永遠解不開。
-    /// 🚫 呼叫端要先問過使用者：core 不做「你確定嗎」，那是前端的事（/docs/design/overview/architecture-v2.md §3）。
+    /// 呼叫端要先問過使用者：core **不**做「你確定嗎」，那是前端的事（/docs/design/overview/architecture-v2.md §3）。
     pub async fn destroy_account(
         &self,
         user: &str,
@@ -93,13 +93,13 @@ impl Core {
         server_backup: bool,
     ) -> Result<DestroyResult, CoreError> {
         // 🚨 **全程**握著帳號生命週期鎖（`account_lock`，PR #40 審查 rumia🔴 第三輪、維護者 2026-09-15）：
-        // 這期間登入被拒，所以「最後一個帳號」的判斷到刪完都成立 —— 🚫 不靠「再掃一次目錄」當同步。
+        // 這期間登入被拒，所以「最後一個帳號」的判斷到刪完都成立 —— **不**靠「再掃一次目錄」當同步。
         let _lifecycle = crate::account_lock::lock_account_lifecycle(&self.data_dir)?;
         // 維護者 2026-09-10：會刪檔的命令，路徑**當場刷新一次**再比對——帳號目錄與
         // recovery key 都從同一份快照來，中間不再掃第二次（掃兩次就有兩個不同時刻的答案）。
         let map = self.refresh_data_dir_map()?;
         let account = self.find_account_by_full_mxid(user, server)?;
-        // 🚫 在 logout 之前先問：`recovery::del` 只認精確的 mxid，而使用者打的那串大小寫
+        // ⚠️ 在 logout 之前先問：`recovery::del` 只認精確的 mxid，而使用者打的那串大小寫
         // 可能跟封存時用的權威 mxid 不同（PR #19 審查 rumia🟡1／salvia）。
         let kept_recovery_key_user_id = map.find_recovery_key_user_id(user)?.map(str::to_string);
         let server = self.server_of(&account, server)?;
@@ -126,7 +126,7 @@ impl Core {
         let described = self.log_out_account_past_the_gate(&account).await?;
 
         // ⚠️ destroy 的語意是「什麼都不留」，所以連 recovery key 也摧毀。
-        // 🚫 `log_out` 不做這件事——它留著它正是為了讓歷史救得回來。
+        // `log_out` **不**做這件事——它留著它正是為了讓歷史救得回來。
         let recovery_key_destroyed = match &kept_recovery_key_user_id {
             Some(kept) => {
                 recovery::del(&self.data_dir, self.vault()?, kept)?;
@@ -153,8 +153,8 @@ impl Core {
 
     /// 忘掉鏈（/docs/design/storage/local-cache-db.md §5），走這台 server 的**唯一寫入者**。
     ///
-    /// 🚫 `cache.db` 不在就不開：開了等於為了「忘掉」建一個空的出來（#25 同一支的 bug）。
-    /// 🚫 不拿使用者打的字串去查 `users` 列：那裡存的是權威 mxid，精確比對差一個大小寫
+    /// `cache.db` 不在就**不**開：開了等於為了「忘掉」建一個空的出來（#25 同一支的 bug）。
+    /// **不**拿使用者打的字串去查 `users` 列：那裡存的是權威 mxid，精確比對差一個大小寫
     /// 就查不到，然後 destroy 會回 `events_removed: 0`，看起來像「本來就沒有」，其實是
     /// 全部殘留（PR #21 審查 salvia🔴——跟 recovery key 那條是同一個形狀）。
     ///
@@ -188,10 +188,10 @@ impl Core {
     /// destroy 的最後一步：刪帳號目錄；那台 server 除了它沒有別的帳號，就整個 server 目錄。
     ///
     /// 🚨 會刪整棵目錄，所以路徑**正面認得**才動：必須正好是 `<data dir>/s/<x>/a/<y>`。
-    /// 形狀不對就拒絕（回 Usage），🚫 不猜、不往上刪。
+    /// 形狀不對就拒絕（回 Usage），**不**猜、不往上刪。
     ///
     /// 🚨 **帳號目錄永遠最後刪**（PR #40 審查 rumia🔴）：帳號目錄一旦不在，`find_account_by_full_mxid` 就找不到它，
-    /// 重跑 destroy 也清不了剩下的東西。所以「最後一個帳號」這條先判斷（🚫 不先刪帳號目錄再看 `a/` 空了沒）、
+    /// 重跑 destroy 也清不了剩下的東西。所以「最後一個帳號」這條先判斷（**不**先刪帳號目錄再看 `a/` 空了沒）、
     /// 先關快取，再刪 server 目錄裡的其他東西，最後才刪帳號目錄 —— 前面任何一步失敗，帳號都還在。
     ///
     /// Return:
@@ -239,7 +239,7 @@ impl Core {
 
     /// 這個帳號在哪個 server：**它自己封著的 session 優先**；已經登出（沒有 session）才用 `--server`。
     ///
-    /// 🚫 `--server` 🚫 不蓋過 session：它只是用來**找帳號目錄**的（照正規化的 host 比對），
+    /// `--server` **不**蓋過 session：它只是用來**找帳號目錄**的（照正規化的 host 比對），
     /// 拼法可以跟 session 裡記的不同，拿它去開 `cache.db` 就會被當成別台 server 的庫。
     ///
     /// Args:
@@ -295,15 +295,14 @@ impl Core {
                 let _logging_out = self.logging_out_guard(account);
                 // 不成：`?` 原樣回錯、guard 解封，連線照常收新封包（維護者 2026-09-21：no-op）。
                 logout(&session).await?;
-                // 成了：先收掉跟上游的 task（它握著訂閱線的 handle），再關線——順序反了 task 會看到 Network 才結束，一樣收得掉，但這樣乾淨。
-                self.stop_room_sync_of(account).await;
-                self.stop_key_sync_of(account).await;
-                self.stop_room_key_share_of(account).await;
+                // 成了：先收掉背景 task（叫停、等它們自己結束，/docs/design/daemon/task-supervision.md §2.1），再關線——
+                // 順序反了 task 會看到 Network 才結束，一樣收得掉，但這樣乾淨。
+                self.stop_background_of(account).await;
                 // 說出口的退出（wbfuwunel 的 /docs/design/wbf-to-device.md §4）：線還開著就退訂裝置佇列；失敗只講一聲。
                 self.unsubscribe_keys_of(account).await;
                 // token 在 server 那邊已經沒了，這個帳號的線全關、釋放資源（/docs/design/daemon/link-pool.md §3）。
                 // `close_all` 等正在用線的命令做完才收那條；遠端先關了的只是丟掉，不二次跳錯。
-                // 🚫 不在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed；「登出中」是帳號的狀態。
+                // **不**在池裡另存一份「登出了沒」：那件事的真相是 server 的 token 表與本地的 session.sealed；「登出中」是帳號的狀態。
                 self.close_links(account, "logged out").await;
                 vault.delete_sealed_session(&account.session_path())?;
             }
@@ -353,7 +352,7 @@ impl Core {
     ///    ⚠️ 第 1 關只說得出「SSSS 設好了」——跑過產生 recovery key、印出來、沒抄就關掉
     ///    終端的人也會通過第 1 關。第 2 關才確認得了「刪完之後這裡還有東西打得開那份備份」。
     ///
-    /// 🚫 第 2 關**不問使用者**：key 產生的當下就封進 `r/` 了，而那個目錄 logout 不碰。
+    /// 第 2 關**不問使用者**：key 產生的當下就封進 `r/` 了，而那個目錄 logout 不碰。
     async fn refuse_if_history_would_be_lost(
         &self,
         account: &AccountDir,
@@ -399,7 +398,7 @@ impl Core {
                  Create a recovery key first",
             ));
         }
-        // 🚫 不用使用者打的字串：封存時用的是 server 的權威 mxid。解不出 session 就是問不出
+        // **不**用使用者打的字串：封存時用的是 server 的權威 mxid。解不出 session 就是問不出
         // 這個帳號是誰——擋下來，不要拿佔位值去查（查不到會變成「沒保管」，方向剛好相反）。
         let Some(session) = self.vault()?.unseal_session(&account.session_path())? else {
             return Err(refusal(
@@ -421,7 +420,7 @@ impl Core {
 
     /// 用**這個帳號自己的** session 與 store 開一個 backend（閘門要拿它問 server）。
     ///
-    /// ⚠️ 🚫 不要改成「current 帳號」那條路：`account del <user>` 的目標是 `<user>`，
+    /// ⚠️ 禁止改成「current 帳號」那條路：`account del <user>` 的目標是 `<user>`，
     /// 用 current 的狀態判斷會放行不該放行的刪除（PR #19 審查 rumia／salvia 🔴1：
     /// current 有 recovery key 就把別的帳號的金鑰刪了）。
     ///
@@ -442,7 +441,7 @@ impl Core {
 
 /// 這個帳號的歷史**救得回來嗎**——只有正面認得才算數（/docs/design/keys/room-key-backup.md §7）。
 ///
-/// 🚫 不寫成「沒有 recovery key 才擋」：上游哪天多一種 `RecoveryState`，那種寫法會默默放行。
+/// 禁止寫成「沒有 recovery key 才擋」：上游哪天多一種 `RecoveryState`，那種寫法會默默放行。
 fn is_history_recoverable(status: Option<&BackupStatus>) -> bool {
     status.is_some_and(|status| status.exists_on_server && status.recovery_enabled)
 }
@@ -475,7 +474,7 @@ fn is_account_dir_of(data_dir: &std::path::Path, account_dir: &std::path::Path) 
 /// `a/` 底下除了這個帳號，還有沒有別的東西。
 ///
 /// Return:
-///     bool  true ＝ 還有（或讀不出來 —— 🚫 不因為一個讀取錯誤就刪掉整台 server 的共用資料）；
+///     bool  true ＝ 還有（或讀不出來 —— **不**因為一個讀取錯誤就刪掉整台 server 的共用資料）；
 ///           false ＝ 只剩這個帳號、或 `a/` 根本不在
 fn has_another_account_entry(
     accounts_dir: &std::path::Path,
@@ -530,14 +529,14 @@ struct ServerDirRemoval {
 /// 0. 放下 `to_be_deleted.lock`（維護者 2026-09-15）：從這一刻起到整個目錄刪完，登入這台 server 一律被拒 ——
 ///    程序中途當掉也一樣。放不下就回 Err，什麼都沒刪。
 /// 1. 刪 `a/` 與 `to_be_deleted.lock` 以外的東西（`cache.db`、媒體池…）—— 失敗就回 Err，帳號沒動。
-/// 2. **再看一次** `a/` 底下是不是只剩這個帳號：有別的，就只刪這個帳號的目錄、收回 `to_be_deleted.lock`、🚫 不收 server 目錄。
-///    📎 呼叫端握著 `account.lock`，正常流程裡不會有新帳號冒出來；這一步是防線，🚫 不是同步。
+/// 2. **再看一次** `a/` 底下是不是只剩這個帳號：有別的，就只刪這個帳號的目錄、收回 `to_be_deleted.lock`、**不**收 server 目錄。
+///    📎 呼叫端握著 `account.lock`，正常流程裡不會有新帳號冒出來；這一步是防線，**不**是同步。
 /// 3. 刪帳號目錄 —— 失敗就回 Err（`remove_dir_all` 最後一步才刪目錄本身，所以失敗時目錄還在）。
 /// 4. 收尾：空的 `a/` → server 目錄**改名**、名字最前面加 🗑️（`s/🗑️<b58>_<b58>`） → 刪裡面的 `to_be_deleted.lock` → 刪那個空目錄。
-///    🚫 **不回 Err**：這時帳號已經不在，回 Err 等於叫人重跑卻找不到它；只記在 `left_behind`。
+///    **不回 Err**：這時帳號已經不在，回 Err 等於叫人重跑卻找不到它；只記在 `left_behind`。
 ///    ⭐ `to_be_deleted.lock` 排在 `a/` 與改名之後：改名前任何一步沒成，標記都還在原本的位置，登入照樣被擋；
 ///    改名之後原本的路徑就沒了，登入建的是新目錄，而留下的 `🗑️…` 掃描時一律跳過（維護者 2026-09-15）。
-///    改名的目標已經存在（上一次也停在這裡）就停下、🚫 不覆蓋，交給人手動收。
+///    改名的目標已經存在（上一次也停在這裡）就停下、**不**覆蓋，交給人手動收。
 ///
 /// Args:
 ///     server_dir: example: "<data dir>/s/<b58>_<b58>"
@@ -657,7 +656,7 @@ fn remove_error(path: &std::path::Path, error: std::io::Error) -> CoreError {
 
 /// 閘門擋下來時的訊息：`why` 是這一次為什麼擋，後面接一律相同的出路。
 ///
-/// 🚫 **不提命令名字**：core 不知道呼叫它的是誰（/docs/design/overview/architecture-v2.md §3）。前端看到
+/// **不提命令名字**：core 不知道呼叫它的是誰（/docs/design/overview/architecture-v2.md §3）。前端看到
 /// [`CoreErrorKind::HistoryWouldBeLost`] 再補上自己那句 `wbf-cli …`。
 fn refusal(account: &AccountDir, why: &str) -> CoreError {
     CoreError::new(
@@ -712,7 +711,7 @@ mod tests {
     /// 🚨 #25 的三件事一起驗：這台 server **最後一個**帳號被 destroy ——
     ///
     /// - 忘掉鏈真的清到東西（以前在登出刪掉 cache.db 之後才跑，回 0）；
-    /// - 🚫 沒有為了忘掉而重建一個空的 cache.db；
+    /// - **沒有**為了忘掉而重建一個空的 cache.db；
     /// - 帳號目錄與整個 server 目錄都刪掉，`account status` 列不出它。
     #[tokio::test]
     async fn destroying_the_last_account_forgets_first_and_leaves_nothing() {
@@ -721,7 +720,7 @@ mod tests {
         let server_dir = alice.server_dir();
         seed_events(&core, &alice, "@alice:localhost", "$a");
 
-        // 🚫 不封 session：登出不必連網路，閘門也跳過（已登出的帳號）。
+        // **不**封 session：登出不必連網路，閘門也跳過（已登出的帳號）。
         let result = core
             .destroy_account("@ALICE:LocalHost", Some(SERVER), true, false)
             .await
@@ -743,7 +742,7 @@ mod tests {
     }
 
     /// 🚨 同 server 還有別的帳號：只刪這個帳號的目錄，server 目錄與 cache.db 留著；
-    /// 而且忘掉鏈走**唯一寫入者**，🚫 不另開 `cache_of` 連線（daemon 裡一台 server 只准一個寫入者，#32）。
+    /// 而且忘掉鏈走**唯一寫入者**，**不**另開 `cache_of` 連線（daemon 裡一台 server 只准一個寫入者，#32）。
     #[tokio::test]
     async fn destroying_one_account_keeps_the_server_and_goes_through_the_one_writer() {
         let (dir, core) = scratch_unlocked("one-of-two");
@@ -785,7 +784,7 @@ mod tests {
     }
 
     /// 🚨 `--server` 拼法跟庫裡記的不同（scheme 大寫、結尾多一個 `/`）：目錄照正規化的 host 找得到，
-    /// 但 🚫 不准拿那串字去開 `cache.db`——那會被當成別台 server 的庫整份重建，bob 的快取跟著沒了。
+    /// 但禁止拿那串字去開 `cache.db`——那會被當成別台 server 的庫整份重建，bob 的快取跟著沒了。
     /// 快取先關掉，模擬 CLI 那種每個命令一個程序、還沒開過這份庫的情形（daemon 裡已經開著的會直接沿用，碰不到）。
     #[tokio::test]
     async fn a_destroy_with_the_server_spelled_differently_keeps_the_other_accounts_cache() {
@@ -826,7 +825,7 @@ mod tests {
     }
 
     /// 🚨 一般開庫那條路也一樣（PR #66 審查 cirno 🟡1）：同一台 server 的第二個帳號用別的拼法（沒有 scheme）第一次開庫，
-    /// 🚫 不准把第一個帳號寫下的那份當成別台 server 的整份重建；唯一寫入者與繞過它的連線（`cache_of`）都照庫記的身分開。
+    /// 禁止把第一個帳號寫下的那份當成別台 server 的整份重建；唯一寫入者與繞過它的連線（`cache_of`）都照庫記的身分開。
     #[tokio::test]
     async fn opening_the_cache_with_another_spelling_of_the_same_server_keeps_it() {
         let (dir, core) = scratch_unlocked("open-spelled-differently");
@@ -862,7 +861,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 既有的庫記的 host 跟要處理的 server 不同：拒絕，🚫 不重建、🚫 不動它（fail closed）。
+    /// 既有的庫記的 host 跟要處理的 server 不同：拒絕，**不**重建、**不**動它（fail closed）。
     #[tokio::test]
     async fn processing_an_existing_cache_of_another_host_is_refused_and_leaves_it_alone() {
         let (dir, core) = scratch_unlocked("other-host");
@@ -949,7 +948,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 🚨 帳號目錄**刪掉之後**的收尾失敗 🚫 不回 Err（PR #40 審查 rumia🔴 第二輪）：回 Err 等於叫呼叫端重跑，
+    /// 🚨 帳號目錄**刪掉之後**的收尾失敗**不**回 Err（PR #40 審查 rumia🔴 第二輪）：回 Err 等於叫呼叫端重跑，
     /// 但重跑已經找不到帳號。留下的只有空目錄，記在 `left_behind`。
     #[test]
     fn a_failure_after_the_account_dir_is_gone_is_reported_but_not_an_error() {
@@ -1051,7 +1050,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 改名的目標已經在（上一次也停在這裡）：🚫 不覆蓋，停下；`to_be_deleted.lock` 留著、登入照樣被擋。
+    /// 改名的目標已經在（上一次也停在這裡）：**不**覆蓋，停下；`to_be_deleted.lock` 留著、登入照樣被擋。
     #[test]
     fn an_earlier_to_be_deleted_dir_stops_the_rename_and_keeps_the_marker() {
         let (root, server_dir, account_dir) = server_dir_fixture("rename-taken");
@@ -1104,7 +1103,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 🚨 清到一半有人建了新帳號（PR #40 審查 rumia🟡）：只刪這個帳號的目錄，🚫 不收 server 目錄、不碰新帳號。
+    /// 🚨 清到一半有人建了新帳號（PR #40 審查 rumia🟡）：只刪這個帳號的目錄，**不**收 server 目錄、不碰新帳號。
     #[test]
     fn an_account_created_during_cleanup_is_left_alone() {
         let (root, server_dir, account_dir) = server_dir_fixture("race");
@@ -1127,7 +1126,7 @@ mod tests {
         assert!(!removal.server_dir_removed);
         assert!(!account_dir.exists());
         assert!(newcomer.exists(), "🚫 不碰中途新建的帳號");
-        // ⭐ 刪帳號目錄之前那次再檢查看到了它：這是正常結果，🚫 不是「收不掉」的警告。
+        // ⭐ 刪帳號目錄之前那次再檢查看到了它：這是正常結果，**不**是「收不掉」的警告。
         // （沒有那次檢查也不會刪到新帳號 —— `remove_dir` 會拒絕非空的 a/ —— 但會變成 left_behind。）
         assert!(removal.left_behind.is_none(), "{:?}", removal.left_behind);
         let _ = std::fs::remove_dir_all(&root);
@@ -1160,7 +1159,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ⭐ `cache.db` 不在就不開：跟「在不在」同一把鎖判斷（PR #40 審查 rumia🟡），🚫 不建一個空的。
+    /// ⭐ `cache.db` 不在就不開：跟「在不在」同一把鎖判斷（PR #40 審查 rumia🟡），**不**建一個空的。
     #[test]
     fn a_missing_cache_db_is_not_created_just_to_look_inside() {
         let (dir, core) = scratch_unlocked("if-present");
@@ -1291,7 +1290,7 @@ mod tests {
             recovery_state: "Enabled".into(),
         };
         assert!(is_history_recoverable(Some(&status(true, true))));
-        // 🚫 缺任何一半都不算——而且「問不到」也不算（fail closed）。
+        // 缺任何一半都**不**算——而且「問不到」也不算（fail closed）。
         assert!(!is_history_recoverable(Some(&status(true, false))));
         assert!(!is_history_recoverable(Some(&status(false, true))));
         assert!(!is_history_recoverable(None));
@@ -1299,7 +1298,7 @@ mod tests {
 
     #[test]
     fn the_refusal_says_the_condition_but_never_names_a_command() {
-        // 🚫 core 不知道呼叫它的是 rpc-cli、Desktop 還是 Android（/docs/design/overview/architecture-v2.md §3）。
+        // core **不**知道呼叫它的是 rpc-cli、Desktop 還是 Android（/docs/design/overview/architecture-v2.md §3）。
         let dir = std::env::temp_dir().join(format!("wbf-core-refusal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

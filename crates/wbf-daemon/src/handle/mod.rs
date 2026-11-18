@@ -179,6 +179,8 @@ pub struct Handle {
     /// 這個 daemon 實例的身分（維護者 2026-09-13）：起來時鑄一次，活著的期間**不變**。
     /// 生產環境一個程序就是一個 `Handle`（`main.rs` 只建一個），所以它也就是那個程序的身分。
     instance: String,
+    /// 正在跑的請求與背景工作：`cancel` 找得到、關機等得到（`in_flight.rs`）。
+    in_flight: crate::in_flight::InFlight,
 }
 
 impl Handle {
@@ -200,7 +202,19 @@ impl Handle {
             write_access: WriteAccess::none(),
             access_keys: std::sync::OnceLock::new(),
             instance: new_instance_id(),
+            in_flight: crate::in_flight::InFlight::default(),
         })
+    }
+
+    /// 正在跑的請求與背景工作（/docs/design/daemon/task-supervision.md §2.2、§2.3）。
+    pub fn in_flight(&self) -> &crate::in_flight::InFlight {
+        &self.in_flight
+    }
+
+    /// 不是 RPC 來的關機（Ctrl+C、SIGTERM）：沒有「那則回應先送出去」要等，記下來就直接廣播。
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.shutdown.send_replace(true);
     }
 
     /// 一條連線開了。回來的 guard 丟掉就是關了。
@@ -253,9 +267,22 @@ impl Handle {
         self.policy.is_enforced()
     }
 
-    /// `daemon.shutdown` 之後變 `true`。server 用它停止 accept 並送 `SHUTTING_DOWN`。
-    pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
+    /// `daemon.shutdown` 之後變 `true`。只給測試看「廣播了沒」；正式碼要**等**關機一律用 [`Handle::wait_until_shutting_down`]。
+    #[cfg(test)]
+    fn shutdown_signal(&self) -> watch::Receiver<bool> {
         self.shutdown.subscribe()
+    }
+
+    /// 等到開始關機；**已經在關就馬上回**。呼叫的當下就訂閱，回傳的 future 不借 `self`。
+    /// 每個要「看到關機就收」的地方一律用它：只等 `changed()` 的接收端，在它訂閱**之前**就廣播的話永遠等不到（PR #87 審查 rumia 🟡1）。
+    pub fn wait_until_shutting_down(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut shutdown = self.shutdown.subscribe();
+        async move {
+            // 送出端不在了也算：沒有人能再叫它開，fail closed。
+            let _ = shutdown.wait_for(|shutting_down| *shutting_down).await;
+        }
     }
 
     /// 要不要拒絕新請求：`daemon.shutdown` 一回完就拒，不等廣播。
@@ -318,16 +345,25 @@ impl Handle {
         })
     }
 
-    /// 一個請求進、一個回應出。這裡**不**印任何東西。
-    pub async fn call(&self, request: Request) -> Response {
-        let id = request.id;
-        if self.is_shutting_down() {
-            return Response::error(
-                id,
+    /// `daemon.shutdown` 之後**進來**的請求回 `107`（/docs/design/rpc-specs/rpc-spec.md §5）。
+    /// 連線在讀到請求的當下問（照線上的順序）：比 `daemon.shutdown` 早到、task 還沒開始跑的請求照常做完。
+    ///
+    /// Return:
+    ///     Some(Response)  正在關機：回這則 `107`、**不**呼叫 [`Handle::call`]
+    ///     None            照常呼叫 [`Handle::call`]
+    pub fn find_shutdown_refusal(&self, request: &Request) -> Option<Response> {
+        self.is_shutting_down().then(|| {
+            Response::error(
+                request.id,
                 code::DAEMON_SHUTTING_DOWN,
                 "the daemon is shutting down",
-            );
-        }
+            )
+        })
+    }
+
+    /// 一個請求進、一個回應出（關機與否由呼叫端先問 [`Handle::find_shutdown_refusal`]）。這裡**不**印任何東西。
+    pub async fn call(&self, request: Request) -> Response {
+        let id = request.id;
         // 🚨 **要寫就要先有寫的能力**（/docs/design/overview/architecture-v2.md §0.2）。這是全 daemon 唯一檢查它的地方。
         // `-s` 在啟動時就拿到了，所以這裡是一個 atomic 讀；單發命令則是**第一個要寫的命令**
         // 觸發去拿鎖。拿不到就回「我沒有寫的權限」，**不**重試、**不**降級成唯讀跑一半。
@@ -611,7 +647,8 @@ impl Handle {
             return;
         }
         let core = self.core().await;
-        tokio::spawn(async move {
+        // 關機時等它做完這一輪（開線、金鑰追平寫到一半禁止被丟掉，/docs/design/daemon/task-supervision.md §2.3）。
+        self.in_flight.spawn_background(async move {
             core.ensure_links().await;
         });
     }
@@ -624,17 +661,11 @@ impl Handle {
         if self.settings().transport == Transport::Http {
             return;
         }
-        let mut shutdown = self.shutdown_signal();
         let mut interval = KEEP_LINKS_INTERVAL;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return;
-                    }
-                    continue;
-                }
+                _ = self.wait_until_shutting_down() => return,
             }
             if self.is_shutting_down() {
                 return;
@@ -1589,13 +1620,18 @@ mod tests {
         assert_eq!(response.result["encryption_enforced"], false);
         assert!(!policy.is_enforced());
         let signal = handle.shutdown_signal();
+        assert!(handle
+            .find_shutdown_refusal(&request("daemon.info", Value::Null))
+            .is_none());
         let response = handle.call(request("daemon.shutdown", Value::Null)).await;
         assert_eq!(response.code, 0);
         // 回完之前不廣播：server 送完回應才叫 begin_shutdown_if_requested。
         assert!(!*signal.borrow());
         assert!(handle.is_shutting_down());
-        let response = handle.call(request("daemon.info", Value::Null)).await;
-        assert_eq!(response.code, code::DAEMON_SHUTTING_DOWN);
+        let refused = handle
+            .find_shutdown_refusal(&request("daemon.info", Value::Null))
+            .expect("refused once shutting down");
+        assert_eq!(refused.code, code::DAEMON_SHUTTING_DOWN);
         handle.begin_shutdown_if_requested();
         assert!(*signal.borrow());
     }
