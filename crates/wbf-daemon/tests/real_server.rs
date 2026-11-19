@@ -1815,7 +1815,16 @@ async fn cross_signing_backup_recovery_and_self_verification_across_three_device
         assert!(keys[kind][&me].is_object(), "{kind} of {me}: {keys}");
     }
     let master = keys["master_keys"][&me].clone();
-    let (status, backup) = other.get_json("/_matrix/client/v3/room_keys/version").await;
+    // 備份版本在交叉簽章之後才建（同一段 `init_keys`）：交叉簽章看得到不代表備份已經建好，一樣問到有為止
+    // （2026-11-19 整套 e2e 跑一次撞到 404，單獨重跑都過）。
+    let (mut status, mut backup) = other.get_json("/_matrix/client/v3/room_keys/version").await;
+    for _ in 0..50 {
+        if status == 200 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        (status, backup) = other.get_json("/_matrix/client/v3/room_keys/version").await;
+    }
     assert_eq!(status, 200, "a backup version exists: {backup}");
     let a1_id = a1.device_id.clone();
     let trust = a1.devices_until_verified(&me, &a1_id).await;
