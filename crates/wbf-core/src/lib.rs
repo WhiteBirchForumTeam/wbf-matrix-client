@@ -119,11 +119,11 @@ pub use link_keeper::EnsuredLinks;
 pub use link_pool::{LinkPool, LinkRole, PooledClient};
 pub use login_ops::LoginResult;
 pub use media_ops::{
-    DeletedMedia, DirectDownloadResult, ExportedMedia, MediaGcReport, MediaJob, MediaRef,
+    DeletedMedia, ExportedMedia, MediaGcReport, MediaJob, MediaRef,
     MediaStats, OpenedMedia, QueuedMedia,
 };
 pub use media_stream::{MediaSource, MediaStream};
-pub use misc_ops::{MediaInfo, SeekResult, SeekSummary, ServerHello, UploadStatusReport};
+pub use misc_ops::{MediaInfo, ServerHello, UploadStatusReport};
 pub use read_ops::MarkedRead;
 pub use room_actions::{EnterRoom, MemberAction, WriteSync};
 pub use room_crypto::{RoomDevices, SendOptions};

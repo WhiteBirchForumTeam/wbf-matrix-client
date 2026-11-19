@@ -40,8 +40,8 @@ PR #1–#78 合併（main `6f25d7f`，2026-11-02；#76 房間動作、#78 收邀
 跟房間動作同一張端點表、同一套中轉（參數與結果照 Matrix、本地不存）。真 server 驗過。
 
 **還沒有**：UI；換掉既有的交叉簽章（server 要密碼）、QR 驗證、房間裡驗證「別人這個人」；一般 Matrix 帳號的驗證（一般帳號的備份由 `Client` 做）；一般 Matrix 帳號的即時推播（沒有常駐的同步迴圈，訊息與邀請都要 UI 叫了才有）；
-別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；下載的暫停；daemon 的單發命令列。
-**不做**：接住 task 的 panic、重連時重探 backend（`/docs/design/daemon/task-supervision.md` §3）。
+別人的已讀回條（server 不推，`/docs/design/messages/read-receipts.md` §8）；下載的暫停。
+**不做**：接住 task 的 panic、重連時重探 backend（`/docs/design/daemon/task-supervision.md` §3）；daemon 的單發命令列（由 rpc-cli 的 `call` 做，/docs/design/rpc-specs/rpc-cli.md §4）。
 
 **daemon 穩健性**（2026-11-10）：每個背景 task 有終止接口、關機（`daemon.shutdown`、Ctrl+C）照順序收、等不到講一聲不 abort；RPC 的 `cancel` 是合作式的（`/docs/design/daemon/task-supervision.md`）。
 
@@ -102,7 +102,7 @@ crates/wbf-sdk/src/
 crates/wbf-core/src/     **命令的本體全在這裡**（#24）。公開面只有可序列化的 DTO 與 `CoreError`
   lib.rs                 `Core`（解鎖一次的 vault、多帳號入口）、`Target`（user／server／server_backup，＝RPC 的 params 形狀）
   error.rs               `CoreError { kind, message, data }`（`data` 選填：例 1401 帶 daemon 自動重拿的房間狀態，/docs/design/rpc-specs/rpc-spec.md §5.3）、`CoreErrorKind`、`rpc_code()`（/docs/design/rpc-specs/rpc-spec.md §5.2 的號碼）
-  conf.rs                wbf.conf 的解析與自動生成（/docs/design/rpc-specs/wbf-cli-spec.md §10）；從 apps/wbf-cli 搬進來，daemon 與 CLI 共用一份
+  conf.rs                wbf.conf 的解析與自動生成（/docs/design/rpc-specs/wbf-cli-spec.md §10）；daemon 用它（生成在 daemon 第一次起來時）
   event.rs               `CoreEvent`（`Note`／`Progress` 帶 `job`，`Message`／`SyncState` 帶 `user`）與 broadcast channel。core **不**印任何東西
                          2026-09-21 多兩個：`Link`（線開關，帶 `LinkRole`／`LinkState`）、`Received`（線收到 pack，只有標頭）
   room_sync.rs           **房間那條線的內容**（/docs/design/rooms/room-sync.md）：`init_connection`（池開線的通用初始化：`Rooms` 就訂、起收推播的 task；`Keys` 交給 key_sync）；不碰水位（只有 `sync.recent` 動它）；一帳號一 task，登出收
@@ -142,25 +142,27 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
                          ⚠️ dispatch 每個分支 Box::pin（E0275）；fresh 資料目錄的起手式是 vault.create，account.add **不**偷建 vault
   lock.rs                資料目錄的獨佔：寫排他／讀共享（std 的 File::try_lock）＋ `WriteAccess`
                          全局能力（起手 false，要寫才拿；`call()` 是唯一檢查點）
-  settings.rs            從 wbf.conf 讀 SERVER_BACKUP／LOCAL_ROOM_KEYS／TRANSPORT（解析在 wbf_core::conf，跟 CLI 共用）
+  settings.rs            從 wbf.conf 讀 SERVER_BACKUP／LOCAL_ROOM_KEYS／TRANSPORT／READ_RECEIPTS（解析在 wbf_core::conf）；資料目錄還沒有 wbf.conf 就生成起手式
   server.rs              loopback WS listener；一連線一 Connection 一 writer task；請求各自 spawn
                          2026-09-21 多：每連線一個推播 task（`forward_pushes`：core 的 broadcast → 訂閱過濾 → `seal_push`；`Lagged` → `desync`）、`subscribe`／`unsubscribe` 在這層回（不進 handle）、
                          請求包在 `job::run_as_job(id)` 裡（`progress`／`note` 對得回發它的連線）
   push.rs                `Subscriptions`（每連線一份：名字集合＋選填 `user`）、`push_of`（`CoreEvent` → 推播名與 params，照 /docs/design/rpc-specs/rpc-spec.md §4）、`desync`、`parse_subscription_params`
-  token.rs               token 檔的三遍覆蓋抹除（隨機 → 0xFF → 0x00 → 刪）與權限檢查；⚠️ daemon 預設不動 token，誰起的誰動
-  main.rs                `-s` 常駐（先拿寫權、讀 token 與 conf、寫 daemon.json）。沒有 `-s` ＝單發，⚠️ **還沒實作**（會報錯講清楚）；
-                         兩個都帶也報錯。控制平面與資料平面一起開、一起停
+  token.rs               token 怎麼交：環境變數 WBF_DAEMON_TOKEN（base64）、daemon 讀完就從自己的環境清掉、前端這頭的 new_token／to_env_value
+                         （/docs/design/rpc-specs/local-interface.md §3；token 不落地，舊的 token 檔與三遍抹寫都拿掉了）
+  client.rs              前端那一頭：spawn_daemon（讀 ready）、RpcClient（hello、call、next_push）、資料平面的 put／get；rpc-cli 與 tests/real_server.rs 用它
+  main.rs                只有 `-s` 常駐（先從環境拿 token、拿寫權、讀 conf／沒有就生成、寫 daemon.json）。沒帶 `-s` 報錯；單發模式定了不做。
+                         控制平面與資料平面一起開、一起停
   data_plane.rs          資料平面：URL 與 meta（共享 token 加密；URL 只帶「用途 ‖ mxc」、上傳狀態在 `Wbf-Upload-Meta` header）與 hyper 的 HTTP listener（`PUT /upload/mxc/…`、`GET`／`HEAD /media/mxc/…` 的 Range 與串流 body、Host 檢查）
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
-  tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、
-                         token 檔 daemon 不動、shutdown 之後程序結束並收走 daemon.json
+  tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、起手式 conf、
+                         shutdown 之後程序結束並收走 daemon.json、資料目錄裡沒有 token；沒帶 token／長度不對／沒帶 `-s` 都不啟動
   tests/real_server.rs   `--ignored`：對真 wbfuwunel 走 vault.create（passphrase）→account.add→whoami→ping→
                          room.list→sync.recent→backup.status→**停掉 daemon 再起**→unlock→whoami→account.del；
                          房間動作：兩個帳號登在同一個 daemon，建房→邀→加入→權限／名字／置頂→升級加密→踢→忘記（要 `WBF_E2E_USER_B`）
-apps/wbf-cli/src/        瘦的前端：main.rs（參數、`CoreErrorKind` → exit code）、unlock.rs（passphrase 來源：檔案或終端，**沒有** ticket 了）、
-                         commands.rs／rooms.rs／recent.rs（叫 core、印 JSON）；conf 的解析已搬到 wbf_core::conf
-                         ⚠️ 目錄名還叫 `wbf-cli`：改成 rpc-cli 留到它真的變成 RPC 前端那支 PR
-scripts/acceptance.sh    /docs/design/rpc-specs/wbf-cli-spec.md §8 的驗收，對本機 wbfuwunel 跑
+apps/wbf-matrix-rpc-cli/src/   rpc-cli（/docs/design/rpc-specs/wbf-cli-spec.md）：main.rs（命令：call、batch、account add／destroy、put、get、watch）、
+                         session.rs（一次執行一支 daemon：起、hello、解鎖、shutdown；RPC code → exit code；passphrase／password 從檔案或終端）
+                         ⚠️ 舊的 apps/wbf-cli 直接叫 core、繞過 daemon，A-2（2026-11-19）拿掉了
+scripts/acceptance.sh    /docs/design/rpc-specs/wbf-cli-spec.md §8 的驗收，用 rpc-cli 對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
 ```
 
@@ -171,7 +173,7 @@ vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/mat
 cargo test --workspace                       # 不含 matrix feature，快；含 cache feature 的測試要 --features cache
 cargo test -p wbf-sdk --features matrix      # 事件轉換、aggregate、錯密碼分類（起迷你 403 server）
 cargo clippy --workspace --all-targets --features wbf-sdk/matrix -- -D warnings   # 含 §8 那套「不准 panic」的 lint（crate 根的 deny）
-cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格式化 submodule
+cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli  # 禁止 --all：會格式化 submodule
 ```
 
 對真 server（本機 wbfuwunel，Windows）：
@@ -188,7 +190,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
 4c. **E2EE 的 RPC 面整條**（#62，/docs/design/keys/e2ee-rpc.md §9）：alice 建加密房、邀 bob、bob 加入，然後
     `WBF_E2E_SERVER=... WBF_E2E_USER=@alice:localhost WBF_E2E_PASSWORD_FILE=... WBF_E2E_USER_B=@bob:localhost WBF_E2E_PASSWORD_B_FILE=... WBF_E2E_ENCRYPTED_ROOM='!…' cargo test --workspace --lib -- --ignored --test-threads=1 an_encrypted_conversation`
     （alice 送、bob 解；bob 登第二台 → 1506 → daemon 回新狀態 → 重送、新舊兩台都解得開，約 3 秒）。daemon 的 `real_server` 帶 `WBF_E2E_ENCRYPTED_ROOM` 會多驗 `room.refresh_devices`＋帶 `room_devices` 送。
-4. `WBF_E2E_SERVER=... WBF_E2E_USER=... WBF_E2E_PASSWORD_FILE=... cargo test -p wbf-sdk --test e2e_local_server -- --ignored`（第 2 步的驗收）；`WBF_PASSWORD_FILE=... scripts/acceptance.sh`（CLI 的驗收，200 MiB 約 80 秒；`WBF_ACCEPT_SIZE_MIB=16` 快跑）。
+4. `WBF_E2E_SERVER=... WBF_E2E_USER=... WBF_E2E_PASSWORD_FILE=... cargo test -p wbf-sdk --test e2e_local_server -- --ignored`（第 2 步的驗收）；`WBF_PASSWORD_FILE=... scripts/acceptance.sh`（rpc-cli 的驗收；`WBF_ACCEPT_SIZE_MIB` 縮小快跑、`WBF_ACCEPT_PROFILE=debug` 不必另編 release）。
+   📎 下面 5–10 是舊 CLI 時代的手動流程，命令照 /docs/design/rpc-specs/wbf-cli-spec.md §3 的對照表換成 rpc-cli 的（例：`rooms` → `call room.list '{"sync":"both"}'`）。
 5. 第 3 步的手動流程：`login` → 用 token `createRoom`（`initial_state` 帶 `m.room.encryption`）→ `rooms` → `send --text` → `read` → `send --file` → `files --save` → `download --manifest`。token 現在在 `session.sealed` 裡讀不到，`createRoom` 那步的 token 用 curl 另外登入一次拿（驗收腳本就是這樣做）。
 8. 快取的手動流程（一個帳號）：`recent`（第一次 `cg_seq_before` 是 null）→ `read <room> --from-cache` → `recent` 再跑一次（`pulled` 應該是 0）。
 10. 媒體池：`upload --sha256 --manifest m.json` → `download --manifest m.json -o a`（`source: server`，池裡出現 `media/<hh>/<hash>`）→ 再 `download` 一次（`source: cache`）→ `media-stats` → 大檔用 `--transport http` 下到一半殺掉 → `media-stats` 看到 `incomplete_files: 1` → 再 `download` 的第一行進度從上次快照的塊數開始、sha 對 → `media-gc --quota-mib 1 --protect-days 0` 清光。2026-09-08 跑過一次全對。
@@ -212,10 +215,10 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
   現在有 `every_vector_id_carries_a_type_byte_we_know` 釘住「非零的 id 一定帶得出型別」，重抄到沒組型別的向量會當場紅。
 - **`cargo test --workspace` 綠不代表 SDK 對得上 server**：黃金向量是整份複製的，server 加了 kind（`0x02 Stream`、
   `0x16 Device`）我們的 `Kind` 表沒有，`vectors.rs` 才會紅；漏抄向量就什麼都不會紅。每次 server 那邊改 wire 就重抄一次。
-- 🚨 **我們只在 Windows 上跑測試，而有些檢查在 Windows 上是 no-op**：`token::is_private`
-  在非 Unix 一律回 `true`（靠目錄 ACL）。所以「測試自己用 `std::fs::write` 寫 token 檔」
+- 🚨 **我們只在 Windows 上跑測試，而有些檢查在 Windows 上是 no-op**：當時的 token 檔權限檢查
+  在非 Unix 一律回 `true`（靠目錄 ACL），所以「測試自己用 `std::fs::write` 寫 token 檔」
   在這裡全綠，到 Unix 上卻會被 daemon fail closed 擋掉、每個 process 測試都死在啟動
-  （PR #31 審查 cirno🔴 抓到）。⭐ 寫測試用的私密檔一律走 `wbf_sdk::vault::write_private`，
+  （PR #31 審查 cirno🔴 抓到；token 檔 A-2 拿掉了，這條教訓還在）。⭐ 寫測試用的私密檔一律走 `wbf_sdk::vault::write_private`，
   禁止先 `std::fs::write` 再 chmod。📎 同一類的還有檔案鎖與權限位元 —— 平台差異的地方，
   **綠燈只代表這個平台綠**。
 - **Windows 上剛關掉的 SQLite store 還會被握著幾百毫秒**：登出刪 `m/` 會撞 `os error 32`
@@ -285,10 +288,11 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-cli  # 禁止 --all：會格
    2026-11-07 做完：/docs/design/keys/cross-signing-and-verification.md。
 3. **daemon 穩健性**：~~終止接口、關機、`cancel`~~ 2026-11-10 在分支 `feat/daemon-robustness` 做完（`/docs/design/daemon/task-supervision.md`；接住 panic 與重探 backend 定了不做）。
    剩進度節流（`/docs/design/daemon/daemon-runtime.md` §5.4 定了先不做）；
-   `apps/wbf-cli` 不再越過 daemon 寫資料目錄（維護者 2026-09-30：前端只能發 RPC，`/docs/design/overview/architecture-v2.md` §0.2）——過渡的「先拿 `daemon.lock`、拿不到就拒絕」已做，剩改走 RPC。
+   ~~`apps/wbf-cli` 改走 RPC~~ 2026-11-19 在分支 `feat/rpc-cli` 做完（A-2：rpc-cli、token 用環境變數、舊 CLI 拿掉，/docs/design/rpc-specs/rpc-cli.md）。
+4. **web 樣板**（維護者 2026-11-17）：daemon 自己送網頁、沒帶 token 時自己產生一把給網頁用（/docs/design/rpc-specs/local-interface.md §3）。Desktop 預計原生 Rust，這個先當快速 demo／debug／驗證。
 
 之後（還沒排）：換掉既有的交叉簽章（UIAA）、QR 驗證、登出閘門的第一關接上 wbf 帳號（/docs/design/keys/cross-signing-and-verification.md §9、§12）；「跳到訊息」等 wbfuwunel #64（#43 已關）；~~server 批 3／4 的功能（#50、#55）~~ 2026-11-08 做完（/docs/design/rpc-specs/matrix-relay.md）；
-下載的暫停（只停主檔，**不**停 seek，`/docs/design/media/media-download.md` §5.4）、daemon 的單發命令列、`apps/wbf-cli` 改成走 RPC（那時 `download --no-cache` 的直寫路一併收掉）；
+下載的暫停（只停主檔，**不**停 seek，`/docs/design/media/media-download.md` §5.4）；
 UI 框架比較。
 ⚠️ UI 落地前要確認「進房逐房翻頁」真的存在：`recent` 被 `max_events` 停下時，`[last_ls, 舊水位)` 那段是永久洞，只有逐房 `/messages` 會補。
 ⏳ 懸著等維護者：`media.db` 拆檔（維護者：「等要做的時候再討論」）。

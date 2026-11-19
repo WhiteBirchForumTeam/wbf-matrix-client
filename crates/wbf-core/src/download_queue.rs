@@ -2698,6 +2698,34 @@ mod tests {
         assert_eq!(read_whole(&core, &manifest.mxc).await, body());
     }
 
+    /// `media.open` 回來的時候那一列已經在：UI 拿到 URL 立刻 GET，不該因為處理端還沒開工就 404
+    /// （rpc-cli 對真 server 走一輪時撞到，/docs/design/rpc-specs/data-plane.md §8）。
+    /// ⚠️ 單執行緒的 runtime：`media_open` 回來到這裡之間沒有讓出，處理端那個 task 還沒機會跑——列在不在只看 `media_open` 自己。
+    #[tokio::test]
+    async fn the_media_row_exists_by_the_time_media_open_returns() {
+        let (core, account, server, manifest) = uploaded("dq-open-row").await;
+        hold_reads(&server).await;
+        let (cache, _me) = core.server_cache_and_me(&account).unwrap();
+        assert!(
+            cache
+                .read()
+                .await
+                .find_media(&manifest.mxc)
+                .unwrap()
+                .is_none(),
+            "an upload without a source has no row yet"
+        );
+        core.media_open(&MediaRef::Manifest(manifest.clone()), &Target::default())
+            .await
+            .unwrap();
+        assert!(cache
+            .read()
+            .await
+            .find_media(&manifest.mxc)
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn not_found_from_the_server_deletes_the_unfinished_file() {
         let (core, account, server, manifest) = uploaded("dq-server-notfound").await;

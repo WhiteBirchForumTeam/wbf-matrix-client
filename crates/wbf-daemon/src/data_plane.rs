@@ -81,7 +81,7 @@ pub struct AccessKeys {
 
 impl AccessKeys {
     /// Args:
-    ///     token: `daemon.token` 的內容（跟 RPC 同一份）, example: 256 個隨機 byte
+    ///     token: 前端交來的 token（`WBF_DAEMON_TOKEN` 解開的，跟 RPC 同一份）, example: 256 個隨機 byte
     pub fn from_token(token: &[u8]) -> AccessKeys {
         AccessKeys {
             key: blake3::derive_key(ACCESS_CONTEXT, token),

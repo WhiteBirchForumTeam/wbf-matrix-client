@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! daemon:  run_as_job(請求的 id, core.upload_file(...)).await
-//! core:    ... events.progress_of(3, Some(10), "chunk 3/10")   ← job 自動是那個 id
+//! core:    ... events.progress("uploading chunk 3")   ← job 自動是那個 id
 //! ```
 //!
 //! ⚠️ **限制**：task-local 不會跟著 `tokio::spawn` 進到新的 task。core 與 sdk 目前的長工作都在

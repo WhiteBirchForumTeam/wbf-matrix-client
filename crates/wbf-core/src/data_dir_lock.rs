@@ -22,23 +22,23 @@
 //! 這不是缺陷 —— 這把鎖回答的問題就只有一個：「誰有權碰這個目錄的檔案」。
 //! ⭐ 「daemon 在寫、同時有人在讀」那種併發**不是靠這把鎖達成的**，是靠 `cache.db` 自己的 WAL
 //! （SQLite 的 WAL 本來就是一個寫、多個讀，而且是**逐筆交易**的粒度，比一把長命鎖精確得多）。
-//! 📎 架構上的答案仍然是：🚫 除了 daemon，沒有人該碰那些檔案 —— 要資料就走 RPC。
+//! 📎 架構上的答案仍然是：禁止 daemon 以外的程序碰那些檔案 —— 要資料就走 RPC。
 //! 共享鎖留給**離線**的唯讀工具（daemon 沒在跑的時候檢查資料目錄），而它被拒絕本身就是答案：
 //! **現在有一個 daemon 在跑，去跟它講話，不要動它的檔。**
 //!
-//! ⚠️ 還有一件不能忘的：這是**勸告式**的鎖 —— 它只擋「有來問」的程序。🚫 它不會、也不可能阻止
+//! ⚠️ 還有一件不能忘的：這是**勸告式**的鎖 —— 它只擋「有來問」的程序。它**不**會、也不可能阻止
 //! 某個程式直接打開 `cache.db` 亂寫。它保護的是**我們自己這些程序之間**的約定。
 //!
 //! ⭐ **為什麼是 OS 的鎖，不是「寫一個 pid 進檔案然後檢查它還活著嗎」**：後者一定有 race
 //! （檢查完到寫進去之間，那個 pid 可能死掉、也可能剛好被回收給別人），而且 daemon 被 `kill -9`
-//! 之後那個檔會留下來擋住下一次。OS 的鎖是**核心在程序結束時自動放手**的，🚫 沒有殘留鎖要清。
+//! 之後那個檔會留下來擋住下一次。OS 的鎖是**核心在程序結束時自動放手**的，**沒有**殘留鎖要清。
 //!
 //! 📎 鎖檔**不刪、也不寫東西進去**：刪掉會跟「另一個程序正要開它」對撞；而「誰握著」不放這裡 ——
 //! Windows 的排他鎖連讀都擋，所以寫進去的字沒人讀得到。⭐ 那個問題已經有答案了：
 //! `<data dir>/daemon.json` 裡有現在這個 daemon 的 `pid` 與 `instance`（/docs/design/rpc-specs/local-interface.md §3）。
 //!
 //! 📎 用的是 `std::fs::File::try_lock`（Rust 1.89 起在標準庫裡，本專案 MSRV 1.95）——
-//! 🚫 不引 `fs2`／`fs4`：標準庫已經有同一個東西了。
+//! 禁止引 `fs2`／`fs4`：標準庫已經有同一個東西了。
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 pub const LOCK_FILE_NAME: &str = "daemon.lock";
 
 /// 拿到的權利（排他或共享）。⚠️ **活著就是鎖著**：這個值被丟掉（或程序結束）鎖才放開，
-/// 所以呼叫端要把它一路拿到用完為止，🚫 不要 `let _ = lock_for_writing(...)`。
+/// 所以呼叫端要把它一路拿到用完為止，禁止 `let _ = lock_for_writing(...)`。
 #[derive(Debug)]
 pub struct DataDirLock {
     /// 只是拿著不用：鎖綁在這個開著的檔案 handle 上。
@@ -73,7 +73,7 @@ impl std::fmt::Display for LockError {
         match self {
             LockError::HeldByAnother(path) => write!(
                 formatter,
-                "another program (a daemon, or a wbf-cli command) is already using this data directory (lock: {}); \
+                "another daemon is already using this data directory (lock: {}); \
                  stop it first, or use a different --data-dir",
                 path.display()
             ),
@@ -108,7 +108,7 @@ pub fn lock_for_writing(data_dir: &Path) -> Result<DataDirLock, LockError> {
 /// Args:
 ///     data_dir: example: "<data dir>"
 /// Return:
-///     Ok(DataDirLock)      拿到了；這期間🚫 沒有人寫得了
+///     Ok(DataDirLock)      拿到了；這期間**沒有**人寫得了
 ///     Err(HeldByAnother)   有 daemon 正握著寫鎖 —— ⭐ 這個答案本身就有用：
 ///                          **去跟那個 daemon 講話（RPC），不要動它的檔**
 ///     Err(Io)              鎖檔開不了
@@ -144,7 +144,7 @@ fn acquire(data_dir: &Path, intent: Intent) -> Result<DataDirLock, LockError> {
     };
     match taken {
         Ok(()) => {}
-        // 拿不到就是別人握著。🚫 不等、不重試：daemon 不是「排隊等前一個結束」的東西。
+        // 拿不到就是別人握著。**不**等、**不**重試：daemon 不是「排隊等前一個結束」的東西。
         Err(TryLockError::WouldBlock) => return Err(LockError::HeldByAnother(path)),
         Err(TryLockError::Error(error)) => return Err(LockError::Io(path, error)),
     }

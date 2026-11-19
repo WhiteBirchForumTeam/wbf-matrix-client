@@ -51,7 +51,7 @@ pub enum CoreErrorKind {
     /// 登出／摧毀的閘門擋下來了：刪掉之後歷史救不回來（/docs/design/keys/room-key-backup.md §7）。
     ///
     /// ⚠️ core 的訊息只說**條件**，**不**提命令名字——前端看到這個 kind 再補上自己那句
-    /// （rpc-cli 說 `wbf-cli key-backup recovery`，Desktop 可能是一個按鈕）。
+    /// （rpc-cli 照樣印出這則錯誤與它的 code，Desktop 可能是一個按鈕）。
     HistoryWouldBeLost,
     /// 使用者用錯了，還沒細分到上面任何一種。
     ///

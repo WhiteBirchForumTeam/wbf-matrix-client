@@ -13,10 +13,10 @@
     )
 )]
 //! `wbf-matrix-client-daemon`：只有 `-s`（常駐）：控制平面（RPC）與資料平面（/docs/design/rpc-specs/data-plane.md）兩個 port。
-//! 還沒做：單發命令（`daemon <命令>`，/docs/design/overview/architecture-v2.md §0.2）。
+//! 單發命令（`daemon <命令>`）**不做**（維護者 2026-11-17，/docs/design/rpc-specs/rpc-cli.md §4）：「在腳本裡跑一條命令」由 rpc-cli 的 `call` 做。
 //!
-//! 起動的順序照 /docs/design/rpc-specs/local-interface.md §3 的五步（前端寫 token → spawn → **daemon 宣告 ready** →
-//! 前端抹掉 token 檔 → 之後只在記憶體裡）。⭐ 這支負責的是第 3 步，而「宣告 ready」是**一個邊緣**，
+//! 起動的順序照 /docs/design/rpc-specs/local-interface.md §3 的三步（前端產生 token、放進環境變數 `WBF_DAEMON_TOKEN`、spawn →
+//! **daemon 讀完清掉、宣告 ready** → 之後只在兩個程序的記憶體裡）。⭐ 這支負責的是第 2 步，而「宣告 ready」是**一個邊緣**，
 //! 不是一個狀態：所以 `daemon.json` 在綁定**之前**先刪掉，綁好之後才 temp＋rename 寫進去 ——
 //! 前端等的那個檔出現的瞬間，port 一定已經在聽了，而且它一定不是上一次留下來的。
 
@@ -31,13 +31,12 @@ use wbf_daemon::handle::Handle;
 use wbf_daemon::pack::RpcKeys;
 use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
-use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
     name = "wbf-matrix-client-daemon",
     version,
-    about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端"
+    about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端。token 由叫起它的前端放在環境變數 WBF_DAEMON_TOKEN"
 )]
 struct Cli {
     /// 常駐：開本地 RPC 的 WS，等前端來連（長旗標**不**叫 `--server`：那個字只指 homeserver，/docs/design/overview/architecture-v2.md §0.1）
@@ -46,110 +45,39 @@ struct Cli {
     /// 資料目錄
     #[arg(long, env = "WBF_DATA_DIR")]
     data_dir: PathBuf,
-    /// `daemon.token` 的路徑（前端產生的 256 byte 隨機檔，/docs/design/rpc-specs/local-interface.md §3）。預設 <data dir>/daemon.token
-    ///
-    /// ⚠️ daemon 讀完就不再回頭讀它：前端該在 ready 之後把它抹掉（`wbf_daemon::token::shred`）
-    #[arg(long)]
-    token_file: Option<PathBuf>,
     /// RPC 的 port；0 就隨機，寫進 <data dir>/daemon.json
     #[arg(long, default_value_t = 0)]
     rpc_port: u16,
     /// 資料平面（媒體 bytes 的 HTTP）的 port；0 就隨機，寫進 <data dir>/daemon.json
     #[arg(long, default_value_t = 0)]
     data_port: u16,
-    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf。⚠️ 明指了卻不在就報錯，不 fallback（/docs/design/rpc-specs/wbf-cli-spec.md §10.1）
+    /// conf 檔在哪；沒給就找 <data dir>/wbf.conf（不在就生成一份）。⚠️ 明指了卻不在就報錯，不 fallback
     #[arg(long, env = "WBF_CONFIG")]
     config: Option<PathBuf>,
-    /// 單發命令：`daemon <命令> [參數…]`（/docs/design/overview/architecture-v2.md §0.2）。⚠️ 還沒實作
-    #[arg(trailing_var_arg = true)]
-    command: Vec<String>,
-}
-
-/// **啟動路徑只有兩種**（維護者 2026-09-13）：常駐，或單發。
-///
-/// ⭐ 它們是兩種**不同的起法**，不是一個旗標加一個選項 —— 所以兩個都帶不是「以某一邊為準」，
-/// 是使用者搞錯了，我們**不**替他猜（A5：不確定就拒絕）。
-#[derive(Debug)]
-enum StartMode {
-    /// `-s`：常駐、開 RPC、**會寫**（所以啟動時就要拿寫權）。
-    Serve,
-    /// 沒有 `-s`：跑一個命令就結束。⚠️ 還沒實作。
-    OneShot(Vec<String>),
-}
-
-/// Args:
-///     serve: 有沒有 `-s`, example: true
-///     command: 尾巴的單發命令, example: vec!["account".into(), "list".into()]
-/// Return:
-///     Ok(StartMode)   兩種起法之一
-///     Err(String)     兩個都帶、或兩個都沒帶；字串就是要印給使用者的那句
-fn start_mode(serve: bool, command: Vec<String>) -> Result<StartMode, String> {
-    match (serve, command.is_empty()) {
-        (true, true) => Ok(StartMode::Serve),
-        (false, false) => Ok(StartMode::OneShot(command)),
-        (true, false) => Err(format!(
-            "-s starts the daemon and a command runs one-shot;              these are the two ways to start it, so pass one or the other (got both: {})",
-            command.join(" ")
-        )),
-        (false, true) => Err(
-            "nothing to do: pass -s to serve, or a command to run one-shot".to_string(),
-        ),
-    }
 }
 
 fn main() -> ExitCode {
+    // 🚨 第一件事：讀 token、從環境裡清掉。⚠️ 要在起 runtime、開任何執行緒之前（`wbf_daemon::token::take_token_from_env`）。
+    // 也排在解析參數之前：參數錯了一樣要清，不能讓 token 留在環境裡。
+    let token = wbf_daemon::token::take_token_from_env();
     let cli = Cli::parse();
-    match start_mode(cli.serve, cli.command) {
-        Ok(StartMode::Serve) => {}
-        Ok(StartMode::OneShot(command)) => {
-            eprintln!(
-                "single-shot commands are not implemented yet (got: {}); only `-s` works today",
-                command.join(" ")
-            );
-            return ExitCode::from(1);
-        }
-        Err(complaint) => {
-            eprintln!("{complaint}");
-            return ExitCode::from(1);
-        }
+    if !cli.serve {
+        eprintln!("nothing to do: pass -s to serve (single-shot commands are not a thing; use wbf-matrix-rpc-cli)");
+        return ExitCode::from(1);
     }
-    let token_path = cli
-        .token_file
-        .unwrap_or_else(|| cli.data_dir.join("daemon.token"));
-    // Unix 上別人讀得到就拒絕跑：token ＝ 整個 RPC 的憑證，fail closed（**不**只印警告）。
-    match wbf_daemon::token::is_private(&token_path) {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!(
-                "the daemon token at {} is readable by other users; make it 0600",
-                token_path.display()
-            );
-            return ExitCode::from(1);
-        }
-        Err(error) => {
-            eprintln!(
-                "cannot stat the daemon token at {}: {error}",
-                token_path.display()
-            );
-            return ExitCode::from(1);
-        }
-    }
-    let token = match std::fs::read(&token_path) {
-        Ok(bytes) => Zeroizing::new(bytes),
-        Err(error) => {
-            eprintln!(
-                "cannot read the daemon token at {}: {error}",
-                token_path.display()
-            );
+    let token = match token {
+        Ok(token) => token,
+        Err(problem) => {
+            eprintln!("{problem}");
             return ExitCode::from(1);
         }
     };
-    let keys = match RpcKeys::from_token_file(&token) {
+    // 長度在 `take_token_from_env` 已經驗過；這裡再驗一次（呼叫端不假定上游洗乾淨了）。
+    let keys = match RpcKeys::from_token_checking_length(&token) {
         Ok(keys) => Arc::new(keys),
         Err(actual) => {
             eprintln!(
-                "the daemon token at {} is {actual} bytes; it must be exactly {} (/docs/design/rpc-specs/local-interface.md §3)",
-                token_path.display(),
+                "the daemon token is {actual} bytes; it must be exactly {} (/docs/design/rpc-specs/local-interface.md §3)",
                 wbf_daemon::pack::TOKEN_LEN
             );
             return ExitCode::from(1);
@@ -179,6 +107,11 @@ fn main() -> ExitCode {
         for warning in &settings.warnings {
             eprintln!("{warning}");
         }
+        // 沒用 `--config` 指別的檔時，資料目錄裡沒有 `wbf.conf` 就生成一份起手式（寫在拿到寫權之後）。
+        let starter_conf = cli
+            .config
+            .is_none()
+            .then(|| settings.starter_conf_entries());
         let policy = EncryptionPolicy::enforced();
         let handle = Handle::new(&cli.data_dir, policy.clone(), settings);
         handle.set_access_keys(access_keys);
@@ -189,6 +122,17 @@ fn main() -> ExitCode {
         if let Err(error) = handle.grant_write_access() {
             eprintln!("{error}");
             return ExitCode::from(1);
+        }
+        // 寫不成只講一聲：conf 是給人改的起手式，沒有它照樣用內建預設跑。已經存在的永遠不改寫。
+        if let Some(entries) = starter_conf {
+            match wbf_core::conf::write_if_absent(&cli.data_dir, &entries) {
+                Ok(true) => eprintln!(
+                    "wrote {} with the built-in defaults; edit it or delete it, it will not be rewritten",
+                    cli.data_dir.join(wbf_core::conf::CONF_FILE_NAME).display()
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!("cannot write the starter wbf.conf: {error}"),
+            }
         }
 
         // ⚠️ 這一步**在拿到寫權之後**：舊的 `daemon.json` 也是這個目錄的檔，沒有寫權就去刪它，
@@ -247,10 +191,6 @@ fn main() -> ExitCode {
             })
         );
         eprintln!("listening on ws://127.0.0.1:{rpc_port} (RPC) and http://127.0.0.1:{data_port} (data plane)");
-        eprintln!(
-            "ready; now shred {} (the daemon will not read it again)",
-            token_path.display()
-        );
         // Ctrl+C（Windows 的 console 事件、Unix 的 SIGINT）與 SIGTERM 走同一條路：等於 `daemon.shutdown`。
         tokio::spawn(shutdown_on_signal(handle.clone()));
         tokio::join!(server.run(), data_server.run());
@@ -297,36 +237,4 @@ async fn shutdown_on_signal(handle: std::sync::Arc<Handle>) {
     }
     eprintln!("shutting down (signal)");
     handle.request_shutdown();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 啟動路徑只有兩種，而且**互斥**（/docs/design/overview/architecture-v2.md §0.2）。
-    #[test]
-    fn there_are_exactly_two_ways_to_start_and_they_are_mutually_exclusive() {
-        assert!(matches!(start_mode(true, Vec::new()), Ok(StartMode::Serve)));
-        match start_mode(false, vec!["account".to_string(), "list".to_string()]) {
-            Ok(StartMode::OneShot(command)) => assert_eq!(command, ["account", "list"]),
-            other => panic!("沒有 -s 就是單發：{}", describe(&other)),
-        }
-        // 兩個都帶**不**猜：那是使用者搞錯了。
-        let both = start_mode(true, vec!["account".to_string()]);
-        assert!(both.is_err(), "-s 加命令應該報錯");
-        assert!(
-            both.unwrap_err().contains("one or the other"),
-            "錯誤訊息要講得出怎麼改"
-        );
-        // 什麼都沒帶也不猜。
-        assert!(start_mode(false, Vec::new()).is_err());
-    }
-
-    fn describe(mode: &Result<StartMode, String>) -> String {
-        match mode {
-            Ok(StartMode::Serve) => "serve".to_string(),
-            Ok(StartMode::OneShot(command)) => format!("one-shot {command:?}"),
-            Err(complaint) => complaint.clone(),
-        }
-    }
 }

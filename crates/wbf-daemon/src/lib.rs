@@ -30,11 +30,13 @@
 //! | `server` | loopback 的 WS listener |
 //! | `data_plane` | 資料平面：用共享 token 加密的 URL 與上傳 meta，與 loopback 的 HTTP listener（媒體的 bytes） |
 //! | `settings` | 從 `wbf.conf` 讀進來、要填進 `Target` 的那幾個值 |
-//! | `token` | `daemon.token` 的生命週期：權限、三遍覆蓋之後抹掉 |
+//! | `token` | token 怎麼交：前端產生、放環境變數 `WBF_DAEMON_TOKEN`，daemon 讀完就清掉 |
+//! | `client` | 前端那一頭：起 daemon、連線、`call`、收推播、資料平面的 `PUT`／`GET`（rpc-cli 用它） |
 //! | `lock` | 資料目錄的獨佔：OS 層排他鎖，拿不到就不啟動 |
 //!
 //! 這個 crate **不**印任何東西到 stdout／stderr（`main.rs` 例外）。
 
+pub mod client;
 pub mod connection;
 pub mod data_plane;
 pub mod handle;

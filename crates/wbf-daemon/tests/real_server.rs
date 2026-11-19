@@ -15,14 +15,12 @@
 
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio_tungstenite::tungstenite::Message;
+use wbf_daemon::client::RpcClient;
 use wbf_daemon::connection::EncryptionPolicy;
 use wbf_daemon::data_plane::{AccessKeys, DataServer};
 use wbf_daemon::handle::Handle;
-use wbf_daemon::pack::{self, PackType, RpcKeys, Side};
-use wbf_daemon::protocol::CURRENT_PROTOCOL;
+use wbf_daemon::pack::RpcKeys;
 use wbf_daemon::server::RpcServer;
 use wbf_daemon::settings::Settings;
 
@@ -103,69 +101,28 @@ async fn stop_daemon(daemon: Daemon, mut client: Client) {
     );
 }
 
-type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
+/// rpc-cli 用的同一個 client（`wbf_daemon::client::RpcClient`），外面包一層讓測試看得到推播、斷線就炸。
 struct Client {
-    socket: Socket,
-    keys: RpcKeys,
-    next_id: u64,
+    rpc: RpcClient,
     /// 等回應時收到的推播（沒有 `id` 的），照順序。
     pushes: Vec<Value>,
 }
 
 impl Client {
     async fn connect(port: u16) -> Client {
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        let (rpc, _hello) = RpcClient::connect(port, &TOKEN, "wbf-matrix-rpc-cli e2e")
             .await
             .unwrap();
-        let mut client = Client {
-            socket,
-            keys: RpcKeys::from_token(&TOKEN),
-            next_id: 0,
+        Client {
+            rpc,
             pushes: Vec::new(),
-        };
-        let hello = client
-            .call(
-                "hello",
-                json!({ "protocols": [CURRENT_PROTOCOL], "client": "wbf-matrix-rpc-cli e2e" }),
-            )
-            .await;
-        assert_eq!(hello["code"], 0, "{hello}");
-        client
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Value {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({ "method": method, "params": params, "id": id });
-        let frame = pack::seal(
-            &self.keys,
-            Side::Client,
-            PackType::Cipher,
-            request.to_string().as_bytes(),
-        )
-        .unwrap();
-        self.socket
-            .send(Message::Binary(frame.into()))
-            .await
-            .unwrap();
-        loop {
-            match self.socket.next().await.unwrap().unwrap() {
-                Message::Binary(bytes) => {
-                    let (_, json) = pack::open(&self.keys, Side::Client, &bytes).unwrap();
-                    let reply: Value = serde_json::from_slice(&json).unwrap();
-                    if reply["id"] == id {
-                        return reply;
-                    }
-                    if reply["id"].is_null() {
-                        self.pushes.push(reply);
-                    }
-                }
-                Message::Ping(_) | Message::Pong(_) => continue,
-                other => panic!("unexpected {other:?}"),
-            }
-        }
+        let reply = self.rpc.call(method, params).await.unwrap();
+        self.pushes.extend(self.rpc.take_buffered_pushes());
+        reply
     }
 }
 

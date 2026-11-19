@@ -3,7 +3,7 @@
 //! `session.sealed` 用第三把子金鑰封住 session 與 token。
 //!
 //! 這裡沒有 SQLite、沒有 matrix-sdk：兩個世界只從 `Vault` 拿各自的子金鑰（/docs/design/storage/local-cache-db.md §4.3 的那一條線）。
-//! 🚫 主金鑰、子金鑰、passphrase 都不印、不進錯誤訊息。
+//! 禁止印出主金鑰、子金鑰、passphrase，也禁止把它們放進錯誤訊息。
 //! 用字：**passphrase** 是解 `local.key` 的那句話；**password** 一律指 Matrix 帳號密碼，這個檔裡沒有它。
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ const ROOM_KEY_BACKUP_KEY_CONTEXT: &str = "wbf-matrix-client room key backup v1"
 /// `session.sealed` 的 AEAD 附加資料：綁住用途，拿別的檔的密文換過來解不開。
 const SESSION_AAD: &[u8] = b"wbf-matrix-client session.sealed v1";
 /// recovery key 的 AEAD 附加資料：跟 session 的密文互換也解不開。
-/// 🚫 字串不要改：改了就是換金鑰，已經封好的 recovery key 全部打不開。
+/// 禁止改這個字串：改了就是換金鑰，已經封好的 recovery key 全部打不開。
 const RECOVERY_AAD: &[u8] = b"wbf-matrix-client recovery.sealed v1";
 /// `local.key` 包主金鑰的 AEAD 附加資料。
 const WRAP_AAD: &[u8] = b"wbf-matrix-client local.key v1";
@@ -76,10 +76,10 @@ impl std::fmt::Debug for Key32 {
 /// 開 vault 時給的東西。`Plain` 的 `local.key` 配 `NoPassphrase`，`KeyFile::Passphrase` 的配 `Passphrase`，配錯就 `Err`（/docs/design/storage/vault-and-keys.md §1）。
 pub enum Unlock {
     NoPassphrase,
-    /// 🚫 不接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
+    /// **不**接受空字串：「沒設 passphrase」是 `Plain` 模式，不是 passphrase 等於空字串。
     /// ⚠️ **原始 bytes，不是字串**（/docs/design/storage/vault-and-keys.md §3）：passphrase 只餵給本機的
     /// Argon2id，永遠不出這台機器，所以它可以是 UTF-8 的中文、可以是一個 mp3。
-    /// 🚫 不驗 UTF-8、🚫 不去尾換行——那是 `--password-file`（要送給 homeserver）的規則。
+    /// **不**驗 UTF-8、**不**去尾換行——那是 `--password-file`（要送給 homeserver）的規則。
     Passphrase(Zeroizing<Vec<u8>>),
 }
 
@@ -284,7 +284,7 @@ impl Vault {
         self.mode
     }
 
-    /// 給 `set_passphrase` 重包用（同一個目錄、同一把主金鑰）。🚫 除此之外不要拿它做別的事。
+    /// 給 `set_passphrase` 重包用（同一個目錄、同一把主金鑰）。禁止拿它做除此之外的事。
     pub fn master_key(&self) -> &Key32 {
         &self.master
     }
@@ -347,11 +347,11 @@ impl Vault {
     ///
     /// ⚠️ 這是**方便性的保管**，不是「使用者擁有」的證明——它跟 crypto store 在同一台機器上，
     /// 一起被拿走就一起沒了。閘門（CLI 的 `refuse_if_history_would_be_lost`）拿它當第 2 關，
-    /// 🚫 不問使用者（/docs/design/keys/room-key-backup.md §8）。
+    /// **不**問使用者（/docs/design/keys/room-key-backup.md §8）。
     ///
     /// Args:
     ///     path: example: "<data dir>/r/<b58 nonce>_<b58 密文>"
-    ///     recovery_key: 🚫 不印、不 log
+    ///     recovery_key: 禁止印出、禁止寫進 log
     pub fn seal_recovery_key(&self, path: &Path, recovery_key: &str) -> Result<(), SdkError> {
         seal_file(
             &self.session_key(),
@@ -382,7 +382,7 @@ impl Vault {
     pub fn unseal_session(&self, path: &Path) -> Result<Option<Session>, SdkError> {
         let plaintext = open_sealed_file(&self.session_key(), path, SESSION_AAD).map_err(
             |error| match error {
-                SdkError::Usage(why) => SdkError::Usage(format!("{why}; run `login` again")),
+                SdkError::Usage(why) => SdkError::Usage(format!("{why}; add the account again (account.add)")),
                 other => other,
             },
         )?;
@@ -500,7 +500,7 @@ fn decode_base64(text: &str, field: &str) -> Result<Vec<u8>, SdkError> {
         .map_err(|error| SdkError::Usage(format!("key file field {field}: {error}")))
 }
 
-/// 檔案裡讀來的 nonce：長度不是 24 就是壞檔，回錯——🚫 交給 `XNonce::from_slice`（長度不對會 panic）。
+/// 檔案裡讀來的 nonce：長度不是 24 就是壞檔，回錯——**不**交給 `XNonce::from_slice`（長度不對會 panic）。
 ///
 /// Args:
 ///     text: base64 的 nonce, example: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -625,7 +625,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SdkError> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    // `std::fs::rename` 在 Windows 也直接蓋掉既有檔（MoveFileExW ＋ MOVEFILE_REPLACE_EXISTING）。🚫 先刪舊檔：
+    // `std::fs::rename` 在 Windows 也直接蓋掉既有檔（MoveFileExW ＋ MOVEFILE_REPLACE_EXISTING）。禁止先刪舊檔：
     // 刪了之後、rename 之前斷電，`local.key` 就沒了，整個 data dir 跟著解不開（/docs/design/storage/local-storage.md §2）。
     if let Err(error) = std::fs::rename(&scratch_path, path) {
         let _ = std::fs::remove_file(&scratch_path);
@@ -765,7 +765,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 蓋掉既有檔靠 rename 本身（Windows 也是），🚫 先刪舊檔：途中斷電時舊檔還在。蓋完不留暫存檔。
+    /// 蓋掉既有檔靠 rename 本身（Windows 也是），**不**先刪舊檔：途中斷電時舊檔還在。蓋完不留暫存檔。
     #[test]
     fn write_private_replaces_an_existing_file_and_leaves_no_scratch_file() {
         let dir = scratch_dir("write-private");
@@ -781,7 +781,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 檔案裡的 nonce 長度不對（壞檔、被截斷）：三個讀檔的地方都回錯，🚫 panic（`XNonce::from_slice` 遇到長度不對會 panic，2026-10-06 一個壞檔測試抓到）。
+    /// 檔案裡的 nonce 長度不對（壞檔、被截斷）：三個讀檔的地方都回錯，**不** panic（`XNonce::from_slice` 遇到長度不對會 panic，2026-10-06 一個壞檔測試抓到）。
     #[test]
     fn a_file_whose_nonce_has_the_wrong_length_is_an_error_not_a_panic() {
         let dir = scratch_dir("short-nonce");

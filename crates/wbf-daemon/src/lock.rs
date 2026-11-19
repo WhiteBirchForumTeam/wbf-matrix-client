@@ -1,5 +1,5 @@
-//! daemon 對資料目錄的寫權（`WriteAccess`）。鎖本身在 `wbf_core::data_dir_lock`：daemon 與 `wbf-cli` 共用同一份，
-//! 🚫 不各寫一份（/docs/design/overview/architecture-v2.md §0.2：前端不越過 daemon 寫資料目錄，維護者 2026-09-30）。
+//! daemon 對資料目錄的寫權（`WriteAccess`）。鎖本身在 `wbf_core::data_dir_lock`（/docs/design/overview/architecture-v2.md §0.2：
+//! 前端不越過 daemon 寫資料目錄，維護者 2026-09-30；舊 CLI 拿掉之後 daemon 是唯一的使用者）。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,13 +23,13 @@ pub use wbf_core::data_dir_lock::{
 /// | 誰 | 什麼時候 grant |
 /// |---|---|
 /// | `-s` 常駐 | **啟動的第一件事**；拿不到就不啟動（/docs/design/overview/architecture-v2.md §0.2） |
-/// | 單發命令 | 那個命令**真的要寫**的時候才拿；`--version` 這種連讀都不用的🚫 不拿 |
+/// | 單發命令 | 那個命令**真的要寫**的時候才拿；`--version` 這種連讀都不用的**不**拿 |
 ///
-/// ⚠️ 能力一旦拿到就**持有到程序結束**（`DataDirLock` 活在這裡）：🚫 不做「寫完就放、下次再拿」——
+/// ⚠️ 能力一旦拿到就**持有到程序結束**（`DataDirLock` 活在這裡）：**不**做「寫完就放、下次再拿」——
 /// 那等於在每兩個寫操作之間開一扇門讓別人進來寫，而我們手上的快取狀態會在那時失效。
 #[derive(Debug)]
 pub struct WriteAccess {
-    /// 快路徑：每個請求都會問，🚫 不要每次都去搶 mutex。
+    /// 快路徑：每個請求都會問，禁止每次都去搶 mutex。
     granted: AtomicBool,
     /// 拿到的鎖本體。`None` 就是還沒拿到。
     held: Mutex<Option<DataDirLock>>,
@@ -56,7 +56,7 @@ impl WriteAccess {
     ///     data_dir: example: "<data dir>"
     /// Return:
     ///     Ok(())               有了（本來就有，或這次拿到）
-    ///     Err(HeldByAnother)   別人在用這個目錄 —— 呼叫端要回「我沒有寫的權限」，🚫 不要自己重試
+    ///     Err(HeldByAnother)   別人在用這個目錄 —— 呼叫端要回「我沒有寫的權限」，禁止自己重試
     ///     Err(Io)              鎖檔開不了
     pub fn grant(&self, data_dir: &Path) -> Result<(), LockError> {
         // ⚠️ 先拿 mutex 再檢查一次：兩個請求同時進來的時候，只有一個該去搶鎖。
@@ -87,7 +87,7 @@ mod tests {
             Err(LockError::HeldByAnother(path)) => assert_eq!(path, *first.path()),
             other => panic!("第二個不該拿得到：{other:?}"),
         }
-        // 第一個放手之後，下一個拿得到（🚫 不留殘留鎖）。
+        // 第一個放手之後，下一個拿得到（**不**留殘留鎖）。
         drop(first);
         let second = lock_for_writing(dir.path()).expect("放手之後拿得到");
         assert!(second.path().exists());
@@ -114,7 +114,7 @@ mod tests {
             access.grant(dir.path()),
             Err(LockError::HeldByAnother(_))
         ));
-        // 失敗之後**還是 false**：🚫 不可以「試過了就當作有」。
+        // 失敗之後**還是 false**：禁止「試過了就當作有」。
         assert!(!access.is_granted());
 
         drop(squatter);
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn a_reader_and_a_writer_cannot_hold_it_at_the_same_time() {
         let dir = tempfile::tempdir().unwrap();
-        // 有人在讀 → 寫不進來（🚫 不會「反正只是讀，讓他寫」）。
+        // 有人在讀 → 寫不進來（**不**會「反正只是讀，讓他寫」）。
         let reader = lock_for_reading(dir.path()).unwrap();
         assert!(
             matches!(

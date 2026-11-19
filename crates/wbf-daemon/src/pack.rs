@@ -1,7 +1,7 @@
 //! RPC 自己的極簡 pack（/docs/design/rpc-specs/rpc-spec.md §1）：`ver(1) ‖ type(1) ‖ data`。
 //!
 //! 📎 跟 homeserver 那套 `wbf-pack`（`wbf-wire`）**無關**，只借「極簡二進位前綴」的做法，
-//! 🚫 不共用 codec。
+//! **不**共用 codec。
 //!
 //! 這個檔只做 bytes ↔ (type, JSON bytes)：明文直接放、密文用 token 導出的兩把金鑰
 //! （/docs/design/rpc-specs/local-interface.md §4）。**哪些該加密**不在這裡判斷——那是 `connection.rs` 的事，
@@ -11,11 +11,11 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// pack 格式的版本。⚠️ 是**封裝**的版本，🚫 不是 `hello` 談的 `protocol`。
+/// pack 格式的版本。⚠️ 是**封裝**的版本，**不**是 `hello` 談的 `protocol`。
 pub const PACK_VERSION: u8 = 0x01;
 /// 一個 frame 的上限（含前綴）。跟「超過就走資料平面」是同一個數。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
-/// `daemon.token` 的長度（/docs/design/rpc-specs/local-interface.md §3）。不是恰好這麼長就拒，不接受「夠長就好」。
+/// token 的長度（/docs/design/rpc-specs/local-interface.md §3）。不是恰好這麼長就拒，不接受「夠長就好」。
 pub const TOKEN_LEN: usize = 256;
 
 const NONCE_LEN: usize = 24;
@@ -59,7 +59,7 @@ pub enum PackError {
     CannotDecrypt,
 }
 
-/// 兩個方向各一把金鑰（反射攻擊擋在這裡），從 `daemon.token` 的內容導出。
+/// 兩個方向各一把金鑰（反射攻擊擋在這裡），從 token 導出（/docs/design/rpc-specs/local-interface.md §4）。
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RpcKeys {
     client_to_daemon: [u8; 32],
@@ -67,21 +67,21 @@ pub struct RpcKeys {
 }
 
 impl RpcKeys {
-    /// 從 `daemon.token` 的內容導鑰，**長度必須恰好 [`TOKEN_LEN`]**。
+    /// 從 token 導鑰，**長度必須恰好 [`TOKEN_LEN`]**（daemon 啟動用）。
     ///
     /// Args:
-    ///     token: 整檔的內容, example: 256 個隨機 byte
+    ///     token: example: 256 個隨機 byte
     /// Return:
     ///     Ok(RpcKeys)
     ///     Err(usize)  實際的長度（不是 256）
-    pub fn from_token_file(token: &[u8]) -> Result<RpcKeys, usize> {
+    pub fn from_token_checking_length(token: &[u8]) -> Result<RpcKeys, usize> {
         if token.len() != TOKEN_LEN {
             return Err(token.len());
         }
         Ok(RpcKeys::from_token(token))
     }
 
-    /// 純導鑰，不驗長度。測試與 client 端用；daemon 讀檔走 [`RpcKeys::from_token_file`]。
+    /// 純導鑰，不驗長度。測試與 client 端用（token 是它自己產生的）；daemon 啟動走 [`RpcKeys::from_token_checking_length`]。
     pub fn from_token(token: &[u8]) -> RpcKeys {
         RpcKeys {
             client_to_daemon: blake3::derive_key(CONTEXT_CLIENT_TO_DAEMON, token),
@@ -259,14 +259,23 @@ mod tests {
     }
 
     #[test]
-    fn a_token_file_must_be_exactly_256_bytes() {
+    fn a_token_must_be_exactly_256_bytes() {
         // `RpcKeys` 刻意沒有 Debug（金鑰不該印得出來），所以只比 `.err()`。
-        assert!(RpcKeys::from_token_file(&[0u8; 256]).is_ok());
-        assert_eq!(RpcKeys::from_token_file(&[0u8; 255]).err(), Some(255));
-        assert_eq!(RpcKeys::from_token_file(&[0u8; 257]).err(), Some(257));
-        assert_eq!(RpcKeys::from_token_file(&[]).err(), Some(0));
-        // 「夠長」不算：32 byte 導得出鑰，但不是規格的 token 檔。
-        assert_eq!(RpcKeys::from_token_file(&[0u8; 32]).err(), Some(32));
+        assert!(RpcKeys::from_token_checking_length(&[0u8; 256]).is_ok());
+        assert_eq!(
+            RpcKeys::from_token_checking_length(&[0u8; 255]).err(),
+            Some(255)
+        );
+        assert_eq!(
+            RpcKeys::from_token_checking_length(&[0u8; 257]).err(),
+            Some(257)
+        );
+        assert_eq!(RpcKeys::from_token_checking_length(&[]).err(), Some(0));
+        // 「夠長」不算：32 byte 導得出鑰，但不是規格的 token。
+        assert_eq!(
+            RpcKeys::from_token_checking_length(&[0u8; 32]).err(),
+            Some(32)
+        );
     }
 
     #[test]

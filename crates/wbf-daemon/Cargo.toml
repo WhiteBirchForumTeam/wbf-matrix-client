@@ -27,8 +27,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
-# 資料平面的 HTTP（/docs/design/rpc-specs/data-plane.md）：hyper 本來就在依賴樹裡（reqwest），這裡只多開 server 那半。
-hyper = { version = "1", features = ["server", "http1"] }
+# 資料平面的 HTTP（/docs/design/rpc-specs/data-plane.md）：hyper 本來就在依賴樹裡（reqwest）。server 那半給 daemon，
+# client 那半給 `client.rs`（rpc-cli 的 put／get，/docs/design/rpc-specs/rpc-cli.md §3）。
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"

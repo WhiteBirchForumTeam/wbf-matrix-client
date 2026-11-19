@@ -231,21 +231,6 @@ impl EventSink {
             text: message.into(),
         });
     }
-
-    /// 發一個有數字的進度。
-    ///
-    /// Args:
-    ///     done: 已完成, example: 3
-    ///     total: 總數；不知道就 None, example: Some(10)
-    ///     text: 給人看的一句話, example: "chunk 3/10"
-    pub(crate) fn progress_of(&self, done: u64, total: Option<u64>, text: impl Into<String>) {
-        self.emit(CoreEvent::Progress {
-            job: crate::job::current(),
-            done,
-            total,
-            text: text.into(),
-        });
-    }
 }
 
 impl Default for EventSink {

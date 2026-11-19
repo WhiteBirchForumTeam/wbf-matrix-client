@@ -43,51 +43,43 @@ Kotlin 的 OkHttp 內建，JS 原生。
 ## 3 token：前端產生，前端叫起 daemon
 
 **前端與 daemon 必然成對出現**（維護者 2026-09-09）——有 rpc-cli 就有 daemon，有 Desktop 就有 daemon。
-所以 token 由**前端**產生，不是 daemon。⭐ 而它落在磁碟上**只是為了交給一個還沒啟動的程序**，
-所以那段落地時間要盡量短（維護者 2026-09-13 定的五步）：
+所以 token 由**前端**產生，不是 daemon；用**環境變數**交給它要起的那支 daemon，**從頭到尾不落地**（維護者 2026-11-17，取代 2026-09-13 的 token 檔五步）：
 
 | 步 | 誰 | 做什麼 |
 |---|---|---|
-| 1 | 前端 | 產生 **256 byte 隨機檔**（例如 `<data dir>/daemon.token`，Unix **0600**） |
-| 2 | 前端 | spawn `daemon -s --token-file <路徑>`。🚫 **不用命令列傳內容**：那會進 `ps` 輸出 |
-| 3 | daemon | 讀它、導出金鑰（§4）、開 port、**宣告 ready** |
-| 4 | 前端 | 收到 ready（或自己 `hello` 成功）之後**抹掉**那個檔 |
-| 5 | — | 此後 token 只活在兩個程序的記憶體裡，**磁碟上沒有** |
+| 1 | 前端 | 產生 256 byte 隨機 token，標準 base64（含 padding）之後放進**子程序的**環境變數 `WBF_DAEMON_TOKEN`，spawn `daemon -s --data-dir <D>`。禁止用命令列參數傳：那會進 `ps` 的輸出 |
+| 2 | daemon | 在起 runtime、開任何執行緒**之前**讀它、**從自己的環境裡清掉**（之後它起的子程序不會繼承到）、導出金鑰（§4）、開 port、**宣告 ready** |
+| 3 | — | token 只活在兩個程序的記憶體裡，**磁碟上沒有** |
 
-- ⚠️ **daemon 讀完就不再回頭讀那個路徑**，所以第 4 步刪掉它不會讓任何東西壞掉（`crates/wbf-daemon/tests/loopback.rs`
-  有一條測這件事）。反過來說，🚫 **不要設計「重讀 token」**——那會把第 5 步整個推翻。
-- 🚨 **誰起的誰動**（維護者 2026-09-13）：token 檔屬於**叫起 daemon 的那個程序**。
-  daemon **默認完全不動它** —— 🚫 不抹、🚫 不刪、🚫 不改權限、🚫 不寫回去。它只讀一次。
-  ⭐ 理由：daemon 不知道是誰起的它、也不知道那個前端收到 ready 了沒有，而「替別人清掉他的檔」
-  猜錯的代價是前端還沒讀完設定就少了一個檔。
-  ⭐ 代價寫明：前端在第 3、4 步之間死掉，那個檔會留在磁碟上 —— 那是**那個前端**下次啟動時要處理的
-  （重新產生一把，舊的照第 4 步抹掉），🚫 不是 daemon 的事。
-- 🚫 **不重用既有的 token**：抹掉之後就沒有既有的那份了；重連就重產生。一把 token 活得越久，
-  它落在磁碟上的那幾秒就越不只是那幾秒（備份、快照、同步資料夾都會抄走它）。
-- **daemon 的 token 檔權限是 fail closed 的**：Unix 上 group／other 有任何讀取位元就**拒絕啟動**，
-  🚫 不是印個警告照跑。
-- 📎 這比「daemon 產生、前端去讀」好的地方：**web 前端不必去讀檔案**——token 本來就是它給的。
+```text
+前端:   token = 256 byte OS 亂數（wbf_daemon::token::new_token）
+        spawn wbf-matrix-client-daemon -s --data-dir D   環境：WBF_DAEMON_TOKEN=<base64(token)>
+daemon: take_token_from_env() → 讀、清掉、驗長度 → RpcKeys::from_token_checking_length → AccessKeys::from_token → 丟掉 token
+stdout: {"ready":true,"rpc_port":8604,"data_port":8605,"pid":45372,"instance":"8952a68f-ee91-4e05-a1a3-66d4ebee4f98"}
+```
 
-**第 3 步的 ready 是一個「邊緣」，不是一個狀態**（不然前端會把上一次殘留的 port 當成這一次的）：
+- **fail closed**：沒帶、不是 UTF-8、解不開 base64、長度不是 256 byte → **拒絕啟動**、stderr 講清楚原因（`crates/wbf-daemon/src/token.rs`；`crates/wbf-daemon/tests/process.rs` 真的 spawn 驗）。
+  沒帶 `-s` 也不啟動：daemon 只有常駐這一種起法（單發模式不做，/docs/design/rpc-specs/rpc-cli.md §4）。
+- **讀完就清**：清掉的是 daemon 自己的環境；這樣它之後起的任何子程序都拿不到。讀與清都在 `main` 的第一行、解析參數之前（參數錯了一樣要清）。
+- **安全邊界跟以前的 0600 檔一樣**：同一個 OS 帳號的程序讀得到別的程序的環境變數（Linux 的 `/proc/<pid>/environ`，Windows 也做得到），跟 0600 擋的是同一層。
+  差別是少了「在磁碟上那幾秒」，所以以前那一套（檔案權限檢查、三遍抹寫、「覆蓋是盡力不是保證」）都不需要了，跟著 `--token-file` 一起拿掉。
+- **禁止重用既有的 token**：重連就重產生一把、起一支新的 daemon。一把 token 活得越久，被抄走的機會越多。
+- **禁止設計「重讀 token」**：daemon 讀一次就清掉了，第 3 步就是靠這個成立。
+- 📎 這比「daemon 產生、前端去讀」好的地方：**前端不必去讀任何檔**——token 本來就是它給的。
+- 📎 **沒帶 token 時 daemon 自己產生一把**（給它自己送出的 web 網頁用）是維護者 2026-11-17 定的方向，下一支（web 樣板）才做；現在沒帶就拒絕啟動，免得起出一支誰都連不上的 daemon。
+- 📎 Android 的 JNI 是同一個程序裡的函式呼叫，不是 spawn：`daemon_start` 直接收 token 的 bytes（/docs/design/overview/architecture-v2.md §4）。
 
-1. daemon 綁定**之前**先刪掉舊的 `<data dir>/daemon.json`（刪不掉就不啟動）。
-2. 綁好之後才 **temp＋rename** 寫進去（`{ "rpc_port", "data_port", "pid", "instance" }`）——前端 watch 到
+**第 2 步的 ready 是一個「邊緣」，不是一個狀態**（不然前端會把上一次殘留的 port 當成這一次的）：
+
+1. daemon 拿到資料目錄的寫權之後、綁定**之前**先刪掉舊的 `<data dir>/daemon.json`（刪不掉就不啟動）。
+2. 綁好之後才 **temp＋rename** 寫進去（`{ "rpc_port", "data_port", "pid", "instance" }`，**沒有** token）——前端 watch 到
    它出現時，port 一定已經在聽，而且一定不是上一次的。
-3. 同時 **stdout 印一行 JSON**：`{"ready":true,"rpc_port":…,"data_port":…,"pid":…,"instance":"<uuid>"}`。
-   spawn daemon 的那個程序手上有 pipe，這樣它不必去 watch 檔案。🚫 stdout 只有這一行，其餘一律 stderr。
+3. 同時 **stdout 印一行 JSON**（上面那行）。spawn daemon 的那個程序手上有 pipe，這樣它不必去 watch 檔案。stdout 只有這一行，其餘一律 stderr。
    📎 `instance` 是這次啟動鑄的 UUID v4，`hello` 與 `daemon.info` 回的是**同一個**（/docs/design/rpc-specs/rpc-spec.md §1.3）：
-   前端拿它判斷「還是剛才那一個 daemon 嗎」——⚠️ 🚫 不要拿 port 或 pid 判斷，那兩個都會被重複使用。
+   前端拿它判斷「還是剛才那一個 daemon 嗎」——⚠️ 禁止拿 port 或 pid 判斷，那兩個都會被重複使用。
 4. daemon 結束時刪掉 `daemon.json`。
 
-**第 4 步的「抹掉」有規定的做法**（`wbf_daemon::token::shred`，維護者 2026-09-13 指定）：
-**隨機 bytes → 填滿 `0xFF` → 填滿 `0x00`，每遍都 flush＋sync，最後才 `remove_file`**。
-
-- 順序的理由：隨機那遍是唯一「連舊值的統計痕跡都蓋掉」的一遍；後兩遍讓人**看得出這個檔被故意清過**。
-- 先 sync 再解除連結：反過來的話目錄項先消失，覆蓋就寫進一個沒有名字的檔。
-- ⚠️ **覆蓋是盡力不是保證**：SSD 的抹寫層與 CoW 檔案系統（APFS、Btrfs、ZFS、VSS 快照）可能把舊內容
-  留在別處，那不是使用者空間管得到的。🚫 所以別把它當成「這個 token 從此不可能被撿回來」——
-  真正的防線是**它只有幾秒鐘在磁碟上**加上 0600。📎 但盡力仍然值得：它擋掉最廉價的那一類
-  （`undelete`、目錄項還在的救援工具、被抄走的備份）。
+📎 前端那一頭的實作在 `crates/wbf-daemon/src/client.rs`（`spawn_daemon` 讀 ready、`RpcClient::connect`），rpc-cli 用的就是它（/docs/design/rpc-specs/rpc-cli.md §3）。
 
 ## 4 每則控制訊息都加密（token 就是金鑰材料）
 
@@ -111,17 +103,17 @@ aad     = "wbf-rpc v1"
   而且它的 JSON **跟正常回應同一個形狀**（`code` 9xxx、`result.close`），前端的 frame 翻譯器只有一條路。
 - **加密是 daemon 的全局狀態 `encryption_enforced`，預設開**：開著時 client 送 `0x01` 一律拒絕；
   只有走密文呼叫 `daemon.set_encryption { enforced: false }` 才降級（除錯用，/docs/design/rpc-specs/rpc-spec.md §1.1）。
-  🚫 所以 `hello` **不帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
+  所以 `hello` **不帶 token 欄位**，它只用來協商協議版本（一個協商表，不是一個數字）、報上 client 名字
   （正式名稱、`wbf-matrix` 開頭，/docs/design/rpc-specs/rpc-spec.md §1.3）。
-- frame 上限 **1 MiB**：超過就關連線（🚫 不讓對方用一個巨大 frame 把記憶體吃光）；
+- frame 上限 **1 MiB**：超過就關連線（**不**讓對方用一個巨大 frame 把記憶體吃光）；
   這個數字跟 §8「超過就走資料平面」是同一個。
 
 **為什麼要加密（而不是只靠 token 認證）**
 
 維護者 2026-09-09：既然可選，傾向用**有保護力**的。
 ⚠️ 老實說收穫的邊界：加密擋的攻擊者有限——能監聽 loopback 的人（要 root／管理員或 npcap）
-通常也能讀你的記憶體與 token 檔。**真正的收穫是完整性**：Poly1305 標籤讓「改一個 bit 讓
-`false` 變 `true`」這種事驗不過。🚫 所以這裡要的是 **AEAD**，不是任何形式的自製混淆——
+通常也能讀你的記憶體與程序的環境變數（token 就在那裡）。**真正的收穫是完整性**：Poly1305 標籤讓「改一個 bit 讓
+`false` 變 `true`」這種事驗不過。所以這裡要的是 **AEAD**，**不**是任何形式的自製混淆——
 沒有標籤的東西擋不住惡意修改，而控制平面上一個被改過的 `true` 就足以刪掉東西。
 
 📎 用的是 `XChaCha20-Poly1305`，跟 chunk 加密、vault、目錄名加密同一個 crate，沒有新依賴。
@@ -145,11 +137,11 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 
 - **passphrase 只留在 daemon 的記憶體裡，直到 daemon 關閉**（維護者 2026-09-09）。
   所以不需要 `unlock.ticket` 那種「明文主金鑰落地」的妥協（/docs/design/storage/vault-and-keys.md §1）——這是 daemon 最直接的安全收穫。
-- 🚫 **沒有「鎖回去」**：`Core` 解鎖一次就活到程序結束，daemon 沒有 `vault.lock`（/docs/design/rpc-specs/rpc-spec.md §3.1）。
+- **沒有「鎖回去」**：`Core` 解鎖一次就活到程序結束，daemon 沒有 `vault.lock`（/docs/design/rpc-specs/rpc-spec.md §3.1）。
   UI 的 lock／unlock 是 **UI 自己那一層**的事 —— daemon 照樣連著、照樣寫 DB、照樣發通知，
   ⭐ 因為使用者按 lock 通常只是暫時離開，回來要看到這段時間的訊息。真的要讓金鑰離開記憶體
   就是 `daemon.shutdown` 再 `daemon -s`。
-- 🚫 daemon **不自己去問終端**：那樣 Desktop 與 Android 沒辦法解鎖。passphrase 一律從 RPC 進來（🚫 也不收 `passphrase_file`，/docs/design/rpc-specs/rpc-spec.md §3.1）。
+- daemon **不自己去問終端**：那樣 Desktop 與 Android 沒辦法解鎖。passphrase 一律從 RPC 進來（也**不**收 `passphrase_file`，/docs/design/rpc-specs/rpc-spec.md §3.1）。
 - 未解鎖時資料平面回 **503 而不是 404**：媒體確實存在，只是現在打不開——這個區別對前端有意義。
 
 ## 6 訊息形狀（加密之前的內容）
@@ -158,7 +150,7 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 `method` ＋ `params` ＋ `id`、有 `id` 要回、沒有 `id` 不回——這幾條照抄，因為它們好用。
 
 ⚠️ 但**回應的形狀不一樣**（標準是 `result`／`error` 二選一，這裡是 `code`／`msg` 平鋪），
-所以 🚫 **不宣告 `"jsonrpc": "2.0"`**，也不要拿現成的 JSON-RPC library 來接——
+所以 **不宣告 `"jsonrpc": "2.0"`**，也不要拿現成的 JSON-RPC library 來接——
 與其假裝相容然後在某個角落炸掉，不如一開始就說清楚這是自己的東西。
 版本識別走 `hello` 的 `protocol` 欄位（/docs/design/rpc-specs/rpc-spec.md §1.3）。
 
@@ -172,7 +164,7 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 }
 ```
 
-**回應**（`code`／`msg` 平鋪在頂層，🚫 不是標準的 `result`／`error` 二選一）：
+**回應**（`code`／`msg` 平鋪在頂層，**不**是標準的 `result`／`error` 二選一）：
 
 ```json
 {
@@ -219,18 +211,18 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 
 - **`id` 由前端給**，單調遞增即可；daemon 原樣回。一條連線上可以同時有很多個未完成的 `id`。
 - **`method` 是 `名詞.動詞`**（`account.add`、`room.send_text`、`media.open`），不是 CLI 的字串命令列——
-  🚫 不要讓前端組命令列字串再由 daemon 解析，那是把 shell 的問題搬進 RPC。
+  禁止讓前端組命令列字串再由 daemon 解析，那是把 shell 的問題搬進 RPC。
 - **`code` 是穩定的整數**：`0` 是成功，其他值一個意思一個號碼、**定了就不改**（前端會拿它做判斷）。
-  `msg` 是給人看的，🚫 前端不要拿它做邏輯。code 表在 /docs/design/rpc-specs/rpc-spec.md §5。
-- **失敗時 `result` 是 `null`**，🚫 不要省略那個欄位——欄位固定在，弱型別的前端少一種 undefined 要處理。
-- **推播要先訂閱**（`subscribe`／`unsubscribe`），🚫 不預設把所有事件推給每條連線。
-- **framing 由 WS 給**：一個 binary frame 就是一則訊息，🚫 我們不自己切。
+  `msg` 是給人看的，禁止前端拿它做邏輯。code 表在 /docs/design/rpc-specs/rpc-spec.md §5。
+- **失敗時 `result` 是 `null`**，禁止省略那個欄位——欄位固定在，弱型別的前端少一種 undefined 要處理。
+- **推播要先訂閱**（`subscribe`／`unsubscribe`），**不**預設把所有事件推給每條連線。
+- **framing 由 WS 給**：一個 binary frame 就是一則訊息，我們**不**自己切。
 
 ## 7 連線數：實務上 1:1，但不寫死
 
 維護者 2026-09-09：**幾乎必然只會 1:1，RPC 只服務一個 client。**
 
-所以 🚫 **不做任何「哪個 client 是主」的概念**——沒有主從、沒有權限分級、沒有連線間的協調。
+所以 **不做任何「哪個 client 是主」的概念**——沒有主從、沒有權限分級、沒有連線間的協調。
 
 但也**不硬性拒絕第二條連線**：那反而要寫拒絕邏輯與錯誤碼，而且 Desktop 開著時想跑一下 CLI 就被擋
 （開發時很煩）。事件推播本來就要用 broadcast channel，多一條訂閱者是免費的。
@@ -259,19 +251,19 @@ daemon 起來時**一律是未解鎖**（`plain` 模式也一樣：前端要叫�
 是**把加密池接上這些現成輪子的唯一接頭**。Range 也不是額外工作：媒體池的 64 KiB 分段
 本來就是為隨機讀設計的（/docs/design/media/media-pool.md §1），`seek` 的語意早就定好了（/docs/design/media/wbf-client-convention-for-chunk.md §7）。
 
-**資料平面的認證：URL 本身就是憑證，🚫 沒有全域 token、🚫 沒有 token 表**（格式在 /docs/design/rpc-specs/data-plane.md §2）
+**資料平面的認證：URL 本身就是憑證，沒有全域 token、沒有 token 表**（格式在 /docs/design/rpc-specs/data-plane.md §2）
 
 ```
 http://127.0.0.1:<data port>/upload/mxc/e-<B58 nonce>_<B58 密文>
 http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 ```
 
-- `e-` 後面是用共享 token 加密的「用途 ‖ mxc」，上傳另外在 header 帶加密的上傳狀態（維護者 2026-09-30）：daemon 解得開就是它發的，🚫 不記、🚫 沒有 TTL。
+- `e-` 後面是用共享 token 加密的「用途 ‖ mxc」，上傳另外在 header 帶加密的上傳狀態（維護者 2026-09-30）：daemon 解得開就是它發的，**不**記、**沒有** TTL。
 - **可以重複使用**。⚠️ 不能「用一次就失效」：播放器 seek 一次就是一次新的 Range 請求，一個影片會發幾十次。
 - 認得「是哪個資源」的那段**放在 URL path 裡，不是 header**。理由是實務的：**有些媒體元件只吃 URL、不讓你設 header**
   （Android 的 ExoPlayer 可以設，很多圖片元件不行）。任何吃 URL 的東西都能直接用。
 - 代價老實寫：URL 會進到那個元件自己的 log。它是一串密文，看不出是哪個檔；讀得到那份 log 的人在 daemon 活著的期間可以拿它抓檔。
-- 認不得的 URL：一律 **404**，🚫 不分辨原因（那會變成探測工具）。
+- 認不得的 URL：一律 **404**，**不**分辨原因（那會變成探測工具）。
 - **未解鎖時一律 503**（§5）：媒體確實存在，只是現在打不開——這跟 404「沒這個東西」不一樣。
 
 ```jsonc
@@ -282,10 +274,10 @@ http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 ```
 
 前端把 `url` 直接交給播放器／圖片元件，它自己發 Range。daemon 邊解密邊吐，
-🚫 **不把整個檔案讀進記憶體**。
+**不把整個檔案讀進記憶體**。
 
 **上傳**：UI `media.create` 拿一張 PUT 的 URL、把 bytes PUT 進去，傳完拿到 manifest，再用 RPC 叫 `room.send_attachment` 帶那份 manifest 發訊息
-（/docs/design/rpc-specs/data-plane.md §0）。進度就是 PUT 送出去多少，🚫 不走 RPC（/docs/design/rpc-specs/rpc-spec.md §4）。
+（/docs/design/rpc-specs/data-plane.md §0）。進度就是 PUT 送出去多少，**不**走 RPC（/docs/design/rpc-specs/rpc-spec.md §4）。
 
 ⚠️ **Android 沒有別的選擇**：SAF 給的是 `content://` URI，**根本沒有檔案路徑可給**。
 所以 PUT 這條路在 Android 上不是「比較好」，是必要的。
@@ -293,7 +285,7 @@ http://127.0.0.1:<data port>/media/mxc/e-<B58 nonce>_<B58 密文>
 `state` 是 `local_source`、`complete`、`downloading`、`verifying`（下載完、正在比整檔 hash）、`queued`：不完整也沒原檔時 `media.open` 順便排進下載，GET 會邊等邊吐（/docs/design/media/media-download.md §12.3）。
 
 **匯出**（使用者明確要把明文放到自己選的位置）給一個 URI，現在只收 `file://`（/docs/design/media/media-download.md §7.3）。
-⚠️ **`to` 已經存在就覆蓋**（維護者 2026-10-03）：要不要覆蓋是 **UI 的事**，選位置的時候先問使用者，daemon 🚫 再擋。
+⚠️ **`to` 已經存在就覆蓋**（維護者 2026-10-03）：要不要覆蓋是 **UI 的事**，選位置的時候先問使用者，daemon **不**再擋。
 
 ```jsonc
 { "method": "media.export_to", "params": { "user": "…", "manifest": { … }, "to": "file:///home/me/video.mkv" }, "id": 15 }
@@ -334,10 +326,10 @@ homeserver  <=>  daemon 的 WS 協議層（wire、五條連線 /docs/design/over
 | 3 | daemon → 前端 | RPC 回 result：資料平面的 PUT URL |
 | 4 | 前端 → daemon | PUT bytes 到那個 URL（一個 HTTP 連線，一直送） |
 | 5 | daemon → server | 邊收邊做 chunk 加密、邊走 `Upload/*` 上傳，最後 `Seal` |
-| 6 | daemon → 前端 | `Seal` 完成之後 PUT 才回 `200`，body 是 manifest（有 mxc）。進度就是 PUT 送出去多少，🚫 不走 RPC |
+| 6 | daemon → 前端 | `Seal` 完成之後 PUT 才回 `200`，body 是 manifest（有 mxc）。進度就是 PUT 送出去多少，**不**走 RPC |
 | 7 | 前端 → daemon | RPC `room.send_attachment`，帶那份 manifest（內容是明文；daemon 用 manifest 的區塊組事件） |
 | 8 | daemon → server | 房間有 E2EE 就 Megolm 加密、沒有就明文，送到 server。附件宣告（/docs/design/rpc-specs/data-plane.md §6）在這一步帶 |
 
 ⚠️ 第 7 步**一定在第 6 步之後**：server 只認 `Seal` 過的媒體，宣告一個還在傳的 mxc 會被整則拒送（2026-09-30 對真 server 驗到）。
-🚫 daemon 不替前端發訊息：傳完之後要不要發、發到哪，是前端的決定。
-⚠️ 上傳失敗與送訊息失敗是**兩件事**，各自回錯誤、各自可重試，🚫 不要綁成一個交易。
+daemon **不**替前端發訊息：傳完之後要不要發、發到哪，是前端的決定。
+⚠️ 上傳失敗與送訊息失敗是**兩件事**，各自回錯誤、各自可重試，禁止綁成一個交易。

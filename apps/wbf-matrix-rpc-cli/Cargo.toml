@@ -1,0 +1,24 @@
+[package]
+name = "wbf-matrix-rpc-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "rpc-cli：從另一個程序丟 RPC 給 daemon（/docs/design/rpc-specs/rpc-cli.md）。命令列只是 RPC 訊息的薄封裝。"
+
+[[bin]]
+name = "wbf-matrix-rpc-cli"
+path = "src/main.rs"
+
+[dependencies]
+# client 那一頭（起 daemon、連線、call、資料平面）在 daemon 的 library 裡（/docs/design/rpc-specs/rpc-cli.md §3）。
+wbf-daemon = { path = "../../crates/wbf-daemon" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-std", "io-util", "signal"] }
+serde_json = "1"
+rpassword = "7"
+zeroize = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

@@ -12,8 +12,7 @@
 //! | `media` | `upload.*`、`media.create`／`info`／`download`／`open`／`queue`／`cancel`／`export_to`、`server.ping` |
 //! | `backup` | `backup.*` |
 //!
-//! 推播與 `subscribe` 在 `push.rs`／`server.rs`；資料平面的 HTTP 在 `data_plane.rs`，這裡只在 `media.create` 把上傳狀態封進它的 URL；`room.send_attachment` 收 UI 帶回來的 manifest。
-//! 還沒有：通用的 `cancel`（/docs/design/rpc-specs/rpc-spec.md §10；下載有自己的 `media.cancel`）。
+//! 推播與 `subscribe`、通用的 `cancel` 在 `push.rs`／`server.rs`；資料平面的 HTTP 在 `data_plane.rs`，這裡只在 `media.create` 把上傳狀態封進它的 URL；`room.send_attachment` 收 UI 帶回來的 manifest。
 
 mod accounts;
 mod backup;
@@ -135,8 +134,9 @@ fn sync_of_request(method: &str, params: &Value) -> Option<wbf_core::SyncMode> {
     if !WITH_SYNC.contains(&method) {
         return None;
     }
+    // `null` 跟寫入那組一樣是 102（`#[serde(default)]` 只管「沒給」），所以交給下面解不開、**不**回報。
     match params.get("sync") {
-        None | Some(Value::Null) => Some(wbf_core::SyncMode::default()),
+        None => Some(wbf_core::SyncMode::default()),
         Some(value) => serde_json::from_value(value.clone()).ok(),
     }
 }
@@ -996,6 +996,12 @@ mod tests {
             .await;
         assert_ne!(response.code, 0, "沒有帳號，本來就會失敗");
         assert_eq!(response.sync, Some(wbf_core::SyncMode::Server));
+        // `null` 不是「沒帶」：參數解析（`#[serde(default)]` 只管沒給）擋成 102，那次一種都沒用，回應就**不**帶。
+        let response = handle
+            .call(request("room.list", json!({ "sync": null })))
+            .await;
+        assert_eq!(response.code, 102, "{response:?}");
+        assert_eq!(response.sync, None);
         // 不認得 `sync` 的 method：欄位不在，**不是** null。
         let response = handle.call(request("daemon.info", Value::Null)).await;
         assert_eq!(response.sync, None);

@@ -18,10 +18,8 @@ use wbf_sdk::local_source::open_local_source;
 use wbf_sdk::manifest::Manifest;
 use wbf_sdk::media;
 use wbf_sdk::media_kind::{MediaKind, Verification};
-use wbf_sdk::Transport;
 
 use crate::accounts::AccountDir;
-use crate::backend_choice::MethodHome;
 use crate::download_queue::{Downloader, DownloaderParts};
 use crate::error::{CoreError, CoreErrorKind};
 use crate::event::DownloadState;
@@ -53,15 +51,6 @@ pub struct MediaGcReport {
     pub swept_missing_files: u64,
     pub swept_pending: u64,
     pub swept_orphan_files: u64,
-}
-
-/// `--no-cache` 的 CLI 下載結果（沒進池，所以沒有 `pool_file`／`source`）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct DirectDownloadResult {
-    pub out: String,
-    pub bytes: u64,
-    pub chunks: u32,
-    pub sha256_verified: bool,
 }
 
 /// 要哪個檔（/docs/design/media/media-download.md §7.1）：三種說法，金鑰從哪來不同（§3.2、§5.3）。
@@ -507,53 +496,6 @@ impl Core {
         }
     }
 
-    /// 直接逐塊下載到檔案，**繞過媒體池與佇列**（CLI 的 `--no-cache`；daemon 的 `media.export_to` 走 [`Core::export_media_to`]）。
-    ///
-    /// ⚠️ 失敗時**刪掉半成品**：一個下載到一半的檔留在那裡，下次會被當成完整的用
-    /// （/docs/design/rpc-specs/wbf-cli-spec.md §4 exit 3 的語意）。
-    pub async fn download_direct(
-        &self,
-        manifest: &Manifest,
-        out: &Path,
-        transport: Transport,
-        target: &Target,
-    ) -> Result<DirectDownloadResult, CoreError> {
-        let account = self.account_or_current(target)?;
-        let mut client = self
-            .client_of(
-                &account,
-                transport,
-                MethodHome::WbfSdkOnly,
-                LinkRole::Download,
-            )
-            .await?;
-        let mut file = std::fs::File::create(out)?;
-        let result = client
-            .download(manifest, &mut file, &mut |done, total| {
-                self.events.progress_of(
-                    done as u64,
-                    Some(total as u64),
-                    format!("chunk {done}/{total}"),
-                )
-            })
-            .await;
-        let report = match result {
-            Ok(report) => report,
-            Err(error) => {
-                drop(file);
-                let _ = std::fs::remove_file(out);
-                return Err(error.into());
-            }
-        };
-        std::io::Write::flush(&mut file)?;
-        Ok(DirectDownloadResult {
-            out: out.display().to_string(),
-            bytes: report.bytes,
-            chunks: report.chunks,
-            sha256_verified: report.sha256_verified,
-        })
-    }
-
     /// 三種說法 → 這個檔是哪一種、金鑰在哪（/docs/design/media/media-download.md §3.2「金鑰從哪來」、§12）。
     /// wbf 帳號兩種都可能（同一個房裡可以有 wbf 分塊檔與別的 client 送的標準附件）；一般 Matrix 帳號只有標準附件。
     ///
@@ -731,6 +673,18 @@ impl Core {
                     verified: Some(entry.verified),
                 });
             }
+        }
+        // 列在回來之前就寫好：UI 拿到 `media.open` 的 URL 會立刻 GET，等處理端開工才寫的話那一下是 404
+        // （/docs/design/media/media-download.md §4.4 的「job 建立」提早做；`media_begin` 已有就原樣回，處理端開工時再叫一次無妨）。
+        // 描述缺大小的區塊不寫：處理端開工時一樣會拒絕它。
+        if let (None, Some(description)) = (
+            &entry,
+            wbf_sdk::cache::MediaDescription::of_chunked_block(&manifest.block),
+        ) {
+            let mxc_here = mxc.clone();
+            cache
+                .run(move |cache| cache.media_begin(&mxc_here, &description).map(|_| ()))
+                .await?;
         }
         // 線先開好：下載處理端只借開著的線（`LinkPool::find_ws_link`），開線是 core 入口與 `link_keeper` 的事。開不起來也照排，線回來就接著拉。
         self.ensure_download_link(account).await;

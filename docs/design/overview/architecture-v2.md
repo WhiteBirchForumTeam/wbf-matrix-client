@@ -28,26 +28,24 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 拿去當 binary 的名字之後，「RPC 掛了」就分不出是協議還是那支程式——正是這一節要根除的那種語病。
 📎 `server` 這個字在這個 repo 已經指過 homeserver 與 wbfuwunel，禁止再拿它指這裡的任何東西。
 
-命令的「做什麼」全部在 `crates/wbf-core`。⚠️ `apps/wbf-cli`（binary 也叫 `wbf-cli`）現在是「解析參數 → 叫一個 core 方法 → 印 JSON」，
-還不是 rpc-cli；改走 RPC 的那一步才改名，禁止先改名：那只會製造一次沒有內容的大 diff（§6）。
+命令的「做什麼」全部在 `crates/wbf-core`。rpc-cli 在 `apps/wbf-matrix-rpc-cli`（A-2 起；以前的 `apps/wbf-cli` 直接叫 core、繞過 daemon，跟著拿掉了，/docs/design/rpc-specs/rpc-cli.md）。
 
-## 0.2 daemon 的命令列就是 RPC 的內部入口（維護者 2026-09-12 定）
+## 0.2 daemon 只有常駐一種起法；命令列操作走 rpc-cli（維護者 2026-09-12 定，2026-11-17 改）
 
-**daemon 就是 client 本體**，而且能用命令列操作。它**只有兩種起法**，而且**互斥**（維護者 2026-09-13）：
+**daemon 就是 client 本體**。它**只有一種起法**：
 
 | 帶了什麼 | 是什麼 |
 |---|---|
-| `-s`（`--serve`） | **常駐**：開本地 RPC 的 WS（/docs/design/rpc-specs/local-interface.md）與資料平面，等前端來連。**大多數時候是這個** |
-| 沒有 `-s`、帶了一個命令（`daemon <命令> <參數>`） | **單發**：起一次、執行那一個命令、就死。**測試性質**（除錯、腳本、驗收），不是日常操作。還沒做：現在帶命令會印 not implemented、exit 1 |
-| **兩個都帶** | **報錯** —— 它們是兩種不同的起法，不是「以某一邊為準」。使用者搞錯了，我們**不**替使用者猜 |
-| 兩個都沒帶 | 報錯（沒事可做） |
+| `-s`（`--serve`） | **常駐**：開本地 RPC 的 WS（/docs/design/rpc-specs/local-interface.md）與資料平面，等前端來連 |
+| 沒帶 `-s` | 報錯（`nothing to do: pass -s to serve …`）、不碰資料目錄 |
 
-⭐ 這條寫進型別裡（`StartMode`，`crates/wbf-daemon/src/main.rs`），禁止散在各處寫 `if cli.serve`：兩種起法的差別
-**不只是要不要開 port**，還包括要不要拿寫權、要不要寫 `daemon.json`、要不要宣告 ready。
+📎 以前定過第二種起法「單發」（`daemon <命令> <參數>`：起一次、執行那一個命令、就死，測試性質），一直沒做。
+維護者 2026-11-17 定**不做**：「在腳本裡跑一條命令」由 rpc-cli 的 `call` 做（每次執行起一支自己的 daemon、做完關掉，/docs/design/rpc-specs/wbf-cli-spec.md §0），
+單發就沒有使用者了。連帶拿掉的是 `StartMode` 那個型別與「兩個都帶就報錯」的規則。
 
-**資料目錄的獨佔：OS 鎖＋寫權**（維護者 2026-09-13）。要寫資料目錄的程序（daemon、`apps/wbf-cli`）對 `<data dir>/daemon.lock` 拿一把 OS 層的鎖
-（`crates/wbf-core/src/data_dir_lock.rs`，兩邊共用這一份；`std::fs::File::try_lock`／`try_lock_shared`），**拿不到就不做**，
-而且這一步排在碰那個目錄任何東西之前（尤其是刪舊的 `daemon.json`）。
+**資料目錄的獨佔：OS 鎖＋寫權**（維護者 2026-09-13）。daemon 對 `<data dir>/daemon.lock` 拿一把 OS 層的鎖
+（`crates/wbf-core/src/data_dir_lock.rs`；`std::fs::File::try_lock`／`try_lock_shared`），**拿不到就不做**，
+而且這一步排在碰那個目錄任何東西之前（尤其是刪舊的 `daemon.json`、生成 `wbf.conf`）。
 
 | 誰 | 拿哪一種 | 效果 |
 |---|---|---|
@@ -62,11 +60,10 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
                                              └ 失敗 ─> 回 109「我沒有寫的權限」
 ```
 
-| 起法 | 什麼時候拿 |
+| 什麼時候 | 拿不拿 |
 |---|---|
 | `-s` | **啟動的第一件事**（`-s` 就是「我要寫」的意思）。拿不到就不啟動 —— 禁止起來之後才發現寫不了 |
-| 單發、會寫的命令 | 那個命令進來的時候才拿；拿不到回 **`109`**（/docs/design/rpc-specs/rpc-spec.md §5.1），**不**重試、**不**降級成唯讀跑一半 |
-| `--version` 這類 | **不拿**：它連讀都不用（clap 印完就結束，根本走不到資料目錄） |
+| `--version`、`--help`、沒帶 `-s` | **不拿**：走不到資料目錄 |
 
 **檢查點只有一個**：`Handle::call()` 進 dispatch 之前。判準是**反過來寫**的 ——
 只有「正面認得、確定只在記憶體裡動」的那幾個（`hello`、`daemon.info`／`set_encryption`／`shutdown`）
@@ -77,42 +74,33 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 
 - 為什麼要鎖：`cache.db` 開在 WAL 模式（SQLite 本來就支援多程序併發）、port 預設隨機，沒有鎖的話
   兩個 daemon 可以同時開著同一個目錄互相踩（維護者 2026-09-13 指出）。
-- `-s` 起來時目錄已被別人（另一個 `-s`、或還沒死的單發）持有就拒絕啟動，**不**接手、**不**等待——
-  兩個常駐同時活著比拒絕一次嚴重得多。
-- 🚨 所以 **`-s` 跑著的時候再叫單發**：要寫權的命令拿不到鎖 → 跳錯、exit 非 0、一個字都不做，
-  訊息要講「daemon 已在常駐，改用 rpc-cli 或前端」；`--version`、`--help` 這類不碰資料目錄的照常。
-  沒有 `-s` 在跑時，單發自己就是那一次的獨佔者，做完就放。
+- `-s` 起來時目錄已被另一個 daemon 持有就拒絕啟動，**不**接手、**不**等待——兩個常駐同時活著比拒絕一次嚴重得多。
+  rpc-cli 在這時就是 exit 1、講清楚「別的前端的 daemon 在用這個目錄」（/docs/design/rpc-specs/wbf-cli-spec.md §1）。
 - ⚠️ 唯讀工具拿共享鎖，在 daemon 跑著時會**被拒** —— 那個拒絕就是答案：**去走 RPC，不要動它的檔**。
   ⭐「一邊寫一邊有人讀」的併發不是這把鎖給的，是 `cache.db` 的 WAL 給的（逐筆交易的粒度，比一把長命鎖精確）。
 - ⚠️ 鎖是**勸告式**的：只擋有來問的程序，擋**不**住直接開 `cache.db` 亂寫的程式。
 - 🚨 **資料目錄綁定 daemon，前端只能發 RPC 請 daemon 改**（維護者 2026-09-30）：「不拿 `daemon.lock` 卻寫資料是非法侵占。」
-  任何前端（UI、rpc-cli）禁止越過 daemon 直接碰資料目錄。
-  現況：`apps/wbf-cli` 還是直接叫 core，但碰資料目錄任何東西之前先拿 `daemon.lock` 的排他鎖、拿不到就拒絕（`commands.rs` 的 `lock_data_dir`）：
-  daemon 跑著時它整個被拒（連唯讀的命令也是），兩個 `wbf-cli` 也不能同時跑。
-  還沒做：改成走 RPC（它就是 rpc-cli 的前身，§6），到時候才能跟 daemon 同時用。
+  任何前端（UI、rpc-cli）禁止越過 daemon 直接碰資料目錄。A-2 起這條沒有例外了（以前的 `apps/wbf-cli` 直接叫 core，跟著拿掉）。
 - ⭐ 用 OS 的鎖而不是「寫 pid 進檔案再檢查它活著嗎」：後者必然有 race，而且 `kill -9` 之後
   會留下擋住下一次的殘留鎖；OS 的鎖由核心在程序結束時自動放手。
 
-⭐ **兩種起法走同一條路**：命令列的參數**先轉成 RPC 格式的訊息**，再丟給內部的 handle 執行。
-禁止有「命令列直接叫 core」與「RPC 叫 core」兩套分派——那是同一個問題的兩份實作，
-遲早漂移（全域 A4）。判準：單發的 `room.list --user a` 與 WS 上收到
-`{"method":"room.list","params":{"user":"a"}}` 進到 handle 的時候**長得一模一樣**。
+⭐ **只有一條路進 core**：RPC 訊息 → daemon 的 handle → core。禁止有「命令列直接叫 core」與「RPC 叫 core」兩套分派——
+那是同一個問題的兩份實作，遲早漂移（全域 A4）。rpc-cli 送的就是 WS 上的 RPC 訊息，跟任何前端一樣：
 
 ```
-命令列 arg ──解析──> RPC 訊息 ──┐
-                                ├──> daemon handle ──> core ──> wbf-sdk ──> server
-本地 WS 收到的 RPC 訊息 ──解密──┘
+rpc-cli／Desktop／Android／Python ──加密的 RPC 訊息──> daemon handle ──> core ──> wbf-sdk ──> server
 ```
 
-**rpc-cli 為什麼送 RPC 訊息、不送命令列參數**：
+**rpc-cli 為什麼送 RPC 訊息、不送 daemon 的命令列參數**：
 
 - RPC 的 WS 才是**通用標準**——不是每個前端都跟著 daemon 的 binary 走（web、Android、Python 都不會），
   把「參數格式」當成介面，每個前端都要再包一次 daemon 的命令列，不優雅也不好管。
-- 統一走 RPC，之後**Rust 端要用 RPC 的時候接口直接重用**（例如 Desktop 若用 Rust 原生，或第二個 Rust 工具）。
+- 統一走 RPC，之後**Rust 端要用 RPC 的時候接口直接重用**：前端那一頭的實作在 `wbf_daemon::client`（起 daemon、連線、`call`、推播、資料平面），
+  rpc-cli 用它，Desktop 若用 Rust 原生也用它（/docs/design/rpc-specs/rpc-cli.md §3）。
 - 所以 rpc-cli 的定位收窄成：**真的從另一個程序丟 RPC 進來，測整條路有沒有通**。
-  它的命令列只是 RPC 訊息的薄封裝，**不**長自己的邏輯。
+  它的命令列只是 RPC 訊息的薄封裝，**不**長自己的邏輯（/docs/design/rpc-specs/wbf-cli-spec.md §0）。
 
-📎 日常操作是 `daemon -s` 加前端；rpc-cli 留著是因為「同程序內轉一圈」證明不了 WS、加密、token 那一段真的通。它可以很小。
+📎 日常操作是 `daemon -s` 加前端；rpc-cli 是 debug／test／腳本用：「同程序內轉一圈」證明不了 WS、加密、token 那一段真的通，它可以。
 
 ## 1. 為什麼要這一層（三個現在就在痛的點）
 
@@ -162,7 +150,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 | 前端 ↔ daemon（控制） | **加密的 JSON over WS** | 是（XChaCha20-Poly1305，token 導出的金鑰） | **否**：同一台機器、同一個使用者 |
 | 前端 ↔ daemon（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上；靠 daemon 用共享 token 加密發的 URL 擋） | 否 |
 
-⚠️ 控制平面**加密的收穫主要是完整性**（/docs/design/rpc-specs/local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與 token 檔。
+⚠️ 控制平面**加密的收穫主要是完整性**（/docs/design/rpc-specs/local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與程序的環境變數（token 就在那裡）。
 資料平面則刻意**不加密**：它要餵給播放器與圖片元件，那些只吃普通的 HTTP；防護靠 daemon 用共享 token 加密發的 URL（/docs/design/rpc-specs/data-plane.md §2）。維護者 2026-09-30 再確認：本機 bytes 先明文，機密模式是之後的伏筆（/docs/design/rpc-specs/data-plane.md §9）。
 
 ## 3. daemon 的職責邊界
@@ -188,11 +176,11 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 
 | 前端 | 怎麼啟動 daemon | 怎麼講話 |
 |---|---|---|
-| **daemon 自己的命令列** | 就是它自己：`daemon -s` 常駐；`daemon <命令>` 單發是測試性質，常駐中再叫會跳錯（§0.2；單發還沒做） | arg → RPC 訊息 → handle，不經 socket |
-| **rpc-cli** | 連不到就自己 spawn 一個（使用者無感）。定位是**從外部程序丟 RPC 測整條路**（§0.2；還沒做，現在的 `apps/wbf-cli` 直接叫 core，§6） | 同一份 RPC |
-| **Desktop** | 可能先用 **web** 當速成框架試 RPC（維護者 2026-09-09），之後再看要不要原生 Rust。內嵌或 spawn 都行 | 同一份 RPC |
-| **Android**（JNI `.so`） | JNI 只有 **`daemon_start(data_dir, token_path) -> {rpc_port, data_port}`** 與 **`daemon_stop()`** | Kotlin 直接連 loopback WS（OkHttp 內建）；媒體 URL 直接餵 ExoPlayer |
-| **Python** | spawn daemon 程序 | 同一份 RPC |
+| **daemon 自己的命令列** | 只有 `daemon -s` 常駐這一種（§0.2）；它不收命令 | — |
+| **rpc-cli** | **每次執行 spawn 一支自己的**、做完 `daemon.shutdown`（token 用環境變數交，/docs/design/rpc-specs/local-interface.md §3）。別的前端的 daemon 佔著資料目錄時拒絕（/docs/design/rpc-specs/wbf-cli-spec.md §1） | 同一份 RPC（`wbf_daemon::client`） |
+| **Desktop** | 維護者 2026-11-17：預計原生 Rust（可以直接用 `wbf_daemon::client`）；先做一個 **web 樣板**當快速 demo／debug／驗證，由 daemon 自己送那個網頁（下一支，§7） | 同一份 RPC |
+| **Android**（JNI `.so`） | JNI 只有 **`daemon_start(data_dir, token) -> {rpc_port, data_port}`** 與 **`daemon_stop()`**（同一個程序裡的函式呼叫，token 直接收 bytes，不經環境變數） | Kotlin 直接連 loopback WS（OkHttp 內建）；媒體 URL 直接餵 ExoPlayer |
+| **Python** | spawn daemon 程序（token 放子程序的環境變數） | 同一份 RPC |
 
 📎 ⚠️ **RPC vs uniffi 還沒定**：如果不要程序隔離，Desktop 與 Android 也可以用 uniffi 直接綁 library（matrix-rust-sdk 自己就是這樣給 Element X 用的），完全不需要 RPC。兩條路的取捨是**安全隔離 vs 簡單**，不是工作量——見 §7 第 7 點。
 
@@ -287,10 +275,10 @@ WS 不會掉單一 frame，跳號只代表 server 故意丟了一包（佇列滿
 crates/wbf-wire     pack 的 codec
 crates/wbf-sdk      協議、chunk 加解密、cache.db、媒體池、vault、matrix backend、crypto 引擎（OlmEngine）
 crates/wbf-core     常駐狀態（多帳號 session、解鎖一次）、連線池、事件分發、命令本體。**沒有 RPC**
-crates/wbf-daemon   core ＋ RPC 服務。library ＋ binary（wbf-matrix-client-daemon）。**自己的命令列**也在這裡（§0.2）
-                    資料平面（`data_plane.rs`）：上傳（`PUT /upload`）與讀（`GET /media`）。還沒做：單發命令
-apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）。
-                    還沒做：改成 rpc-cli——只封裝 RPC 訊息、丟到本地 WS（§0.2），那時才改名
+crates/wbf-daemon   core ＋ RPC 服務。library ＋ binary（wbf-matrix-client-daemon，只有 -s，§0.2）
+                    資料平面（`data_plane.rs`）：上傳（`PUT /upload`）與讀（`GET /media`）
+                    前端那一頭（`client.rs`）：起 daemon、連線、call、推播、資料平面的 PUT／GET
+apps/wbf-matrix-rpc-cli   rpc-cli：參數 → RPC 訊息 → 本地 WS，印 result（/docs/design/rpc-specs/wbf-cli-spec.md）
 ```
 
 **`core` 與 `daemon` 刻意分開**，因為它們的命運不同：
@@ -309,13 +297,13 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
   公開介面上禁止出現複雜生命週期、trait object、`impl Trait`；回傳是可序列化的 DTO，錯誤是 `CoreError { kind, message }`。
   這樣它之後包 RPC 或包 uniffi 都不用改。⚠️ 往 core 加方法一樣要過這一條。
 
-### 6.1 現在那支 CLI 的假設要重新檢視
+### 6.1 舊 CLI 的假設，換成 rpc-cli 之後的答案（A-2，2026-11-19）
 
-/docs/design/rpc-specs/wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout 只印一個 JSON 物件）都建立在
-「它是開發與除錯工具，不是產品面」上。變成 rpc-cli 之後要重想的：
+/docs/design/rpc-specs/wbf-cli-spec.md §9 那些簡化（沒有互動模式、不存密碼、stdout 只印 JSON）都建立在「它是開發與除錯工具，不是產品面」上，rpc-cli 照留。
+當時列的兩個要重想的：
 
-- `--token` 模式：那是「不碰 vault、不碰帳號目錄」的路徑，在 daemon 模型下是什麼意思？
-- stdout「只印一個 JSON 物件」對 `watch` 這種串流命令本來就有例外（JSON Lines），RPC 的推播會讓這種情況變多。
+- `--token` 模式（「不碰 vault、不碰帳號目錄」的路徑）：**拿掉**。daemon 模型下沒有這條路（/docs/design/rpc-specs/rpc-cli.md §2.3）。
+- stdout「只印一個 JSON 物件」：`call` 與便利命令一行一個 JSON；`batch` 與 `watch` 是 JSON Lines（/docs/design/rpc-specs/wbf-cli-spec.md §4）。
 
 ## 7. 還開著的
 
@@ -329,6 +317,7 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
   📎 `Client::olm_machine_for_testing()` 也拿得到，但它掛在 `testing` feature 底下，會把 `wiremock` 等拖進出貨的 binary，只能當 spike。
 - **第 4 點：daemon 的生命週期**：誰負責關掉它、閒置多久自己結束、多個前端同時連著時誰說了算。
   兩個 daemon 搶同一個資料目錄已經有答案：§0.2 的排他鎖，後來的起不來。
+  rpc-cli 的答案也有了：它自己起、自己關，**不**附掛別人的 daemon（/docs/design/rpc-specs/rpc-cli.md §1 的甲）。
   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。要等 Desktop 的實際使用模式出來再定。
 - ~~第 5 點：資料平面 token 的 TTL 與撤銷~~ 已定（維護者 2026-09-30）：**沒有** TTL、**沒有** token 表。URL 是用共享 token 加密的 access key，
   daemon 重開就全部失效，帳號登出之後 core 照樣拒（/docs/design/rpc-specs/data-plane.md §2）。
@@ -347,6 +336,8 @@ apps/wbf-cli        參數解析與 JSON 輸出，直接叫 core（不經 RPC）
   長期若要原生則是 egui／iced／slint／gtk-rs 這一類。
   ⚠️ 原生 Rust GUI 的傳統弱項（長列表虛擬化、IME 中文輸入）要單獨驗；web 那批沒有這個問題，
   但多一層 runtime。評估維度見 /docs/handover.md §7。
+  📎 維護者 2026-11-17：Desktop 預計原生 Rust；先做一個 web 樣板當快速 demo／debug／驗證，由 daemon 自己送那個網頁。
+  沒帶 token 時 daemon 自己產生一把給網頁用（/docs/design/rpc-specs/local-interface.md §3）；接法是 A-2 之後的下一支。
 - **第 9 點：續傳狀態檔放哪**：現在寫在被上傳的檔旁邊（`<file>.wbf-upload.json`，/docs/design/rpc-specs/wbf-cli-spec.md §6），那是一命令一程序時定的。
   daemon 不一定有那個目錄的寫入權，Android 的 SAF 連路徑都沒有（`crates/wbf-core/src/upload_ops.rs` 檔頭）。
 

@@ -1,7 +1,8 @@
-# rpc-cli：命令列改走 RPC（草稿，等維護者點頭）
+# rpc-cli：命令列改走 RPC（維護者 2026-11-17 定，A-2 實作）
 
 > 這份回答：`apps/wbf-cli` 怎麼從「直接叫 `Core`」變成 rpc-cli（從另一個程序丟 RPC 給 daemon）、它跟 daemon 怎麼拿到同一把 token、命令面留下什麼。
 > 對應 /docs/handover.md §7 第 3 點的後半、/docs/design/overview/architecture-v2.md §0.2／§4／§6／§6.1、/docs/design/daemon/task-supervision.md §3 的 A-2；本 repo issue #26 的 CLI 那半也在這裡。
+> 這份是**為什麼與怎麼決定的**；rpc-cli 現在的命令、參數、輸出、exit code 的權威在 /docs/design/rpc-specs/wbf-cli-spec.md（檔名沿用舊的）。§6 四個決定都照建議定了；實作時跟草稿不一樣的地方在 §9。
 
 ## 0. 為什麼要做
 
@@ -33,7 +34,9 @@
 
 **甲的代價**：每次執行都要起 daemon、解鎖（有 passphrase 時要跑金鑰衍生）；解鎖之後 daemon 會在背景開線（每個 wbf 帳號五條，/docs/design/daemon/link-pool.md §3.1），關機時最多等它 5 秒。
 
-- 批次模式（§2.1 的 `--stdin`）讓一串命令共用一次起動，腳本與驗收主要走這條。
+- 批次模式（§2.1 的 `batch`）讓一串命令共用一次起動，腳本與驗收主要走這條。
+- 實跑量到的（2026-11-19，debug build、本機 wbfuwunel）：一次 `call daemon.info`（沒有帳號）約 2.7 秒；連續跑十幾次、每次都開五條線，server 會用 429 拒絕開線（exit 4）。
+  一次執行讀加密房，別台剛分來的房間金鑰可能還沒到（`Keys` 線才剛開）；這些都寫進了 /docs/design/rpc-specs/wbf-cli-spec.md §3、§3.4。
 - 📎 考慮過「rpc-cli 起的 daemon 不在背景開線」的旗標，**這支不做**：收金鑰的 `Keys` 線與收房間推播的 `Rooms` 線沒有命令會用，只有背景開線會開（/docs/design/daemon/link-pool.md §3 的「訂閱線」），
   關掉它們，別台裝置分來的房間金鑰就收不到，讀加密房會看到解不開的訊息。先量實際的起動時間，嫌慢再談。
 
@@ -61,12 +64,12 @@
 ### 2.1 核心：`call`
 
 ```text
-wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] call <method> [params JSON]
-wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一個 {"method","params"}
+wbf-matrix-rpc-cli --data-dir D [--passphrase-file F] call <method> [params JSON]
+wbf-matrix-rpc-cli --data-dir D [--passphrase-file F] batch      # stdin 每行一個 {"method","params"}
 ```
 
 - `call`：送一則 RPC，`result` 印到 stdout（一個 JSON 物件），錯誤印到 stderr、exit code 照 /docs/design/rpc-specs/rpc-spec.md §5.2 那一欄（已經定好，例：`105` → 130、1402 → 5）。
-- `--stdin`：每行一則請求，每則回應印一行（JSON Lines，帶 `id` 與 `code`）。遇到第一個錯就停，exit code 用那個錯的。
+- `batch`：每行一則請求，每則回應印一行（JSON Lines，帶 `id` 與 `code`）。遇到第一個錯就停，exit code 用那個錯的。
 - 解鎖在送命令之前做：`--passphrase-file`，沒給而 vault 要 passphrase 就問終端；`plain` 模式不問（/docs/design/rpc-specs/local-interface.md §5：daemon 不自己問終端）。
 - `id` 由 rpc-cli 發，使用者不用管。
 
@@ -117,7 +120,7 @@ wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一
 - 測試裡那三份自己拼的 client 換成它：三份變一份（全域 A4）。
 - 代價：rpc-cli 要依賴 `wbf-daemon` 的 library（會帶進 hyper 那些）。rpc-cli 本來就要 spawn 同一包的 daemon，可以接受。
   另一條路是拆一個 `wbf-rpc-client` crate，等真的有第二個 Rust 前端再拆不遲。
-- 找 daemon 的執行檔：rpc-cli 同一個目錄的 `wbf-matrix-client-daemon`（Windows 加 `.exe`），`--daemon-path` 可以覆寫。
+- 找 daemon 的執行檔：rpc-cli 同一個目錄的 `wbf-matrix-client-daemon`（Windows 加 `.exe`），`--daemon`（或 `WBF_DAEMON`）可以覆寫。
 
 ## 4. 跟著改的
 
@@ -144,11 +147,12 @@ wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一
 ## 6. 要維護者決定的
 
 1. **拿 token 的方式**：甲（一次執行一支 daemon；別的前端的 daemon 在跑時拒絕）。建議甲。
-2. **命令面**：一個通用 `call`（加 `--stdin` 批次）＋ §2.2 的五個便利命令；`send --text` 的加密房流程、`--token` 模式、`files --save`、`watch` 的各種模式拿掉。建議照這樣。
+2. **命令面**：一個通用 `call`（加 `batch` 批次）＋ §2.2 的五個便利命令；`send --text` 的加密房流程、`--token` 模式、`files --save`、`watch` 的各種模式拿掉。建議照這樣。
 3. **client 放哪**：`wbf_daemon::client`，測試的三份換成它。建議放這裡。
 4. **daemon 的單發模式**：改成不做。建議不做。
 
 已定（2026-11-17）：token 改用環境變數 `WBF_DAEMON_TOKEN` 交、拿掉 `--token-file`（§1.1）。
+維護者 2026-11-17「好開工吧」：上面四個都照建議。
 
 ## 7. 驗收
 
@@ -165,7 +169,37 @@ wbf-matrix-rpc-cli [--data-dir D] [--passphrase-file F] --stdin      # 每行一
 ## 8. 不做的
 
 - 附掛到別的前端起的 daemon（§1 的丙，/docs/design/overview/architecture-v2.md §7 第 4 點）。
-- 互動式 REPL：`--stdin` 批次已經夠腳本用。
+- 互動式 REPL：`batch` 已經夠腳本用。
 - rpc-cli 自己的重試、進度條、輸出改形：它是薄封裝。
 
 📎 規模估計：rpc-cli 約 600 行、`wbf_daemon::client` 約 400 行；刪掉舊 CLI 約 2000 行，以及 core 裡沒人用的幾支方法。
+
+實際：rpc-cli 953 行（`main.rs` 666、`session.rs` 287）、`wbf_daemon::client` 563 行；刪掉舊 CLI 2383 行。
+
+## 9. 實作時跟草稿不一樣的、與順手修的（A-2，2026-11-19）
+
+| 草稿 | 實作 | 為什麼 |
+|---|---|---|
+| `--stdin` 旗標 | `batch` 子命令 | 旗標會跟 `call` 打架（兩個都帶算什麼）；子命令一看就知道是另一種用法 |
+| `--daemon-path` | `--daemon`（或 `WBF_DAEMON`） | 跟其他旗標一樣短；環境變數讓腳本不必每次帶 |
+| 測試的三份 client 都換 | 只有 `crates/wbf-daemon/tests/real_server.rs` 換成 `RpcClient` | `loopback.rs`、`process.rs` 測的就是 frame 本身（壞的版本、明文 frame、重複 id、token 不對），用 client 反而測不到；`RpcClient` 多了 `take_buffered_pushes` 給它看推播 |
+| `get` ＝ `media.open` → `GET` | GET 回 502 而檔還在排或在拉時，等 `media.download` 推到 `complete` 再讀一次 | 每次執行是剛起的 daemon，帶金鑰的事件常常還沒進快取，現拉不了；從池讀就不需要事件（/docs/design/rpc-specs/wbf-cli-spec.md §3.3） |
+| — | `watch --timeout` 沒帶 `--count` 是「看這麼久」、exit 0；帶了 `--count` 沒收滿才是逾時 5 | 舊 CLI 的 `wait <秒>` 與 `once --timeout` 兩種語意，用有沒有 `--count` 分開 |
+| — | clap 的用法錯回 1（不是 clap 預設的 2） | 2 在這裡是「server 拒絕」 |
+
+順手修的（對真 server 走一輪時撞到）：
+
+- **`media.open` 回來時 `media` 那一列還沒寫**（`crates/wbf-core/src/media_ops.rs` 的 `ensure_queued`）：列本來等下載處理端開工才寫，UI 拿到 URL 立刻 GET 就是 404。
+  改成排進佇列之前先寫（`media_begin` 本來就冪等）；測試 `the_media_row_exists_by_the_time_media_open_returns`。
+- **`client::get` 把錯誤的 body 寫進輸出**：只有 200／206／412 才寫，其他收進 `DataReply::refusal`。
+- **Ctrl+C**：終端裡 daemon 跟 rpc-cli 在同一個 console、兩個都收到。`finish` 送不出 `daemon.shutdown`（daemon 已經在關）不算錯，判準是 daemon 結束了沒有；`watch` 優先看 Ctrl+C，監聽只建一次。
+- **`wbf.conf` 起手式的 `READ_RECEIPTS` 寫在 `[general]`**：改成 /docs/design/rpc-specs/wbf-cli-spec.md §10.1 與 /docs/design/messages/read-receipts.md §5 說的 `[read]`。
+- core 與 sdk 叫人去跑 `login` 的錯誤訊息，改成 `account.add`。
+- 規格核對（/docs/design/rpc-specs/rpc-spec.md 逐支對實作）抓到的程式那一邊：讀的 method 帶 `"sync": null` 回 102、回應卻宣稱用了 `local`
+  （`crates/wbf-daemon/src/handle/mod.rs` 的 `sync_of_request`）——`null` 改成跟認不得的值一樣不回報。其餘都是規格寫錯或沒寫，改在規格上。
+
+core 裡只剩舊 CLI 在用、跟著刪掉的：`Core::download_direct`（與 `DirectDownloadResult`）、`Core::upload_stream`、`Core::seek_read`（與 `SeekResult`、`SeekSummary`；SDK 的 `seek_read` 留著，資料平面的讀塊照同一套算）、
+`Core::current_user_id`、`Core::is_wbf_account_for`、`EventSink::progress_of`。
+
+⚠️ **留給之後**：`progress_of` 是唯一發帶數字的 `CoreEvent::Progress` 的地方，而它的兩個呼叫點（`upload_stream`、`download_direct`）都只有舊 CLI 在用——
+所以 `progress` 推播（/docs/design/rpc-specs/rpc-spec.md §4）在 daemon 這邊**本來就沒有來源**，現在連 core 裡也沒有了；長工作的進度只走 `note`。推播的型別先留著（它是協議的一部分），要不要讓 `upload.file` 這類發帶數字的進度、還是從規格拿掉，另外決定。

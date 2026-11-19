@@ -3,7 +3,7 @@
 //! ⚠️ 這一家是**會刪檔**的，所以 fail closed 的規矩最多；每一條的理由都在
 //! /docs/design/keys/room-key-backup.md §7 與 /docs/design/storage/local-cache-db.md §5。
 //!
-//! 這裡的訊息**不提任何命令名字**（`wbf-cli key-backup recovery` 那種）：core 不知道
+//! 這裡的訊息**不提任何命令或 method 名字**（`backup.recovery` 那種）：core 不知道
 //! 呼叫它的是 rpc-cli、Desktop 還是 Android（/docs/design/overview/architecture-v2.md §3）。它只說**條件**，前端照
 //! [`CoreErrorKind::HistoryWouldBeLost`] 補上自己的那句話。
 
@@ -657,7 +657,7 @@ fn remove_error(path: &std::path::Path, error: std::io::Error) -> CoreError {
 /// 閘門擋下來時的訊息：`why` 是這一次為什麼擋，後面接一律相同的出路。
 ///
 /// **不提命令名字**：core 不知道呼叫它的是誰（/docs/design/overview/architecture-v2.md §3）。前端看到
-/// [`CoreErrorKind::HistoryWouldBeLost`] 再補上自己那句 `wbf-cli …`。
+/// [`CoreErrorKind::HistoryWouldBeLost`] 再補上自己那句話。
 fn refusal(account: &AccountDir, why: &str) -> CoreError {
     CoreError::new(
         CoreErrorKind::HistoryWouldBeLost,
@@ -1313,7 +1313,7 @@ mod tests {
 
         let error = refusal(&account, "the server could not be reached");
         assert_eq!(error.kind, CoreErrorKind::HistoryWouldBeLost);
-        assert!(!error.message.contains("wbf-cli"), "{}", error.message);
+        assert!(!error.message.contains("rpc-cli"), "{}", error.message);
         assert!(error.message.contains("alice"), "{}", error.message);
         let _ = std::fs::remove_dir_all(&dir);
     }

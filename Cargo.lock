@@ -4234,21 +4234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wbf-cli"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "rpassword",
- "serde",
- "serde_json",
- "tokio",
- "wbf-core",
- "wbf-sdk",
- "zeroize",
-]
-
-[[package]]
 name = "wbf-core"
 version = "0.1.0"
 dependencies = [
@@ -4290,6 +4275,20 @@ dependencies = [
  "uuid",
  "wbf-core",
  "wbf-sdk",
+ "zeroize",
+]
+
+[[package]]
+name = "wbf-matrix-rpc-cli"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "rpassword",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wbf-daemon",
  "zeroize",
 ]
 

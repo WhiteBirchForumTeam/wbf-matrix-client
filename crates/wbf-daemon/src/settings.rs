@@ -86,6 +86,50 @@ pub struct Reloaded {
 }
 
 impl Settings {
+    /// 自動生成的 `wbf.conf` 要寫的鍵：這次生效的值（/docs/design/rpc-specs/rpc-cli.md §4；以前是舊 CLI 寫，CLI 不再碰資料目錄之後搬到 daemon）。
+    /// 只在 `<data dir>` 裡還沒有 `wbf.conf`、也沒用 `--config` 指別的時候寫，所以每個值都是內建預設。
+    ///
+    /// Return:
+    ///     Vec<conf::Entry>  example: [{section:"backup", key:"SERVER_BACKUP", value:"on", origin:"built-in default"}, …]
+    pub fn starter_conf_entries(&self) -> Vec<conf::Entry> {
+        let on_off = |on: bool| if on { "on" } else { "off" }.to_string();
+        let origin = conf::origin_of(false, false);
+        vec![
+            conf::Entry {
+                section: "general",
+                key: "TRANSPORT",
+                value: match self.transport {
+                    Transport::WebSocket => "ws",
+                    Transport::Http => "http",
+                }
+                .to_string(),
+                origin,
+            },
+            conf::Entry {
+                section: "read",
+                key: "READ_RECEIPTS",
+                value: match self.read_receipts {
+                    ReadReceipts::Private => "private",
+                    ReadReceipts::Public => "public",
+                }
+                .to_string(),
+                origin,
+            },
+            conf::Entry {
+                section: "backup",
+                key: "SERVER_BACKUP",
+                value: on_off(self.server_backup),
+                origin,
+            },
+            conf::Entry {
+                section: "backup",
+                key: "LOCAL_ROOM_KEYS",
+                value: on_off(self.local_room_keys),
+                origin,
+            },
+        ]
+    }
+
     /// Args:
     ///     explicit_conf: `--config`, example: None
     ///     data_dir: example: "<data dir>"

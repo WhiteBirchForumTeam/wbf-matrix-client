@@ -711,7 +711,7 @@ fn store_open_error(store_dir: &Path, error: &dyn std::fmt::Display) -> SdkError
     } else {
         // store 是上游自己的狀態（裝置、sync），聊天紀錄的權威在 cache.db：刪掉重新 login 就好；不做遷移（/docs/design/storage/local-cache-db.md §1）。
         SdkError::Usage(format!(
-            "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and run `login` again"
+            "cannot open the matrix store at {path}: {error}; it was made with another key file - delete that directory and add the account again (account.add)"
         ))
     }
 }

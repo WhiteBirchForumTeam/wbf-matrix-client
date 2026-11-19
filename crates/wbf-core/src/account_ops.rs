@@ -15,7 +15,7 @@ use crate::accounts::{self, AccountDir};
 use crate::recovery;
 use crate::{Core, Target};
 
-/// 「我是誰」。🚫 刻意**沒有** `access_token`：那是秘密，不過邊界（`handles` 模組註解）。
+/// 「我是誰」。刻意**沒有** `access_token`：那是秘密，不過邊界（`handles` 模組註解）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WhoAmI {
     pub user_id: String,
@@ -76,14 +76,14 @@ impl Core {
 
     /// 這台機器保管的 recovery key 裡，對應這串 mxid 的那一把。
     ///
-    /// ⚠️ **會回傳秘密本身**——只有「使用者明說要看」的路徑該叫它（rpc-cli 的
-    /// `recovery show`）。🚫 不要拿它做判斷用；要問「有沒有保管」用
+    /// ⚠️ **會回傳秘密本身**——只有「使用者明說要看」的路徑該叫它（RPC 的
+    /// `recovery.show`）。禁止拿它做判斷用；要問「有沒有保管」用
     /// [`Core::list_recovery_key_users`]。
     ///
     /// Return:
     ///     Ok(Some(Zeroizing<String>))   那串 key
     ///     Ok(None)                      沒保管
-    ///     Err(Usage)                    只差大小寫的保管著好幾把（🚫 不猜）
+    ///     Err(Usage)                    只差大小寫的保管著好幾把（禁止猜）
     pub fn find_recovery_key(&self, user: &str) -> Result<Option<Zeroizing<String>>, CoreError> {
         let map = self.refresh_data_dir_map()?;
         let Some(user_id) = map.find_recovery_key_user_id(user)? else {
@@ -103,12 +103,6 @@ impl Core {
             device_id: who.device_id,
             server: session.server,
         })
-    }
-
-    /// `current` 指到誰（完整 mxid）。`logout` 要拿它當目標。
-    pub fn current_user_id(&self) -> Result<String, CoreError> {
-        let account = self.current_account()?;
-        Ok(self.session_of(&account)?.user_id)
     }
 
     /// 設或拿掉 `local.key` 的 passphrase。**只重包主金鑰**，其他檔案不動。
@@ -144,7 +138,7 @@ impl Core {
 
     /// `switch`／`del`／`destroy` 的 `<user>`：**一律完整 mxid**（/docs/design/rpc-specs/wbf-cli-spec.md §3.1）——
     /// 這些命令會登出、會刪檔，變更的對象不該靠猜。只給 localpart 就報錯並列出本機的帳號，
-    /// 🚫 不推測、🚫 不拿唯一一個頂替。
+    /// 禁止推測、禁止拿唯一一個頂替。
     pub(crate) fn find_account_by_full_mxid(
         &self,
         user: &str,
@@ -235,7 +229,7 @@ mod tests {
     fn a_bare_localpart_is_refused_and_the_message_lists_what_is_here() {
         let dir = scratch("bare");
         let core = unlocked(&dir);
-        // 🚫 會刪檔的命令不准靠猜：只給 localpart 就報錯。
+        // 會刪檔的命令禁止靠猜：只給 localpart 就報錯。
         let error = core.find_account_by_full_mxid("alice", None).unwrap_err();
         let message = format!("{error}");
         assert!(message.contains("expected a full Matrix ID"), "{message}");
@@ -262,7 +256,7 @@ mod tests {
         let second = core.switch_current("@bob:localhost", None).unwrap();
         assert!(second.switched_from.unwrap().contains("alice"));
 
-        // 事件走 channel，🚫 core 不印東西。
+        // 事件走 channel，core **不**印東西。
         let crate::CoreEvent::Note { text: line, .. } = events.try_recv().unwrap() else {
             panic!("switch 發的是 Note，不是別的");
         };

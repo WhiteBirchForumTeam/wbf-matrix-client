@@ -4,7 +4,7 @@
 //! <data dir>/
 //!   local.key                          一台機器一把主金鑰（vault）
 //!   current                             目前帳號：一行 "<加密的 server 目錄名>/<加密的帳號目錄名>"
-//!   r/<b58>_<b58>                       recovery key（recovery.rs）；🚫 logout 不碰
+//!   r/<b58>_<b58>                       recovery key（recovery.rs）；logout **不**碰
 //!   s/<b58>_<b58>/                      正規化過的 server host，加密（/docs/design/storage/vault-and-keys.md §2.2）
 //!     cache.db                          這個 server 上所有帳號共用的快取
 //!     a/<b58>_<b58>/                    localpart，加密
@@ -25,7 +25,7 @@
 //!
 //! 第二條路不能用算的：`@BOB:matrix.org` 加密出來的名字跟 `@bob:matrix.org` 完全不同，
 //! 而大小寫不敏感的比對**沒有算式**，只能拿現場有什麼來比。所以會刪檔的命令一律是
-//! 「**當場**刷新 → 解密 → 建 map → 比對」，🚫 不留成長命的全域狀態——存起來的那一份
+//! 「**當場**刷新 → 解密 → 建 map → 比對」，禁止留成長命的全域狀態——存起來的那一份
 //! 不會知道中間有東西被刪掉，而它決定的是刪哪個目錄。
 
 use std::path::{Path, PathBuf};
@@ -100,8 +100,8 @@ impl AccountDir {
     /// （/docs/design/storage/vault-and-keys.md §2.4）。
     ///
     /// ⚠️ Base58 區分大小寫、Windows 的檔名不區分：兩個只差大小寫的名字在 Windows 上是**同一個目錄**。
-    /// 實際上碰不到（密文 40 byte 以上的熵），但 🚫 不靠「不可能碰撞」：上層目錄裡只差大小寫的名字
-    /// 一律解密比對，不是同一個 host／localpart 就拒絕——🚫 不覆蓋、🚫 不加後綴自己找空位。
+    /// 實際上碰不到（密文 40 byte 以上的熵），但**不**靠「不可能碰撞」：上層目錄裡只差大小寫的名字
+    /// 一律解密比對，不是同一個 host／localpart 就拒絕——**不**覆蓋、**不**加後綴自己找空位。
     ///
     /// Args:
     ///     key: example: vault.account_dir_key()
@@ -153,7 +153,7 @@ impl AccountDir {
         self.session_path().exists()
     }
 
-    /// `current` 檔的內容：兩段**加密後**的目錄名。🚫 不寫明文（寫了等於把剛加密的名字再漏一次）。
+    /// `current` 檔的內容：兩段**加密後**的目錄名。**不**寫明文（寫了等於把剛加密的名字再漏一次）。
     pub fn key(&self) -> String {
         format!("{}/{}", self.server_dir_name, self.account_dir_name)
     }
@@ -168,7 +168,7 @@ impl AccountDir {
     /// ⚠️ Windows 上剛用完的 SQLite store **有時還被握著**（`os error 32`：檔案正由另一個程序使用）——
     /// 登出的閘門才剛開過一次 backend 去問 recovery 狀態，那個 handle 關掉與 OS 真的放手之間有延遲。
     /// 所以這裡**重試幾次**（2026-09-13 對真 server 跑 daemon e2e 時遇到，第二次跑就過了 —— 典型的 race）。
-    /// 🚫 重試完還是不行就回錯，不吞掉：那時多半是**別的程序**開著同一個 store（例如一個常駐的
+    /// 重試完還是不行就回錯，**不**吞掉：那時多半是**別的程序**開著同一個 store（例如一個常駐的
     /// daemon 加一個單發命令，/docs/design/overview/architecture-v2.md §0.2），而那件事必須讓呼叫端知道。
     pub fn delete_matrix_store(&self) -> Result<(), SdkError> {
         const TRIES: u32 = 10;
@@ -190,7 +190,7 @@ impl AccountDir {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AccountSummary {
     /// 權威的完整 mxid，來源是 `session.sealed`。**登出的帳號沒有**（目錄名只解得出 localpart 與 host，
-    /// 組不出可靠的 mxid），所以是 `null` —— 🚫 不自己拼一個出來騙人。
+    /// 組不出可靠的 mxid），所以是 `null` —— **不**自己拼一個出來騙人。
     pub user_id: Option<String>,
     pub server: String,
     pub localpart: String,
@@ -224,7 +224,7 @@ struct ServerEntry {
 /// 掃 `s/*/a/*` 兩層與 `r/`，解密每一段名字，做成 map（/docs/design/storage/vault-and-keys.md §2.5）。
 ///
 /// 解不開的一律跳過（fail closed）：可能是別把 `local.key` 建的，也可能是舊版留下的明文佈局。
-/// 🚫 不猜、🚫 不刪、🚫 不報錯——當它不存在。
+/// **不**猜、**不**刪、**不**報錯——當它不存在。
 ///
 /// Args:
 ///     data_dir: example: "<data dir>"
@@ -245,7 +245,7 @@ pub fn refresh_data_dir_map(data_dir: &Path, vault: &Vault) -> Result<DataDirMap
                 continue;
             }
             let server_dir_name = server_entry.file_name().to_string_lossy().into_owned();
-            // destroy 改名後還沒刪完的舊目錄：垃圾，🚫 不當成 server（/docs/design/storage/local-cache-db.md §5）。
+            // destroy 改名後還沒刪完的舊目錄：垃圾，**不**當成 server（/docs/design/storage/local-cache-db.md §5）。
             if crate::account_lock::is_to_be_deleted_dir_name(&server_dir_name) {
                 continue;
             }
@@ -354,7 +354,7 @@ impl DataDirMap {
         }
         match matches.as_slice() {
             [] => Err(SdkError::Usage(format!(
-                "no account {user}{} in {}; run `login` first",
+                "no account {user}{} in {}; add it first (account.add)",
                 server
                     .map(|server| format!(" on {server}"))
                     .unwrap_or_default(),
@@ -382,7 +382,7 @@ impl DataDirMap {
     /// Return:
     ///     Ok(Some(&str))   這台機器實際保管的那串, example: "@bob:matrix.org"
     ///     Ok(None)         沒保管
-    ///     Err(Usage)       只差大小寫的保管著好幾把——🚫 不猜，要精確的那串
+    ///     Err(Usage)       只差大小寫的保管著好幾把——**不**猜，要精確的那串
     pub fn find_recovery_key_user_id(&self, user_id: &str) -> Result<Option<&str>, SdkError> {
         Ok(find_one(
             &self.recovery_keys,
@@ -395,7 +395,7 @@ impl DataDirMap {
 
     /// 這台機器上的每個帳號（`account status`）。
     ///
-    /// 🚫 目錄名解出來的只有 localpart 與 host，組不出可靠的 mxid——權威的那串在
+    /// 目錄名解出來的只有 localpart 與 host，組**不**出可靠的 mxid——權威的那串在
     /// `session.sealed` 裡，所以這裡才需要 `vault`。
     ///
     /// Return:
@@ -427,7 +427,7 @@ impl DataDirMap {
         Ok(summaries)
     }
 
-    /// 這台機器上每個帳號的目錄，🚫 不管登入了沒（要登入的自己問 `is_logged_in`）。
+    /// 這台機器上每個帳號的目錄，**不**管登入了沒（要登入的自己問 `is_logged_in`）。
     ///
     /// Return:
     ///     Vec<AccountDir>   一個都沒有就是空的
@@ -460,7 +460,7 @@ impl DataDirMap {
         });
         any_entry.then(|| {
             format!(
-                "warning: no directory in {} could be decrypted with this local.key; if this data dir was made by an older build, delete it and run `login` again",
+                "warning: no directory in {} could be decrypted with this local.key; if this data dir was made by an older build, delete it and add the accounts again (account.add)",
                 servers.display()
             )
         })
@@ -484,7 +484,7 @@ impl DataDirMap {
 
 /// 明文比對的**唯一**規則，整個資料目錄共用：先精確，再大小寫不敏感。
 ///
-/// ⚠️ 大小寫那一輪對到兩個以上就 `Err`，🚫 不挑一個最像的 —— 這些名字決定的是刪哪個
+/// ⚠️ 大小寫那一輪對到兩個以上就 `Err`，**不**挑一個最像的 —— 這些名字決定的是刪哪個
 /// 目錄。而且**不是靜默的 None**：`destroy` 說的是「什麼都不留」，它自己不知道有沒有
 /// 留乾淨，對呼叫者就是另一種謊（PR #21 審查 rumia🟡2a）。
 ///
@@ -523,7 +523,7 @@ fn find_one<'a, T>(
 }
 
 /// `find_one` 的公開版，給資料目錄以外、但同樣要「使用者打的字串 → 權威值」的地方用
-/// （例如 `cache.db` 的 `users` 列）。比對規則只有這一份，🚫 不要在別的模組再寫一次。
+/// （例如 `cache.db` 的 `users` 列）。比對規則只有這一份，禁止在別的模組再寫一次。
 ///
 /// Args:
 ///     candidates: 權威值, example: &["@alice:localhost".to_string()]
@@ -659,7 +659,7 @@ fn verify_name_on_disk(
 /// `http://localhost:6167` → `localhost:6167`；`https://matrix.example.org` → `matrix.example.org`（預設 port 不帶）。
 ///
 /// ⚠️ 這是**加密的輸入**（/docs/design/storage/vault-and-keys.md §2.3），不是檔名了：所以要正規化到底（小寫），
-/// 🚫 不再過濾 `[A-Za-z0-9._-]` —— 那是為了當檔名才做的，留著只會讓不同的 host 撞成同一個目錄。
+/// **不**再過濾 `[A-Za-z0-9._-]` —— 那是為了當檔名才做的，留著只會讓不同的 host 撞成同一個目錄。
 pub fn server_host_of(server: &str) -> String {
     // scheme 先小寫再比：`HTTPS://x:443` 與 `https://x:443` 必須算同一台，
     // 不然 443 只在其中一邊被當成預設 port 拿掉，同一個 server 長出兩個目錄
@@ -751,7 +751,7 @@ mod tests {
         );
     }
 
-    /// 🚨 上層目錄裡有個只差大小寫、卻不是這個 server 的目錄（在 Windows 上就是同一個目錄）：拒絕，🚫 不沿用。
+    /// 🚨 上層目錄裡有個只差大小寫、卻不是這個 server 的目錄（在 Windows 上就是同一個目錄）：拒絕，**不**沿用。
     /// 自己的目錄已經在，照常過。（/docs/design/storage/vault-and-keys.md §2.4）
     #[test]
     fn a_directory_that_differs_only_in_case_but_is_someone_else_is_refused() {
@@ -938,7 +938,7 @@ mod tests {
                 .unwrap(),
             alice
         );
-        // 🚫 沒保管的就是沒有，不要挑一個最像的。
+        // 沒保管的就是沒有，禁止挑一個最像的。
         assert_eq!(
             map.find_recovery_key_user_id("@bob:localhost").unwrap(),
             None
@@ -958,7 +958,7 @@ mod tests {
             map.find_recovery_key_user_id("@Alice:localhost").unwrap(),
             Some("@Alice:localhost")
         );
-        // 🚫 只差大小寫的有兩把時不挑——而且要說出來，不是靜默當作「沒有」：
+        // 只差大小寫的有兩把時**不**挑——而且要說出來，不是靜默當作「沒有」：
         // `destroy` 說的是「什麼都不留」，它得知道自己沒留乾淨。
         let error = map
             .find_recovery_key_user_id("@ALICE:localhost")
@@ -1013,7 +1013,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// destroy 改名後沒刪完的 `🗑️…`：🚫 不當 server、🚫 不觸發「local.key 換過了」的提示。
+    /// destroy 改名後沒刪完的 `🗑️…`：**不**當 server、**不**觸發「local.key 換過了」的提示。
     #[test]
     fn to_be_deleted_server_dirs_are_skipped_by_the_scan() {
         let dir = std::env::temp_dir().join(format!(
