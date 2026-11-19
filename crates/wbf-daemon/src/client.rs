@@ -600,4 +600,54 @@ mod tests {
         assert_eq!(code_of(&json!({ "code": 0 })), 0);
         assert_eq!(code_of(&json!({ "result": {} })), 108);
     }
+
+    /// 回一則固定的 HTTP 回應的假資料平面（只收一次連線）。
+    async fn answering_once(status_line: &str, body: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reply = format!(
+            "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        port
+    }
+
+    /// 不是資料的回應（例 502）一個 byte 都不寫進輸出：錯誤的 JSON 混進下載的檔比沒寫更糟。它在 `refusal`。
+    #[tokio::test]
+    async fn a_refusal_is_not_written_where_the_file_goes() {
+        let port = answering_once("502 Bad Gateway", r#"{"code":1100}"#).await;
+        let mut sink = Vec::new();
+        let reply = get(
+            &format!("http://127.0.0.1:{port}/media/mxc/x"),
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status, 502);
+        assert!(sink.is_empty(), "{sink:?}");
+        assert_eq!(reply.refusal.as_deref(), Some(r#"{"code":1100}"#));
+
+        let port = answering_once("200 OK", "the bytes").await;
+        let mut sink = Vec::new();
+        let reply = get(
+            &format!("http://127.0.0.1:{port}/media/mxc/x"),
+            None,
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (reply.status, sink.as_slice()),
+            (200, b"the bytes".as_slice())
+        );
+        assert_eq!(reply.refusal, None);
+    }
 }
