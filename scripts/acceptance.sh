@@ -29,6 +29,8 @@ case "$PROFILE" in
 esac
 cli="$repo_root/target/$PROFILE/wbf-matrix-rpc-cli"
 [ -x "$cli" ] || cli="$cli.exe"
+daemon="$repo_root/target/$PROFILE/wbf-matrix-client-daemon"
+[ -x "$daemon" ] || daemon="$daemon.exe"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -36,7 +38,8 @@ data_dir="$work/data"
 
 # daemon 是 Windows 的程式時，JSON 裡的路徑要給它看得懂的那種（命令列參數 Git Bash 會自己轉，字串裡的不會）。
 native_path() { if command -v cygpath >/dev/null; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
-rpc() { sleep 3; "$cli" --data-dir "$data_dir" -q "$@"; }
+# 每次起一支新的 daemon（--daemon）、做完關掉：續傳那條要殺掉「這一次」的 daemon，所以不用 --attach 共用一支。
+rpc() { sleep 3; "$cli" --data-dir "$data_dir" --daemon "$daemon" -q "$@"; }
 step() { echo; echo "== $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 # JSON 的一個欄位（只認這個腳本用到的那幾種：字串、數字、true／false）。
@@ -115,7 +118,7 @@ state_file="$resume_src.wbf-upload.json"
 resume_args="{\"path\":\"$(native_path "$resume_src")\",\"cipher\":\"chacha20-poly1305\",\"chunk_size\":65536,\"sha256\":true}"
 sleep 3
 # 直接跑 exe 不經 shell 函數：$! 才是它本人。
-"$cli" --data-dir "$data_dir" -q call upload.file "$resume_args" >/dev/null 2>"$work/resume.log" &
+"$cli" --data-dir "$data_dir" --daemon "$daemon" -q call upload.file "$resume_args" >/dev/null 2>"$work/resume.log" &
 cli_pid=$!
 for _ in $(seq 1 600); do
     [ -f "$state_file" ] && break

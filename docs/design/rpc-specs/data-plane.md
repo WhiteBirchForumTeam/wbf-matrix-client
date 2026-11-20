@@ -90,7 +90,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 - **meta 綁住它的 mxc**（AAD 接 mxc）：A 檔的 meta 配 B 檔的 URL 解不開；明文模式沒有 AAD，所以解開之後兩種都再對一次 mxc。
 - **header 名字** `Wbf-Upload-Meta`：用連字號（有些代理會丟掉名字帶底線的 header）、**不**加 `X-`（RFC 6648）。
   `media.create` 直接回 `headers: { "Wbf-Upload-Meta": "…" }`，UI 照抄。
-- **共享 token** 就是 UI 產生、用環境變數 `WBF_DAEMON_TOKEN` 交給 daemon 的那份（/docs/design/rpc-specs/local-interface.md §3），RPC 的兩把鑰也從它導出；
+- **共享 token** 就是 daemon 的那份（`<data dir>/daemon.token`，/docs/design/rpc-specs/local-interface.md §3），RPC 的兩把鑰也從它導出；
   資料平面的這把用另一個 context，跟 RPC 的分開。
 - **daemon 解得開就是它發的**：**沒有** token 表、**沒有** TTL。上傳能活多久、要不要拒，是 server 的事（維護者 2026-09-30：
   「daemon 應該是更純的連線載體」）。
@@ -110,7 +110,7 @@ UploadState JSON      {"server":"http://127.0.0.1:6167","user_id":"@alice:localh
 
 📎 唯一的表是「正在收的上傳」：同一個上傳同時只收一條 PUT（兩條交錯送，串流的塊會亂），只活在那條連線的期間。
 
-📎 daemon 沒開資料平面（單發命令、沒有 `-s`）時，`media.create` 回 **100**、**不**去 server 建檔：建了也沒有地方收 bytes。
+📎 daemon 沒開資料平面（例：只起 RPC 的測試；正式的 `-s` 一定兩個都開）時，`media.create` 回 **100**、**不**去 server 建檔：建了也沒有地方收 bytes。
 `daemon.info`、`daemon.json`、ready 那行的 `data_port` 就是這個 port（啟動參數 `--data-port`，0 ＝ 隨機）。
 
 ## 3. 路徑

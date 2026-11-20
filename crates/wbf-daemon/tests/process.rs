@@ -138,6 +138,9 @@ async fn the_daemon_process_announces_ready_and_cleans_up_on_shutdown() {
     let conf = std::fs::read_to_string(dir.path().join(wbf_core::conf::CONF_FILE_NAME))
         .expect("the daemon writes a starter wbf.conf");
     assert!(conf.contains("TRANSPORT"), "{conf}");
+    // 指定的 token 也寫進 daemon.token（別的前端讀它來連，/docs/design/rpc-specs/local-interface.md §3）。
+    let written_token = wbf_daemon::token::read_token_file(dir.path()).expect("daemon.token");
+    assert_eq!(written_token.as_slice(), TOKEN.as_slice());
 
     let keys = RpcKeys::from_token(&TOKEN);
     let replies = call(
@@ -166,7 +169,7 @@ async fn the_daemon_process_announces_ready_and_cleans_up_on_shutdown() {
     assert!(status.success(), "{status:?}");
     assert!(!ready_path.exists(), "daemon.json 應該被收掉");
 
-    // 🔴 token 從頭到尾不落地：資料目錄裡沒有任何一個檔含它（原始 bytes 或環境變數那種 base64）。
+    // 正常結束收掉 daemon.token：資料目錄裡沒有任何一個檔還含它（原始 bytes 或 base64）。
     let encoded = to_env_value(&TOKEN);
     for entry in walk(dir.path()) {
         let bytes = std::fs::read(&entry).unwrap();
@@ -302,23 +305,99 @@ fn without_serve_the_daemon_does_nothing_and_says_so() {
     assert!(!dir.path().join(wbf_core::conf::CONF_FILE_NAME).exists());
 }
 
-/// 沒帶 token 就不啟動，而且講得出要放在哪個環境變數（fail closed，/docs/design/rpc-specs/local-interface.md §3）。
-#[test]
-fn without_a_token_the_daemon_refuses_to_start_and_names_the_variable() {
-    let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
+/// 沒指定 token：daemon 自己產生一把、寫進 `daemon.token`，讀那個檔就連得上；正常結束時收掉（/docs/design/rpc-specs/local-interface.md §3，維護者 2026-11-20）。
+#[tokio::test]
+async fn without_a_given_token_the_daemon_makes_one_and_writes_it_to_daemon_token() {
+    let dir = tempfile::Builder::new()
+        .prefix("wt")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"))
         .arg("-s")
         .arg("--data-dir")
         .arg(dir.path())
         .env_remove(TOKEN_ENV)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("the daemon binary runs");
-    assert!(!output.status.success(), "沒有 token 不該啟動得起來");
-    assert!(output.stdout.is_empty(), "不該印 ready");
-    let complaint = String::from_utf8_lossy(&output.stderr);
-    assert!(complaint.contains(TOKEN_ENV), "{complaint}");
+    let mut line = String::new();
+    BufReader::new(child.stdout.as_mut().expect("piped stdout"))
+        .read_line(&mut line)
+        .expect("讀 daemon 的 stdout");
+    assert!(!line.trim().is_empty(), "{}", complaint_of(child));
+
+    // 前端那一頭：daemon.json ＋ daemon.token 就連得上（rpc-cli 的 --attach 走的就是這條）。
+    let (found, token) = wbf_daemon::client::find_running_daemon(dir.path()).unwrap();
+    assert_eq!(found.pid, child.id());
+    assert_ne!(
+        token.as_slice(),
+        TOKEN.as_slice(),
+        "a fresh one, not the test's"
+    );
+    let keys = RpcKeys::from_token(&token);
+    let replies = call(
+        found.rpc_port,
+        &keys,
+        &[
+            json!({ "method": "hello", "params": { "protocols": [CURRENT_PROTOCOL], "client": "wbf-matrix-rpc-cli process-test" }, "id": 0 }),
+            json!({ "method": "daemon.shutdown", "id": 1 }),
+        ],
+    )
+    .await;
+    assert_eq!(replies[0]["code"], 0, "{}", replies[0]);
+    assert_eq!(replies[1]["code"], 0, "{}", replies[1]);
+    assert!(wait_for_exit(&mut child).success());
+    assert!(
+        !wbf_daemon::token::token_file_path(dir.path()).exists(),
+        "正常結束收掉 daemon.token"
+    );
     assert!(!dir.path().join("daemon.json").exists());
-    assert!(!dir.path().join(wbf_daemon::lock::LOCK_FILE_NAME).exists());
+}
+
+/// 起到一半出錯（ready 之後連不上、`hello` 被拒）的前端只要丟掉 `DaemonProcess`，那支 daemon 就會被殺掉、
+/// 資料目錄的鎖放掉，下一支起得來（PR #89 審查：之前那條錯誤路把 daemon 留著佔鎖）。
+#[tokio::test]
+async fn dropping_a_spawned_daemon_stops_it_and_frees_the_data_directory() {
+    let dir = tempfile::Builder::new()
+        .prefix("wk")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let daemon = std::path::Path::new(env!("CARGO_BIN_EXE_wbf-matrix-client-daemon"));
+    let first = wbf_daemon::client::spawn_daemon(daemon, dir.path(), &TOKEN, Stdio::null())
+        .await
+        .expect("the first daemon comes up");
+    drop(first);
+    // 被殺的程序放掉 OS 的檔案鎖要一點時間：在上限內重試，起得來就是放了。
+    let mut second = None;
+    for _ in 0..50 {
+        match wbf_daemon::client::spawn_daemon(daemon, dir.path(), &TOKEN, Stdio::null()).await {
+            Ok(process) => {
+                second = Some(process);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let second =
+        second.expect("the data directory is free again after the first daemon was dropped");
+    let (mut rpc, _) = wbf_daemon::client::RpcClient::connect(
+        second.ready.rpc_port,
+        &TOKEN,
+        "wbf-matrix-rpc-cli process-test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rpc.call("daemon.shutdown", Value::Null).await.unwrap()["code"],
+        0
+    );
+    rpc.close().await;
+    assert!(second
+        .wait_for_exit(std::time::Duration::from_secs(30))
+        .await
+        .unwrap()
+        .success());
 }
 
 /// token 長度不對就不啟動，而且**講得出原因**（`TOKEN_LEN`，/docs/design/rpc-specs/local-interface.md §3）。

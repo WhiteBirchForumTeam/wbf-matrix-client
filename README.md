@@ -37,8 +37,8 @@ homeserver ──wbf protocol (WS) / Matrix HTTP──> daemon ──encrypted J
 | [`crates/wbf-wire`](crates/wbf-wire) | Wire codec: packs, `EncryptedFileInfo`, CRC-32C. Pure functions, no async | ✅ Done — tested against the server's golden vectors |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | Protocol client: per-chunk AEAD, WebSocket channel, chunked upload / download / seek / resume / streaming, encrypted vault, `cache.db`, media pool, matrix-sdk adapter | 🟢 Working |
 | [`crates/wbf-core`](crates/wbf-core) | Everything a command *does*: accounts, rooms, messages, media, backend probing, the single writer for `cache.db`. No CLI, no RPC | 🟢 Working |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | The daemon binary `wbf-matrix-client-daemon`: RPC server, data-directory locking, token lifecycle | 🟢 RPC methods, push subscriptions, per-account upstream links kept open by the daemon, E2EE for text messages, the media data plane (upload, read with `Range`, a per-account download queue). ⏳ Not yet: RPC `cancel`, traditional `/_matrix/media` for ordinary Matrix servers |
-| [`apps/wbf-cli`](apps/wbf-cli) | Command-line frontend `wbf-cli`: login, rooms, send, watch, upload, download, seek, accounts, media cache | 🟢 Working (calls `wbf-core` directly for now) |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | The daemon binary `wbf-matrix-client-daemon`: RPC server, data-directory locking, the token in `<data dir>/daemon.token`; also the Rust client side (`wbf_daemon::client`) | 🟢 RPC methods, push subscriptions, cooperative `cancel`, per-account upstream links kept open by the daemon, E2EE, the media data plane (upload, read with `Range`, a per-account download queue) |
+| [`apps/wbf-matrix-rpc-cli`](apps/wbf-matrix-rpc-cli) | Command-line frontend `wbf-matrix-rpc-cli`: sends RPC to a daemon (`--attach` to the running one, or `--daemon <binary>` to start one); `call`, `batch`, `account add`/`destroy`, `put`, `get`, `watch` | 🟢 Working |
 | Desktop / Android / Python | Frontends over RPC | ⏳ Not started |
 
 ## Getting started
@@ -65,10 +65,10 @@ git submodule update --init
 
 A few notes:
 
-- The `matrix` feature of `wbf-sdk` (the matrix-sdk adapter) is off by default; `apps/wbf-cli` turns it on. To test it on its own: `cargo test -p wbf-sdk --features matrix`.
+- The `matrix` feature of `wbf-sdk` (the matrix-sdk adapter) is off by default; `wbf-core` and `wbf-daemon` turn it on. To test it on its own: `cargo test -p wbf-sdk --features matrix`.
 - Tests that need a real wbfuwunel server are `#[ignore]`d; the file header of each explains how to run it.
 - ⚠️ `cargo fmt --all` also reformats the vendored matrix-rust-sdk. Format only this workspace:
-  `cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-cli`
+  `cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli`
 
 ## Documentation
 
@@ -123,8 +123,8 @@ Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 WBFT.
 ## 為什麼
 
 - **大型加密媒體要真的能用。** 檔案切成區塊、每塊各自加密（AEAD），所以上傳與下載可以**續傳、跳著讀、邊收邊播**，而不是斷了就重來。
-- **一個 daemon，多個前端。** 資料庫與連線都在 daemon 裡；前端只講一套小而有文件的 RPC。做 UI 的人🚫 不必重寫 Matrix、加密或同步。
-- **本地優先。** UI 顯示的東西讀自加密的本地快取。要去問 server，是呼叫端**明講**才做的事，🚫 不是每捲一次就打一次。
+- **一個 daemon，多個前端。** 資料庫與連線都在 daemon 裡；前端只講一套小而有文件的 RPC。做 UI 的人**不**必重寫 Matrix、加密或同步。
+- **本地優先。** UI 顯示的東西讀自加密的本地快取。要去問 server，是呼叫端**明講**才做的事，**不**是每捲一次就打一次。
 - **一般的 Matrix server 也能用。** daemon 會探測每一台 homeserver：講 wbf 協議就用它，不講就退回標準 Matrix（透過 [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk)）。⚠️ 只有 wbf 協議才有的功能（例如分塊加密媒體）在那種 server 上是關的。
 
 ## 架構
@@ -139,7 +139,7 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 
 - **控制平面** —— JSON 訊息走綁在 `127.0.0.1` 的 WebSocket，用 XChaCha20-Poly1305 加密，金鑰由每次啟動的 token 導出。
 - **資料平面** —— 本機 HTTP，媒體的 bytes 只走這裡：上傳是 `PUT`（邊收邊加密邊傳到 homeserver）；讀是 `GET` 支援 `Range`、讓播放器直接串流，seek 只拉需要的那幾塊。規格在 [`docs/design/rpc-specs/data-plane.md`](docs/design/rpc-specs/data-plane.md)。
-- **backend 怎麼選** —— `transport: ws`（預設）＝ wbf 協議；`transport: http` ＝ 標準 Matrix。對一般 homeserver 指定 `ws` 是 no-op，🚫 不是錯誤。
+- **backend 怎麼選** —— `transport: ws`（預設）＝ wbf 協議；`transport: http` ＝ 標準 Matrix。對一般 homeserver 指定 `ws` 是 no-op，**不**是錯誤。
 
 ## 專案結構
 
@@ -148,8 +148,8 @@ homeserver ──wbf 協議（WS）／Matrix HTTP──> daemon ──加密的 
 | [`crates/wbf-wire`](crates/wbf-wire) | 線上協議的 codec：pack、`EncryptedFileInfo`、CRC-32C。純函數、無 async | ✅ 完成 —— 對著 server 的黃金向量測 |
 | [`crates/wbf-sdk`](crates/wbf-sdk) | 協議 client：每塊 AEAD、WebSocket 通道、分塊上傳／下載／seek／續傳／串流、加密 vault、`cache.db`、媒體池、matrix-sdk adapter | 🟢 可用 |
 | [`crates/wbf-core`](crates/wbf-core) | 每個命令「做什麼」：帳號、房間、訊息、媒體、backend 探測、`cache.db` 的單一寫入者。沒有命令列、沒有 RPC | 🟢 可用 |
-| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、token 生命週期 | 🟢 RPC method、推播訂閱、daemon 替每個帳號開著上游連線、文字訊息的 E2EE、資料平面的上傳（`PUT`，加密房的附件）與讀（`media.open` → `GET /media`、每帳號一個下載處理端，所有檔一起跑）。⏳ 還沒有：RPC 的 `cancel`；一般 Matrix server 的傳統 `/_matrix/media` |
-| [`apps/wbf-cli`](apps/wbf-cli) | 命令列前端 `wbf-cli`：登入、房間、送訊息、watch、上傳、下載、seek、多帳號、媒體快取 | 🟢 可用（目前直接叫 `wbf-core`） |
+| [`crates/wbf-daemon`](crates/wbf-daemon) | daemon 本體 `wbf-matrix-client-daemon`：RPC 服務、資料目錄獨佔、`<data dir>/daemon.token`；也放 Rust 的 client 那一頭（`wbf_daemon::client`） | 🟢 RPC method、推播訂閱、合作式的 `cancel`、daemon 替每個帳號開著上游連線、E2EE、資料平面的上傳（`PUT`，加密房的附件）與讀（`media.open` → `GET /media`、每帳號一個下載處理端，所有檔一起跑） |
+| [`apps/wbf-matrix-rpc-cli`](apps/wbf-matrix-rpc-cli) | 命令列前端 `wbf-matrix-rpc-cli`：丟 RPC 給 daemon（`--attach` 連在跑的那支，或 `--daemon <binary>` 起一支）；`call`、`batch`、`account add`／`destroy`、`put`、`get`、`watch` | 🟢 可用 |
 | 桌面／Android／Python | 走 RPC 的前端 | ⏳ 還沒開始 |
 
 ## 開始
@@ -176,10 +176,10 @@ git submodule update --init
 
 幾件事：
 
-- `wbf-sdk` 的 `matrix` feature（matrix-sdk adapter）預設關閉，`apps/wbf-cli` 才打開。單獨測它：`cargo test -p wbf-sdk --features matrix`。
+- `wbf-sdk` 的 `matrix` feature（matrix-sdk adapter）預設關閉，`wbf-core` 與 `wbf-daemon` 才打開。單獨測它：`cargo test -p wbf-sdk --features matrix`。
 - 需要真的 wbfuwunel server 的測試標了 `#[ignore]`，怎麼跑寫在各自的檔頭。
 - ⚠️ `cargo fmt --all` 會連 vendor 進來的 matrix-rust-sdk 一起格式化。只格式化這個 workspace：
-  `cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-cli`
+  `cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli`
 
 ## 文件
 
@@ -203,15 +203,15 @@ git submodule update --init
 
 | 專案 | 角色 |
 |---|---|
-| [**wbfuwunel**](https://github.com/WhiteBirchForumTeam/wbfuwunel) | **這個 client 對接的 server，也是協議的權威。** 它是 [tuwunel](https://github.com/matrix-construct/tuwunel) 的 fork，而且刻意分岔；它跟 Matrix 規格不一致時，本 client 照 wbfuwunel。線上規格與黃金向量從它複製過來 —— 🚫 不共用程式碼。 |
+| [**wbfuwunel**](https://github.com/WhiteBirchForumTeam/wbfuwunel) | **這個 client 對接的 server，也是協議的權威。** 它是 [tuwunel](https://github.com/matrix-construct/tuwunel) 的 fork，而且刻意分岔；它跟 Matrix 規格不一致時，本 client 照 wbfuwunel。線上規格與黃金向量從它複製過來 —— **不**共用程式碼。 |
 | [**matrix-rust-sdk**](https://github.com/WhiteBirchForumTeam/matrix-rust-sdk) | Matrix 的基礎（登入、同步、房間、E2EE）。以 submodule 引入，指向我們 fork 的 [matrix-org/matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk)。 |
 
 ## 參與開發
 
 開發與 pull request 在 [Forgejo（`amaid/wbf-matrix-client`）](http://ai.zooy.cc:30008/amaid/wbf-matrix-client)；GitHub 上的這個 repo 是鏡像。
 
-- 所有程式碼改動都走分支加 pull request —— 🚫 不直接推到 `main`。
-- 歷史只往前長：要修就再 commit 一次。🚫 不 rebase、不 amend、不 force push。PR 用 merge commit 合併。
+- 所有程式碼改動都走分支加 pull request —— 禁止直接推到 `main`。
+- 歷史只往前長：要修就再 commit 一次。禁止 rebase、amend、force push。PR 用 merge commit 合併。
 - 自訂的 Matrix 事件型別與 key 用 `org.wbftw.wbfuwunel.<名字>` 命名空間。
 
 ## 授權

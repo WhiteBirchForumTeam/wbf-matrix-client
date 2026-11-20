@@ -147,20 +147,23 @@ crates/wbf-daemon/src/   **RPC 那一面**（rpc-spec）。控制平面的基底
                          2026-09-21 多：每連線一個推播 task（`forward_pushes`：core 的 broadcast → 訂閱過濾 → `seal_push`；`Lagged` → `desync`）、`subscribe`／`unsubscribe` 在這層回（不進 handle）、
                          請求包在 `job::run_as_job(id)` 裡（`progress`／`note` 對得回發它的連線）
   push.rs                `Subscriptions`（每連線一份：名字集合＋選填 `user`）、`push_of`（`CoreEvent` → 推播名與 params，照 /docs/design/rpc-specs/rpc-spec.md §4）、`desync`、`parse_subscription_params`
-  token.rs               token 怎麼交：環境變數 WBF_DAEMON_TOKEN（base64）、daemon 讀完就從自己的環境清掉、前端這頭的 new_token／to_env_value
-                         （/docs/design/rpc-specs/local-interface.md §3；token 不落地，舊的 token 檔與三遍抹寫都拿掉了）
-  client.rs              前端那一頭：spawn_daemon（讀 ready）、RpcClient（hello、call、next_push）、資料平面的 put／get；rpc-cli 與 tests/real_server.rs 用它
-  main.rs                只有 `-s` 常駐（先從環境拿 token、拿寫權、讀 conf／沒有就生成、寫 daemon.json）。沒帶 `-s` 報錯；單發模式定了不做。
+  token.rs               daemon 的 token：WBF_DAEMON_TOKEN 指定就用（讀完清掉）、沒指定就自己產生；寫讀 <data dir>/daemon.token
+                         （/docs/design/rpc-specs/local-interface.md §3，維護者 2026-11-20）
+  client.rs              前端那一頭：find_running_daemon（daemon.json＋daemon.token）、spawn_daemon（讀 ready、丟掉就殺）、RpcClient（hello、call、next_push）、
+                         資料平面的 put／get；rpc-cli 與 tests/real_server.rs 用它
+  main.rs                只有 `-s` 常駐（先從環境拿指定的 token、拿寫權、讀 conf／沒有就生成、寫 daemon.token 與 daemon.json）。沒帶 `-s` 報錯；單發模式定了不做。
                          控制平面與資料平面一起開、一起停
   data_plane.rs          資料平面：URL 與 meta（共享 token 加密；URL 只帶「用途 ‖ mxc」、上傳狀態在 `Wbf-Upload-Meta` header）與 hyper 的 HTTP listener（`PUT /upload/mxc/…`、`GET`／`HEAD /media/mxc/…` 的 Range 與串流 body、Host 檢查）
   tests/loopback.rs      真的起 listener、用 tokio-tungstenite 原生 client 走 hello／token 錯／text frame／shutdown
   tests/process.rs       真的把 daemon binary 跑起來：ready 的兩個管道、殘留的 daemon.json 被蓋掉、起手式 conf、
-                         shutdown 之後程序結束並收走 daemon.json、資料目錄裡沒有 token；沒帶 token／長度不對／沒帶 `-s` 都不啟動
+                         daemon.token、shutdown 之後程序結束並收走 daemon.json 與 daemon.token；沒指定 token 就自己產生；指定的長度不對／沒帶 `-s` 不啟動；
+                         丟掉 DaemonProcess 就殺掉 daemon、鎖放開
   tests/real_server.rs   `--ignored`：對真 wbfuwunel 走 vault.create（passphrase）→account.add→whoami→ping→
                          room.list→sync.recent→backup.status→**停掉 daemon 再起**→unlock→whoami→account.del；
                          房間動作：兩個帳號登在同一個 daemon，建房→邀→加入→權限／名字／置頂→升級加密→踢→忘記（要 `WBF_E2E_USER_B`）
 apps/wbf-matrix-rpc-cli/src/   rpc-cli（/docs/design/rpc-specs/wbf-cli-spec.md）：main.rs（命令：call、batch、account add／destroy、put、get、watch）、
-                         session.rs（一次執行一支 daemon：起、hello、解鎖、shutdown；RPC code → exit code；passphrase／password 從檔案或終端）
+                         session.rs（--attach 連在跑的、或 --daemon 起一支：hello、解鎖、收尾；RPC code → exit code；passphrase／password 從檔案或終端）
+                         tests/cli.rs 真的跑 rpc-cli 配真的 daemon（batch 一行一則、--attach、參數二選一）
                          ⚠️ 舊的 apps/wbf-cli 直接叫 core、繞過 daemon，A-2（2026-11-19）拿掉了
 scripts/acceptance.sh    /docs/design/rpc-specs/wbf-cli-spec.md §8 的驗收，用 rpc-cli 對本機 wbfuwunel 跑
 vendor/matrix-rust-sdk   上游 submodule，path dependency；只在 backend/matrix_sdk.rs 出現
@@ -244,7 +247,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli
 - **D 槽會滿**：連結器 `1201`／`1180`／`1318`、`os error 112`（磁碟空間不足）、`invalid metadata` 先 `df -h /d`。禁止整個 `cargo clean`（重編 matrix-sdk 一輪十幾分鐘）。
   先清「現在的建置用不到的舊產物」：等這一輪該編的都編完，對 `cargo test --workspace --no-run`、`cargo clippy --workspace --all-targets --features wbf-sdk/matrix`、
   `cargo test -p wbf-sdk --features matrix --no-run` 各跑一次 `--message-format=json`（都是新鮮度檢查、不重編），收 `compiler-artifact` 的檔名，`target/debug/deps` 裡不在清單上的就是舊的
-  （2026-09-29 這樣清出 2.47G，全是舊版 matrix-sdk 的變體）。還不夠才 `cargo clean -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-cli -p wbf-wire`（2026-09-21 清出 25.7G），禁止清 deps。
+  （2026-09-29 這樣清出 2.47G，全是舊版 matrix-sdk 的變體）。還不夠才 `cargo clean -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli -p wbf-wire`（2026-09-21 清出 25.7G），禁止清 deps。
 - `cargo fmt --all` 會格式化 `vendor/matrix-rust-sdk`（path dependency）。用 `-p`。commit 前看 `git -C vendor/matrix-rust-sdk status` 是空的。
 - 帶 `--features matrix` 的第一次編譯很久（matrix-sdk 全家）；放背景。
 - Windows 的 autocrlf 會把向量 JSON 換成 CRLF，`client_vectors.rs` 比對前有 normalize；`*.sh` 靠 `.gitattributes` 保持 LF。
@@ -261,7 +264,7 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli
 - Windows 主執行緒棧只有 1 MB，debug build 的 `send` 會爆棧；`main.rs` 把 runtime 跑在 64 MiB 棧的執行緒上。新增大的 async 路徑如果又爆，先懷疑這個。
 - `logout` 一定要連 `m/`（matrix-sdk 的 crypto store）一起刪：Matrix logout 讓裝置失效，留著的 crypto store 會擋下一次 `login`（"account in the store doesn't match"）。`cache.db` 反過來要留（維護者定），只有這個 server 最後一個帳號登出才刪。
 - 快取讀寫都要帶「我是誰」（mxid）：`Context::cache()` 回 `(Cache, me)`；漏帶就變成別人的視角。SDK 端沒有預設值可以偷懶。
-- 編 SQLCipher（`cache` feature，wbf-cli 預設帶）在 Windows 要 Strawberry Perl 在 PATH 前面，不然 openssl-sys 的 build script 掛在 `Configure`。
+- 編 SQLCipher（`cache` feature，wbf-core 與 wbf-daemon 帶）在 Windows 要 Strawberry Perl 在 PATH 前面，不然 openssl-sys 的 build script 掛在 `Configure`。
 
 ## 6. 已知的洞（不是忘了，是等別人）
 
@@ -288,8 +291,8 @@ cargo fmt -p wbf-wire -p wbf-sdk -p wbf-core -p wbf-daemon -p wbf-matrix-rpc-cli
    2026-11-07 做完：/docs/design/keys/cross-signing-and-verification.md。
 3. **daemon 穩健性**：~~終止接口、關機、`cancel`~~ 2026-11-10 在分支 `feat/daemon-robustness` 做完（`/docs/design/daemon/task-supervision.md`；接住 panic 與重探 backend 定了不做）。
    剩進度節流（`/docs/design/daemon/daemon-runtime.md` §5.4 定了先不做）；
-   ~~`apps/wbf-cli` 改走 RPC~~ 2026-11-19 在分支 `feat/rpc-cli` 做完（A-2：rpc-cli、token 用環境變數、舊 CLI 拿掉，/docs/design/rpc-specs/rpc-cli.md）。
-4. **web 樣板**（維護者 2026-11-17）：daemon 自己送網頁、沒帶 token 時自己產生一把給網頁用（/docs/design/rpc-specs/local-interface.md §3）。Desktop 預計原生 Rust，這個先當快速 demo／debug／驗證。
+   ~~`apps/wbf-cli` 改走 RPC~~ 2026-11-19 在分支 `feat/rpc-cli` 做完（A-2：rpc-cli、daemon 寫 daemon.token、rpc-cli 的 --attach／--daemon、舊 CLI 拿掉，/docs/design/rpc-specs/rpc-cli.md）。
+4. **web 樣板**（維護者 2026-11-17）：daemon 自己送網頁；沒指定 token 時自己產生、寫進 daemon.token 已經做了（/docs/design/rpc-specs/local-interface.md §3），剩網頁怎麼拿到它。Desktop 預計原生 Rust，這個先當快速 demo／debug／驗證。
 
 之後（還沒排）：換掉既有的交叉簽章（UIAA）、QR 驗證、登出閘門的第一關接上 wbf 帳號（/docs/design/keys/cross-signing-and-verification.md §9、§12）；「跳到訊息」等 wbfuwunel #64（#43 已關）；~~server 批 3／4 的功能（#50、#55）~~ 2026-11-08 做完（/docs/design/rpc-specs/matrix-relay.md）；
 下載的暫停（只停主檔，**不**停 seek，`/docs/design/media/media-download.md` §5.4）；

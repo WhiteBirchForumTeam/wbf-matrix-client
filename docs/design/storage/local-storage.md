@@ -11,14 +11,14 @@
 | 媒體池的檔案格式、清理 | `/docs/design/media/media-pool.md`、`/docs/design/media/media-download.md` §4 |
 | `k/snapshot`、`r/` 的 recovery key、登出的閘門 | `/docs/design/keys/room-key-backup.md` §4、§7、§8 |
 | `m/td.json`（to-device 的游標） | `/docs/design/keys/to-device-client.md` §2 |
-| `daemon.json`（token **不**落地） | `/docs/design/rpc-specs/local-interface.md` §3 |
+| `daemon.json`、`daemon.token` | `/docs/design/rpc-specs/local-interface.md` §3 |
 | `wbf.conf` | `/docs/design/rpc-specs/wbf-cli-spec.md` §10 |
 
 ⚠️ **目錄樹只畫在這裡（§3）**。其他文件需要的時候指過來，禁止各自再畫一份——三份樹已經漂移過一次（`r/` 被畫進帳號目錄、`m/` 寫成兩個 store、`local.key` 寫成「32 byte」）。
 
 📎 **範例的來源**：除了標「示意」的，都是 2026-10-06 對本機 wbfuwunel 實際跑出來的（`wbf-cli login` → `send` → `upload --manifest` → `download` → `set-passphrase`，
 再起一次 daemon），host 是 `127.0.0.1:6167`、帳號是 `@alice:localhost`。那個資料目錄用完就刪了；金鑰、token 這類值仍然換成 `<…>`。
-那支 `wbf-cli` 在 A-2 拿掉了（換成走 RPC 的 rpc-cli，/docs/design/rpc-specs/rpc-cli.md），檔的格式沒變；後來改過的地方（`wbf.conf` 由 daemon 生成、token 不落地）各節有寫。
+那支 `wbf-cli` 在 A-2 拿掉了（換成走 RPC 的 rpc-cli，/docs/design/rpc-specs/rpc-cli.md），檔的格式沒變；後來改過的地方（`wbf.conf` 由 daemon 生成、`daemon.token` 由 daemon 寫）各節有寫。
 
 ## 1. 資料目錄在哪
 
@@ -122,6 +122,7 @@
 ├── account.lock                           登入／登出／destroy 的 OS 鎖（§4.3）
 ├── daemon.lock                            daemon 獨佔的 OS 鎖（§4.4）
 ├── daemon.json                            daemon 起好之後的 port（§4.5）
+├── daemon.token                           daemon 的 token：前端讀它來連（§4.6）
 ├── wbf.conf                               設定檔（§4.7）
 ├── r/                                     recovery key（§4.8；目前只有一般 Matrix 帳號會有）
 │   └── <加密的 "recovery-key"+mxid>
@@ -176,7 +177,7 @@ wbfdemo/
 
 - `-wal`／`-shm` 不在：程序結束時關乾淨了。daemon 開著的時候看得到。
 - `td.json` 不在：當時的 CLI 沒開 `Keys` 線。daemon 收過 to-device 就有。
-- `daemon.json` 不在：daemon 沒在跑（§4.5）。token **從來不在**資料目錄裡（§4.6）。
+- `daemon.json`、`daemon.token` 不在：daemon 沒在跑（§4.5、§4.6；正常結束時收掉）。
 - `*.<pid>.tmp`（§2.4）、`td.json.tmp`、`k/snapshot.tmp` 是寫到一半的暫存檔，正常結束時不會留著。
 
 ## 4. 資料目錄的根
@@ -261,11 +262,23 @@ qEo6fzbP5sYDLQTa_kAMTdNaqhioNtFdiJeWrCLJpij1DK2F3p9iLfVGx4/X5zKj34KRZ7dGWS9_GRFD
 
 📎 stdout 那一行 ready 訊號多一個 `"ready":true`，檔裡沒有。
 
-### 4.6 `daemon.token`（拿掉了）
+### 4.6 `daemon.token`
 
-**token 不落地**（維護者 2026-11-17）：前端用環境變數 `WBF_DAEMON_TOKEN` 交給它起的 daemon，daemon 讀完就從自己的環境清掉，
-此後只活在兩個程序的記憶體裡（`/docs/design/rpc-specs/local-interface.md` §3）。以前的 `daemon.token` 檔、`--token-file`、
-權限檢查與三遍抹寫都跟著拿掉；節號留著，免得別處的 §4.6 指到別的東西。
+| | |
+|---|---|
+| 內容 | daemon 的 token：256 byte 的標準 base64（344 個字元）加一個換行。RPC 與資料平面的金鑰材料 |
+| 誰寫 | **daemon**，拿到寫權、開好 port 之後、寫 `daemon.json` 之前（temp＋rename、只有本人讀得到，同 `local.key`）。token 是 `WBF_DAEMON_TOKEN` 指定的那把，沒指定就自己產生（`/docs/design/rpc-specs/local-interface.md` §3） |
+| 誰讀 | 要連這支 daemon 的前端（rpc-cli 的 `--attach`、`wbf_daemon::client::find_running_daemon`） |
+| 誰刪 | daemon 正常結束時。被強制殺掉會留著，下一支起來時蓋掉 |
+
+例：
+
+```text
+<344 個 base64 字元>
+```
+
+這個檔不加密：它就是那把鑰，加密它得再有一把鑰放在旁邊。它保護的是通訊，擋的是這台機器上別的帳號（維護者 2026-11-20）。
+📎 2026-09-13 到 2026-11-17 之間是「前端寫、daemon 讀、前端三遍抹寫」的同名檔；2026-11-17 到 2026-11-20 之間沒有這個檔（環境變數交）。
 
 ### 4.7 `wbf.conf`
 
@@ -543,6 +556,7 @@ manifest 的例子（`wbf-cli upload photo.bin --manifest photo.manifest.json` �
 | 檔 | 明文的是什麼 | 為什麼可以 |
 |---|---|---|
 | `local.key`（plain 模式） | 主金鑰 | 使用者選了不設 passphrase；要保護就設（`/docs/design/storage/vault-and-keys.md` §1） |
+| `daemon.token` | 本地介面的金鑰材料 | 它就是那把鑰；只有本人讀得到，擋的是別的帳號（同一個帳號的程序本來就讀得到資料目錄，§4.6） |
 | `daemon.json` | port、pid | 沒有秘密 |
 | `wbf.conf` | 設定 | 拒收秘密 |
 | `m/td.json` | 兩種序號 | 只有數字，沒有身分 |

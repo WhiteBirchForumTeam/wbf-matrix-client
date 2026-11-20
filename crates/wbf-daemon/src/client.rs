@@ -1,12 +1,11 @@
-//! RPC 的 client 那一頭（/docs/design/rpc-specs/rpc-cli.md §3）：起 daemon、連線、`hello`、`call`、收推播、資料平面的讀寫。
+//! RPC 的 client 那一頭（/docs/design/rpc-specs/rpc-cli.md §3）：起 daemon 或找到在跑的那支、連線、`hello`、`call`、收推播、資料平面的讀寫。
 //!
 //! rpc-cli 用它；之後原生 Rust 的 Desktop 也直接用它（/docs/design/overview/architecture-v2.md §0.2「Rust 端要用 RPC 的時候接口直接重用」）。
-//! 別的語言（JS、Kotlin）照這裡的順序寫自己的一份：產生 token → 環境變數交給 daemon → 讀 ready 那一行 → 連線 → `hello` → 每則加解密。
+//! 別的語言（JS、Kotlin）照這裡的順序寫自己的一份：讀 `daemon.json`（port）與 `daemon.token`（或起 daemon、讀 ready 那一行）→ 連線 → `hello` → 每則加解密。
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,28 +14,39 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 use zeroize::Zeroizing;
 
 use crate::pack::{self, PackType, RpcKeys, Side, TOKEN_LEN};
 use crate::protocol::CURRENT_PROTOCOL;
-use crate::token::{to_env_value, TOKEN_ENV};
+use crate::token::{read_token_file, to_env_value, TOKEN_ENV};
 
-/// client 這一頭出的錯。訊息就是要給人看的那句。
+/// 起 daemon 之後最多等它宣告 ready 多久：它要拿鎖、讀 conf、開兩個 port，正常一兩秒；等不到就收掉它、講出來（禁止無限等）。
+pub const READY_WAIT: Duration = Duration::from_secs(30);
+
+/// client 這一頭出的錯。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientError(pub String);
+pub struct ClientError {
+    /// 要給人看的那句
+    pub message: String,
+    /// daemon 關這條連線之前送的通知的 `code`（/docs/design/rpc-specs/rpc-spec.md §1.4，例 9006 ＝ daemon 要關了）；不是這種錯就是 None
+    pub closing_code: Option<u64>,
+}
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
 impl std::error::Error for ClientError {}
 
 fn fail(message: impl Into<String>) -> ClientError {
-    ClientError(message.into())
+    ClientError {
+        message: message.into(),
+        closing_code: None,
+    }
 }
 
 /// JSON 物件的一個欄位；沒有（或不是物件）就是 `Null`。用它而不是 `value["x"]`：crate 根擋了索引（寫入那種會 panic）。
@@ -44,7 +54,7 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
     value.get(name).unwrap_or(&Value::Null)
 }
 
-/// daemon 起來時 stdout 那一行（/docs/design/rpc-specs/local-interface.md §3）。
+/// 一支在跑的 daemon 在哪（daemon 起來時 stdout 那一行，或 `<data dir>/daemon.json`；/docs/design/rpc-specs/local-interface.md §3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
     pub rpc_port: u16,
@@ -55,29 +65,33 @@ pub struct Ready {
 }
 
 /// 我們起的那個 daemon 程序。
+///
+/// ⚠️ 丟掉它（沒走 [`DaemonProcess::wait_for_exit`] 等到結束）就會**殺掉**那支 daemon：起到一半出錯的路
+/// （ready 之後連不上、`hello` 被拒）不必各自記得收尾（`kill_on_drop`）。
 pub struct DaemonProcess {
-    child: Child,
+    child: tokio::process::Child,
     pub ready: Ready,
 }
 
-/// 起一個 daemon（`-s`），token 用環境變數交，等它在 stdout 宣告 ready。
+/// 起一個 daemon（`-s`），token 用環境變數指定，等它在 stdout 宣告 ready（最多 [`READY_WAIT`]）。
 ///
 /// Args:
 ///     daemon: daemon 的執行檔, example: "target/debug/wbf-matrix-client-daemon.exe"
 ///     data_dir: example: "<data dir>"
-///     token: 這次產生的 token（`crate::token::new_token`）
+///     token: 這次用的 token（`crate::token::new_token`）
 ///     stderr: daemon 的 stderr 給誰；rpc-cli 給 `Stdio::inherit()`，測試給 `Stdio::piped()`
 /// Return:
 ///     Ok(DaemonProcess)   起來了、宣告了 ready
-///     Err(ClientError)    執行檔起不來、或它沒宣告 ready 就結束了（資料目錄被別的 daemon 佔著、token 不對…，原因在它的 stderr）
-pub fn spawn_daemon(
+///     Err(ClientError)    執行檔起不來、它沒宣告 ready 就結束了（資料目錄被別的 daemon 佔著、token 不對…，原因在它的 stderr）、
+///                         或 [`READY_WAIT`] 內沒宣告（那支已經殺掉了）
+pub async fn spawn_daemon(
     daemon: &Path,
     data_dir: &Path,
-    token: &[u8; TOKEN_LEN],
+    token: &[u8],
     stderr: Stdio,
 ) -> Result<DaemonProcess, ClientError> {
     let token_value = to_env_value(token);
-    let mut child = Command::new(daemon)
+    let mut child = tokio::process::Command::new(daemon)
         .arg("-s")
         .arg("--data-dir")
         .arg(data_dir)
@@ -85,29 +99,43 @@ pub fn spawn_daemon(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(stderr)
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| fail(format!("cannot start {}: {error}", daemon.display())))?;
     drop(token_value);
     let mut line = String::new();
-    let read = match child.stdout.as_mut() {
-        Some(stdout) => BufReader::new(stdout).read_line(&mut line),
-        None => Ok(0),
+    let read = match child.stdout.take() {
+        Some(stdout) => {
+            let mut stdout = tokio::io::BufReader::new(stdout);
+            tokio::time::timeout(READY_WAIT, stdout.read_line(&mut line)).await
+        }
+        None => Ok(Ok(0)),
     };
     let ready = match read {
-        Ok(read) if read > 0 => parse_ready(&line),
-        Ok(_) => Err(fail("the daemon exited before saying ready")),
-        Err(error) => Err(fail(format!(
+        Ok(Ok(read)) if read > 0 => parse_ready(&line),
+        Ok(Ok(_)) => Err(fail("the daemon exited before saying ready")),
+        Ok(Err(error)) => Err(fail(format!(
             "cannot read the daemon's ready line: {error}"
         ))),
+        Err(_) => {
+            // 既沒說 ready 也沒結束：收掉它（丟掉 child 也會殺，這裡明講、等它真的走）。
+            let _ = child.kill().await;
+            return Err(fail(format!(
+                "the daemon did not say ready within {}s; it was stopped",
+                READY_WAIT.as_secs()
+            )));
+        }
     };
     match ready {
         Ok(ready) => Ok(DaemonProcess { child, ready }),
         Err(error) => {
-            // 沒說 ready：等它結束（不殺它——它沒起來就會自己走），把 exit code 一起講。
-            let status = child
-                .wait()
+            // 沒說 ready 就結束了：把 exit code 一起講（還活著的話丟掉 child 時會被殺）。
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .ok()
+                .and_then(|waited| waited.ok())
                 .map(|status| status.to_string())
-                .unwrap_or_default();
+                .unwrap_or_else(|| "still running; stopped".to_string());
             Err(fail(format!("{error} ({status})")))
         }
     }
@@ -117,66 +145,83 @@ pub fn spawn_daemon(
 ///     line: daemon stdout 的那一行, example: "{\"ready\":true,\"rpc_port\":51234,\"data_port\":51235,\"pid\":4321,\"instance\":\"…\"}"
 /// Return:
 ///     Ok(Ready)
-///     Err(ClientError)   不是 JSON、或少了欄位（禁止猜 port）
+///     Err(ClientError)   不是 JSON、不是 ready 那一行、或少了欄位（禁止猜 port）
 pub fn parse_ready(line: &str) -> Result<Ready, ClientError> {
     let ready: Value = serde_json::from_str(line.trim()).map_err(|error| {
         fail(format!(
             "the daemon's ready line is not JSON ({error}): {line:?}"
         ))
     })?;
-    let port = |name: &str| {
-        field(&ready, name)
-            .as_u64()
-            .and_then(|port| u16::try_from(port).ok())
-            .filter(|port| *port != 0)
-            .ok_or_else(|| {
-                fail(format!(
-                    "the daemon's ready line has no usable {name}: {ready}"
-                ))
-            })
-    };
     if field(&ready, "ready") != true {
         return Err(fail(format!(
             "the daemon's first line is not a ready line: {ready}"
         )));
     }
+    where_it_runs(&ready, "the daemon's ready line")
+}
+
+/// `daemon.json` 與 ready 那一行共同的欄位。
+fn where_it_runs(value: &Value, source: &str) -> Result<Ready, ClientError> {
+    let port = |name: &str| {
+        field(value, name)
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+            .ok_or_else(|| fail(format!("{source} has no usable {name}: {value}")))
+    };
     Ok(Ready {
         rpc_port: port("rpc_port")?,
         data_port: port("data_port")?,
-        pid: field(&ready, "pid")
+        pid: field(value, "pid")
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
-            .ok_or_else(|| fail(format!("the daemon's ready line has no pid: {ready}")))?,
-        instance: field(&ready, "instance")
+            .ok_or_else(|| fail(format!("{source} has no pid: {value}")))?,
+        instance: field(value, "instance")
             .as_str()
-            .ok_or_else(|| fail(format!("the daemon's ready line has no instance: {ready}")))?
+            .ok_or_else(|| fail(format!("{source} has no instance: {value}")))?
             .to_string(),
     })
 }
 
+/// 這個資料目錄裡在跑的那支 daemon：`daemon.json` 的 port ＋ `daemon.token`（/docs/design/rpc-specs/local-interface.md §3）。
+///
+/// ⚠️ daemon 被強制殺掉時兩個檔都會留著：讀得到**不**保證它還活著，連不上就是答案（[`RpcClient::connect`] 會講）。
+///
+/// Args:
+///     data_dir: example: "<data dir>"
+/// Return:
+///     Ok((Ready, token))   兩個檔都在、形狀對
+///     Err(ClientError)     沒有 daemon 在跑（檔不在）、讀不了、形狀不對
+pub fn find_running_daemon(data_dir: &Path) -> Result<(Ready, Zeroizing<Vec<u8>>), ClientError> {
+    let path = data_dir.join("daemon.json");
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        fail(format!(
+            "cannot read {} ({error}); is a daemon serving this data directory?",
+            path.display()
+        ))
+    })?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| fail(format!("{} is not JSON: {error}", path.display())))?;
+    let ready = where_it_runs(&value, &path.display().to_string())?;
+    let token = read_token_file(data_dir).map_err(|problem| fail(problem.0))?;
+    Ok((ready, token))
+}
+
 impl DaemonProcess {
-    /// 等 daemon 自己結束（送了 `daemon.shutdown` 之後）。**不**殺它：等不到就講出來，由呼叫端決定。
+    /// 等 daemon 自己結束（送了 `daemon.shutdown` 之後）。
     ///
     /// Return:
     ///     Ok(ExitStatus)      結束了
-    ///     Err(ClientError)    `limit` 內沒結束
-    pub fn wait_for_exit(mut self, limit: Duration) -> Result<ExitStatus, ClientError> {
-        let deadline = std::time::Instant::now() + limit;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Ok(None) => {
-                    return Err(fail(format!(
-                        "the daemon (pid {}) did not exit within {}s",
-                        self.ready.pid,
-                        limit.as_secs()
-                    )))
-                }
-                Err(error) => return Err(fail(format!("cannot wait for the daemon: {error}"))),
-            }
+    ///     Err(ClientError)    `limit` 內沒結束（`self` 在這裡丟掉，那支會被殺掉）
+    pub async fn wait_for_exit(mut self, limit: Duration) -> Result<ExitStatus, ClientError> {
+        match tokio::time::timeout(limit, self.child.wait()).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(error)) => Err(fail(format!("cannot wait for the daemon: {error}"))),
+            Err(_) => Err(fail(format!(
+                "the daemon (pid {}) did not exit within {}s; it was stopped",
+                self.ready.pid,
+                limit.as_secs()
+            ))),
         }
     }
 }
@@ -197,16 +242,21 @@ impl RpcClient {
     ///
     /// Args:
     ///     rpc_port: ready 那一行的, example: 51234
-    ///     token: 跟交給 daemon 的同一把
+    ///     token: 那支 daemon 的 token（交給它的那把，或 `daemon.token` 讀出來的）
     ///     client_name: 要 `wbf-matrix` 開頭（/docs/design/rpc-specs/rpc-spec.md §1.3）, example: "wbf-matrix-rpc-cli 0.1.0"
     /// Return:
     ///     Ok((RpcClient, Value))   連上了，第二個是 `hello` 的 result
-    ///     Err(ClientError)         連不上、或 `hello` 被拒
+    ///     Err(ClientError)         token 長度不對、連不上、或 `hello` 被拒
     pub async fn connect(
         rpc_port: u16,
-        token: &[u8; TOKEN_LEN],
+        token: &[u8],
         client_name: &str,
     ) -> Result<(RpcClient, Value), ClientError> {
+        let keys = RpcKeys::from_token_checking_length(token).map_err(|actual| {
+            fail(format!(
+                "the daemon token is {actual} bytes; it must be exactly {TOKEN_LEN}"
+            ))
+        })?;
         let (socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{rpc_port}"))
             .await
             .map_err(|error| {
@@ -216,7 +266,7 @@ impl RpcClient {
             })?;
         let mut client = RpcClient {
             socket,
-            keys: RpcKeys::from_token(token),
+            keys,
             next_id: 1,
             pushes: VecDeque::new(),
         };
@@ -324,9 +374,10 @@ impl RpcClient {
                 ))
             })?;
             if pack_type == PackType::Plain {
-                return Err(fail(format!(
-                    "the daemon is closing this connection: {message}"
-                )));
+                return Err(ClientError {
+                    message: format!("the daemon is closing this connection: {message}"),
+                    closing_code: Some(code_of(&message)),
+                });
             }
             return Ok(message);
         }

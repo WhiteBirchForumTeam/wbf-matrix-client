@@ -18,27 +18,29 @@
 //! 加上五個「RPC 本身做不到、一定要在前端做」的便利命令（讀密碼、確認、讀寫本地檔、把推播印出來）。**不**長自己的邏輯：
 //! 不重試、不改形、不串動作（例：加密房送訊息遇到 1401 要不要重送，是呼叫的人的事）。
 //!
-//! 每次執行起一支自己的 daemon（`session.rs`）；stdout 只放結果（JSON），訊息與錯誤走 stderr。
+//! 連哪一支 daemon 由參數決定：`--attach` 連資料目錄裡在跑的那支、`--daemon <binary>` 起一支新的（`session.rs`）。
+//! stdout 只放結果（JSON），訊息與錯誤走 stderr。
 
 mod session;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::{json, Map, Value};
 use wbf_daemon::client;
 
-use session::{require_success, Failure, Session};
+use session::{require_success, DaemonChoice, Failure, Session};
 
 #[derive(Parser)]
 #[command(
     name = "wbf-matrix-rpc-cli",
     version,
-    about = "從另一個程序丟 RPC 給 daemon：每次執行起一支自己的 daemon，做完就關掉它"
+    about = "從另一個程序丟 RPC 給 daemon：--attach 連在跑的那支，或 --daemon <binary> 起一支新的、做完關掉"
 )]
+#[command(group(ArgGroup::new("which_daemon").required(true).args(["attach", "daemon"])))]
 struct Cli {
     /// 資料目錄（daemon 的）
     #[arg(long, env = "WBF_DATA_DIR")]
@@ -46,10 +48,13 @@ struct Cli {
     /// 解 `local.key` 的 passphrase 所在的檔（整檔原始 bytes）。沒給而需要時問終端
     #[arg(long, env = "WBF_PASSPHRASE_FILE")]
     passphrase_file: Option<PathBuf>,
-    /// daemon 的執行檔；沒給用 rpc-cli 同一個目錄的 wbf-matrix-client-daemon
+    /// 連資料目錄裡在跑的那支 daemon（daemon.json 的 port、daemon.token）；用完不關它
+    #[arg(long)]
+    attach: bool,
+    /// 起一支新的 daemon：它的執行檔。用完 daemon.shutdown、等它結束
     #[arg(long, env = "WBF_DAEMON")]
     daemon: Option<PathBuf>,
-    /// 不顯示 daemon 自己的訊息（它的 stderr）
+    /// 不顯示起的 daemon 自己的訊息（它的 stderr）
     #[arg(long, short)]
     quiet: bool,
     #[command(subcommand)]
@@ -191,8 +196,17 @@ enum Asked {
 
 async fn run(cli: Cli) -> Result<(), Failure> {
     let asked = ask_before_starting(&cli.command)?;
-    let daemon = session::daemon_path(cli.daemon)?;
-    let mut session = Session::start(&daemon, &cli.data_dir, cli.quiet).await?;
+    // clap 的群組已經保證兩個恰好給一個；這裡再問一次、沒有就當用法錯（不假定上游洗乾淨了）。
+    let choice = match (cli.attach, cli.daemon) {
+        (true, None) => DaemonChoice::Attach,
+        (false, Some(path)) => DaemonChoice::Spawn(path),
+        _ => {
+            return Err(Failure::usage(
+                "pass exactly one of --attach (the daemon already serving the data directory) or --daemon <path> (start a new one)",
+            ))
+        }
+    };
+    let mut session = Session::start(&choice, &cli.data_dir, cli.quiet).await?;
     let outcome = run_command(
         &mut session,
         cli.command,
@@ -364,6 +378,7 @@ async fn account_add(
     } else {
         session.unlock(passphrase_file).await?;
     }
+    // ⚠️ 抹記憶體是盡力而為：`password` 是 Zeroizing，組進 JSON 請求的那份複本**不**會被抹掉。
     let mut params = json!({ "server": server, "user": user, "password": password.as_str() });
     if let (Some(device_name), Some(fields)) = (device_name, params.as_object_mut()) {
         fields.insert("device_name".into(), json!(device_name));
@@ -372,19 +387,21 @@ async fn account_add(
     print_json(require_success(&response)?)
 }
 
-/// 一行一則：印回應原樣（含 `code`），呼叫的人自己看；第一個錯之後不再送。
+/// 一行一則：讀一行、送、印回應原樣（含 `code`）、才讀下一行（PR #89 審查：先讀到 EOF 會讓「寫一行、等回應、再寫」的呼叫端互等）。
+/// 第一個錯之後不再讀、不再送。
 async fn batch(session: &mut Session) -> Result<(), Failure> {
-    let lines: Vec<String> = std::io::stdin()
-        .lock()
-        .lines()
-        .collect::<Result<_, _>>()
-        .map_err(|error| Failure::usage(format!("cannot read stdin: {error}")))?;
-    // 去掉 UTF-8 BOM：Windows PowerShell 5.1 的管線會在第一行前面加一個。
-    for line in lines
-        .iter()
-        .map(|line| line.trim_start_matches('\u{feff}'))
-        .filter(|line| !line.trim().is_empty())
+    use tokio::io::AsyncBufReadExt as _;
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|error| Failure::usage(format!("cannot read stdin: {error}")))?
     {
+        // 去掉 UTF-8 BOM：Windows PowerShell 5.1 的管線會在第一行前面加一個。
+        let line = line.trim_start_matches('\u{feff}');
+        if line.trim().is_empty() {
+            continue;
+        }
         let request: Value = serde_json::from_str(line)
             .map_err(|error| Failure::usage(format!("not a JSON line ({error}): {line}")))?;
         let method = request
@@ -459,10 +476,7 @@ async fn put(session: &mut Session, upload: Upload, target: Target) -> Result<()
         let created = create(session, params).await?;
         client::put(&created, file, Some(size)).await
     }
-    .map_err(|error| Failure {
-        message: error.0,
-        exit_code: 4,
-    })?;
+    .map_err(Failure::connection)?;
     if reply.status != 200 {
         return Err(Failure {
             message: format!("the data plane answered {}: {manifest}", reply.status),
@@ -525,7 +539,8 @@ async fn get(
             .call("subscribe", json!({ "events": ["media.download"] }))
             .await?,
     )?;
-    let response = session.call("media.open", Value::Object(params)).await?;
+    let media = Value::Object(params);
+    let response = session.call("media.open", media.clone()).await?;
     let opened = require_success(&response)?;
     let text_of = |name: &str| opened.get(name).and_then(Value::as_str).map(str::to_string);
     let (Some(url), Some(mxc)) = (text_of("url"), text_of("mxc")) else {
@@ -540,7 +555,7 @@ async fn get(
     // 它已經排進佇列了：等它下載完，從池裡讀就不需要事件（/docs/design/rpc-specs/wbf-cli-spec.md §3.3）。
     if reply.status == 502 && matches!(state.as_str(), "queued" | "downloading" | "verifying") {
         eprintln!("{mxc} cannot be streamed before it is downloaded; waiting for the download");
-        wait_for_download(session, &mxc).await?;
+        wait_for_download(session, &mxc, &media).await?;
         reply = fetch(&url, range.as_deref(), output.as_deref()).await?;
     }
     eprintln!(
@@ -584,23 +599,36 @@ async fn fetch(
         }
         None => client::get(url, range, tokio::io::stdout()).await,
     }
-    .map_err(|error| Failure {
-        message: error.0,
-        exit_code: 4,
-    })
+    .map_err(Failure::connection)
 }
 
 /// 等 `media.download` 推這個 mxc 走到終點。沒有上限（下載多久要看檔多大），Ctrl+C 停。
 ///
+/// 推播會掉（/docs/design/rpc-specs/rpc-spec.md §4）：收到 `desync` 就重叫一次 `media.open` 看狀態，完成了就不再等（PR #89 審查）。
+///
+/// Args:
+///     media: 當初 `media.open` 的 params，重查用
 /// Return:
-///     Ok(())         `complete`
+///     Ok(())         `complete`（推播或重查）
 ///     Err(Failure)   `failed`／`cancelled`（exit 2）、連線斷了（exit 4）
-async fn wait_for_download(session: &mut Session, mxc: &str) -> Result<(), Failure> {
+async fn wait_for_download(session: &mut Session, mxc: &str, media: &Value) -> Result<(), Failure> {
     loop {
-        let push = session.client.next_push().await.map_err(|error| Failure {
-            message: error.0,
-            exit_code: 4,
-        })?;
+        let push = session
+            .client
+            .next_push()
+            .await
+            .map_err(Failure::connection)?;
+        if push.get("method").and_then(Value::as_str) == Some("desync") {
+            let response = session.call("media.open", media.clone()).await?;
+            let state = require_success(&response)?
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if matches!(state, "complete" | "local_source") {
+                return Ok(());
+            }
+            continue;
+        }
         let params = push.get("params").unwrap_or(&Value::Null);
         let is_this_file = push.get("method").and_then(Value::as_str) == Some("media.download")
             && params.get("mxc").and_then(Value::as_str) == Some(mxc);
@@ -655,7 +683,15 @@ async fn watch(
             biased;
             _ = &mut interrupted => break,
             push = session.client.next_push() => {
-                let push = push.map_err(|error| Failure { message: error.0, exit_code: 4 })?;
+                let push = match push {
+                    Ok(push) => push,
+                    // daemon 要關了（9006，例：終端的 Ctrl+C 也送到它那裡、它的通知先到）：沒有東西可看了，正常結束。
+                    Err(error) if error.closing_code == Some(9006) => {
+                        eprintln!("the daemon is shutting down; stopped watching");
+                        break;
+                    }
+                    Err(error) => return Err(Failure::connection(error)),
+                };
                 print_json(&push)?;
                 received += 1;
             }

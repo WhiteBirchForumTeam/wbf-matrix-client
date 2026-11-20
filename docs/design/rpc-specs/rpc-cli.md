@@ -3,6 +3,7 @@
 > 這份回答：`apps/wbf-cli` 怎麼從「直接叫 `Core`」變成 rpc-cli（從另一個程序丟 RPC 給 daemon）、它跟 daemon 怎麼拿到同一把 token、命令面留下什麼。
 > 對應 /docs/handover.md §7 第 3 點的後半、/docs/design/overview/architecture-v2.md §0.2／§4／§6／§6.1、/docs/design/daemon/task-supervision.md §3 的 A-2；本 repo issue #26 的 CLI 那半也在這裡。
 > 這份是**為什麼與怎麼決定的**；rpc-cli 現在的命令、參數、輸出、exit code 的權威在 /docs/design/rpc-specs/wbf-cli-spec.md（檔名沿用舊的）。§6 四個決定都照建議定了；實作時跟草稿不一樣的地方在 §9。
+> ⚠️ **§1 與 §1.1 被 §10 取代**（維護者 2026-11-20，PR #89 審查之後）：token 改由 daemon 寫進 `<data dir>/daemon.token`，rpc-cli 用 `--attach` 或 `--daemon <binary>` 決定連哪一支。下面 §1–§8 留著是當時怎麼想的。
 
 ## 0. 為什麼要做
 
@@ -113,9 +114,9 @@ wbf-matrix-rpc-cli --data-dir D [--passphrase-file F] batch      # stdin 每行�
 
 ## 3. client 程式放哪：`wbf_daemon::client`
 
-一份就好：起 daemon（token 五步、讀 ready 那一行）、連線、`hello`、`call`、收推播、資料平面的 `PUT`／`GET`。
+一份就好：起 daemon（讀 ready 那一行）或找在跑的那支（`daemon.json` ＋ `daemon.token`）、連線、`hello`、`call`、收推播、資料平面的 `PUT`／`GET`。
 
-- 放在 `wbf-daemon` 的 library 裡（建議）：加解密（`pack.rs` 的 `RpcKeys`、`seal`、`open`）、`protocol.rs`、`message.rs`、`token::shred` 都已經在這裡，而且是公開的；client 那半只是另一邊。
+- 放在 `wbf-daemon` 的 library 裡（建議）：加解密（`pack.rs` 的 `RpcKeys`、`seal`、`open`）、`protocol.rs`、`message.rs`、`token.rs` 都已經在這裡，而且是公開的；client 那半只是另一邊。
   /docs/design/overview/architecture-v2.md §0.2 說「之後 Rust 端要用 RPC 的時候接口直接重用」，指的就是它。
 - 測試裡那三份自己拼的 client 換成它：三份變一份（全域 A4）。
 - 代價：rpc-cli 要依賴 `wbf-daemon` 的 library（會帶進 hyper 那些）。rpc-cli 本來就要 spawn 同一包的 daemon，可以接受。
@@ -174,7 +175,7 @@ wbf-matrix-rpc-cli --data-dir D [--passphrase-file F] batch      # stdin 每行�
 
 📎 規模估計：rpc-cli 約 600 行、`wbf_daemon::client` 約 400 行；刪掉舊 CLI 約 2000 行，以及 core 裡沒人用的幾支方法。
 
-實際：rpc-cli 953 行（`main.rs` 666、`session.rs` 287）、`wbf_daemon::client` 563 行；刪掉舊 CLI 2383 行。
+實際（`7830271`，PR #89 第一版）：rpc-cli 996 行（`main.rs` 702、`session.rs` 294）、`wbf_daemon::client` 563 行；刪掉舊 CLI 2383 行。
 
 ## 9. 實作時跟草稿不一樣的、與順手修的（A-2，2026-11-19）
 
@@ -203,3 +204,26 @@ core 裡只剩舊 CLI 在用、跟著刪掉的：`Core::download_direct`（與 `
 
 ⚠️ **留給之後**：`progress_of` 是唯一發帶數字的 `CoreEvent::Progress` 的地方，而它的兩個呼叫點（`upload_stream`、`download_direct`）都只有舊 CLI 在用——
 所以 `progress` 推播（/docs/design/rpc-specs/rpc-spec.md §4）在 daemon 這邊**本來就沒有來源**，現在連 core 裡也沒有了；長工作的進度只走 `note`。推播的型別先留著（它是協議的一部分），要不要讓 `upload.file` 這類發帶數字的進度、還是從規格拿掉，另外決定。
+
+## 10. 審查之後改的：token 寫回 `<data dir>/daemon.token`、rpc-cli 用參數決定連哪一支（維護者 2026-11-20）
+
+PR #89 審查（cirno、salvia、rumia、oliver）抓到兩件跟 §1 有關的事：
+
+- oliver 在 Linux 實測：daemon 刪掉環境變數只改了自己程序內的表，`/proc/<pid>/environ` 讀的是啟動時那份，token 在 daemon 整個生命期都讀得到。§1.1「從頭到尾不落地」不成立。
+- 四位都抓到：`--daemon` 起的那支在 ready 之後連不上、`hello` 被拒時，rpc-cli 直接走掉，daemon 留著佔鎖；rpc-cli 被殺時也一樣。
+
+維護者 2026-11-20 的判斷：「token 這東西寫檔案不就足夠了嗎」——**token 保護的是通訊**，擋的是這台機器上別的帳號；同一個帳號的程序本來就讀得到資料目錄、`plain` 模式的 `local.key`、別的程序的環境變數，不落地換不到實際的保護。定的兩條：
+
+1. **`<data dir>/daemon.token`**：daemon 起來時，`WBF_DAEMON_TOKEN` 有指定就用，**沒指定就自動隨機產生**；都寫進這個檔（只有本人讀得到）。
+   正常結束時順便刪；被 TERM 或強制殺掉時留著無所謂（下一支會蓋掉）。權威：/docs/design/rpc-specs/local-interface.md §3。
+2. **rpc-cli 用參數決定**：要嘛指定既有的那支（`--attach`：讀 `daemon.json` ＋ `daemon.token`、用完不關），要嘛起一支新的、**必須帶 daemon binary 的位置**（`--daemon <path>`：用完關掉）。
+   不再自動找同目錄的執行檔。權威：/docs/design/rpc-specs/wbf-cli-spec.md §0、§2。
+
+連帶的：
+
+- §1 的「別的前端起的 daemon 在跑時 rpc-cli 用不了」不成立了：`--attach` 就連得上。§1 表裡的丙（附掛）就是 `--attach`，生命週期的問題（/docs/design/overview/architecture-v2.md §7 第 4 點）對 rpc-cli 的答案是「誰起的誰關」。
+- 審查提的 stdin 生命線（前端用 pipe 交 token、pipe 斷了 daemon 就關）**不做**：維護者選了寫檔。rpc-cli 被強制殺掉時它起的 daemon 會留著，`--attach` 連上去 `daemon.shutdown` 收掉。
+- 起到一半出錯的那條路：`DaemonProcess` 丟掉就殺（`kill_on_drop`），不必每條錯誤路各自記得收尾；測試 `crates/wbf-daemon/tests/process.rs` 的 `dropping_a_spawned_daemon_stops_it_and_frees_the_data_directory`。
+- 讀 ready 那一行有上限（30 秒，`READY_WAIT`），等不到就殺掉、講出來；讀法改成非同步，**不**佔 tokio 的 worker。
+
+同一輪一起修的其他審查項：`batch` 一行一行讀（以前先讀到 EOF）、`get` 等下載時收到 `desync` 就重查、`watch` 遇到 daemon 關機通知（9006）正常結束、rpc-cli 自己的整合測試（`apps/wbf-matrix-rpc-cli/tests/cli.rs`）、README／handover 裡的 `wbf-cli` 殘留、三份文件的「單發命令」殘留、密碼與 passphrase 只抹得到 `Zeroizing` 那份（JSON 複本抹不到，寫進 docstring）。

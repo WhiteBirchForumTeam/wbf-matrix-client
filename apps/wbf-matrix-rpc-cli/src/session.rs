@@ -1,5 +1,8 @@
-//! 一次執行＝一支 daemon（/docs/design/rpc-specs/rpc-cli.md §1 的甲）：產生 token → 環境變數交給 daemon → 連線、`hello` → 解鎖；
-//! 結束時 `daemon.shutdown`、等它自己走。別的前端起的 daemon 在跑時，daemon 自己拿不到資料目錄的鎖、不宣告 ready，這裡講清楚、不重試。
+//! 一次執行的連線（/docs/design/rpc-specs/wbf-cli-spec.md §0、§1；維護者 2026-11-20 定兩種，由參數決定）：
+//!
+//! - `--attach`：連資料目錄裡在跑的那支 daemon（`daemon.json` 的 port ＋ `daemon.token`），用完只斷線，**不**關它。
+//! - `--daemon <binary>`：起一支新的（產生 token、用環境變數指定給它），用完 `daemon.shutdown`、等它結束。
+//!   起到一半出錯（ready 之後連不上、`hello` 被拒）時丟掉 `DaemonProcess` 就會殺掉它（`wbf_daemon::client`）。
 //!
 //! passphrase 與 password 從檔案或終端讀（daemon 不問終端，/docs/design/rpc-specs/local-interface.md §5）。
 
@@ -34,9 +37,9 @@ impl Failure {
     }
 
     /// 連線那一頭的錯（daemon 中途走了、連線斷了）：跟網路同一級。
-    fn connection(error: ClientError) -> Failure {
+    pub fn connection(error: ClientError) -> Failure {
         Failure {
-            message: error.0,
+            message: error.message,
             exit_code: 4,
         }
     }
@@ -79,46 +82,92 @@ pub fn exit_code_of(code: u64) -> u8 {
     }
 }
 
+/// 要連哪一支 daemon（`--attach` 與 `--daemon` 二選一）。
+pub enum DaemonChoice {
+    /// 資料目錄裡在跑的那支
+    Attach,
+    /// 起一支新的，example: "C:/wbf/wbf-matrix-client-daemon.exe"
+    Spawn(PathBuf),
+}
+
 pub struct Session {
     pub client: RpcClient,
-    daemon: DaemonProcess,
+    /// 我們起的那支；`--attach` 時是 None（不是我們的，不關它）
+    spawned: Option<DaemonProcess>,
     /// `hello` 的 result（`unlocked`、`key_mode`…）
     pub hello: Value,
 }
 
 impl Session {
-    /// 起 daemon、連上、`hello`。
+    /// 連上（必要時先起 daemon）、`hello`。
     ///
     /// Args:
-    ///     daemon: daemon 的執行檔, example: "<rpc-cli 同一個目錄>/wbf-matrix-client-daemon.exe"
+    ///     choice: `--attach` 或 `--daemon <binary>`
     ///     data_dir: example: "<data dir>"
-    ///     quiet: true ＝ daemon 的 stderr 丟掉
-    pub async fn start(daemon: &Path, data_dir: &Path, quiet: bool) -> Result<Session, Failure> {
-        let token = client::new_token().map_err(|error| Failure::usage(error.0))?;
-        let stderr = if quiet {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        };
-        let daemon = client::spawn_daemon(daemon, data_dir, &token, stderr).map_err(|error| {
-            Failure::usage(format!(
-                "{error}\n(if another frontend's daemon is serving {}, use that frontend or stop it first: \
-                 rpc-cli can only talk to a daemon it starts itself, /docs/design/rpc-specs/rpc-cli.md §1)",
-                data_dir.display()
-            ))
-        })?;
-        let (client, hello) = RpcClient::connect(daemon.ready.rpc_port, &token, CLIENT_NAME)
-            .await
-            .map_err(Failure::connection)?;
-        drop(token);
-        Ok(Session {
-            client,
-            daemon,
-            hello,
-        })
+    ///     quiet: true ＝ 起的 daemon 的 stderr 丟掉
+    pub async fn start(
+        choice: &DaemonChoice,
+        data_dir: &Path,
+        quiet: bool,
+    ) -> Result<Session, Failure> {
+        match choice {
+            DaemonChoice::Attach => {
+                let (running, token) = client::find_running_daemon(data_dir).map_err(|error| {
+                    Failure::usage(format!(
+                        "{error}\n(to start one for this run instead, pass --daemon <path to wbf-matrix-client-daemon>)"
+                    ))
+                })?;
+                let (client, hello) = RpcClient::connect(running.rpc_port, &token, CLIENT_NAME)
+                    .await
+                    .map_err(|error| {
+                        Failure::connection(ClientError {
+                            message: format!(
+                                "{}\n(the daemon in {} may have been killed without cleaning up; \
+                                 if so, start a new one with --daemon)",
+                                error.message,
+                                data_dir.display()
+                            ),
+                            closing_code: error.closing_code,
+                        })
+                    })?;
+                Ok(Session {
+                    client,
+                    spawned: None,
+                    hello,
+                })
+            }
+            DaemonChoice::Spawn(daemon) => {
+                let token = client::new_token().map_err(|error| Failure::usage(error.message))?;
+                let stderr = if quiet {
+                    Stdio::null()
+                } else {
+                    Stdio::inherit()
+                };
+                let spawned = client::spawn_daemon(daemon, data_dir, token.as_slice(), stderr)
+                    .await
+                    .map_err(|error| {
+                        Failure::usage(format!(
+                            "{error}\n(if a daemon is already serving {}, connect to it with --attach)",
+                            data_dir.display()
+                        ))
+                    })?;
+                // 這裡出錯時 `spawned` 被丟掉，那支 daemon 就被殺掉（`DaemonProcess` 的 kill_on_drop）。
+                let (client, hello) =
+                    RpcClient::connect(spawned.ready.rpc_port, token.as_slice(), CLIENT_NAME)
+                        .await
+                        .map_err(Failure::connection)?;
+                Ok(Session {
+                    client,
+                    spawned: Some(spawned),
+                    hello,
+                })
+            }
+        }
     }
 
     /// 解鎖（還沒解的話）。還沒有 `local.key` 就什麼都不做：要它的命令自己會拿到 1002。
+    ///
+    /// ⚠️ 抹記憶體是盡力而為：讀進來的 passphrase 與它的 base64 是 `Zeroizing`，但組進 JSON 請求的那份複本（`serde_json::Value`、送出的字串）**不**會被抹掉。
     ///
     /// Args:
     ///     passphrase_file: `--passphrase-file`；None 而 vault 要 passphrase 時問終端
@@ -157,18 +206,21 @@ impl Session {
             .map_err(Failure::connection)
     }
 
-    /// `daemon.shutdown`、關連線、等 daemon 自己結束。
+    /// 收尾。`--attach` 的：只關連線，daemon 照跑。我們起的：`daemon.shutdown`、關連線、等它結束。
     ///
-    /// 送不出去（連線已經斷了）照樣等：終端按 Ctrl+C 時 daemon 跟我們在同一個 console、也收到了，
+    /// 送不出 `daemon.shutdown`（連線已經斷了）照樣等：終端按 Ctrl+C 時 daemon 跟我們在同一個 console、也收到了，
     /// 它自己在關（/docs/design/rpc-specs/wbf-cli-spec.md §3.4.2）。判準只有一個：daemon 結束了沒有。
     pub async fn finish(mut self) -> Result<(), Failure> {
+        let Some(spawned) = self.spawned.take() else {
+            self.client.close().await;
+            return Ok(());
+        };
         let asked = self.call("daemon.shutdown", Value::Null).await;
         self.client.close().await;
-        let daemon = self.daemon;
-        tokio::task::spawn_blocking(move || daemon.wait_for_exit(DAEMON_EXIT_WAIT))
+        spawned
+            .wait_for_exit(DAEMON_EXIT_WAIT)
             .await
-            .map_err(|error| Failure::usage(format!("cannot wait for the daemon: {error}")))?
-            .map_err(|error| Failure::usage(error.0))?;
+            .map_err(|error| Failure::usage(error.message))?;
         // 連線斷了但 daemon 已經結束：要的結果到了。daemon 回了錯（例 107 以外的拒絕）才講。
         if let Ok(response) = asked {
             if client::code_of(&response) != 0 && client::code_of(&response) != 107 {
@@ -187,29 +239,6 @@ pub fn require_success(response: &Value) -> Result<&Value, Failure> {
         return Err(Failure::of_response(response));
     }
     Ok(response.get("result").unwrap_or(&Value::Null))
-}
-
-/// daemon 的執行檔：`--daemon` 給了用它，沒給用 rpc-cli 同一個目錄的那支。
-///
-/// Return:
-///     Ok(PathBuf)    example: "C:/wbf/wbf-matrix-client-daemon.exe"
-///     Err(Failure)   找不到自己在哪
-pub fn daemon_path(explicit: Option<PathBuf>) -> Result<PathBuf, Failure> {
-    if let Some(path) = explicit {
-        return Ok(path);
-    }
-    let me = std::env::current_exe().map_err(|error| {
-        Failure::usage(format!(
-            "cannot find where rpc-cli is: {error}; pass --daemon"
-        ))
-    })?;
-    let dir = me
-        .parent()
-        .ok_or_else(|| Failure::usage("cannot find rpc-cli's directory; pass --daemon"))?;
-    Ok(dir.join(format!(
-        "wbf-matrix-client-daemon{}",
-        std::env::consts::EXE_SUFFIX
-    )))
 }
 
 /// `--passphrase-file`：**整檔原始 bytes**，不去尾換行、不驗 UTF-8（/docs/design/storage/vault-and-keys.md §3）。

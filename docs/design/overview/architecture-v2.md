@@ -75,7 +75,7 @@ wbfuwunel ──wbf-pack（二進位）──> daemon ──127.0.0.1 加密的 
 - 為什麼要鎖：`cache.db` 開在 WAL 模式（SQLite 本來就支援多程序併發）、port 預設隨機，沒有鎖的話
   兩個 daemon 可以同時開著同一個目錄互相踩（維護者 2026-09-13 指出）。
 - `-s` 起來時目錄已被另一個 daemon 持有就拒絕啟動，**不**接手、**不**等待——兩個常駐同時活著比拒絕一次嚴重得多。
-  rpc-cli 在這時就是 exit 1、講清楚「別的前端的 daemon 在用這個目錄」（/docs/design/rpc-specs/wbf-cli-spec.md §1）。
+  rpc-cli 的 `--daemon` 在這時就是 exit 1、提示改用 `--attach` 連在跑的那支（/docs/design/rpc-specs/wbf-cli-spec.md §1）。
 - ⚠️ 唯讀工具拿共享鎖，在 daemon 跑著時會**被拒** —— 那個拒絕就是答案：**去走 RPC，不要動它的檔**。
   ⭐「一邊寫一邊有人讀」的併發不是這把鎖給的，是 `cache.db` 的 WAL 給的（逐筆交易的粒度，比一把長命鎖精確）。
 - ⚠️ 鎖是**勸告式**的：只擋有來問的程序，擋**不**住直接開 `cache.db` 亂寫的程式。
@@ -150,7 +150,7 @@ rpc-cli／Desktop／Android／Python ──加密的 RPC 訊息──> daemon ha
 | 前端 ↔ daemon（控制） | **加密的 JSON over WS** | 是（XChaCha20-Poly1305，token 導出的金鑰） | **否**：同一台機器、同一個使用者 |
 | 前端 ↔ daemon（資料） | **HTTP，支援 Range** | 否（明文 bytes，只在 loopback 上；靠 daemon 用共享 token 加密發的 URL 擋） | 否 |
 
-⚠️ 控制平面**加密的收穫主要是完整性**（/docs/design/rpc-specs/local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與程序的環境變數（token 就在那裡）。
+⚠️ 控制平面**加密的收穫主要是完整性**（/docs/design/rpc-specs/local-interface.md §4），不是機密性——能監聽 loopback 的人通常也能讀記憶體與資料目錄（`daemon.token` 就在那裡）。
 資料平面則刻意**不加密**：它要餵給播放器與圖片元件，那些只吃普通的 HTTP；防護靠 daemon 用共享 token 加密發的 URL（/docs/design/rpc-specs/data-plane.md §2）。維護者 2026-09-30 再確認：本機 bytes 先明文，機密模式是之後的伏筆（/docs/design/rpc-specs/data-plane.md §9）。
 
 ## 3. daemon 的職責邊界
@@ -177,10 +177,10 @@ rpc-cli／Desktop／Android／Python ──加密的 RPC 訊息──> daemon ha
 | 前端 | 怎麼啟動 daemon | 怎麼講話 |
 |---|---|---|
 | **daemon 自己的命令列** | 只有 `daemon -s` 常駐這一種（§0.2）；它不收命令 | — |
-| **rpc-cli** | **每次執行 spawn 一支自己的**、做完 `daemon.shutdown`（token 用環境變數交，/docs/design/rpc-specs/local-interface.md §3）。別的前端的 daemon 佔著資料目錄時拒絕（/docs/design/rpc-specs/wbf-cli-spec.md §1） | 同一份 RPC（`wbf_daemon::client`） |
+| **rpc-cli** | 參數決定（維護者 2026-11-20）：`--attach` 連在跑的那支（讀 `daemon.json` ＋ `daemon.token`，用完不關），或 `--daemon <binary>` 起一支、做完 `daemon.shutdown`（/docs/design/rpc-specs/wbf-cli-spec.md §0） | 同一份 RPC（`wbf_daemon::client`） |
 | **Desktop** | 維護者 2026-11-17：預計原生 Rust（可以直接用 `wbf_daemon::client`）；先做一個 **web 樣板**當快速 demo／debug／驗證，由 daemon 自己送那個網頁（下一支，§7） | 同一份 RPC |
 | **Android**（JNI `.so`） | JNI 只有 **`daemon_start(data_dir, token) -> {rpc_port, data_port}`** 與 **`daemon_stop()`**（同一個程序裡的函式呼叫，token 直接收 bytes，不經環境變數） | Kotlin 直接連 loopback WS（OkHttp 內建）；媒體 URL 直接餵 ExoPlayer |
-| **Python** | spawn daemon 程序（token 放子程序的環境變數） | 同一份 RPC |
+| **Python** | spawn daemon 程序（token 讀 `daemon.token`，或用環境變數指定），或連在跑的那支 | 同一份 RPC |
 
 📎 ⚠️ **RPC vs uniffi 還沒定**：如果不要程序隔離，Desktop 與 Android 也可以用 uniffi 直接綁 library（matrix-rust-sdk 自己就是這樣給 Element X 用的），完全不需要 RPC。兩條路的取捨是**安全隔離 vs 簡單**，不是工作量——見 §7 第 7 點。
 
@@ -317,7 +317,7 @@ apps/wbf-matrix-rpc-cli   rpc-cli：參數 → RPC 訊息 → 本地 WS，印 re
   📎 `Client::olm_machine_for_testing()` 也拿得到，但它掛在 `testing` feature 底下，會把 `wiremock` 等拖進出貨的 binary，只能當 spike。
 - **第 4 點：daemon 的生命週期**：誰負責關掉它、閒置多久自己結束、多個前端同時連著時誰說了算。
   兩個 daemon 搶同一個資料目錄已經有答案：§0.2 的排他鎖，後來的起不來。
-  rpc-cli 的答案也有了：它自己起、自己關，**不**附掛別人的 daemon（/docs/design/rpc-specs/rpc-cli.md §1 的甲）。
+  rpc-cli 的答案也有了：**誰起的誰關**——`--daemon` 起的自己關、`--attach` 連的不關（/docs/design/rpc-specs/rpc-cli.md §10）。
   ⚠️ 這是這份架構裡**複雜度真正的所在**——RPC 本身是機械工作，生命週期不是。要等 Desktop 的實際使用模式出來再定。
 - ~~第 5 點：資料平面 token 的 TTL 與撤銷~~ 已定（維護者 2026-09-30）：**沒有** TTL、**沒有** token 表。URL 是用共享 token 加密的 access key，
   daemon 重開就全部失效，帳號登出之後 core 照樣拒（/docs/design/rpc-specs/data-plane.md §2）。
@@ -337,7 +337,7 @@ apps/wbf-matrix-rpc-cli   rpc-cli：參數 → RPC 訊息 → 本地 WS，印 re
   ⚠️ 原生 Rust GUI 的傳統弱項（長列表虛擬化、IME 中文輸入）要單獨驗；web 那批沒有這個問題，
   但多一層 runtime。評估維度見 /docs/handover.md §7。
   📎 維護者 2026-11-17：Desktop 預計原生 Rust；先做一個 web 樣板當快速 demo／debug／驗證，由 daemon 自己送那個網頁。
-  沒帶 token 時 daemon 自己產生一把給網頁用（/docs/design/rpc-specs/local-interface.md §3）；接法是 A-2 之後的下一支。
+  沒指定 token 時 daemon 自己產生一把、寫進 `daemon.token`（A-2 已做，/docs/design/rpc-specs/local-interface.md §3）；網頁怎麼拿到它是下一支的事。
 - **第 9 點：續傳狀態檔放哪**：現在寫在被上傳的檔旁邊（`<file>.wbf-upload.json`，/docs/design/rpc-specs/wbf-cli-spec.md §6），那是一命令一程序時定的。
   daemon 不一定有那個目錄的寫入權，Android 的 SAF 連路徑都沒有（`crates/wbf-core/src/upload_ops.rs` 檔頭）。
 

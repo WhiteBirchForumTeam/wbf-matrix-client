@@ -40,46 +40,47 @@ Windows 是主力平台、Python 是要支援的前端，那個組合直接不�
 WS 的成本不高：Rust 已經在用 `tokio-tungstenite`（對 server 那條），Python 有 `websockets`，
 Kotlin 的 OkHttp 內建，JS 原生。
 
-## 3 token：前端產生，前端叫起 daemon
+## 3 token：daemon 寫進 `<data dir>/daemon.token`，前端讀它來連（維護者 2026-11-20 定）
 
-**前端與 daemon 必然成對出現**（維護者 2026-09-09）——有 rpc-cli 就有 daemon，有 Desktop 就有 daemon。
-所以 token 由**前端**產生，不是 daemon；用**環境變數**交給它要起的那支 daemon，**從頭到尾不落地**（維護者 2026-11-17，取代 2026-09-13 的 token 檔五步）：
+**token 保護的是通訊**（維護者 2026-11-20）：擋的是這台機器上**別的帳號**。同一個 OS 帳號的程序本來就讀得到資料目錄、
+`plain` 模式的 `local.key`、別的程序的環境變數，token 怎麼交都擋不住它們——所以一個只有本人讀得到的檔就夠了。
 
 | 步 | 誰 | 做什麼 |
 |---|---|---|
-| 1 | 前端 | 產生 256 byte 隨機 token，標準 base64（含 padding）之後放進**子程序的**環境變數 `WBF_DAEMON_TOKEN`，spawn `daemon -s --data-dir <D>`。禁止用命令列參數傳：那會進 `ps` 的輸出 |
-| 2 | daemon | 在起 runtime、開任何執行緒**之前**讀它、**從自己的環境裡清掉**（之後它起的子程序不會繼承到）、導出金鑰（§4）、開 port、**宣告 ready** |
-| 3 | — | token 只活在兩個程序的記憶體裡，**磁碟上沒有** |
+| 1 | daemon | 起來時：環境變數 `WBF_DAEMON_TOKEN` **有指定**就用它（標準 base64、恰好 256 byte；讀完從自己的環境清掉）；**沒指定**就自己產生 256 byte 隨機 token |
+| 2 | daemon | 拿到資料目錄的寫權、開好兩個 port 之後，把 token 寫進 `<data dir>/daemon.token`（一行 base64，temp＋rename、只有本人讀得到，同 `local.key`），**然後**才寫 `daemon.json`、宣告 ready |
+| 3 | 前端 | 讀 `daemon.json`（port）＋ `daemon.token` 就連得上；自己起 daemon 的前端也可以用第 1 步指定的那把（不必回頭讀檔） |
+| 4 | daemon | 正常結束時刪掉 `daemon.json` 與 `daemon.token`。被強制殺掉時留著也無所謂：下一支起來會蓋掉 |
 
 ```text
-前端:   token = 256 byte OS 亂數（wbf_daemon::token::new_token）
-        spawn wbf-matrix-client-daemon -s --data-dir D   環境：WBF_DAEMON_TOKEN=<base64(token)>
-daemon: take_token_from_env() → 讀、清掉、驗長度 → RpcKeys::from_token_checking_length → AccessKeys::from_token → 丟掉 token
+$ wbf-matrix-client-daemon -s --data-dir D            （沒指定：自己產生）
 stdout: {"ready":true,"rpc_port":8604,"data_port":8605,"pid":45372,"instance":"8952a68f-ee91-4e05-a1a3-66d4ebee4f98"}
+D/daemon.token: <344 個 base64 字元>
 ```
 
-- **fail closed**：沒帶、不是 UTF-8、解不開 base64、長度不是 256 byte → **拒絕啟動**、stderr 講清楚原因（`crates/wbf-daemon/src/token.rs`；`crates/wbf-daemon/tests/process.rs` 真的 spawn 驗）。
+- **指定了卻壞掉**（不是 UTF-8、解不開 base64、長度不是 256 byte）→ **拒絕啟動**、stderr 講清楚，**不**默默改用自己產生的：
+  那個前端會拿著對不上的 token 連不進來（`crates/wbf-daemon/src/token.rs`；`crates/wbf-daemon/tests/process.rs` 真的 spawn 驗）。
   沒帶 `-s` 也不啟動：daemon 只有常駐這一種起法（單發模式不做，/docs/design/rpc-specs/rpc-cli.md §4）。
-- **讀完就清**：清掉的是 daemon 自己的環境；這樣它之後起的任何子程序都拿不到。讀與清都在 `main` 的第一行、解析參數之前（參數錯了一樣要清）。
-- **安全邊界跟以前的 0600 檔一樣**：同一個 OS 帳號的程序讀得到別的程序的環境變數（Linux 的 `/proc/<pid>/environ`，Windows 也做得到），跟 0600 擋的是同一層。
-  差別是少了「在磁碟上那幾秒」，所以以前那一套（檔案權限檢查、三遍抹寫、「覆蓋是盡力不是保證」）都不需要了，跟著 `--token-file` 一起拿掉。
-- **禁止重用既有的 token**：重連就重產生一把、起一支新的 daemon。一把 token 活得越久，被抄走的機會越多。
-- **禁止設計「重讀 token」**：daemon 讀一次就清掉了，第 3 步就是靠這個成立。
-- 📎 這比「daemon 產生、前端去讀」好的地方：**前端不必去讀任何檔**——token 本來就是它給的。
-- 📎 **沒帶 token 時 daemon 自己產生一把**（給它自己送出的 web 網頁用）是維護者 2026-11-17 定的方向，下一支（web 樣板）才做；現在沒帶就拒絕啟動，免得起出一支誰都連不上的 daemon。
+- 指定用環境變數、**禁止**用命令列參數傳：那會進 `ps` 的輸出。讀與清都在 `main` 的第一行、解析參數之前（參數錯了一樣要清）。
+- `daemon.token` 寫不了（例：磁碟滿）→ 不宣告 ready、exit 1：寫不出來就沒有前端連得上。
+- 📎 web 樣板（下一支）：手動起、沒指定 token 的 daemon，自己產生的那把就是網頁用的；網頁怎麼拿到它在那支定。
 - 📎 Android 的 JNI 是同一個程序裡的函式呼叫，不是 spawn：`daemon_start` 直接收 token 的 bytes（/docs/design/overview/architecture-v2.md §4）。
+- 📎 **演變**：2026-09-13 是「前端寫 token 檔、`--token-file` 交、ready 後三遍抹寫」；2026-11-17 改成「環境變數交、從頭到尾不落地」；
+  2026-11-20 定成現在這樣——Linux 的 `/proc/<pid>/environ` 在 daemon 整個生命期都讀得到啟動時的環境變數（PR #89 審查 oliver 實測），
+  「不落地」換不到實際的保護；而 token 放在資料目錄，任何同帳號的前端都連得上在跑的那支（rpc-cli 的 `--attach`）。
 
-**第 2 步的 ready 是一個「邊緣」，不是一個狀態**（不然前端會把上一次殘留的 port 當成這一次的）：
+**ready 是一個「邊緣」，不是一個狀態**（不然前端會把上一次殘留的 port 當成這一次的）：
 
 1. daemon 拿到資料目錄的寫權之後、綁定**之前**先刪掉舊的 `<data dir>/daemon.json`（刪不掉就不啟動）。
-2. 綁好之後才 **temp＋rename** 寫進去（`{ "rpc_port", "data_port", "pid", "instance" }`，**沒有** token）——前端 watch 到
-   它出現時，port 一定已經在聽，而且一定不是上一次的。
+2. 綁好、寫好 `daemon.token` 之後才 **temp＋rename** 寫 `daemon.json`（`{ "rpc_port", "data_port", "pid", "instance" }`）——前端 watch 到
+   它出現時，port 一定已經在聽、token 一定已經在，而且一定不是上一次的。
 3. 同時 **stdout 印一行 JSON**（上面那行）。spawn daemon 的那個程序手上有 pipe，這樣它不必去 watch 檔案。stdout 只有這一行，其餘一律 stderr。
    📎 `instance` 是這次啟動鑄的 UUID v4，`hello` 與 `daemon.info` 回的是**同一個**（/docs/design/rpc-specs/rpc-spec.md §1.3）：
    前端拿它判斷「還是剛才那一個 daemon 嗎」——⚠️ 禁止拿 port 或 pid 判斷，那兩個都會被重複使用。
-4. daemon 結束時刪掉 `daemon.json`。
+4. daemon 結束時刪掉 `daemon.json`（與 `daemon.token`）。⚠️ 被強制殺掉時兩個都會留著：讀得到**不**保證它還活著，連不上就是答案。
 
-📎 前端那一頭的實作在 `crates/wbf-daemon/src/client.rs`（`spawn_daemon` 讀 ready、`RpcClient::connect`），rpc-cli 用的就是它（/docs/design/rpc-specs/rpc-cli.md §3）。
+📎 前端那一頭的實作在 `crates/wbf-daemon/src/client.rs`（`find_running_daemon` 讀兩個檔、`spawn_daemon` 起一支並讀 ready、`RpcClient::connect`），
+rpc-cli 用的就是它（/docs/design/rpc-specs/rpc-cli.md §3）。
 
 ## 4 每則控制訊息都加密（token 就是金鑰材料）
 
@@ -112,7 +113,7 @@ aad     = "wbf-rpc v1"
 
 維護者 2026-09-09：既然可選，傾向用**有保護力**的。
 ⚠️ 老實說收穫的邊界：加密擋的攻擊者有限——能監聽 loopback 的人（要 root／管理員或 npcap）
-通常也能讀你的記憶體與程序的環境變數（token 就在那裡）。**真正的收穫是完整性**：Poly1305 標籤讓「改一個 bit 讓
+通常也能讀你的記憶體與資料目錄（`daemon.token` 就在那裡）。**真正的收穫是完整性**：Poly1305 標籤讓「改一個 bit 讓
 `false` 變 `true`」這種事驗不過。所以這裡要的是 **AEAD**，**不**是任何形式的自製混淆——
 沒有標籤的東西擋不住惡意修改，而控制平面上一個被改過的 `true` 就足以刪掉東西。
 

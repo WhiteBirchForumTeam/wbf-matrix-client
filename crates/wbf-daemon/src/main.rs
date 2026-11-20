@@ -15,10 +15,10 @@
 //! `wbf-matrix-client-daemon`：只有 `-s`（常駐）：控制平面（RPC）與資料平面（/docs/design/rpc-specs/data-plane.md）兩個 port。
 //! 單發命令（`daemon <命令>`）**不做**（維護者 2026-11-17，/docs/design/rpc-specs/rpc-cli.md §4）：「在腳本裡跑一條命令」由 rpc-cli 的 `call` 做。
 //!
-//! 起動的順序照 /docs/design/rpc-specs/local-interface.md §3 的三步（前端產生 token、放進環境變數 `WBF_DAEMON_TOKEN`、spawn →
-//! **daemon 讀完清掉、宣告 ready** → 之後只在兩個程序的記憶體裡）。⭐ 這支負責的是第 2 步，而「宣告 ready」是**一個邊緣**，
-//! 不是一個狀態：所以 `daemon.json` 在綁定**之前**先刪掉，綁好之後才 temp＋rename 寫進去 ——
-//! 前端等的那個檔出現的瞬間，port 一定已經在聽了，而且它一定不是上一次留下來的。
+//! token 照 /docs/design/rpc-specs/local-interface.md §3：`WBF_DAEMON_TOKEN` 有指定就用（讀完清掉）、沒指定就自己產生，
+//! 都寫進 `<data dir>/daemon.token` 給前端讀。⭐ 「宣告 ready」是**一個邊緣**，不是一個狀態：`daemon.json` 在綁定**之前**先刪掉，
+//! 綁好、`daemon.token` 寫好之後才 temp＋rename 寫進去 —— 前端等的那個檔出現的瞬間，port 一定已經在聽、token 一定已經在，
+//! 而且它一定不是上一次留下來的。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,7 +36,7 @@ use wbf_daemon::settings::Settings;
 #[command(
     name = "wbf-matrix-client-daemon",
     version,
-    about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端。token 由叫起它的前端放在環境變數 WBF_DAEMON_TOKEN"
+    about = "wbfuwunel client 本體：常駐、持有本地資料庫、開 RPC 給前端。token：環境變數 WBF_DAEMON_TOKEN 指定，沒指定就自己產生；都寫進 <data dir>/daemon.token"
 )]
 struct Cli {
     /// 常駐：開本地 RPC 的 WS，等前端來連（長旗標**不**叫 `--server`：那個字只指 homeserver，/docs/design/overview/architecture-v2.md §0.1）
@@ -57,16 +57,24 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    // 🚨 第一件事：讀 token、從環境裡清掉。⚠️ 要在起 runtime、開任何執行緒之前（`wbf_daemon::token::take_token_from_env`）。
+    // 🚨 第一件事：讀指定的 token、從環境裡清掉。⚠️ 要在起 runtime、開任何執行緒之前（`wbf_daemon::token::take_token_from_env`）。
     // 也排在解析參數之前：參數錯了一樣要清，不能讓 token 留在環境裡。
-    let token = wbf_daemon::token::take_token_from_env();
+    let given_token = wbf_daemon::token::take_token_from_env();
     let cli = Cli::parse();
     if !cli.serve {
         eprintln!("nothing to do: pass -s to serve (single-shot commands are not a thing; use wbf-matrix-rpc-cli)");
         return ExitCode::from(1);
     }
-    let token = match token {
-        Ok(token) => token,
+    // 沒指定就自己產生一把；指定了卻壞掉就不啟動（**不**默默改用自己產生的：那個前端會拿著對不上的 token 連不進來）。
+    let token = match given_token {
+        Ok(Some(token)) => token,
+        Ok(None) => match wbf_daemon::token::new_token() {
+            Ok(token) => zeroize::Zeroizing::new(token.to_vec()),
+            Err(problem) => {
+                eprintln!("{problem}");
+                return ExitCode::from(1);
+            }
+        },
         Err(problem) => {
             eprintln!("{problem}");
             return ExitCode::from(1);
@@ -83,9 +91,8 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // 資料平面的 URL 也用同一份 token 導鑰（/docs/design/rpc-specs/data-plane.md §2），導完 token 就不留。
+    // 資料平面的 URL 也用同一份 token 導鑰（/docs/design/rpc-specs/data-plane.md §2）。token 本身留到寫進 daemon.token 為止。
     let access_keys = AccessKeys::from_token(&token);
-    drop(token);
 
     let ready_path = cli.data_dir.join("daemon.json");
     // 沒有 runtime 就沒有這支 daemon（維護者的規矩裡「必須要開」的那個層級）——但停也要講清楚、給 exit code，**不** panic。
@@ -172,6 +179,12 @@ fn main() -> ExitCode {
             "pid": std::process::id(),
             "instance": handle.instance(),
         });
+        // token 先寫（蓋掉上一支留下的）、daemon.json 後寫：前端看到 daemon.json 時 token 一定已經在。寫不了就不宣告 ready（前端連不上）。
+        if let Err(problem) = wbf_daemon::token::write_token_file(&cli.data_dir, &token) {
+            eprintln!("{problem}");
+            return ExitCode::from(1);
+        }
+        drop(token);
         // temp＋rename：前端可能正在 watch 這個檔，**不**讓它讀到寫一半的。
         if let Err(error) = wbf_sdk::vault::write_private(&ready_path, info.to_string().as_bytes())
         {
@@ -199,7 +212,9 @@ fn main() -> ExitCode {
         handle.in_flight().finish_connections().await;
         handle.in_flight().finish_background().await;
         handle.core().await.shutdown().await;
+        // 正常結束順便收掉；被強制殺掉時留著無所謂，下一支起來會蓋掉（維護者 2026-11-20）。
         let _ = std::fs::remove_file(&ready_path);
+        let _ = std::fs::remove_file(wbf_daemon::token::token_file_path(&cli.data_dir));
         ExitCode::SUCCESS
     });
     // 到這裡該停的都停了；還沒停的（等不到、已經講過）給它們最後一段時間，之後才結束程序。

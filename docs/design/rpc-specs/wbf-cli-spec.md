@@ -8,34 +8,53 @@
 
 ## 0. 一句話
 
-`wbf-matrix-rpc-cli` 是 daemon 的第一個正式外部 client：**每次執行起一支自己的 daemon、丟 RPC、印結果、關掉 daemon**。
+`wbf-matrix-rpc-cli` 是 daemon 的第一個正式外部 client：**連上一支 daemon、丟 RPC、印結果**。連哪一支由參數決定（維護者 2026-11-20），兩個恰好給一個：
+
+| 參數 | 連哪一支 | 用完 |
+|---|---|---|
+| `--attach` | 資料目錄裡**在跑的那支**：讀 `<data dir>/daemon.json`（port）＋ `<data dir>/daemon.token`（/docs/design/rpc-specs/local-interface.md §3） | 只斷線，daemon 照跑 |
+| `--daemon <binary>` | **起一支新的**（那個執行檔，`-s --data-dir <D>`） | `daemon.shutdown`、等它結束 |
+
 命令列只是 RPC 訊息的薄封裝（/docs/design/overview/architecture-v2.md §0.2）：**不**重試、**不**改輸出的形狀、**不**替人串動作。
 結果是 JSON，印到 stdout；訊息與錯誤印到 stderr；exit code 說明失敗類別（§4）。所以它能被腳本串起來，驗收腳本就是這樣寫的（§8）。
 
 一次執行做這幾件事（`apps/wbf-matrix-rpc-cli/src/session.rs`）：
 
 ```text
-1. 先問人：密碼（account add）、確認（account destroy）—— 問完才起 daemon，免得 daemon 開著等人打字
-2. 產生 256 byte 的 token，放進子程序的環境變數 WBF_DAEMON_TOKEN，spawn `wbf-matrix-client-daemon -s --data-dir <D>`，讀它 stdout 的 ready 那一行
+1. 先問人：密碼（account add）、確認（account destroy）—— 問完才連，免得 daemon 開著等人打字
+2. --attach：讀 daemon.json ＋ daemon.token
+   --daemon：產生 256 byte 的 token，用環境變數 WBF_DAEMON_TOKEN 指定給它，spawn、讀它 stdout 的 ready 那一行（最多等 30 秒）
 3. 連 RPC 的 port、hello（client 名稱 `wbf-matrix-rpc-cli <版本>`）
-4. 解鎖（§7.1）
+4. 解鎖（§7.1；daemon 已經解鎖就跳過）
 5. 命令
-6. daemon.shutdown → 等 daemon 自己結束（最多 60 秒）
+6. --attach：關連線。--daemon：daemon.shutdown → 等它自己結束（最多 60 秒）
 ```
 
-📎 用 `-q` 時看不到 daemon 自己的 stderr；沒用時 daemon 那幾行（`listening on …`、自動生成 conf 的提示）跟 rpc-cli 的混在同一個 stderr。
+- `--daemon` 起的那支，在 2–3 之間出錯（ready 之後連不上、`hello` 被拒）時一定收掉（`wbf_daemon::client::DaemonProcess` 丟掉就殺），**不**留著佔資料目錄。
+- ⚠️ rpc-cli 自己被強制殺掉（`kill -9`、工作管理員）時，它起的 daemon 會留著；那就是一支在跑的 daemon，`--attach` 連上去 `call daemon.shutdown` 收掉。
+- 📎 用 `-q` 時看不到起的 daemon 自己的 stderr；沒用時 daemon 那幾行（`listening on …`、自動生成 conf 的提示）跟 rpc-cli 的混在同一個 stderr。
 
 ## 1. 權限從哪來
 
-**rpc-cli 對 daemon**：用它自己產生、交給它自己起的那支 daemon 的 token（/docs/design/rpc-specs/local-interface.md §3）。token 只活在兩個程序的記憶體裡，**不**落地。
+**rpc-cli 對 daemon**：那支 daemon 的 token（/docs/design/rpc-specs/local-interface.md §3）。`--attach` 讀 `daemon.token`；`--daemon` 用自己產生、指定給它的那把。
+token 保護的是通訊：檔只有本人讀得到，擋的是這台機器上別的帳號。
 
-所以 **別的前端（例：Desktop）起的 daemon 正在用這個資料目錄時，rpc-cli 用不了**：它連不上那支（沒有 token），也起不了第二支（資料目錄的排他鎖，/docs/design/overview/architecture-v2.md §0.2）。
-這時 exit 1，訊息講清楚（實跑，`-q`）：
+資料目錄已經有一支 daemon 在跑時，`--daemon` 起不了第二支（資料目錄的排他鎖，/docs/design/overview/architecture-v2.md §0.2），exit 1、提示改用 `--attach`；
+`--attach` 而沒有 daemon 在跑時，exit 1、提示改用 `--daemon`（實跑，`-q`）：
 
 ```text
-the daemon exited before saying ready (exit code: 1)
-(if another frontend's daemon is serving D:/Weil/Desktop/AI/wbf-walk-a, use that frontend or stop it first: rpc-cli can only talk to a daemon it starts itself, /docs/design/rpc-specs/rpc-cli.md §1)
+cannot read D:/Weil/Desktop/AI/wbf-show-attach\daemon.json (系統找不到指定的檔案。 (os error 2)); is a daemon serving this data directory?
+(to start one for this run instead, pass --daemon <path to wbf-matrix-client-daemon>)
 ```
+
+兩個都沒給（實跑）：
+
+```text
+error: the following required arguments were not provided:
+  <--attach|--daemon <DAEMON>>
+```
+
+exit 1（clap 預設的 2 在這裡是「server 拒絕」，§4）。
 
 **daemon 對 homeserver**：Matrix 登入發的 `access_token`，由 `account add`（RPC 的 `account.add`）取得、封進帳號目錄的 `session.sealed`（/docs/design/daemon/account-session.md §1）。
 
@@ -51,9 +70,10 @@ the daemon exited before saying ready (exit code: 1)
 | 參數 | 環境變數 | 說明 |
 |---|---|---|
 | `--data-dir <dir>` | `WBF_DATA_DIR` | daemon 的資料目錄（必填）。裡面每個檔是什麼在 §7 |
+| `--attach` | | 連資料目錄裡在跑的那支 daemon（§0）。跟 `--daemon` 恰好給一個 |
+| `--daemon <path>` | `WBF_DAEMON` | 起一支新的 daemon：它的執行檔（§0）。跟 `--attach` 恰好給一個（環境變數設了也算給了） |
 | `--passphrase-file <path>` | `WBF_PASSPHRASE_FILE` | 整檔的**原始 bytes** 就是 passphrase（解 `local.key` 用）。**不**去尾換行、**不**驗 UTF-8：可以是中文、可以是一個 mp3（/docs/design/storage/vault-and-keys.md §3）。沒給而 vault 要 passphrase 時從終端讀（不回顯）。**沒有** `--passphrase <pw>`、**不**接受環境變數給 passphrase 本身 |
-| `--daemon <path>` | `WBF_DAEMON` | daemon 的執行檔；沒給用 rpc-cli 同一個目錄的 `wbf-matrix-client-daemon`（Windows 加 `.exe`） |
-| `-q`／`--quiet` | | daemon 自己的 stderr 丟掉 |
+| `-q`／`--quiet` | | 起的 daemon 的 stderr 丟掉 |
 
 舊 CLI 的全域參數去哪了：
 
@@ -78,21 +98,25 @@ the daemon exited before saying ready (exit code: 1)
 | `watch [events…]` | 訂閱推播、一則一行印出來（§3.4.2） | JSON Lines |
 
 **其他全部用 `call`**。`call` 與 `batch` 的 `params` 就是 /docs/design/rpc-specs/rpc-spec.md 那一欄，原樣送、原樣印；`id` 由 rpc-cli 發。
+本文的例子裡 `$DAEMON` 是 daemon 執行檔的路徑（例 `target/debug/wbf-matrix-client-daemon.exe`）；連在跑的那支就把 `--daemon $DAEMON` 換成 `--attach`。
 
 ```bash
-wbf-matrix-rpc-cli --data-dir D call daemon.info
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON call daemon.info
 # {"cache_queue":0,"connections":1,"data_dir":"D:\\Weil\\Desktop\\AI\\wbf-smoke-a2","data_port":8605,"encryption_enforced":true,"instance":"8952a68f-ee91-4e05-a1a3-66d4ebee4f98","key_mode":null,"links":0,"local_room_keys_setting":"on","pid":45372,"protocols":[2],"read_receipts_setting":"private","rpc_port":8604,"server_backup_setting":"on","unlocked":false,"uptime_seconds":0,"version":"wbf-matrix-client-daemon 0.1.0"}
 
 printf '%s\n' '{"method":"vault.create"}' '{"method":"account.list"}' '{"method":"nope.nope"}' '{"method":"daemon.info"}' \
-  | wbf-matrix-rpc-cli --data-dir D -q batch
+  | wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q batch
 # {"code":0,"id":2,"msg":"ok","result":{"key_mode":"plain","ok":true}}
 # {"code":0,"id":3,"msg":"ok","result":{"accounts":[]}}
 # {"code":101,"id":4,"msg":"unknown method \"nope.nope\"","result":null}
 # stderr: error 101: unknown method "nope.nope"      exit 1；第四行沒送
 ```
 
-- ⭐ **一串命令用 `batch`**：每次執行都要起 daemon、解鎖、在背景開線（每個 wbf 帳號五條，/docs/design/daemon/link-pool.md §3.1）。
-  連續跑很多次 rpc-cli，server 可能用 429 拒絕開線（2026-11-19 對本機 wbfuwunel 實跑撞到：`websocket connect …: HTTP error: 429 Too Many Requests`，exit 4）。
+- `batch` **一行一則**：讀一行、送、印回應，才讀下一行。呼叫端可以「寫一行、等回應、再決定下一行」，stdin 不必先關。
+  第一個錯之後不再讀、不再送（`apps/wbf-matrix-rpc-cli/tests/cli.rs` 驗這兩件）。
+- ⭐ **一串命令用 `batch` 或 `--attach`**：`--daemon` 每次執行都要起 daemon、解鎖、在背景開線（每個 wbf 帳號五條，/docs/design/daemon/link-pool.md §3.1）。
+  連續跑很多次，server 可能用 429 拒絕開線（2026-11-19 對本機 wbfuwunel 實跑撞到：`websocket connect …: HTTP error: 429 Too Many Requests`，exit 4）。
+  先起一支（例：`--daemon` 跑一個長的 `watch`，或另外起 daemon）、其他次都 `--attach`，就沒有這個問題。
 - `batch` 跳過空行；第一行開頭的 UTF-8 BOM 去掉（Windows PowerShell 5.1 的管線會加）。
 
 舊 CLI 的命令對到哪：
@@ -131,10 +155,10 @@ printf '%s\n' '{"method":"vault.create"}' '{"method":"account.list"}' '{"method"
 | `account destroy <mxid> [--server <url>] [--yes] [--accept-history-loss]` | **不可逆**：沒帶 `--yes` 就要使用者把 mxid 再打一次；stdin 不是終端就要 `--yes`（禁止默默當成同意）。然後 `account.destroy`。做了什麼在 /docs/design/rpc-specs/rpc-spec.md 的 `account.destroy` 與本文 §3.5 |
 
 ```bash
-wbf-matrix-rpc-cli --data-dir D -q account add --server http://127.0.0.1:6167 --user alice --password-file alice-pw.txt --device-name rpc-cli-walk
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q account add --server http://127.0.0.1:6167 --user alice --password-file alice-pw.txt --device-name rpc-cli-walk
 # {"device_id":"r2vpn5sMAn","server":"http://127.0.0.1:6167","user_id":"@alice:localhost"}
 
-wbf-matrix-rpc-cli --data-dir D -q account destroy @bob:localhost < /dev/null
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q account destroy @bob:localhost < /dev/null
 # stderr: account destroy cannot be undone; stdin is not a terminal, so pass --yes      exit 1
 ```
 
@@ -152,18 +176,18 @@ core 另外發一則 `note`（`switched to @alice:localhost on http://localhost:
 
 ```bash
 # 兩個帳號共用一個資料目錄（一把 local.key、一份 cache.db）
-wbf-matrix-rpc-cli --data-dir ~/.wbf account add --server https://matrix.org --user alice --password-file pw-alice
-wbf-matrix-rpc-cli --data-dir ~/.wbf account add --server https://matrix.org --user bob --password-file pw-bob
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach account add --server https://matrix.org --user alice --password-file pw-alice
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach account add --server https://matrix.org --user bob --password-file pw-bob
 
-wbf-matrix-rpc-cli --data-dir ~/.wbf call account.list
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach call account.list
 # 換預設帳號：完整 mxid，不是 "alice"
-wbf-matrix-rpc-cli --data-dir ~/.wbf call account.switch '{"user":"@alice:matrix.org"}'
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach call account.switch '{"user":"@alice:matrix.org"}'
 # 只有這一則用 bob，current 不動
-wbf-matrix-rpc-cli --data-dir ~/.wbf call room.list '{"user":"@bob:matrix.org","sync":"both"}'
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach call room.list '{"user":"@bob:matrix.org","sync":"both"}'
 # 登出 bob：session、m/（crypto store）、k/（金鑰快照）沒了，cache.db 裡的紀錄還在
-wbf-matrix-rpc-cli --data-dir ~/.wbf call account.del '{"user":"@bob:matrix.org"}'
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach call account.del '{"user":"@bob:matrix.org"}'
 # 連 bob 在本機的紀錄一起清掉（alice 也看得到的那些不動）
-wbf-matrix-rpc-cli --data-dir ~/.wbf account destroy @bob:matrix.org --yes
+wbf-matrix-rpc-cli --data-dir ~/.wbf --attach account destroy @bob:matrix.org --yes
 ```
 
 同一個 localpart 在兩個 server 上是**兩個帳號**，完整 mxid 才分得開（`@bob:matrix.org` 跟 `@bob:localhost` 不是同一個人）。
@@ -175,10 +199,10 @@ wbf-matrix-rpc-cli --data-dir ~/.wbf account destroy @bob:matrix.org --yes
 做的就是 UI 的兩步的第一步（/docs/design/rpc-specs/data-plane.md）：`media.create` → `PUT` 到它給的 URL → 印 manifest（§5）。發訊息是第二步、另外叫：
 
 ```bash
-wbf-matrix-rpc-cli --data-dir D -q put orig.bin --room '!mm4wSdeMnTkkVqycfJ:localhost' > manifest.json
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q put orig.bin --room '!mm4wSdeMnTkkVqycfJ:localhost' > manifest.json
 # manifest.json: {"block":{"chunk_size":65536,"cipher":"none","file_size":300000,"name":"orig.bin","sha256":"c4f8c750…","v":1},"mxc":"mxc://localhost/88612388bc1d73","server":"http://127.0.0.1:6167"}
 printf '%s\n' "{\"method\":\"room.send_attachment\",\"params\":{\"room\":\"!mm4wSdeMnTkkVqycfJ:localhost\",\"manifest\":$(cat manifest.json)}}" \
-  | wbf-matrix-rpc-cli --data-dir D -q batch
+  | wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q batch
 # {"code":0,"id":3,"msg":"ok","result":{"attachment_declared":true,"event_id":"$wa5KJv77yhi95W1x2lHFZTf3aJFgVwNzdKuaJrjAfsg","mxc":"mxc://localhost/88612388bc1d73"}}
 ```
 
@@ -197,16 +221,17 @@ printf '%s\n' "{\"method\":\"room.send_attachment\",\"params\":{\"room\":\"!mm4w
 `media.open`（三種指法同 /docs/design/rpc-specs/rpc-spec.md §3.6）→ `GET` 它給的 URL → 寫到 `-o`（沒給或 `-` 是 stdout）。stderr 最後一行是狀態碼與 `wbf-media-verified`：
 
 ```bash
-wbf-matrix-rpc-cli --data-dir D -q get --manifest manifest.json -o got.bin
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q get --manifest manifest.json -o got.bin
 # stderr: mxc://localhost/88612388bc1d73 cannot be streamed before it is downloaded; waiting for the download
 # stderr: status 200, verified 1
-wbf-matrix-rpc-cli --data-dir D -q get --manifest manifest.json --range bytes=70000-70999 -o range.bin
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q get --manifest manifest.json --range bytes=70000-70999 -o range.bin
 # stderr: status 206, verified 1
 ```
 
 - **還沒下載完、這支 daemon 又現拉不了時，等它下載完再讀**：GET 回 502（沒有帳號看得到帶金鑰的事件，/docs/design/rpc-specs/data-plane.md §8）而 `media.open` 說它在排或在拉時，
   `get` 等 `media.download` 推到 `complete`，再 GET 一次（從池讀就不需要事件）。推到 `failed`／`cancelled` 就 exit 2。等多久沒有上限，Ctrl+C 停。
-  ⚠️ 這在 rpc-cli 很常見：每次執行是一支剛起的 daemon，訂閱線還沒把事件帶進快取。UI 的 daemon 常駐，多半直接就讀得到。
+  推播會掉（/docs/design/rpc-specs/rpc-spec.md §4）：收到 `desync` 就重叫一次 `media.open`，它說完成了就不再等。
+  ⚠️ 這在 `--daemon` 很常見：每次執行是一支剛起的 daemon，訂閱線還沒把事件帶進快取。常駐的 daemon（`--attach`、UI）多半直接就讀得到。
 - `--mxc` 要本地有那個 mxc 的紀錄（看過帶它的事件、或先前用 manifest 開過）；只上傳、沒送進任何房的檔用 `--manifest`。
 - **412**：資料照寫，但它沒驗過或驗不過（傳統加密附件，/docs/design/rpc-specs/data-plane.md §8.2）→ exit 3。
 - 不是資料的回應（404、502…）**一個 byte 都不寫進輸出**，stderr 印 daemon 回的那則錯誤，exit 2。
@@ -239,13 +264,13 @@ rpc-cli **沒有** `seek` 命令了：`get --range` 就是 seek（同一個語�
 - **加密房**：`call room.refresh_devices` 拿到 `room_devices`，帶著它 `call room.send_text`；被 1401 擋就用錯誤 `data` 裡的新狀態再送一次（同一個 `txn_id`，/docs/design/keys/e2ee-rpc.md §3）。rpc-cli **不**替你重送。
 
 ```bash
-printf '%s\n' '{"method":"room.get","params":{"room":"!mm4wSdeMnTkkVqycfJ:localhost","sync":"both"}}' | wbf-matrix-rpc-cli --data-dir D -q batch
-wbf-matrix-rpc-cli --data-dir D -q call room.send_text '{"room":"!mm4wSdeMnTkkVqycfJ:localhost","body":"hello from rpc-cli"}'
+printf '%s\n' '{"method":"room.get","params":{"room":"!mm4wSdeMnTkkVqycfJ:localhost","sync":"both"}}' | wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q batch
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q call room.send_text '{"room":"!mm4wSdeMnTkkVqycfJ:localhost","body":"hello from rpc-cli"}'
 # {"event_id":"$lP0O-3QN257vKAfU86tgi4hTCnLMg5tb4rXFcYfJVJ0"}
 
-DEVICES=$(wbf-matrix-rpc-cli --data-dir D -q call room.refresh_devices '{"room":"!wvQRbpkcdLe0ooYAKO:localhost"}')
+DEVICES=$(wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q call room.refresh_devices '{"room":"!wvQRbpkcdLe0ooYAKO:localhost"}')
 # {"members":{"@alice:localhost":"5-a4ab25b7e5","@bob:localhost":"6-41c732f4ba"},"room_version":17803949296791669694}
-wbf-matrix-rpc-cli --data-dir D -q call room.send_text "{\"room\":\"!wvQRbpkcdLe0ooYAKO:localhost\",\"body\":\"secret\",\"room_devices\":$DEVICES}"
+wbf-matrix-rpc-cli --data-dir D --daemon $DAEMON -q call room.send_text "{\"room\":\"!wvQRbpkcdLe0ooYAKO:localhost\",\"body\":\"secret\",\"room_devices\":$DEVICES}"
 # {"event_id":"$12PdcD68XUCNHao4iNiFRoEAAF1o-989QCYeERA0csQ"}
 ```
 
@@ -291,14 +316,15 @@ wbf-matrix-rpc-cli --data-dir D -q call room.send_text "{\"room\":\"!wvQRbpkcdLe
 | `--count N --timeout S` | 收滿就 0；時間到還沒收滿 | 5 |
 
 ```bash
-wbf-matrix-rpc-cli --data-dir D2 -q watch room.message --count 1 --timeout 90
+wbf-matrix-rpc-cli --data-dir D2 --daemon $DAEMON -q watch room.message --count 1 --timeout 90
 # {"method":"room.message","params":{"message":{"body":"hello from rpc-cli","conversation":"!mm4wSdeMnTkkVqycfJ:localhost","decrypted":null,"g_seq":495,"id":"$lP0O-3QN257vKAfU86tgi4hTCnLMg5tb4rXFcYfJVJ0","kind":"text","r_seq":12,"sender":"@alice:localhost","sent_at":1795052781312},"room":"!mm4wSdeMnTkkVqycfJ:localhost","user":"@bob:localhost"}}
 ```
 
 - `--user` 要**完整 mxid**：daemon 逐字比對推播的 `user`（localpart 會把全部濾掉）。
 - **只看得到訂閱之後的**：訂閱不補先前的訊息；要歷史用 `room.history`。⚠️ 剛起的 daemon 要等背景開線（`daemon.info` 的 `links`）才收得到房間推播，所以 `watch` 起來之後隔幾秒才送的那則才保證收得到。
 - **自己送的也印**（`sender` 是自己），腳本自己濾。
-- **Ctrl+C**：終端裡 daemon 跟 rpc-cli 在同一個 console，兩個都收到；rpc-cli 照樣 `daemon.shutdown`、等 daemon 結束，關機請求送不出去（daemon 已經在關）不算錯（`session.rs` 的 `finish`）。
+- **Ctrl+C**：`--daemon` 起的那支跟 rpc-cli 在同一個 console，兩個都收到；rpc-cli 照樣 `daemon.shutdown`、等 daemon 結束，關機請求送不出去（daemon 已經在關）不算錯（`session.rs` 的 `finish`）。
+  daemon 關連線的通知（9006）比 Ctrl+C 先到也是正常結束（exit 0、stderr 說一聲），不是網路錯。`--attach` 時 Ctrl+C 只結束 rpc-cli，daemon 照跑。
 
 ### 3.5 本地快取（/docs/design/storage/local-cache-db.md §5）
 
@@ -426,18 +452,18 @@ wbf-matrix-rpc-cli --data-dir D2 -q watch room.message --count 1 --timeout 90
 - `local.key` 為什麼在頂層不在帳號底下：主金鑰的定位是「這台機器」（/docs/design/storage/vault-and-keys.md §1），passphrase 也是一台機器一個。
 - `cache.db` 為什麼在 server 層：`r_seq`／`g_seq` 是 fork server 發的，同一個 room 在不同 homeserver 上序號不同；共用範圍就是同一個 server 的帳號（§3.5）。
 - **明文目錄名的舊佈局一律不遷移**（維護者 2026-09-09）：一個都解不開時提示刪掉 data dir 重新加帳號（/docs/design/storage/vault-and-keys.md §2.7）。
-- **token 不在資料目錄裡**：`daemon.json` 只有 port、pid、`instance`（/docs/design/rpc-specs/local-interface.md §3）。
+- **daemon 的 token 在 `daemon.token`**（只有本人讀得到，daemon 正常結束時刪掉）；`daemon.json` 只有 port、pid、`instance`（/docs/design/rpc-specs/local-interface.md §3）。
 
 任何輸出、log、錯誤訊息都**不**印 `access_token`、主金鑰、子金鑰、passphrase、password、daemon 的 token。
 
-### 7.1 解鎖：每次執行都要；**沒有** unlock ticket（維護者 2026-09-13）
+### 7.1 解鎖；**沒有** unlock ticket（維護者 2026-09-13）
 
-每次執行是一支新的 daemon，所以 `local.key` 是 `passphrase` 模式時**每次都要 passphrase**：`--passphrase-file` → 問終端（不回顯）；stdin 不是終端就拒絕。`plain` 模式不問。
+`--attach` 連的 daemon 已經解鎖就不問。`--daemon` 起的是新的一支，所以 `local.key` 是 `passphrase` 模式時**每次都要 passphrase**：`--passphrase-file` → 問終端（不回顯）；stdin 不是終端就拒絕。`plain` 模式不問。
 還沒有 `local.key` 時不解（要它的 method 自己會回 1002）；`account add` 會先建。
 
 **不**為了省打字讓明文主金鑰落地（沒有 `unlock.ticket`、`lock` 命令、`--unlock-ttl`、conf 的 `UNLOCK_TTL`）。
 
-- ⭐ 理由：常駐的 daemon 解鎖一次就夠（/docs/design/overview/architecture-v2.md §1），rpc-cli 是 debug／test 用、一次一支，省下的那幾次打字**換不到「明文主金鑰落地」**。
+- ⭐ 理由：常駐的 daemon 解鎖一次就夠（/docs/design/overview/architecture-v2.md §1），要省打字就 `--attach` 它；省下的那幾次打字**換不到「明文主金鑰落地」**。
 - 📎 **UI 的 lock 不是這個東西**：UI 有自己的 lock／unlock，但它鎖的是 UI 那一層，**不**動 daemon（/docs/design/rpc-specs/rpc-spec.md §3.1）。真正要讓金鑰離開記憶體就是 `daemon.shutdown`。
 
 ## 8. 驗收腳本
@@ -460,7 +486,6 @@ wbf-matrix-rpc-cli --data-dir D2 -q watch room.message --count 1 --timeout 90
 
 - 沒有互動模式（REPL）、沒有進度條：一串命令用 `batch`。
 - rpc-cli 自己的重試、輸出改形、串動作（例：加密房 1401 的重送）：它是薄封裝（/docs/design/rpc-specs/rpc-cli.md §8）。
-- 附掛到別的前端起的 daemon（/docs/design/rpc-specs/rpc-cli.md §1 的丙）。
 - 不存密碼，只存 token（`session.sealed`）。
 - `backup` **不**做「刪掉 server 上的 backup version」（不可逆，而且會連帶其他裝置，/docs/design/keys/room-key-backup.md §9）。
 - conf **不**改寫已經存在的檔、不寫秘密（§10.3、§10.5）。
@@ -516,7 +541,7 @@ LOCAL_ROOM_KEYS=on   ; built-in default
 
 維護者 2026-09-09 定：**環境變數優先於 conf**。命令列旗標仍然最高（它是「就這一次」的意思）。每個值各自比一次，不是整份取代。
 
-daemon 認得的環境變數只有三個：`WBF_DAEMON_TOKEN`（token，/docs/design/rpc-specs/local-interface.md §3）、`WBF_DATA_DIR`（`--data-dir`）、`WBF_CONFIG`（`--config`）。
+daemon 認得的環境變數只有三個：`WBF_DAEMON_TOKEN`（指定 token；沒給就自己產生，/docs/design/rpc-specs/local-interface.md §3）、`WBF_DATA_DIR`（`--data-dir`）、`WBF_CONFIG`（`--config`）。
 📎 這三個**都不是 conf 的鍵**，所以今天 daemon 上**沒有任何一個值同時來自環境與 conf**，這條規則在那邊還沒有實際的比較對象。
 **沒有** `WBF_SERVER`／`WBF_ACCOUNT` 那一類：daemon 同時服務所有帳號，「對誰動作」是每則 RPC 的 `params`（/docs/design/rpc-specs/rpc-spec.md §2），不是啟動時的環境。
 
@@ -527,7 +552,7 @@ daemon 認得的環境變數只有三個：`WBF_DAEMON_TOKEN`（token，/docs/de
 維護者 2026-09-09 要求：**資料目錄裡自動生成一份 conf，把當前的值寫進去。** A-2 起由 daemon 做（以前是舊 CLI，/docs/design/rpc-specs/rpc-cli.md §4）：
 
 - 觸發條件：daemon `-s` 起來、**拿到資料目錄的寫權之後**、沒用 `--config` 指別的檔、`<data dir>` 下**還沒有** `wbf.conf`。
-  daemon 起不來（token 不對、資料目錄被佔著、沒帶 `-s`）就不寫。
+  daemon 起不來（指定的 token 壞掉、資料目錄被佔著、沒帶 `-s`）就不寫。
 - 寫進去的是**這次實際生效的值**，每個值後面附一行註解說它是從哪來的；stderr 說一聲寫了哪個檔。寫不成只說一聲、照樣跑（沒有它就是內建預設）。
 - 已經存在的 `wbf.conf` **永遠不改寫**（連補鍵都不做）：那是使用者的檔，不是我們的狀態檔。要重生成先自己刪掉。
 - **不**寫任何秘密，也不寫「秘密在哪」的路徑（§10.5）。
